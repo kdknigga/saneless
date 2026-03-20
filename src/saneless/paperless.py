@@ -106,18 +106,18 @@ class PaperlessClient:
                     # Combine form fields and file into a single multipart
                     # files list for httpx. This avoids issues with mixing
                     # data= and files= parameters.
-                    multipart_files: list[tuple[str, object]] = list(fields)
-                    multipart_files.append(
-                        ("document", (pdf_path.name, f, "application/pdf"))
-                    )
+                    multipart_files: list[tuple[str, object]] = [
+                        *fields,
+                        ("document", (pdf_path.name, f, "application/pdf")),
+                    ]
                     response = self._client.post(
                         "/api/documents/post_document/",
-                        files=multipart_files,
+                        files=multipart_files,  # type: ignore[arg-type]
                     )
                 response.raise_for_status()
                 task_id = response.json()
                 logger.info("Upload succeeded, task ID: %s", task_id)
-                return task_id  # type: ignore[no-any-return]
+                return str(task_id)
 
             except (httpx.ConnectError, httpx.TimeoutException) as exc:
                 last_error = exc
@@ -157,7 +157,7 @@ class PaperlessClient:
         msg = f"Upload failed after {self._max_retries} retries"
         raise PaperlessError(msg) from last_error
 
-    def poll_task(self, task_id: str, timeout: int | float = 300) -> dict:
+    def poll_task(self, task_id: str, timeout: int | float = 300) -> dict[str, object]:
         """Poll task endpoint until terminal state with exponential backoff.
 
         Handles the race condition where a task may not appear
@@ -186,7 +186,7 @@ class PaperlessClient:
                     status = task.get("status")
                     if status in ("SUCCESS", "FAILURE"):
                         logger.info("Task %s completed: %s", task_id, status)
-                        return task  # type: ignore[no-any-return]
+                        return dict(task)
 
             time.sleep(delay)
             elapsed += delay

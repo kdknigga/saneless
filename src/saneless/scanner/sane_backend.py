@@ -14,7 +14,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import PIL.Image
 from PIL import Image
@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 # monkeypatch ``sane_backend.sane`` without the real C extension
 # being installed.  The actual import is deferred to avoid a hard
 # dependency at collection time.
-sane: object = None  # type: ignore[assignment]
+sane: Any = None
 
 
 def _ensure_sane() -> None:
