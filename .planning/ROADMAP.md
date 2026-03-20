@@ -63,9 +63,10 @@ Plans:
   3. For manual duplex scans, UI shows a flip prompt with Continue and Cancel buttons and the scan button is disabled while a job is in progress
   4. User can browse job history showing timestamp, profile, title, and outcome -- with old entries automatically pruned
   5. `GET /health` returns 200 when the system is healthy and 503 when the worker thread is down, requiring no authentication
-**Plans**: 3 plans
+**Plans**: 4 plans
 
 Plans:
+- [ ] 03-00-PLAN.md -- Wave 0: xfail test stubs and httpx dev dependency for Nyquist compliance
 - [ ] 03-01-PLAN.md -- Backend extensions and FastAPI web application scaffold (app factory, cache, routes, health endpoint)
 - [ ] 03-02-PLAN.md -- Complete Jinja2 templates with HTMX interactions (scan form, status polling, flip prompt, job history)
 - [ ] 03-03-PLAN.md -- Test suite for web endpoints, cache, and JobStore extensions
@@ -93,5 +94,5 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 |-------|----------------|--------|-----------|
 | 1. Core Pipeline | 0/3 | Planning complete | - |
 | 2. ADF and Multi-Page | 0/3 | Planning complete | - |
-| 3. Web UI | 0/3 | Planning complete | - |
+| 3. Web UI | 0/4 | Planning complete | - |
 | 4. Packaging and Deployment | 0/1 | Not started | - |
