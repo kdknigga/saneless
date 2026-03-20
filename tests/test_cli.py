@@ -97,7 +97,7 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
 
         monkeypatch.setattr("saneless.cli.PaperlessClient", MockPaperlessClient)
 
-    return CliRunner(mix_stderr=False), settings
+    return CliRunner(), settings
 
 
 class TestCliHelp:
@@ -159,7 +159,7 @@ class TestScanCommand:
 
     def test_scan_config_error(self, monkeypatch):
         """Config loading fails -> exit code 2."""
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
 
         def bad_load(*args, **kwargs):
             msg = "bad config"
@@ -171,7 +171,7 @@ class TestScanCommand:
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 2
-        assert "Configuration error" in result.stderr
+        assert "Configuration error" in result.output
 
     def test_scan_scan_error(self, monkeypatch):
         """Pipeline raises ScanError -> exit code 1."""
@@ -185,7 +185,7 @@ class TestScanCommand:
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 1
-        assert "Paper jam" in result.stderr
+        assert "Paper jam" in result.output
 
     def test_scan_paperless_error(self, monkeypatch):
         """Pipeline raises PaperlessError -> exit code 3."""
@@ -205,7 +205,7 @@ class TestScanCommand:
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 3
-        assert "Server down" in result.stderr
+        assert "Server down" in result.output
 
     def test_scan_with_profile(self, monkeypatch):
         """scan --profile photo -> pipeline called with profile_name='photo'."""
@@ -274,7 +274,7 @@ class TestCliFlags:
         def capture_logging(*args, **kwargs):
             captured["verbose"] = kwargs.get("verbose", False)
 
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
         monkeypatch.setattr("saneless.cli.load_settings", lambda *a, **kw: _make_settings())
         monkeypatch.setattr("saneless.cli.configure_logging", capture_logging)
 
@@ -297,7 +297,7 @@ class TestCliFlags:
             captured["config_path"] = config_path
             return _make_settings()
 
-        runner = CliRunner(mix_stderr=False)
+        runner = CliRunner()
         monkeypatch.setattr("saneless.cli.load_settings", capture_load)
         monkeypatch.setattr("saneless.cli.configure_logging", lambda *a, **kw: None)
 
