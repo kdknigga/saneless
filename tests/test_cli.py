@@ -98,8 +98,13 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
                 )
 
             def scan_pages(self, _device_id, _settings):
-                """Return a single white test image."""
-                return iter([Image.new("RGB", (100, 100), "white")])
+                """Return a single test image with content."""
+                from PIL import ImageDraw
+
+                img = Image.new("RGB", (100, 100), "white")
+                draw = ImageDraw.Draw(img)
+                draw.rectangle([10, 10, 90, 90], fill="black")
+                return iter([img])
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
 
