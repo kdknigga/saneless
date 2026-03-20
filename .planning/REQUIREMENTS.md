@@ -22,8 +22,8 @@
 
 ### Profiles
 
-- [ ] **PROF-01**: User can define scan profiles in TOML config specifying source, resolution, color mode, and optional default metadata
-- [ ] **PROF-02**: A `default` profile must always be present
+- [x] **PROF-01**: User can define scan profiles in TOML config specifying source, resolution, color mode, and optional default metadata
+- [x] **PROF-02**: A `default` profile must always be present
 - [ ] **PROF-03**: User can select a profile from a dropdown in the web UI
 
 ### PDF Assembly
@@ -64,9 +64,9 @@
 
 ### Configuration
 
-- [ ] **CONF-01**: Configuration via pydantic-settings reading TOML file with env var overrides
-- [ ] **CONF-02**: Scanner host, device, paperless URL/token, tmp_dir, log settings, profiles all configurable
-- [ ] **CONF-03**: No hardcoded credentials; API token via config file or environment variable
+- [x] **CONF-01**: Configuration via pydantic-settings reading TOML file with env var overrides
+- [x] **CONF-02**: Scanner host, device, paperless URL/token, tmp_dir, log settings, profiles all configurable
+- [x] **CONF-03**: No hardcoded credentials; API token via config file or environment variable
 
 ### Architecture
 
@@ -76,8 +76,8 @@
 
 ### Error Handling & Logging
 
-- [ ] **LOG-01**: All errors and significant events written to a rotating log file at configurable path
-- [ ] **LOG-02**: Log level configurable (DEBUG, INFO, WARNING, ERROR)
+- [x] **LOG-01**: All errors and significant events written to a rotating log file at configurable path
+- [x] **LOG-02**: Log level configurable (DEBUG, INFO, WARNING, ERROR)
 - [ ] **LOG-03**: All scan/API/assembly errors displayed in web UI for current or most recent job
 - [ ] **LOG-04**: Temporary files cleaned up on error -- no orphaned scan data
 
@@ -129,21 +129,21 @@
 | SCAN-01 | Phase 1 | Pending |
 | SCAN-02 | Phase 1 | Pending |
 | SCAN-03 | Phase 1 | Pending |
-| PROF-01 | Phase 1 | Pending |
-| PROF-02 | Phase 1 | Pending |
+| PROF-01 | Phase 1 | Complete |
+| PROF-02 | Phase 1 | Complete |
 | PDF-01 | Phase 1 | Pending |
 | PDF-02 | Phase 1 | Pending |
 | PLSS-01 | Phase 1 | Pending |
 | PLSS-02 | Phase 1 | Pending |
 | PLSS-03 | Phase 1 | Pending |
-| CONF-01 | Phase 1 | Pending |
-| CONF-02 | Phase 1 | Pending |
-| CONF-03 | Phase 1 | Pending |
+| CONF-01 | Phase 1 | Complete |
+| CONF-02 | Phase 1 | Complete |
+| CONF-03 | Phase 1 | Complete |
 | ARCH-01 | Phase 1 | Pending |
 | ARCH-02 | Phase 1 | Pending |
 | ARCH-03 | Phase 1 | Pending |
-| LOG-01 | Phase 1 | Pending |
-| LOG-02 | Phase 1 | Pending |
+| LOG-01 | Phase 1 | Complete |
+| LOG-02 | Phase 1 | Complete |
 | LOG-04 | Phase 1 | Pending |
 | CLI-01 | Phase 1 | Pending |
 | CLI-02 | Phase 1 | Pending |
