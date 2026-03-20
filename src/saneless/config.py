@@ -142,7 +142,7 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     """
     if config_path:
-        return Settings(_toml_file=Path(config_path))
+        return Settings(_toml_file=Path(config_path))  # type: ignore[call-arg]
 
     search_paths = [
         Path("./saneless.toml"),
@@ -152,7 +152,7 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     for path in search_paths:
         if path.exists():
-            return Settings(_toml_file=path)
+            return Settings(_toml_file=path)  # type: ignore[call-arg]
 
     # No config file found -- use defaults + env vars only
     return Settings()
