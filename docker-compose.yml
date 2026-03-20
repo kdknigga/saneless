@@ -1,0 +1,24 @@
+# Saneless Docker Compose deployment example
+#
+# Configuration options:
+#   - Volume mount: bind config.toml to /etc/saneless/config.toml (read-only)
+#   - Environment variables: use SANELESS_ prefix with __ nested delimiter
+#     (e.g., SANELESS_PAPERLESS__URL, SANELESS_PAPERLESS__TOKEN)
+#   - Consume directory: optionally mount a host directory for paperless-ngx
+#     file-based ingestion as a fallback to API upload
+
+services:
+  saneless:
+    image: ghcr.io/kris-knigga/saneless:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.toml:/etc/saneless/config.toml:ro
+      - saneless-data:/tmp/saneless
+    environment:
+      - SANELESS_PAPERLESS__URL=http://paperless:8000
+      - SANELESS_PAPERLESS__TOKEN=changeme
+    restart: unless-stopped
+
+volumes:
+  saneless-data:
