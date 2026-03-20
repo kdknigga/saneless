@@ -1,4 +1,5 @@
-"""SANE scanner backend implementation wrapping python-sane.
+"""
+SANE scanner backend implementation wrapping python-sane.
 
 This module provides the concrete SaneBackend that communicates with
 physical scanners through the SANE (Scanner Access Now Easy) library.
@@ -13,17 +14,21 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from collections.abc import Iterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 import PIL.Image
 from PIL import Image
 
-from ..exceptions import ScanError
-from .base import DeviceCapabilities, DeviceInfo, ScannerBackend, ScanSettings
+from saneless.exceptions import ScanError
+from saneless.scanner.base import (
+    DeviceCapabilities,
+    DeviceInfo,
+    ScannerBackend,
+    ScanSettings,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterator
 
 # python-sane is imported as a module-level name so that tests can
 # monkeypatch ``sane_backend.sane`` without the real C extension
@@ -40,6 +45,7 @@ def _ensure_sane() -> None:
 
         sane = _sane
 
+
 # Allow high-DPI scans without triggering Pillow's decompression bomb check.
 # 600 DPI A4 color = ~34.8M pixels; 1200 DPI = ~139M pixels.
 # Pillow default limit is 89.5M pixels.
@@ -50,8 +56,22 @@ __all__ = ["SaneBackend"]
 logger = logging.getLogger(__name__)
 
 
+class SaneDevice(Protocol):
+    """Protocol describing the SANE device handle interface."""
+
+    mode: str
+    resolution: int
+    source: str
+
+    def get_options(self) -> list: ...
+    def snap(self) -> Image.Image: ...
+    def cancel(self) -> None: ...
+    def close(self) -> None: ...
+
+
 class SaneBackend(ScannerBackend):
-    """Scanner backend wrapping python-sane.
+    """
+    Scanner backend wrapping python-sane.
 
     Calls sane.init() exactly once at construction. Device handles
     are opened via a context manager that ensures cancel() and close()
@@ -59,13 +79,15 @@ class SaneBackend(ScannerBackend):
     """
 
     def __init__(self) -> None:
+        """Initialize SANE and store the library version."""
         _ensure_sane()
         self._sane_version = sane.init()
         logger.info("SANE initialized, version %s", self._sane_version)
 
     @contextlib.contextmanager
-    def _open_device(self, device_id: str) -> Generator[object, None, None]:
-        """Context manager for SANE device lifecycle.
+    def _open_device(self, device_id: str) -> Generator[SaneDevice]:
+        """
+        Context manager for SANE device lifecycle.
 
         Opens the device, yields it for use, then ensures cancel()
         and close() are called on all exit paths (normal and error).
@@ -75,22 +97,23 @@ class SaneBackend(ScannerBackend):
 
         Yields:
             An open SANE device handle.
+
         """
-        dev = sane.open(device_id)
+        dev: SaneDevice = sane.open(device_id)
         try:
             yield dev
         finally:
-            try:
+            with contextlib.suppress(Exception):
                 dev.cancel()
-            except Exception:  # noqa: BLE001, S110
-                pass
             dev.close()
 
     def get_devices(self) -> list[DeviceInfo]:
-        """Enumerate available scanning devices.
+        """
+        Enumerate available scanning devices.
 
         Returns:
             List of DeviceInfo objects for each discovered device.
+
         """
         raw_devices = sane.get_devices()
         return [
@@ -104,7 +127,8 @@ class SaneBackend(ScannerBackend):
         ]
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-        """Query device capabilities and available options.
+        """
+        Query device capabilities and available options.
 
         Opens the device, reads its option list, and extracts
         available sources, resolutions, and modes.
@@ -114,6 +138,7 @@ class SaneBackend(ScannerBackend):
 
         Returns:
             DeviceCapabilities with parsed option information.
+
         """
         with self._open_device(device_id) as dev:
             raw_options = dev.get_options()
@@ -124,7 +149,7 @@ class SaneBackend(ScannerBackend):
             for opt in raw_options:
                 # SANE option tuple:
                 # (index, name, title, desc, type, unit, size, cap, constraint)
-                if len(opt) < 9:  # noqa: PLR2004
+                if len(opt) < 9:
                     continue
                 name = opt[1]
                 constraint = opt[8]
@@ -145,7 +170,8 @@ class SaneBackend(ScannerBackend):
     def scan_pages(
         self, device_id: str, settings: ScanSettings
     ) -> Iterator[Image.Image]:
-        """Acquire pages from scanner.
+        """
+        Acquire pages from scanner.
 
         Opens the device, validates the requested source against
         available options, sets scan parameters, and yields the
@@ -161,6 +187,7 @@ class SaneBackend(ScannerBackend):
 
         Raises:
             ScanError: If the device does not support the requested source.
+
         """
         with self._open_device(device_id) as dev:
             # Validate source option against device capabilities
@@ -169,7 +196,7 @@ class SaneBackend(ScannerBackend):
             has_source_option = False
 
             for opt in raw_options:
-                if len(opt) >= 9 and opt[1] == "source":  # noqa: PLR2004
+                if len(opt) >= 9 and opt[1] == "source":
                     has_source_option = True
                     constraint = opt[8]
                     if isinstance(constraint, list):

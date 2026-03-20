@@ -1,4 +1,5 @@
-"""Job model with state machine and SQLite persistence.
+"""
+Job model with state machine and SQLite persistence.
 
 Tracks scan jobs through their lifecycle (PENDING -> SCANNING ->
 ASSEMBLING -> UPLOADING -> DONE) with SQLite-backed persistence
@@ -12,15 +13,15 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 __all__ = ["Job", "JobState", "JobStore"]
 
 logger = logging.getLogger(__name__)
 
 
-class JobState(str, Enum):
+class JobState(StrEnum):
     """States in the scan job lifecycle."""
 
     PENDING = "PENDING"
@@ -33,7 +34,8 @@ class JobState(str, Enum):
 
 @dataclass
 class Job:
-    """A scan job with metadata and state tracking.
+    """
+    A scan job with metadata and state tracking.
 
     Attributes:
         id: Unique job identifier (UUID).
@@ -44,6 +46,7 @@ class Job:
         created_at: Timezone-aware creation timestamp.
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
+
     """
 
     id: str
@@ -51,20 +54,23 @@ class Job:
     title: str
     state: JobState = JobState.PENDING
     error: str | None = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(tz=timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     tags: list[int] = field(default_factory=list)
     correspondent: int | None = None
 
 
 class JobStore:
-    """SQLite-backed persistence for scan jobs.
+    """
+    SQLite-backed persistence for scan jobs.
 
     Args:
         db_path: Path to SQLite database file, or ":memory:" for
             in-memory storage (default).
+
     """
 
     def __init__(self, db_path: str = ":memory:") -> None:
+        """Initialize the job store with a SQLite database connection."""
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute(
@@ -88,7 +94,8 @@ class JobStore:
         tags: list[int] | None = None,
         correspondent: int | None = None,
     ) -> Job:
-        """Create and persist a new job.
+        """
+        Create and persist a new job.
 
         Args:
             profile: Scan profile name.
@@ -98,6 +105,7 @@ class JobStore:
 
         Returns:
             The newly created Job instance.
+
         """
         job = Job(
             id=str(uuid.uuid4()),
@@ -125,13 +133,15 @@ class JobStore:
         return job
 
     def get_job(self, job_id: str) -> Job | None:
-        """Fetch a job by ID.
+        """
+        Fetch a job by ID.
 
         Args:
             job_id: The UUID string of the job.
 
         Returns:
             The Job if found, None otherwise.
+
         """
         row = self._conn.execute(
             "SELECT id, profile, title, state, error, tags, correspondent, created_at "
@@ -157,12 +167,14 @@ class JobStore:
         state: JobState,
         error: str | None = None,
     ) -> None:
-        """Update the state (and optionally error) of a job.
+        """
+        Update the state (and optionally error) of a job.
 
         Args:
             job_id: The UUID string of the job.
             state: New job state.
             error: Optional error message (typically set with ERROR state).
+
         """
         self._conn.execute(
             "UPDATE jobs SET state = ?, error = ? WHERE id = ?",

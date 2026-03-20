@@ -5,7 +5,7 @@ from saneless.config import Settings
 
 def main() -> None:
     """Entry point for the saneless CLI."""
-    from .cli import cli  # noqa: PLC0415
+    from .cli import cli
 
     cli()
 
