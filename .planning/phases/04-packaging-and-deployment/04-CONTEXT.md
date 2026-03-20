@@ -20,7 +20,7 @@ pip-installable Python package published to PyPI, OCI container image published 
 - HEALTHCHECK instruction: `curl`-based, `--interval=30s --timeout=5s --retries=3` pinging `GET /health` (per PRD §8)
 - No `--privileged` required — USB device access handled by external `saned` server (PRD §8, PKG-03)
 - No hardcoded credentials — API token via config file or environment variable
-- Expose port 8000 (uvicorn default)
+- Expose port 8080 (matches `OutputConfig.web_port` default of 8080)
 - Config injected via volume mount (`/etc/saneless/config.toml`) or environment variables (SANELESS_ prefix)
 - Consume directory as optional volume mount
 
@@ -29,7 +29,7 @@ pip-installable Python package published to PyPI, OCI container image published 
 - PyPI publishing via trusted publisher (GitHub Actions OIDC) — no API tokens needed
 - GHCR image tagged with version + `latest`
 - Docker Compose example included in repo for quick deployment reference
-- CI runs linting, type checking, and tests before publishing
+- CI runs linting (ruff) and tests (pytest) before publishing; type checking (ty, pyrefly) omitted from CI because Python 3.14 may not be available on ubuntu-latest — pre-commit hooks enforce type checking locally before tagging
 
 ### CLI `jobs` command
 - Human-readable table by default: timestamp, profile, title, status columns — matches `devices` command pattern
