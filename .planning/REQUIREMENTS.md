@@ -7,9 +7,9 @@
 
 ### Scanner
 
-- [ ] **SCAN-01**: User can discover available SANE devices at startup and on demand
-- [ ] **SCAN-02**: User can pin a target device by name in config or select interactively in the web UI
-- [ ] **SCAN-03**: User can perform a flatbed single-page scan
+- [x] **SCAN-01**: User can discover available SANE devices at startup and on demand
+- [x] **SCAN-02**: User can pin a target device by name in config or select interactively in the web UI
+- [x] **SCAN-03**: User can perform a flatbed single-page scan
 - [ ] **SCAN-04**: User can perform an ADF multi-page scan that collects all pages from the feeder
 - [ ] **SCAN-05**: User can perform an ADF duplex scan using native hardware duplex
 - [ ] **SCAN-06**: User can perform an ADF manual duplex scan (two-pass with flip prompt) that produces correctly interleaved pages
@@ -28,14 +28,14 @@
 
 ### PDF Assembly
 
-- [ ] **PDF-01**: Scanned pages are assembled into a single PDF using img2pdf (lossless encoding)
-- [ ] **PDF-02**: Temporary files are written to a configurable tmp_dir and cleaned up after success or on error
+- [x] **PDF-01**: Scanned pages are assembled into a single PDF using img2pdf (lossless encoding)
+- [x] **PDF-02**: Temporary files are written to a configurable tmp_dir and cleaned up after success or on error
 
 ### Paperless Integration
 
-- [ ] **PLSS-01**: System uploads PDF to paperless-ngx via REST API with metadata (title, created, correspondent ID, tag IDs)
-- [ ] **PLSS-02**: System polls paperless-ngx task endpoint until terminal state and surfaces outcome in UI and log
-- [ ] **PLSS-03**: System provides `GET /api/paperless/test` endpoint distinguishing three failure modes: server unreachable, token rejected, connection successful
+- [x] **PLSS-01**: System uploads PDF to paperless-ngx via REST API with metadata (title, created, correspondent ID, tag IDs)
+- [x] **PLSS-02**: System polls paperless-ngx task endpoint until terminal state and surfaces outcome in UI and log
+- [x] **PLSS-03**: System provides `GET /api/paperless/test` endpoint distinguishing three failure modes: server unreachable, token rejected, connection successful
 - [ ] **PLSS-04**: User can set title, tags (multi-select from fetched list), and correspondent (select from fetched list) before scanning
 - [ ] **PLSS-05**: Tag and correspondent lists are cached with TTL (default 60s) and per-resource manual refresh
 - [ ] **PLSS-06**: System supports a consume directory fallback as a config option
@@ -70,16 +70,16 @@
 
 ### Architecture
 
-- [ ] **ARCH-01**: Scanner access isolated behind an abstraction layer (interface methods for device enumeration, capability queries, page acquisition)
+- [x] **ARCH-01**: Scanner access isolated behind an abstraction layer (interface methods for device enumeration, capability queries, page acquisition)
 - [ ] **ARCH-02**: Background worker thread with queue.Queue for job coordination
-- [ ] **ARCH-03**: SANE initialized once at startup (never re-init per scan to avoid fd leaks)
+- [x] **ARCH-03**: SANE initialized once at startup (never re-init per scan to avoid fd leaks)
 
 ### Error Handling & Logging
 
 - [x] **LOG-01**: All errors and significant events written to a rotating log file at configurable path
 - [x] **LOG-02**: Log level configurable (DEBUG, INFO, WARNING, ERROR)
 - [ ] **LOG-03**: All scan/API/assembly errors displayed in web UI for current or most recent job
-- [ ] **LOG-04**: Temporary files cleaned up on error -- no orphaned scan data
+- [x] **LOG-04**: Temporary files cleaned up on error -- no orphaned scan data
 
 ### Packaging
 
@@ -126,25 +126,25 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SCAN-01 | Phase 1 | Pending |
-| SCAN-02 | Phase 1 | Pending |
-| SCAN-03 | Phase 1 | Pending |
+| SCAN-01 | Phase 1 | Complete |
+| SCAN-02 | Phase 1 | Complete |
+| SCAN-03 | Phase 1 | Complete |
 | PROF-01 | Phase 1 | Complete |
 | PROF-02 | Phase 1 | Complete |
-| PDF-01 | Phase 1 | Pending |
-| PDF-02 | Phase 1 | Pending |
-| PLSS-01 | Phase 1 | Pending |
-| PLSS-02 | Phase 1 | Pending |
-| PLSS-03 | Phase 1 | Pending |
+| PDF-01 | Phase 1 | Complete |
+| PDF-02 | Phase 1 | Complete |
+| PLSS-01 | Phase 1 | Complete |
+| PLSS-02 | Phase 1 | Complete |
+| PLSS-03 | Phase 1 | Complete |
 | CONF-01 | Phase 1 | Complete |
 | CONF-02 | Phase 1 | Complete |
 | CONF-03 | Phase 1 | Complete |
-| ARCH-01 | Phase 1 | Pending |
+| ARCH-01 | Phase 1 | Complete |
 | ARCH-02 | Phase 1 | Pending |
-| ARCH-03 | Phase 1 | Pending |
+| ARCH-03 | Phase 1 | Complete |
 | LOG-01 | Phase 1 | Complete |
 | LOG-02 | Phase 1 | Complete |
-| LOG-04 | Phase 1 | Pending |
+| LOG-04 | Phase 1 | Complete |
 | CLI-01 | Phase 1 | Pending |
 | CLI-02 | Phase 1 | Pending |
 | SCAN-04 | Phase 2 | Pending |
