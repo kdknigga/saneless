@@ -105,6 +105,30 @@ def mock_scanner():
 
 
 @pytest.fixture
+def multi_page_images():
+    """Return 5 distinct page images simulating an ADF scan."""
+    colors = ["white", "red", "blue", "green", "yellow"]
+    return [Image.new("RGB", (200, 300), c) for c in colors]
+
+
+@pytest.fixture
+def empty_page_image():
+    """Return a nearly-white image that should be detected as empty."""
+    return Image.new("RGB", (200, 300), (253, 253, 253))
+
+
+@pytest.fixture
+def content_page_image():
+    """Return an image with content (not empty)."""
+    from PIL import ImageDraw
+
+    img = Image.new("RGB", (200, 300), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([20, 20, 180, 280], fill="black")
+    return img
+
+
+@pytest.fixture
 def mock_paperless():
     """Return a mock PaperlessClient that succeeds."""
     paperless = MagicMock()
