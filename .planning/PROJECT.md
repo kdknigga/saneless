@@ -1,0 +1,90 @@
+# saneless
+
+## What This Is
+
+saneless is an open-source tool that bridges SANE-compatible network scanners (exposed via `saned`) and paperless-ngx. It provides a web UI and CLI for triggering scans, assembling multi-page PDFs, and ingesting documents into paperless-ngx with rich metadata — all from any device on the local network.
+
+## Core Value
+
+A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata — without touching any other tool.
+
+## Requirements
+
+### Validated
+
+- ✓ Python 3.14 project scaffolding with UV, ruff, pytest, pre-commit — existing
+- ✓ pyproject.toml with entry point `saneless = "saneless:main"` — existing
+
+### Active
+
+- [ ] Scanner discovery and device selection via SANE
+- [ ] Scan profiles (source, resolution, color mode, default metadata) defined in TOML config
+- [ ] Flatbed single-page scanning
+- [ ] ADF multi-page scanning with `multi_scan()`
+- [ ] ADF duplex scanning (native hardware duplex)
+- [ ] ADF manual duplex (two-pass with flip prompt, reverse-and-interleave)
+- [ ] Empty page detection (mean luminance + stddev dual threshold)
+- [ ] First-page thumbnail generation (base64 JPEG, long edge ≤ 300px)
+- [ ] PDF assembly via `img2pdf` (lossless)
+- [ ] Paperless-ngx REST API ingestion with metadata (title, tags, correspondent, created)
+- [ ] Paperless-ngx task polling until terminal state
+- [ ] Consume directory fallback
+- [ ] Paperless-ngx connection test endpoint (3 distinct failure modes)
+- [ ] Web UI: profile selector, metadata fields, scan button, live status indicator
+- [ ] Web UI: ADF manual duplex flip prompt with Continue/Cancel and flip illustration
+- [ ] Web UI: first-page thumbnail preview
+- [ ] Web UI: job history table (SQLite, pruned by age + count)
+- [ ] Web UI: tag/correspondent dropdowns with TTL cache and per-resource refresh
+- [ ] Health endpoint (`GET /health`, 200/503 based on worker thread state)
+- [ ] CLI: `saneless scan`, `saneless devices`, `saneless jobs`
+- [ ] pydantic-settings configuration (TOML + env var override)
+- [ ] Scanner abstraction layer (interface for pluggable backends)
+- [ ] Background worker thread with `queue.Queue` (single concurrent scan)
+- [ ] Rotating log file with configurable level and path
+- [ ] Temporary file cleanup on success and error
+- [ ] pip-installable package (pyproject.toml, PyPI)
+- [ ] OCI container image (GHCR, HEALTHCHECK instruction)
+
+### Out of Scope
+
+- Driverless scanning (eSCL, WSD, sane-airscan) — architecture supports future addition but not v1
+- OCR — delegated to paperless-ngx
+- Cloud storage / email / non-paperless-ngx destinations — v1 is paperless-ngx only
+- Multi-user auth on web UI — assumes trusted LAN, auth deferred to reverse proxy
+- `saned` management — external dependency, user configures separately
+- `scanbd` hardware button integration — future work
+- Heavier task queue (rq + Redis) — `queue.Queue` sufficient for v1
+
+## Context
+
+- Target audience: self-hosters running paperless-ngx on home/small-office LAN
+- Users range from technical homelab operators to non-technical household members (web UI only)
+- Deployment: saneless may run on same machine as `saned` or a separate host
+- `saned` is always external; saneless never bundles or manages it
+- Scanner is shared hardware — only one scan job at a time
+- USB device access handled by `saned` server, not by saneless container
+- Project scaffolding already exists: pyproject.toml, pre-commit hooks, ruff, pytest, playwright
+
+## Constraints
+
+- **Runtime**: Python 3.14+, `libsane` only required system package
+- **Scanner protocol**: `python-sane` via `saned` network backend only in v1
+- **Container**: No `--privileged` required; USB passthrough handled by `saned`
+- **Credentials**: API token via config file or env var, never baked into image
+- **Response time**: Scan button must return job ID within 500ms
+- **Concurrency**: Single active scan job; additional requests queued
+
+## Key Decisions
+
+| Decision | Rationale | Outcome |
+|----------|-----------|---------|
+| FastAPI + uvicorn for web layer | Async-capable, modern Python web framework, good for API-first design | — Pending |
+| `queue.Queue` + worker thread (not rq/Redis) | Sufficient for single-scanner v1; avoids infrastructure dependency | — Pending |
+| `img2pdf` for PDF assembly | Lossless encoding, no re-compression of scanned images | — Pending |
+| `pydantic-settings` for config | TOML + env var support, validation at startup, type safety | — Pending |
+| Scanner abstraction layer from day one | Enables future driverless backend without pipeline changes | — Pending |
+| SQLite for job persistence | Stdlib, no external database, sufficient for single-process model | — Pending |
+| No web UI auth in v1 | Trusted LAN assumption; reverse proxy handles auth if needed | — Pending |
+
+---
+*Last updated: 2026-03-20 after initialization*
