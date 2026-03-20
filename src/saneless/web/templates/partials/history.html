@@ -1,0 +1,1 @@
+<tbody id="history-body">{% for job in jobs %}<tr><td>{{ job.created_at }}</td><td>{{ job.profile }}</td><td>{{ job.title }}</td><td>{{ job.state.value }}</td></tr>{% endfor %}</tbody>
