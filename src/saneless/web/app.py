@@ -19,7 +19,7 @@ from .cache import MetadataCache
 from .routes import router
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from saneless.config import Settings
     from saneless.scanner.base import ScannerBackend
@@ -59,7 +59,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     worker = ScanWorker(scanner, paperless, settings, job_store)
 
     @contextlib.asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         """Manage worker lifecycle and job pruning on startup/shutdown."""
         worker.start()
         job_store.prune(
