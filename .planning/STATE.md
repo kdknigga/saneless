@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 04-02-PLAN.md
-last_updated: "2026-03-20T21:49:11.575Z"
+stopped_at: Completed 04-01-PLAN.md
+last_updated: "2026-03-20T21:50:37.789Z"
 last_activity: 2026-03-20
 progress:
   total_phases: 4
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 12
-  completed_plans: 11
+  completed_plans: 12
 ---
 
 # Project State
@@ -57,6 +57,7 @@ Plan: 2 of 2 (COMPLETE)
 | Phase 03-web-ui P02 | 2min | 2 tasks | 8 files |
 | Phase 03-web-ui P03 | 5min | 2 tasks | 3 files |
 | Phase 04 P02 | 2min | 2 tasks | 4 files |
+| Phase 04-packaging-and-deployment P01 | 3min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -89,6 +90,7 @@ Recent decisions affecting current work:
 - [Phase 03-03]: Direct job_store manipulation for state-dependent tests instead of form submission
 - [Phase 04]: Port 8080 in Dockerfile matches OutputConfig.web_port default
 - [Phase 04]: PyPI trusted publishing via OIDC -- no API tokens needed
+- [Phase 04-01]: DB path for jobs command matches web layer: tmp_dir/saneless.db
 
 ### Pending Todos
 
@@ -108,6 +110,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-20
-Last session: 2026-03-20T21:49:11.573Z
-Stopped at: Completed 04-02-PLAN.md
+Last session: 2026-03-20T21:50:37.788Z
+Stopped at: Completed 04-01-PLAN.md
 Resume file: None

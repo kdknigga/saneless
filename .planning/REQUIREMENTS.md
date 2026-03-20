@@ -38,7 +38,7 @@
 - [x] **PLSS-03**: System provides `GET /api/paperless/test` endpoint distinguishing three failure modes: server unreachable, token rejected, connection successful
 - [x] **PLSS-04**: User can set title, tags (multi-select from fetched list), and correspondent (select from fetched list) before scanning
 - [x] **PLSS-05**: Tag and correspondent lists are cached with TTL (default 60s) and per-resource manual refresh
-- [ ] **PLSS-06**: System supports a consume directory fallback as a config option
+- [x] **PLSS-06**: System supports a consume directory fallback as a config option
 
 ### Web UI
 
@@ -60,7 +60,7 @@
 
 - [x] **CLI-01**: `saneless scan [--profile PROFILE] [--title TITLE]` triggers a scan job
 - [x] **CLI-02**: `saneless devices` lists available SANE devices
-- [ ] **CLI-03**: `saneless jobs` lists recent job history
+- [x] **CLI-03**: `saneless jobs` lists recent job history
 
 ### Configuration
 
@@ -173,8 +173,8 @@
 | PKG-01 | Phase 4 | Complete |
 | PKG-02 | Phase 4 | Complete |
 | PKG-03 | Phase 4 | Complete |
-| PLSS-06 | Phase 4 | Pending |
-| CLI-03 | Phase 4 | Pending |
+| PLSS-06 | Phase 4 | Complete |
+| CLI-03 | Phase 4 | Complete |
 
 **Coverage:**
 - v1 requirements: 49 total
