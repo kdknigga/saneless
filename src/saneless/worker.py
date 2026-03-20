@@ -50,7 +50,7 @@ class ScanWorker:
         self._scanner = scanner
         self._paperless = paperless
         self._settings = settings
-        self._job_store = job_store
+        self._job_store: JobStore = job_store
         self._queue: queue.Queue[Job | None] = queue.Queue(maxsize=10)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._flip_event: threading.Event | None = None
