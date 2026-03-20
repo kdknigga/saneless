@@ -94,6 +94,11 @@ class ScanWorker:
             logger.info("Manual duplex: abort signal sent")
 
     @property
+    def is_alive(self) -> bool:
+        """Whether the worker thread is currently running."""
+        return self._thread.is_alive()
+
+    @property
     def current_job_id(self) -> str | None:
         """ID of the currently processing job, or None."""
         return self._current_job_id
