@@ -58,8 +58,8 @@
 
 ### CLI
 
-- [ ] **CLI-01**: `saneless scan [--profile PROFILE] [--title TITLE]` triggers a scan job
-- [ ] **CLI-02**: `saneless devices` lists available SANE devices
+- [x] **CLI-01**: `saneless scan [--profile PROFILE] [--title TITLE]` triggers a scan job
+- [x] **CLI-02**: `saneless devices` lists available SANE devices
 - [ ] **CLI-03**: `saneless jobs` lists recent job history
 
 ### Configuration
@@ -71,7 +71,7 @@
 ### Architecture
 
 - [x] **ARCH-01**: Scanner access isolated behind an abstraction layer (interface methods for device enumeration, capability queries, page acquisition)
-- [ ] **ARCH-02**: Background worker thread with queue.Queue for job coordination
+- [x] **ARCH-02**: Background worker thread with queue.Queue for job coordination
 - [x] **ARCH-03**: SANE initialized once at startup (never re-init per scan to avoid fd leaks)
 
 ### Error Handling & Logging
@@ -140,13 +140,13 @@
 | CONF-02 | Phase 1 | Complete |
 | CONF-03 | Phase 1 | Complete |
 | ARCH-01 | Phase 1 | Complete |
-| ARCH-02 | Phase 1 | Pending |
+| ARCH-02 | Phase 1 | Complete |
 | ARCH-03 | Phase 1 | Complete |
 | LOG-01 | Phase 1 | Complete |
 | LOG-02 | Phase 1 | Complete |
 | LOG-04 | Phase 1 | Complete |
-| CLI-01 | Phase 1 | Pending |
-| CLI-02 | Phase 1 | Pending |
+| CLI-01 | Phase 1 | Complete |
+| CLI-02 | Phase 1 | Complete |
 | SCAN-04 | Phase 2 | Pending |
 | SCAN-05 | Phase 2 | Pending |
 | SCAN-06 | Phase 2 | Pending |
