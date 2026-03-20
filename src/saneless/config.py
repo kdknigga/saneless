@@ -72,6 +72,9 @@ class OutputConfig(BaseModel):
     history_retention_days: int = 7
     history_max_rows: int = 500
     paperless_task_timeout: int = 300
+    paperless_cache_ttl_seconds: int = 60
+    web_host: str = "0.0.0.0"
+    web_port: int = 8080
 
 
 class Settings(BaseSettings):

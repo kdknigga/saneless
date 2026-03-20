@@ -218,6 +218,38 @@ class PaperlessClient:
         except httpx.ConnectError:
             return "unreachable"
 
+    def get_tags(self) -> list[dict[str, object]]:
+        """
+        Fetch all tags from paperless-ngx.
+
+        Returns:
+            List of tag dicts with at least 'id' and 'name' keys.
+
+        """
+        response = self._client.get(
+            "/api/tags/",
+            params={"page_size": 1000},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("results", []) if isinstance(data, dict) else data
+
+    def get_correspondents(self) -> list[dict[str, object]]:
+        """
+        Fetch all correspondents from paperless-ngx.
+
+        Returns:
+            List of correspondent dicts with at least 'id' and 'name' keys.
+
+        """
+        response = self._client.get(
+            "/api/correspondents/",
+            params={"page_size": 1000},
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("results", []) if isinstance(data, dict) else data
+
     def close(self) -> None:
         """Close the underlying HTTP client."""
         self._client.close()

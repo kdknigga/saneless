@@ -13,7 +13,7 @@ import logging
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 __all__ = ["Job", "JobState", "JobStore"]
@@ -206,6 +206,74 @@ class JobStore:
             (thumbnail, job_id),
         )
         self._conn.commit()
+
+    def list_recent(self, limit: int = 50) -> list[Job]:
+        """
+        Fetch the most recent jobs ordered newest-first.
+
+        Args:
+            limit: Maximum number of jobs to return.
+
+        Returns:
+            List of Job instances ordered by creation time descending.
+
+        """
+        rows = self._conn.execute(
+            "SELECT id, profile, title, state, error, tags, correspondent, "
+            "thumbnail, created_at FROM jobs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            Job(
+                id=row[0],
+                profile=row[1],
+                title=row[2],
+                state=JobState(row[3]),
+                error=row[4],
+                tags=json.loads(row[5]),
+                correspondent=row[6],
+                thumbnail=row[7],
+                created_at=datetime.fromisoformat(row[8]),
+            )
+            for row in rows
+        ]
+
+    def prune(self, max_age_days: int = 7, max_rows: int = 500) -> int:
+        """
+        Remove old jobs by age and count limits.
+
+        First deletes jobs older than max_age_days, then trims to
+        max_rows keeping the most recent entries.
+
+        Args:
+            max_age_days: Maximum age in days before a job is pruned.
+            max_rows: Maximum number of jobs to retain.
+
+        Returns:
+            Total number of jobs deleted.
+
+        """
+        before_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+        cutoff = (datetime.now(tz=UTC) - timedelta(days=max_age_days)).isoformat()
+        self._conn.execute(
+            "DELETE FROM jobs WHERE created_at < ?",
+            (cutoff,),
+        )
+
+        self._conn.execute(
+            "DELETE FROM jobs WHERE id NOT IN "
+            "(SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?)",
+            (max_rows,),
+        )
+        self._conn.commit()
+
+        after_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+        deleted = before_count - after_count
+        if deleted > 0:
+            logger.debug("Pruned %d old jobs", deleted)
+        return deleted
 
     def close(self) -> None:
         """Close the database connection."""
