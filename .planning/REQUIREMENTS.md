@@ -83,9 +83,9 @@
 
 ### Packaging
 
-- [ ] **PKG-01**: pip-installable Python package (pyproject.toml, published to PyPI)
-- [ ] **PKG-02**: OCI container image published to GHCR with HEALTHCHECK instruction
-- [ ] **PKG-03**: Container does not require --privileged; USB handled by saned server
+- [x] **PKG-01**: pip-installable Python package (pyproject.toml, published to PyPI)
+- [x] **PKG-02**: OCI container image published to GHCR with HEALTHCHECK instruction
+- [x] **PKG-03**: Container does not require --privileged; USB handled by saned server
 
 ## v2 Requirements
 
@@ -170,9 +170,9 @@
 | HLTH-01 | Phase 3 | Complete |
 | HLTH-02 | Phase 3 | Complete |
 | LOG-03 | Phase 3 | Complete |
-| PKG-01 | Phase 4 | Pending |
-| PKG-02 | Phase 4 | Pending |
-| PKG-03 | Phase 4 | Pending |
+| PKG-01 | Phase 4 | Complete |
+| PKG-02 | Phase 4 | Complete |
+| PKG-03 | Phase 4 | Complete |
 | PLSS-06 | Phase 4 | Pending |
 | CLI-03 | Phase 4 | Pending |
 

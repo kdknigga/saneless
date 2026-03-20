@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Phase 4 context gathered
-last_updated: "2026-03-20T21:30:15.132Z"
+stopped_at: Completed 04-02-PLAN.md
+last_updated: "2026-03-20T21:49:11.575Z"
 last_activity: 2026-03-20
 progress:
   total_phases: 4
   completed_phases: 3
-  total_plans: 10
-  completed_plans: 10
+  total_plans: 12
+  completed_plans: 11
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 03 — web-ui
+**Current focus:** Phase 04 — packaging-and-deployment
 
 ## Current Position
 
-Phase: 03 (web-ui) — EXECUTING
-Plan: 3 of 4
+Phase: 04 (packaging-and-deployment) — EXECUTING
+Plan: 2 of 2 (COMPLETE)
 
 ## Performance Metrics
 
@@ -56,6 +56,7 @@ Plan: 3 of 4
 | Phase 03-web-ui P01 | 8min | 2 tasks | 17 files |
 | Phase 03-web-ui P02 | 2min | 2 tasks | 8 files |
 | Phase 03-web-ui P03 | 5min | 2 tasks | 3 files |
+| Phase 04 P02 | 2min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -86,6 +87,8 @@ Recent decisions affecting current work:
 - [Phase 03-web-ui]: SVG currentColor for dark/light PicoCSS theme compatibility
 - [Phase 03-03]: StubScanner concrete class instead of MagicMock to avoid ABC issues with lifespan
 - [Phase 03-03]: Direct job_store manipulation for state-dependent tests instead of form submission
+- [Phase 04]: Port 8080 in Dockerfile matches OutputConfig.web_port default
+- [Phase 04]: PyPI trusted publishing via OIDC -- no API tokens needed
 
 ### Pending Todos
 
@@ -105,6 +108,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-20
-Last session: 2026-03-20T21:30:15.131Z
-Stopped at: Phase 4 context gathered
-Resume file: .planning/phases/04-packaging-and-deployment/04-CONTEXT.md
+Last session: 2026-03-20T21:49:11.573Z
+Stopped at: Completed 04-02-PLAN.md
+Resume file: None
