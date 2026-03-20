@@ -80,10 +80,11 @@ Plans:
   2. OCI container image runs without `--privileged`, includes a working HEALTHCHECK, and is published to GHCR
   3. User can configure a consume directory fallback that deposits PDFs to a local path when paperless-ngx API is unavailable
   4. User can run `saneless jobs` to view recent job history from the command line
-**Plans**: TBD
+**Plans**: 2 plans
 
 Plans:
-- [ ] 04-01: TBD
+- [ ] 04-01-PLAN.md -- CLI `jobs` command and consume directory fallback completion
+- [ ] 04-02-PLAN.md -- PyPI metadata, Dockerfile, Docker Compose, and GitHub Actions release workflow
 
 ## Progress
 
@@ -95,4 +96,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 1. Core Pipeline | 0/3 | Planning complete | - |
 | 2. ADF and Multi-Page | 0/3 | Planning complete | - |
 | 3. Web UI | 1/4 | In Progress|  |
-| 4. Packaging and Deployment | 0/1 | Not started | - |
+| 4. Packaging and Deployment | 0/2 | Planning complete | - |
