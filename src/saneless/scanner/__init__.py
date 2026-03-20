@@ -1,4 +1,5 @@
-"""Scanner abstraction layer for saneless.
+"""
+Scanner abstraction layer for saneless.
 
 Provides the ScannerBackend ABC and the SaneBackend implementation
 wrapping python-sane, along with data types for device information,

@@ -1,4 +1,5 @@
-"""Click CLI group with scan and devices commands.
+"""
+Click CLI group with scan and devices commands.
 
 Provides the main command-line interface for saneless, including
 scanner discovery and the full scan-to-upload pipeline.
@@ -16,7 +17,7 @@ from .config import load_settings
 from .exceptions import PaperlessError, ScanError
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
-from .pipeline import run_pipeline
+from .pipeline import PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
 
 __all__ = ["cli"]
@@ -38,13 +39,13 @@ logger = logging.getLogger(__name__)
     help="Enable debug output.",
 )
 @click.pass_context
-def cli(ctx: click.Context, config_path: str | None, verbose: bool) -> None:
+def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
     """Saneless -- SANE scanner to paperless-ngx bridge."""
     ctx.ensure_object(dict)
 
     try:
         settings = load_settings(config_path)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         click.echo(f"Configuration error: {exc}", err=True)
         sys.exit(2)
 
@@ -91,15 +92,18 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         click.echo(msg)
 
     try:
+        request = PipelineRequest(
+            profile_name=profile,
+            title=title,
+            tags=settings.profiles[profile].default_tags or None,
+            correspondent=settings.profiles[profile].default_correspondent,
+            status_callback=status_callback,
+        )
         run_pipeline(
             scanner,
             paperless,
             settings,
-            profile,
-            title,
-            settings.profiles[profile].default_tags or None,
-            settings.profiles[profile].default_correspondent,
-            status_callback=status_callback,
+            request,
         )
     except ScanError as exc:
         click.echo(f"Scan error: {exc}", err=True)
@@ -124,7 +128,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     help="Show raw SANE options.",
 )
 @click.pass_context
-def devices(ctx: click.Context, as_json: bool, capabilities: bool) -> None:
+def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     """List available scanning devices."""
     _settings = ctx.obj["settings"]
 
@@ -167,5 +171,5 @@ def devices(ctx: click.Context, as_json: bool, capabilities: bool) -> None:
             if caps.raw_options:
                 click.echo("  Raw options:")
                 for opt in caps.raw_options:
-                    if len(opt) >= 2:  # noqa: PLR2004
+                    if len(opt) >= 2:
                         click.echo(f"    {opt[1]}")

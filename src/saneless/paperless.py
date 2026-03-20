@@ -1,4 +1,5 @@
-"""Paperless-ngx REST API client with retry, polling, and connection test.
+"""
+Paperless-ngx REST API client with retry, polling, and connection test.
 
 Uploads PDFs with metadata (title, tags, correspondent, created date),
 polls the task endpoint with exponential backoff until terminal state,
@@ -12,14 +13,10 @@ import logging
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import httpx
 
 from .exceptions import PaperlessError
-
-if TYPE_CHECKING:
-    pass
 
 __all__ = ["PaperlessClient"]
 
@@ -27,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 
 class PaperlessClient:
-    """Client for the paperless-ngx REST API.
+    """
+    Client for the paperless-ngx REST API.
 
     Handles document uploads with metadata, task polling with
     exponential backoff, and connection testing. Supports retry
@@ -39,6 +37,7 @@ class PaperlessClient:
         consume_dir: Optional fallback directory for PDF upload failures.
         max_retries: Maximum number of upload retry attempts.
         _transport: Optional httpx transport for testing.
+
     """
 
     def __init__(
@@ -49,6 +48,7 @@ class PaperlessClient:
         max_retries: int = 3,
         _transport: httpx.BaseTransport | None = None,
     ) -> None:
+        """Initialize the paperless-ngx API client."""
         client_kwargs: dict = {
             "base_url": url.rstrip("/"),
             "headers": {"Authorization": f"Token {token}"},
@@ -68,7 +68,8 @@ class PaperlessClient:
         correspondent: int | None = None,
         created: str | None = None,
     ) -> str:
-        """Upload a PDF document to paperless-ngx.
+        """
+        Upload a PDF document to paperless-ngx.
 
         Builds multipart form data with title and optional metadata.
         Tags are submitted as repeated form fields. Retries on network
@@ -89,14 +90,14 @@ class PaperlessClient:
         Raises:
             PaperlessError: If upload fails and no fallback is available,
                 or if the server returns a 4xx error.
+
         """
         fields: list[tuple[str, str]] = [("title", title)]
         if created is not None:
             fields.append(("created", created))
         if correspondent is not None:
             fields.append(("correspondent", str(correspondent)))
-        for tag_id in tags or []:
-            fields.append(("tags", str(tag_id)))
+        fields.extend(("tags", str(tag_id)) for tag_id in tags or [])
 
         last_error: Exception | None = None
 
@@ -131,7 +132,7 @@ class PaperlessClient:
                     time.sleep(2**attempt)
 
             except httpx.HTTPStatusError as exc:
-                if 400 <= exc.response.status_code < 500:  # noqa: PLR2004
+                if 400 <= exc.response.status_code < 500:
                     msg = (
                         f"Paperless rejected upload: "
                         f"{exc.response.status_code} {exc.response.text}"
@@ -158,7 +159,8 @@ class PaperlessClient:
         raise PaperlessError(msg) from last_error
 
     def poll_task(self, task_id: str, timeout: int | float = 300) -> dict[str, object]:
-        """Poll task endpoint until terminal state with exponential backoff.
+        """
+        Poll task endpoint until terminal state with exponential backoff.
 
         Handles the race condition where a task may not appear
         immediately after upload (Pitfall #8).
@@ -170,6 +172,7 @@ class PaperlessClient:
         Returns:
             Task dict with status field. Status is one of
             SUCCESS, FAILURE, or TIMEOUT.
+
         """
         delay = 0.5
         elapsed = 0.0
@@ -179,7 +182,7 @@ class PaperlessClient:
                 "/api/tasks/",
                 params={"task_id": task_id},
             )
-            if response.status_code == 200:  # noqa: PLR2004
+            if response.status_code == 200:
                 tasks = response.json()
                 if isinstance(tasks, list) and tasks:
                     task = tasks[0]
@@ -196,7 +199,8 @@ class PaperlessClient:
         return {"status": "TIMEOUT", "task_id": task_id}
 
     def test_connection(self) -> str:
-        """Test paperless-ngx connection.
+        """
+        Test paperless-ngx connection.
 
         Distinguishes three states: connected (API reachable and
         authenticated), token_rejected (API reachable but auth
@@ -204,6 +208,7 @@ class PaperlessClient:
 
         Returns:
             One of "connected", "token_rejected", or "unreachable".
+
         """
         try:
             response = self._client.get("/api/")

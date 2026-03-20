@@ -8,7 +8,9 @@ always be present in the configuration.
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from pydantic import BaseModel, field_validator
 from pydantic_settings import (
@@ -17,6 +19,9 @@ from pydantic_settings import (
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+
+if TYPE_CHECKING:
+    from pydantic_settings.main import InitSettingsSource
 
 __all__ = [
     "OutputConfig",
@@ -57,7 +62,7 @@ class ProfileConfig(BaseModel):
 class OutputConfig(BaseModel):
     """Output and logging configuration."""
 
-    tmp_dir: str = "/tmp/saneless"  # noqa: S108
+    tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
     log_file: str = "/var/log/saneless/saneless.log"
     log_level: str = "INFO"
     log_max_bytes: int = 10_485_760
@@ -101,7 +106,9 @@ class Settings(BaseSettings):
         The _toml_file init kwarg is extracted and used to create a
         TomlConfigSettingsSource if the file exists.
         """
-        toml_file = init_settings.init_kwargs.pop("_toml_file", None)
+        # init_settings is always an InitSettingsSource at runtime
+        init_src = cast("InitSettingsSource", init_settings)
+        toml_file = init_src.init_kwargs.pop("_toml_file", None)
 
         if toml_file is not None:
             toml_source = TomlConfigSettingsSource(

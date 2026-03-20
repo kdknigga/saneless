@@ -1,4 +1,5 @@
-"""PDF assembly via img2pdf with temporary file handling.
+"""
+PDF assembly via img2pdf with temporary file handling.
 
 Scanned PIL Images are saved to temporary files on disk (seekable,
 required by img2pdf) and assembled into a single PDF. Temporary
@@ -26,7 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 def assemble_pdf(images: list[Image.Image], output_dir: Path) -> Path:
-    """Assemble PIL Images into a single PDF using img2pdf.
+    """
+    Assemble PIL Images into a single PDF using img2pdf.
 
     Images are first saved as PNG files in a temporary directory
     within output_dir, then passed to img2pdf for lossless PDF
@@ -38,6 +40,7 @@ def assemble_pdf(images: list[Image.Image], output_dir: Path) -> Path:
 
     Returns:
         Path to the generated PDF file.
+
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -51,6 +54,9 @@ def assemble_pdf(images: list[Image.Image], output_dir: Path) -> Path:
 
         pdf_path = output_dir / "output.pdf"
         pdf_bytes = img2pdf.convert(image_paths)
+        if pdf_bytes is None:
+            msg = "img2pdf.convert returned None"
+            raise RuntimeError(msg)
         pdf_path.write_bytes(pdf_bytes)
         logger.info("Assembled %d page(s) into %s", len(images), pdf_path)
 

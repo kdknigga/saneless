@@ -1,4 +1,5 @@
-"""Background worker thread consuming scan jobs from a queue.
+"""
+Background worker thread consuming scan jobs from a queue.
 
 The ScanWorker runs a daemon thread that processes Job objects
 submitted via a queue.Queue, updating job state through the
@@ -13,7 +14,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from .job import JobState
-from .pipeline import run_pipeline
+from .pipeline import PipelineRequest, run_pipeline
 
 if TYPE_CHECKING:
     from .config import Settings
@@ -27,13 +28,15 @@ logger = logging.getLogger(__name__)
 
 
 class ScanWorker:
-    """Background worker that processes scan jobs from a queue.
+    """
+    Background worker that processes scan jobs from a queue.
 
     Args:
         scanner: Scanner backend instance.
         paperless: Paperless-ngx API client.
         settings: Application settings.
         job_store: Job persistence store.
+
     """
 
     def __init__(
@@ -43,6 +46,7 @@ class ScanWorker:
         settings: Settings,
         job_store: JobStore,
     ) -> None:
+        """Initialize the worker with its dependencies and start queue."""
         self._scanner = scanner
         self._paperless = paperless
         self._settings = settings
@@ -62,10 +66,12 @@ class ScanWorker:
         logger.info("ScanWorker stopped")
 
     def submit(self, job: Job) -> None:
-        """Submit a job for processing.
+        """
+        Submit a job for processing.
 
         Args:
             job: The Job to process.
+
         """
         self._queue.put(job)
         logger.info("Job %s submitted to worker queue", job.id)
@@ -81,19 +87,24 @@ class ScanWorker:
             self._job_store.update_state(job.id, JobState.SCANNING)
 
             try:
+                request = PipelineRequest(
+                    profile_name=job.profile,
+                    title=job.title,
+                    tags=job.tags or None,
+                    correspondent=job.correspondent,
+                    status_callback=logger.info,
+                )
                 run_pipeline(
                     self._scanner,
                     self._paperless,
                     self._settings,
-                    job.profile,
-                    job.title,
-                    job.tags or None,
-                    job.correspondent,
-                    status_callback=lambda msg: logger.info(msg),
+                    request,
                 )
                 self._job_store.update_state(job.id, JobState.DONE)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 self._job_store.update_state(
-                    job.id, JobState.ERROR, error=str(exc),
+                    job.id,
+                    JobState.ERROR,
+                    error=str(exc),
                 )
                 logger.error("Job %s failed: %s", job.id, exc)
