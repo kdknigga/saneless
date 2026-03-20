@@ -32,17 +32,17 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ ADF manual duplex (two-pass with flip prompt, reverse-and-interleave) — Phase 2
 - ✓ Empty page detection (mean luminance + stddev dual threshold) — Phase 2
 - ✓ First-page thumbnail generation (base64 JPEG, long edge ≤ 300px) — Phase 2
+- ✓ Web UI: profile selector, metadata fields, scan button, live status indicator — Phase 3
+- ✓ Web UI: ADF manual duplex flip prompt with Continue/Cancel and flip illustration — Phase 3
+- ✓ Web UI: first-page thumbnail preview — Phase 3
+- ✓ Web UI: job history table (SQLite, pruned by age + count) — Phase 3
+- ✓ Web UI: tag/correspondent dropdowns with TTL cache and per-resource refresh — Phase 3
+- ✓ Health endpoint (`GET /health`, 200/503 based on worker thread state) — Phase 3
+- ✓ FastAPI + Jinja2 + HTMX web layer with PicoCSS — Phase 3
 
 ### Active
 - [ ] Consume directory fallback
-- [ ] Web UI: profile selector, metadata fields, scan button, live status indicator
-- [ ] Web UI: ADF manual duplex flip prompt with Continue/Cancel and flip illustration
-- [ ] Web UI: first-page thumbnail preview
-- [ ] Web UI: job history table (SQLite, pruned by age + count)
-- [ ] Web UI: tag/correspondent dropdowns with TTL cache and per-resource refresh
-- [ ] Health endpoint (`GET /health`, 200/503 based on worker thread state)
 - [ ] CLI: `saneless jobs`
-- [ ] Temporary file cleanup on success and error
 - [ ] pip-installable package (pyproject.toml, PyPI)
 - [ ] OCI container image (GHCR, HEALTHCHECK instruction)
 
@@ -79,13 +79,15 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
-| FastAPI + uvicorn for web layer | Async-capable, modern Python web framework, good for API-first design | — Pending |
+| FastAPI + uvicorn for web layer | Async-capable, modern Python web framework, good for API-first design | ✓ Good |
 | `queue.Queue` + worker thread (not rq/Redis) | Sufficient for single-scanner v1; avoids infrastructure dependency | ✓ Good |
 | `img2pdf` for PDF assembly | Lossless encoding, no re-compression of scanned images | ✓ Good |
 | `pydantic-settings` for config | TOML + env var support, validation at startup, type safety | ✓ Good |
 | Scanner abstraction layer from day one | Enables future driverless backend without pipeline changes | ✓ Good |
 | SQLite for job persistence | Stdlib, no external database, sufficient for single-process model | ✓ Good |
-| No web UI auth in v1 | Trusted LAN assumption; reverse proxy handles auth if needed | — Pending |
+| No web UI auth in v1 | Trusted LAN assumption; reverse proxy handles auth if needed | ✓ Good |
+| Jinja2 + HTMX (no SPA) | No JS build step, server-rendered, declarative interactions | ✓ Good |
+| PicoCSS classless styling | Minimal CSS, semantic HTML, auto dark mode, no build step | ✓ Good |
 
 ---
-*Last updated: 2026-03-20 after Phase 2 completion*
+*Last updated: 2026-03-20 after Phase 3 completion*
