@@ -94,5 +94,5 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 |-------|----------------|--------|-----------|
 | 1. Core Pipeline | 0/3 | Planning complete | - |
 | 2. ADF and Multi-Page | 0/3 | Planning complete | - |
-| 3. Web UI | 0/4 | Planning complete | - |
+| 3. Web UI | 1/4 | In Progress|  |
 | 4. Packaging and Deployment | 0/1 | Not started | - |

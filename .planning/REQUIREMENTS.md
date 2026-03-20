@@ -24,7 +24,7 @@
 
 - [x] **PROF-01**: User can define scan profiles in TOML config specifying source, resolution, color mode, and optional default metadata
 - [x] **PROF-02**: A `default` profile must always be present
-- [ ] **PROF-03**: User can select a profile from a dropdown in the web UI
+- [x] **PROF-03**: User can select a profile from a dropdown in the web UI
 
 ### PDF Assembly
 
@@ -36,25 +36,25 @@
 - [x] **PLSS-01**: System uploads PDF to paperless-ngx via REST API with metadata (title, created, correspondent ID, tag IDs)
 - [x] **PLSS-02**: System polls paperless-ngx task endpoint until terminal state and surfaces outcome in UI and log
 - [x] **PLSS-03**: System provides `GET /api/paperless/test` endpoint distinguishing three failure modes: server unreachable, token rejected, connection successful
-- [ ] **PLSS-04**: User can set title, tags (multi-select from fetched list), and correspondent (select from fetched list) before scanning
-- [ ] **PLSS-05**: Tag and correspondent lists are cached with TTL (default 60s) and per-resource manual refresh
+- [x] **PLSS-04**: User can set title, tags (multi-select from fetched list), and correspondent (select from fetched list) before scanning
+- [x] **PLSS-05**: Tag and correspondent lists are cached with TTL (default 60s) and per-resource manual refresh
 - [ ] **PLSS-06**: System supports a consume directory fallback as a config option
 
 ### Web UI
 
-- [ ] **UI-01**: Web UI accessible from any browser on the LAN with profile selector, metadata fields, and Scan button
-- [ ] **UI-02**: Live status indicator shows job state (idle/scanning/assembling/uploading/done/error) via polling
-- [ ] **UI-03**: For manual duplex, UI shows `awaiting_flip` state with flip prompt, illustration, Continue and Cancel buttons
-- [ ] **UI-04**: First-page thumbnail displayed in status area once first page is scanned
-- [ ] **UI-05**: Job history table showing timestamp, profile, title, and status, persisted to SQLite
-- [ ] **UI-06**: Job history pruned by age (default 7 days) and count (default 500 rows)
-- [ ] **UI-07**: Scan button disabled while a job is in progress
-- [ ] **UI-08**: Refresh icon on tag/correspondent dropdowns for manual cache invalidation
+- [x] **UI-01**: Web UI accessible from any browser on the LAN with profile selector, metadata fields, and Scan button
+- [x] **UI-02**: Live status indicator shows job state (idle/scanning/assembling/uploading/done/error) via polling
+- [x] **UI-03**: For manual duplex, UI shows `awaiting_flip` state with flip prompt, illustration, Continue and Cancel buttons
+- [x] **UI-04**: First-page thumbnail displayed in status area once first page is scanned
+- [x] **UI-05**: Job history table showing timestamp, profile, title, and status, persisted to SQLite
+- [x] **UI-06**: Job history pruned by age (default 7 days) and count (default 500 rows)
+- [x] **UI-07**: Scan button disabled while a job is in progress
+- [x] **UI-08**: Refresh icon on tag/correspondent dropdowns for manual cache invalidation
 
 ### Health & Monitoring
 
-- [ ] **HLTH-01**: `GET /health` returns 200 when web layer and worker thread are running, 503 otherwise
-- [ ] **HLTH-02**: Health endpoint requires no authentication
+- [x] **HLTH-01**: `GET /health` returns 200 when web layer and worker thread are running, 503 otherwise
+- [x] **HLTH-02**: Health endpoint requires no authentication
 
 ### CLI
 
@@ -78,7 +78,7 @@
 
 - [x] **LOG-01**: All errors and significant events written to a rotating log file at configurable path
 - [x] **LOG-02**: Log level configurable (DEBUG, INFO, WARNING, ERROR)
-- [ ] **LOG-03**: All scan/API/assembly errors displayed in web UI for current or most recent job
+- [x] **LOG-03**: All scan/API/assembly errors displayed in web UI for current or most recent job
 - [x] **LOG-04**: Temporary files cleaned up on error -- no orphaned scan data
 
 ### Packaging
@@ -156,20 +156,20 @@
 | SCAN-10 | Phase 2 | Complete |
 | SCAN-11 | Phase 2 | Complete |
 | SCAN-12 | Phase 2 | Complete |
-| UI-01 | Phase 3 | Pending |
-| UI-02 | Phase 3 | Pending |
-| UI-03 | Phase 3 | Pending |
-| UI-04 | Phase 3 | Pending |
-| UI-05 | Phase 3 | Pending |
-| UI-06 | Phase 3 | Pending |
-| UI-07 | Phase 3 | Pending |
-| UI-08 | Phase 3 | Pending |
-| PROF-03 | Phase 3 | Pending |
-| PLSS-04 | Phase 3 | Pending |
-| PLSS-05 | Phase 3 | Pending |
-| HLTH-01 | Phase 3 | Pending |
-| HLTH-02 | Phase 3 | Pending |
-| LOG-03 | Phase 3 | Pending |
+| UI-01 | Phase 3 | Complete |
+| UI-02 | Phase 3 | Complete |
+| UI-03 | Phase 3 | Complete |
+| UI-04 | Phase 3 | Complete |
+| UI-05 | Phase 3 | Complete |
+| UI-06 | Phase 3 | Complete |
+| UI-07 | Phase 3 | Complete |
+| UI-08 | Phase 3 | Complete |
+| PROF-03 | Phase 3 | Complete |
+| PLSS-04 | Phase 3 | Complete |
+| PLSS-05 | Phase 3 | Complete |
+| HLTH-01 | Phase 3 | Complete |
+| HLTH-02 | Phase 3 | Complete |
+| LOG-03 | Phase 3 | Complete |
 | PKG-01 | Phase 4 | Pending |
 | PKG-02 | Phase 4 | Pending |
 | PKG-03 | Phase 4 | Pending |
