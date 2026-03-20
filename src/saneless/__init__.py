@@ -5,7 +5,9 @@ from saneless.config import Settings
 
 def main() -> None:
     """Entry point for the saneless CLI."""
-    print("Hello from saneless!")  # noqa: T201
+    from .cli import cli  # noqa: PLC0415
+
+    cli()
 
 
 __all__ = ["Settings", "main"]
