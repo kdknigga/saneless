@@ -53,6 +53,9 @@ class ScanWorker:
         self._job_store = job_store
         self._queue: queue.Queue[Job | None] = queue.Queue(maxsize=10)
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._flip_event: threading.Event | None = None
+        self._abort_event: threading.Event | None = None
+        self._current_job_id: str | None = None
 
     def start(self) -> None:
         """Start the worker thread."""
@@ -76,6 +79,25 @@ class ScanWorker:
         self._queue.put(job)
         logger.info("Job %s submitted to worker queue", job.id)
 
+    def continue_flip(self) -> None:
+        """Signal the worker to continue with pass B of manual duplex."""
+        if self._flip_event is not None:
+            self._flip_event.set()
+            logger.info("Manual duplex: continue signal sent")
+
+    def abort_flip(self) -> None:
+        """Signal the worker to abort manual duplex scan."""
+        if self._abort_event is not None:
+            self._abort_event.set()
+        if self._flip_event is not None:
+            self._flip_event.set()  # Unblock the wait
+            logger.info("Manual duplex: abort signal sent")
+
+    @property
+    def current_job_id(self) -> str | None:
+        """ID of the currently processing job, or None."""
+        return self._current_job_id
+
     def _run(self) -> None:
         """Worker loop: process jobs until sentinel None received."""
         while True:
@@ -84,7 +106,28 @@ class ScanWorker:
                 break
 
             job = item
+            self._current_job_id = job.id
             self._job_store.update_state(job.id, JobState.SCANNING)
+
+            # Detect manual duplex from profile source
+            profile = self._settings.profiles.get(job.profile)
+            source = profile.source.lower() if profile else ""
+            is_manual_duplex = "manual" in source and "duplex" in source
+
+            if is_manual_duplex:
+                self._flip_event = threading.Event()
+                self._abort_event = threading.Event()
+            else:
+                self._flip_event = None
+                self._abort_event = None
+
+            def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
+                self._job_store.update_thumbnail(_jid, thumb)
+
+            def _status_cb(msg: str, _jid: str = job.id) -> None:
+                logger.info(msg)
+                if msg == "Awaiting flip...":
+                    self._job_store.update_state(_jid, JobState.AWAITING_FLIP)
 
             try:
                 request = PipelineRequest(
@@ -92,7 +135,10 @@ class ScanWorker:
                     title=job.title,
                     tags=job.tags or None,
                     correspondent=job.correspondent,
-                    status_callback=logger.info,
+                    status_callback=_status_cb,
+                    thumbnail_callback=_thumbnail_cb,
+                    flip_event=self._flip_event,
+                    abort_event=self._abort_event,
                 )
                 run_pipeline(
                     self._scanner,
@@ -108,3 +154,7 @@ class ScanWorker:
                     error=str(exc),
                 )
                 logger.error("Job %s failed: %s", job.id, exc)
+            finally:
+                self._flip_event = None
+                self._abort_event = None
+                self._current_job_id = None
