@@ -8,18 +8,21 @@ Key safety measures:
 - Device handles managed via context manager with cancel+close (Pitfall #4)
 - No progress callbacks to snap() (Pitfall #2)
 - Source option validated against device capabilities (Pitfall #5)
+- ADF multi-page scan with per-page timeout and inline validation
 """
 
 from __future__ import annotations
 
 import contextlib
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import TYPE_CHECKING, Any, Protocol
 
 import PIL.Image
-from PIL import Image
+from PIL import Image, ImageStat
 
-from saneless.exceptions import ScanError
+from saneless.exceptions import FeederEmptyError, ScanError
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -51,9 +54,100 @@ def _ensure_sane() -> None:
 # Pillow default limit is 89.5M pixels.
 PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
 
+# Per-page timeout: 2x a generous single-page scan estimate (60s at 600 DPI).
+# At 300 DPI typical scan is ~10-15s, so 120s is very conservative.
+_DEFAULT_PAGE_TIMEOUT_SECONDS: float = 120.0
+
+# Minimum raw image data size in bytes. A valid scanned page at any reasonable
+# resolution will be well above this. Catches corrupt/truncated pages.
+_MIN_PAGE_BYTES: int = 10_000  # 10 KB
+
+# Thresholds for pure white/black detection at the scanner level.
+# These are intentionally extreme (tighter than the configurable empty-page
+# thresholds in pages.py) to only catch obviously invalid images.
+_SCANNER_WHITE_MEAN_THRESHOLD: float = 254.0
+_SCANNER_WHITE_STDDEV_THRESHOLD: float = 1.0
+_SCANNER_BLACK_MEAN_THRESHOLD: float = 1.0
+_SCANNER_BLACK_STDDEV_THRESHOLD: float = 1.0
+
 __all__ = ["SaneBackend"]
 
 logger = logging.getLogger(__name__)
+
+
+def _as_image(obj: object) -> Image.Image:
+    """
+    Cast an object to Image.Image for type checker satisfaction.
+
+    ThreadPoolExecutor.submit(next, iterator) loses generic type info,
+    so ty cannot infer the result is Image.Image. This cast is safe
+    because the iterator is known to yield Image.Image.
+    """
+    if not isinstance(obj, Image.Image):
+        msg = f"Expected Image, got {type(obj)}"
+        raise TypeError(msg)
+    return obj
+
+
+def _is_adf_source(source: str) -> bool:
+    """Check if the source string indicates an ADF source."""
+    return "adf" in source.lower()
+
+
+def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
+    """
+    Validate a scanned page image inline at the scanner level.
+
+    Checks nonzero dimensions, minimum file size, and not pure white/black.
+    Returns True if the page is valid, False if it should be skipped.
+
+    Per user decision: "Validate each scanned image inline before yielding:
+    check nonzero dimensions, minimum file size, not pure white/black."
+    """
+    # Check 1: Nonzero dimensions
+    if page_image.size[0] == 0 or page_image.size[1] == 0:
+        logger.warning(
+            "Page %d: zero dimensions (%s), skipping", page_num, page_image.size
+        )
+        return False
+
+    # Check 2: Minimum file size (raw pixel data)
+    raw_size = len(page_image.tobytes())
+    if raw_size < _MIN_PAGE_BYTES:
+        logger.warning("Page %d: too small (%d bytes), skipping", page_num, raw_size)
+        return False
+
+    # Check 3: Not pure white or pure black (scanner-level, very strict thresholds)
+    gray = page_image.convert("L")
+    stats = ImageStat.Stat(gray)
+    mean_val = stats.mean[0]
+    stddev_val = stats.stddev[0]
+
+    if (
+        mean_val > _SCANNER_WHITE_MEAN_THRESHOLD
+        and stddev_val < _SCANNER_WHITE_STDDEV_THRESHOLD
+    ):
+        logger.warning(
+            "Page %d: pure white (mean=%.1f, stddev=%.1f), skipping",
+            page_num,
+            mean_val,
+            stddev_val,
+        )
+        return False
+
+    if (
+        mean_val < _SCANNER_BLACK_MEAN_THRESHOLD
+        and stddev_val < _SCANNER_BLACK_STDDEV_THRESHOLD
+    ):
+        logger.warning(
+            "Page %d: pure black (mean=%.1f, stddev=%.1f), skipping",
+            page_num,
+            mean_val,
+            stddev_val,
+        )
+        return False
+
+    return True
 
 
 class SaneDevice(Protocol):
@@ -168,6 +262,92 @@ class SaneBackend(ScannerBackend):
                 raw_options=raw_options,
             )
 
+    def _scan_adf_pages(
+        self,
+        dev: SaneDevice,
+        timeout_per_page: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
+    ) -> Iterator[Image.Image]:
+        """
+        Yield validated pages from ADF via multi_scan() with per-page timeout.
+
+        Per user decision: "Wrap ADF iteration with per-page timeout (not per-job)
+        -- cancel if single page takes longer than 2-3x expected duration."
+
+        Uses concurrent.futures.ThreadPoolExecutor to wrap each next(iterator)
+        call with a timeout, since signal.alarm is not safe in non-main threads
+        (per RESEARCH.md Open Question 1).
+
+        Args:
+            dev: Open SANE device handle.
+            timeout_per_page: Maximum seconds to wait for each page.
+
+        Yields:
+            Validated PIL Image for each scanned page.
+
+        Raises:
+            FeederEmptyError: If the ADF feeder is empty.
+            ScanError: If a page times out.
+
+        """
+        feeder_empty_msg = "No paper detected in feeder"
+        try:
+            iterator = dev.multi_scan()
+        except Exception as exc:
+            raise FeederEmptyError(feeder_empty_msg) from exc
+
+        page_num = 0
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            while True:
+                try:
+                    # Per-page timeout: wrap next() in a future
+                    future = executor.submit(next, iterator)
+                    try:
+                        page_image = _as_image(future.result(timeout=timeout_per_page))
+                    except FuturesTimeoutError as timeout_exc:
+                        logger.error(
+                            "Page %d timed out after %.0fs",
+                            page_num + 1,
+                            timeout_per_page,
+                        )
+                        timeout_msg = (
+                            f"Page {page_num + 1} timed out after "
+                            f"{timeout_per_page:.0f}s"
+                        )
+                        raise ScanError(timeout_msg) from timeout_exc
+                except StopIteration:
+                    break
+                except ScanError:
+                    raise
+                except FeederEmptyError:
+                    raise
+                except Exception as exc:
+                    error_str = str(exc).lower()
+                    if page_num == 0:
+                        raise FeederEmptyError(feeder_empty_msg) from exc
+                    # After first page, end-of-feed signals
+                    if "out of documents" in error_str or "no docs" in error_str:
+                        break
+                    raise
+
+                page_num += 1
+
+                # Validate: nonzero dimensions, min file size, not pure white/black
+                if not _validate_page_image(page_image, page_num):
+                    continue
+
+                # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf)
+                page_image.info.pop("exif", None)
+                yield page_image
+        finally:
+            # Shut down the timeout executor
+            executor.shutdown(wait=False)
+            # Delete iterator before cancel to avoid __del__ issues (Pitfall #1)
+            del iterator
+
+        if page_num == 0:
+            raise FeederEmptyError(feeder_empty_msg)
+
     def scan_pages(
         self, device_id: str, settings: ScanSettings
     ) -> Iterator[Image.Image]:
@@ -175,9 +355,10 @@ class SaneBackend(ScannerBackend):
         Acquire pages from scanner.
 
         Opens the device, validates the requested source against
-        available options, sets scan parameters, and yields the
-        scanned image. Does NOT pass a progress callback to snap()
-        to prevent segfaults (Pitfall #2).
+        available options, sets scan parameters, and yields scanned
+        images. Uses multi_scan() for ADF sources, snap() for flatbed.
+        Does NOT pass a progress callback to snap() to prevent
+        segfaults (Pitfall #2).
 
         Args:
             device_id: SANE device identifier string.
@@ -188,6 +369,7 @@ class SaneBackend(ScannerBackend):
 
         Raises:
             ScanError: If the device does not support the requested source.
+            FeederEmptyError: If the ADF feeder is empty.
 
         """
         with self._open_device(device_id) as dev:
@@ -217,6 +399,12 @@ class SaneBackend(ScannerBackend):
             if has_source_option:
                 dev.source = settings.source
 
-            # Snap without progress callback (Pitfall #2 prevention)
-            image = dev.snap()
-            yield image
+            if _is_adf_source(settings.source):
+                # ADF/duplex: use multi_scan() for multi-page acquisition
+                yield from self._scan_adf_pages(dev)
+            else:
+                # Flatbed: snap without progress callback (Pitfall #2 prevention)
+                image = dev.snap()
+                # Strip EXIF from flatbed scans too
+                image.info.pop("exif", None)
+                yield image
