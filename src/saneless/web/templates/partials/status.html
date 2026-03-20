@@ -1,1 +1,38 @@
-<div id="status-area">{% if job %}{{ job.state.value }}{% else %}Ready to scan.{% endif %}</div>
+{% set active_states = ["SCANNING", "ASSEMBLING", "UPLOADING", "AWAITING_FLIP"] %}
+<div id="status-area"
+     {% if job and job.state.value in active_states %}
+     hx-get="/api/jobs/current/status"
+     hx-trigger="every 1s"
+     hx-swap="outerHTML"
+     {% endif %}>
+  {% if job %}
+    {% if job.state.value == "SCANNING" %}
+      <p aria-busy="true">Scanning...</p>
+    {% elif job.state.value == "AWAITING_FLIP" %}
+      {% include "partials/flip.html" %}
+    {% elif job.state.value == "ASSEMBLING" %}
+      <p aria-busy="true">Assembling PDF...</p>
+    {% elif job.state.value == "UPLOADING" %}
+      <p aria-busy="true">Uploading to paperless-ngx...</p>
+    {% elif job.state.value == "DONE" %}
+      <p class="status-done">&#10003; Done: {{ job.title }}</p>
+      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" style="display:none"></div>
+      <script>
+        var btn = document.getElementById("scan-btn");
+        if (btn) { btn.disabled = false; btn.ariaBusy = "false"; btn.textContent = "Scan"; }
+      </script>
+    {% elif job.state.value == "ERROR" %}
+      <p role="alert" class="status-error">&#10007; Error: {{ job.error }}</p>
+      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" style="display:none"></div>
+      <script>
+        var btn = document.getElementById("scan-btn");
+        if (btn) { btn.disabled = false; btn.ariaBusy = "false"; btn.textContent = "Scan"; }
+      </script>
+    {% endif %}
+    {% if job.thumbnail %}
+      <img src="data:image/jpeg;base64,{{ job.thumbnail }}" alt="First page preview" class="thumbnail">
+    {% endif %}
+  {% else %}
+    <p>Ready to scan.</p>
+  {% endif %}
+</div>

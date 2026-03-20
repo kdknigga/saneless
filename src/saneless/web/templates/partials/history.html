@@ -1,1 +1,15 @@
-<tbody id="history-body">{% for job in jobs %}<tr><td>{{ job.created_at }}</td><td>{{ job.profile }}</td><td>{{ job.title }}</td><td>{{ job.state.value }}</td></tr>{% endfor %}</tbody>
+<tbody id="history-body">
+{% for job in jobs %}
+<tr>
+  <td>{{ job.created_at.strftime("%Y-%m-%d %H:%M") }}</td>
+  <td>{{ job.profile }}</td>
+  <td>{{ job.title }}</td>
+  <td class="{% if job.state.value == 'DONE' %}status-done{% elif job.state.value == 'ERROR' %}status-error{% endif %}">
+    {{ job.state.value }}
+  </td>
+</tr>
+{% endfor %}
+{% if not jobs %}
+<tr><td colspan="4">No scan history yet.</td></tr>
+{% endif %}
+</tbody>
