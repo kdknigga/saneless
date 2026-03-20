@@ -63,12 +63,12 @@ Plans:
   3. For manual duplex scans, UI shows a flip prompt with Continue and Cancel buttons and the scan button is disabled while a job is in progress
   4. User can browse job history showing timestamp, profile, title, and outcome -- with old entries automatically pruned
   5. `GET /health` returns 200 when the system is healthy and 503 when the worker thread is down, requiring no authentication
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 03-01: TBD
-- [ ] 03-02: TBD
-- [ ] 03-03: TBD
+- [ ] 03-01-PLAN.md -- Backend extensions and FastAPI web application scaffold (app factory, cache, routes, health endpoint)
+- [ ] 03-02-PLAN.md -- Complete Jinja2 templates with HTMX interactions (scan form, status polling, flip prompt, job history)
+- [ ] 03-03-PLAN.md -- Test suite for web endpoints, cache, and JobStore extensions
 
 ### Phase 4: Packaging and Deployment
 **Goal**: Users can install saneless via pip or deploy it as an OCI container with minimal configuration
@@ -93,5 +93,5 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 |-------|----------------|--------|-----------|
 | 1. Core Pipeline | 0/3 | Planning complete | - |
 | 2. ADF and Multi-Page | 0/3 | Planning complete | - |
-| 3. Web UI | 0/3 | Not started | - |
+| 3. Web UI | 0/3 | Planning complete | - |
 | 4. Packaging and Deployment | 0/1 | Not started | - |
