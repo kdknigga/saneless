@@ -2,8 +2,8 @@
 phase: 2
 slug: adf-and-multi-page
 status: draft
-nyquist_compliant: false
-wave_0_complete: false
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-03-20
 ---
 
@@ -38,27 +38,25 @@ created: 2026-03-20
 
 | Task ID | Plan | Wave | Requirement | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|-----------|-------------------|-------------|--------|
-| 02-01-01 | 01 | 1 | SCAN-04 | unit | `uv run pytest tests/test_scanner_adf.py -k multi_page` | ❌ W0 | ⬜ pending |
-| 02-01-02 | 01 | 1 | SCAN-10 | unit | `uv run pytest tests/test_scanner_adf.py -k empty_feeder` | ❌ W0 | ⬜ pending |
-| 02-01-03 | 01 | 1 | SCAN-05 | unit | `uv run pytest tests/test_scanner_adf.py -k hardware_duplex` | ❌ W0 | ⬜ pending |
-| 02-02-01 | 02 | 1 | SCAN-08 | unit | `uv run pytest tests/test_empty_page.py` | ❌ W0 | ⬜ pending |
-| 02-02-02 | 02 | 1 | SCAN-09 | unit | `uv run pytest tests/test_thumbnail.py` | ❌ W0 | ⬜ pending |
-| 02-03-01 | 03 | 2 | SCAN-06, SCAN-07 | unit+integration | `uv run pytest tests/test_manual_duplex.py` | ❌ W0 | ⬜ pending |
-| 02-03-02 | 03 | 2 | SCAN-11, SCAN-12 | integration | `uv run pytest tests/test_pipeline_adf.py` | ❌ W0 | ⬜ pending |
+| 02-01-01 | 01 | 1 | SCAN-08, SCAN-09 | unit | `uv run pytest tests/test_pages.py -x -v` | Created by Plan 01 Task 2 | pending |
+| 02-01-02 | 01 | 1 | SCAN-08, SCAN-09 | unit | `uv run pytest tests/test_config.py tests/test_worker.py -x -q` | Existing files | pending |
+| 02-02-01 | 02 | 2 | SCAN-04, SCAN-05, SCAN-10 | unit | `uv run pytest tests/test_scanner.py -x -v` | Extended by Plan 02 Task 1 | pending |
+| 02-03-01 | 03 | 3 | SCAN-06, SCAN-07 | unit+integration | `uv run pytest tests/test_pipeline.py -x -v` | Extended by Plan 03 Task 1 | pending |
+| 02-03-02 | 03 | 3 | SCAN-11, SCAN-12 | integration | `uv run pytest tests/test_worker.py -x -v` | Extended by Plan 03 Task 2 | pending |
 
-*Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
+*Status: pending -- green -- red -- flaky*
 
 ---
 
 ## Wave 0 Requirements
 
-- [ ] `tests/test_scanner_adf.py` — stubs for SCAN-04, SCAN-05, SCAN-10
-- [ ] `tests/test_empty_page.py` — stubs for SCAN-08
-- [ ] `tests/test_thumbnail.py` — stubs for SCAN-09
-- [ ] `tests/test_manual_duplex.py` — stubs for SCAN-06, SCAN-07
-- [ ] `tests/test_pipeline_adf.py` — stubs for SCAN-11, SCAN-12
+- [x] `tests/test_pages.py` -- created by Plan 01 Task 2 (SCAN-08: empty page detection, SCAN-09: thumbnail generation)
+- [x] `tests/test_scanner.py` -- extended by Plan 02 Task 1 (SCAN-04: ADF multi-page, SCAN-05: duplex, SCAN-10: empty feeder)
+- [x] `tests/test_pipeline.py` -- extended by Plan 03 Task 1 (SCAN-06: manual duplex, SCAN-07: page count validation)
+- [x] `tests/test_worker.py` -- extended by Plan 03 Task 2 (SCAN-11: queuing, SCAN-12: background worker)
+- [x] `tests/conftest.py` -- extended by Plan 01 Task 1 (multi-page/empty/content image fixtures)
 
-*Existing infrastructure covers pytest framework and conftest.py.*
+*Each plan creates its own test files/classes as TDD tasks. No separate Wave 0 stub generation needed -- plans are type: execute with tdd="true" on each task, so tests are written before implementation within each task.*
 
 ---
 
@@ -75,11 +73,11 @@ created: 2026-03-20
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 10s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 10s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved
