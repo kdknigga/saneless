@@ -1,7 +1,7 @@
 # Requirements: saneless
 
 **Defined:** 2026-03-20
-**Core Value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata — without touching any other tool.
+**Core Value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
 
 ## v1 Requirements
 
@@ -15,7 +15,7 @@
 - [ ] **SCAN-06**: User can perform an ADF manual duplex scan (two-pass with flip prompt) that produces correctly interleaved pages
 - [ ] **SCAN-07**: System validates raw page count match between pass A and pass B for manual duplex before interleaving
 - [ ] **SCAN-08**: System detects and discards empty pages using dual-threshold algorithm (mean luminance + stddev), both thresholds configurable per profile
-- [ ] **SCAN-09**: System generates a first-page thumbnail (JPEG, long edge ≤ 300px, base64) after the first page is acquired
+- [ ] **SCAN-09**: System generates a first-page thumbnail (JPEG, long edge <= 300px, base64) after the first page is acquired
 - [ ] **SCAN-10**: System fails fast with "No paper detected in feeder" when ADF is empty, not a generic error
 - [ ] **SCAN-11**: Only one scan job runs at a time; concurrent requests are queued
 - [ ] **SCAN-12**: All scanning runs in a background worker thread, never blocking the web request handler
@@ -79,7 +79,7 @@
 - [ ] **LOG-01**: All errors and significant events written to a rotating log file at configurable path
 - [ ] **LOG-02**: Log level configurable (DEBUG, INFO, WARNING, ERROR)
 - [ ] **LOG-03**: All scan/API/assembly errors displayed in web UI for current or most recent job
-- [ ] **LOG-04**: Temporary files cleaned up on error — no orphaned scan data
+- [ ] **LOG-04**: Temporary files cleaned up on error -- no orphaned scan data
 
 ### Packaging
 
@@ -177,10 +177,10 @@
 | CLI-03 | Phase 4 | Pending |
 
 **Coverage:**
-- v1 requirements: 47 total
-- Mapped to phases: 47
-- Unmapped: 0 ✓
+- v1 requirements: 49 total
+- Mapped to phases: 49
+- Unmapped: 0
 
 ---
 *Requirements defined: 2026-03-20*
-*Last updated: 2026-03-20 after initial definition*
+*Last updated: 2026-03-20 after roadmap creation*
