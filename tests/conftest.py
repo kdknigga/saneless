@@ -3,6 +3,7 @@
 import os
 
 import pytest
+from PIL import Image
 
 
 @pytest.fixture
@@ -36,6 +37,22 @@ mode = "color"
     config_file = tmp_config_dir / "saneless.toml"
     config_file.write_text(toml_content)
     return config_file
+
+
+@pytest.fixture
+def sample_pil_image():
+    """Return a 100x100 white RGB PIL Image."""
+    return Image.new("RGB", (100, 100), "white")
+
+
+@pytest.fixture
+def sample_pil_images():
+    """Return a list of 3 sample PIL Images of varying sizes and colors."""
+    return [
+        Image.new("RGB", (100, 100), "white"),
+        Image.new("RGB", (200, 200), "red"),
+        Image.new("RGB", (150, 150), "blue"),
+    ]
 
 
 @pytest.fixture(autouse=True)
