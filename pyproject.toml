@@ -9,10 +9,14 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "click>=8.3.1",
+    "fastapi>=0.135.1",
     "httpx>=0.28.1",
     "img2pdf>=0.6.3",
+    "jinja2>=3.1.6",
     "pillow>=12.1.1",
     "pydantic-settings[toml]>=2.13.1",
+    "python-multipart>=0.0.22",
+    "uvicorn>=0.42.0",
 ]
 
 [project.scripts]
@@ -104,6 +108,7 @@ docstring-code-line-length = "dynamic"
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101", "ANN", "TCH", "T201", "PLC0415", "PLR0915", "PLR0912", "PLR0913"]
 "src/saneless/__init__.py" = ["PLC0415"]
+"src/saneless/config.py" = ["S104"]
 
 [tool.ty.src]
 exclude = ["tests/"]
@@ -116,6 +121,7 @@ testpaths = ["tests"]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "playwright>=1.58.0",
     "prek>=0.3.5",
     "pyrefly>=0.55.0",
