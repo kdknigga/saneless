@@ -1,6 +1,8 @@
 """Shared test fixtures for all test modules."""
 
 import os
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +16,9 @@ from saneless.config import (
     Settings,
 )
 from saneless.scanner.base import ScannerBackend
+
+_TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
+_TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
 
 
 @pytest.fixture
@@ -76,15 +81,16 @@ def clean_env(monkeypatch):
 @pytest.fixture
 def default_settings():
     """Return a Settings instance with test-safe defaults."""
+    auth = "test-token"
     return Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(
             url="http://localhost:8000",
-            token="test-token",
+            token=auth,
         ),
         output=OutputConfig(
-            tmp_dir="/tmp/saneless-test",
-            log_file="/tmp/saneless-test/saneless.log",
+            tmp_dir=_TEST_TMP,
+            log_file=_TEST_LOG,
         ),
         profiles={"default": ProfileConfig()},
     )

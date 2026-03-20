@@ -2,7 +2,7 @@
 
 import time
 
-from saneless.job import Job, JobState, JobStore
+from saneless.job import JobState, JobStore
 from saneless.worker import ScanWorker
 
 
@@ -101,7 +101,9 @@ class TestJobStore:
 class TestScanWorker:
     """Worker thread tests."""
 
-    def test_worker_starts_and_stops(self, mock_scanner, mock_paperless, default_settings):
+    def test_worker_starts_and_stops(
+        self, mock_scanner, mock_paperless, default_settings
+    ):
         """ScanWorker starts background thread and stop() joins it."""
         store = JobStore()
         try:
@@ -113,14 +115,16 @@ class TestScanWorker:
         finally:
             store.close()
 
-    def test_worker_processes_job(self, mock_scanner, mock_paperless, default_settings, monkeypatch):
+    def test_worker_processes_job(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
         """Submit job to worker -> job reaches DONE state."""
         store = JobStore()
         try:
             # Mock run_pipeline to succeed
             monkeypatch.setattr(
                 "saneless.worker.run_pipeline",
-                lambda *args, **kwargs: {"status": "SUCCESS"},
+                lambda *_args, **_kwargs: {"status": "SUCCESS"},
             )
 
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -138,11 +142,14 @@ class TestScanWorker:
         finally:
             store.close()
 
-    def test_worker_sets_error_on_failure(self, mock_scanner, mock_paperless, default_settings, monkeypatch):
+    def test_worker_sets_error_on_failure(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
         """Pipeline raises exception -> job state is ERROR with message."""
         store = JobStore()
         try:
-            def failing_pipeline(*args, **kwargs):
+
+            def failing_pipeline(*_args, **_kwargs):
                 msg = "Scanner on fire"
                 raise RuntimeError(msg)
 
