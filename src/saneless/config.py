@@ -57,6 +57,8 @@ class ProfileConfig(BaseModel):
     default_tags: list[int] = []
     default_correspondent: int | None = None
     default_title_template: str = ""
+    empty_page_mean_threshold: float = 250.0
+    empty_page_stddev_threshold: float = 5.0
 
 
 class OutputConfig(BaseModel):

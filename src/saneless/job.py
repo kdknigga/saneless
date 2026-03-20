@@ -26,6 +26,7 @@ class JobState(StrEnum):
 
     PENDING = "PENDING"
     SCANNING = "SCANNING"
+    AWAITING_FLIP = "AWAITING_FLIP"
     ASSEMBLING = "ASSEMBLING"
     UPLOADING = "UPLOADING"
     DONE = "DONE"
@@ -46,6 +47,7 @@ class Job:
         created_at: Timezone-aware creation timestamp.
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
+        thumbnail: Optional base64-encoded JPEG thumbnail string.
 
     """
 
@@ -57,6 +59,7 @@ class Job:
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     tags: list[int] = field(default_factory=list)
     correspondent: int | None = None
+    thumbnail: str | None = None
 
 
 class JobStore:
@@ -82,6 +85,7 @@ class JobStore:
                 error TEXT,
                 tags TEXT NOT NULL,
                 correspondent INTEGER,
+                thumbnail TEXT,
                 created_at TEXT NOT NULL
             )"""
         )
@@ -93,6 +97,7 @@ class JobStore:
         title: str,
         tags: list[int] | None = None,
         correspondent: int | None = None,
+        thumbnail: str | None = None,
     ) -> Job:
         """
         Create and persist a new job.
@@ -102,6 +107,7 @@ class JobStore:
             title: Document title.
             tags: Optional list of tag IDs.
             correspondent: Optional correspondent ID.
+            thumbnail: Optional base64-encoded JPEG thumbnail.
 
         Returns:
             The newly created Job instance.
@@ -113,10 +119,11 @@ class JobStore:
             title=title,
             tags=tags or [],
             correspondent=correspondent,
+            thumbnail=thumbnail,
         )
         self._conn.execute(
-            "INSERT INTO jobs (id, profile, title, state, error, tags, correspondent, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO jobs (id, profile, title, state, error, tags, correspondent, thumbnail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job.id,
                 job.profile,
@@ -125,6 +132,7 @@ class JobStore:
                 job.error,
                 json.dumps(job.tags),
                 job.correspondent,
+                job.thumbnail,
                 job.created_at.isoformat(),
             ),
         )
@@ -144,7 +152,7 @@ class JobStore:
 
         """
         row = self._conn.execute(
-            "SELECT id, profile, title, state, error, tags, correspondent, created_at "
+            "SELECT id, profile, title, state, error, tags, correspondent, thumbnail, created_at "
             "FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
@@ -158,7 +166,8 @@ class JobStore:
             error=row[4],
             tags=json.loads(row[5]),
             correspondent=row[6],
-            created_at=datetime.fromisoformat(row[7]),
+            thumbnail=row[7],
+            created_at=datetime.fromisoformat(row[8]),
         )
 
     def update_state(
@@ -182,6 +191,21 @@ class JobStore:
         )
         self._conn.commit()
         logger.debug("Job %s -> %s", job_id, state.value)
+
+    def update_thumbnail(self, job_id: str, thumbnail: str) -> None:
+        """
+        Update the thumbnail of a job.
+
+        Args:
+            job_id: The UUID string of the job.
+            thumbnail: Base64-encoded JPEG thumbnail string.
+
+        """
+        self._conn.execute(
+            "UPDATE jobs SET thumbnail = ? WHERE id = ?",
+            (thumbnail, job_id),
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         """Close the database connection."""

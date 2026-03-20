@@ -5,7 +5,13 @@ All saneless-specific exceptions inherit from SanelessError,
 allowing callers to catch broad or narrow exception types.
 """
 
-__all__ = ["ConfigError", "PaperlessError", "SanelessError", "ScanError"]
+__all__ = [
+    "ConfigError",
+    "FeederEmptyError",
+    "PaperlessError",
+    "SanelessError",
+    "ScanError",
+]
 
 
 class SanelessError(Exception):
@@ -18,6 +24,10 @@ class ConfigError(SanelessError):
 
 class ScanError(SanelessError):
     """Scanner operation failure."""
+
+
+class FeederEmptyError(ScanError):
+    """ADF feeder is empty -- no paper detected."""
 
 
 class PaperlessError(SanelessError):

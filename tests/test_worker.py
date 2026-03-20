@@ -98,6 +98,37 @@ class TestJobStore:
             store2.close()
 
 
+class TestJobStateAwaitingFlip:
+    """AWAITING_FLIP state tests."""
+
+    def test_awaiting_flip_exists(self):
+        """JobState.AWAITING_FLIP exists and equals 'AWAITING_FLIP'."""
+        assert JobState.AWAITING_FLIP == "AWAITING_FLIP"
+        assert JobState.AWAITING_FLIP.value == "AWAITING_FLIP"
+
+
+class TestJobThumbnail:
+    """Job thumbnail field tests."""
+
+    def test_thumbnail_defaults_none(self):
+        """Job.thumbnail field defaults to None."""
+        from saneless.job import Job
+
+        job = Job(id="test", profile="default", title="Test")
+        assert job.thumbnail is None
+
+    def test_jobstore_persists_thumbnail(self):
+        """JobStore persists and retrieves thumbnail field."""
+        store = JobStore()
+        try:
+            job = store.create_job("default", "Thumb Test")
+            store.update_thumbnail(job.id, "base64data")
+            fetched = store.get_job(job.id)
+            assert fetched.thumbnail == "base64data"
+        finally:
+            store.close()
+
+
 class TestScanWorker:
     """Worker thread tests."""
 

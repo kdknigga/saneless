@@ -3,10 +3,12 @@
 import pytest
 
 from saneless.config import (
+    ProfileConfig,
     load_settings,
 )
 from saneless.exceptions import (
     ConfigError,
+    FeederEmptyError,
     PaperlessError,
     SanelessError,
     ScanError,
@@ -164,3 +166,39 @@ class TestExceptionHierarchy:
         msg = "api error"
         with pytest.raises(SanelessError):
             raise PaperlessError(msg)
+
+    def test_feeder_empty_error_is_scan_error(self):
+        """FeederEmptyError is a subclass of ScanError."""
+        assert issubclass(FeederEmptyError, ScanError)
+        msg = "no paper"
+        with pytest.raises(ScanError):
+            raise FeederEmptyError(msg)
+
+
+class TestProfileConfigThresholds:
+    """ProfileConfig empty page threshold fields."""
+
+    def test_default_mean_threshold(self):
+        """ProfileConfig has empty_page_mean_threshold defaulting to 250.0."""
+        profile = ProfileConfig()
+        assert profile.empty_page_mean_threshold == 250.0
+
+    def test_default_stddev_threshold(self):
+        """ProfileConfig has empty_page_stddev_threshold defaulting to 5.0."""
+        profile = ProfileConfig()
+        assert profile.empty_page_stddev_threshold == 5.0
+
+    def test_custom_threshold_values(self, tmp_config_dir):
+        """ProfileConfig accepts custom threshold values from TOML."""
+        toml_content = """\
+[profiles.default]
+source = "ADF"
+empty_page_mean_threshold = 240.0
+empty_page_stddev_threshold = 10.0
+"""
+        config_file = tmp_config_dir / "thresholds.toml"
+        config_file.write_text(toml_content)
+        settings = load_settings(config_path=str(config_file))
+        profile = settings.profiles["default"]
+        assert profile.empty_page_mean_threshold == 240.0
+        assert profile.empty_page_stddev_threshold == 10.0
