@@ -27,13 +27,13 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ Rotating log file with configurable level and path — Phase 1
 - ✓ Temporary file cleanup on success and error — Phase 1
 - ✓ CLI: `saneless scan`, `saneless devices` — Phase 1
+- ✓ ADF multi-page scanning with `multi_scan()` — Phase 2
+- ✓ ADF duplex scanning (native hardware duplex) — Phase 2
+- ✓ ADF manual duplex (two-pass with flip prompt, reverse-and-interleave) — Phase 2
+- ✓ Empty page detection (mean luminance + stddev dual threshold) — Phase 2
+- ✓ First-page thumbnail generation (base64 JPEG, long edge ≤ 300px) — Phase 2
 
 ### Active
-- [ ] ADF multi-page scanning with `multi_scan()`
-- [ ] ADF duplex scanning (native hardware duplex)
-- [ ] ADF manual duplex (two-pass with flip prompt, reverse-and-interleave)
-- [ ] Empty page detection (mean luminance + stddev dual threshold)
-- [ ] First-page thumbnail generation (base64 JPEG, long edge ≤ 300px)
 - [ ] Consume directory fallback
 - [ ] Web UI: profile selector, metadata fields, scan button, live status indicator
 - [ ] Web UI: ADF manual duplex flip prompt with Continue/Cancel and flip illustration
@@ -88,4 +88,4 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 | No web UI auth in v1 | Trusted LAN assumption; reverse proxy handles auth if needed | — Pending |
 
 ---
-*Last updated: 2026-03-20 after Phase 1 completion*
+*Last updated: 2026-03-20 after Phase 2 completion*
