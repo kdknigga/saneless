@@ -46,11 +46,12 @@ Plans:
   3. Empty pages are automatically detected and discarded before PDF assembly, with configurable thresholds per profile
   4. A thumbnail of the first scanned page is generated and available for downstream display
   5. Attempting to ADF-scan with an empty feeder produces a specific "No paper detected in feeder" error, not a generic failure
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 02-01: TBD
-- [ ] 02-02: TBD
+- [ ] 02-01-PLAN.md -- Foundation types + page processing: config thresholds, AWAITING_FLIP state, FeederEmptyError, empty page detection, thumbnail generation
+- [ ] 02-02-PLAN.md -- ADF scanner extension: multi_scan() for ADF/duplex sources, page validation, empty feeder detection, EXIF stripping
+- [ ] 02-03-PLAN.md -- Pipeline + worker integration: manual duplex interleaving, empty page filtering, thumbnail callbacks, AWAITING_FLIP event coordination
 
 ### Phase 3: Web UI
 **Goal**: Users can perform all scanning operations from a browser on any device on the LAN, with live feedback, metadata entry, and job history
@@ -91,6 +92,6 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Core Pipeline | 0/3 | Planning complete | - |
-| 2. ADF and Multi-Page | 0/2 | Not started | - |
+| 2. ADF and Multi-Page | 0/3 | Planning complete | - |
 | 3. Web UI | 0/3 | Not started | - |
 | 4. Packaging and Deployment | 0/1 | Not started | - |
