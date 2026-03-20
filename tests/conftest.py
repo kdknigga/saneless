@@ -98,9 +98,14 @@ def default_settings():
 
 @pytest.fixture
 def mock_scanner():
-    """Return a mock ScannerBackend that yields a single white image."""
+    """Return a mock ScannerBackend that yields a single image with content."""
+    from PIL import ImageDraw
+
     scanner = MagicMock(spec=ScannerBackend)
-    scanner.scan_pages.return_value = iter([Image.new("RGB", (100, 100), "white")])
+    img = Image.new("RGB", (100, 100), "white")
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([10, 10, 90, 90], fill="black")
+    scanner.scan_pages.return_value = iter([img])
     return scanner
 
 
