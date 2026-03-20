@@ -1,9 +1,19 @@
 """Shared test fixtures for all test modules."""
 
 import os
+from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
+
+from saneless.config import (
+    OutputConfig,
+    PaperlessConfig,
+    ProfileConfig,
+    ScannerConfig,
+    Settings,
+)
+from saneless.scanner.base import ScannerBackend
 
 
 @pytest.fixture
@@ -61,3 +71,37 @@ def clean_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith("SANELESS_"):
             monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture
+def default_settings():
+    """Return a Settings instance with test-safe defaults."""
+    return Settings(
+        scanner=ScannerConfig(device="test:device:001"),
+        paperless=PaperlessConfig(
+            url="http://localhost:8000",
+            token="test-token",
+        ),
+        output=OutputConfig(
+            tmp_dir="/tmp/saneless-test",
+            log_file="/tmp/saneless-test/saneless.log",
+        ),
+        profiles={"default": ProfileConfig()},
+    )
+
+
+@pytest.fixture
+def mock_scanner():
+    """Return a mock ScannerBackend that yields a single white image."""
+    scanner = MagicMock(spec=ScannerBackend)
+    scanner.scan_pages.return_value = iter([Image.new("RGB", (100, 100), "white")])
+    return scanner
+
+
+@pytest.fixture
+def mock_paperless():
+    """Return a mock PaperlessClient that succeeds."""
+    paperless = MagicMock()
+    paperless.upload_document.return_value = "mock-task-uuid"
+    paperless.poll_task.return_value = {"status": "SUCCESS"}
+    return paperless
