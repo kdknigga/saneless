@@ -10,11 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from pathlib import Path
 
 import click
 
 from .config import load_settings
 from .exceptions import PaperlessError, ScanError
+from .job import JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import PipelineRequest, run_pipeline
@@ -173,3 +175,43 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
                 for opt in caps.raw_options:
                     if len(opt) >= 2:
                         click.echo(f"    {opt[1]}")
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+@click.option("--limit", default=20, type=int, help="Maximum jobs to show.")
+@click.pass_context
+def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
+    """List recent scan job history."""
+    settings = ctx.obj["settings"]
+    db_path = str(Path(settings.output.tmp_dir) / "saneless.db")
+    store = JobStore(db_path=db_path)
+    try:
+        recent = store.list_recent(limit=limit)
+        if as_json:
+            click.echo(
+                json.dumps(
+                    [
+                        {
+                            "id": j.id,
+                            "profile": j.profile,
+                            "title": j.title,
+                            "state": j.state.value,
+                            "created_at": j.created_at.isoformat(),
+                        }
+                        for j in recent
+                    ],
+                    indent=2,
+                )
+            )
+        else:
+            header = f"{'Timestamp':<22} {'Profile':<15} {'Title':<30} {'Status'}"
+            click.echo(header)
+            click.echo("-" * len(header))
+            for j in recent:
+                click.echo(
+                    f"{j.created_at.strftime('%Y-%m-%d %H:%M:%S'):<22} "
+                    f"{j.profile:<15} {j.title:<30} {j.state.value}"
+                )
+    finally:
+        store.close()

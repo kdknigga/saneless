@@ -15,6 +15,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.exceptions import PaperlessError, ScanError
+from saneless.job import JobStore
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
@@ -368,3 +369,147 @@ class TestCliFlags:
         result = runner.invoke(cli, ["--config", "/path/to/config.toml", "devices"])
         assert result.exit_code == 0
         assert captured["config_path"] == "/path/to/config.toml"
+
+
+class TestJobsCommand:
+    """Jobs command tests."""
+
+    def _populate_store(self, db_path: str, count: int = 2) -> None:
+        """Populate a JobStore at db_path with test jobs."""
+        store = JobStore(db_path=db_path)
+        for i in range(count):
+            store.create_job(
+                profile="default" if i % 2 == 0 else "photo",
+                title=f"Test Document {i + 1}",
+            )
+        store.close()
+
+    def test_jobs_empty(self, monkeypatch, tmp_path):
+        """Jobs with no jobs in DB shows empty output (exit 0)."""
+        db_path = str(tmp_path / "saneless.db")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        # Create empty DB
+        store = JobStore(db_path=db_path)
+        store.close()
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+
+    def test_jobs_table_output(self, monkeypatch, tmp_path):
+        """Jobs with 2 jobs shows table with Timestamp, Profile, Title, Status columns."""
+        db_path = str(tmp_path / "saneless.db")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        self._populate_store(db_path, count=2)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        assert "Timestamp" in result.output
+        assert "Profile" in result.output
+        assert "Title" in result.output
+        assert "Status" in result.output
+        assert "Test Document 1" in result.output
+        assert "Test Document 2" in result.output
+        assert "PENDING" in result.output
+
+    def test_jobs_json_output(self, monkeypatch, tmp_path):
+        """Jobs --json with 2 jobs returns valid JSON array."""
+        db_path = str(tmp_path / "saneless.db")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        self._populate_store(db_path, count=2)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert isinstance(data, list)
+        assert len(data) == 2
+        for item in data:
+            assert "id" in item
+            assert "profile" in item
+            assert "title" in item
+            assert "state" in item
+            assert "created_at" in item
+
+    def test_jobs_limit(self, monkeypatch, tmp_path):
+        """Jobs --limit 1 with 2 jobs in DB shows only 1 job."""
+        db_path = str(tmp_path / "saneless.db")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        self._populate_store(db_path, count=2)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["jobs", "--limit", "1"])
+        assert result.exit_code == 0
+        # Should only have 1 data row (plus header and separator)
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        # Header + separator + 1 data row = 3 lines
+        assert len(lines) == 3
+
+    def test_jobs_exit_code_zero(self, monkeypatch, tmp_path):
+        """Jobs always exits with code 0."""
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+
+    def test_jobs_help(self, monkeypatch):
+        """Jobs --help shows --json and --limit options."""
+        runner, _ = _patch_cli(monkeypatch)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["jobs", "--help"])
+        assert result.exit_code == 0
+        assert "--json" in result.output
+        assert "--limit" in result.output
+
+    def test_jobs_json_empty(self, monkeypatch, tmp_path):
+        """Jobs --json with no jobs outputs empty JSON array."""
+        db_path = str(tmp_path / "saneless.db")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        # Create empty DB
+        store = JobStore(db_path=db_path)
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data == []
