@@ -14,33 +14,34 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 
 - ✓ Python 3.14 project scaffolding with UV, ruff, pytest, pre-commit — existing
 - ✓ pyproject.toml with entry point `saneless = "saneless:main"` — existing
+- ✓ Scanner discovery and device selection via SANE — Phase 1
+- ✓ Scan profiles (source, resolution, color mode, default metadata) defined in TOML config — Phase 1
+- ✓ Flatbed single-page scanning — Phase 1
+- ✓ PDF assembly via `img2pdf` (lossless) — Phase 1
+- ✓ Paperless-ngx REST API ingestion with metadata (title, tags, correspondent, created) — Phase 1
+- ✓ Paperless-ngx task polling until terminal state — Phase 1
+- ✓ Paperless-ngx connection test endpoint (3 distinct failure modes) — Phase 1
+- ✓ pydantic-settings configuration (TOML + env var override) — Phase 1
+- ✓ Scanner abstraction layer (interface for pluggable backends) — Phase 1
+- ✓ Background worker thread with `queue.Queue` (single concurrent scan) — Phase 1
+- ✓ Rotating log file with configurable level and path — Phase 1
+- ✓ Temporary file cleanup on success and error — Phase 1
+- ✓ CLI: `saneless scan`, `saneless devices` — Phase 1
 
 ### Active
-
-- [ ] Scanner discovery and device selection via SANE
-- [ ] Scan profiles (source, resolution, color mode, default metadata) defined in TOML config
-- [ ] Flatbed single-page scanning
 - [ ] ADF multi-page scanning with `multi_scan()`
 - [ ] ADF duplex scanning (native hardware duplex)
 - [ ] ADF manual duplex (two-pass with flip prompt, reverse-and-interleave)
 - [ ] Empty page detection (mean luminance + stddev dual threshold)
 - [ ] First-page thumbnail generation (base64 JPEG, long edge ≤ 300px)
-- [ ] PDF assembly via `img2pdf` (lossless)
-- [ ] Paperless-ngx REST API ingestion with metadata (title, tags, correspondent, created)
-- [ ] Paperless-ngx task polling until terminal state
 - [ ] Consume directory fallback
-- [ ] Paperless-ngx connection test endpoint (3 distinct failure modes)
 - [ ] Web UI: profile selector, metadata fields, scan button, live status indicator
 - [ ] Web UI: ADF manual duplex flip prompt with Continue/Cancel and flip illustration
 - [ ] Web UI: first-page thumbnail preview
 - [ ] Web UI: job history table (SQLite, pruned by age + count)
 - [ ] Web UI: tag/correspondent dropdowns with TTL cache and per-resource refresh
 - [ ] Health endpoint (`GET /health`, 200/503 based on worker thread state)
-- [ ] CLI: `saneless scan`, `saneless devices`, `saneless jobs`
-- [ ] pydantic-settings configuration (TOML + env var override)
-- [ ] Scanner abstraction layer (interface for pluggable backends)
-- [ ] Background worker thread with `queue.Queue` (single concurrent scan)
-- [ ] Rotating log file with configurable level and path
+- [ ] CLI: `saneless jobs`
 - [ ] Temporary file cleanup on success and error
 - [ ] pip-installable package (pyproject.toml, PyPI)
 - [ ] OCI container image (GHCR, HEALTHCHECK instruction)
@@ -79,12 +80,12 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | FastAPI + uvicorn for web layer | Async-capable, modern Python web framework, good for API-first design | — Pending |
-| `queue.Queue` + worker thread (not rq/Redis) | Sufficient for single-scanner v1; avoids infrastructure dependency | — Pending |
-| `img2pdf` for PDF assembly | Lossless encoding, no re-compression of scanned images | — Pending |
-| `pydantic-settings` for config | TOML + env var support, validation at startup, type safety | — Pending |
-| Scanner abstraction layer from day one | Enables future driverless backend without pipeline changes | — Pending |
-| SQLite for job persistence | Stdlib, no external database, sufficient for single-process model | — Pending |
+| `queue.Queue` + worker thread (not rq/Redis) | Sufficient for single-scanner v1; avoids infrastructure dependency | ✓ Good |
+| `img2pdf` for PDF assembly | Lossless encoding, no re-compression of scanned images | ✓ Good |
+| `pydantic-settings` for config | TOML + env var support, validation at startup, type safety | ✓ Good |
+| Scanner abstraction layer from day one | Enables future driverless backend without pipeline changes | ✓ Good |
+| SQLite for job persistence | Stdlib, no external database, sufficient for single-process model | ✓ Good |
 | No web UI auth in v1 | Trusted LAN assumption; reverse proxy handles auth if needed | — Pending |
 
 ---
-*Last updated: 2026-03-20 after initialization*
+*Last updated: 2026-03-20 after Phase 1 completion*
