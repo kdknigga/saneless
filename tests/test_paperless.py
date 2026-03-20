@@ -335,6 +335,84 @@ class TestConnectionTest:
 # ---------------------------------------------------------------------------
 
 
+class TestConsumeDir:
+    """Consume directory fallback tests."""
+
+    def test_consume_dir_created_if_not_exists(self, sample_pdf, tmp_path) -> None:
+        """Fallback creates consume_dir if it does not exist before copying."""
+        consume_dir = tmp_path / "nonexistent" / "consume"
+        assert not consume_dir.exists()
+
+        def handler(_request):
+            msg = "connection refused"
+            raise httpx.ConnectError(msg)
+
+        transport = _make_transport(handler)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            consume_dir=str(consume_dir),
+            _transport=transport,
+            max_retries=1,
+        )
+        result = client.upload_document(sample_pdf, title="Auto-create test")
+        assert result == "fallback"
+        assert consume_dir.exists()
+        copied = list(consume_dir.iterdir())
+        assert len(copied) == 1
+        assert copied[0].name == "test.pdf"
+        client.close()
+
+    def test_consume_dir_works_when_exists(self, sample_pdf, tmp_path) -> None:
+        """Fallback works when consume_dir already exists."""
+        consume_dir = tmp_path / "existing-consume"
+        consume_dir.mkdir()
+
+        def handler(_request):
+            msg = "connection refused"
+            raise httpx.ConnectError(msg)
+
+        transport = _make_transport(handler)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            consume_dir=str(consume_dir),
+            _transport=transport,
+            max_retries=1,
+        )
+        result = client.upload_document(sample_pdf, title="Existing dir test")
+        assert result == "fallback"
+        copied = list(consume_dir.iterdir())
+        assert len(copied) == 1
+        client.close()
+
+    def test_consume_dir_logs_warning_on_create(
+        self, sample_pdf, tmp_path, caplog
+    ) -> None:
+        """A warning is logged when creating the consume directory."""
+        consume_dir = tmp_path / "warn-consume"
+        assert not consume_dir.exists()
+
+        def handler(_request):
+            msg = "connection refused"
+            raise httpx.ConnectError(msg)
+
+        transport = _make_transport(handler)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            consume_dir=str(consume_dir),
+            _transport=transport,
+            max_retries=1,
+        )
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
+            client.upload_document(sample_pdf, title="Warning test")
+        assert any("Created consume directory" in msg for msg in caplog.messages)
+        client.close()
+
+
 class TestAuthHeader:
     """Authentication header tests."""
 

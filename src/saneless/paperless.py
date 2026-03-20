@@ -150,7 +150,11 @@ class PaperlessClient:
 
         # All retries exhausted
         if self._consume_dir:
-            dest = Path(self._consume_dir) / pdf_path.name
+            dest_dir = Path(self._consume_dir)
+            if not dest_dir.exists():
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                logger.warning("Created consume directory %s", dest_dir)
+            dest = dest_dir / pdf_path.name
             shutil.copy2(pdf_path, dest)
             logger.warning("All retries exhausted. Copied PDF to %s", dest)
             return "fallback"
