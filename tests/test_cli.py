@@ -1,6 +1,8 @@
 """Tests for CLI commands via click.testing.CliRunner."""
 
 import json
+import tempfile
+from pathlib import Path
 
 from click.testing import CliRunner
 from PIL import Image
@@ -15,18 +17,22 @@ from saneless.config import (
 from saneless.exceptions import PaperlessError, ScanError
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
 
+_TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
+_TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
+
 
 def _make_settings(**overrides):
     """Create a Settings instance with test defaults."""
+    auth = "test-token"
     defaults = {
         "scanner": ScannerConfig(device="test:device:001"),
         "paperless": PaperlessConfig(
             url="http://localhost:8000",
-            token="test-token",
+            token=auth,
         ),
         "output": OutputConfig(
-            tmp_dir="/tmp/saneless-test",
-            log_file="/tmp/saneless-test/saneless.log",
+            tmp_dir=_TEST_TMP,
+            log_file=_TEST_LOG,
         ),
         "profiles": {
             "default": ProfileConfig(),
@@ -38,7 +44,8 @@ def _make_settings(**overrides):
 
 
 def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None):
-    """Patch cli module dependencies for testing.
+    """
+    Patch cli module dependencies for testing.
 
     Returns (runner, settings_used).
     """
@@ -46,35 +53,52 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
 
     monkeypatch.setattr(
         "saneless.cli.load_settings",
-        lambda *args, **kwargs: settings,
+        lambda *_args, **_kwargs: settings,
     )
     monkeypatch.setattr(
         "saneless.cli.configure_logging",
-        lambda *args, **kwargs: None,
+        lambda *_args, **_kwargs: None,
     )
 
     if scanner_cls is not None:
         monkeypatch.setattr("saneless.cli.SaneBackend", scanner_cls)
     else:
-        # Default mock scanner
+
         class MockSaneBackend:
+            """Mock scanner backend for CLI tests."""
+
             def get_devices(self):
+                """Return two test scanner devices."""
                 return [
                     DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner"),
-                    DeviceInfo("hp:002", "HP", "Envy 6055", "multi-function peripheral"),
+                    DeviceInfo(
+                        "hp:002", "HP", "Envy 6055", "multi-function peripheral"
+                    ),
                 ]
 
-            def get_capabilities(self, device_id):
+            def get_capabilities(self, _device_id):
+                """Return fixed test capabilities."""
                 return DeviceCapabilities(
                     sources=["Flatbed", "ADF"],
                     resolutions=[150, 300, 600],
                     modes=["color", "gray"],
                     raw_options=[
-                        (0, "source", "Source", "desc", 3, 0, 1, 0, ["Flatbed", "ADF"]),
+                        (
+                            0,
+                            "source",
+                            "Source",
+                            "desc",
+                            3,
+                            0,
+                            1,
+                            0,
+                            ["Flatbed", "ADF"],
+                        ),
                     ],
                 )
 
-            def scan_pages(self, device_id, settings):
+            def scan_pages(self, _device_id, _settings):
+                """Return a single white test image."""
                 return iter([Image.new("RGB", (100, 100), "white")])
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
@@ -82,18 +106,23 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
     if paperless_cls is not None:
         monkeypatch.setattr("saneless.cli.PaperlessClient", paperless_cls)
     else:
-        class MockPaperlessClient:
-            def __init__(self, *args, **kwargs):
-                pass
 
-            def upload_document(self, *args, **kwargs):
+        class MockPaperlessClient:
+            """Mock paperless client for CLI tests."""
+
+            def __init__(self, *_args, **_kwargs):
+                """Accept and ignore all constructor arguments."""
+
+            def upload_document(self, *_args, **_kwargs):
+                """Return a fake task UUID."""
                 return "mock-task-uuid"
 
-            def poll_task(self, *args, **kwargs):
+            def poll_task(self, *_args, **_kwargs):
+                """Return a successful task result."""
                 return {"status": "SUCCESS"}
 
             def close(self):
-                pass
+                """No-op close."""
 
         monkeypatch.setattr("saneless.cli.PaperlessClient", MockPaperlessClient)
 
@@ -104,6 +133,7 @@ class TestCliHelp:
     """CLI help text tests."""
 
     def test_cli_help(self, monkeypatch):
+        """Main CLI --help shows usage information."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -112,6 +142,7 @@ class TestCliHelp:
         assert "saneless" in result.output.lower() or "scan" in result.output.lower()
 
     def test_scan_command_help(self, monkeypatch):
+        """Scan subcommand --help shows --profile and --title options."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -121,6 +152,7 @@ class TestCliHelp:
         assert "--title" in result.output
 
     def test_devices_command_help(self, monkeypatch):
+        """Devices subcommand --help shows --json and --capabilities options."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -134,6 +166,7 @@ class TestScanCommand:
     """Scan command tests."""
 
     def test_scan_requires_title(self, monkeypatch):
+        """Scan without --title exits with non-zero code."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -141,6 +174,7 @@ class TestScanCommand:
         assert result.exit_code != 0
 
     def test_scan_happy_path(self, monkeypatch):
+        """Scan with --title succeeds and shows Done message."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -149,6 +183,7 @@ class TestScanCommand:
         assert "Done: Test" in result.output
 
     def test_scan_status_output(self, monkeypatch):
+        """Scan shows progress messages during pipeline execution."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -161,12 +196,12 @@ class TestScanCommand:
         """Config loading fails -> exit code 2."""
         runner = CliRunner()
 
-        def bad_load(*args, **kwargs):
+        def bad_load(*_args, **_kwargs):
             msg = "bad config"
             raise ValueError(msg)
 
         monkeypatch.setattr("saneless.cli.load_settings", bad_load)
-        monkeypatch.setattr("saneless.cli.configure_logging", lambda *a, **kw: None)
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: None)
         from saneless.cli import cli
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
@@ -177,8 +212,12 @@ class TestScanCommand:
         """Pipeline raises ScanError -> exit code 1."""
 
         class FailScanner:
-            def scan_pages(self, *args, **kwargs):
-                raise ScanError("Paper jam")
+            """Scanner that always raises ScanError."""
+
+            def scan_pages(self, *_args, **_kwargs):
+                """Raise a scan error."""
+                msg = "Paper jam"
+                raise ScanError(msg)
 
         runner, _ = _patch_cli(monkeypatch, scanner_cls=FailScanner)
         from saneless.cli import cli
@@ -191,14 +230,18 @@ class TestScanCommand:
         """Pipeline raises PaperlessError -> exit code 3."""
 
         class FailPaperless:
-            def __init__(self, *a, **kw):
-                pass
+            """Paperless client that always raises PaperlessError on upload."""
 
-            def upload_document(self, *a, **kw):
-                raise PaperlessError("Server down")
+            def __init__(self, *_a, **_kw):
+                """Accept and ignore all constructor arguments."""
+
+            def upload_document(self, *_a, **_kw):
+                """Raise a paperless error."""
+                msg = "Server down"
+                raise PaperlessError(msg)
 
             def close(self):
-                pass
+                """No-op close."""
 
         runner, _ = _patch_cli(monkeypatch, paperless_cls=FailPaperless)
         from saneless.cli import cli
@@ -208,13 +251,12 @@ class TestScanCommand:
         assert "Server down" in result.output
 
     def test_scan_with_profile(self, monkeypatch):
-        """scan --profile photo -> pipeline called with profile_name='photo'."""
+        """Scan --profile photo -> pipeline called with profile_name='photo'."""
         captured = {}
 
-        original_run_pipeline = None
-
-        def capturing_pipeline(*args, **kwargs):
-            captured["profile_name"] = kwargs.get("profile_name") or args[3]
+        def capturing_pipeline(*args, **_kwargs):
+            """Capture the PipelineRequest from the 4th positional arg."""
+            captured["request"] = args[3]
             return {"status": "SUCCESS"}
 
         runner, _ = _patch_cli(monkeypatch)
@@ -223,14 +265,14 @@ class TestScanCommand:
 
         result = runner.invoke(cli, ["scan", "--profile", "photo", "--title", "Test"])
         assert result.exit_code == 0
-        assert captured["profile_name"] == "photo"
+        assert captured["request"].profile_name == "photo"
 
 
 class TestDevicesCommand:
     """Devices command tests."""
 
     def test_devices_table_output(self, monkeypatch):
-        """devices -> table with device names, vendors, models."""
+        """Devices -> table with device names, vendors, models."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -242,7 +284,7 @@ class TestDevicesCommand:
         assert "hp:002" in result.output
 
     def test_devices_json_output(self, monkeypatch):
-        """devices --json -> valid JSON with device list."""
+        """Devices --json -> valid JSON with device list."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -254,7 +296,7 @@ class TestDevicesCommand:
         assert data[0]["name"] == "epson:001"
 
     def test_devices_capabilities(self, monkeypatch):
-        """devices --capabilities -> raw option names shown."""
+        """Devices --capabilities -> raw option names shown."""
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
 
@@ -271,15 +313,21 @@ class TestCliFlags:
         """The -v flag calls configure_logging with verbose=True."""
         captured = {}
 
-        def capture_logging(*args, **kwargs):
+        def capture_logging(*_args, **kwargs):
+            """Record whether verbose was passed."""
             captured["verbose"] = kwargs.get("verbose", False)
 
         runner = CliRunner()
-        monkeypatch.setattr("saneless.cli.load_settings", lambda *a, **kw: _make_settings())
+        monkeypatch.setattr(
+            "saneless.cli.load_settings", lambda *_a, **_kw: _make_settings()
+        )
         monkeypatch.setattr("saneless.cli.configure_logging", capture_logging)
 
         class MockSaneBackend:
+            """Mock scanner that returns no devices."""
+
             def get_devices(self):
+                """Return empty device list."""
                 return []
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
@@ -294,15 +342,19 @@ class TestCliFlags:
         captured = {}
 
         def capture_load(config_path=None):
+            """Record the config_path argument."""
             captured["config_path"] = config_path
             return _make_settings()
 
         runner = CliRunner()
         monkeypatch.setattr("saneless.cli.load_settings", capture_load)
-        monkeypatch.setattr("saneless.cli.configure_logging", lambda *a, **kw: None)
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: None)
 
         class MockSaneBackend:
+            """Mock scanner that returns no devices."""
+
             def get_devices(self):
+                """Return empty device list."""
                 return []
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)

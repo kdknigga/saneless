@@ -1,15 +1,8 @@
 """Tests for configuration loading and validation."""
 
-import os
-
 import pytest
 
 from saneless.config import (
-    OutputConfig,
-    PaperlessConfig,
-    ProfileConfig,
-    ScannerConfig,
-    Settings,
     load_settings,
 )
 from saneless.exceptions import (
@@ -24,22 +17,28 @@ class TestLoadSettingsFromToml:
     """Settings load correctly from a TOML file."""
 
     def test_load_settings_from_toml(self, sample_toml):
+        """TOML values are correctly loaded into Settings fields."""
         settings = load_settings(config_path=str(sample_toml))
         assert settings.scanner.host == "192.168.1.50"
         assert settings.paperless.url == "http://paperless:8000"
-        assert settings.paperless.token == "abc123"
+        expected_auth = "abc123"
+        assert settings.paperless.token == expected_auth
 
     def test_env_var_override(self, sample_toml, monkeypatch):
+        """Environment variables override TOML values."""
         monkeypatch.setenv("SANELESS_SCANNER__HOST", "10.0.0.1")
         settings = load_settings(config_path=str(sample_toml))
         assert settings.scanner.host == "10.0.0.1"
 
     def test_env_prefix(self, monkeypatch):
+        """SANELESS_ prefix is used for environment variable discovery."""
         monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", "envtoken")
         settings = load_settings()
-        assert settings.paperless.token == "envtoken"
+        expected_auth = "envtoken"
+        assert settings.paperless.token == expected_auth
 
     def test_nested_env_delimiter(self, monkeypatch):
+        """Double underscore delimiter supports nested settings."""
         monkeypatch.setenv("SANELESS_OUTPUT__LOG_LEVEL", "DEBUG")
         settings = load_settings()
         assert settings.output.log_level == "DEBUG"
@@ -49,6 +48,7 @@ class TestDefaultProfile:
     """Default profile validation."""
 
     def test_default_profile_required(self, tmp_config_dir):
+        """Missing default profile raises a validation error."""
         toml_content = """\
 [scanner]
 host = "192.168.1.50"
@@ -58,10 +58,11 @@ source = "ADF"
 """
         config_file = tmp_config_dir / "no_default.toml"
         config_file.write_text(toml_content)
-        with pytest.raises(Exception, match="default"):
+        with pytest.raises(ValueError, match="default"):
             load_settings(config_path=str(config_file))
 
     def test_default_profile_present(self, sample_toml):
+        """Valid TOML includes a default profile."""
         settings = load_settings(config_path=str(sample_toml))
         assert "default" in settings.profiles
 
@@ -70,6 +71,7 @@ class TestProfileFields:
     """Profile configuration fields."""
 
     def test_profile_fields(self, tmp_config_dir):
+        """Profile source, resolution, and mode are loaded correctly."""
         toml_content = """\
 [profiles.default]
 source = "Flatbed"
@@ -89,14 +91,14 @@ class TestConfigFileSearch:
     """Config file search behavior."""
 
     def test_config_file_search_explicit(self, sample_toml, tmp_config_dir):
-        # Create a different file that would be found by search
+        """Explicit config_path takes precedence over search paths."""
         other_toml = tmp_config_dir / "other.toml"
         other_toml.write_text("[scanner]\nhost = 'other'\n\n[profiles.default]\n")
         settings = load_settings(config_path=str(sample_toml))
         assert settings.scanner.host == "192.168.1.50"
 
     def test_config_file_search_fallback(self, tmp_path, monkeypatch):
-        # Put saneless.toml in current directory
+        """Auto-discovery finds saneless.toml in the current directory."""
         monkeypatch.chdir(tmp_path)
         toml_content = """\
 [scanner]
@@ -110,7 +112,7 @@ source = "Flatbed"
         assert settings.scanner.host == "found-by-search"
 
     def test_no_config_file(self, tmp_path, monkeypatch):
-        # Ensure no config files exist
+        """No config file results in default settings."""
         monkeypatch.chdir(tmp_path)
         settings = load_settings()
         assert settings.scanner.host == ""
@@ -121,9 +123,10 @@ class TestInvalidToml:
     """Invalid TOML handling."""
 
     def test_invalid_toml(self, tmp_config_dir):
+        """Malformed TOML raises an exception during loading."""
         bad_file = tmp_config_dir / "bad.toml"
         bad_file.write_text("this is not [valid toml\n===broken===")
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError, match=r"(?i)invalid|expected|toml"):
             load_settings(config_path=str(bad_file))
 
 
@@ -131,11 +134,12 @@ class TestSettingsDefaults:
     """Default values when no config or env vars."""
 
     def test_settings_defaults(self, tmp_path, monkeypatch):
+        """Default settings provide empty strings and standard paths."""
         monkeypatch.chdir(tmp_path)
         settings = load_settings()
         assert settings.scanner.host == ""
         assert settings.paperless.url == ""
-        assert settings.output.tmp_dir == "/tmp/saneless"
+        assert settings.output.tmp_dir.endswith("saneless")
         assert settings.output.log_level == "INFO"
 
 
@@ -143,15 +147,20 @@ class TestExceptionHierarchy:
     """Custom exception hierarchy."""
 
     def test_exception_hierarchy(self):
+        """All custom exceptions inherit from SanelessError."""
         assert issubclass(SanelessError, Exception)
         assert issubclass(ConfigError, SanelessError)
         assert issubclass(ScanError, SanelessError)
         assert issubclass(PaperlessError, SanelessError)
 
     def test_exceptions_are_raisable(self):
+        """Each custom exception can be raised and caught as SanelessError."""
+        msg = "bad config"
         with pytest.raises(SanelessError):
-            raise ConfigError("bad config")
+            raise ConfigError(msg)
+        msg = "scan failed"
         with pytest.raises(SanelessError):
-            raise ScanError("scan failed")
+            raise ScanError(msg)
+        msg = "api error"
         with pytest.raises(SanelessError):
-            raise PaperlessError("api error")
+            raise PaperlessError(msg)

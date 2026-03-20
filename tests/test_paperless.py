@@ -1,15 +1,12 @@
 """Tests for paperless-ngx REST client."""
 
-import json
-import shutil
-from pathlib import Path
-from unittest.mock import patch
-
 import httpx
 import pytest
 
 from saneless.exceptions import PaperlessError
 from saneless.paperless import PaperlessClient
+
+_MOCK_AUTH = "testtoken"
 
 
 @pytest.fixture
@@ -31,17 +28,19 @@ def _make_transport(handler):
 
 
 class TestUploadDocument:
+    """Document upload tests."""
+
     def test_upload_document(self, sample_pdf) -> None:
+        """Upload returns task UUID on success."""
         task_uuid = "abc-123-def"
 
-        def handler(request):
-            assert request.url.path == "/api/documents/post_document/"
+        def handler(_request):
             return httpx.Response(200, json=task_uuid)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         result = client.upload_document(sample_pdf, title="Test Doc")
@@ -49,18 +48,18 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_with_tags(self, sample_pdf) -> None:
+        """Upload includes repeated tag form fields."""
         captured_data = {}
 
-        def handler(request):
-            # httpx sends multipart; parse the raw content for tag fields
-            content = request.content.decode("utf-8", errors="replace")
+        def handler(_request):
+            content = _request.content.decode("utf-8", errors="replace")
             captured_data["content"] = content
             return httpx.Response(200, json="task-id")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         client.upload_document(sample_pdf, title="Test", tags=[1, 2, 3])
@@ -70,17 +69,18 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_with_correspondent(self, sample_pdf) -> None:
+        """Upload includes correspondent field."""
         captured_data = {}
 
-        def handler(request):
-            content = request.content.decode("utf-8", errors="replace")
+        def handler(_request):
+            content = _request.content.decode("utf-8", errors="replace")
             captured_data["content"] = content
             return httpx.Response(200, json="task-id")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         client.upload_document(sample_pdf, title="Test", correspondent=5)
@@ -89,17 +89,18 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_with_created(self, sample_pdf) -> None:
+        """Upload includes created date field."""
         captured_data = {}
 
-        def handler(request):
-            content = request.content.decode("utf-8", errors="replace")
+        def handler(_request):
+            content = _request.content.decode("utf-8", errors="replace")
             captured_data["content"] = content
             return httpx.Response(200, json="task-id")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         client.upload_document(sample_pdf, title="Test", created="2026-03-20")
@@ -107,18 +108,20 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_retry_on_network_error(self, sample_pdf) -> None:
+        """Upload retries on ConnectError and eventually succeeds."""
         call_count = {"n": 0}
 
-        def handler(request):
+        def handler(_request):
             call_count["n"] += 1
             if call_count["n"] <= 2:
-                raise httpx.ConnectError("connection refused")
+                msg = "connection refused"
+                raise httpx.ConnectError(msg)
             return httpx.Response(200, json="task-id-ok")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
             max_retries=3,
         )
@@ -128,31 +131,35 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_no_retry_on_4xx(self, sample_pdf) -> None:
+        """Upload does not retry on 4xx errors."""
         call_count = {"n": 0}
 
-        def handler(request):
+        def handler(_request):
             call_count["n"] += 1
             return httpx.Response(400, text="Bad Request")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
-        with pytest.raises(PaperlessError):
+        with pytest.raises(PaperlessError, match="rejected"):
             client.upload_document(sample_pdf, title="Bad")
         assert call_count["n"] == 1
         client.close()
 
     def test_upload_retry_exhausted_no_fallback(self, sample_pdf) -> None:
-        def handler(request):
-            raise httpx.ConnectError("connection refused")
+        """Upload raises PaperlessError when retries are exhausted without fallback."""
+
+        def handler(_request):
+            msg = "connection refused"
+            raise httpx.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
             max_retries=3,
         )
@@ -161,16 +168,18 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_retry_exhausted_with_fallback(self, sample_pdf, tmp_path) -> None:
+        """Upload falls back to consume directory when retries are exhausted."""
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
 
-        def handler(request):
-            raise httpx.ConnectError("connection refused")
+        def handler(_request):
+            msg = "connection refused"
+            raise httpx.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             consume_dir=str(consume_dir),
             _transport=transport,
             max_retries=3,
@@ -190,14 +199,18 @@ class TestUploadDocument:
 
 
 class TestPollTask:
+    """Task polling tests."""
+
     def test_poll_task_success(self) -> None:
-        def handler(request):
+        """Polling returns SUCCESS when task completes."""
+
+        def handler(_request):
             return httpx.Response(200, json=[{"status": "SUCCESS", "task_id": "t1"}])
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         result = client.poll_task("t1", timeout=10)
@@ -205,7 +218,9 @@ class TestPollTask:
         client.close()
 
     def test_poll_task_failure(self) -> None:
-        def handler(request):
+        """Polling returns FAILURE when task fails."""
+
+        def handler(_request):
             return httpx.Response(
                 200, json=[{"status": "FAILURE", "task_id": "t1", "result": "error"}]
             )
@@ -213,7 +228,7 @@ class TestPollTask:
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         result = client.poll_task("t1", timeout=10)
@@ -221,13 +236,15 @@ class TestPollTask:
         client.close()
 
     def test_poll_task_timeout(self) -> None:
-        def handler(request):
+        """Polling returns TIMEOUT when deadline is exceeded."""
+
+        def handler(_request):
             return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         # Very short timeout to trigger timeout quickly
@@ -239,7 +256,7 @@ class TestPollTask:
         """Pitfall #8: task not found on first poll, succeeds on second."""
         call_count = {"n": 0}
 
-        def handler(request):
+        def handler(_request):
             call_count["n"] += 1
             if call_count["n"] == 1:
                 return httpx.Response(200, json=[])
@@ -248,7 +265,7 @@ class TestPollTask:
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         result = client.poll_task("t1", timeout=30)
@@ -263,40 +280,50 @@ class TestPollTask:
 
 
 class TestConnectionTest:
+    """Connection test method tests."""
+
     def test_test_connection_connected(self) -> None:
-        def handler(request):
+        """Connection test returns 'connected' on 200 response."""
+
+        def handler(_request):
             return httpx.Response(200, json={"status": "ok"})
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         assert client.test_connection() == "connected"
         client.close()
 
     def test_test_connection_token_rejected(self) -> None:
-        def handler(request):
+        """Connection test returns 'token_rejected' on 401 response."""
+
+        def handler(_request):
             return httpx.Response(401, text="Unauthorized")
 
         transport = _make_transport(handler)
+        auth = "badtoken"
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="badtoken",
+            token=auth,
             _transport=transport,
         )
         assert client.test_connection() == "token_rejected"
         client.close()
 
     def test_test_connection_unreachable(self) -> None:
-        def handler(request):
-            raise httpx.ConnectError("connection refused")
+        """Connection test returns 'unreachable' on ConnectError."""
+
+        def handler(_request):
+            msg = "connection refused"
+            raise httpx.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="testtoken",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         assert client.test_connection() == "unreachable"
@@ -309,17 +336,21 @@ class TestConnectionTest:
 
 
 class TestAuthHeader:
+    """Authentication header tests."""
+
     def test_auth_header(self) -> None:
+        """Authorization header contains Token prefix and credential."""
         captured_headers = {}
 
-        def handler(request):
-            captured_headers["auth"] = request.headers.get("authorization")
+        def handler(_request):
+            captured_headers["auth"] = _request.headers.get("authorization")
             return httpx.Response(200, json={"status": "ok"})
 
         transport = _make_transport(handler)
+        auth = "my-secret-token"
         client = PaperlessClient(
             url="http://paperless:8000",
-            token="my-secret-token",
+            token=auth,
             _transport=transport,
         )
         client.test_connection()

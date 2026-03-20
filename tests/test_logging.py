@@ -18,6 +18,7 @@ class TestConfigureLogging:
         root.setLevel(logging.WARNING)
 
     def test_configure_logging_creates_file_handler(self, tmp_path):
+        """configure_logging adds a RotatingFileHandler to the root logger."""
         log_file = tmp_path / "logs" / "test.log"
         try:
             configure_logging(log_file=str(log_file))
@@ -33,6 +34,7 @@ class TestConfigureLogging:
             self._cleanup_handlers()
 
     def test_log_level_from_config(self, tmp_path):
+        """Log level DEBUG is applied to the root logger."""
         log_file = tmp_path / "test.log"
         try:
             configure_logging(log_file=str(log_file), log_level="DEBUG")
@@ -42,6 +44,7 @@ class TestConfigureLogging:
             self._cleanup_handlers()
 
     def test_log_level_info(self, tmp_path):
+        """Log level INFO is applied to the root logger."""
         log_file = tmp_path / "test.log"
         try:
             configure_logging(log_file=str(log_file), log_level="INFO")
@@ -51,6 +54,7 @@ class TestConfigureLogging:
             self._cleanup_handlers()
 
     def test_log_rotation_params(self, tmp_path):
+        """Custom max_bytes and backup_count are passed to RotatingFileHandler."""
         log_file = tmp_path / "test.log"
         try:
             configure_logging(
@@ -71,6 +75,7 @@ class TestConfigureLogging:
             self._cleanup_handlers()
 
     def test_log_format_includes_timestamp_and_module(self, tmp_path):
+        """Log messages include timestamp, module name, and level."""
         log_file = tmp_path / "test.log"
         try:
             configure_logging(log_file=str(log_file), log_level="INFO")
@@ -82,6 +87,7 @@ class TestConfigureLogging:
             self._cleanup_handlers()
 
     def test_verbose_adds_stderr_handler(self, tmp_path):
+        """verbose=True adds a StreamHandler alongside the file handler."""
         log_file = tmp_path / "test.log"
         try:
             configure_logging(log_file=str(log_file), verbose=True)
