@@ -88,9 +88,9 @@ async def index(request: Request) -> Response:
     jobs = state.job_store.list_recent(limit=50)
 
     return state.templates.TemplateResponse(
+        request,
         "index.html",
         {
-            "request": request,
             "profiles": profiles,
             "tags": tags,
             "correspondents": correspondents,
@@ -151,8 +151,9 @@ async def start_scan(
     state.worker.submit(job)
 
     return state.templates.TemplateResponse(
+        request,
         "partials/status.html",
-        {"request": request, "job": job},
+        {"job": job},
     )
 
 
@@ -172,8 +173,9 @@ async def current_job_status(request: Request) -> Response:
         job = recent[0] if recent else None
 
     return state.templates.TemplateResponse(
+        request,
         "partials/status.html",
-        {"request": request, "job": job},
+        {"job": job},
     )
 
 
@@ -188,8 +190,9 @@ async def get_tags(request: Request) -> Response:
     state = request.app.state
     tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     return state.templates.TemplateResponse(
+        request,
         "partials/tags.html",
-        {"request": request, "tags": tags},
+        {"tags": tags},
     )
 
 
@@ -206,8 +209,9 @@ async def get_correspondents(request: Request) -> Response:
         state.cache, state.paperless, "correspondents"
     )
     return state.templates.TemplateResponse(
+        request,
         "partials/correspondents.html",
-        {"request": request, "correspondents": correspondents},
+        {"correspondents": correspondents},
     )
 
 
@@ -230,16 +234,18 @@ async def invalidate_cache(request: Request, resource: str) -> Response:
     if resource == "tags":
         tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
         return state.templates.TemplateResponse(
+            request,
             "partials/tags.html",
-            {"request": request, "tags": tags},
+            {"tags": tags},
         )
 
     correspondents = _get_cached_or_fetch(
         state.cache, state.paperless, "correspondents"
     )
     return state.templates.TemplateResponse(
+        request,
         "partials/correspondents.html",
-        {"request": request, "correspondents": correspondents},
+        {"correspondents": correspondents},
     )
 
 
@@ -254,8 +260,9 @@ async def job_history(request: Request) -> Response:
     state = request.app.state
     jobs = state.job_store.list_recent(limit=50)
     return state.templates.TemplateResponse(
+        request,
         "partials/history.html",
-        {"request": request, "jobs": jobs},
+        {"jobs": jobs},
     )
 
 
@@ -272,8 +279,9 @@ async def continue_flip(request: Request) -> Response:
     if state.worker.current_job_id:
         job = state.job_store.get_job(state.worker.current_job_id)
     return state.templates.TemplateResponse(
+        request,
         "partials/status.html",
-        {"request": request, "job": job},
+        {"job": job},
     )
 
 
@@ -290,6 +298,7 @@ async def abort_flip(request: Request) -> Response:
     if state.worker.current_job_id:
         job = state.job_store.get_job(state.worker.current_job_id)
     return state.templates.TemplateResponse(
+        request,
         "partials/status.html",
-        {"request": request, "job": job},
+        {"job": job},
     )
