@@ -1,1 +1,75 @@
-/* saneless app-specific overrides */
+/* saneless -- app-specific layout overrides for PicoCSS */
+
+/* Status area */
+#status-area {
+    margin: 1rem 0;
+    padding: 1rem;
+    border-left: 3px solid var(--pico-primary);
+    border-radius: var(--pico-border-radius);
+}
+
+/* Status indicators */
+.status-done {
+    color: var(--pico-ins-color, green);
+}
+
+.status-error {
+    color: var(--pico-del-color, red);
+}
+
+/* Thumbnail preview */
+.thumbnail {
+    max-width: 200px;
+    max-height: 300px;
+    margin-top: 0.5rem;
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: var(--pico-border-radius);
+}
+
+/* Flip illustration */
+.flip-illustration {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    margin: 1rem 0;
+}
+
+.flip-illustration svg {
+    width: 120px;
+    height: auto;
+}
+
+/* Refresh buttons inline with labels */
+.refresh-btn {
+    display: inline;
+    width: auto;
+    padding: 0.2rem 0.5rem;
+    margin-left: 0.5rem;
+    font-size: 0.9rem;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    color: var(--pico-primary);
+}
+
+.refresh-btn:hover {
+    color: var(--pico-primary-hover);
+}
+
+/* Job history */
+#history-body td {
+    white-space: nowrap;
+}
+
+/* Responsive: stack on mobile */
+@media (max-width: 576px) {
+    .flip-illustration {
+        flex-direction: column;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .thumbnail {
+        max-width: 100%;
+    }
+}
