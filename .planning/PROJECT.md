@@ -39,12 +39,14 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ Web UI: tag/correspondent dropdowns with TTL cache and per-resource refresh — Phase 3
 - ✓ Health endpoint (`GET /health`, 200/503 based on worker thread state) — Phase 3
 - ✓ FastAPI + Jinja2 + HTMX web layer with PicoCSS — Phase 3
+- ✓ Consume directory fallback — Phase 4
+- ✓ CLI: `saneless jobs` — Phase 4
+- ✓ pip-installable package (pyproject.toml, PyPI) — Phase 4
+- ✓ OCI container image (GHCR, HEALTHCHECK instruction) — Phase 4
 
 ### Active
-- [ ] Consume directory fallback
-- [ ] CLI: `saneless jobs`
-- [ ] pip-installable package (pyproject.toml, PyPI)
-- [ ] OCI container image (GHCR, HEALTHCHECK instruction)
+
+None — all v1 requirements validated.
 
 ### Out of Scope
 
@@ -88,6 +90,8 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 | No web UI auth in v1 | Trusted LAN assumption; reverse proxy handles auth if needed | ✓ Good |
 | Jinja2 + HTMX (no SPA) | No JS build step, server-rendered, declarative interactions | ✓ Good |
 | PicoCSS classless styling | Minimal CSS, semantic HTML, auto dark mode, no build step | ✓ Good |
+| Two-stage Dockerfile with uv_build | Lean OCI image — build stage creates wheel, runtime has only libsane + curl | ✓ Good |
+| GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-20 after Phase 3 completion*
+*Last updated: 2026-03-20 after Phase 4 completion*
