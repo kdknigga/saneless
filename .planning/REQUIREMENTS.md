@@ -14,8 +14,8 @@
 - [ ] **SCAN-05**: User can perform an ADF duplex scan using native hardware duplex
 - [ ] **SCAN-06**: User can perform an ADF manual duplex scan (two-pass with flip prompt) that produces correctly interleaved pages
 - [ ] **SCAN-07**: System validates raw page count match between pass A and pass B for manual duplex before interleaving
-- [ ] **SCAN-08**: System detects and discards empty pages using dual-threshold algorithm (mean luminance + stddev), both thresholds configurable per profile
-- [ ] **SCAN-09**: System generates a first-page thumbnail (JPEG, long edge <= 300px, base64) after the first page is acquired
+- [x] **SCAN-08**: System detects and discards empty pages using dual-threshold algorithm (mean luminance + stddev), both thresholds configurable per profile
+- [x] **SCAN-09**: System generates a first-page thumbnail (JPEG, long edge <= 300px, base64) after the first page is acquired
 - [ ] **SCAN-10**: System fails fast with "No paper detected in feeder" when ADF is empty, not a generic error
 - [ ] **SCAN-11**: Only one scan job runs at a time; concurrent requests are queued
 - [ ] **SCAN-12**: All scanning runs in a background worker thread, never blocking the web request handler
@@ -151,8 +151,8 @@
 | SCAN-05 | Phase 2 | Pending |
 | SCAN-06 | Phase 2 | Pending |
 | SCAN-07 | Phase 2 | Pending |
-| SCAN-08 | Phase 2 | Pending |
-| SCAN-09 | Phase 2 | Pending |
+| SCAN-08 | Phase 2 | Complete |
+| SCAN-09 | Phase 2 | Complete |
 | SCAN-10 | Phase 2 | Pending |
 | SCAN-11 | Phase 2 | Pending |
 | SCAN-12 | Phase 2 | Pending |
