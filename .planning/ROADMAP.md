@@ -110,7 +110,10 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. `GET /api/paperless/test` returns JSON with connection status distinguishing connected/token_rejected/unreachable
   2. Worker emits ASSEMBLING state before PDF assembly and UPLOADING state before paperless upload, visible in web UI status polling
-**Plans**: 0 plans
+**Plans**: 1 plans
+
+Plans:
+- [ ] 06-01-PLAN.md -- Paperless test route, worker ASSEMBLING/UPLOADING state transitions, and tests
 
 ## Progress
 
@@ -124,4 +127,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 3. Web UI | 1/4 | In Progress|  |
 | 4. Packaging and Deployment | 0/2 | Planning complete | - |
 | 5. Web Server Launch Command | 0/1 | Planning complete | - |
-| 6. Gap Closure Fixes | 0/0 | Gap closure | - |
+| 6. Gap Closure Fixes | 0/1 | Planning complete | - |
