@@ -133,6 +133,10 @@ class ScanWorker:
                 logger.info(msg)
                 if msg == "Awaiting flip...":
                     self._job_store.update_state(_jid, JobState.AWAITING_FLIP)
+                elif msg == "Assembling PDF...":
+                    self._job_store.update_state(_jid, JobState.ASSEMBLING)
+                elif msg == "Uploading to paperless-ngx...":
+                    self._job_store.update_state(_jid, JobState.UPLOADING)
 
             try:
                 request = PipelineRequest(
