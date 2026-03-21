@@ -5,12 +5,10 @@ status: passed
 score: 14/14 must-haves verified
 re_verification: false
 human_verification:
-  - test: "Load http://<host>:8080 in a browser on a separate LAN device"
-    expected: "Page renders with PicoCSS styling, profile dropdown, tags multi-select, correspondent dropdown, and Scan button. No layout breaks."
-    why_human: "CDN-loaded PicoCSS and HTMX require a real browser to verify rendering, responsive layout, and actual interactive behavior."
+  - test: "RESOLVED by Phase 7 Playwright tests — PicoCSS rendering, HTMX polling, form elements, flip prompt all verified in real browser (8 tests in tests/test_browser.py)"
   - test: "Submit a scan with a real scanner attached"
     expected: "Status area updates live every 1s during scanning, thumbnail appears after first page, flip prompt appears for duplex, history table refreshes on completion."
-    why_human: "Real-time HTMX polling behavior and actual scanner integration cannot be exercised by unit tests."
+    why_human: "Requires physical scanner hardware — cannot be stubbed"
 ---
 
 # Phase 3: Web UI Verification Report
@@ -111,17 +109,16 @@ No blocker anti-patterns found. No TODO/FIXME/placeholder comments in production
 
 ### Human Verification Required
 
-#### 1. Browser Rendering on LAN Device
+#### 1. Browser Rendering on LAN Device — RESOLVED
 
-**Test:** Open `http://<server-ip>:8080` in a browser on a separate device on the same LAN.
-**Expected:** Page renders with PicoCSS styles applied, responsive layout, all form elements visible, dark/light mode toggle works via `data-theme="auto"`.
-**Why human:** CDN-loaded PicoCSS and HTMX cannot be verified by unit tests. Network accessibility from another device requires a real environment.
+**Resolved by:** Phase 7 Playwright tests (`tests/test_browser.py`, 8 tests)
+**Covers:** PicoCSS styling, HTMX loading, form elements, profile dropdown, flip prompt visibility, dark mode, responsive layout, status area polling.
 
-#### 2. Live HTMX Polling During Active Scan
+#### 2. Live Scan with Physical Hardware
 
-**Test:** Submit a scan job from the web UI with a real or stubbed scanner.
-**Expected:** Status area updates every ~1 second showing state transitions (PENDING -> SCANNING -> ASSEMBLING -> UPLOADING -> DONE). Polling stops when terminal state is reached. History table refreshes automatically on DONE/ERROR.
-**Why human:** Real-time polling behavior, HTMX swap animations, and actual state transitions require a live browser session.
+**Test:** Submit a scan job from the web UI with a real scanner attached.
+**Expected:** Status area updates live showing state transitions, thumbnail appears, flip prompt works for duplex, history table refreshes.
+**Why human:** Requires physical scanner hardware — cannot be stubbed.
 
 ### Gaps Summary
 

@@ -5,12 +5,12 @@ status: passed
 score: 21/21 must-haves verified
 re_verification: false
 human_verification:
-  - test: "Run `saneless devices` on a machine with a physical scanner and libsane-dev installed"
+  - test: "Run `saneless devices` on a machine with a physical scanner attached"
     expected: "Table listing discovered SANE devices; no error"
-    why_human: "python-sane omitted from dependencies (no libsane-dev in build env); SaneBackend lazy-imports sane module which is absent in CI — cannot exercise real SANE path programmatically"
+    why_human: "Requires physical scanner hardware — cannot be stubbed"
   - test: "Run `saneless scan --title 'Test' --config /path/to/real.toml` against a real paperless-ngx instance"
     expected: "Output shows Scanning..., Assembling PDF..., Uploading to paperless-ngx..., Done: Test — then document appears in paperless-ngx"
-    why_human: "Full end-to-end requires physical scanner and live paperless-ngx; mocked in tests only"
+    why_human: "Requires physical scanner and live paperless-ngx instance — cannot be stubbed"
 ---
 
 # Phase 01: Core Pipeline Verification Report
@@ -139,15 +139,15 @@ One notable deviation: `python-sane` is not in `pyproject.toml` dependencies (de
 
 #### 1. Physical scanner discovery
 
-**Test:** On a machine with libsane-dev and a USB/network scanner attached, install the package, then run `saneless devices`
+**Test:** On a machine with a USB/network scanner attached, run `saneless devices`
 **Expected:** Table showing discovered device name, vendor, model, type; no error
-**Why human:** python-sane C extension requires libsane-dev system headers absent in the build environment; SaneBackend lazy-imports sane only when instantiated
+**Why human:** Requires physical scanner hardware — cannot be stubbed
 
 #### 2. Full end-to-end scan pipeline
 
 **Test:** Configure `saneless.toml` with a real scanner device and paperless-ngx URL/token, then run `saneless scan --title "Test Document"`
 **Expected:** Terminal prints "Scanning...", "Assembling PDF...", "Uploading to paperless-ngx...", "Done: Test Document" and the document appears in paperless-ngx inbox
-**Why human:** Requires physical scanner + live paperless-ngx instance; all individual units verified via mocks only
+**Why human:** Requires physical scanner and live paperless-ngx instance — cannot be stubbed
 
 ### Gaps Summary
 
