@@ -151,15 +151,15 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 6. Gap Closure Fixes | 0/1 | Planning complete | - |
 | 7. Tech Debt Cleanup | 0/2 | Planning complete | - |
 
-### Phase 8: audit lint and type checker ignores and noqas and fix them
+### Phase 8: Audit Lint and Type Checker Ignores
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Zero unjustified suppressions in production code -- fix every fixable # noqa and # type: ignore, document remaining justified ones, tighten per-file-ignores
+**Requirements**: AUDIT-01, AUDIT-02, AUDIT-03, AUDIT-04
 **Depends on:** Phase 7
-**Plans:** 0 plans
+**Plans:** 1 plan
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 8 to break down)
+- [ ] 08-01-PLAN.md -- Fix httpx type: ignore, document justified suppressions, tighten per-file-ignores
 
 ### Phase 9: enable pytest strict mode and ensure all tests are properly type annotated and pass all of the same linting and type checking quality checks as the normal code
 
