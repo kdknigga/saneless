@@ -116,6 +116,25 @@ async def health(request: Request) -> dict[str, str] | JSONResponse:
     )
 
 
+@router.get("/api/paperless/test", response_model=None)
+async def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
+    """
+    Test paperless-ngx connection status.
+
+    Returns JSON with status: connected, token_rejected, unreachable,
+    or error with detail on unexpected failures.
+    """
+    try:
+        status = request.app.state.paperless.test_connection()
+        return {"status": status}
+    except Exception as exc:
+        logger.warning("Paperless connection test failed: %s", exc)
+        return JSONResponse(
+            status_code=502,
+            content={"status": "error", "detail": str(exc)},
+        )
+
+
 @router.post("/api/scan")
 async def start_scan(
     request: Request,
