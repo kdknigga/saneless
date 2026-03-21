@@ -1,6 +1,7 @@
 """Tests for logging configuration."""
 
 import logging
+import logging.handlers
 import re
 
 from saneless.config import OutputConfig

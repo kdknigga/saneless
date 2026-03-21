@@ -128,6 +128,7 @@ docstring-code-line-length = "dynamic"
 "tests/**/*.py" = [
     "S101",   # assert is the test mechanism
     "ANN",    # test annotation coverage is Phase 9 scope
+    "ARG",    # unused args in ABC stubs and fixture overrides
     "PLC0415",  # lazy imports are test-inherent (77 occurrences)
     "S104", "S105", "S106",  # hardcoded test values are inherent to fixtures
 ]

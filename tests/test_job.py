@@ -111,6 +111,7 @@ class TestErrorCategory:
                 error_category=ErrorCategory.SCANNER,
             )
             fetched = store.get_job(job.id)
+            assert fetched is not None
             assert fetched.error_category == ErrorCategory.SCANNER
         finally:
             store.close()
@@ -142,6 +143,7 @@ class TestErrorCategory:
                 error_category=ErrorCategory.CONFIG,
             )
             fetched = store.get_job(job.id)
+            assert fetched is not None
             assert fetched.error_category == ErrorCategory.CONFIG
         finally:
             store.close()
