@@ -1,9 +1,9 @@
 ---
-status: diagnosed
+status: resolved
 phase: 01-core-pipeline
 source: [01-01-SUMMARY.md, 01-02-SUMMARY.md, 01-03-SUMMARY.md, 01-04-SUMMARY.md]
 started: 2026-03-21T15:00:00Z
-updated: 2026-03-21T15:00:00Z
+updated: 2026-03-21T15:09:00Z
 ---
 
 ## Current Test
@@ -59,7 +59,7 @@ skipped: 0
 ## Gaps
 
 - truth: "Config loading accepts title field in [default] section of config.toml"
-  status: failed
+  status: resolved
   reason: "User reported: Configuration error: 1 validation error for Settings default Extra inputs are not permitted [type=extra_forbidden, input_value={'title': 'Test Doc'}, input_type=dict]"
   severity: major
   test: 4
@@ -76,7 +76,7 @@ skipped: 0
   debug_session: ".planning/debug/config-extra-forbidden.md"
 
 - truth: "Environment variable override with SANELESS_ prefix works for nested config"
-  status: failed
+  status: resolved
   reason: "User reported: Same extra_forbidden validation error — config.toml with title field causes Pydantic to reject it before env var override is reached"
   severity: major
   test: 5
