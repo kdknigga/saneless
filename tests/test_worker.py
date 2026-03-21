@@ -477,6 +477,176 @@ class TestWorkerIntermediateStates:
             store.close()
 
 
+class TestWorkerErrorCategories:
+    """Worker sets correct ErrorCategory for each exception type."""
+
+    def test_feeder_empty_error_category(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
+        """FeederEmptyError sets ErrorCategory.FEEDER."""
+        from saneless.exceptions import FeederEmptyError
+        from saneless.job import ErrorCategory
+
+        def failing(*_a, **_k):
+            msg = "No paper"
+            raise FeederEmptyError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Feeder Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            fetched = store.get_job(job.id)
+            assert fetched.error_category == ErrorCategory.FEEDER
+        finally:
+            store.close()
+
+    def test_scan_error_category(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
+        """ScanError sets ErrorCategory.SCANNER."""
+        from saneless.job import ErrorCategory
+
+        def failing(*_a, **_k):
+            msg = "Scanner jam"
+            raise ScanError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Scanner Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            fetched = store.get_job(job.id)
+            assert fetched.error_category == ErrorCategory.SCANNER
+        finally:
+            store.close()
+
+    def test_paperless_error_category(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
+        """PaperlessError sets ErrorCategory.UPLOAD."""
+        from saneless.exceptions import PaperlessError
+        from saneless.job import ErrorCategory
+
+        def failing(*_a, **_k):
+            msg = "Upload failed"
+            raise PaperlessError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Upload Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            fetched = store.get_job(job.id)
+            assert fetched.error_category == ErrorCategory.UPLOAD
+        finally:
+            store.close()
+
+    def test_config_error_category(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
+        """ConfigError sets ErrorCategory.CONFIG."""
+        from saneless.exceptions import ConfigError
+        from saneless.job import ErrorCategory
+
+        def failing(*_a, **_k):
+            msg = "Bad config"
+            raise ConfigError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Config Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            fetched = store.get_job(job.id)
+            assert fetched.error_category == ErrorCategory.CONFIG
+        finally:
+            store.close()
+
+    def test_unknown_error_category(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
+        """Generic Exception sets ErrorCategory.UNKNOWN."""
+        from saneless.job import ErrorCategory
+
+        def failing(*_a, **_k):
+            msg = "Mystery"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Unknown Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            fetched = store.get_job(job.id)
+            assert fetched.error_category == ErrorCategory.UNKNOWN
+        finally:
+            store.close()
+
+
+class TestWorkerFlipTiming:
+    """Worker flip timing synchronization tests."""
+
+    def test_wait_transition_returns_true(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ):
+        """wait_transition returns True when event fires within timeout."""
+        from saneless.config import ProfileConfig
+
+        default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline", _mock_manual_duplex_pipeline
+        )
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("duplex", "Timing Test")
+            worker.submit(job)
+            for _ in range(50):
+                time.sleep(0.05)
+                if store.get_job(job.id).state == JobState.AWAITING_FLIP:
+                    break
+            worker.continue_flip()
+            result = worker.wait_transition(timeout=2.0)
+            assert result is True
+            worker.stop()
+        finally:
+            store.close()
+
+    def test_wait_transition_timeout(
+        self, mock_scanner, mock_paperless, default_settings
+    ):
+        """wait_transition returns False when timeout expires."""
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            result = worker.wait_transition(timeout=0.1)
+            assert result is False
+        finally:
+            store.close()
+
+
 class TestScanWorkerQueuing:
     """Worker sequential queuing tests."""
 

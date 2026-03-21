@@ -1,13 +1,14 @@
 """
-JobStore list and prune operation tests.
+JobStore list, prune, and error category tests.
 
-Covers requirements: UI-05, UI-06.
+Covers requirements: UI-05, UI-06, PKG-01.
 """
 
+import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 
-from saneless.job import JobStore
+from saneless.job import JobState, JobStore
 
 
 def test_list_recent() -> None:
@@ -74,3 +75,73 @@ def test_prune_no_deletions() -> None:
 
     deleted = store.prune(max_age_days=365, max_rows=500)
     assert deleted == 0
+
+
+class TestErrorCategory:
+    """ErrorCategory enum and JobStore integration tests."""
+
+    def test_error_category_enum_values(self):
+        """ErrorCategory has all five expected values."""
+        from saneless.job import ErrorCategory
+
+        assert ErrorCategory.FEEDER == "FEEDER"
+        assert ErrorCategory.CONFIG == "CONFIG"
+        assert ErrorCategory.SCANNER == "SCANNER"
+        assert ErrorCategory.UPLOAD == "UPLOAD"
+        assert ErrorCategory.UNKNOWN == "UNKNOWN"
+
+    def test_job_error_category_defaults_none(self):
+        """Job.error_category field defaults to None."""
+        from saneless.job import Job
+
+        job = Job(id="test", profile="default", title="Test")
+        assert job.error_category is None
+
+    def test_jobstore_persists_error_category(self):
+        """JobStore persists and retrieves error_category from SQLite."""
+        from saneless.job import ErrorCategory
+
+        store = JobStore()
+        try:
+            job = store.create_job("default", "Cat Test")
+            store.update_state(
+                job.id,
+                JobState.ERROR,
+                error="boom",
+                error_category=ErrorCategory.SCANNER,
+            )
+            fetched = store.get_job(job.id)
+            assert fetched.error_category == ErrorCategory.SCANNER
+        finally:
+            store.close()
+
+    def test_jobstore_migration_adds_column(self, tmp_path):
+        """Opening a pre-existing DB without error_category column succeeds."""
+        from saneless.job import ErrorCategory
+
+        db_path = str(tmp_path / "migrate.db")
+        # Create old-schema DB
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, profile TEXT NOT NULL, title TEXT NOT NULL,
+            state TEXT NOT NULL, error TEXT, tags TEXT NOT NULL,
+            correspondent INTEGER, thumbnail TEXT, created_at TEXT NOT NULL
+        )"""
+        )
+        conn.commit()
+        conn.close()
+        # Open with new JobStore -- should add error_category column
+        store = JobStore(db_path=db_path)
+        try:
+            job = store.create_job("default", "Migration Test")
+            store.update_state(
+                job.id,
+                JobState.ERROR,
+                error="test",
+                error_category=ErrorCategory.CONFIG,
+            )
+            fetched = store.get_job(job.id)
+            assert fetched.error_category == ErrorCategory.CONFIG
+        finally:
+            store.close()
