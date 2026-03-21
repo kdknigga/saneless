@@ -9,7 +9,7 @@
 ## Commands
 
 ```bash
-uv run fathom              # Run the application
+uv run saneless              # Run the application
 uv run ruff check .        # Lint
 uv run ruff check --fix .  # Lint with auto-fix
 uv run ruff format .       # Format code
