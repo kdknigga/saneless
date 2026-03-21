@@ -16,11 +16,11 @@ No new features, no UI changes, no pipeline restructuring. This is cleanup and h
 ## Implementation Decisions
 
 ### python-sane packaging
-- Declare `python-sane` as an optional dependency group: `pip install saneless[sane]`
-- Add `[project.optional-dependencies] sane = ["python-sane"]` to pyproject.toml
-- Dockerfile installs the `[sane]` extra: `pip install /tmp/*.whl[sane]` (or equivalent)
-- Lazy import pattern in `sane_backend.py` remains — the optional extra handles deployment, lazy import handles test collection
-- Document in README that `libsane-dev` system headers are required for the `[sane]` extra
+- `python-sane` is a mandatory dependency — the application cannot function without it
+- Add `"python-sane>=2.9.1"` to the main `dependencies` list in pyproject.toml
+- Dockerfile already has `libsane` in runtime stage — `python-sane` compiles during `pip install`
+- Lazy import pattern in `sane_backend.py` remains for dev convenience (test collection without C extension)
+- README documents that `libsane-dev` (Debian) or `sane-backends-devel` (RHEL/Fedora) system headers are required before `pip install`
 
 ### Starlette TemplateResponse deprecation
 - Fix all 10 call sites in `src/saneless/web/routes.py` to use the new Starlette signature
@@ -87,8 +87,8 @@ No new features, no UI changes, no pipeline restructuring. This is cleanup and h
 - `src/saneless/worker.py` — `continue_flip()` method and `_flip_event` threading.Event
 
 ### Packaging
-- `pyproject.toml` lines 23-33 — Current dependencies (python-sane absent)
-- `Dockerfile` — Two-stage build, runtime installs `libsane` but not `python-sane`
+- `pyproject.toml` lines 23-33 — Dependencies (python-sane is mandatory, requires libsane-dev headers)
+- `Dockerfile` — Two-stage build, runtime has `libsane` for python-sane compilation
 - `src/saneless/scanner/sane_backend.py` — Lazy import of `sane` module
 
 ### Existing test patterns
@@ -114,7 +114,7 @@ No new features, no UI changes, no pipeline restructuring. This is cleanup and h
 - Exception hierarchy: All custom exceptions inherit from `SanelessError` — new `ErrorCategory` fits alongside
 - Worker state machine: `_status_cb` maps pipeline status strings to `JobState` values — error categorization follows same pattern
 - Web tests: httpx `TestClient` with `create_app()` — Playwright tests would use same app factory but with real browser
-- Optional dependencies: No existing pattern — this would be the first optional extra in pyproject.toml
+- System dependency documentation: README must note libsane-dev/sane-backends-devel requirement
 
 ### Integration Points
 - `JobStore.update_state()` — needs `error_category` parameter added
@@ -132,7 +132,7 @@ No new features, no UI changes, no pipeline restructuring. This is cleanup and h
 - Error categorization should match the exception hierarchy: each exception class maps to exactly one category
 - Flip timing fix extends the existing `_flip_event` threading.Event pattern — not a new mechanism
 - Playwright tests should use CDN-loaded PicoCSS and HTMX (same as production) to catch real rendering issues
-- python-sane optional extra follows the established Python packaging convention for C-extension dependencies
+- python-sane is mandatory — a scanning app that installs without error but can't scan is worse than a loud build failure prompting the user to install libsane-dev
 
 </specifics>
 

@@ -70,7 +70,7 @@ None — all v1 requirements validated.
 
 ## Constraints
 
-- **Runtime**: Python 3.14+, `libsane` only required system package
+- **Runtime**: Python 3.14+, `libsane-dev` (or `sane-backends-devel`) required for `python-sane` compilation
 - **Scanner protocol**: `python-sane` via `saned` network backend only in v1
 - **Container**: No `--privileged` required; USB passthrough handled by `saned`
 - **Credentials**: API token via config file or env var, never baked into image

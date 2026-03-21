@@ -52,7 +52,7 @@ completed: 2026-03-21
 
 # Phase 7 Plan 1: Backend Hardening Summary
 
-**Optional python-sane dependency, ErrorCategory enum with 5 typed exception handlers, and threading.Event flip timing synchronization**
+**Mandatory python-sane dependency, ErrorCategory enum with 5 typed exception handlers, and threading.Event flip timing synchronization**
 
 ## Performance
 
@@ -63,7 +63,7 @@ completed: 2026-03-21
 - **Files modified:** 7
 
 ## Accomplishments
-- python-sane declared as optional `[sane]` extra, Dockerfile installs it, closing packaging gap
+- python-sane declared as mandatory dependency in pyproject.toml, closing packaging gap
 - ErrorCategory enum (FEEDER/CONFIG/SCANNER/UPLOAD/UNKNOWN) replaces bare except block with typed error classification
 - Flip timing race condition fixed: continue_flip route waits on threading.Event before responding
 - pytest-playwright added as dev dependency for Plan 02 browser testing

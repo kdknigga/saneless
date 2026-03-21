@@ -122,7 +122,7 @@ Plans:
 **Requirements**: PKG-01, UI-01, UI-02, UI-03, ARCH-02
 **Tech Debt Closure:** Closes 5 of 6 tech debt items from v1.0 audit (1 deferred: physical scanner verification)
 **Success Criteria** (what must be TRUE):
-  1. `python-sane` is available as an optional dependency and Dockerfile installs it correctly
+  1. `python-sane` is a mandatory dependency in `pyproject.toml` and Dockerfile installs it correctly
   2. Zero Starlette `TemplateResponse` deprecation warnings across all 13 call sites
   3. `JobState` distinguishes error categories (feeder, config, scanner, upload) rather than relying on error message text
   4. POST to `/api/flip/continue` returns response only after worker has transitioned out of `AWAITING_FLIP` state
@@ -130,7 +130,7 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 07-01-PLAN.md -- Backend hardening: python-sane optional dep, ErrorCategory enum, typed exception handling, flip timing synchronization
+- [ ] 07-01-PLAN.md -- Backend hardening: python-sane mandatory dep, ErrorCategory enum, typed exception handling, flip timing synchronization
 - [ ] 07-02-PLAN.md -- Playwright browser tests for PicoCSS rendering, HTMX polling, flip prompt UI, scan form
 
 ## Progress

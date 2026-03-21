@@ -21,8 +21,8 @@ re_verification: false
 
 | #   | Truth | Status | Evidence |
 | --- | ----- | ------ | -------- |
-| 1   | python-sane is an optional dependency installable via pip install saneless[sane] | ✓ VERIFIED | `[project.optional-dependencies]` with `sane = ["python-sane>=2.9.1"]` in pyproject.toml line 43-44 |
-| 2   | Dockerfile installs the sane extra so python-sane is available in container | ✓ VERIFIED | `'/tmp/saneless-*.whl[sane]'` on Dockerfile line 14 |
+| 1   | python-sane is a mandatory dependency in pyproject.toml | ✓ VERIFIED | `"python-sane>=2.9.1"` in main `dependencies` list in pyproject.toml |
+| 2   | Dockerfile installs python-sane as part of the wheel (libsane already in runtime image) | ✓ VERIFIED | `pip install --no-cache-dir /tmp/*.whl` with `libsane` in apt-get install |
 | 3   | Worker categorizes errors by exception type (FEEDER, CONFIG, SCANNER, UPLOAD, UNKNOWN) | ✓ VERIFIED | `_categorize_error()` helper with isinstance chain in worker.py lines 123-142; all 5 categories present |
 | 4   | POST /api/flip/continue waits for worker state transition before responding | ✓ VERIFIED | `state.worker.wait_transition(timeout=2.0)` in routes.py line 297 |
 | 5   | Zero Starlette TemplateResponse deprecation warnings in test output | ✓ VERIFIED | `uv run pytest tests/test_web.py -W error::DeprecationWarning -x` exits 0, 19 passed |
@@ -39,8 +39,8 @@ re_verification: false
 
 | Artifact | Expected | Status | Details |
 | -------- | -------- | ------ | ------- |
-| `pyproject.toml` | Optional dependency group for python-sane | ✓ VERIFIED | `[project.optional-dependencies]` section with `sane = ["python-sane>=2.9.1"]`; `pytest-playwright>=0.7.0` in dev group; `browser` marker in `[tool.pytest.ini_options]` |
-| `Dockerfile` | Container installs sane extra | ✓ VERIFIED | `pip install --no-cache-dir '/tmp/saneless-*.whl[sane]'` on line 14 |
+| `pyproject.toml` | python-sane as mandatory dependency | ✓ VERIFIED | `"python-sane>=2.9.1"` in main `dependencies` list; `pytest-playwright>=0.7.0` in dev group; `browser` marker in `[tool.pytest.ini_options]` |
+| `Dockerfile` | Container compiles python-sane via libsane | ✓ VERIFIED | `pip install --no-cache-dir /tmp/*.whl` with `libsane` in runtime apt-get |
 | `src/saneless/job.py` | ErrorCategory enum and error_category field on Job | ✓ VERIFIED | `class ErrorCategory(StrEnum)` at line 36; `error_category: ErrorCategory | None = None` on Job dataclass at line 70; ALTER TABLE migration at lines 107-111 |
 | `src/saneless/worker.py` | Typed exception catches and transition event | ✓ VERIFIED | `_categorize_error()` method at lines 123-142; `self._transition_event = threading.Event()` at line 59; `wait_transition()` method at lines 98-111; `ErrorCategory` imported at line 17 |
 | `src/saneless/web/routes.py` | Flip continue route waits on transition event | ✓ VERIFIED | `state.worker.wait_transition(timeout=2.0)` at line 297 in `continue_flip` route |
@@ -66,7 +66,7 @@ re_verification: false
 
 | Requirement | Source Plan | Description | Phase 7 Contribution | Status |
 | ----------- | ----------- | ----------- | -------------------- | ------ |
-| PKG-01 | 07-01-PLAN | pip-installable Python package | Added optional `[sane]` extra to pyproject.toml; Dockerfile installs it | ✓ SATISFIED |
+| PKG-01 | 07-01-PLAN | pip-installable Python package | python-sane added as mandatory dependency in pyproject.toml; Dockerfile runtime has libsane for compilation | ✓ SATISFIED |
 | ARCH-02 | 07-01-PLAN | Background worker thread with queue.Queue | Hardened: typed error categorization, flip timing synchronization | ✓ SATISFIED |
 | UI-01 | 07-02-PLAN | Web UI accessible from any browser | Browser-verified via Playwright: form elements, profile dropdown, title field, scan button all render correctly | ✓ SATISFIED |
 | UI-02 | 07-02-PLAN | Live status indicator shows job state via polling | Browser-verified via Playwright: HTMX loaded, status area element present | ✓ SATISFIED |
