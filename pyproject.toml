@@ -142,6 +142,11 @@ testpaths = ["tests"]
 markers = [
     "browser: Playwright browser tests (requires chromium)",
 ]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+strict_markers = true
+strict_config = true
+xfail_strict = true
+filterwarnings = ["error"]
 
 [dependency-groups]
 dev = [
