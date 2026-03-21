@@ -215,7 +215,7 @@ class PaperlessClient:
 
         """
         try:
-            response = self._client.get("/api/")
+            response = self._client.get("/api/tags/", params={"page_size": 1})
             if response.status_code in (401, 403):
                 return "token_rejected"
             return "connected"
