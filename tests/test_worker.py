@@ -413,6 +413,70 @@ class TestScanWorkerManualDuplex:
             store.close()
 
 
+class TestWorkerIntermediateStates:
+    """Worker emits ASSEMBLING and UPLOADING intermediate states (UI-02)."""
+
+    def test_worker_assembling_state(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ) -> None:
+        """Worker sets ASSEMBLING when pipeline emits 'Assembling PDF...'."""
+        states_seen: list[str] = []
+        store = JobStore()
+        try:
+            original_update = store.update_state
+
+            def tracking_update(job_id, state, **kw):
+                states_seen.append(state)
+                original_update(job_id, state, **kw)
+
+            store.update_state = tracking_update
+
+            def fake_pipeline(_scanner, _paperless, _settings, request):
+                if request.status_callback:
+                    request.status_callback("Assembling PDF...")
+
+            monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Assembling Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            assert JobState.ASSEMBLING in states_seen
+        finally:
+            store.close()
+
+    def test_worker_uploading_state(
+        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+    ) -> None:
+        """Worker sets UPLOADING when pipeline emits 'Uploading to paperless-ngx...'."""
+        states_seen: list[str] = []
+        store = JobStore()
+        try:
+            original_update = store.update_state
+
+            def tracking_update(job_id, state, **kw):
+                states_seen.append(state)
+                original_update(job_id, state, **kw)
+
+            store.update_state = tracking_update
+
+            def fake_pipeline(_scanner, _paperless, _settings, request):
+                if request.status_callback:
+                    request.status_callback("Uploading to paperless-ngx...")
+
+            monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Uploading Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            assert JobState.UPLOADING in states_seen
+        finally:
+            store.close()
+
+
 class TestScanWorkerQueuing:
     """Worker sequential queuing tests."""
 
