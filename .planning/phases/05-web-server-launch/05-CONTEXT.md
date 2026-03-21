@@ -22,8 +22,8 @@ Add `saneless serve` CLI command that starts the FastAPI web server with proper 
 - Uses `uvicorn.run()` programmatically to start the server
 
 ### Logging integration
-- `serve` command calls `configure_logging()` before `uvicorn.run()`, same pattern as `scan`/`devices`/`jobs` commands
-- Uvicorn's own loggers configured to use the same rotating file handler as the application
+- `configure_logging()` is called in the CLI group callback before any subcommand runs (including `serve`) — the serve command body does NOT call it again (same as `scan`/`devices`/`jobs` which also rely on the group callback)
+- Uvicorn's own loggers configured to use the same rotating file handler via `log_config=None` (disables uvicorn's default dictConfig, lets loggers propagate to root)
 - `--verbose` flag (inherited from CLI group) enables uvicorn debug logging and stderr output
 - Uvicorn access log format matches application log format for consistency in the rotating log file
 
