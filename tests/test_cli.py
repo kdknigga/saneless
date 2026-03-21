@@ -513,3 +513,96 @@ class TestJobsCommand:
         assert result.exit_code == 0
         data = json.loads(result.output)
         assert data == []
+
+
+class TestServeCommand:
+    """Serve command tests."""
+
+    def test_serve_calls_uvicorn_defaults(self, monkeypatch):
+        """Serve with no flags calls uvicorn.run with config defaults."""
+        captured = {}
+
+        def mock_uvicorn_run(app, **kwargs):
+            """Capture uvicorn.run arguments."""
+            captured["app"] = app
+            captured.update(kwargs)
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        runner, _settings = _patch_cli(monkeypatch)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 0
+        assert captured["host"] == "0.0.0.0"
+        assert captured["port"] == 8080
+        assert captured["log_config"] is None
+        assert captured["access_log"] is True
+
+    def test_serve_custom_host_port(self, monkeypatch):
+        """Serve --host/--port overrides config defaults."""
+        captured = {}
+
+        def mock_uvicorn_run(_app, **kwargs):
+            """Capture uvicorn.run arguments."""
+            captured.update(kwargs)
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        runner, _ = _patch_cli(monkeypatch)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "9090"])
+        assert result.exit_code == 0
+        assert captured["host"] == "127.0.0.1"
+        assert captured["port"] == 9090
+
+    def test_serve_log_level(self, monkeypatch):
+        """Serve passes log_level from settings to uvicorn."""
+        captured = {}
+
+        def mock_uvicorn_run(_app, **kwargs):
+            """Capture uvicorn.run arguments."""
+            captured.update(kwargs)
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        runner, _ = _patch_cli(monkeypatch)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 0
+        assert captured["log_level"] == "info"
+
+    def test_serve_prints_address(self, monkeypatch):
+        """Serve prints listening address to stdout."""
+        monkeypatch.setattr("saneless.cli.uvicorn.run", lambda *_a, **_kw: None)
+        runner, _ = _patch_cli(monkeypatch)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 0
+        assert "Serving on http://0.0.0.0:8080" in result.output
+
+    def test_serve_help(self, monkeypatch):
+        """Serve --help shows --host and --port options."""
+        runner, _ = _patch_cli(monkeypatch)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["serve", "--help"])
+        assert result.exit_code == 0
+        assert "--host" in result.output
+        assert "--port" in result.output
+
+    def test_serve_receives_app(self, monkeypatch):
+        """Serve passes a FastAPI app (not None) to uvicorn.run."""
+        captured = {}
+
+        def mock_uvicorn_run(app, **_kwargs):
+            """Capture the app argument."""
+            captured["app"] = app
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        runner, _ = _patch_cli(monkeypatch)
+        from saneless.cli import cli
+
+        result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 0
+        assert captured["app"] is not None
