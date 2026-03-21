@@ -283,10 +283,12 @@ class TestConnectionTest:
     """Connection test method tests."""
 
     def test_test_connection_connected(self) -> None:
-        """Connection test returns 'connected' on 200 response."""
+        """Connection test returns 'connected' on 200 from /api/tags/."""
 
-        def handler(_request):
-            return httpx.Response(200, json={"status": "ok"})
+        def handler(request):
+            assert "/api/tags/" in str(request.url)
+            assert "page_size=1" in str(request.url)
+            return httpx.Response(200, json={"count": 0, "results": []})
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -297,10 +299,12 @@ class TestConnectionTest:
         assert client.test_connection() == "connected"
         client.close()
 
-    def test_test_connection_token_rejected(self) -> None:
-        """Connection test returns 'token_rejected' on 401 response."""
+    def test_test_connection_token_rejected_401(self) -> None:
+        """Connection test returns 'token_rejected' on 401 from /api/tags/."""
 
-        def handler(_request):
+        def handler(request):
+            assert "/api/tags/" in str(request.url)
+            assert "page_size=1" in str(request.url)
             return httpx.Response(401, text="Unauthorized")
 
         transport = _make_transport(handler)
@@ -308,6 +312,23 @@ class TestConnectionTest:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=auth,
+            _transport=transport,
+        )
+        assert client.test_connection() == "token_rejected"
+        client.close()
+
+    def test_test_connection_token_rejected_403(self) -> None:
+        """Connection test returns 'token_rejected' on 403 from /api/tags/."""
+
+        def handler(request):
+            assert "/api/tags/" in str(request.url)
+            assert "page_size=1" in str(request.url)
+            return httpx.Response(403, text="Forbidden")
+
+        transport = _make_transport(handler)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
             _transport=transport,
         )
         assert client.test_connection() == "token_rejected"
