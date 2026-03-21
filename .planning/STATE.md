@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Phase 9 context gathered
-last_updated: "2026-03-21T20:22:23.318Z"
+stopped_at: Completed 09-01-PLAN.md
+last_updated: "2026-03-21T20:58:22.492Z"
 last_activity: 2026-03-21
 progress:
-  total_phases: 9
+  total_phases: 10
   completed_phases: 8
-  total_plans: 20
-  completed_plans: 20
+  total_plans: 23
+  completed_plans: 21
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 08 — audit-lint-and-type-checker-ignores-and-noqas-and-fix-them
+**Current focus:** Phase 09 — enable-pytest-strict-mode-and-ensure-all-tests-are-properly-type-annotated-and-pass-all-of-the-same-linting-and-type-checking-quality-checks-as-the-normal-code
 
 ## Current Position
 
-Phase: 08 (audit-lint-and-type-checker-ignores-and-noqas-and-fix-them) — EXECUTING
-Plan: 1 of 1
+Phase: 09 (enable-pytest-strict-mode-and-ensure-all-tests-are-properly-type-annotated-and-pass-all-of-the-same-linting-and-type-checking-quality-checks-as-the-normal-code) — EXECUTING
+Plan: 2 of 3
 
 ## Performance Metrics
 
@@ -66,6 +66,7 @@ Plan: 1 of 1
 | Phase 01 P05 | 3min | 2 tasks | 2 files |
 | Phase 06 P02 | 1min | 1 tasks | 2 files |
 | Phase 08 P01 | 3min | 2 tasks | 6 files |
+| Phase 09 P01 | 8min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -114,11 +115,15 @@ Recent decisions affecting current work:
 - [Phase 06]: Gap closure complete -- PLSS-03 and UI-02 requirements fully satisfied
 - [Phase 08]: httpx._types.FileTypes via TYPE_CHECKING guard for multipart upload typing
 - [Phase 08]: PLC0415 retained for tests (77 lazy imports); TCH/T201/PLR* removed (0 violations each)
+- [Phase 09]: ARG rule ignored for tests via per-file-ignores (ABC stubs have legitimately unused params)
+- [Phase 09]: _FakeSaneDevice with pluggable callables and real methods for SaneDevice protocol compliance
+- [Phase 09]: Type-narrowing helpers (_get, _app) centralize None checks in test code
 
 ### Roadmap Evolution
 
 - Phase 8 added: Audit lint and type checker ignores and noqas and fix them
 - Phase 9 added: Enable pytest strict mode and ensure all tests pass the same linting and type checking quality checks as normal code
+- Phase 10 added: Automatic scanner profile creation
 
 ### Pending Todos
 
@@ -138,6 +143,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-21
-Last session: 2026-03-21T20:22:23.315Z
-Stopped at: Phase 9 context gathered
-Resume file: .planning/phases/09-enable-pytest-strict-mode-and-ensure-all-tests-are-properly-type-annotated-and-pass-all-of-the-same-linting-and-type-checking-quality-checks-as-the-normal-code/09-CONTEXT.md
+Last session: 2026-03-21T20:58:22.489Z
+Stopped at: Completed 09-01-PLAN.md
+Resume file: None
