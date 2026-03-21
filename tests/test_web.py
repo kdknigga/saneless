@@ -7,9 +7,12 @@ HLTH-01, HLTH-02, LOG-03.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 from fastapi.testclient import TestClient
 from PIL import Image
 

@@ -1,8 +1,13 @@
 """Tests for scanner abstraction layer (ABC + SaneBackend)."""
 
+from __future__ import annotations
+
 import threading
-from collections.abc import Iterator
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 import pytest
 from PIL import Image, ImageDraw
