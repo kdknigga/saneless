@@ -12,13 +12,15 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+
+from saneless.exceptions import ConfigError
 
 if TYPE_CHECKING:
     from pydantic_settings.main import InitSettingsSource
@@ -51,12 +53,14 @@ class PaperlessConfig(BaseModel):
 class ProfileConfig(BaseModel):
     """Scan profile configuration."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     source: str = "Flatbed"
     resolution: int = 300
     mode: str = "color"
     default_tags: list[int] = []
     default_correspondent: int | None = None
-    default_title_template: str = ""
+    default_title_template: str = Field(default="", alias="title")
     empty_page_mean_threshold: float = 250.0
     empty_page_stddev_threshold: float = 5.0
 
@@ -137,6 +141,39 @@ class Settings(BaseSettings):
         return v
 
 
+_VALID_SECTIONS = ("scanner", "paperless", "output", "profiles")
+
+
+def _build_settings(
+    toml_file: Path | None = None,
+) -> Settings:
+    """Build Settings, converting extra-field errors to user-friendly messages."""
+    try:
+        if toml_file is not None:
+            return Settings(_toml_file=toml_file)  # type: ignore[call-arg]
+        return Settings()
+    except ValidationError as exc:
+        extra_fields: list[str] = []
+        for err in exc.errors():
+            if err["type"] == "extra_forbidden":
+                loc = err.get("loc", ())
+                if loc:
+                    extra_fields.append(str(loc[0]))
+
+        if extra_fields:
+            names = ", ".join(repr(f) for f in extra_fields)
+            valid = ", ".join(_VALID_SECTIONS)
+            hints = [f"Did you mean [profiles.{f}]?" for f in extra_fields]
+            hint_text = " ".join(hints)
+            msg = (
+                f"Unknown config section {names}. "
+                f"Valid top-level sections: {valid}. {hint_text}"
+            )
+            raise ConfigError(msg) from exc
+
+        raise
+
+
 def load_settings(config_path: str | None = None) -> Settings:
     """
     Load settings from TOML file with env var overrides.
@@ -150,11 +187,11 @@ def load_settings(config_path: str | None = None) -> Settings:
         Fully validated Settings instance.
 
     Raises:
-        Exception: If the TOML file is malformed or validation fails.
+        ConfigError: If the TOML file has unrecognized top-level sections.
 
     """
     if config_path:
-        return Settings(_toml_file=Path(config_path))  # type: ignore[call-arg]
+        return _build_settings(toml_file=Path(config_path))
 
     search_paths = [
         Path("./saneless.toml"),
@@ -164,7 +201,7 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     for path in search_paths:
         if path.exists():
-            return Settings(_toml_file=path)  # type: ignore[call-arg]
+            return _build_settings(toml_file=path)
 
     # No config file found -- use defaults + env vars only
-    return Settings()
+    return _build_settings()
