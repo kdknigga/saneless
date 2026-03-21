@@ -136,10 +136,8 @@ docstring-code-line-length = "dynamic"
 "src/saneless/config.py" = ["S104"]
 
 [tool.ty.src]
-exclude = ["tests/"]
 
 [tool.pyrefly]
-project_excludes = ["tests/"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

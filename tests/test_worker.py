@@ -3,8 +3,15 @@
 import time
 
 from saneless.exceptions import ScanError
-from saneless.job import JobState, JobStore
+from saneless.job import Job, JobState, JobStore
 from saneless.worker import ScanWorker
+
+
+def _get(store: JobStore, job_id: str) -> Job:
+    """Retrieve a job, asserting it exists (narrows Job | None to Job)."""
+    fetched = store.get_job(job_id)
+    assert fetched is not None
+    return fetched
 
 
 class TestJobStateTransitions:
@@ -18,16 +25,16 @@ class TestJobStateTransitions:
             assert job.state == JobState.PENDING
 
             store.update_state(job.id, JobState.SCANNING)
-            assert store.get_job(job.id).state == JobState.SCANNING
+            assert _get(store, job.id).state == JobState.SCANNING
 
             store.update_state(job.id, JobState.ASSEMBLING)
-            assert store.get_job(job.id).state == JobState.ASSEMBLING
+            assert _get(store, job.id).state == JobState.ASSEMBLING
 
             store.update_state(job.id, JobState.UPLOADING)
-            assert store.get_job(job.id).state == JobState.UPLOADING
+            assert _get(store, job.id).state == JobState.UPLOADING
 
             store.update_state(job.id, JobState.DONE)
-            assert store.get_job(job.id).state == JobState.DONE
+            assert _get(store, job.id).state == JobState.DONE
         finally:
             store.close()
 
@@ -43,7 +50,7 @@ class TestJobStateTransitions:
                 job = store.create_job("default", "Test Doc")
                 store.update_state(job.id, start_state)
                 store.update_state(job.id, JobState.ERROR, error="Something broke")
-                fetched = store.get_job(job.id)
+                fetched = _get(store, job.id)
                 assert fetched.state == JobState.ERROR
                 assert fetched.error == "Something broke"
         finally:
@@ -61,7 +68,7 @@ class TestJobStore:
             assert job.id is not None
             assert len(job.id) > 0
 
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched is not None
             assert fetched.id == job.id
             assert fetched.profile == "default"
@@ -76,7 +83,7 @@ class TestJobStore:
         try:
             job = store.create_job("default", "Test")
             store.update_state(job.id, JobState.SCANNING)
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.state == JobState.SCANNING
         finally:
             store.close()
@@ -124,7 +131,7 @@ class TestJobThumbnail:
         try:
             job = store.create_job("default", "Thumb Test")
             store.update_thumbnail(job.id, "base64data")
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.thumbnail == "base64data"
         finally:
             store.close()
@@ -169,7 +176,7 @@ class TestScanWorker:
             time.sleep(0.5)
             worker.stop()
 
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.state == JobState.DONE
         finally:
             store.close()
@@ -199,8 +206,9 @@ class TestScanWorker:
             time.sleep(0.5)
             worker.stop()
 
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.state == JobState.ERROR
+            assert fetched.error is not None
             assert "Scanner on fire" in fetched.error
         finally:
             store.close()
@@ -247,11 +255,11 @@ class TestScanWorkerManualDuplex:
             # Wait for the pipeline to reach AWAITING_FLIP
             for _ in range(50):
                 time.sleep(0.05)
-                fetched = store.get_job(job.id)
+                fetched = _get(store, job.id)
                 if fetched.state == JobState.AWAITING_FLIP:
                     break
 
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.state == JobState.AWAITING_FLIP
 
             # Continue the flip
@@ -260,7 +268,7 @@ class TestScanWorkerManualDuplex:
             time.sleep(0.5)
             worker.stop()
 
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.state == JobState.DONE
         finally:
             store.close()
@@ -289,7 +297,7 @@ class TestScanWorkerManualDuplex:
             # Wait for AWAITING_FLIP
             for _ in range(50):
                 time.sleep(0.05)
-                fetched = store.get_job(job.id)
+                fetched = _get(store, job.id)
                 if fetched.state == JobState.AWAITING_FLIP:
                     break
 
@@ -298,8 +306,9 @@ class TestScanWorkerManualDuplex:
             time.sleep(0.5)
             worker.stop()
 
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.state == JobState.ERROR
+            assert fetched.error is not None
             assert "cancelled by user" in fetched.error
         finally:
             store.close()
@@ -328,11 +337,11 @@ class TestScanWorkerManualDuplex:
             # Wait for AWAITING_FLIP (thumbnail should be stored by now)
             for _ in range(50):
                 time.sleep(0.05)
-                fetched = store.get_job(job.id)
+                fetched = _get(store, job.id)
                 if fetched.state == JobState.AWAITING_FLIP:
                     break
 
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.thumbnail == "dGh1bWI="
 
             worker.continue_flip()
@@ -429,7 +438,7 @@ class TestWorkerIntermediateStates:
                 states_seen.append(state)
                 original_update(job_id, state, **kw)
 
-            store.update_state = tracking_update
+            monkeypatch.setattr(store, "update_state", tracking_update)
 
             def fake_pipeline(_scanner, _paperless, _settings, request):
                 if request.status_callback:
@@ -459,7 +468,7 @@ class TestWorkerIntermediateStates:
                 states_seen.append(state)
                 original_update(job_id, state, **kw)
 
-            store.update_state = tracking_update
+            monkeypatch.setattr(store, "update_state", tracking_update)
 
             def fake_pipeline(_scanner, _paperless, _settings, request):
                 if request.status_callback:
@@ -500,7 +509,7 @@ class TestWorkerErrorCategories:
             worker.submit(job)
             time.sleep(0.5)
             worker.stop()
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.FEEDER
         finally:
             store.close()
@@ -524,7 +533,7 @@ class TestWorkerErrorCategories:
             worker.submit(job)
             time.sleep(0.5)
             worker.stop()
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.SCANNER
         finally:
             store.close()
@@ -549,7 +558,7 @@ class TestWorkerErrorCategories:
             worker.submit(job)
             time.sleep(0.5)
             worker.stop()
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.UPLOAD
         finally:
             store.close()
@@ -574,7 +583,7 @@ class TestWorkerErrorCategories:
             worker.submit(job)
             time.sleep(0.5)
             worker.stop()
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.CONFIG
         finally:
             store.close()
@@ -598,7 +607,7 @@ class TestWorkerErrorCategories:
             worker.submit(job)
             time.sleep(0.5)
             worker.stop()
-            fetched = store.get_job(job.id)
+            fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.UNKNOWN
         finally:
             store.close()
@@ -625,7 +634,7 @@ class TestWorkerFlipTiming:
             worker.submit(job)
             for _ in range(50):
                 time.sleep(0.05)
-                if store.get_job(job.id).state == JobState.AWAITING_FLIP:
+                if _get(store, job.id).state == JobState.AWAITING_FLIP:
                     break
             worker.continue_flip()
             result = worker.wait_transition(timeout=2.0)
@@ -672,7 +681,7 @@ class TestScanWorkerQueuing:
             time.sleep(1.0)
             worker.stop()
 
-            assert store.get_job(job1.id).state == JobState.DONE
-            assert store.get_job(job2.id).state == JobState.DONE
+            assert _get(store, job1.id).state == JobState.DONE
+            assert _get(store, job2.id).state == JobState.DONE
         finally:
             store.close()

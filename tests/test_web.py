@@ -7,12 +7,13 @@ HLTH-01, HLTH-02, LOG-03.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -33,6 +34,15 @@ from saneless.scanner.base import (
 from saneless.web.app import create_app
 
 
+def _app(client: TestClient) -> FastAPI:
+    """Extract the FastAPI app from a TestClient, helping the type checker."""
+    app: Any = client.app
+    if not isinstance(app, FastAPI):
+        msg = "Expected FastAPI app"
+        raise TypeError(msg)
+    return app
+
+
 class StubScanner(ScannerBackend):
     """Minimal scanner backend for web tests that avoids ABC mock issues."""
 
@@ -40,7 +50,7 @@ class StubScanner(ScannerBackend):
         """Return an empty device list."""
         return []
 
-    def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """Return default capabilities."""
         return DeviceCapabilities(
             sources=["Flatbed"],
@@ -49,7 +59,7 @@ class StubScanner(ScannerBackend):
         )
 
     def scan_pages(
-        self, _device_id: str, _settings: ScanSettings
+        self, device_id: str, settings: ScanSettings
     ) -> Iterator[Image.Image]:
         """Yield a single white test image."""
         yield Image.new("RGB", (100, 100), "white")
@@ -157,10 +167,10 @@ def test_status_polling(client) -> None:
 
 def test_status_polling_active_job(client) -> None:
     """Active job triggers hx-trigger polling attributes (UI-02)."""
-    job_store: JobStore = client.app.state.job_store
+    job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Polling Test")
     job_store.update_state(job.id, JobState.SCANNING)
-    client.app.state.worker._current_job_id = job.id
+    _app(client).state.worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     assert response.status_code == 200
@@ -171,10 +181,10 @@ def test_status_polling_active_job(client) -> None:
 
 def test_flip_prompt(client) -> None:
     """AWAITING_FLIP state shows flip prompt with PRD wording (UI-03)."""
-    job_store: JobStore = client.app.state.job_store
+    job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Flip Test")
     job_store.update_state(job.id, JobState.AWAITING_FLIP)
-    client.app.state.worker._current_job_id = job.id
+    _app(client).state.worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     text_lower = response.text.lower()
@@ -185,11 +195,11 @@ def test_flip_prompt(client) -> None:
 
 def test_thumbnail_display(client) -> None:
     """Job with thumbnail shows base64 img tag (UI-04)."""
-    job_store: JobStore = client.app.state.job_store
+    job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Thumb Test")
     job_store.update_thumbnail(job.id, "dGVzdA==")
     job_store.update_state(job.id, JobState.SCANNING)
-    client.app.state.worker._current_job_id = job.id
+    _app(client).state.worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     assert "data:image/jpeg;base64,dGVzdA==" in response.text
@@ -197,7 +207,7 @@ def test_thumbnail_display(client) -> None:
 
 def test_job_history(client) -> None:
     """GET /api/jobs/history returns job list (UI-05)."""
-    job_store: JobStore = client.app.state.job_store
+    job_store: JobStore = _app(client).state.job_store
     titles = ["Job Alpha", "Job Beta", "Job Gamma"]
     for title in titles:
         job_store.create_job(profile="default", title=title)
@@ -210,10 +220,10 @@ def test_job_history(client) -> None:
 
 def test_error_display(client) -> None:
     """Error state shows error message in status area (LOG-03)."""
-    job_store: JobStore = client.app.state.job_store
+    job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Error Test")
     job_store.update_state(job.id, JobState.ERROR, error="Scanner disconnected")
-    client.app.state.worker._current_job_id = job.id
+    _app(client).state.worker._current_job_id = job.id
 
     response = client.get("/api/jobs/current/status")
     assert "Scanner disconnected" in response.text
@@ -239,7 +249,7 @@ def test_flip_abort(client) -> None:
 
 def test_paperless_test_connected(client: TestClient) -> None:
     """GET /api/paperless/test returns connected status (PLSS-03)."""
-    client.app.state.paperless.test_connection = lambda: "connected"
+    _app(client).state.paperless.test_connection = lambda: "connected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "connected"}
@@ -247,7 +257,7 @@ def test_paperless_test_connected(client: TestClient) -> None:
 
 def test_paperless_test_token_rejected(client: TestClient) -> None:
     """GET /api/paperless/test returns token_rejected status (PLSS-03)."""
-    client.app.state.paperless.test_connection = lambda: "token_rejected"
+    _app(client).state.paperless.test_connection = lambda: "token_rejected"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "token_rejected"}
@@ -255,7 +265,7 @@ def test_paperless_test_token_rejected(client: TestClient) -> None:
 
 def test_paperless_test_unreachable(client: TestClient) -> None:
     """GET /api/paperless/test returns unreachable status (PLSS-03)."""
-    client.app.state.paperless.test_connection = lambda: "unreachable"
+    _app(client).state.paperless.test_connection = lambda: "unreachable"
     response = client.get("/api/paperless/test")
     assert response.status_code == 200
     assert response.json() == {"status": "unreachable"}
@@ -268,7 +278,7 @@ def test_paperless_test_error(client: TestClient) -> None:
         msg = "boom"
         raise RuntimeError(msg)
 
-    client.app.state.paperless.test_connection = raise_exc
+    _app(client).state.paperless.test_connection = raise_exc
     response = client.get("/api/paperless/test")
     assert response.status_code == 502
     data = response.json()
@@ -278,10 +288,10 @@ def test_paperless_test_error(client: TestClient) -> None:
 
 def test_scan_button_disabled_during_active_job(client) -> None:
     """Scan button disabled during active job (UI-07)."""
-    job_store: JobStore = client.app.state.job_store
+    job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Active Job")
     job_store.update_state(job.id, JobState.SCANNING)
-    client.app.state.worker._current_job_id = job.id
+    _app(client).state.worker._current_job_id = job.id
 
     response = client.get("/")
     assert "disabled" in response.text
