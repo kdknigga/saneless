@@ -113,10 +113,11 @@ Plans:
 **Success Criteria** (what must be TRUE):
   1. `GET /api/paperless/test` returns JSON with connection status distinguishing connected/token_rejected/unreachable
   2. Worker emits ASSEMBLING state before PDF assembly and UPLOADING state before paperless upload, visible in web UI status polling
-**Plans**: 1 plans
+**Plans**: 2 plans
 
 Plans:
 - [ ] 06-01-PLAN.md -- Paperless test route, worker ASSEMBLING/UPLOADING state transitions, and tests
+- [ ] 06-02-PLAN.md -- Gap closure: fix test_connection to use auth-requiring endpoint (/api/tags/) instead of /api/
 
 ### Phase 7: Tech Debt Cleanup
 **Goal**: Address accumulated tech debt from v1.0 milestone audit — packaging gaps, deprecation warnings, error handling clarity, flip flow timing, and browser rendering verification
@@ -149,3 +150,23 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 5. Web Server Launch Command | 0/1 | Planning complete | - |
 | 6. Gap Closure Fixes | 0/1 | Planning complete | - |
 | 7. Tech Debt Cleanup | 0/2 | Planning complete | - |
+
+### Phase 8: audit lint and type checker ignores and noqas and fix them
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 7
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 8 to break down)
+
+### Phase 9: enable pytest strict mode and ensure all tests are properly type annotated and pass all of the same linting and type checking quality checks as the normal code
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 8
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 9 to break down)
