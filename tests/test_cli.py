@@ -1,12 +1,17 @@
 """Tests for CLI commands via click.testing.CliRunner."""
 
+from __future__ import annotations
+
 import json
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 from click.testing import CliRunner
-from PIL import Image
+from PIL import Image, ImageDraw
 
+from saneless.cli import cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -18,14 +23,20 @@ from saneless.exceptions import PaperlessError, ScanError
 from saneless.job import JobStore
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    import pytest
+
+
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
 _TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
 
 
-def _make_settings(**overrides):
+def _make_settings(**overrides: object) -> Settings:
     """Create a Settings instance with test defaults."""
     auth = "test-token"
-    defaults = {
+    defaults: dict[str, Any] = {
         "scanner": ScannerConfig(device="test:device:001"),
         "paperless": PaperlessConfig(
             url="http://localhost:8000",
@@ -44,7 +55,12 @@ def _make_settings(**overrides):
     return Settings(**defaults)
 
 
-def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None):
+def _patch_cli(
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings | None = None,
+    scanner_cls: type | None = None,
+    paperless_cls: type | None = None,
+) -> tuple[CliRunner, Settings]:
     """
     Patch cli module dependencies for testing.
 
@@ -68,7 +84,7 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
         class MockSaneBackend:
             """Mock scanner backend for CLI tests."""
 
-            def get_devices(self):
+            def get_devices(self) -> list[DeviceInfo]:
                 """Return two test scanner devices."""
                 return [
                     DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner"),
@@ -77,7 +93,7 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
                     ),
                 ]
 
-            def get_capabilities(self, _device_id):
+            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
                 """Return fixed test capabilities."""
                 return DeviceCapabilities(
                     sources=["Flatbed", "ADF"],
@@ -98,10 +114,10 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
                     ],
                 )
 
-            def scan_pages(self, _device_id, _settings):
+            def scan_pages(
+                self, _device_id: str, _settings: object
+            ) -> Iterator[Image.Image]:
                 """Return a single test image with content."""
-                from PIL import ImageDraw
-
                 img = Image.new("RGB", (100, 100), "white")
                 draw = ImageDraw.Draw(img)
                 draw.rectangle([10, 10, 90, 90], fill="black")
@@ -116,18 +132,18 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
         class MockPaperlessClient:
             """Mock paperless client for CLI tests."""
 
-            def __init__(self, *_args, **_kwargs):
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
                 """Accept and ignore all constructor arguments."""
 
-            def upload_document(self, *_args, **_kwargs):
+            def upload_document(self, *_args: object, **_kwargs: object) -> str:
                 """Return a fake task UUID."""
                 return "mock-task-uuid"
 
-            def poll_task(self, *_args, **_kwargs):
+            def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
                 """Return a successful task result."""
                 return {"status": "SUCCESS"}
 
-            def close(self):
+            def close(self) -> None:
                 """No-op close."""
 
         monkeypatch.setattr("saneless.cli.PaperlessClient", MockPaperlessClient)
@@ -138,30 +154,24 @@ def _patch_cli(monkeypatch, settings=None, scanner_cls=None, paperless_cls=None)
 class TestCliHelp:
     """CLI help text tests."""
 
-    def test_cli_help(self, monkeypatch):
+    def test_cli_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Main CLI --help shows usage information."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
-
         result = runner.invoke(cli, ["--help"])
         assert result.exit_code == 0
         assert "saneless" in result.output.lower() or "scan" in result.output.lower()
 
-    def test_scan_command_help(self, monkeypatch):
+    def test_scan_command_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan subcommand --help shows --profile and --title options."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
-
         result = runner.invoke(cli, ["scan", "--help"])
         assert result.exit_code == 0
         assert "--profile" in result.output
         assert "--title" in result.output
 
-    def test_devices_command_help(self, monkeypatch):
+    def test_devices_command_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Devices subcommand --help shows --json and --capabilities options."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
-
         result = runner.invoke(cli, ["devices", "--help"])
         assert result.exit_code == 0
         assert "--json" in result.output
@@ -171,116 +181,107 @@ class TestCliHelp:
 class TestScanCommand:
     """Scan command tests."""
 
-    def test_scan_requires_title(self, monkeypatch):
+    def test_scan_requires_title(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan without --title exits with non-zero code."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
-
         result = runner.invoke(cli, ["scan"])
         assert result.exit_code != 0
 
-    def test_scan_happy_path(self, monkeypatch):
+    def test_scan_happy_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan with --title succeeds and shows Done message."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
-
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 0
         assert "Done: Test" in result.output
 
-    def test_scan_status_output(self, monkeypatch):
+    def test_scan_status_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan shows progress messages during pipeline execution."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
-
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert "Scanning..." in result.output
         assert "Assembling PDF..." in result.output
         assert "Uploading to paperless-ngx..." in result.output
 
-    def test_scan_config_error(self, monkeypatch):
+    def test_scan_config_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Config loading fails -> exit code 2."""
         runner = CliRunner()
 
-        def bad_load(*_args, **_kwargs):
+        def bad_load(*_args: object, **_kwargs: object) -> None:
             msg = "bad config"
             raise ValueError(msg)
 
         monkeypatch.setattr("saneless.cli.load_settings", bad_load)
         monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: None)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 2
         assert "Configuration error" in result.output
 
-    def test_scan_scan_error(self, monkeypatch):
+    def test_scan_scan_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Pipeline raises ScanError -> exit code 1."""
 
         class FailScanner:
             """Scanner that always raises ScanError."""
 
-            def scan_pages(self, *_args, **_kwargs):
+            def scan_pages(self, *_args: object, **_kwargs: object) -> None:
                 """Raise a scan error."""
                 msg = "Paper jam"
                 raise ScanError(msg)
 
         runner, _ = _patch_cli(monkeypatch, scanner_cls=FailScanner)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 1
         assert "Paper jam" in result.output
 
-    def test_scan_paperless_error(self, monkeypatch):
+    def test_scan_paperless_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Pipeline raises PaperlessError -> exit code 3."""
 
         class FailPaperless:
             """Paperless client that always raises PaperlessError on upload."""
 
-            def __init__(self, *_a, **_kw):
+            def __init__(self, *_a: object, **_kw: object) -> None:
                 """Accept and ignore all constructor arguments."""
 
-            def upload_document(self, *_a, **_kw):
+            def upload_document(self, *_a: object, **_kw: object) -> None:
                 """Raise a paperless error."""
                 msg = "Server down"
                 raise PaperlessError(msg)
 
-            def close(self):
+            def close(self) -> None:
                 """No-op close."""
 
         runner, _ = _patch_cli(monkeypatch, paperless_cls=FailPaperless)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 3
         assert "Server down" in result.output
 
-    def test_scan_with_profile(self, monkeypatch):
+    def test_scan_with_profile(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan --profile photo -> pipeline called with profile_name='photo'."""
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def capturing_pipeline(*args, **_kwargs):
+        def capturing_pipeline(*args: object, **_kwargs: object) -> dict[str, str]:
             """Capture the PipelineRequest from the 4th positional arg."""
             captured["request"] = args[3]
             return {"status": "SUCCESS"}
 
         runner, _ = _patch_cli(monkeypatch)
         monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["scan", "--profile", "photo", "--title", "Test"])
         assert result.exit_code == 0
-        assert captured["request"].profile_name == "photo"
+        request = captured["request"]
+        assert hasattr(request, "profile_name")
+        assert request.profile_name == "photo"
 
 
 class TestDevicesCommand:
     """Devices command tests."""
 
-    def test_devices_table_output(self, monkeypatch):
+    def test_devices_table_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Devices -> table with device names, vendors, models."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["devices"])
         assert result.exit_code == 0
@@ -289,10 +290,9 @@ class TestDevicesCommand:
         assert "ET-4850" in result.output
         assert "hp:002" in result.output
 
-    def test_devices_json_output(self, monkeypatch):
+    def test_devices_json_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Devices --json -> valid JSON with device list."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["devices", "--json"])
         assert result.exit_code == 0
@@ -301,10 +301,9 @@ class TestDevicesCommand:
         assert len(data) == 2
         assert data[0]["name"] == "epson:001"
 
-    def test_devices_capabilities(self, monkeypatch):
+    def test_devices_capabilities(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Devices --capabilities -> raw option names shown."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["devices", "--capabilities"])
         assert result.exit_code == 0
@@ -315,11 +314,11 @@ class TestDevicesCommand:
 class TestCliFlags:
     """CLI flag tests."""
 
-    def test_verbose_flag(self, monkeypatch):
+    def test_verbose_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The -v flag calls configure_logging with verbose=True."""
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def capture_logging(*_args, **kwargs):
+        def capture_logging(*_args: object, **kwargs: object) -> None:
             """Record whether verbose was passed."""
             captured["verbose"] = kwargs.get("verbose", False)
 
@@ -332,22 +331,21 @@ class TestCliFlags:
         class MockSaneBackend:
             """Mock scanner that returns no devices."""
 
-            def get_devices(self):
+            def get_devices(self) -> list[DeviceInfo]:
                 """Return empty device list."""
                 return []
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["-v", "devices"])
         assert result.exit_code == 0
         assert captured.get("verbose") is True
 
-    def test_config_flag(self, monkeypatch):
+    def test_config_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """--config /path/to/config -> load_settings called with that path."""
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def capture_load(config_path=None):
+        def capture_load(config_path: str | None = None) -> Settings:
             """Record the config_path argument."""
             captured["config_path"] = config_path
             return _make_settings()
@@ -359,12 +357,11 @@ class TestCliFlags:
         class MockSaneBackend:
             """Mock scanner that returns no devices."""
 
-            def get_devices(self):
+            def get_devices(self) -> list[DeviceInfo]:
                 """Return empty device list."""
                 return []
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["--config", "/path/to/config.toml", "devices"])
         assert result.exit_code == 0
@@ -384,7 +381,7 @@ class TestJobsCommand:
             )
         store.close()
 
-    def test_jobs_empty(self, monkeypatch, tmp_path):
+    def test_jobs_empty(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs with no jobs in DB shows empty output (exit 0)."""
         db_path = str(tmp_path / "saneless.db")
         settings = _make_settings(
@@ -397,12 +394,13 @@ class TestJobsCommand:
         # Create empty DB
         store = JobStore(db_path=db_path)
         store.close()
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
 
-    def test_jobs_table_output(self, monkeypatch, tmp_path):
+    def test_jobs_table_output(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Jobs with 2 jobs shows table with Timestamp, Profile, Title, Status columns."""
         db_path = str(tmp_path / "saneless.db")
         settings = _make_settings(
@@ -413,7 +411,6 @@ class TestJobsCommand:
         )
         self._populate_store(db_path, count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
@@ -425,7 +422,9 @@ class TestJobsCommand:
         assert "Test Document 2" in result.output
         assert "PENDING" in result.output
 
-    def test_jobs_json_output(self, monkeypatch, tmp_path):
+    def test_jobs_json_output(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Jobs --json with 2 jobs returns valid JSON array."""
         db_path = str(tmp_path / "saneless.db")
         settings = _make_settings(
@@ -436,7 +435,6 @@ class TestJobsCommand:
         )
         self._populate_store(db_path, count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["jobs", "--json"])
         assert result.exit_code == 0
@@ -450,7 +448,7 @@ class TestJobsCommand:
             assert "state" in item
             assert "created_at" in item
 
-    def test_jobs_limit(self, monkeypatch, tmp_path):
+    def test_jobs_limit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --limit 1 with 2 jobs in DB shows only 1 job."""
         db_path = str(tmp_path / "saneless.db")
         settings = _make_settings(
@@ -461,7 +459,6 @@ class TestJobsCommand:
         )
         self._populate_store(db_path, count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["jobs", "--limit", "1"])
         assert result.exit_code == 0
@@ -470,7 +467,9 @@ class TestJobsCommand:
         # Header + separator + 1 data row = 3 lines
         assert len(lines) == 3
 
-    def test_jobs_exit_code_zero(self, monkeypatch, tmp_path):
+    def test_jobs_exit_code_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Jobs always exits with code 0."""
         settings = _make_settings(
             output=OutputConfig(
@@ -479,22 +478,22 @@ class TestJobsCommand:
             ),
         )
         runner, _ = _patch_cli(monkeypatch, settings=settings)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
 
-    def test_jobs_help(self, monkeypatch):
+    def test_jobs_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Jobs --help shows --json and --limit options."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["jobs", "--help"])
         assert result.exit_code == 0
         assert "--json" in result.output
         assert "--limit" in result.output
 
-    def test_jobs_json_empty(self, monkeypatch, tmp_path):
+    def test_jobs_json_empty(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
         """Jobs --json with no jobs outputs empty JSON array."""
         db_path = str(tmp_path / "saneless.db")
         settings = _make_settings(
@@ -507,7 +506,6 @@ class TestJobsCommand:
         store = JobStore(db_path=db_path)
         store.close()
         runner, _ = _patch_cli(monkeypatch, settings=settings)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["jobs", "--json"])
         assert result.exit_code == 0
@@ -519,18 +517,18 @@ class TestServeCommand:
     """Serve command tests."""
 
     @staticmethod
-    def _mock_socket(monkeypatch):
+    def _mock_socket(monkeypatch: pytest.MonkeyPatch) -> None:
         """Bypass the port-availability check in serve()."""
-        from unittest.mock import MagicMock
-
         mock_sock = MagicMock()
         monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: mock_sock)
 
-    def test_serve_calls_uvicorn_defaults(self, monkeypatch):
+    def test_serve_calls_uvicorn_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Serve with no flags calls uvicorn.run with config defaults."""
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def mock_uvicorn_run(app, **kwargs):
+        def mock_uvicorn_run(app: object, **kwargs: object) -> None:
             """Capture uvicorn.run arguments."""
             captured["app"] = app
             captured.update(kwargs)
@@ -538,7 +536,6 @@ class TestServeCommand:
         self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
         runner, _settings = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 0
@@ -547,73 +544,68 @@ class TestServeCommand:
         assert captured["log_config"] is None
         assert captured["access_log"] is True
 
-    def test_serve_custom_host_port(self, monkeypatch):
+    def test_serve_custom_host_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve --host/--port overrides config defaults."""
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def mock_uvicorn_run(_app, **kwargs):
+        def mock_uvicorn_run(_app: object, **kwargs: object) -> None:
             """Capture uvicorn.run arguments."""
             captured.update(kwargs)
 
         monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "9090"])
         assert result.exit_code == 0
         assert captured["host"] == "127.0.0.1"
         assert captured["port"] == 9090
 
-    def test_serve_log_level(self, monkeypatch):
+    def test_serve_log_level(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve passes log_level from settings to uvicorn."""
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def mock_uvicorn_run(_app, **kwargs):
+        def mock_uvicorn_run(_app: object, **kwargs: object) -> None:
             """Capture uvicorn.run arguments."""
             captured.update(kwargs)
 
         self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 0
         assert captured["log_level"] == "info"
 
-    def test_serve_prints_address(self, monkeypatch):
+    def test_serve_prints_address(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve prints listening address to stdout."""
         self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", lambda *_a, **_kw: None)
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 0
         assert "Serving on http://0.0.0.0:8080" in result.output
 
-    def test_serve_help(self, monkeypatch):
+    def test_serve_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve --help shows --host and --port options."""
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["serve", "--help"])
         assert result.exit_code == 0
         assert "--host" in result.output
         assert "--port" in result.output
 
-    def test_serve_receives_app(self, monkeypatch):
+    def test_serve_receives_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve passes a FastAPI app (not None) to uvicorn.run."""
-        captured = {}
+        captured: dict[str, object] = {}
 
-        def mock_uvicorn_run(app, **_kwargs):
+        def mock_uvicorn_run(app: object, **_kwargs: object) -> None:
             """Capture the app argument."""
             captured["app"] = app
 
         self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
         runner, _ = _patch_cli(monkeypatch)
-        from saneless.cli import cli
 
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 0

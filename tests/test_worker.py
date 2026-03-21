@@ -1,10 +1,27 @@
 """Tests for job model and worker thread."""
 
-import time
+from __future__ import annotations
 
-from saneless.exceptions import ScanError
-from saneless.job import Job, JobState, JobStore
+import time
+from typing import TYPE_CHECKING
+
+from saneless.config import ProfileConfig, Settings
+from saneless.exceptions import (
+    ConfigError,
+    FeederEmptyError,
+    PaperlessError,
+    ScanError,
+)
+from saneless.job import ErrorCategory, Job, JobState, JobStore
 from saneless.worker import ScanWorker
+
+if TYPE_CHECKING:
+    from pathlib import Path
+    from unittest.mock import MagicMock
+
+    import pytest
+
+    from saneless.pipeline import PipelineRequest
 
 
 def _get(store: JobStore, job_id: str) -> Job:
@@ -17,7 +34,7 @@ def _get(store: JobStore, job_id: str) -> Job:
 class TestJobStateTransitions:
     """Job state machine tests."""
 
-    def test_job_state_transitions(self):
+    def test_job_state_transitions(self) -> None:
         """Job starts as PENDING and transitions through all active states."""
         store = JobStore()
         try:
@@ -38,7 +55,7 @@ class TestJobStateTransitions:
         finally:
             store.close()
 
-    def test_job_state_error(self):
+    def test_job_state_error(self) -> None:
         """Job can transition to ERROR from any active state."""
         store = JobStore()
         try:
@@ -60,7 +77,7 @@ class TestJobStateTransitions:
 class TestJobStore:
     """JobStore persistence tests."""
 
-    def test_job_store_create_and_get(self):
+    def test_job_store_create_and_get(self) -> None:
         """JobStore.create_job returns Job with UUID, get_job returns same."""
         store = JobStore()
         try:
@@ -77,7 +94,7 @@ class TestJobStore:
         finally:
             store.close()
 
-    def test_job_store_update_state(self):
+    def test_job_store_update_state(self) -> None:
         """update_state changes the job state."""
         store = JobStore()
         try:
@@ -88,7 +105,7 @@ class TestJobStore:
         finally:
             store.close()
 
-    def test_job_store_sqlite_persistence(self, tmp_path):
+    def test_job_store_sqlite_persistence(self, tmp_path: Path) -> None:
         """Jobs survive JobStore close/reopen cycle."""
         db_path = str(tmp_path / "jobs.db")
 
@@ -109,7 +126,7 @@ class TestJobStore:
 class TestJobStateAwaitingFlip:
     """AWAITING_FLIP state tests."""
 
-    def test_awaiting_flip_exists(self):
+    def test_awaiting_flip_exists(self) -> None:
         """JobState.AWAITING_FLIP exists and equals 'AWAITING_FLIP'."""
         assert JobState.AWAITING_FLIP == "AWAITING_FLIP"
         assert JobState.AWAITING_FLIP.value == "AWAITING_FLIP"
@@ -118,14 +135,12 @@ class TestJobStateAwaitingFlip:
 class TestJobThumbnail:
     """Job thumbnail field tests."""
 
-    def test_thumbnail_defaults_none(self):
+    def test_thumbnail_defaults_none(self) -> None:
         """Job.thumbnail field defaults to None."""
-        from saneless.job import Job
-
         job = Job(id="test", profile="default", title="Test")
         assert job.thumbnail is None
 
-    def test_jobstore_persists_thumbnail(self):
+    def test_jobstore_persists_thumbnail(self) -> None:
         """JobStore persists and retrieves thumbnail field."""
         store = JobStore()
         try:
@@ -141,8 +156,11 @@ class TestScanWorker:
     """Worker thread tests."""
 
     def test_worker_starts_and_stops(
-        self, mock_scanner, mock_paperless, default_settings
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
         """ScanWorker starts background thread and stop() joins it."""
         store = JobStore()
         try:
@@ -155,8 +173,12 @@ class TestScanWorker:
             store.close()
 
     def test_worker_processes_job(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Submit job to worker -> job reaches DONE state."""
         store = JobStore()
         try:
@@ -182,13 +204,17 @@ class TestScanWorker:
             store.close()
 
     def test_worker_sets_error_on_failure(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Pipeline raises exception -> job state is ERROR with message."""
         store = JobStore()
         try:
 
-            def failing_pipeline(*_args, **_kwargs):
+            def failing_pipeline(*_args: object, **_kwargs: object) -> None:
                 msg = "Scanner on fire"
                 raise RuntimeError(msg)
 
@@ -214,7 +240,12 @@ class TestScanWorker:
             store.close()
 
 
-def _mock_manual_duplex_pipeline(_scanner, _paperless, _settings, request):
+def _mock_manual_duplex_pipeline(
+    _scanner: object,
+    _paperless: object,
+    _settings: object,
+    request: PipelineRequest,
+) -> dict[str, str]:
     """Simulate pipeline behavior for manual duplex tests."""
     if request.thumbnail_callback:
         request.thumbnail_callback("dGh1bWI=")  # base64 "thumb"
@@ -232,11 +263,13 @@ class TestScanWorkerManualDuplex:
     """Worker manual duplex coordination tests."""
 
     def test_worker_creates_flip_event_for_manual_duplex(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Worker creates flip_event and abort_event for manual duplex jobs."""
-        from saneless.config import ProfileConfig
-
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -274,11 +307,13 @@ class TestScanWorkerManualDuplex:
             store.close()
 
     def test_worker_abort_flip(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """abort_flip() sets abort and flip events, causing pipeline to raise."""
-        from saneless.config import ProfileConfig
-
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -314,11 +349,13 @@ class TestScanWorkerManualDuplex:
             store.close()
 
     def test_worker_stores_thumbnail(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Worker stores thumbnail on job via JobStore when thumbnail_callback fires."""
-        from saneless.config import ProfileConfig
-
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -351,12 +388,22 @@ class TestScanWorkerManualDuplex:
             store.close()
 
     def test_non_duplex_no_flip_events(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Non-duplex jobs do not create flip/abort events."""
-        captured_request = {}
+        captured_request: dict[str, object] = {}
 
-        def capturing_pipeline(_scanner, _paperless, _settings, request):
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> dict[str, str]:
+            """Capture pipeline request events."""
             captured_request["flip_event"] = request.flip_event
             captured_request["abort_event"] = request.abort_event
             return {"status": "SUCCESS"}
@@ -383,11 +430,13 @@ class TestScanWorkerManualDuplex:
             store.close()
 
     def test_current_job_id_tracked(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Worker tracks current_job_id during processing."""
-        from saneless.config import ProfileConfig
-
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -426,7 +475,11 @@ class TestWorkerIntermediateStates:
     """Worker emits ASSEMBLING and UPLOADING intermediate states (UI-02)."""
 
     def test_worker_assembling_state(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Worker sets ASSEMBLING when pipeline emits 'Assembling PDF...'."""
         states_seen: list[str] = []
@@ -434,13 +487,25 @@ class TestWorkerIntermediateStates:
         try:
             original_update = store.update_state
 
-            def tracking_update(job_id, state, **kw):
+            def tracking_update(
+                job_id: str,
+                state: JobState,
+                error: str | None = None,
+                error_category: ErrorCategory | None = None,
+            ) -> None:
                 states_seen.append(state)
-                original_update(job_id, state, **kw)
+                original_update(
+                    job_id, state, error=error, error_category=error_category
+                )
 
             monkeypatch.setattr(store, "update_state", tracking_update)
 
-            def fake_pipeline(_scanner, _paperless, _settings, request):
+            def fake_pipeline(
+                _scanner: object,
+                _paperless: object,
+                _settings: object,
+                request: PipelineRequest,
+            ) -> None:
                 if request.status_callback:
                     request.status_callback("Assembling PDF...")
 
@@ -456,7 +521,11 @@ class TestWorkerIntermediateStates:
             store.close()
 
     def test_worker_uploading_state(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Worker sets UPLOADING when pipeline emits 'Uploading to paperless-ngx...'."""
         states_seen: list[str] = []
@@ -464,13 +533,25 @@ class TestWorkerIntermediateStates:
         try:
             original_update = store.update_state
 
-            def tracking_update(job_id, state, **kw):
+            def tracking_update(
+                job_id: str,
+                state: JobState,
+                error: str | None = None,
+                error_category: ErrorCategory | None = None,
+            ) -> None:
                 states_seen.append(state)
-                original_update(job_id, state, **kw)
+                original_update(
+                    job_id, state, error=error, error_category=error_category
+                )
 
             monkeypatch.setattr(store, "update_state", tracking_update)
 
-            def fake_pipeline(_scanner, _paperless, _settings, request):
+            def fake_pipeline(
+                _scanner: object,
+                _paperless: object,
+                _settings: object,
+                request: PipelineRequest,
+            ) -> None:
                 if request.status_callback:
                     request.status_callback("Uploading to paperless-ngx...")
 
@@ -490,13 +571,15 @@ class TestWorkerErrorCategories:
     """Worker sets correct ErrorCategory for each exception type."""
 
     def test_feeder_empty_error_category(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """FeederEmptyError sets ErrorCategory.FEEDER."""
-        from saneless.exceptions import FeederEmptyError
-        from saneless.job import ErrorCategory
 
-        def failing(*_a, **_k):
+        def failing(*_a: object, **_k: object) -> None:
             msg = "No paper"
             raise FeederEmptyError(msg)
 
@@ -515,12 +598,15 @@ class TestWorkerErrorCategories:
             store.close()
 
     def test_scan_error_category(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """ScanError sets ErrorCategory.SCANNER."""
-        from saneless.job import ErrorCategory
 
-        def failing(*_a, **_k):
+        def failing(*_a: object, **_k: object) -> None:
             msg = "Scanner jam"
             raise ScanError(msg)
 
@@ -539,13 +625,15 @@ class TestWorkerErrorCategories:
             store.close()
 
     def test_paperless_error_category(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """PaperlessError sets ErrorCategory.UPLOAD."""
-        from saneless.exceptions import PaperlessError
-        from saneless.job import ErrorCategory
 
-        def failing(*_a, **_k):
+        def failing(*_a: object, **_k: object) -> None:
             msg = "Upload failed"
             raise PaperlessError(msg)
 
@@ -564,13 +652,15 @@ class TestWorkerErrorCategories:
             store.close()
 
     def test_config_error_category(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """ConfigError sets ErrorCategory.CONFIG."""
-        from saneless.exceptions import ConfigError
-        from saneless.job import ErrorCategory
 
-        def failing(*_a, **_k):
+        def failing(*_a: object, **_k: object) -> None:
             msg = "Bad config"
             raise ConfigError(msg)
 
@@ -589,12 +679,15 @@ class TestWorkerErrorCategories:
             store.close()
 
     def test_unknown_error_category(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Generic Exception sets ErrorCategory.UNKNOWN."""
-        from saneless.job import ErrorCategory
 
-        def failing(*_a, **_k):
+        def failing(*_a: object, **_k: object) -> None:
             msg = "Mystery"
             raise RuntimeError(msg)
 
@@ -617,11 +710,13 @@ class TestWorkerFlipTiming:
     """Worker flip timing synchronization tests."""
 
     def test_wait_transition_returns_true(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """wait_transition returns True when event fires within timeout."""
-        from saneless.config import ProfileConfig
-
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
         monkeypatch.setattr(
             "saneless.worker.run_pipeline", _mock_manual_duplex_pipeline
@@ -644,8 +739,11 @@ class TestWorkerFlipTiming:
             store.close()
 
     def test_wait_transition_timeout(
-        self, mock_scanner, mock_paperless, default_settings
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
         """wait_transition returns False when timeout expires."""
         store = JobStore()
         try:
@@ -660,8 +758,12 @@ class TestScanWorkerQueuing:
     """Worker sequential queuing tests."""
 
     def test_jobs_processed_sequentially(
-        self, mock_scanner, mock_paperless, default_settings, monkeypatch
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Two submitted jobs are both processed to DONE (SCAN-11)."""
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",

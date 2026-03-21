@@ -13,6 +13,7 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -66,7 +67,7 @@ class StubScanner(ScannerBackend):
 
 
 @pytest.fixture
-def test_settings(tmp_path) -> Settings:
+def test_settings(tmp_path: Path) -> Settings:
     """Create Settings with test-safe defaults and tmp_path for output."""
     auth = "test-token"
     return Settings(
@@ -92,13 +93,13 @@ def web_scanner() -> StubScanner:
 
 
 @pytest.fixture
-def app(test_settings, web_scanner):
+def app(test_settings: Settings, web_scanner: StubScanner) -> FastAPI:
     """Create the FastAPI app with test settings and stub scanner."""
     return create_app(test_settings, web_scanner)
 
 
 @pytest.fixture
-def mock_paperless(app):
+def mock_paperless(app: FastAPI) -> object:
     """Patch paperless client methods to return test data without network calls."""
     app.state.paperless.get_tags = lambda: [
         {"id": 1, "name": "receipt"},
@@ -111,14 +112,14 @@ def mock_paperless(app):
 
 
 @pytest.fixture
-def client(app, mock_paperless):
+def client(app: FastAPI, mock_paperless: object) -> Iterator[TestClient]:
     """TestClient that handles lifespan enter/exit automatically."""
     _ = mock_paperless  # Ensure paperless is patched before requests
     with TestClient(app) as tc:
         yield tc
 
 
-def test_page_loads(client) -> None:
+def test_page_loads(client: TestClient) -> None:
     """GET / returns 200 with form elements (UI-01)."""
     response = client.get("/")
     assert response.status_code == 200
@@ -129,27 +130,27 @@ def test_page_loads(client) -> None:
     assert 'id="scan-btn"' in response.text
 
 
-def test_health_endpoint_ok(client) -> None:
+def test_health_endpoint_ok(client: TestClient) -> None:
     """GET /health returns 200 with status ok when worker alive (HLTH-01)."""
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_health_endpoint_no_auth(client) -> None:
+def test_health_endpoint_no_auth(client: TestClient) -> None:
     """GET /health requires no authentication (HLTH-02)."""
     response = client.get("/health")
     assert response.status_code == 200
 
 
-def test_profile_dropdown(client, test_settings) -> None:
+def test_profile_dropdown(client: TestClient, test_settings: Settings) -> None:
     """Profile names from settings appear in dropdown (PROF-03)."""
     response = client.get("/")
     for profile_name in test_settings.profiles:
         assert profile_name in response.text
 
 
-def test_scan_form_submit(client) -> None:
+def test_scan_form_submit(client: TestClient) -> None:
     """POST /api/scan creates job and returns status partial (PLSS-04, UI-07)."""
     response = client.post(
         "/api/scan", data={"profile": "default", "title": "Test Scan"}
@@ -158,14 +159,14 @@ def test_scan_form_submit(client) -> None:
     assert 'id="status-area"' in response.text
 
 
-def test_status_polling(client) -> None:
+def test_status_polling(client: TestClient) -> None:
     """GET /api/jobs/current/status returns status partial (UI-02)."""
     response = client.get("/api/jobs/current/status")
     assert response.status_code == 200
     assert 'id="status-area"' in response.text
 
 
-def test_status_polling_active_job(client) -> None:
+def test_status_polling_active_job(client: TestClient) -> None:
     """Active job triggers hx-trigger polling attributes (UI-02)."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Polling Test")
@@ -179,7 +180,7 @@ def test_status_polling_active_job(client) -> None:
     assert has_polling
 
 
-def test_flip_prompt(client) -> None:
+def test_flip_prompt(client: TestClient) -> None:
     """AWAITING_FLIP state shows flip prompt with PRD wording (UI-03)."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Flip Test")
@@ -193,7 +194,7 @@ def test_flip_prompt(client) -> None:
     assert 'hx-post="/api/flip/abort"' in response.text
 
 
-def test_thumbnail_display(client) -> None:
+def test_thumbnail_display(client: TestClient) -> None:
     """Job with thumbnail shows base64 img tag (UI-04)."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Thumb Test")
@@ -205,7 +206,7 @@ def test_thumbnail_display(client) -> None:
     assert "data:image/jpeg;base64,dGVzdA==" in response.text
 
 
-def test_job_history(client) -> None:
+def test_job_history(client: TestClient) -> None:
     """GET /api/jobs/history returns job list (UI-05)."""
     job_store: JobStore = _app(client).state.job_store
     titles = ["Job Alpha", "Job Beta", "Job Gamma"]
@@ -218,7 +219,7 @@ def test_job_history(client) -> None:
         assert title in response.text
 
 
-def test_error_display(client) -> None:
+def test_error_display(client: TestClient) -> None:
     """Error state shows error message in status area (LOG-03)."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Error Test")
@@ -229,19 +230,19 @@ def test_error_display(client) -> None:
     assert "Scanner disconnected" in response.text
 
 
-def test_cache_invalidate(client) -> None:
+def test_cache_invalidate(client: TestClient) -> None:
     """POST /api/cache/invalidate refreshes resource (UI-08)."""
     response = client.post("/api/cache/invalidate?resource=tags")
     assert response.status_code == 200
 
 
-def test_flip_continue(client) -> None:
+def test_flip_continue(client: TestClient) -> None:
     """POST /api/flip/continue returns 200 (UI-03)."""
     response = client.post("/api/flip/continue")
     assert response.status_code == 200
 
 
-def test_flip_abort(client) -> None:
+def test_flip_abort(client: TestClient) -> None:
     """POST /api/flip/abort returns 200 (UI-03)."""
     response = client.post("/api/flip/abort")
     assert response.status_code == 200
@@ -274,7 +275,7 @@ def test_paperless_test_unreachable(client: TestClient) -> None:
 def test_paperless_test_error(client: TestClient) -> None:
     """GET /api/paperless/test returns error on exception (PLSS-03)."""
 
-    def raise_exc():
+    def raise_exc() -> None:
         msg = "boom"
         raise RuntimeError(msg)
 
@@ -286,7 +287,7 @@ def test_paperless_test_error(client: TestClient) -> None:
     assert "boom" in data["detail"]
 
 
-def test_scan_button_disabled_during_active_job(client) -> None:
+def test_scan_button_disabled_during_active_job(client: TestClient) -> None:
     """Scan button disabled during active job (UI-07)."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Active Job")

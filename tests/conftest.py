@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from saneless.config import (
     OutputConfig,
@@ -22,7 +22,7 @@ _TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
 
 
 @pytest.fixture
-def tmp_config_dir(tmp_path):
+def tmp_config_dir(tmp_path: Path) -> Path:
     """Create a temporary directory for config files."""
     config_dir = tmp_path / "config"
     config_dir.mkdir()
@@ -30,7 +30,7 @@ def tmp_config_dir(tmp_path):
 
 
 @pytest.fixture
-def sample_toml(tmp_config_dir):
+def sample_toml(tmp_config_dir: Path) -> Path:
     """Write a minimal valid TOML config to tmp_config_dir/saneless.toml."""
     toml_content = """\
 [scanner]
@@ -55,13 +55,13 @@ mode = "color"
 
 
 @pytest.fixture
-def sample_pil_image():
+def sample_pil_image() -> Image.Image:
     """Return a 100x100 white RGB PIL Image."""
     return Image.new("RGB", (100, 100), "white")
 
 
 @pytest.fixture
-def sample_pil_images():
+def sample_pil_images() -> list[Image.Image]:
     """Return a list of 3 sample PIL Images of varying sizes and colors."""
     return [
         Image.new("RGB", (100, 100), "white"),
@@ -71,7 +71,7 @@ def sample_pil_images():
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch):
+def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Remove all SANELESS_* env vars before each test."""
     for key in list(os.environ):
         if key.startswith("SANELESS_"):
@@ -79,7 +79,7 @@ def clean_env(monkeypatch):
 
 
 @pytest.fixture
-def default_settings():
+def default_settings() -> Settings:
     """Return a Settings instance with test-safe defaults."""
     auth = "test-token"
     return Settings(
@@ -97,10 +97,8 @@ def default_settings():
 
 
 @pytest.fixture
-def mock_scanner():
+def mock_scanner() -> MagicMock:
     """Return a mock ScannerBackend that yields a single image with content."""
-    from PIL import ImageDraw
-
     scanner = MagicMock(spec=ScannerBackend)
     img = Image.new("RGB", (100, 100), "white")
     draw = ImageDraw.Draw(img)
@@ -110,23 +108,21 @@ def mock_scanner():
 
 
 @pytest.fixture
-def multi_page_images():
+def multi_page_images() -> list[Image.Image]:
     """Return 5 distinct page images simulating an ADF scan."""
     colors = ["white", "red", "blue", "green", "yellow"]
     return [Image.new("RGB", (200, 300), c) for c in colors]
 
 
 @pytest.fixture
-def empty_page_image():
+def empty_page_image() -> Image.Image:
     """Return a nearly-white image that should be detected as empty."""
     return Image.new("RGB", (200, 300), (253, 253, 253))
 
 
 @pytest.fixture
-def content_page_image():
+def content_page_image() -> Image.Image:
     """Return an image with content (not empty)."""
-    from PIL import ImageDraw
-
     img = Image.new("RGB", (200, 300), "white")
     draw = ImageDraw.Draw(img)
     draw.rectangle([20, 20, 180, 280], fill="black")
@@ -134,7 +130,7 @@ def content_page_image():
 
 
 @pytest.fixture
-def mock_paperless():
+def mock_paperless() -> MagicMock:
     """Return a mock PaperlessClient that succeeds."""
     paperless = MagicMock()
     paperless.upload_document.return_value = "mock-task-uuid"
