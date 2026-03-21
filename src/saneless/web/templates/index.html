@@ -6,7 +6,7 @@
     <form hx-post="/api/scan"
           hx-target="#status-area"
           hx-swap="outerHTML"
-          hx-on::before-request="this.querySelector('#scan-btn').disabled=true; this.querySelector('#scan-btn').ariaBusy='true'; this.querySelector('#scan-btn').textContent='Scanning...'">
+          hx-on::before-request="if(event.detail.elt===this){this.querySelector('#scan-btn').disabled=true; this.querySelector('#scan-btn').ariaBusy='true'; this.querySelector('#scan-btn').textContent='Scanning...'}">
 
         <label for="profile-select">Profile</label>
         <select name="profile" id="profile-select">
@@ -29,7 +29,7 @@
                     title="Refresh tags">&#x21bb;</button>
         </label>
         <select name="tags" id="tags-select" multiple
-                hx-get="/api/tags" hx-trigger="load" hx-swap="innerHTML">
+                hx-get="/api/tags" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
             {% for tag in tags %}
             <option value="{{ tag.id }}">{{ tag.name }}</option>
             {% endfor %}
@@ -45,7 +45,7 @@
                     title="Refresh correspondents">&#x21bb;</button>
         </label>
         <select name="correspondent" id="correspondent-select"
-                hx-get="/api/correspondents" hx-trigger="load" hx-swap="innerHTML">
+                hx-get="/api/correspondents" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
             <option value="">-- None --</option>
             {% for c in correspondents %}
             <option value="{{ c.id }}">{{ c.name }}</option>
@@ -53,8 +53,8 @@
         </select>
 
         <button type="submit" id="scan-btn"
-                {% if job and job.state.value in ["SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}disabled aria-busy="true"{% endif %}>
-            {% if job and job.state.value in ["SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}Scanning...{% else %}Scan{% endif %}
+                {% if job and job.state.value in ["PENDING", "SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}disabled aria-busy="true"{% endif %}>
+            {% if job and job.state.value in ["PENDING", "SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}Scanning...{% else %}Scan{% endif %}
         </button>
     </form>
 </article>
@@ -65,17 +65,19 @@
 {# --- Section 3: Job History --- #}
 <article>
     <h2>Job History</h2>
-    <table role="grid">
-        <thead>
-            <tr>
-                <th>Time</th>
-                <th>Profile</th>
-                <th>Title</th>
-                <th>Status</th>
-            </tr>
-        </thead>
-        {% include "partials/history.html" %}
-    </table>
+    <div class="history-table-wrap">
+        <table role="grid">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Profile</th>
+                    <th>Title</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            {% include "partials/history.html" %}
+        </table>
+    </div>
 </article>
 
 {% endblock %}

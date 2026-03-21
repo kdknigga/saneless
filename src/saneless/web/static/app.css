@@ -57,8 +57,9 @@
 }
 
 /* Job history */
-#history-body td {
-    white-space: nowrap;
+article .history-table-wrap {
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch;
 }
 
 /* Responsive: stack on mobile */
@@ -71,5 +72,16 @@
 
     .thumbnail {
         max-width: 100%;
+    }
+
+    #history-body td {
+        font-size: 0.85rem;
+        white-space: normal;
+        word-break: break-word;
+    }
+
+    .history-table-wrap table {
+        table-layout: fixed;
+        width: 100%;
     }
 }

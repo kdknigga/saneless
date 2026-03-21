@@ -52,6 +52,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         token=settings.paperless.token,
         consume_dir=settings.paperless.consume_dir,
     )
+    Path(settings.output.tmp_dir).mkdir(parents=True, exist_ok=True)
     job_store = JobStore(
         db_path=str(Path(settings.output.tmp_dir) / "saneless.db"),
     )
