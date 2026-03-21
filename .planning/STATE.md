@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: idle
-stopped_at: Phase 01 gap closure complete — UAT blocker resolved
-last_updated: "2026-03-21T14:10:14.504Z"
+status: unknown
+stopped_at: Completed 01-05-PLAN.md
+last_updated: "2026-03-21T15:05:15.437Z"
 last_activity: 2026-03-21
 progress:
   total_phases: 7
   completed_phases: 7
-  total_plans: 17
-  completed_plans: 17
+  total_plans: 18
+  completed_plans: 18
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** All v1.0 phases complete — gap closure done
+**Current focus:** Phase 01 — core-pipeline
 
 ## Current Position
 
-All phases complete. Gap closure 01-04 resolved UAT blocker.
-Milestone v1.0: 7/7 phases, 17/17 plans.
+Phase: 01 (core-pipeline) — COMPLETE
+Plan: 5 of 5
 
 ## Performance Metrics
 
@@ -63,6 +63,7 @@ Milestone v1.0: 7/7 phases, 17/17 plans.
 | Phase 07-tech-debt-cleanup P01 | 7min | 2 tasks | 7 files |
 | Phase 07-tech-debt-cleanup P02 | 4min | 1 tasks | 2 files |
 | Phase 01 P04 | 2min | 1 tasks | 3 files |
+| Phase 01 P05 | 3min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -105,6 +106,8 @@ Recent decisions affecting current work:
 - [Phase 07]: Concrete _BrowserTestScanner stub for lifespan-safe browser testing
 - [01-04]: Catch OSError alone (PermissionError subclass) for log dir fallback
 - [01-04]: XDG state dir (~/.local/state/saneless) for log file default
+- [Phase 01]: Field(alias='title') with populate_by_name=True for TOML and code access
+- [Phase 01]: Intercept ValidationError extra_forbidden to provide ConfigError with section hints
 
 ### Pending Todos
 
@@ -124,6 +127,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-21
-Last session: 2026-03-21
-Stopped at: Phase 01 gap closure complete — UAT blocker resolved, all phases done
+Last session: 2026-03-21T15:05:15.435Z
+Stopped at: Completed 01-05-PLAN.md
 Resume file: None
