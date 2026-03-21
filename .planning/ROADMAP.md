@@ -18,6 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 4: Packaging and Deployment** - pip package, OCI container, consume directory fallback
 - [ ] **Phase 5: Web Server Launch Command** - `saneless serve` CLI command, web logging, Dockerfile CMD
 - [ ] **Phase 6: Gap Closure Fixes** - Paperless test route, worker intermediate states
+- [ ] **Phase 7: Tech Debt Cleanup** - python-sane packaging, Starlette deprecation, error typing, flip timing, Playwright browser tests
 
 ## Phase Details
 
@@ -115,6 +116,22 @@ Plans:
 Plans:
 - [ ] 06-01-PLAN.md -- Paperless test route, worker ASSEMBLING/UPLOADING state transitions, and tests
 
+### Phase 7: Tech Debt Cleanup
+**Goal**: Address accumulated tech debt from v1.0 milestone audit — packaging gaps, deprecation warnings, error handling clarity, flip flow timing, and browser rendering verification
+**Depends on**: Phase 6
+**Requirements**: PKG-01, UI-01, UI-02, UI-03, ARCH-02
+**Tech Debt Closure:** Closes 5 of 6 tech debt items from v1.0 audit (1 deferred: physical scanner verification)
+**Success Criteria** (what must be TRUE):
+  1. `python-sane` is available as an optional dependency and Dockerfile installs it correctly
+  2. Zero Starlette `TemplateResponse` deprecation warnings across all 13 call sites
+  3. `JobState` distinguishes error categories (feeder, config, scanner, upload) rather than relying on error message text
+  4. POST to `/api/flip/continue` returns response only after worker has transitioned out of `AWAITING_FLIP` state
+  5. Playwright tests verify PicoCSS/HTMX rendering, live status polling, and flip prompt UI in a real browser
+**Plans**: 0 plans
+
+Plans:
+- (none yet)
+
 ## Progress
 
 **Execution Order:**
@@ -128,3 +145,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 4. Packaging and Deployment | 0/2 | Planning complete | - |
 | 5. Web Server Launch Command | 0/1 | Planning complete | - |
 | 6. Gap Closure Fixes | 0/1 | Planning complete | - |
+| 7. Tech Debt Cleanup | 0/0 | Not started | - |
