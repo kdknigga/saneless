@@ -125,7 +125,12 @@ docstring-code-format = false
 docstring-code-line-length = "dynamic"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "ANN", "TCH", "T201", "PLC0415", "PLR0915", "PLR0912", "PLR0913", "S104", "S105", "S106"]
+"tests/**/*.py" = [
+    "S101",   # assert is the test mechanism
+    "ANN",    # test annotation coverage is Phase 9 scope
+    "PLC0415",  # lazy imports are test-inherent (77 occurrences)
+    "S104", "S105", "S106",  # hardcoded test values are inherent to fixtures
+]
 "src/saneless/__init__.py" = ["PLC0415"]
 "src/saneless/config.py" = ["S104"]
 

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
 from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 import pytest
 import uvicorn
