@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 01-05-PLAN.md
-last_updated: "2026-03-21T15:09:45.985Z"
+stopped_at: Completed 06-02-PLAN.md
+last_updated: "2026-03-21T19:32:02.737Z"
 last_activity: 2026-03-21
 progress:
-  total_phases: 7
+  total_phases: 9
   completed_phases: 7
-  total_plans: 18
-  completed_plans: 18
+  total_plans: 19
+  completed_plans: 19
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** All phases complete — gap closure on Phase 01 finished
+**Current focus:** Phase 06 — gap-closure-fixes
 
 ## Current Position
 
-Phase: 01 (core-pipeline) — COMPLETE
-Plan: 5 of 5
+Phase: 06 (gap-closure-fixes) — EXECUTING
+Plan: 1 of 2
 
 ## Performance Metrics
 
@@ -64,6 +64,7 @@ Plan: 5 of 5
 | Phase 07-tech-debt-cleanup P02 | 4min | 1 tasks | 2 files |
 | Phase 01 P04 | 2min | 1 tasks | 3 files |
 | Phase 01 P05 | 3min | 2 tasks | 2 files |
+| Phase 06 P02 | 1min | 1 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -108,6 +109,12 @@ Recent decisions affecting current work:
 - [01-04]: XDG state dir (~/.local/state/saneless) for log file default
 - [Phase 01]: Field(alias='title') with populate_by_name=True for TOML and code access
 - [Phase 01]: Intercept ValidationError extra_forbidden to provide ConfigError with section hints
+- [Phase 06]: Use /api/tags/?page_size=1 instead of /api/ for connection testing -- DRF browsable API root returns 200 regardless of auth
+
+### Roadmap Evolution
+
+- Phase 8 added: Audit lint and type checker ignores and noqas and fix them
+- Phase 9 added: Enable pytest strict mode and ensure all tests pass the same linting and type checking quality checks as normal code
 
 ### Pending Todos
 
@@ -127,6 +134,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-21
-Last session: 2026-03-21T15:05:15.435Z
-Stopped at: Phase 01 gap closure complete — UAT gaps resolved, all 7 phases done
+Last session: 2026-03-21T19:32:02.735Z
+Stopped at: Completed 06-02-PLAN.md
 Resume file: None
