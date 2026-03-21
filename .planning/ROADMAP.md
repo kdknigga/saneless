@@ -16,6 +16,8 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 2: ADF and Multi-Page** - ADF scanning, hardware duplex, manual duplex, empty page detection, thumbnails
 - [ ] **Phase 3: Web UI** - Browser interface with profiles, metadata, live status, job history, health endpoint
 - [ ] **Phase 4: Packaging and Deployment** - pip package, OCI container, consume directory fallback
+- [ ] **Phase 5: Web Server Launch Command** - `saneless serve` CLI command, web logging, Dockerfile CMD
+- [ ] **Phase 6: Gap Closure Fixes** - Paperless test route, worker intermediate states
 
 ## Phase Details
 
@@ -86,6 +88,27 @@ Plans:
 - [ ] 04-01-PLAN.md -- CLI `jobs` command and consume directory fallback completion
 - [ ] 04-02-PLAN.md -- PyPI metadata, Dockerfile, Docker Compose, and GitHub Actions release workflow
 
+### Phase 5: Web Server Launch Command
+**Goal**: Users can start the web server via `saneless serve` and deploy via Docker container with working healthcheck
+**Depends on**: Phase 4
+**Requirements**: UI-01, UI-02, UI-03, UI-04, UI-05, UI-06, UI-07, UI-08, PROF-03, PLSS-04, PLSS-05, HLTH-01, HLTH-02, LOG-01, LOG-02, LOG-03, PKG-02
+**Gap Closure:** Closes GAP-01, integration gaps (cli→web, web→logging), broken flows (web UI, container deployment)
+**Success Criteria** (what must be TRUE):
+  1. User can run `saneless serve` and the web UI is accessible in a browser at the configured host/port
+  2. Web server startup calls `configure_logging()` so logs go to the configured rotating file, not Python's default logger
+  3. Docker container starts with `CMD ["serve"]`, healthcheck passes, and container stays running
+**Plans**: 0 plans
+
+### Phase 6: Gap Closure Fixes
+**Goal**: Close remaining requirement gaps — paperless test endpoint route and worker intermediate status states
+**Depends on**: Phase 5
+**Requirements**: PLSS-03, UI-02
+**Gap Closure:** Closes GAP-02 (PLSS-03 route), GAP-03 (UI-02 intermediate states)
+**Success Criteria** (what must be TRUE):
+  1. `GET /api/paperless/test` returns JSON with connection status distinguishing connected/token_rejected/unreachable
+  2. Worker emits ASSEMBLING state before PDF assembly and UPLOADING state before paperless upload, visible in web UI status polling
+**Plans**: 0 plans
+
 ## Progress
 
 **Execution Order:**
@@ -97,3 +120,5 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 2. ADF and Multi-Page | 0/3 | Planning complete | - |
 | 3. Web UI | 1/4 | In Progress|  |
 | 4. Packaging and Deployment | 0/2 | Planning complete | - |
+| 5. Web Server Launch Command | 0/0 | Gap closure | - |
+| 6. Gap Closure Fixes | 0/0 | Gap closure | - |

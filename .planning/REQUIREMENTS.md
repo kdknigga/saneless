@@ -35,7 +35,7 @@
 
 - [x] **PLSS-01**: System uploads PDF to paperless-ngx via REST API with metadata (title, created, correspondent ID, tag IDs)
 - [x] **PLSS-02**: System polls paperless-ngx task endpoint until terminal state and surfaces outcome in UI and log
-- [x] **PLSS-03**: System provides `GET /api/paperless/test` endpoint distinguishing three failure modes: server unreachable, token rejected, connection successful
+- [ ] **PLSS-03**: System provides `GET /api/paperless/test` endpoint distinguishing three failure modes: server unreachable, token rejected, connection successful
 - [x] **PLSS-04**: User can set title, tags (multi-select from fetched list), and correspondent (select from fetched list) before scanning
 - [x] **PLSS-05**: Tag and correspondent lists are cached with TTL (default 60s) and per-resource manual refresh
 - [x] **PLSS-06**: System supports a consume directory fallback as a config option
@@ -43,7 +43,7 @@
 ### Web UI
 
 - [x] **UI-01**: Web UI accessible from any browser on the LAN with profile selector, metadata fields, and Scan button
-- [x] **UI-02**: Live status indicator shows job state (idle/scanning/assembling/uploading/done/error) via polling
+- [ ] **UI-02**: Live status indicator shows job state (idle/scanning/assembling/uploading/done/error) via polling
 - [x] **UI-03**: For manual duplex, UI shows `awaiting_flip` state with flip prompt, illustration, Continue and Cancel buttons
 - [x] **UI-04**: First-page thumbnail displayed in status area once first page is scanned
 - [x] **UI-05**: Job history table showing timestamp, profile, title, and status, persisted to SQLite
@@ -135,7 +135,7 @@
 | PDF-02 | Phase 1 | Complete |
 | PLSS-01 | Phase 1 | Complete |
 | PLSS-02 | Phase 1 | Complete |
-| PLSS-03 | Phase 1 | Complete |
+| PLSS-03 | Phase 6 | Pending |
 | CONF-01 | Phase 1 | Complete |
 | CONF-02 | Phase 1 | Complete |
 | CONF-03 | Phase 1 | Complete |
@@ -157,7 +157,7 @@
 | SCAN-11 | Phase 2 | Complete |
 | SCAN-12 | Phase 2 | Complete |
 | UI-01 | Phase 3 | Complete |
-| UI-02 | Phase 3 | Complete |
+| UI-02 | Phase 6 | Pending |
 | UI-03 | Phase 3 | Complete |
 | UI-04 | Phase 3 | Complete |
 | UI-05 | Phase 3 | Complete |
@@ -180,6 +180,8 @@
 - v1 requirements: 49 total
 - Mapped to phases: 49
 - Unmapped: 0
+- Satisfied: 47
+- Pending (gap closure): 2 (PLSS-03, UI-02)
 
 ---
 *Requirements defined: 2026-03-20*
