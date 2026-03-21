@@ -53,7 +53,7 @@ class _BrowserTestScanner(ScannerBackend):
             ),
         ]
 
-    def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """Return default capabilities."""
         return DeviceCapabilities(
             sources=["Flatbed"],
@@ -62,7 +62,7 @@ class _BrowserTestScanner(ScannerBackend):
         )
 
     def scan_pages(
-        self, _device_id: str, _settings: ScanSettings
+        self, device_id: str, settings: ScanSettings
     ) -> Iterator[Image.Image]:
         """Yield a single white test image."""
         yield Image.new("RGB", (100, 100), "white")
