@@ -175,6 +175,41 @@ class TestExceptionHierarchy:
             raise FeederEmptyError(msg)
 
 
+class TestTomlStructureErrors:
+    """User-friendly error messages for common TOML structure mistakes."""
+
+    def test_wrong_section_name_gives_helpful_error(self, tmp_config_dir):
+        """TOML [default] instead of [profiles.default] gives a helpful ConfigError."""
+        toml_content = '[default]\ntitle = "Test Doc"\n'
+        config_file = tmp_config_dir / "wrong_section.toml"
+        config_file.write_text(toml_content)
+        with pytest.raises(ConfigError, match=r"profiles\.default"):
+            load_settings(config_path=str(config_file))
+
+    def test_unknown_toplevel_section_error(self, tmp_config_dir):
+        """Unknown top-level TOML section raises ConfigError naming the section."""
+        toml_content = '[bogus]\nfoo = "bar"\n\n[profiles.default]\n'
+        config_file = tmp_config_dir / "bogus_section.toml"
+        config_file.write_text(toml_content)
+        with pytest.raises(ConfigError, match="bogus"):
+            load_settings(config_path=str(config_file))
+
+    def test_title_alias_works(self, tmp_config_dir):
+        """The 'title' field in [profiles.default] maps to default_title_template."""
+        toml_content = '[profiles.default]\ntitle = "My Doc"\n'
+        config_file = tmp_config_dir / "title_alias.toml"
+        config_file.write_text(toml_content)
+        settings = load_settings(config_path=str(config_file))
+        assert settings.profiles["default"].default_title_template == "My Doc"
+
+    def test_title_env_var_override(self, monkeypatch, tmp_path):
+        """Env var SANELESS_PROFILES__DEFAULT__TITLE sets default_title_template."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("SANELESS_PROFILES__DEFAULT__TITLE", "EnvTitle")
+        settings = load_settings()
+        assert settings.profiles["default"].default_title_template == "EnvTitle"
+
+
 class TestProfileConfigThresholds:
     """ProfileConfig empty page threshold fields."""
 
