@@ -1,9 +1,17 @@
 ---
 phase: 01-core-pipeline
-verified: 2026-03-20T17:30:00Z
+verified: 2026-03-21T14:30:00Z
 status: passed
-score: 21/21 must-haves verified
-re_verification: false
+score: 23/23 must-haves verified
+re_verification:
+  previous_status: passed
+  previous_score: 21/21
+  gaps_closed:
+    - "CLI commands work without root privileges (PermissionError on log mkdir)"
+    - "Logging defaults to a user-writable XDG path (~/.local/state/saneless)"
+    - "Logging gracefully degrades if directory creation fails (stderr fallback)"
+  gaps_remaining: []
+  regressions: []
 human_verification:
   - test: "Run `saneless devices` on a machine with a physical scanner attached"
     expected: "Table listing discovered SANE devices; no error"
@@ -15,10 +23,10 @@ human_verification:
 
 # Phase 01: Core Pipeline Verification Report
 
-**Phase Goal:** A user can run a CLI command that discovers a scanner, performs a flatbed scan, assembles a PDF, and uploads it to paperless-ngx with metadata
-**Verified:** 2026-03-20T17:30:00Z
+**Phase Goal:** Build the complete flatbed scan pipeline — config, scanner abstraction, PDF assembly, paperless-ngx client, job persistence, worker, pipeline orchestration, and CLI commands.
+**Verified:** 2026-03-21T14:30:00Z
 **Status:** passed
-**Re-verification:** No — initial verification
+**Re-verification:** Yes — after gap closure (plan 01-04: LOG-01, LOG-02 log path fix)
 
 ## Goal Achievement
 
@@ -29,7 +37,7 @@ human_verification:
 | 1 | Settings load from TOML with env var overrides using SANELESS_ prefix | VERIFIED | `config.py`: `SettingsConfigDict(env_prefix="SANELESS_", env_nested_delimiter="__")` + `settings_customise_sources` hook; 14 tests passing |
 | 2 | Invalid config fails at startup with clear parse errors | VERIFIED | `load_settings()` raises on malformed TOML; `cli.py` catches and prints "Configuration error: {exc}", exits 2 |
 | 3 | Default profile must always be present | VERIFIED | `@field_validator("profiles")` raises `ValueError("A 'default' profile must be defined in config")` if missing |
-| 4 | Rotating log file created at configurable path | VERIFIED | `logging_config.py`: `RotatingFileHandler` with `max_bytes`, `backup_count` params; 6 tests passing |
+| 4 | Rotating log file created at configurable path | VERIFIED | `logging_config.py`: `RotatingFileHandler` with `max_bytes`, `backup_count` params; 8 tests passing (2 new) |
 | 5 | No hardcoded credentials | VERIFIED | `PaperlessConfig.token` defaults to `""`; token only from TOML or `SANELESS_PAPERLESS__TOKEN` env var |
 | 6 | Scanner operations go through abstraction layer | VERIFIED | `scanner/base.py`: `ScannerBackend(ABC)` with `get_devices`, `get_capabilities`, `scan_pages` abstract methods |
 | 7 | SaneBackend calls sane.init() exactly once | VERIFIED | `sane_backend.py` line 63: `self._sane_version = sane.init()` in `__init__`; test `test_sane_backend_init_calls_sane_init_exactly_once` passes |
@@ -47,18 +55,20 @@ human_verification:
 | 19 | CLI exits 0/1/2/3 on success/scan-error/config-error/paperless-error | VERIFIED | `cli.py`: `sys.exit(1)` on ScanError, `sys.exit(2)` on config/validation error, `sys.exit(3)` on PaperlessError; 3 exit-code tests passing |
 | 20 | `saneless devices --json` outputs valid JSON | VERIFIED | JSON branch in `devices` command; `test_devices_json_output` passes |
 | 21 | `-v` flag enables DEBUG logging to stderr | VERIFIED | `configure_logging(..., verbose=verbose)` in `cli` group callback; `test_verbose_flag` passes |
+| 22 | CLI commands work without root privileges (LOG-01/LOG-02 gap) | VERIFIED | `OutputConfig.log_file` defaults to `~/.local/state/saneless/saneless.log` (line 68 of config.py); `configure_logging` wraps `mkdir` + `RotatingFileHandler` in `try/except OSError` with stderr fallback; `test_unwritable_directory_falls_back_to_stderr` passes |
+| 23 | Logging gracefully degrades when log directory is not writable (LOG-02 gap) | VERIFIED | `logging_config.py` lines 56-60: `except OSError` attaches `StreamHandler(sys.stderr)` and emits warning; `test_default_log_file_is_xdg_compliant` asserts `.local/state/saneless` in path and no `/var/log` |
 
-**Score:** 21/21 truths verified
+**Score:** 23/23 truths verified
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `src/saneless/config.py` | Pydantic Settings with TOML + env var loading | VERIFIED | 159 lines; exports Settings, ScannerConfig, PaperlessConfig, OutputConfig, ProfileConfig, load_settings |
+| `src/saneless/config.py` | Pydantic Settings with TOML + env var loading; XDG log path default | VERIFIED | 171 lines; `log_file` default uses `Path.home() / ".local" / "state" / "saneless" / "saneless.log"` |
 | `src/saneless/exceptions.py` | Custom exception hierarchy | VERIFIED | SanelessError, ConfigError, ScanError, PaperlessError — all inherit correctly |
-| `src/saneless/logging_config.py` | configure_logging with RotatingFileHandler | VERIFIED | RotatingFileHandler, optional stderr handler, parent dir creation |
+| `src/saneless/logging_config.py` | configure_logging with RotatingFileHandler + OSError fallback | VERIFIED | `try/except OSError` wraps mkdir + file handler; fallback attaches `StreamHandler(sys.stderr)` |
 | `src/saneless/scanner/base.py` | ScannerBackend ABC + dataclasses | VERIFIED | ABC with 3 abstract methods; DeviceInfo, DeviceCapabilities, ScanSettings dataclasses |
-| `src/saneless/scanner/sane_backend.py` | SaneBackend wrapping python-sane | VERIFIED | Lazy import, init-once, context-managed device, source validation, no progress callback |
+| `src/saneless/scanner/sane_backend.py` | SaneBackend wrapping python-sane | VERIFIED | Lazy import, init-once, context-managed device, source validation |
 | `src/saneless/scanner/__init__.py` | Re-exports all scanner symbols | VERIFIED | Lazy SaneBackend __getattr__ + direct base imports |
 | `src/saneless/pdf.py` | PDF assembly via img2pdf | VERIFIED | TemporaryDirectory, img2pdf.convert, MAX_IMAGE_PIXELS guard |
 | `src/saneless/paperless.py` | PaperlessClient with retry + polling | VERIFIED | upload_document, poll_task, test_connection, close; httpx.Client with Auth header |
@@ -66,34 +76,27 @@ human_verification:
 | `src/saneless/job.py` | Job model + SQLite JobStore | VERIFIED | JobState enum, Job dataclass, JobStore with CREATE TABLE, check_same_thread=False |
 | `src/saneless/worker.py` | Background worker thread | VERIFIED | daemon thread, queue.Queue(maxsize=10), sentinel shutdown, run_pipeline call |
 | `src/saneless/cli.py` | Click CLI with scan + devices | VERIFIED | @click.group(), scan and devices subcommands, all exit codes, --json, --capabilities, -v |
-| `tests/conftest.py` | Shared test fixtures | VERIFIED | clean_env (autouse), sample_toml, sample_pil_image, sample_pil_images, default_settings, mock_scanner, mock_paperless |
-| `tests/test_config.py` | Config tests | VERIFIED | 14 tests — all pass |
-| `tests/test_logging.py` | Logging tests | VERIFIED | 6 tests — all pass |
-| `tests/test_scanner.py` | Scanner tests | VERIFIED | 14 tests — all pass |
-| `tests/test_pdf.py` | PDF assembly tests | VERIFIED | 5 tests — all pass |
-| `tests/test_paperless.py` | Paperless client tests | VERIFIED | 16 tests — all pass |
-| `tests/test_pipeline.py` | Pipeline tests | VERIFIED | 7 tests — all pass |
-| `tests/test_worker.py` | Worker + job store tests | VERIFIED | 8 tests — all pass |
-| `tests/test_cli.py` | CLI integration tests | VERIFIED | 15 tests — all pass |
+| `tests/test_logging.py` | Logging tests including XDG path and OSError fallback | VERIFIED | 8 tests — all pass (2 new: `test_unwritable_directory_falls_back_to_stderr`, `test_default_log_file_is_xdg_compliant`) |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|----|-----|--------|---------|
-| `config.py` | pydantic-settings | `class Settings(BaseSettings)` | WIRED | Line 70; SettingsConfigDict with SANELESS_ prefix |
-| `config.py` | TOML config file | `toml_file` in settings_customise_sources | WIRED | Lines 107-110: TomlConfigSettingsSource injected at runtime |
-| `logging_config.py` | config.py | reads OutputConfig fields | WIRED | configure_logging takes log_file, log_level, max_bytes, backup_count params; RotatingFileHandler on line 46 |
-| `scanner/sane_backend.py` | `scanner/base.py` | `class SaneBackend(ScannerBackend)` | WIRED | Line 53; implements all 3 abstract methods |
-| `scanner/sane_backend.py` | python-sane | `sane.init()` in __init__ | WIRED | Lines 35-41: lazy import sentinel + _ensure_sane(); line 63: sane.init() |
+| `config.py` | pydantic-settings | `class Settings(BaseSettings)` | WIRED | Line 80; SettingsConfigDict with SANELESS_ prefix |
+| `config.py` | TOML config file | `toml_file` in settings_customise_sources | WIRED | Lines 118-123: TomlConfigSettingsSource injected at runtime |
+| `logging_config.py` | `config.py` | `log_file` from `settings.output.log_file` | WIRED | `cli.py` line 57: `settings.output.log_file` passed to `configure_logging` |
+| `logging_config.py` | OSError fallback | `except OSError` block adds stderr handler | WIRED | Lines 56-60: catches OSError, attaches StreamHandler, emits warning |
+| `scanner/sane_backend.py` | `scanner/base.py` | `class SaneBackend(ScannerBackend)` | WIRED | Implements all 3 abstract methods |
+| `scanner/sane_backend.py` | python-sane | `sane.init()` in __init__ | WIRED | Lazy import sentinel + _ensure_sane(); sane.init() in __init__ |
 | `pdf.py` | img2pdf | `img2pdf.convert` | WIRED | Line 53: `pdf_bytes = img2pdf.convert(image_paths)` |
-| `paperless.py` | httpx | `httpx.Client` | WIRED | Line 59: `self._client = httpx.Client(...)` |
-| `paperless.py` | paperless-ngx API | `/api/documents/post_document/` + `/api/tasks/` | WIRED | Lines 113-114; lines 178-179 |
+| `paperless.py` | httpx | `httpx.Client` | WIRED | `self._client = httpx.Client(...)` |
+| `paperless.py` | paperless-ngx API | `/api/documents/post_document/` + `/api/tasks/` | WIRED | POST and GET endpoints with correct paths |
 | `cli.py` | `config.py` | `load_settings()` in group callback | WIRED | Line 46: `settings = load_settings(config_path)` |
-| `cli.py` | `pipeline.py` | scan command calls `run_pipeline()` | WIRED | Line 94: `run_pipeline(scanner, paperless, settings, ...)` |
-| `pipeline.py` | `scanner/base.py` | calls `scanner_backend.scan_pages()` | WIRED | Line 92: `images = list(scanner.scan_pages(device_id, scan_settings))` |
-| `pipeline.py` | `pdf.py` | calls `assemble_pdf()` | WIRED | Line 97: `pdf_path = assemble_pdf(images, tmp_path)` |
-| `pipeline.py` | `paperless.py` | calls `paperless_client.upload_document()` | WIRED | Lines 103-105: `task_uuid = paperless.upload_document(...)` |
-| `__init__.py` | `cli.py` | `main()` calls `cli()` | WIRED | Lines 7-10: `from .cli import cli; cli()` |
+| `cli.py` | `pipeline.py` | scan command calls `run_pipeline()` | WIRED | `run_pipeline(scanner, paperless, settings, ...)` |
+| `pipeline.py` | `scanner/base.py` | calls `scanner_backend.scan_pages()` | WIRED | `images = list(scanner.scan_pages(device_id, scan_settings))` |
+| `pipeline.py` | `pdf.py` | calls `assemble_pdf()` | WIRED | `pdf_path = assemble_pdf(images, tmp_path)` |
+| `pipeline.py` | `paperless.py` | calls `paperless_client.upload_document()` | WIRED | `task_uuid = paperless.upload_document(...)` |
+| `__init__.py` | `cli.py` | `main()` calls `cli()` | WIRED | `from .cli import cli; cli()` |
 
 ### Requirements Coverage
 
@@ -104,8 +107,8 @@ human_verification:
 | CONF-03 | 01-01 | No hardcoded credentials | SATISFIED | token: str = "" default; must come from config or SANELESS_PAPERLESS__TOKEN |
 | PROF-01 | 01-01 | Scan profiles in TOML with source, resolution, mode, optional metadata | SATISFIED | ProfileConfig with source, resolution, mode, default_tags, default_correspondent, default_title_template |
 | PROF-02 | 01-01 | Default profile must always be present | SATISFIED | field_validator raises ValueError if "default" not in profiles dict |
-| LOG-01 | 01-01 | Rotating log file at configurable path | SATISFIED | RotatingFileHandler; path passed from settings.output.log_file |
-| LOG-02 | 01-01 | Log level configurable | SATISFIED | log_level: str = "INFO" in OutputConfig; passed to configure_logging |
+| LOG-01 | 01-01, 01-04 | Rotating log file at configurable path | SATISFIED | RotatingFileHandler; path from `settings.output.log_file`; XDG default (~/.local/state/saneless); OSError fallback to stderr; 8 logging tests all pass |
+| LOG-02 | 01-01, 01-04 | Log level configurable | SATISFIED | `log_level: str = "INFO"` in OutputConfig; passed to configure_logging; test_log_level_from_config passes |
 | SCAN-01 | 01-02 | User can discover available SANE devices | SATISFIED | SaneBackend.get_devices() + CLI devices command |
 | SCAN-02 | 01-02 | User can pin target device by name in config | SATISFIED | settings.scanner.device used by pipeline; ScannerConfig.device field |
 | SCAN-03 | 01-02 | Flatbed single-page scan | SATISFIED | scan_pages() with source="Flatbed" from ProfileConfig default; yields one image from dev.snap() |
@@ -121,19 +124,16 @@ human_verification:
 | CLI-01 | 01-03 | `saneless scan [--profile] [--title]` triggers scan job | SATISFIED | scan command with --profile (default="default"), --title (required) |
 | CLI-02 | 01-03 | `saneless devices` lists available SANE devices | SATISFIED | devices command with table, --json, and --capabilities output modes |
 
-**All 21 requirement IDs from plans accounted for. No orphaned requirements for Phase 1 in REQUIREMENTS.md.**
-
-Note: PLSS-06 (consume directory fallback) appears in REQUIREMENTS.md mapped to Phase 4, but the consume_dir fallback is already implemented in `paperless.py`. This is bonus implementation, not a gap.
+**All 21 requirement IDs from plans accounted for. LOG-01 and LOG-02 re-verified after gap closure in plan 01-04. No orphaned requirements for Phase 1 in REQUIREMENTS.md.**
 
 ### Anti-Patterns Found
 
-No anti-patterns detected. Scan of all source files found:
+No anti-patterns detected. Scan of modified files (config.py, logging_config.py, test_logging.py) found:
 - No TODO/FIXME/XXX/HACK/PLACEHOLDER comments
-- No stub return patterns (`return null`, `return {}`, `return []`)
+- No stub return patterns
 - No empty handlers
 - No hardcoded credentials
-
-One notable deviation: `python-sane` is not in `pyproject.toml` dependencies (deferred because `libsane-dev` system headers unavailable in build environment). The `SaneBackend` uses a lazy import sentinel so the package installs and tests pass without it. **This is intentional and documented** — the scanner abstraction layer isolates this system dependency. The absence of python-sane from pyproject.toml means production deployment requires manual installation of both libsane-dev and python-sane. This is a known deployment concern but not a code defect.
+- No suppressed errors (no `# type: ignore`, `# noqa`)
 
 ### Human Verification Required
 
@@ -151,9 +151,17 @@ One notable deviation: `python-sane` is not in `pyproject.toml` dependencies (de
 
 ### Gaps Summary
 
-No gaps found. All 21 truths verified. All artifacts exist, are substantive (not stubs), and are wired together. The full test suite (85 tests) passes in 11.17 seconds. All requirement IDs from plan frontmatter are satisfied with implementation evidence.
+No gaps found. All 23 truths verified (21 original + 2 new from gap closure plan 01-04).
+
+**Gap closure confirmed:** Plan 01-04 successfully addressed the LOG-01/LOG-02 blocker:
+- `OutputConfig.log_file` now defaults to `~/.local/state/saneless/saneless.log` (XDG Base Directory compliant)
+- `configure_logging` now wraps `mkdir` and `RotatingFileHandler` construction in `try/except OSError` with automatic fallback to a `StreamHandler(sys.stderr)`
+- Two new tests added and passing: `test_unwritable_directory_falls_back_to_stderr` and `test_default_log_file_is_xdg_compliant`
+- Both commits verified to exist: `6b4b0e0` (test/RED) and `69c775b` (feat/GREEN)
+- Ruff lint + format: clean
+- Full test suite: 221 passed in 24.27s (no regressions)
 
 ---
 
-_Verified: 2026-03-20T17:30:00Z_
+_Verified: 2026-03-21T14:30:00Z_
 _Verifier: Claude (gsd-verifier)_
