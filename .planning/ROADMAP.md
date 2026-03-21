@@ -127,10 +127,11 @@ Plans:
   3. `JobState` distinguishes error categories (feeder, config, scanner, upload) rather than relying on error message text
   4. POST to `/api/flip/continue` returns response only after worker has transitioned out of `AWAITING_FLIP` state
   5. Playwright tests verify PicoCSS/HTMX rendering, live status polling, and flip prompt UI in a real browser
-**Plans**: 0 plans
+**Plans**: 2 plans
 
 Plans:
-- (none yet)
+- [ ] 07-01-PLAN.md -- Backend hardening: python-sane optional dep, ErrorCategory enum, typed exception handling, flip timing synchronization
+- [ ] 07-02-PLAN.md -- Playwright browser tests for PicoCSS rendering, HTMX polling, flip prompt UI, scan form
 
 ## Progress
 
@@ -145,4 +146,4 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 | 4. Packaging and Deployment | 0/2 | Planning complete | - |
 | 5. Web Server Launch Command | 0/1 | Planning complete | - |
 | 6. Gap Closure Fixes | 0/1 | Planning complete | - |
-| 7. Tech Debt Cleanup | 0/0 | Not started | - |
+| 7. Tech Debt Cleanup | 0/2 | Planning complete | - |
