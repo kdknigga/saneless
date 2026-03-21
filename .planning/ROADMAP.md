@@ -32,13 +32,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. User can define scan profiles in a TOML config file and select one via `--profile` flag
   4. Configuration loads from TOML file with environment variable overrides, and invalid config fails at startup with a clear error
   5. Scanner operations go through an abstraction layer that isolates python-sane behind clean interface methods
-**Plans**: 4 plans
+**Plans**: 5 plans
 
 Plans:
 - [ ] 01-01-PLAN.md -- Foundation: dependencies, config (pydantic-settings TOML + env), exceptions, logging
 - [ ] 01-02-PLAN.md -- Core modules: scanner abstraction (ABC + SaneBackend), PDF assembly (img2pdf), paperless-ngx client
 - [ ] 01-03-PLAN.md -- Integration: job model, worker thread, pipeline orchestration, Click CLI commands
 - [ ] 01-04-PLAN.md -- Gap closure: XDG-compliant log path default, graceful mkdir error handling
+- [ ] 01-05-PLAN.md -- Gap closure: user-friendly TOML structure errors, title alias for default_title_template
 
 ### Phase 2: ADF and Multi-Page
 **Goal**: Users can scan multi-page documents from the ADF in all modes (simplex, hardware duplex, manual duplex) with automatic empty page removal
