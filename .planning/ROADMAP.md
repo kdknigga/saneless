@@ -175,10 +175,11 @@ Plans:
 
 ### Phase 10: Automatic scanner profile creation
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Users get scan profiles auto-generated from scanner capabilities on first use, and can explicitly regenerate via `saneless auto-profiles` CLI command
+**Requirements**: AP-01, AP-02, AP-03, AP-04, AP-05, AP-06, AP-07, AP-08, AP-09
 **Depends on:** Phase 9
-**Plans:** 0 plans
+**Plans:** 2 plans
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 10 to break down)
+- [ ] 10-01-PLAN.md -- Core auto_profiles module: pure generation functions, TOML persistence, tomlkit dep, ProfileConfig auto_generated field (TDD)
+- [ ] 10-02-PLAN.md -- CLI auto-profiles command and worker lazy trigger integration
