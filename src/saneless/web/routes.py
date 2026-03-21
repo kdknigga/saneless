@@ -294,6 +294,7 @@ async def continue_flip(request: Request) -> Response:
     """
     state = request.app.state
     state.worker.continue_flip()
+    state.worker.wait_transition(timeout=2.0)
     job = None
     if state.worker.current_job_id:
         job = state.job_store.get_job(state.worker.current_job_id)

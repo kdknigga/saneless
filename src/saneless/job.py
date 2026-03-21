@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
-__all__ = ["Job", "JobState", "JobStore"]
+__all__ = ["ErrorCategory", "Job", "JobState", "JobStore"]
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,16 @@ class JobState(StrEnum):
     ERROR = "ERROR"
 
 
+class ErrorCategory(StrEnum):
+    """Categories of errors for programmatic handling."""
+
+    FEEDER = "FEEDER"
+    CONFIG = "CONFIG"
+    SCANNER = "SCANNER"
+    UPLOAD = "UPLOAD"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass
 class Job:
     """
@@ -44,6 +54,7 @@ class Job:
         title: Document title for paperless-ngx.
         state: Current job lifecycle state.
         error: Error message if state is ERROR.
+        error_category: Categorized error type for programmatic handling.
         created_at: Timezone-aware creation timestamp.
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
@@ -56,6 +67,7 @@ class Job:
     title: str
     state: JobState = JobState.PENDING
     error: str | None = None
+    error_category: ErrorCategory | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
     tags: list[int] = field(default_factory=list)
     correspondent: int | None = None
@@ -83,6 +95,7 @@ class JobStore:
                 title TEXT NOT NULL,
                 state TEXT NOT NULL,
                 error TEXT,
+                error_category TEXT,
                 tags TEXT NOT NULL,
                 correspondent INTEGER,
                 thumbnail TEXT,
@@ -90,6 +103,12 @@ class JobStore:
             )"""
         )
         self._conn.commit()
+        # Migration: add error_category column to existing databases
+        try:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN error_category TEXT")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
 
     def create_job(
         self,
@@ -122,14 +141,16 @@ class JobStore:
             thumbnail=thumbnail,
         )
         self._conn.execute(
-            "INSERT INTO jobs (id, profile, title, state, error, tags, correspondent, thumbnail, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO jobs (id, profile, title, state, error, error_category, "
+            "tags, correspondent, thumbnail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 job.id,
                 job.profile,
                 job.title,
                 job.state.value,
                 job.error,
+                job.error_category.value if job.error_category else None,
                 json.dumps(job.tags),
                 job.correspondent,
                 job.thumbnail,
@@ -152,7 +173,8 @@ class JobStore:
 
         """
         row = self._conn.execute(
-            "SELECT id, profile, title, state, error, tags, correspondent, thumbnail, created_at "
+            "SELECT id, profile, title, state, error, error_category, "
+            "tags, correspondent, thumbnail, created_at "
             "FROM jobs WHERE id = ?",
             (job_id,),
         ).fetchone()
@@ -164,10 +186,11 @@ class JobStore:
             title=row[2],
             state=JobState(row[3]),
             error=row[4],
-            tags=json.loads(row[5]),
-            correspondent=row[6],
-            thumbnail=row[7],
-            created_at=datetime.fromisoformat(row[8]),
+            error_category=ErrorCategory(row[5]) if row[5] else None,
+            tags=json.loads(row[6]),
+            correspondent=row[7],
+            thumbnail=row[8],
+            created_at=datetime.fromisoformat(row[9]),
         )
 
     def update_state(
@@ -175,6 +198,7 @@ class JobStore:
         job_id: str,
         state: JobState,
         error: str | None = None,
+        error_category: ErrorCategory | None = None,
     ) -> None:
         """
         Update the state (and optionally error) of a job.
@@ -183,11 +207,17 @@ class JobStore:
             job_id: The UUID string of the job.
             state: New job state.
             error: Optional error message (typically set with ERROR state).
+            error_category: Optional error category for programmatic handling.
 
         """
         self._conn.execute(
-            "UPDATE jobs SET state = ?, error = ? WHERE id = ?",
-            (state.value, error, job_id),
+            "UPDATE jobs SET state = ?, error = ?, error_category = ? WHERE id = ?",
+            (
+                state.value,
+                error,
+                error_category.value if error_category else None,
+                job_id,
+            ),
         )
         self._conn.commit()
         logger.debug("Job %s -> %s", job_id, state.value)
@@ -219,8 +249,9 @@ class JobStore:
 
         """
         rows = self._conn.execute(
-            "SELECT id, profile, title, state, error, tags, correspondent, "
-            "thumbnail, created_at FROM jobs ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, profile, title, state, error, error_category, "
+            "tags, correspondent, thumbnail, created_at "
+            "FROM jobs ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [
@@ -230,10 +261,11 @@ class JobStore:
                 title=row[2],
                 state=JobState(row[3]),
                 error=row[4],
-                tags=json.loads(row[5]),
-                correspondent=row[6],
-                thumbnail=row[7],
-                created_at=datetime.fromisoformat(row[8]),
+                error_category=ErrorCategory(row[5]) if row[5] else None,
+                tags=json.loads(row[6]),
+                correspondent=row[7],
+                thumbnail=row[8],
+                created_at=datetime.fromisoformat(row[9]),
             )
             for row in rows
         ]
