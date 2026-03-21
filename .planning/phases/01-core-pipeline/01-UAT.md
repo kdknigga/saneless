@@ -1,9 +1,9 @@
 ---
-status: diagnosed
+status: resolved
 phase: 01-core-pipeline
 source: [01-01-SUMMARY.md, 01-02-SUMMARY.md, 01-03-SUMMARY.md]
 started: 2026-03-21T00:00:00Z
-updated: 2026-03-21T00:05:00Z
+updated: 2026-03-21T00:00:00Z
 ---
 
 ## Current Test
@@ -53,7 +53,7 @@ skipped: 2
 ## Gaps
 
 - truth: "CLI commands should work without root privileges"
-  status: failed
+  status: resolved
   reason: "User reported: PermissionError: [Errno 13] Permission denied: '/var/log/saneless' — configure_logging tries to mkdir /var/log/saneless which requires root"
   severity: blocker
   test: 2
