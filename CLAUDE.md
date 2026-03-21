@@ -48,10 +48,15 @@ Use these tools during development:
 
 ## Browser-Based Validation
 
-All browser-based verification must be automated via Playwright MCP — no manual browser checks. This includes:
+All web application development must be validated via Playwright MCP before asking the human to test. Never mark browser-based checks as "manual-only", "needs human", or "human verification required." Use Playwright MCP to automate:
 - Visual layout and CSS rendering (navigate + screenshot + DOM assertions)
+- HTMX interactivity and live polling (trigger actions, wait for DOM updates)
 - Responsive design (resize viewport, assert layout changes)
 - Form interactivity (fill fields, submit, verify results)
+- Dark/light mode rendering
+- Component visibility and state (buttons disabled, prompts shown/hidden)
+
+The only legitimate "human verification" items are those requiring physical hardware (e.g., real scanner attached) or external network services that cannot be stubbed.
 
 ## Skills available
 
