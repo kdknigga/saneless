@@ -94,4 +94,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-21 after Phase 6 completion — gap closure fixes complete, paperless auth verification fixed, all v1 requirements satisfied*
+*Last updated: 2026-03-21 after Phase 9 completion — pytest strict mode enabled, all tests fully type-annotated and passing identical linting/type-checking quality checks as production code*
