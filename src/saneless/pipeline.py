@@ -211,8 +211,12 @@ def run_pipeline(
 
     device_id = settings.scanner.device
     if not device_id:
-        msg = "No scanner device configured (settings.scanner.device is empty)"
-        raise ConfigError(msg)
+        devices = scanner.get_devices()
+        if not devices:
+            msg = "No scanner found: settings.scanner.device is empty and auto-detection found no devices"
+            raise ConfigError(msg)
+        device_id = devices[0].name
+        logger.info("Auto-detected scanner: %s", device_id)
 
     scan_settings = ScanSettings(
         source=profile.source,

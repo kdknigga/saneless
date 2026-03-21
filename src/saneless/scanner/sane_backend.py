@@ -386,20 +386,35 @@ class SaneBackend(ScannerBackend):
                         available_sources = [str(s) for s in constraint]
                     break
 
-            if has_source_option and settings.source not in available_sources:
-                msg = (
-                    f"Device does not support source '{settings.source}'. "
-                    f"Available: {available_sources}"
-                )
-                raise ScanError(msg)
+            effective_source = settings.source
+            if has_source_option and effective_source not in available_sources:
+                if "Auto" in available_sources:
+                    logger.info(
+                        "Source '%s' not available, falling back to 'Auto'",
+                        effective_source,
+                    )
+                    effective_source = "Auto"
+                else:
+                    msg = (
+                        f"Device does not support source '{effective_source}'. "
+                        f"Available: {available_sources}"
+                    )
+                    raise ScanError(msg)
 
             # Set device options
             dev.mode = settings.mode
             dev.resolution = settings.resolution
             if has_source_option:
-                dev.source = settings.source
+                dev.source = effective_source
 
-            if _is_adf_source(settings.source):
+            use_adf = _is_adf_source(effective_source)
+            if (
+                effective_source.lower() == "auto"
+                and "Flatbed" not in available_sources
+            ):
+                use_adf = True
+
+            if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
                 yield from self._scan_adf_pages(dev)
             else:

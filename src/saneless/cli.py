@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
 import sys
 from pathlib import Path
 
@@ -231,6 +232,16 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
     scanner = SaneBackend()
     app = create_app(settings, scanner)
+
+    # Check port availability before starting to give a clear error
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((actual_host, actual_port))
+    except OSError as e:
+        msg = f"Cannot bind to {actual_host}:{actual_port}: {e}"
+        raise click.ClickException(msg) from e
+    finally:
+        sock.close()
 
     click.echo(f"Serving on http://{actual_host}:{actual_port}")
 

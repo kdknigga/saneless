@@ -518,6 +518,14 @@ class TestJobsCommand:
 class TestServeCommand:
     """Serve command tests."""
 
+    @staticmethod
+    def _mock_socket(monkeypatch):
+        """Bypass the port-availability check in serve()."""
+        from unittest.mock import MagicMock
+
+        mock_sock = MagicMock()
+        monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: mock_sock)
+
     def test_serve_calls_uvicorn_defaults(self, monkeypatch):
         """Serve with no flags calls uvicorn.run with config defaults."""
         captured = {}
@@ -527,6 +535,7 @@ class TestServeCommand:
             captured["app"] = app
             captured.update(kwargs)
 
+        self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
         runner, _settings = _patch_cli(monkeypatch)
         from saneless.cli import cli
@@ -563,6 +572,7 @@ class TestServeCommand:
             """Capture uvicorn.run arguments."""
             captured.update(kwargs)
 
+        self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
@@ -573,6 +583,7 @@ class TestServeCommand:
 
     def test_serve_prints_address(self, monkeypatch):
         """Serve prints listening address to stdout."""
+        self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", lambda *_a, **_kw: None)
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
@@ -599,6 +610,7 @@ class TestServeCommand:
             """Capture the app argument."""
             captured["app"] = app
 
+        self._mock_socket(monkeypatch)
         monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
         runner, _ = _patch_cli(monkeypatch)
         from saneless.cli import cli
