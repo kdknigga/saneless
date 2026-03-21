@@ -65,7 +65,7 @@ class OutputConfig(BaseModel):
     """Output and logging configuration."""
 
     tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
-    log_file: str = "/var/log/saneless/saneless.log"
+    log_file: str = str(Path.home() / ".local" / "state" / "saneless" / "saneless.log")
     log_level: str = "INFO"
     log_max_bytes: int = 10_485_760
     log_backup_count: int = 5
