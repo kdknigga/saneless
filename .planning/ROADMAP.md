@@ -161,12 +161,24 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 Plans:
 - [ ] 08-01-PLAN.md -- Fix httpx type: ignore, document justified suppressions, tighten per-file-ignores
 
-### Phase 9: enable pytest strict mode and ensure all tests are properly type annotated and pass all of the same linting and type checking quality checks as the normal code
+### Phase 9: Enable Pytest Strict Mode and Test Quality Parity
+
+**Goal:** Full test quality parity with production code -- type annotations, docstrings, and lint compliance on all test files, with pytest strict mode enforcing warnings-as-errors and strict markers
+**Requirements**: TQUAL-01, TQUAL-02, TQUAL-03, TQUAL-04, TQUAL-05, TQUAL-06, TQUAL-07
+**Depends on:** Phase 8
+**Plans:** 3 plans
+
+Plans:
+- [ ] 09-01-PLAN.md -- Fix type checker errors in test files, replace mock patterns with concrete stubs, remove ty/pyrefly exclusions
+- [ ] 09-02-PLAN.md -- Add type annotations, docstrings, move lazy imports to top-level, remove ANN/PLC0415 per-file-ignores
+- [ ] 09-03-PLAN.md -- Fix ResourceWarning from unclosed SQLite connections, enable pytest strict configuration
+
+### Phase 10: Automatic scanner profile creation
 
 **Goal:** [To be planned]
 **Requirements**: TBD
-**Depends on:** Phase 8
+**Depends on:** Phase 9
 **Plans:** 0 plans
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 9 to break down)
+- [ ] TBD (run /gsd:plan-phase 10 to break down)
