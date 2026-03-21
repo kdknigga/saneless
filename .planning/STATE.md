@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Phase 5 context gathered
-last_updated: "2026-03-21T00:23:58.359Z"
-last_activity: 2026-03-20
+stopped_at: Completed 05-01-PLAN.md
+last_updated: "2026-03-21T00:43:18.875Z"
+last_activity: 2026-03-21
 progress:
   total_phases: 6
-  completed_phases: 4
-  total_plans: 12
-  completed_plans: 12
+  completed_phases: 5
+  total_plans: 13
+  completed_plans: 13
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-20)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 04 — packaging-and-deployment
+**Current focus:** Phase 05 — web-server-launch
 
 ## Current Position
 
-Phase: 04 (packaging-and-deployment) — EXECUTING
-Plan: 2 of 2 (COMPLETE)
+Phase: 05 (web-server-launch) — EXECUTING
+Plan: 1 of 1
 
 ## Performance Metrics
 
@@ -58,6 +58,7 @@ Plan: 2 of 2 (COMPLETE)
 | Phase 03-web-ui P03 | 5min | 2 tasks | 3 files |
 | Phase 04 P02 | 2min | 2 tasks | 4 files |
 | Phase 04-packaging-and-deployment P01 | 3min | 2 tasks | 4 files |
+| Phase 05 P01 | 3min | 2 tasks | 4 files |
 
 ## Accumulated Context
 
@@ -91,6 +92,8 @@ Recent decisions affecting current work:
 - [Phase 04]: Port 8080 in Dockerfile matches OutputConfig.web_port default
 - [Phase 04]: PyPI trusted publishing via OIDC -- no API tokens needed
 - [Phase 04-01]: DB path for jobs command matches web layer: tmp_dir/saneless.db
+- [Phase 05]: log_config=None so uvicorn loggers propagate to root handler configured by CLI group
+- [Phase 05]: Click option defaults are None, resolved at runtime from settings (not decoration time)
 
 ### Pending Todos
 
@@ -109,7 +112,7 @@ None yet.
 
 ## Session Continuity
 
-Last activity: 2026-03-20
-Last session: 2026-03-21T00:23:58.357Z
-Stopped at: Phase 5 context gathered
-Resume file: .planning/phases/05-web-server-launch/05-CONTEXT.md
+Last activity: 2026-03-21
+Last session: 2026-03-21T00:43:18.873Z
+Stopped at: Completed 05-01-PLAN.md
+Resume file: None
