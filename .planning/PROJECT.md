@@ -94,4 +94,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-20 after Phase 4 completion*
+*Last updated: 2026-03-21 after Phase 5 completion*
