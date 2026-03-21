@@ -13,10 +13,14 @@ import logging
 import shutil
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from .exceptions import PaperlessError
+
+if TYPE_CHECKING:
+    from httpx._types import FileTypes
 
 __all__ = ["PaperlessClient"]
 
@@ -107,13 +111,13 @@ class PaperlessClient:
                     # Combine form fields and file into a single multipart
                     # files list for httpx. This avoids issues with mixing
                     # data= and files= parameters.
-                    multipart_files: list[tuple[str, object]] = [
+                    multipart_files: list[tuple[str, FileTypes]] = [
                         *fields,
                         ("document", (pdf_path.name, f, "application/pdf")),
                     ]
                     response = self._client.post(
                         "/api/documents/post_document/",
-                        files=multipart_files,  # type: ignore[arg-type]
+                        files=multipart_files,
                     )
                 response.raise_for_status()
                 task_id = response.json()

@@ -106,8 +106,8 @@ class Settings(BaseSettings):
         settings_cls: type[BaseSettings],
         init_settings: PydanticBaseSettingsSource,
         env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003
-        file_secret_settings: PydanticBaseSettingsSource,  # noqa: ARG003
+        dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003 -- pydantic-settings requires this signature param
+        file_secret_settings: PydanticBaseSettingsSource,  # noqa: ARG003 -- pydantic-settings requires this signature param
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         """
         Configure settings sources with optional TOML file support.
@@ -150,7 +150,7 @@ def _build_settings(
     """Build Settings, converting extra-field errors to user-friendly messages."""
     try:
         if toml_file is not None:
-            return Settings(_toml_file=toml_file)  # type: ignore[call-arg]
+            return Settings(_toml_file=toml_file)  # type: ignore[call-arg] -- ty cannot see BaseSettings dynamic __init__ kwargs
         return Settings()
     except ValidationError as exc:
         extra_fields: list[str] = []
