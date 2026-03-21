@@ -522,19 +522,34 @@ class TestServeCommand:
         mock_sock = MagicMock()
         monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: mock_sock)
 
+    @staticmethod
+    def _capture_uvicorn(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> dict[str, object]:
+        """Patch uvicorn.run to capture args and close the app's job_store."""
+        captured: dict[str, object] = {}
+
+        def mock_uvicorn_run(app: object, **kwargs: object) -> None:
+            """Capture uvicorn.run arguments and close the app's job_store."""
+            captured["app"] = app
+            captured.update(kwargs)
+            # Close the eagerly-created JobStore to prevent ResourceWarning
+            from fastapi import FastAPI  # noqa: PLC0415
+
+            if isinstance(app, FastAPI):
+                store: object = app.state.job_store
+                if isinstance(store, JobStore):
+                    store.close()
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        return captured
+
     def test_serve_calls_uvicorn_defaults(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Serve with no flags calls uvicorn.run with config defaults."""
-        captured: dict[str, object] = {}
-
-        def mock_uvicorn_run(app: object, **kwargs: object) -> None:
-            """Capture uvicorn.run arguments."""
-            captured["app"] = app
-            captured.update(kwargs)
-
         self._mock_socket(monkeypatch)
-        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        captured = self._capture_uvicorn(monkeypatch)
         runner, _settings = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve"])
@@ -546,13 +561,7 @@ class TestServeCommand:
 
     def test_serve_custom_host_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve --host/--port overrides config defaults."""
-        captured: dict[str, object] = {}
-
-        def mock_uvicorn_run(_app: object, **kwargs: object) -> None:
-            """Capture uvicorn.run arguments."""
-            captured.update(kwargs)
-
-        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        captured = self._capture_uvicorn(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "9090"])
@@ -562,14 +571,8 @@ class TestServeCommand:
 
     def test_serve_log_level(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve passes log_level from settings to uvicorn."""
-        captured: dict[str, object] = {}
-
-        def mock_uvicorn_run(_app: object, **kwargs: object) -> None:
-            """Capture uvicorn.run arguments."""
-            captured.update(kwargs)
-
         self._mock_socket(monkeypatch)
-        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        captured = self._capture_uvicorn(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve"])
@@ -579,7 +582,7 @@ class TestServeCommand:
     def test_serve_prints_address(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve prints listening address to stdout."""
         self._mock_socket(monkeypatch)
-        monkeypatch.setattr("saneless.cli.uvicorn.run", lambda *_a, **_kw: None)
+        self._capture_uvicorn(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve"])
@@ -597,14 +600,8 @@ class TestServeCommand:
 
     def test_serve_receives_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve passes a FastAPI app (not None) to uvicorn.run."""
-        captured: dict[str, object] = {}
-
-        def mock_uvicorn_run(app: object, **_kwargs: object) -> None:
-            """Capture the app argument."""
-            captured["app"] = app
-
         self._mock_socket(monkeypatch)
-        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
+        captured = self._capture_uvicorn(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve"])
