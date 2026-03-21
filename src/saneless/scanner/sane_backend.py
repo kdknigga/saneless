@@ -44,7 +44,7 @@ def _ensure_sane() -> None:
     """Import the real sane module on first use."""
     global sane  # noqa: PLW0603
     if sane is None:
-        import sane as _sane  # type: ignore[no-redef]  # noqa: PLC0415
+        import sane as _sane  # noqa: PLC0415
 
         sane = _sane
 
