@@ -37,22 +37,27 @@ def configure_logging(
         verbose: If True, also add a StreamHandler writing to stderr.
 
     """
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-
     formatter = logging.Formatter(
         "%(asctime)s %(levelname)-8s %(name)s %(message)s",
     )
 
-    file_handler = RotatingFileHandler(
-        log_file,
-        maxBytes=max_bytes,
-        backupCount=backup_count,
-    )
-    file_handler.setFormatter(formatter)
-
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, log_level.upper()))
-    root_logger.addHandler(file_handler)
+
+    try:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+        )
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    except OSError:
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(formatter)
+        root_logger.addHandler(stderr_handler)
+        root_logger.warning("Cannot write to %s, logging to stderr only", log_file)
 
     if verbose:
         stderr_handler = logging.StreamHandler(sys.stderr)
