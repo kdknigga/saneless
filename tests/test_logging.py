@@ -3,6 +3,7 @@
 import logging
 import re
 
+from saneless.config import OutputConfig
 from saneless.logging_config import configure_logging
 
 
@@ -101,3 +102,30 @@ class TestConfigureLogging:
             assert len(stream_handlers) >= 1
         finally:
             self._cleanup_handlers()
+
+    def test_unwritable_directory_falls_back_to_stderr(self, tmp_path):
+        """configure_logging with unwritable dir does not raise, falls back to stderr."""
+        unwritable = tmp_path / "noperm"
+        unwritable.mkdir()
+        unwritable.chmod(0o000)
+        log_file = str(unwritable / "subdir" / "test.log")
+        try:
+            # Must not raise
+            configure_logging(log_file=log_file)
+            root = logging.getLogger()
+            stream_handlers = [
+                h
+                for h in root.handlers
+                if isinstance(h, logging.StreamHandler)
+                and not isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert len(stream_handlers) >= 1, "Expected stderr fallback handler"
+        finally:
+            unwritable.chmod(0o700)
+            self._cleanup_handlers()
+
+    def test_default_log_file_is_xdg_compliant(self):
+        """OutputConfig.log_file default uses XDG state dir, not /var/log."""
+        config = OutputConfig()
+        assert ".local/state/saneless" in config.log_file
+        assert "/var/log" not in config.log_file
