@@ -1,0 +1,21 @@
+[scanner]
+host = ""       # SANE network host, leave empty for local
+device = ""     # SANE device string, leave empty for auto-detect
+
+[paperless]
+url = "http://your-paperless-host:8000"
+token = "your-api-token-here"
+consume_dir = "/path/to/paperless/consume"
+
+[output]
+web_port = 8081          # change if 8080 is taken
+# tmp_dir = "/tmp/saneless"
+# log_level = "INFO"
+
+[profiles.default]
+source = "Flatbed"
+resolution = 300
+mode = "color"
+# default_tags = []
+# default_correspondent = 1
+# title = ""
