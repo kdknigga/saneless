@@ -234,6 +234,45 @@ def test_flip_abort(client) -> None:
     assert response.status_code == 200
 
 
+def test_paperless_test_connected(client: TestClient) -> None:
+    """GET /api/paperless/test returns connected status (PLSS-03)."""
+    client.app.state.paperless.test_connection = lambda: "connected"
+    response = client.get("/api/paperless/test")
+    assert response.status_code == 200
+    assert response.json() == {"status": "connected"}
+
+
+def test_paperless_test_token_rejected(client: TestClient) -> None:
+    """GET /api/paperless/test returns token_rejected status (PLSS-03)."""
+    client.app.state.paperless.test_connection = lambda: "token_rejected"
+    response = client.get("/api/paperless/test")
+    assert response.status_code == 200
+    assert response.json() == {"status": "token_rejected"}
+
+
+def test_paperless_test_unreachable(client: TestClient) -> None:
+    """GET /api/paperless/test returns unreachable status (PLSS-03)."""
+    client.app.state.paperless.test_connection = lambda: "unreachable"
+    response = client.get("/api/paperless/test")
+    assert response.status_code == 200
+    assert response.json() == {"status": "unreachable"}
+
+
+def test_paperless_test_error(client: TestClient) -> None:
+    """GET /api/paperless/test returns error on exception (PLSS-03)."""
+
+    def raise_exc():
+        msg = "boom"
+        raise RuntimeError(msg)
+
+    client.app.state.paperless.test_connection = raise_exc
+    response = client.get("/api/paperless/test")
+    assert response.status_code == 502
+    data = response.json()
+    assert data["status"] == "error"
+    assert "boom" in data["detail"]
+
+
 def test_scan_button_disabled_during_active_job(client) -> None:
     """Scan button disabled during active job (UI-07)."""
     job_store: JobStore = client.app.state.job_store
