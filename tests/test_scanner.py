@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 import pytest
 from PIL import Image, ImageDraw
@@ -148,6 +148,45 @@ class MockSaneModule:
         return self._mock_dev
 
 
+class _FakeSaneDevice:
+    """Fake SANE device for testing scan_pages behavior."""
+
+    def __init__(
+        self,
+        *,
+        multi_scan: Callable[[], Iterator[Image.Image]] | None = None,
+        cancel: Callable[[], None] | None = None,
+        close: Callable[[], None] | None = None,
+    ) -> None:
+        """Initialize fake device with pluggable multi_scan, cancel, close."""
+        self.mode: str = "color"
+        self.resolution: int = 300
+        self.source: str = "Flatbed"
+        self._multi_scan_fn = multi_scan or (lambda: iter([]))
+        self._cancel_fn = cancel or (lambda: None)
+        self._close_fn = close or (lambda: None)
+
+    def get_options(self) -> list[tuple]:
+        """Return empty options list."""
+        return []
+
+    def snap(self) -> Image.Image:
+        """Return a test image."""
+        return Image.new("RGB", (100, 100), "white")
+
+    def multi_scan(self) -> Iterator[Image.Image]:
+        """Delegate to pluggable multi_scan function."""
+        return self._multi_scan_fn()
+
+    def cancel(self) -> None:
+        """Delegate to pluggable cancel function."""
+        self._cancel_fn()
+
+    def close(self) -> None:
+        """Delegate to pluggable close function."""
+        self._close_fn()
+
+
 class MockBackend(ScannerBackend):
     """Concrete mock backend to test the ABC contract."""
 
@@ -162,7 +201,7 @@ class MockBackend(ScannerBackend):
             ),
         ]
 
-    def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """Return minimal capabilities for the mock device."""
         return DeviceCapabilities(
             sources=["Flatbed"],
@@ -172,7 +211,7 @@ class MockBackend(ScannerBackend):
         )
 
     def scan_pages(
-        self, _device_id: str, _settings: ScanSettings
+        self, device_id: str, settings: ScanSettings
     ) -> Iterator[Image.Image]:
         """Yield a single white test image."""
         yield Image.new("RGB", (100, 100), "white")
@@ -221,8 +260,9 @@ class TestScannerBackendABC:
 
     def test_scanner_backend_is_abstract(self) -> None:
         """ScannerBackend cannot be instantiated directly."""
+        cls: type = ScannerBackend
         with pytest.raises(TypeError, match="abstract"):
-            ScannerBackend()  # type: ignore[abstract]
+            cls()
 
 
 class TestMockBackend:
@@ -459,16 +499,11 @@ class TestSaneBackendEmptyFeeder:
         """Multi_scan first iteration error with 'out of documents' raises FeederEmptyError."""
         from saneless.scanner.sane_backend import SaneBackend
 
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = []
-        # Simulate error on first iteration by making multi_scan return
-        # an iterator that raises on first next()
-
         def _raising_multi_scan():
             msg = "out of documents"
             raise RuntimeError(msg)
 
-        mock_dev.multi_scan = _raising_multi_scan  # type: ignore[assignment]
+        mock_sane_module._mock_dev = _FakeSaneDevice(multi_scan=_raising_multi_scan)
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
@@ -601,7 +636,6 @@ class TestSaneBackendPerPageTimeout:
         """Page that takes too long raises ScanError with timeout message."""
         from saneless.scanner.sane_backend import SaneBackend
 
-        mock_dev = mock_sane_module._mock_dev
         event = threading.Event()
 
         def _blocking_iterator():
@@ -609,12 +643,12 @@ class TestSaneBackendPerPageTimeout:
             event.wait(timeout=10)
             yield _make_content_image()
 
-        mock_dev.multi_scan = _blocking_iterator  # type: ignore[assignment]
+        fake_dev = _FakeSaneDevice(multi_scan=_blocking_iterator)
 
         backend = SaneBackend()
 
         with pytest.raises(ScanError, match="timed out"):
-            list(backend._scan_adf_pages(mock_dev, timeout_per_page=0.5))
+            list(backend._scan_adf_pages(fake_dev, timeout_per_page=0.5))
 
         # Unblock the thread so it can clean up
         event.set()
@@ -644,18 +678,19 @@ class TestSaneBackendADFCleanup:
         """dev.cancel() and dev.close() called even when ADF scan errors."""
         from saneless.scanner.sane_backend import SaneBackend
 
-        mock_dev = mock_sane_module._mock_dev
-
-        call_count = 0
+        operations: list[str] = []
 
         def _error_iterator():
-            nonlocal call_count
             yield _make_content_image()
-            call_count += 1
             msg = "hardware error"
             raise RuntimeError(msg)
 
-        mock_dev.multi_scan = _error_iterator  # type: ignore[assignment]
+        fake_dev = _FakeSaneDevice(
+            multi_scan=_error_iterator,
+            cancel=lambda: operations.append("cancel"),
+            close=lambda: operations.append("close"),
+        )
+        mock_sane_module._mock_dev = fake_dev
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
@@ -663,8 +698,8 @@ class TestSaneBackendADFCleanup:
         with pytest.raises(RuntimeError, match="hardware error"):
             list(backend.scan_pages("test:device:001", settings))
 
-        assert mock_dev._cancel_called
-        assert mock_dev._close_called
+        assert "cancel" in operations
+        assert "close" in operations
 
     def test_iterator_deleted_before_cancel(self, mock_sane_module) -> None:
         """Multi_scan iterator reference is deleted before dev.cancel()."""
@@ -674,7 +709,6 @@ class TestSaneBackendADFCleanup:
 
         # Track operation order
         operations: list[str] = []
-        original_cancel = mock_dev.cancel
 
         class TrackingIterator:
             """Iterator that tracks when it is deleted."""
@@ -700,10 +734,11 @@ class TestSaneBackendADFCleanup:
 
         def _tracking_cancel() -> None:
             operations.append("cancel_called")
-            original_cancel()
 
-        mock_dev.multi_scan = _tracking_multi_scan  # type: ignore[assignment]
-        mock_dev.cancel = _tracking_cancel  # type: ignore[assignment]
+        fake_dev = _FakeSaneDevice(
+            multi_scan=_tracking_multi_scan, cancel=_tracking_cancel
+        )
+        mock_sane_module._mock_dev = fake_dev
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
