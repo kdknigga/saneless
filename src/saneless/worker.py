@@ -13,7 +13,8 @@ import queue
 import threading
 from typing import TYPE_CHECKING
 
-from .job import JobState
+from .exceptions import ConfigError, FeederEmptyError, PaperlessError, ScanError
+from .job import ErrorCategory, JobState
 from .pipeline import PipelineRequest, run_pipeline
 
 if TYPE_CHECKING:
@@ -55,6 +56,7 @@ class ScanWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._flip_event: threading.Event | None = None
         self._abort_event: threading.Event | None = None
+        self._transition_event = threading.Event()
         self._current_job_id: str | None = None
 
     def start(self) -> None:
@@ -93,6 +95,21 @@ class ScanWorker:
             self._flip_event.set()  # Unblock the wait
             logger.info("Manual duplex: abort signal sent")
 
+    def wait_transition(self, timeout: float = 2.0) -> bool:
+        """
+        Wait for worker to transition state after flip continue.
+
+        Args:
+            timeout: Maximum seconds to wait.
+
+        Returns:
+            True if transition occurred, False on timeout.
+
+        """
+        result = self._transition_event.wait(timeout=timeout)
+        self._transition_event.clear()
+        return result
+
     @property
     def is_alive(self) -> bool:
         """Whether the worker thread is currently running."""
@@ -103,67 +120,103 @@ class ScanWorker:
         """ID of the currently processing job, or None."""
         return self._current_job_id
 
+    def _categorize_error(self, exc: Exception) -> ErrorCategory:
+        """
+        Map an exception to its error category.
+
+        Args:
+            exc: The caught exception.
+
+        Returns:
+            The appropriate ErrorCategory value.
+
+        """
+        if isinstance(exc, FeederEmptyError):
+            return ErrorCategory.FEEDER
+        if isinstance(exc, ConfigError):
+            return ErrorCategory.CONFIG
+        if isinstance(exc, ScanError):
+            return ErrorCategory.SCANNER
+        if isinstance(exc, PaperlessError):
+            return ErrorCategory.UPLOAD
+        return ErrorCategory.UNKNOWN
+
     def _run(self) -> None:
         """Worker loop: process jobs until sentinel None received."""
         while True:
             item = self._queue.get()
             if item is None:
                 break
+            self._process_job(item)
 
-            job = item
-            self._current_job_id = job.id
-            self._job_store.update_state(job.id, JobState.SCANNING)
+    def _process_job(self, job: Job) -> None:
+        """
+        Execute a single scan job through the pipeline.
 
-            # Detect manual duplex from profile source
-            profile = self._settings.profiles.get(job.profile)
-            source = profile.source.lower() if profile else ""
-            is_manual_duplex = "manual" in source and "duplex" in source
+        Args:
+            job: The Job to process.
 
-            if is_manual_duplex:
-                self._flip_event = threading.Event()
-                self._abort_event = threading.Event()
-            else:
-                self._flip_event = None
-                self._abort_event = None
+        """
+        self._current_job_id = job.id
+        self._job_store.update_state(job.id, JobState.SCANNING)
+        self._transition_event.set()
 
-            def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
-                self._job_store.update_thumbnail(_jid, thumb)
+        # Detect manual duplex from profile source
+        profile = self._settings.profiles.get(job.profile)
+        source = profile.source.lower() if profile else ""
+        is_manual_duplex = "manual" in source and "duplex" in source
 
-            def _status_cb(msg: str, _jid: str = job.id) -> None:
-                logger.info(msg)
-                if msg == "Awaiting flip...":
-                    self._job_store.update_state(_jid, JobState.AWAITING_FLIP)
-                elif msg == "Assembling PDF...":
-                    self._job_store.update_state(_jid, JobState.ASSEMBLING)
-                elif msg == "Uploading to paperless-ngx...":
-                    self._job_store.update_state(_jid, JobState.UPLOADING)
+        if is_manual_duplex:
+            self._flip_event = threading.Event()
+            self._abort_event = threading.Event()
+        else:
+            self._flip_event = None
+            self._abort_event = None
 
-            try:
-                request = PipelineRequest(
-                    profile_name=job.profile,
-                    title=job.title,
-                    tags=job.tags or None,
-                    correspondent=job.correspondent,
-                    status_callback=_status_cb,
-                    thumbnail_callback=_thumbnail_cb,
-                    flip_event=self._flip_event,
-                    abort_event=self._abort_event,
-                )
-                run_pipeline(
-                    self._scanner,
-                    self._paperless,
-                    self._settings,
-                    request,
-                )
-                self._job_store.update_state(job.id, JobState.DONE)
-            except Exception as exc:
-                self._job_store.update_state(
-                    job.id,
-                    JobState.ERROR,
-                    error=str(exc),
-                )
-                logger.error("Job %s failed: %s", job.id, exc)
-            finally:
-                self._flip_event = None
-                self._abort_event = None
-                self._current_job_id = None
+        def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
+            self._job_store.update_thumbnail(_jid, thumb)
+
+        def _status_cb(msg: str, _jid: str = job.id) -> None:
+            logger.info(msg)
+            if msg == "Awaiting flip...":
+                self._transition_event.clear()
+                self._job_store.update_state(_jid, JobState.AWAITING_FLIP)
+            elif msg == "Assembling PDF...":
+                self._job_store.update_state(_jid, JobState.ASSEMBLING)
+                self._transition_event.set()
+            elif msg == "Uploading to paperless-ngx...":
+                self._job_store.update_state(_jid, JobState.UPLOADING)
+                self._transition_event.set()
+
+        try:
+            request = PipelineRequest(
+                profile_name=job.profile,
+                title=job.title,
+                tags=job.tags or None,
+                correspondent=job.correspondent,
+                status_callback=_status_cb,
+                thumbnail_callback=_thumbnail_cb,
+                flip_event=self._flip_event,
+                abort_event=self._abort_event,
+            )
+            run_pipeline(
+                self._scanner,
+                self._paperless,
+                self._settings,
+                request,
+            )
+            self._job_store.update_state(job.id, JobState.DONE)
+            self._transition_event.set()
+        except Exception as exc:
+            category = self._categorize_error(exc)
+            self._job_store.update_state(
+                job.id,
+                JobState.ERROR,
+                error=str(exc),
+                error_category=category,
+            )
+            logger.error("Job %s failed (%s): %s", job.id, category.value.lower(), exc)
+        finally:
+            self._flip_event = None
+            self._abort_event = None
+            self._current_job_id = None
