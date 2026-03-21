@@ -156,7 +156,7 @@ Phases execute in numeric order: 1 -> 2 -> 3 -> 4
 **Goal:** Zero unjustified suppressions in production code -- fix every fixable # noqa and # type: ignore, document remaining justified ones, tighten per-file-ignores
 **Requirements**: AUDIT-01, AUDIT-02, AUDIT-03, AUDIT-04
 **Depends on:** Phase 7
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 
 Plans:
 - [ ] 08-01-PLAN.md -- Fix httpx type: ignore, document justified suppressions, tighten per-file-ignores
