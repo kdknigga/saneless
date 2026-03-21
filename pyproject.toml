@@ -40,6 +40,9 @@ Homepage = "https://github.com/kris-knigga/saneless"
 Repository = "https://github.com/kris-knigga/saneless"
 Issues = "https://github.com/kris-knigga/saneless/issues"
 
+[project.optional-dependencies]
+sane = ["python-sane>=2.9.1"]
+
 [build-system]
 requires = ["uv_build>=0.10.3,<0.11.0"]
 build-backend = "uv_build"
@@ -141,6 +144,7 @@ testpaths = ["tests"]
 dev = [
     "httpx>=0.28.1",
     "playwright>=1.58.0",
+    "pytest-playwright>=0.7.0",
     "prek>=0.3.5",
     "pyrefly>=0.55.0",
     "pytest>=9.0.2",
