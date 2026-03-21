@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import click
+import uvicorn
 
 from .config import load_settings
 from .exceptions import PaperlessError, ScanError
@@ -21,6 +22,7 @@ from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
+from .web.app import create_app
 
 __all__ = ["cli"]
 
@@ -215,3 +217,28 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                 )
     finally:
         store.close()
+
+
+@cli.command()
+@click.option("--host", default=None, help="Bind address.")
+@click.option("--port", default=None, type=int, help="Bind port.")
+@click.pass_context
+def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
+    """Start the web server."""
+    settings = ctx.obj["settings"]
+    actual_host = host or settings.output.web_host
+    actual_port = port or settings.output.web_port
+
+    scanner = SaneBackend()
+    app = create_app(settings, scanner)
+
+    click.echo(f"Serving on http://{actual_host}:{actual_port}")
+
+    uvicorn.run(
+        app,
+        host=actual_host,
+        port=actual_port,
+        log_config=None,
+        log_level=settings.output.log_level.lower(),
+        access_log=True,
+    )
