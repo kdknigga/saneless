@@ -1,5 +1,5 @@
 ---
-status: complete
+status: diagnosed
 phase: 01-core-pipeline
 source: [01-01-SUMMARY.md, 01-02-SUMMARY.md, 01-03-SUMMARY.md, 01-04-SUMMARY.md]
 started: 2026-03-21T15:00:00Z
@@ -63,17 +63,27 @@ skipped: 0
   reason: "User reported: Configuration error: 1 validation error for Settings default Extra inputs are not permitted [type=extra_forbidden, input_value={'title': 'Test Doc'}, input_type=dict]"
   severity: major
   test: 4
-  root_cause: ""
-  artifacts: []
-  missing: []
-  debug_session: ""
+  root_cause: "TOML [default] parsed as top-level key but Settings(BaseSettings) inherits extra='forbid'. Correct path is [profiles.default]. Also ProfileConfig has no 'title' field — user likely wants 'default_title_template'."
+  artifacts:
+    - path: "src/saneless/config.py"
+      issue: "Settings inherits extra='forbid' from BaseSettings — rejects unknown top-level TOML keys with no helpful error"
+    - path: "src/saneless/config.py"
+      issue: "ProfileConfig has no 'title' field; closest is 'default_title_template'"
+  missing:
+    - "Add user-friendly error message when TOML structure is wrong, pointing to expected schema"
+    - "Document expected TOML structure (e.g. [profiles.default] not [default])"
+    - "Consider adding 'title' as alias for 'default_title_template' or document the correct field name"
+  debug_session: ".planning/debug/config-extra-forbidden.md"
 
 - truth: "Environment variable override with SANELESS_ prefix works for nested config"
   status: failed
   reason: "User reported: Same extra_forbidden validation error — config.toml with title field causes Pydantic to reject it before env var override is reached"
   severity: major
   test: 5
-  root_cause: ""
-  artifacts: []
-  missing: []
-  debug_session: ""
+  root_cause: "Same root cause as test 4 — the config.toml with [default] section triggers validation error before env var processing. With correct TOML structure or no config file, env vars should work."
+  artifacts:
+    - path: "src/saneless/config.py"
+      issue: "TOML loading and validation happens before env var merge"
+  missing:
+    - "Fix test 4 root cause — once TOML validation passes, env vars can be tested independently"
+  debug_session: ".planning/debug/config-extra-forbidden.md"
