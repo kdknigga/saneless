@@ -1,6 +1,10 @@
 """Tests for pipeline orchestration."""
 
+from __future__ import annotations
+
+import base64
 import threading
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,13 +19,22 @@ from saneless.pipeline import (
 )
 from saneless.scanner.base import ScannerBackend
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from saneless.config import Settings
+
 
 class TestRunPipeline:
     """Pipeline orchestration tests."""
 
     def test_run_pipeline_happy_path(
-        self, mock_scanner, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Full pipeline: scan -> assemble -> upload succeeds."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -37,7 +50,12 @@ class TestRunPipeline:
         mock_scanner.scan_pages.assert_called_once()
         mock_paperless.upload_document.assert_called_once()
 
-    def test_run_pipeline_scan_error(self, mock_paperless, default_settings, tmp_path):
+    def test_run_pipeline_scan_error(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Scanner raises ScanError -> pipeline raises ScanError."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -53,7 +71,12 @@ class TestRunPipeline:
                 request=request,
             )
 
-    def test_run_pipeline_upload_error(self, mock_scanner, default_settings, tmp_path):
+    def test_run_pipeline_upload_error(
+        self,
+        mock_scanner: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Paperless raises PaperlessError -> pipeline raises PaperlessError."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -70,8 +93,12 @@ class TestRunPipeline:
             )
 
     def test_run_pipeline_temp_cleanup(
-        self, mock_scanner, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """After successful run, tmp_dir has no leftover scan files."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -89,7 +116,9 @@ class TestRunPipeline:
         for item in remaining:
             assert not item.is_dir(), f"Leftover directory: {item}"
 
-    def test_run_pipeline_temp_cleanup_on_error(self, default_settings, tmp_path):
+    def test_run_pipeline_temp_cleanup_on_error(
+        self, default_settings: Settings, tmp_path: Path
+    ) -> None:
         """After failed run, tmp_dir has no leftover scan files."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -111,8 +140,12 @@ class TestRunPipeline:
             assert not item.is_dir(), f"Leftover directory: {item}"
 
     def test_run_pipeline_calls_poll(
-        self, mock_scanner, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """After upload, pipeline calls poll_task with returned UUID."""
         default_settings.output.tmp_dir = str(tmp_path)
         mock_paperless.upload_document.return_value = "task-uuid-123"
@@ -131,8 +164,12 @@ class TestRunPipeline:
         assert call_args[0][0] == "task-uuid-123"
 
     def test_run_pipeline_status_callback(
-        self, mock_scanner, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Pipeline calls status_callback with correct status messages in order."""
         default_settings.output.tmp_dir = str(tmp_path)
         messages: list[str] = []
@@ -171,24 +208,24 @@ def _make_empty_image() -> Image.Image:
 class TestIsManualDuplex:
     """Tests for _is_manual_duplex helper."""
 
-    def test_adf_manual_duplex(self):
+    def test_adf_manual_duplex(self) -> None:
         """Source 'ADF Manual Duplex' is manual duplex."""
         assert _is_manual_duplex("ADF Manual Duplex") is True
 
-    def test_manual_duplex_case_insensitive(self):
+    def test_manual_duplex_case_insensitive(self) -> None:
         """Case insensitive detection."""
         assert _is_manual_duplex("adf manual duplex") is True
         assert _is_manual_duplex("MANUAL DUPLEX") is True
 
-    def test_flatbed_not_manual_duplex(self):
+    def test_flatbed_not_manual_duplex(self) -> None:
         """Flatbed is not manual duplex."""
         assert _is_manual_duplex("Flatbed") is False
 
-    def test_adf_not_manual_duplex(self):
+    def test_adf_not_manual_duplex(self) -> None:
         """Plain ADF (no manual) is not manual duplex."""
         assert _is_manual_duplex("ADF") is False
 
-    def test_hardware_duplex_not_manual(self):
+    def test_hardware_duplex_not_manual(self) -> None:
         """Hardware duplex without 'manual' is not manual duplex."""
         assert _is_manual_duplex("ADF Duplex") is False
 
@@ -196,7 +233,7 @@ class TestIsManualDuplex:
 class TestInterleave:
     """Unit tests for _interleave_duplex."""
 
-    def test_interleave_basic(self):
+    def test_interleave_basic(self) -> None:
         """Interleave 3 fronts + 3 backs correctly reverses backs."""
         fronts = [Image.new("RGB", (10, 10), c) for c in ["red", "green", "blue"]]
         backs = [Image.new("RGB", (10, 10), c) for c in ["cyan", "magenta", "yellow"]]
@@ -211,7 +248,7 @@ class TestInterleave:
         assert result[4] is fronts[2]
         assert result[5] is backs[0]  # reversed
 
-    def test_interleave_single_page(self):
+    def test_interleave_single_page(self) -> None:
         """Single front + single back works."""
         f = [Image.new("RGB", (10, 10), "red")]
         b = [Image.new("RGB", (10, 10), "blue")]
@@ -220,7 +257,7 @@ class TestInterleave:
         assert result[0] is f[0]
         assert result[1] is b[0]
 
-    def test_interleave_count_mismatch_raises(self):
+    def test_interleave_count_mismatch_raises(self) -> None:
         """Mismatched front/back counts raise ScanError."""
         fronts = [Image.new("RGB", (10, 10)) for _ in range(3)]
         backs = [Image.new("RGB", (10, 10)) for _ in range(2)]
@@ -232,8 +269,12 @@ class TestPipelineThumbnail:
     """Thumbnail generation in pipeline."""
 
     def test_thumbnail_callback_called_flatbed(
-        self, mock_scanner, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Flatbed scan calls thumbnail_callback with non-empty base64 string."""
         default_settings.output.tmp_dir = str(tmp_path)
         # Use a content image so it doesn't get filtered as empty
@@ -255,13 +296,15 @@ class TestPipelineThumbnail:
         assert len(thumb_results) == 1
         assert len(thumb_results[0]) > 0
         # Should be valid base64
-        import base64
-
         base64.b64decode(thumb_results[0])
 
     def test_no_thumbnail_callback_ok(
-        self, mock_scanner, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Pipeline works without thumbnail_callback."""
         default_settings.output.tmp_dir = str(tmp_path)
         mock_scanner.scan_pages.return_value = iter([_make_content_image()])
@@ -282,7 +325,12 @@ class TestPipelineThumbnail:
 class TestPipelineEmptyPageFilter:
     """Empty page filtering in pipeline."""
 
-    def test_empty_pages_filtered(self, mock_paperless, default_settings, tmp_path):
+    def test_empty_pages_filtered(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Pipeline with 5 pages (3 content + 2 empty) assembles PDF with only 3."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -317,8 +365,11 @@ class TestPipelineEmptyPageFilter:
             assert len(called_images) == 3
 
     def test_custom_thresholds_from_profile(
-        self, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Custom thresholds from ProfileConfig are passed to filter_empty_pages."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].empty_page_mean_threshold = 200.0
@@ -342,7 +393,12 @@ class TestPipelineEmptyPageFilter:
             assert kwargs["mean_threshold"] == 200.0
             assert kwargs["stddev_threshold"] == 10.0
 
-    def test_all_pages_empty_raises(self, mock_paperless, default_settings, tmp_path):
+    def test_all_pages_empty_raises(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """All pages empty -> raises ScanError."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -364,7 +420,12 @@ class TestPipelineEmptyPageFilter:
 class TestManualDuplex:
     """Manual duplex pipeline tests."""
 
-    def test_manual_duplex_happy_path(self, mock_paperless, default_settings, tmp_path):
+    def test_manual_duplex_happy_path(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Manual duplex: 3 fronts + 3 backs -> 6 interleaved pages."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
@@ -395,8 +456,11 @@ class TestManualDuplex:
             assert len(called_images) == 6
 
     def test_manual_duplex_count_mismatch(
-        self, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Pass A yields 3 pages, pass B yields 2 -> raises ScanError."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
@@ -421,8 +485,11 @@ class TestManualDuplex:
             )
 
     def test_manual_duplex_empty_page_after_interleave(
-        self, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Empty page detection runs on interleaved result, not individual passes."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
@@ -455,8 +522,11 @@ class TestManualDuplex:
             assert len(called_images) == 3
 
     def test_manual_duplex_thumbnail_from_first_page(
-        self, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Thumbnail generated from first front page in manual duplex."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
@@ -485,8 +555,11 @@ class TestManualDuplex:
         assert len(thumb_results[0]) > 0
 
     def test_manual_duplex_flip_event_wait(
-        self, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Pipeline waits on flip_event for manual duplex."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
@@ -514,7 +587,12 @@ class TestManualDuplex:
             request=request,
         )
 
-    def test_manual_duplex_abort(self, mock_paperless, default_settings, tmp_path):
+    def test_manual_duplex_abort(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Abort event set -> raises ScanError."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
@@ -548,7 +626,12 @@ class TestManualDuplex:
 class TestExifStripped:
     """EXIF stripping before PDF assembly."""
 
-    def test_exif_stripped_before_pdf(self, mock_paperless, default_settings, tmp_path):
+    def test_exif_stripped_before_pdf(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Images passed to assemble_pdf have no 'exif' key in .info."""
         default_settings.output.tmp_dir = str(tmp_path)
 
@@ -580,8 +663,11 @@ class TestFlatbedStillWorks:
     """Flatbed regression tests."""
 
     def test_flatbed_single_page_with_thumbnail(
-        self, mock_paperless, default_settings, tmp_path
-    ):
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
         """Single-page flatbed scan produces correct PDF with thumbnail."""
         default_settings.output.tmp_dir = str(tmp_path)
 

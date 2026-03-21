@@ -4,11 +4,17 @@ JobStore list, prune, and error category tests.
 Covers requirements: UI-05, UI-06, PKG-01.
 """
 
+from __future__ import annotations
+
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
-from saneless.job import JobState, JobStore
+from saneless.job import ErrorCategory, Job, JobState, JobStore
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_list_recent() -> None:
@@ -80,27 +86,21 @@ def test_prune_no_deletions() -> None:
 class TestErrorCategory:
     """ErrorCategory enum and JobStore integration tests."""
 
-    def test_error_category_enum_values(self):
+    def test_error_category_enum_values(self) -> None:
         """ErrorCategory has all five expected values."""
-        from saneless.job import ErrorCategory
-
         assert ErrorCategory.FEEDER == "FEEDER"
         assert ErrorCategory.CONFIG == "CONFIG"
         assert ErrorCategory.SCANNER == "SCANNER"
         assert ErrorCategory.UPLOAD == "UPLOAD"
         assert ErrorCategory.UNKNOWN == "UNKNOWN"
 
-    def test_job_error_category_defaults_none(self):
+    def test_job_error_category_defaults_none(self) -> None:
         """Job.error_category field defaults to None."""
-        from saneless.job import Job
-
         job = Job(id="test", profile="default", title="Test")
         assert job.error_category is None
 
-    def test_jobstore_persists_error_category(self):
+    def test_jobstore_persists_error_category(self) -> None:
         """JobStore persists and retrieves error_category from SQLite."""
-        from saneless.job import ErrorCategory
-
         store = JobStore()
         try:
             job = store.create_job("default", "Cat Test")
@@ -116,10 +116,8 @@ class TestErrorCategory:
         finally:
             store.close()
 
-    def test_jobstore_migration_adds_column(self, tmp_path):
+    def test_jobstore_migration_adds_column(self, tmp_path: Path) -> None:
         """Opening a pre-existing DB without error_category column succeeds."""
-        from saneless.job import ErrorCategory
-
         db_path = str(tmp_path / "migrate.db")
         # Create old-schema DB
         conn = sqlite3.connect(db_path)

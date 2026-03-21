@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 import pytest
 from PIL import Image, ImageDraw
 
+import saneless.scanner.sane_backend as sane_backend_mod
 from saneless.exceptions import FeederEmptyError, ScanError
 from saneless.scanner.base import (
     DeviceCapabilities,
@@ -19,6 +20,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
+from saneless.scanner.sane_backend import SaneBackend
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -59,9 +61,12 @@ class MockSaneDev:
             _make_content_image(color="blue"),
         ]
         self._multi_scan_error: BaseException | None = None
+        self._snap_impl: MagicMock | None = None
 
     def snap(self) -> Image.Image:
-        """Return a simple test image (no progress callback)."""
+        """Return a simple test image, or delegate to _snap_impl if set."""
+        if self._snap_impl is not None:
+            return self._snap_impl()
         self._snap_calls.append({})
         return Image.new("RGB", (100, 100), "white")
 
@@ -290,41 +295,35 @@ class TestMockBackend:
 
 
 @pytest.fixture
-def mock_sane_module(monkeypatch):
+def mock_sane_module(monkeypatch: pytest.MonkeyPatch) -> MockSaneModule:
     """Patch sane module into sane_backend's namespace."""
-    import saneless.scanner.sane_backend as sane_backend_mod
-
     mock_sane = MockSaneModule()
     monkeypatch.setattr(sane_backend_mod, "sane", mock_sane)
     return mock_sane
 
 
 @pytest.fixture
-def sane_backend(mock_sane_module):
+def sane_backend(mock_sane_module: MockSaneModule) -> SaneBackend:
     """Create a SaneBackend with mocked sane module."""
     _ = mock_sane_module  # side-effect: patches the sane module
-    from saneless.scanner.sane_backend import SaneBackend
-
     return SaneBackend()
 
 
 class TestSaneBackendInit:
     """SaneBackend initialization tests."""
 
-    def test_sane_backend_init_calls_sane_init(self, mock_sane_module) -> None:
+    def test_sane_backend_init_calls_sane_init(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """SaneBackend constructor calls sane.init() exactly once."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         assert mock_sane_module.init_call_count == 0
         SaneBackend()
         assert mock_sane_module.init_call_count == 1
 
     def test_sane_backend_init_calls_sane_init_exactly_once(
-        self, mock_sane_module
+        self, mock_sane_module: MockSaneModule
     ) -> None:
         """A single SaneBackend instance only triggers one init call."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         SaneBackend()
         assert mock_sane_module.init_call_count == 1
 
@@ -332,7 +331,7 @@ class TestSaneBackendInit:
 class TestSaneBackendGetDevices:
     """SaneBackend device enumeration tests."""
 
-    def test_sane_backend_get_devices(self, sane_backend) -> None:
+    def test_sane_backend_get_devices(self, sane_backend: SaneBackend) -> None:
         """get_devices returns DeviceInfo objects from sane.get_devices()."""
         devices = sane_backend.get_devices()
         assert len(devices) == 1
@@ -347,7 +346,7 @@ class TestSaneBackendScanPages:
     """SaneBackend scan page acquisition tests."""
 
     def test_sane_backend_scan_pages_opens_and_closes_device(
-        self, sane_backend, mock_sane_module
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
     ) -> None:
         """scan_pages opens device, yields image, then closes device."""
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
@@ -358,7 +357,7 @@ class TestSaneBackendScanPages:
         assert mock_dev._close_called
 
     def test_sane_backend_cancel_before_close(
-        self, sane_backend, mock_sane_module
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
     ) -> None:
         """Device cancel() is called before close() on normal exit."""
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
@@ -367,13 +366,13 @@ class TestSaneBackendScanPages:
         assert mock_dev._cancel_called
         assert mock_dev._close_called
 
-    def test_sane_backend_cancel_before_close_on_error(self, mock_sane_module) -> None:
+    def test_sane_backend_cancel_before_close_on_error(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """Device cancel() and close() are called even when snap() raises."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         # Make snap raise an error
         mock_dev = mock_sane_module._mock_dev
-        mock_dev.snap = MagicMock(side_effect=RuntimeError("scan failed"))
+        mock_dev._snap_impl = MagicMock(side_effect=RuntimeError("scan failed"))
 
         backend = SaneBackend()
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
@@ -385,23 +384,23 @@ class TestSaneBackendScanPages:
         assert mock_dev._close_called
 
     def test_sane_backend_no_progress_callback(
-        self, sane_backend, mock_sane_module
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
     ) -> None:
         """Verify snap() is called without progress argument (Pitfall #2)."""
         mock_dev = mock_sane_module._mock_dev
-        mock_dev.snap = MagicMock(return_value=Image.new("RGB", (100, 100), "white"))
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
         list(sane_backend.scan_pages("test:device:001", settings))
 
         # snap() should be called with no arguments (no progress callback)
-        mock_dev.snap.assert_called_once_with()
+        mock_dev._snap_impl.assert_called_once_with()
 
     @pytest.mark.usefixtures("mock_sane_module")
     def test_sane_backend_validates_source_option(self) -> None:
         """Requesting an unsupported source raises ScanError."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         backend = SaneBackend()
         settings = ScanSettings(
             source="NonExistentSource", resolution=300, mode="color"
@@ -414,7 +413,7 @@ class TestSaneBackendScanPages:
 class TestSaneBackendGetCapabilities:
     """SaneBackend capability query tests."""
 
-    def test_sane_backend_get_capabilities(self, sane_backend) -> None:
+    def test_sane_backend_get_capabilities(self, sane_backend: SaneBackend) -> None:
         """get_capabilities returns parsed sources, resolutions, and modes."""
         caps = sane_backend.get_capabilities("test:device:001")
         assert isinstance(caps, DeviceCapabilities)
@@ -436,7 +435,9 @@ class TestSaneBackendGetCapabilities:
 class TestSaneBackendADFScan:
     """ADF simplex scan tests."""
 
-    def test_adf_scan_yields_all_pages(self, sane_backend, mock_sane_module) -> None:
+    def test_adf_scan_yields_all_pages(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
         """Verify ADF scan via multi_scan yields all 3 pages from the feeder."""
         _ = mock_sane_module  # fixture provides mock device
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
@@ -446,33 +447,41 @@ class TestSaneBackendADFScan:
             assert isinstance(page, Image.Image)
 
     def test_adf_scan_uses_multi_scan_not_snap(
-        self, sane_backend, mock_sane_module
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
     ) -> None:
         """ADF scan calls multi_scan(), not snap()."""
         mock_dev = mock_sane_module._mock_dev
-        mock_dev.snap = MagicMock(return_value=Image.new("RGB", (100, 100), "white"))
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
 
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         list(sane_backend.scan_pages("test:device:001", settings))
 
-        mock_dev.snap.assert_not_called()
+        mock_dev._snap_impl.assert_not_called()
 
-    def test_flatbed_still_uses_snap(self, sane_backend, mock_sane_module) -> None:
+    def test_flatbed_still_uses_snap(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
         """Flatbed scan still uses snap(), not multi_scan()."""
         mock_dev = mock_sane_module._mock_dev
-        mock_dev.snap = MagicMock(return_value=Image.new("RGB", (100, 100), "white"))
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
         pages = list(sane_backend.scan_pages("test:device:001", settings))
 
         assert len(pages) == 1
-        mock_dev.snap.assert_called_once_with()
+        mock_dev._snap_impl.assert_called_once_with()
 
 
 class TestSaneBackendDuplex:
     """ADF Duplex scan tests."""
 
-    def test_duplex_scan_yields_pages(self, sane_backend, mock_sane_module) -> None:
+    def test_duplex_scan_yields_pages(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
         """Verify ADF Duplex scan yields pages pre-interleaved from hardware."""
         _ = mock_sane_module  # fixture provides mock device
         settings = ScanSettings(source="ADF Duplex", resolution=300, mode="color")
@@ -481,29 +490,38 @@ class TestSaneBackendDuplex:
         for page in pages:
             assert isinstance(page, Image.Image)
 
-    def test_duplex_scan_uses_multi_scan(self, sane_backend, mock_sane_module) -> None:
+    def test_duplex_scan_uses_multi_scan(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
         """ADF Duplex uses multi_scan(), not snap()."""
         mock_dev = mock_sane_module._mock_dev
-        mock_dev.snap = MagicMock(return_value=Image.new("RGB", (100, 100), "white"))
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
 
         settings = ScanSettings(source="ADF Duplex", resolution=300, mode="color")
         list(sane_backend.scan_pages("test:device:001", settings))
 
-        mock_dev.snap.assert_not_called()
+        mock_dev._snap_impl.assert_not_called()
 
 
 class TestSaneBackendEmptyFeeder:
     """Empty ADF feeder detection tests."""
 
-    def test_empty_feeder_out_of_documents_error(self, mock_sane_module) -> None:
+    def test_empty_feeder_out_of_documents_error(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """Multi_scan first iteration error with 'out of documents' raises FeederEmptyError."""
-        from saneless.scanner.sane_backend import SaneBackend
 
-        def _raising_multi_scan():
+        def _raising_multi_scan() -> Iterator[Image.Image]:
             msg = "out of documents"
             raise RuntimeError(msg)
 
-        mock_sane_module._mock_dev = _FakeSaneDevice(multi_scan=_raising_multi_scan)
+        object.__setattr__(
+            mock_sane_module,
+            "_mock_dev",
+            _FakeSaneDevice(multi_scan=_raising_multi_scan),
+        )
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
@@ -511,10 +529,10 @@ class TestSaneBackendEmptyFeeder:
         with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
             list(backend.scan_pages("test:device:001", settings))
 
-    def test_empty_feeder_stop_iteration(self, mock_sane_module) -> None:
+    def test_empty_feeder_stop_iteration(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """Multi_scan that yields zero pages raises FeederEmptyError."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         mock_dev._multi_scan_pages = []
 
@@ -528,10 +546,10 @@ class TestSaneBackendEmptyFeeder:
 class TestSaneBackendPageValidation:
     """Inline page validation tests."""
 
-    def test_zero_dimension_page_skipped(self, mock_sane_module) -> None:
+    def test_zero_dimension_page_skipped(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """Page with zero dimensions is skipped with warning."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         zero_img = Image.new("RGB", (0, 0))
         normal_img = _make_content_image()
@@ -542,10 +560,8 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
 
-    def test_min_file_size_page_skipped(self, mock_sane_module) -> None:
+    def test_min_file_size_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
         """Page below MIN_PAGE_BYTES (1x1 pixel) is skipped."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         tiny_img = Image.new("RGB", (1, 1), "red")
         normal_img = _make_content_image()
@@ -556,10 +572,8 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
 
-    def test_pure_white_page_skipped(self, mock_sane_module) -> None:
+    def test_pure_white_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
         """Pure white image (255,255,255) is skipped at scanner level."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         white_img = Image.new("RGB", (200, 300), (255, 255, 255))
         normal_img = _make_content_image()
@@ -570,10 +584,8 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
 
-    def test_pure_black_page_skipped(self, mock_sane_module) -> None:
+    def test_pure_black_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
         """Pure black image (0,0,0) is skipped at scanner level."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         black_img = Image.new("RGB", (200, 300), (0, 0, 0))
         normal_img = _make_content_image()
@@ -584,10 +596,8 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
 
-    def test_normal_content_page_passes(self, mock_sane_module) -> None:
+    def test_normal_content_page_passes(self, mock_sane_module: MockSaneModule) -> None:
         """Image with mixed content passes all validation checks."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         content_img = _make_content_image()
         mock_dev._multi_scan_pages = [content_img]
@@ -597,10 +607,8 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
 
-    def test_exif_stripped(self, mock_sane_module) -> None:
+    def test_exif_stripped(self, mock_sane_module: MockSaneModule) -> None:
         """EXIF data is removed from scanned images before yielding."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         img = _make_content_image()
         # Inject fake EXIF data
@@ -613,14 +621,12 @@ class TestSaneBackendPageValidation:
         assert len(pages) == 1
         assert "exif" not in pages[0].info
 
-    def test_exif_stripped_flatbed(self, mock_sane_module) -> None:
+    def test_exif_stripped_flatbed(self, mock_sane_module: MockSaneModule) -> None:
         """EXIF data is stripped from flatbed scans too."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
         img = Image.new("RGB", (100, 100), "white")
         img.info["exif"] = b"fake-exif-data"
-        mock_dev.snap = MagicMock(return_value=img)
+        mock_dev._snap_impl = MagicMock(return_value=img)
 
         backend = SaneBackend()
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
@@ -632,13 +638,13 @@ class TestSaneBackendPageValidation:
 class TestSaneBackendPerPageTimeout:
     """Per-page timeout tests."""
 
-    def test_page_timeout_raises_scan_error(self, mock_sane_module) -> None:
+    def test_page_timeout_raises_scan_error(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """Page that takes too long raises ScanError with timeout message."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         event = threading.Event()
 
-        def _blocking_iterator():
+        def _blocking_iterator() -> Iterator[Image.Image]:
             """Block on first next() call to simulate slow scan."""
             event.wait(timeout=10)
             yield _make_content_image()
@@ -653,11 +659,12 @@ class TestSaneBackendPerPageTimeout:
         # Unblock the thread so it can clean up
         event.set()
 
-    def test_pages_within_timeout_succeed(self, mock_sane_module) -> None:
+    def test_pages_within_timeout_succeed(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """Pages acquired within timeout proceed normally."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
+        assert isinstance(mock_dev, MockSaneDev)
 
         backend = SaneBackend()
         pages = list(backend._scan_adf_pages(mock_dev, timeout_per_page=5.0))
@@ -667,20 +674,20 @@ class TestSaneBackendPerPageTimeout:
 class TestSaneBackendADFCleanup:
     """ADF cleanup (cancel/close) tests."""
 
-    def test_cancel_called_after_adf_scan(self, sane_backend, mock_sane_module) -> None:
+    def test_cancel_called_after_adf_scan(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
         """dev.cancel() is called after ADF multi_scan completes."""
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         list(sane_backend.scan_pages("test:device:001", settings))
         mock_dev = mock_sane_module._mock_dev
         assert mock_dev._cancel_called
 
-    def test_cancel_called_on_adf_error(self, mock_sane_module) -> None:
+    def test_cancel_called_on_adf_error(self, mock_sane_module: MockSaneModule) -> None:
         """dev.cancel() and dev.close() called even when ADF scan errors."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         operations: list[str] = []
 
-        def _error_iterator():
+        def _error_iterator() -> Iterator[Image.Image]:
             yield _make_content_image()
             msg = "hardware error"
             raise RuntimeError(msg)
@@ -690,7 +697,7 @@ class TestSaneBackendADFCleanup:
             cancel=lambda: operations.append("cancel"),
             close=lambda: operations.append("close"),
         )
-        mock_sane_module._mock_dev = fake_dev
+        object.__setattr__(mock_sane_module, "_mock_dev", fake_dev)
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
@@ -701,10 +708,10 @@ class TestSaneBackendADFCleanup:
         assert "cancel" in operations
         assert "close" in operations
 
-    def test_iterator_deleted_before_cancel(self, mock_sane_module) -> None:
+    def test_iterator_deleted_before_cancel(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
         """Multi_scan iterator reference is deleted before dev.cancel()."""
-        from saneless.scanner.sane_backend import SaneBackend
-
         mock_dev = mock_sane_module._mock_dev
 
         # Track operation order
@@ -729,7 +736,7 @@ class TestSaneBackendADFCleanup:
                 """Track deletion."""
                 operations.append("iterator_deleted")
 
-        def _tracking_multi_scan():
+        def _tracking_multi_scan() -> TrackingIterator:
             return TrackingIterator(mock_dev._multi_scan_pages)
 
         def _tracking_cancel() -> None:
@@ -738,7 +745,7 @@ class TestSaneBackendADFCleanup:
         fake_dev = _FakeSaneDevice(
             multi_scan=_tracking_multi_scan, cancel=_tracking_cancel
         )
-        mock_sane_module._mock_dev = fake_dev
+        object.__setattr__(mock_sane_module, "_mock_dev", fake_dev)
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")

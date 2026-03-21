@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from playwright.sync_api import Page
+
 import pytest
 import uvicorn
 from PIL import Image
@@ -34,9 +36,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-
-if TYPE_CHECKING:
-    from playwright.sync_api import Page
+from saneless.web.app import create_app
 
 
 class _BrowserTestScanner(ScannerBackend):
@@ -69,10 +69,8 @@ class _BrowserTestScanner(ScannerBackend):
 
 
 @pytest.fixture(scope="session")
-def browser_server_url(tmp_path_factory):
+def browser_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """Start a real uvicorn server for browser tests."""
-    from saneless.web.app import create_app
-
     tmp_dir = tmp_path_factory.mktemp("browser")
     test_token = "fake-token"
     settings = Settings(

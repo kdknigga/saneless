@@ -5,14 +5,15 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
+import saneless.pdf as pdf_mod
+from saneless.pdf import assemble_pdf
+
 
 class TestAssemblePdf:
     """PDF assembly tests."""
 
-    def test_assemble_single_page(self, tmp_path) -> None:
+    def test_assemble_single_page(self, tmp_path: Path) -> None:
         """Single image produces a valid PDF file."""
-        from saneless.pdf import assemble_pdf
-
         img = Image.new("RGB", (100, 100), "white")
         pdf_path = assemble_pdf([img], tmp_path)
 
@@ -21,10 +22,8 @@ class TestAssemblePdf:
         content = pdf_path.read_bytes()
         assert content[:5] == b"%PDF-"
 
-    def test_assemble_multiple_pages(self, tmp_path) -> None:
+    def test_assemble_multiple_pages(self, tmp_path: Path) -> None:
         """Multiple images produce a larger PDF than a single image."""
-        from saneless.pdf import assemble_pdf
-
         images = [
             Image.new("RGB", (100, 100), "white"),
             Image.new("RGB", (200, 200), "red"),
@@ -42,10 +41,8 @@ class TestAssemblePdf:
 
         assert multi_size > single_size
 
-    def test_temp_files_cleaned_on_success(self, tmp_path) -> None:
+    def test_temp_files_cleaned_on_success(self, tmp_path: Path) -> None:
         """Temporary PNG files are removed after successful assembly."""
-        from saneless.pdf import assemble_pdf
-
         img = Image.new("RGB", (100, 100), "white")
         assemble_pdf([img], tmp_path)
 
@@ -54,12 +51,13 @@ class TestAssemblePdf:
         png_files = list(tmp_path.rglob("*.png"))
         assert len(png_files) == 0
 
-    def test_temp_files_cleaned_on_error(self, tmp_path, monkeypatch) -> None:
+    def test_temp_files_cleaned_on_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Temporary PNG files are removed even when img2pdf raises."""
-        import saneless.pdf as pdf_mod
 
         # Make img2pdf.convert raise an error
-        def fake_convert(*_args, **_kwargs):
+        def fake_convert(*_args: object, **_kwargs: object) -> None:
             msg = "fake img2pdf error"
             raise RuntimeError(msg)
 
@@ -77,10 +75,8 @@ class TestAssemblePdf:
         png_files = list(tmp_path.rglob("*.png"))
         assert len(png_files) == 0
 
-    def test_output_path(self, tmp_path) -> None:
+    def test_output_path(self, tmp_path: Path) -> None:
         """Output PDF is written to the specified directory with .pdf extension."""
-        from saneless.pdf import assemble_pdf
-
         img = Image.new("RGB", (100, 100), "white")
         pdf_path = assemble_pdf([img], tmp_path)
 
