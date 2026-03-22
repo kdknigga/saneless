@@ -7,13 +7,14 @@ HLTH-01, HLTH-02, LOG-03.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -32,7 +33,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.web.app import create_app
+from saneless.web.app import create_app, humanize_state
 
 
 def _app(client: TestClient) -> FastAPI:
@@ -297,3 +298,92 @@ def test_scan_button_disabled_during_active_job(client: TestClient) -> None:
     response = client.get("/")
     assert "disabled" in response.text
     assert 'id="scan-btn"' in response.text
+
+
+def test_history_humanized_labels(client: TestClient) -> None:
+    """Job history shows human-readable state labels instead of raw enum values (P12-01)."""
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title="Label Test")
+    job_store.update_state(job.id, JobState.DONE)
+
+    response = client.get("/api/jobs/history")
+    assert response.status_code == 200
+    assert "Complete" in response.text
+
+
+def test_status_no_inline_scripts(client: TestClient) -> None:
+    """Status partial contains no inline script tags for DONE or ERROR states (P12-04)."""
+    job_store: JobStore = _app(client).state.job_store
+
+    # DONE state
+    job_done = job_store.create_job(profile="default", title="Done Script Test")
+    job_store.update_state(job_done.id, JobState.DONE)
+    _app(client).state.worker._current_job_id = job_done.id
+    resp_done = client.get("/api/jobs/current/status")
+    assert "<script>" not in resp_done.text
+
+    # ERROR state
+    job_err = job_store.create_job(profile="default", title="Err Script Test")
+    job_store.update_state(job_err.id, JobState.ERROR, error="test error")
+    _app(client).state.worker._current_job_id = job_err.id
+    resp_err = client.get("/api/jobs/current/status")
+    assert "<script>" not in resp_err.text
+
+
+def test_scan_form_no_hx_on(client: TestClient) -> None:
+    """Scan form does not use hx-on:: inline event attributes (P12-04)."""
+    response = client.get("/")
+    assert "hx-on::before-request" not in response.text
+
+
+def test_refresh_buttons_accessible(client: TestClient) -> None:
+    """Refresh buttons have aria-label attributes and sr-only text (P12-02)."""
+    response = client.get("/")
+    assert 'aria-label="Refresh tags"' in response.text
+    assert 'aria-label="Refresh correspondents"' in response.text
+    assert "sr-only" in response.text
+
+
+def test_scan_form_has_heading(client: TestClient) -> None:
+    """Scan form article has an h2 heading for accessibility (P12-02)."""
+    response = client.get("/")
+    assert "<h2>Scan</h2>" in response.text
+
+
+def test_flip_abort_label(client: TestClient) -> None:
+    """Flip prompt cancel button reads Abort scan (P12-05)."""
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title="Flip Abort Test")
+    job_store.update_state(job.id, JobState.AWAITING_FLIP)
+    _app(client).state.worker._current_job_id = job.id
+
+    response = client.get("/api/jobs/current/status")
+    assert "Abort scan" in response.text
+    assert ">Cancel<" not in response.text
+
+
+def test_correspondent_placeholder(client: TestClient) -> None:
+    """Correspondent dropdown placeholder reads No correspondent (P12-05)."""
+    response = client.get("/")
+    assert "No correspondent" in response.text
+    assert "-- None --" not in response.text
+
+
+def test_humanize_state_filter_unit() -> None:
+    """humanize_state converts enum values to human-readable labels (P12-01)."""
+    assert humanize_state("DONE") == "Complete"
+    assert humanize_state("ERROR") == "Failed"
+    assert humanize_state("SCANNING") == "Scanning"
+    assert humanize_state("AWAITING_FLIP") == "Waiting for flip"
+    assert humanize_state("UNKNOWN") == "UNKNOWN"
+
+
+def test_css_spacing_normalized() -> None:
+    """CSS uses PicoCSS grid-aligned spacing with no !important overrides (P12-05)."""
+    css_path = (
+        Path(__file__).parent.parent / "src" / "saneless" / "web" / "static" / "app.css"
+    )
+    css_content = css_path.read_text()
+    assert "!important" not in css_content
+    assert "padding: 0.25rem" in css_content
+    assert "var(--pico-border-width)" in css_content
