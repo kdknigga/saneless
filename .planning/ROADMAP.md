@@ -244,3 +244,26 @@ Plans:
   2. If `SANE_NET_HOSTS` is already set externally, the application does not override it
   3. All 4 CLI commands pass `settings.scanner.host` to the `SaneBackend` constructor
   4. `docker-compose.yml` documents `SANELESS_SCANNER__HOST` as a commented-out example
+
+### Phase 15: Create user-facing documentation using the Diataxis approach
+
+**Goal:** Complete user-facing documentation site with all four Diataxis quadrants (tutorials, how-to guides, reference, explanation) published via MkDocs Material to GitHub Pages
+**Requirements**: D-01, D-02, D-03, D-04, D-05, D-06, D-07, D-08, D-09, D-10, D-11, D-12, D-13, D-14, D-15, D-16, D-17, D-18
+**Depends on:** Phase 14
+**Plans:** 4 plans
+
+Plans:
+- [ ] 15-01-PLAN.md -- MkDocs scaffolding (config, theme, GitHub Actions, landing page) and "Scan Your First Document" tutorial
+- [ ] 15-02-PLAN.md -- How-to guides: install, Docker Compose, scan profiles, ADF duplex, scanner host discovery, CLI scripting
+- [ ] 15-03-PLAN.md -- Reference pages: CLI commands, configuration, environment variables, web API, Docker
+- [ ] 15-04-PLAN.md -- Explanation pages: architecture, empty page detection, consume directory fallback; README docs link
+
+**Success Criteria** (what must be TRUE):
+  1. `uv run mkdocs build --strict` exits 0 with all 16 pages (index + 15 content pages)
+  2. Documentation site has four clearly separated Diataxis quadrants in navigation
+  3. Tutorial walks new user from install to verified scan in paperless-ngx
+  4. All how-to guides have prerequisites sections and copy-paste commands
+  5. Reference pages are terse and complete with all CLI flags, config fields, env vars, and API endpoints
+  6. No screenshots in any documentation page
+  7. README has a Documentation section linking to the docs site without duplicating content
+  8. GitHub Actions workflow deploys docs to GitHub Pages on push to main
