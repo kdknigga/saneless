@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 11-01-PLAN.md
-last_updated: "2026-03-22T04:33:33.110Z"
+stopped_at: Completed 12-02-PLAN.md
+last_updated: "2026-03-22T12:41:02.436Z"
 last_activity: 2026-03-22
 progress:
-  total_phases: 11
+  total_phases: 12
   completed_phases: 11
-  total_plans: 26
-  completed_plans: 26
+  total_plans: 28
+  completed_plans: 27
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 11 — review-and-adjust-default-dpi-setting
+**Current focus:** Phase 12 — ui-polish-humanize-enum-labels-add-accessible-button-labels-fix-cli-table-truncation-replace-inline-htmx-scripts-normalize-spacing-to-design-token-grid
 
 ## Current Position
 
-Phase: 11 (review-and-adjust-default-dpi-setting) — EXECUTING
-Plan: 1 of 1
+Phase: 12 (ui-polish-humanize-enum-labels-add-accessible-button-labels-fix-cli-table-truncation-replace-inline-htmx-scripts-normalize-spacing-to-design-token-grid) — EXECUTING
+Plan: 2 of 2 (COMPLETE)
 
 ## Performance Metrics
 
@@ -72,6 +72,7 @@ Plan: 1 of 1
 | Phase 10 P01 | 4min | 1 tasks | 5 files |
 | Phase 10 P02 | 3min | 2 tasks | 4 files |
 | Phase 11 P01 | 2min | 2 tasks | 4 files |
+| Phase 12 P02 | 2min | 2 tasks | 2 files |
 
 ## Accumulated Context
 
@@ -134,6 +135,7 @@ Recent decisions affecting current work:
 - [Phase 10]: Worker _auto_generated flag set True before attempt to prevent retrigger on failure
 - [Phase 11]: 300 DPI confirmed as correct default per Tesseract OCR minimum recommendation
 - [Phase 11]: Single DEFAULT_RESOLUTION constant eliminates duplication between config.py and auto_profiles.py
+- [Phase 12]: Dynamic column widths: name_w = max(20, cols - 45) for devices, title_w = max(15, cols - 50) for jobs
 
 ### Roadmap Evolution
 
@@ -141,6 +143,7 @@ Recent decisions affecting current work:
 - Phase 9 added: Enable pytest strict mode and ensure all tests pass the same linting and type checking quality checks as normal code
 - Phase 10 added: Automatic scanner profile creation
 - Phase 11 added: Review and adjust default DPI setting
+- Phase 12 added: UI polish: humanize enum labels, add accessible button labels, fix CLI table truncation, replace inline HTMX scripts, normalize spacing to design token grid
 
 ### Pending Todos
 
@@ -160,6 +163,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-22
-Last session: 2026-03-22T04:29:39.640Z
-Stopped at: Completed 11-01-PLAN.md
+Last session: 2026-03-22T12:41:02.434Z
+Stopped at: Completed 12-02-PLAN.md
 Resume file: None
