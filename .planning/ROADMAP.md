@@ -19,7 +19,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 5: Web Server Launch Command** - `saneless serve` CLI command, web logging, Dockerfile CMD
 - [ ] **Phase 6: Gap Closure Fixes** - Paperless test route, worker intermediate states
 - [ ] **Phase 7: Tech Debt Cleanup** - python-sane packaging, Starlette deprecation, error typing, flip timing, Playwright browser tests
-- [ ] **Phase 13: Review Hardening** - Disk space checks, duplex data preservation, typed state events, exception sanitization, config validation, periodic pruning, empty page toggle, signal handler fix, Docker docs
+- [x] **Phase 13: Review Hardening** - Disk space checks, duplex data preservation, typed state events, exception sanitization, config validation, periodic pruning, empty page toggle, signal handler fix, Docker docs (completed 2026-03-22)
 
 ## Phase Details
 
@@ -211,12 +211,12 @@ Plans:
 **Goal:** Address 9 hardening items identified by cross-AI plan review (Gemini CLI) -- disk space pre-flight checks, manual duplex data preservation, typed state machine events, exception sanitization, config writability validation, periodic job pruning, empty page detection toggle, threaded Uvicorn signal fix, and Docker Compose documentation
 **Requirements**: RH-01, RH-02, RH-03, RH-04, RH-05, RH-06, RH-07, RH-08, RH-09
 **Depends on:** Phase 12
-**Plans:** 2/3 plans executed
+**Plans:** 3/3 plans complete
 
 Plans:
 - [x] 13-01-PLAN.md -- Simple independent fixes: exception sanitization, config writability validation, empty page toggle, Uvicorn signal fix, Docker Compose docs
 - [x] 13-02-PLAN.md -- Core pipeline hardening: PipelineEvent typed enum, disk space pre-flight check, post-job pruning
-- [ ] 13-03-PLAN.md -- Manual duplex mismatch recovery: save partial PDFs and upload both to paperless-ngx
+- [x] 13-03-PLAN.md -- Manual duplex mismatch recovery: save partial PDFs and upload both to paperless-ngx
 
 **Success Criteria** (what must be TRUE):
   1. Multi-page scan pipeline checks disk space before starting and raises a clear error if estimated space exceeds available

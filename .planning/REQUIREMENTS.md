@@ -91,7 +91,7 @@
 ### Review Hardening
 
 - [x] **RH-01**: System checks available disk space before multi-page scans and fails fast if insufficient for estimated page count at current DPI
-- [ ] **RH-02**: Manual duplex page count mismatch saves front pages as partial PDF to consume directory instead of discarding all scanned data
+- [x] **RH-02**: Manual duplex page count mismatch saves front pages as partial PDF to consume directory instead of discarding all scanned data
 - [x] **RH-03**: Worker state transitions use typed enum events instead of string matching against log messages
 - [x] **RH-04**: Paperless test endpoint sanitizes exception messages in 502 responses to prevent leaking tokens or internal IPs
 - [x] **RH-05**: Config validation checks tmp_dir and consume_dir are writable at startup, failing fast on permission errors
