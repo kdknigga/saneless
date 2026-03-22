@@ -43,6 +43,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ CLI `saneless auto-profiles` command with `--force` flag — Phase 10
 - ✓ Lazy auto-profile trigger on first scan (bare default detection) — Phase 10
 - ✓ Comment-preserving TOML config writing via tomlkit — Phase 10
+- ✓ Default scan resolution validated at 300 DPI, consolidated into single DEFAULT_RESOLUTION constant — Phase 11
 - ✓ Consume directory fallback — Phase 4
 - ✓ CLI: `saneless jobs` — Phase 4
 - ✓ pip-installable package (pyproject.toml, PyPI) — Phase 4
@@ -98,4 +99,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-22 after Phase 10 completion — automatic scanner profile generation from device capabilities, CLI command, lazy first-scan trigger, comment-preserving TOML persistence*
+*Last updated: 2026-03-22 after Phase 11 completion — validated 300 DPI default via Tesseract OCR research, consolidated duplicated DPI value into single DEFAULT_RESOLUTION constant*
