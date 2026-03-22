@@ -44,6 +44,11 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ Lazy auto-profile trigger on first scan (bare default detection) — Phase 10
 - ✓ Comment-preserving TOML config writing via tomlkit — Phase 10
 - ✓ Default scan resolution validated at 300 DPI, consolidated into single DEFAULT_RESOLUTION constant — Phase 11
+- ✓ Humanized enum labels in job history table via Jinja2 filter — Phase 12
+- ✓ Accessible button labels (aria-label + sr-only) on icon-only buttons — Phase 12
+- ✓ External app.js replacing all inline scripts and hx-on attributes — Phase 12
+- ✓ CSS spacing normalized to PicoCSS design token grid (no !important) — Phase 12
+- ✓ CLI table truncation with terminal-aware column widths — Phase 12
 - ✓ Consume directory fallback — Phase 4
 - ✓ CLI: `saneless jobs` — Phase 4
 - ✓ pip-installable package (pyproject.toml, PyPI) — Phase 4
@@ -99,4 +104,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-22 after Phase 11 completion — validated 300 DPI default via Tesseract OCR research, consolidated duplicated DPI value into single DEFAULT_RESOLUTION constant*
+*Last updated: 2026-03-22 after Phase 12 completion — UI polish: humanized enum labels, accessible buttons, extracted inline scripts, normalized CSS spacing, CLI table truncation*
