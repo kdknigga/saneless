@@ -178,7 +178,7 @@ Plans:
 **Goal:** Users get scan profiles auto-generated from scanner capabilities on first use, and can explicitly regenerate via `saneless auto-profiles` CLI command
 **Requirements**: AP-01, AP-02, AP-03, AP-04, AP-05, AP-06, AP-07, AP-08, AP-09
 **Depends on:** Phase 9
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 
 Plans:
 - [ ] 10-01-PLAN.md -- Core auto_profiles module: pure generation functions, TOML persistence, tomlkit dep, ProfileConfig auto_generated field (TDD)
