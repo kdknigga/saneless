@@ -55,6 +55,14 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ pip-installable package (pyproject.toml, PyPI) — Phase 4
 - ✓ OCI container image (GHCR, HEALTHCHECK instruction) — Phase 4
 
+- ✓ MkDocs Material documentation site with Diataxis structure (tutorials, how-to, reference, explanation) — Phase 15
+- ✓ GitHub Actions docs deployment workflow — Phase 15
+- ✓ Flagship tutorial "Scan Your First Document" (136 lines) — Phase 15
+- ✓ 6 how-to guides (install, deploy, configure, ADF, scanner discovery, CLI scripting) — Phase 15
+- ✓ 5 reference pages (CLI, config, env vars, web API, Docker) — Phase 15
+- ✓ 3 explanation pages (architecture, empty-page detection, consume-dir fallback) — Phase 15
+- ✓ README documentation section with docs site link — Phase 15
+
 ### Active
 
 None — all v1 requirements validated.
@@ -105,4 +113,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-22 after Phase 14 completion — containerized scanner detection via SANE_NET_HOSTS env var wiring from scanner.host config*
+*Last updated: 2026-03-22 after Phase 15 completion — complete Diataxis documentation site with 16 pages across all four quadrants*
