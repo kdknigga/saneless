@@ -113,4 +113,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-22 after Phase 15 completion — complete Diataxis documentation site with 16 pages across all four quadrants*
+*Last updated: 2026-03-22 after Phase 16 completion — configurable auto source mode (flatbed/ADF routing for Auto scanner sources)*
