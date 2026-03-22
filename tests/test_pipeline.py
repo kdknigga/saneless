@@ -12,7 +12,9 @@ from PIL import Image, ImageDraw
 
 from saneless.exceptions import PaperlessError, ScanError
 from saneless.pipeline import (
+    PipelineEvent,
     PipelineRequest,
+    _check_disk_space,
     _interleave_duplex,
     _is_manual_duplex,
     run_pipeline,
@@ -170,14 +172,14 @@ class TestRunPipeline:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Pipeline calls status_callback with correct status messages in order."""
+        """Pipeline calls status_callback with PipelineEvent enum values in order."""
         default_settings.output.tmp_dir = str(tmp_path)
-        messages: list[str] = []
+        events: list[PipelineEvent] = []
 
         request = PipelineRequest(
             profile_name="default",
             title="Status Doc",
-            status_callback=messages.append,
+            status_callback=events.append,
         )
         run_pipeline(
             scanner=mock_scanner,
@@ -186,10 +188,10 @@ class TestRunPipeline:
             request=request,
         )
 
-        assert messages[0] == "Scanning..."
-        assert messages[1] == "Assembling PDF..."
-        assert messages[2] == "Uploading to paperless-ngx..."
-        assert messages[3] == "Done: Status Doc"
+        assert events[0] is PipelineEvent.SCANNING
+        assert events[1] is PipelineEvent.ASSEMBLING
+        assert events[2] is PipelineEvent.UPLOADING
+        assert events[3] is PipelineEvent.DONE
 
 
 def _make_content_image(color: str = "black") -> Image.Image:
@@ -729,3 +731,57 @@ class TestFlatbedStillWorks:
 
         assert len(thumb_results) == 1
         mock_paperless.upload_document.assert_called_once()
+
+
+class TestDiskSpaceCheck:
+    """Disk space pre-flight check tests."""
+
+    def test_disk_space_check_passes_when_sufficient(self, tmp_path: Path) -> None:
+        """No exception when free space exceeds minimum."""
+        _check_disk_space(str(tmp_path), 1)
+
+    def test_disk_space_check_fails_when_insufficient(self, tmp_path: Path) -> None:
+        """Raises ScanError when free space below threshold."""
+        with pytest.raises(ScanError, match="Insufficient disk space"):
+            _check_disk_space(str(tmp_path), 999_999_999)
+
+
+class TestPipelineEventEnum:
+    """PipelineEvent StrEnum tests."""
+
+    def test_pipeline_event_enum_members(self) -> None:
+        """All 6 PipelineEvent members exist with correct string values."""
+        assert PipelineEvent.SCANNING == "SCANNING"
+        assert PipelineEvent.AWAITING_FLIP == "AWAITING_FLIP"
+        assert PipelineEvent.SCANNING_REVERSE == "SCANNING_REVERSE"
+        assert PipelineEvent.ASSEMBLING == "ASSEMBLING"
+        assert PipelineEvent.UPLOADING == "UPLOADING"
+        assert PipelineEvent.DONE == "DONE"
+        assert len(PipelineEvent) == 6
+
+    def test_pipeline_emits_enum_events(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """All status_callback values are PipelineEvent instances, not strings."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        events: list[object] = []
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Enum Check",
+            status_callback=events.append,
+        )
+        run_pipeline(
+            scanner=mock_scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=request,
+        )
+
+        assert len(events) > 0
+        for event in events:
+            assert isinstance(event, PipelineEvent)

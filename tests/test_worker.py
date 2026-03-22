@@ -14,6 +14,7 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.job import ErrorCategory, Job, JobState, JobStore
+from saneless.pipeline import PipelineEvent
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
 from saneless.worker import ScanWorker
 
@@ -253,7 +254,7 @@ def _mock_manual_duplex_pipeline(
         request.thumbnail_callback("dGh1bWI=")  # base64 "thumb"
     if request.flip_event:
         if request.status_callback:
-            request.status_callback("Awaiting flip...")
+            request.status_callback(PipelineEvent.AWAITING_FLIP)
         request.flip_event.wait()
         if request.abort_event and request.abort_event.is_set():
             msg = "Manual duplex scan cancelled by user"
@@ -509,7 +510,7 @@ class TestWorkerIntermediateStates:
                 request: PipelineRequest,
             ) -> None:
                 if request.status_callback:
-                    request.status_callback("Assembling PDF...")
+                    request.status_callback(PipelineEvent.ASSEMBLING)
 
             monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -555,7 +556,7 @@ class TestWorkerIntermediateStates:
                 request: PipelineRequest,
             ) -> None:
                 if request.status_callback:
-                    request.status_callback("Uploading to paperless-ngx...")
+                    request.status_callback(PipelineEvent.UPLOADING)
 
             monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -960,5 +961,94 @@ class TestLazyAutoGenerate:
 
             # get_capabilities called exactly once, not twice
             assert mock_scanner.get_capabilities.call_count == 1
+        finally:
+            store.close()
+
+
+class TestWorkerEnumDispatch:
+    """Worker dispatches on PipelineEvent enum, not strings."""
+
+    def test_worker_status_cb_dispatches_on_pipeline_event(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker transitions to ASSEMBLING when receiving PipelineEvent.ASSEMBLING."""
+        states_seen: list[JobState] = []
+        store = JobStore()
+        try:
+            original_update = store.update_state
+
+            def tracking_update(
+                job_id: str,
+                state: JobState,
+                error: str | None = None,
+                error_category: ErrorCategory | None = None,
+            ) -> None:
+                states_seen.append(state)
+                original_update(
+                    job_id, state, error=error, error_category=error_category
+                )
+
+            monkeypatch.setattr(store, "update_state", tracking_update)
+
+            def fake_pipeline(
+                _scanner: object,
+                _paperless: object,
+                _settings: object,
+                request: PipelineRequest,
+            ) -> None:
+                if request.status_callback:
+                    request.status_callback(PipelineEvent.ASSEMBLING)
+
+            monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Enum Dispatch Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+            assert JobState.ASSEMBLING in states_seen
+        finally:
+            store.close()
+
+    def test_worker_prunes_after_job_completion(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker calls job_store.prune() after each job completes."""
+        prune_calls: list[tuple[int, int]] = []
+        store = JobStore()
+        try:
+            original_prune = store.prune
+
+            def tracking_prune(max_age_days: int = 7, max_rows: int = 500) -> int:
+                prune_calls.append((max_age_days, max_rows))
+                return original_prune(max_age_days, max_rows)
+
+            monkeypatch.setattr(store, "prune", tracking_prune)
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: {"status": "SUCCESS"},
+            )
+
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Prune Test")
+            worker.submit(job)
+            time.sleep(0.5)
+            worker.stop()
+
+            assert len(prune_calls) >= 1
+            # Verify it used settings values
+            assert prune_calls[0] == (
+                default_settings.output.history_retention_days,
+                default_settings.output.history_max_rows,
+            )
         finally:
             store.close()
