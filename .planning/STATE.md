@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 14-01-PLAN.md
-last_updated: "2026-03-22T19:48:22.781Z"
+stopped_at: Completed 15-01-PLAN.md
+last_updated: "2026-03-22T20:29:39.207Z"
 last_activity: 2026-03-22
 progress:
-  total_phases: 14
+  total_phases: 15
   completed_phases: 14
-  total_plans: 32
-  completed_plans: 32
+  total_plans: 36
+  completed_plans: 33
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 14 — Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable
+**Current focus:** Phase 15 — create-user-facing-documentation-using-the-di-taxis-approach
 
 ## Current Position
 
-Phase: 14
-Plan: Not started
+Phase: 15 (create-user-facing-documentation-using-the-di-taxis-approach) — EXECUTING
+Plan: 2 of 4
 
 ## Performance Metrics
 
@@ -78,6 +78,7 @@ Plan: Not started
 | Phase 13 P02 | 4min | 2 tasks | 4 files |
 | Phase 13 P03 | 5min | 1 tasks | 2 files |
 | Phase 14 P01 | 3min | 2 tasks | 5 files |
+| Phase 15 P01 | 3min | 2 tasks | 20 files |
 
 ## Accumulated Context
 
@@ -150,6 +151,7 @@ Recent decisions affecting current work:
 - [Phase 13]: _scan_manual_duplex returns (fronts, backs) tuple on mismatch for graceful degradation instead of ScanError
 - [Phase 14]: SANE_NET_HOSTS set before sane.init() -- env var must exist before SANE probes backends
 - [Phase 14]: Externally-set SANE_NET_HOSTS takes priority over config file scanner.host value
+- [Phase 15]: Material theme with indigo palette and dark/light toggle for docs site
 
 ### Roadmap Evolution
 
@@ -159,6 +161,7 @@ Recent decisions affecting current work:
 - Phase 11 added: Review and adjust default DPI setting
 - Phase 12 added: UI polish: humanize enum labels, add accessible button labels, fix CLI table truncation, replace inline HTMX scripts, normalize spacing to design token grid
 - Phase 14 added: Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable
+- Phase 15 added: Create user-facing documentation using the Diátaxis approach
 
 ### Pending Todos
 
@@ -178,6 +181,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-22
-Last session: 2026-03-22T19:44:42.414Z
-Stopped at: Completed 14-01-PLAN.md
+Last session: 2026-03-22T20:29:39.205Z
+Stopped at: Completed 15-01-PLAN.md
 Resume file: None
