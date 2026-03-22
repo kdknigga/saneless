@@ -39,6 +39,10 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ Web UI: tag/correspondent dropdowns with TTL cache and per-resource refresh — Phase 3
 - ✓ Health endpoint (`GET /health`, 200/503 based on worker thread state) — Phase 3
 - ✓ FastAPI + Jinja2 + HTMX web layer with PicoCSS — Phase 3
+- ✓ Automatic scanner profile generation from device capabilities — Phase 10
+- ✓ CLI `saneless auto-profiles` command with `--force` flag — Phase 10
+- ✓ Lazy auto-profile trigger on first scan (bare default detection) — Phase 10
+- ✓ Comment-preserving TOML config writing via tomlkit — Phase 10
 - ✓ Consume directory fallback — Phase 4
 - ✓ CLI: `saneless jobs` — Phase 4
 - ✓ pip-installable package (pyproject.toml, PyPI) — Phase 4
@@ -94,4 +98,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-21 after Phase 9 completion — pytest strict mode enabled, all tests fully type-annotated and passing identical linting/type-checking quality checks as production code*
+*Last updated: 2026-03-22 after Phase 10 completion — automatic scanner profile generation from device capabilities, CLI command, lazy first-scan trigger, comment-preserving TOML persistence*
