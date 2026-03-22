@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
@@ -326,6 +327,38 @@ class TestSaneBackendInit:
         """A single SaneBackend instance only triggers one init call."""
         SaneBackend()
         assert mock_sane_module.init_call_count == 1
+
+    def test_sane_backend_sets_sane_net_hosts(
+        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SaneBackend(host='192.168.1.50') sets SANE_NET_HOSTS env var."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend(host="192.168.1.50")
+        assert os.environ["SANE_NET_HOSTS"] == "192.168.1.50"
+
+    def test_sane_backend_does_not_override_existing_env(
+        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SaneBackend does not override externally-set SANE_NET_HOSTS."""
+        monkeypatch.setenv("SANE_NET_HOSTS", "external-host")
+        SaneBackend(host="config-host")
+        assert os.environ["SANE_NET_HOSTS"] == "external-host"
+
+    def test_sane_backend_no_host_no_env_change(
+        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SaneBackend() with no host does not set SANE_NET_HOSTS."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend()
+        assert "SANE_NET_HOSTS" not in os.environ
+
+    def test_sane_backend_multi_host_colon_delimiter(
+        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SaneBackend with colon-delimited hosts sets multi-host value."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend(host="192.168.1.50:192.168.1.51")
+        assert os.environ["SANE_NET_HOSTS"] == "192.168.1.50:192.168.1.51"
 
 
 class TestSaneBackendGetDevices:
