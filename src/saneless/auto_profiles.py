@@ -45,6 +45,8 @@ def source_to_slug(source: str) -> str:
 
     """
     lower = source.lower()
+    if lower == "auto":
+        return "auto-scan"
     if "flatbed" in lower:
         return "flatbed-scan"
     if "duplex" in lower:
@@ -153,12 +155,16 @@ def generate_profiles(
 
     for source in capabilities.sources:
         slug = source_to_slug(source)
-        profiles[slug] = ProfileConfig(
-            source=source,
-            resolution=resolution,
-            mode=mode,
-            auto_generated=True,
-        )
+        kwargs: dict[str, object] = {
+            "source": source,
+            "resolution": resolution,
+            "mode": mode,
+            "auto_generated": True,
+        }
+        if source.lower() == "auto":
+            has_flatbed = any("flatbed" in s.lower() for s in capabilities.sources)
+            kwargs["auto_source_mode"] = "flatbed" if has_flatbed else "adf"
+        profiles[slug] = ProfileConfig(**kwargs)
 
     # Set default to flatbed if available
     flatbed_sources = [s for s in capabilities.sources if "flatbed" in s.lower()]
@@ -238,6 +244,8 @@ def write_profiles_to_config(
         profile_table.add("source", profile.source)
         profile_table.add("resolution", profile.resolution)
         profile_table.add("mode", profile.mode)
+        if profile.auto_source_mode != "flatbed":
+            profile_table.add("auto_source_mode", profile.auto_source_mode)
         auto_generated_flag = True
         profile_table.add("auto_generated", auto_generated_flag)
         profiles_section[name] = profile_table
