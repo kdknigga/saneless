@@ -3,10 +3,10 @@
 
 {# --- Section 1: Scan Form --- #}
 <article>
+    <h2>Scan</h2>
     <form hx-post="/api/scan"
           hx-target="#status-area"
-          hx-swap="outerHTML"
-          hx-on::before-request="if(event.detail.elt===this){this.querySelector('#scan-btn').disabled=true; this.querySelector('#scan-btn').ariaBusy='true'; this.querySelector('#scan-btn').textContent='Scanning...'}">
+          hx-swap="outerHTML">
 
         <label for="profile-select">Profile</label>
         <select name="profile" id="profile-select">
@@ -26,7 +26,8 @@
                     hx-target="#tags-select"
                     hx-swap="innerHTML"
                     class="refresh-btn"
-                    title="Refresh tags">&#x21bb;</button>
+                    title="Refresh tags"
+                    aria-label="Refresh tags">&#x21bb;<span class="sr-only">Refresh tags</span></button>
         </label>
         <select name="tags" id="tags-select" multiple
                 hx-get="/api/tags" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
@@ -42,11 +43,12 @@
                     hx-target="#correspondent-select"
                     hx-swap="innerHTML"
                     class="refresh-btn"
-                    title="Refresh correspondents">&#x21bb;</button>
+                    title="Refresh correspondents"
+                    aria-label="Refresh correspondents">&#x21bb;<span class="sr-only">Refresh correspondents</span></button>
         </label>
         <select name="correspondent" id="correspondent-select"
                 hx-get="/api/correspondents" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
-            <option value="">-- None --</option>
+            <option value="">No correspondent</option>
             {% for c in correspondents %}
             <option value="{{ c.id }}">{{ c.name }}</option>
             {% endfor %}

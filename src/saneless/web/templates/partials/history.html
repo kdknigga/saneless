@@ -5,7 +5,7 @@
   <td>{{ job.profile }}</td>
   <td>{{ job.title }}</td>
   <td class="{% if job.state.value == 'DONE' %}status-done{% elif job.state.value == 'ERROR' %}status-error{% endif %}">
-    {{ job.state.value }}
+    {{ job.state.value | humanize_state }}
   </td>
 </tr>
 {% endfor %}
