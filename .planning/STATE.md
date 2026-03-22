@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 16-01-PLAN.md
-last_updated: "2026-03-22T23:05:41.459Z"
+stopped_at: Completed 16-02-PLAN.md
+last_updated: "2026-03-22T23:11:13.418Z"
 last_activity: 2026-03-22
 progress:
   total_phases: 17
-  completed_phases: 15
+  completed_phases: 16
   total_plans: 38
-  completed_plans: 37
+  completed_plans: 38
 ---
 
 # Project State
@@ -83,6 +83,7 @@ Plan: 2 of 2
 | Phase 15 P02 | 3min | 2 tasks | 6 files |
 | Phase 15 P04 | 2min | 2 tasks | 4 files |
 | Phase 16 P01 | 2min | 2 tasks | 6 files |
+| Phase 16 P02 | 2min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -161,6 +162,9 @@ Recent decisions affecting current work:
 - [Phase 15]: Cross-linked explanation pages to related how-to guides for actionable follow-up
 - [Phase 16]: Auto source override placed after _is_adf_source() call, preserving D-05
 - [Phase 16]: Literal type on ProfileConfig for validation; plain str on ScanSettings dataclass
+- [Phase 16]: Auto source check before flatbed in source_to_slug to prevent substring match
+- [Phase 16]: Only write auto_source_mode to TOML when non-default (keep config clean)
+- [Phase 16]: Auto-only scanner defaults to adf mode for multi-page capability
 
 ### Roadmap Evolution
 
@@ -192,6 +196,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-22
-Last session: 2026-03-22T23:05:41.457Z
-Stopped at: Completed 16-01-PLAN.md
+Last session: 2026-03-22T23:11:13.416Z
+Stopped at: Completed 16-02-PLAN.md
 Resume file: None

@@ -273,11 +273,11 @@ Plans:
 **Goal:** Users can configure whether a scanner's "Auto" source routes to flatbed (single-page) or ADF (multi-page) scanning via a per-profile `auto_source_mode` setting, with smart defaults in auto-generated profiles
 **Requirements**: D-01, D-02, D-03, D-04, D-05, D-06, D-07, D-08, D-09, D-10
 **Depends on:** Phase 15
-**Plans:** 1/2 plans executed
+**Plans:** 2/2 plans complete
 
 Plans:
 - [x] 16-01-PLAN.md -- Config + data models + scan routing: auto_source_mode on ProfileConfig/ScanSettings, pipeline bridge, scan_pages conditional routing
-- [ ] 16-02-PLAN.md -- Auto-profile generation + docs: source_to_slug Auto handling, smart auto_source_mode defaults, TOML persistence, config reference update
+- [x] 16-02-PLAN.md -- Auto-profile generation + docs: source_to_slug Auto handling, smart auto_source_mode defaults, TOML persistence, config reference update
 
 **Success Criteria** (what must be TRUE):
   1. `ProfileConfig(auto_source_mode="adf")` validates successfully; invalid values are rejected
