@@ -21,6 +21,9 @@ services:
     environment:
       - SANELESS_PAPERLESS__URL=http://paperless:8000
       - SANELESS_PAPERLESS__TOKEN=changeme
+      # Uncomment to discover scanners on a remote host via SANE net backend:
+      # - SANELESS_SCANNER__HOST=192.168.1.50
+      # Multiple hosts use colons: SANELESS_SCANNER__HOST=192.168.1.50:192.168.1.51
     restart: unless-stopped
 
 volumes:
