@@ -285,7 +285,7 @@ def test_paperless_test_error(client: TestClient) -> None:
     assert response.status_code == 502
     data = response.json()
     assert data["status"] == "error"
-    assert "boom" in data["detail"]
+    assert data["detail"] == "RuntimeError"
 
 
 def test_scan_button_disabled_during_active_job(client: TestClient) -> None:
@@ -387,3 +387,26 @@ def test_css_spacing_normalized() -> None:
     assert "!important" not in css_content
     assert "padding: 0.25rem" in css_content
     assert "var(--pico-border-width)" in css_content
+
+
+def test_paperless_test_502_sanitizes_exception(client: TestClient) -> None:
+    """502 response returns exception class name, not raw message with secrets (RH-04)."""
+    sensitive_msg = "http://192.168.1.100:8000 token=abc123"
+    _app(client).state.paperless.test_connection = _raise_factory(
+        ConnectionError, sensitive_msg
+    )
+    response = client.get("/api/paperless/test")
+    assert response.status_code == 502
+    data = response.json()
+    assert data["detail"] == "ConnectionError"
+    assert "192.168.1.100" not in response.text
+    assert "abc123" not in response.text
+
+
+def _raise_factory(exc_type: type[Exception], msg: str):  # noqa: ANN202 -- return type is dynamic callable
+    """Create a callable that raises the given exception with the given message."""
+
+    def _raise() -> None:
+        raise exc_type(msg)
+
+    return _raise

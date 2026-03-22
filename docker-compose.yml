@@ -13,6 +13,9 @@ services:
     ports:
       - "8080:8080"
     volumes:
+      # WARNING: config.toml must exist on the host before first run.
+      # Create it with at minimum: [profiles.default] and [paperless] sections.
+      # See: https://github.com/kris-knigga/saneless#configuration
       - ./config.toml:/etc/saneless/config.toml:ro
       - saneless-data:/tmp/saneless
     environment:
