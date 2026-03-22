@@ -96,6 +96,66 @@ def _is_manual_duplex(source: str) -> bool:
     return "manual" in source.lower() and "duplex" in source.lower()
 
 
+def _handle_duplex_mismatch(
+    passes: tuple[list[Image.Image], list[Image.Image]],
+    tmp_path: Path,
+    paperless: PaperlessClient,
+    request: PipelineRequest,
+    notify: Callable[[PipelineEvent], None],
+) -> str:
+    """
+    Save and upload partial PDFs when duplex page counts mismatch.
+
+    Instead of discarding scanned data, assembles fronts and backs into
+    separate PDFs and uploads both to paperless-ngx for manual review.
+
+    Args:
+        passes: Tuple of (front-side images, back-side images).
+        tmp_path: Temporary directory for PDF assembly.
+        paperless: Paperless-ngx client for upload.
+        request: Pipeline request with title, tags, correspondent.
+        notify: Status callback function.
+
+    Returns:
+        Warning message describing the mismatch and recovery action.
+
+    """
+    fronts, backs = passes
+    notify(PipelineEvent.ASSEMBLING)
+    fronts_pdf = assemble_pdf(fronts, tmp_path / "fronts")
+    backs_pdf = assemble_pdf(backs, tmp_path / "backs")
+    logger.info(
+        "Duplex mismatch: assembled %d fronts and %d backs as separate PDFs",
+        len(fronts),
+        len(backs),
+    )
+
+    notify(PipelineEvent.UPLOADING)
+    created = datetime.now(tz=UTC).isoformat()
+    title = request.title
+    paperless.upload_document(
+        fronts_pdf,
+        f"{title} (fronts)",
+        request.tags,
+        request.correspondent,
+        created,
+    )
+    paperless.upload_document(
+        backs_pdf,
+        f"{title} (backs)",
+        request.tags,
+        request.correspondent,
+        created,
+    )
+
+    warning = (
+        f"Page count mismatch: {len(fronts)} fronts, {len(backs)} backs. "
+        f"Partial PDFs saved."
+    )
+    logger.warning(warning)
+    return warning
+
+
 def _interleave_duplex(
     fronts: list[Image.Image],
     backs: list[Image.Image],
@@ -134,7 +194,7 @@ def _scan_manual_duplex(
     scan_settings: ScanSettings,
     request: PipelineRequest,
     notify: Callable[[PipelineEvent], None],
-) -> list[Image.Image]:
+) -> list[Image.Image] | tuple[list[Image.Image], list[Image.Image]]:
     """
     Perform a two-pass manual duplex scan with flip coordination.
 
@@ -146,10 +206,11 @@ def _scan_manual_duplex(
         notify: Status callback function.
 
     Returns:
-        Interleaved list of front and back page images.
+        Interleaved list of images on matching page counts, or a tuple
+        of (fronts, backs) when counts mismatch for recovery handling.
 
     Raises:
-        ScanError: If page counts mismatch or scan is aborted.
+        ScanError: If scan is aborted by user.
 
     """
     # Pass A: scan fronts
@@ -177,6 +238,9 @@ def _scan_manual_duplex(
     logger.info("Pass B: scanned %d back page(s)", len(back_pages))
 
     # Raw count validation BEFORE empty page detection (SCAN-07)
+    if len(front_pages) != len(back_pages):
+        return (front_pages, back_pages)
+
     images = _interleave_duplex(front_pages, back_pages)
     logger.info("Interleaved %d total pages", len(images))
     return images
@@ -210,6 +274,32 @@ def _scan_simplex(
         request.thumbnail_callback(thumb)
 
     return images
+
+
+def _resolve_device(scanner: ScannerBackend, settings: Settings) -> str:
+    """
+    Resolve the scanner device ID from settings or auto-detection.
+
+    Args:
+        scanner: Scanner backend instance.
+        settings: Application settings.
+
+    Returns:
+        SANE device identifier string.
+
+    Raises:
+        ConfigError: If no device is configured and auto-detection finds none.
+
+    """
+    device_id = settings.scanner.device
+    if device_id:
+        return device_id
+    devices = scanner.get_devices()
+    if not devices:
+        msg = "No scanner found: settings.scanner.device is empty and auto-detection found no devices"
+        raise ConfigError(msg)
+    logger.info("Auto-detected scanner: %s", devices[0].name)
+    return devices[0].name
 
 
 def run_pipeline(
@@ -247,15 +337,7 @@ def run_pipeline(
         raise ConfigError(msg)
 
     profile = settings.profiles[request.profile_name]
-
-    device_id = settings.scanner.device
-    if not device_id:
-        devices = scanner.get_devices()
-        if not devices:
-            msg = "No scanner found: settings.scanner.device is empty and auto-detection found no devices"
-            raise ConfigError(msg)
-        device_id = devices[0].name
-        logger.info("Auto-detected scanner: %s", device_id)
+    device_id = _resolve_device(scanner, settings)
 
     scan_settings = ScanSettings(
         source=profile.source,
@@ -279,9 +361,28 @@ def run_pipeline(
         )
 
         if _is_manual_duplex(profile.source):
-            images = _scan_manual_duplex(
-                scanner, device_id, scan_settings, request, notify
+            duplex_result = _scan_manual_duplex(
+                scanner,
+                device_id,
+                scan_settings,
+                request,
+                notify,
             )
+            if isinstance(duplex_result, tuple):
+                warning = _handle_duplex_mismatch(
+                    duplex_result,
+                    tmp_path,
+                    paperless,
+                    request,
+                    notify,
+                )
+                notify(PipelineEvent.DONE)
+                logger.info(
+                    "Pipeline complete for '%s' (duplex mismatch recovery)",
+                    request.title,
+                )
+                return {"status": "DONE", "warning": warning}
+            images = duplex_result
         else:
             images = _scan_simplex(scanner, device_id, scan_settings, request)
 
