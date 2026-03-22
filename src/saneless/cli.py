@@ -100,7 +100,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         click.echo(f"Unknown profile: {profile}", err=True)
         sys.exit(2)
 
-    scanner = SaneBackend()
+    scanner = SaneBackend(host=settings.scanner.host)
     paperless = PaperlessClient(
         settings.paperless.url,
         settings.paperless.token,
@@ -164,7 +164,7 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
 
     if not as_json:
         click.echo("Discovering scanners...")
-    scanner = SaneBackend()
+    scanner = SaneBackend(host=_settings.scanner.host)
     device_list = scanner.get_devices()
 
     if not device_list:
@@ -275,7 +275,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     actual_host = host or settings.output.web_host
     actual_port = port or settings.output.web_port
 
-    scanner = SaneBackend()
+    scanner = SaneBackend(host=settings.scanner.host)
     app = create_app(settings, scanner)
 
     # Check port availability before starting to give a clear error
@@ -310,7 +310,7 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         ctx.parent.params.get("config_path") if ctx.parent else None
     )
 
-    scanner = SaneBackend()
+    scanner = SaneBackend(host=settings.scanner.host)
     device_list = scanner.get_devices()
     if not device_list:
         click.echo("No scanners found.", err=True)

@@ -85,6 +85,9 @@ def _patch_cli(
         class MockSaneBackend:
             """Mock scanner backend for CLI tests."""
 
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
             def get_devices(self) -> list[DeviceInfo]:
                 """Return two test scanner devices."""
                 return [
@@ -224,6 +227,9 @@ class TestScanCommand:
         class FailScanner:
             """Scanner that always raises ScanError."""
 
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
             def scan_pages(self, *_args: object, **_kwargs: object) -> None:
                 """Raise a scan error."""
                 msg = "Paper jam"
@@ -332,6 +338,9 @@ class TestCliFlags:
         class MockSaneBackend:
             """Mock scanner that returns no devices."""
 
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
             def get_devices(self) -> list[DeviceInfo]:
                 """Return empty device list."""
                 return []
@@ -357,6 +366,9 @@ class TestCliFlags:
 
         class MockSaneBackend:
             """Mock scanner that returns no devices."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
 
             def get_devices(self) -> list[DeviceInfo]:
                 """Return empty device list."""
@@ -645,6 +657,9 @@ class TestAutoProfiles:
         class _AutoScanner:
             """Mock scanner for auto-profiles tests."""
 
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
             def get_devices(self) -> list[DeviceInfo]:
                 """Return configured device list."""
                 return _devices
@@ -752,6 +767,9 @@ class TestTruncation:
 
         class LongNameScanner:
             """Scanner returning a device with a very long name."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
 
             def get_devices(self) -> list[DeviceInfo]:
                 """Return a device with a 50-character name."""
