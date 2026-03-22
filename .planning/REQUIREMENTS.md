@@ -25,6 +25,7 @@
 - [x] **PROF-01**: User can define scan profiles in TOML config specifying source, resolution, color mode, and optional default metadata
 - [x] **PROF-02**: A `default` profile must always be present
 - [x] **PROF-03**: User can select a profile from a dropdown in the web UI
+- [x] **DPI-01**: Default scan resolution is 300 DPI, consolidated into a single DEFAULT_RESOLUTION constant as the authoritative source of truth
 
 ### PDF Assembly
 
@@ -175,12 +176,13 @@
 | PKG-03 | Phase 4 | Complete |
 | PLSS-06 | Phase 4 | Complete |
 | CLI-03 | Phase 4 | Complete |
+| DPI-01 | Phase 11 | Complete |
 
 **Coverage:**
-- v1 requirements: 49 total
-- Mapped to phases: 49
+- v1 requirements: 50 total
+- Mapped to phases: 50
 - Unmapped: 0
-- Satisfied: 47
+- Satisfied: 48
 - Pending (gap closure): 2 (PLSS-03, UI-02)
 
 ---
