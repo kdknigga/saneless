@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 12-02-PLAN.md
-last_updated: "2026-03-22T12:41:02.436Z"
+stopped_at: Completed 12-01-PLAN.md
+last_updated: "2026-03-22T12:43:23.535Z"
 last_activity: 2026-03-22
 progress:
   total_phases: 12
-  completed_phases: 11
+  completed_phases: 12
   total_plans: 28
-  completed_plans: 27
+  completed_plans: 28
 ---
 
 # Project State
@@ -73,6 +73,7 @@ Plan: 2 of 2 (COMPLETE)
 | Phase 10 P02 | 3min | 2 tasks | 4 files |
 | Phase 11 P01 | 2min | 2 tasks | 4 files |
 | Phase 12 P02 | 2min | 2 tasks | 2 files |
+| Phase 12 P01 | 3min | 3 tasks | 9 files |
 
 ## Accumulated Context
 
@@ -136,6 +137,8 @@ Recent decisions affecting current work:
 - [Phase 11]: 300 DPI confirmed as correct default per Tesseract OCR minimum recommendation
 - [Phase 11]: Single DEFAULT_RESOLUTION constant eliminates duplication between config.py and auto_profiles.py
 - [Phase 12]: Dynamic column widths: name_w = max(20, cols - 45) for devices, title_w = max(15, cols - 50) for jobs
+- [Phase 12]: humanize_state as Jinja2 filter registered on template env rather than template-level macro
+- [Phase 12]: External app.js with IIFE pattern for HTMX event delegation instead of inline scripts
 
 ### Roadmap Evolution
 
@@ -163,6 +166,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-22
-Last session: 2026-03-22T12:41:02.434Z
-Stopped at: Completed 12-02-PLAN.md
+Last session: 2026-03-22T12:43:23.533Z
+Stopped at: Completed 12-01-PLAN.md
 Resume file: None
