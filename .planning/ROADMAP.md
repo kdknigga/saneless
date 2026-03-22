@@ -19,6 +19,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 5: Web Server Launch Command** - `saneless serve` CLI command, web logging, Dockerfile CMD
 - [ ] **Phase 6: Gap Closure Fixes** - Paperless test route, worker intermediate states
 - [ ] **Phase 7: Tech Debt Cleanup** - python-sane packaging, Starlette deprecation, error typing, flip timing, Playwright browser tests
+- [ ] **Phase 13: Review Hardening** - Disk space checks, duplex data preservation, typed state events, exception sanitization, config validation, periodic pruning, empty page toggle, signal handler fix, Docker docs
 
 ## Phase Details
 
@@ -204,3 +205,19 @@ Plans:
 Plans:
 - [ ] 12-01-PLAN.md -- Web UI polish: humanize_state Jinja2 filter, accessible button labels, extract inline scripts to app.js, normalize CSS spacing, copywriting fixes
 - [ ] 12-02-PLAN.md -- CLI table truncation: _truncate helper with terminal-aware column widths for devices and jobs commands
+
+### Phase 13: Review hardening -- cross-AI review findings
+
+**Goal:** Address 9 hardening items identified by cross-AI plan review (Gemini CLI) -- disk space pre-flight checks, manual duplex data preservation, typed state machine events, exception sanitization, config writability validation, periodic job pruning, empty page detection toggle, threaded Uvicorn signal fix, and Docker Compose documentation
+**Requirements**: RH-01, RH-02, RH-03, RH-04, RH-05, RH-06, RH-07, RH-08, RH-09
+**Depends on:** Phase 12
+**Success Criteria** (what must be TRUE):
+  1. Multi-page scan pipeline checks disk space before starting and raises a clear error if estimated space exceeds available
+  2. Manual duplex page count mismatch saves front pages as partial PDF to consume directory, not silently discarded
+  3. Worker state transitions use a typed enum callback, not string comparison against log messages
+  4. `GET /api/paperless/test` 502 response contains sanitized error detail, never raw exception strings with tokens or IPs
+  5. Config validation at startup fails fast if tmp_dir or consume_dir paths are not writable
+  6. Job history is pruned periodically during runtime (not only at application startup)
+  7. `ProfileConfig.enable_empty_page_detection` boolean toggle exists and defaults to True
+  8. Browser test Uvicorn server sets `install_signal_handlers=False` to prevent ValueError in non-main thread
+  9. docker-compose.yml includes a comment warning that config.toml must exist on host before first run
