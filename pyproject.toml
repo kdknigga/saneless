@@ -159,4 +159,5 @@ dev = [
     "pytest>=9.0.2",
     "ruff>=0.15.5",
     "ty>=0.0.21",
+    "mkdocs-material>=9.7.6",
 ]

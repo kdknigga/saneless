@@ -1,0 +1,58 @@
+site_name: saneless
+site_description: SANE scanner to paperless-ngx bridge
+site_url: https://kris-knigga.github.io/saneless/
+repo_url: https://github.com/kris-knigga/saneless
+repo_name: kris-knigga/saneless
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - attr_list
+  - def_list
+  - tables
+
+nav:
+  - Home: index.md
+  - Tutorials:
+    - Scan Your First Document: tutorials/scan-your-first-document.md
+  - How-To Guides:
+    - Install on Bare Metal: how-to/install-bare-metal.md
+    - Deploy with Docker Compose: how-to/deploy-docker-compose.md
+    - Configure Scan Profiles: how-to/configure-scan-profiles.md
+    - Set Up ADF Duplex Scanning: how-to/set-up-adf-duplex.md
+    - Scanner Host Discovery (Containers): how-to/scanner-host-discovery.md
+    - Use the CLI for Scripting: how-to/cli-scripting.md
+  - Reference:
+    - CLI Commands: reference/cli-commands.md
+    - Configuration (TOML): reference/configuration.md
+    - Environment Variables: reference/environment-variables.md
+    - Web API: reference/web-api.md
+    - Docker: reference/docker.md
+  - Explanation:
+    - Architecture Overview: explanation/architecture.md
+    - Empty Page Detection: explanation/empty-page-detection.md
+    - Consume Directory Fallback: explanation/consume-directory-fallback.md
