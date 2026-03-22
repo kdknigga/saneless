@@ -457,13 +457,13 @@ class TestManualDuplex:
             called_images = mock_assemble.call_args[0][0]
             assert len(called_images) == 6
 
-    def test_manual_duplex_count_mismatch(
+    def test_duplex_mismatch_saves_partial_pdfs(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Pass A yields 3 pages, pass B yields 2 -> raises ScanError."""
+        """Pass A yields 3 pages, pass B yields 2 -> saves both as separate PDFs."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
 
@@ -478,13 +478,59 @@ class TestManualDuplex:
             title="Mismatch Test",
         )
 
-        with pytest.raises(ScanError, match="Page count mismatch: 3 fronts, 2 backs"):
-            run_pipeline(
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=request,
+        )
+
+        # Both partial PDFs uploaded
+        assert mock_paperless.upload_document.call_count == 2
+        first_call = mock_paperless.upload_document.call_args_list[0]
+        second_call = mock_paperless.upload_document.call_args_list[1]
+        assert "(fronts)" in first_call[0][1]
+        assert "(backs)" in second_call[0][1]
+
+        # Returns DONE with warning, not ERROR
+        assert result["status"] == "DONE"
+        assert "Page count mismatch: 3 fronts, 2 backs" in result["warning"]
+
+    def test_duplex_match_still_interleaves_normally(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Matching front/back counts still interleave and upload single PDF."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+
+        fronts = [_make_content_image("red"), _make_content_image("blue")]
+        backs = [_make_content_image("green"), _make_content_image("yellow")]
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Normal Duplex",
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
                 request=request,
             )
+
+            # Normal path: single PDF uploaded
+            mock_paperless.upload_document.assert_called_once()
+            assert "warning" not in result
 
     def test_manual_duplex_empty_page_after_interleave(
         self,
