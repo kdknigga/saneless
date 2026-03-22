@@ -159,6 +159,7 @@ class SaneDevice(Protocol):
     source: str
 
     def get_options(self) -> list: ...
+    def start(self) -> None: ...
     def snap(self) -> Image.Image: ...
     def multi_scan(self) -> Iterator[Image.Image]: ...
     def cancel(self) -> None: ...
@@ -421,17 +422,24 @@ class SaneBackend(ScannerBackend):
                 dev.source = effective_source
 
             use_adf = _is_adf_source(effective_source)
-            if (
-                effective_source.lower() == "auto"
-                and "Flatbed" not in available_sources
-            ):
-                use_adf = True
+
+            # D-04: Override for "Auto" source using config-driven routing
+            if effective_source == "Auto":
+                use_adf = settings.auto_source_mode == "adf"
+                logger.info(
+                    "Auto source routing: auto_source_mode='%s', use_adf=%s",
+                    settings.auto_source_mode,
+                    use_adf,
+                )
 
             if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
                 yield from self._scan_adf_pages(dev)
             else:
-                # Flatbed: snap without progress callback (Pitfall #2 prevention)
+                # Flatbed: start() initiates the SANE data channel, then
+                # snap() drains it via sane_read() loop.  Without start()
+                # the read loop has no data source.
+                dev.start()
                 image = dev.snap()
                 # Strip EXIF from flatbed scans too
                 image.info.pop("exif", None)
