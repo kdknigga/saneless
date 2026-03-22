@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+import tomlkit
 from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
@@ -607,3 +608,122 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 0
         assert captured["app"] is not None
+
+
+class TestAutoProfiles:
+    """auto-profiles command tests."""
+
+    @staticmethod
+    def _make_auto_scanner(
+        *,
+        devices: list[DeviceInfo] | None = None,
+        caps: DeviceCapabilities | None = None,
+    ) -> type:
+        """Build a mock scanner class for auto-profiles tests."""
+        _devices = (
+            devices
+            if devices is not None
+            else [
+                DeviceInfo(
+                    name="test:device",
+                    vendor="Test",
+                    model="Scanner",
+                    device_type="scanner",
+                ),
+            ]
+        )
+        _caps = (
+            caps
+            if caps is not None
+            else DeviceCapabilities(
+                sources=["Flatbed", "ADF"],
+                resolutions=[150, 300, 600],
+                modes=["Color", "Gray"],
+            )
+        )
+
+        class _AutoScanner:
+            """Mock scanner for auto-profiles tests."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Return configured device list."""
+                return _devices
+
+            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+                """Return configured capabilities."""
+                return _caps
+
+        return _AutoScanner
+
+    def test_auto_profiles_generates_profiles(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """auto-profiles generates profiles and prints summary."""
+        config_file = tmp_path / "saneless.toml"
+        scanner_cls = self._make_auto_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+        assert result.exit_code == 0
+        assert "Generated" in result.output
+        assert "flatbed-scan" in result.output
+        assert "adf-simplex" in result.output
+
+    def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """auto-profiles with no scanners exits with code 1."""
+        scanner_cls = self._make_auto_scanner(devices=[])
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["auto-profiles"])
+        assert result.exit_code == 1
+        assert "No scanners found" in result.output
+
+    def test_auto_profiles_force_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """auto-profiles --force overwrites existing profiles."""
+        config_file = tmp_path / "saneless.toml"
+        # Pre-populate config with an existing flatbed-scan profile
+        doc = tomlkit.document()
+        profiles_table = tomlkit.table(is_super_table=True)
+        existing = tomlkit.table()
+        existing.add("source", "Old Source")
+        existing.add("resolution", 150)
+        existing.add("mode", "Gray")
+        profiles_table["flatbed-scan"] = existing
+        doc.add("profiles", profiles_table)
+        config_file.write_text(tomlkit.dumps(doc))
+
+        scanner_cls = self._make_auto_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "auto-profiles", "--force"]
+        )
+        assert result.exit_code == 0
+        assert "Generated" in result.output
+        assert "flatbed-scan" in result.output
+
+    def test_auto_profiles_no_force_skips_existing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """auto-profiles without --force does not overwrite existing profiles."""
+        config_file = tmp_path / "saneless.toml"
+        # Pre-populate config with ALL profiles that would be generated
+        doc = tomlkit.document()
+        profiles_table = tomlkit.table(is_super_table=True)
+        for name in ("default", "flatbed-scan", "adf-simplex"):
+            entry = tomlkit.table()
+            entry.add("source", "Existing")
+            entry.add("resolution", 150)
+            entry.add("mode", "Gray")
+            profiles_table[name] = entry
+        doc.add("profiles", profiles_table)
+        config_file.write_text(tomlkit.dumps(doc))
+
+        scanner_cls = self._make_auto_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+        assert result.exit_code == 0
+        assert "No new profiles written" in result.output
