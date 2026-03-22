@@ -298,6 +298,30 @@ class TestMinFreeSpaceMb:
         assert output.min_free_space_mb == 500
 
 
+class TestAutoSourceMode:
+    """ProfileConfig auto_source_mode field validation."""
+
+    def test_auto_source_mode_default_flatbed(self) -> None:
+        """ProfileConfig defaults auto_source_mode to 'flatbed'."""
+        profile = ProfileConfig()
+        assert profile.auto_source_mode == "flatbed"
+
+    def test_auto_source_mode_flatbed(self) -> None:
+        """ProfileConfig accepts auto_source_mode='flatbed'."""
+        profile = ProfileConfig(auto_source_mode="flatbed")
+        assert profile.auto_source_mode == "flatbed"
+
+    def test_auto_source_mode_adf(self) -> None:
+        """ProfileConfig accepts auto_source_mode='adf'."""
+        profile = ProfileConfig(auto_source_mode="adf")
+        assert profile.auto_source_mode == "adf"
+
+    def test_auto_source_mode_invalid_raises(self) -> None:
+        """ProfileConfig rejects invalid auto_source_mode values."""
+        with pytest.raises(ValueError, match="auto_source_mode"):
+            ProfileConfig(auto_source_mode="invalid")
+
+
 class TestValidateSettingsDirs:
     """Writability validation via validate_settings_dirs."""
 

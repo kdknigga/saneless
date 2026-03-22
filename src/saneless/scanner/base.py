@@ -47,6 +47,7 @@ class ScanSettings:
     source: str
     resolution: int
     mode: str
+    auto_source_mode: str = "flatbed"
 
 
 class ScannerBackend(ABC):
