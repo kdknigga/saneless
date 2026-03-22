@@ -193,3 +193,14 @@ Plans:
 
 Plans:
 - [ ] 11-01-PLAN.md -- Consolidate DEFAULT_RESOLUTION constant in config.py, update auto_profiles.py and tests
+
+### Phase 12: UI polish: humanize enum labels, add accessible button labels, fix CLI table truncation, replace inline HTMX scripts, normalize spacing to design token grid
+
+**Goal:** Cosmetic and accessibility polish across web UI and CLI -- humanize raw enum labels, add ARIA attributes to icon buttons, extract inline scripts to external JS, normalize CSS spacing to PicoCSS design token grid, and fix CLI table truncation with terminal-aware column widths
+**Requirements**: P12-01, P12-02, P12-03, P12-04, P12-05
+**Depends on:** Phase 11
+**Plans:** 2 plans
+
+Plans:
+- [ ] 12-01-PLAN.md -- Web UI polish: humanize_state Jinja2 filter, accessible button labels, extract inline scripts to app.js, normalize CSS spacing, copywriting fixes
+- [ ] 12-02-PLAN.md -- CLI table truncation: _truncate helper with terminal-aware column widths for devices and jobs commands
