@@ -1,5 +1,5 @@
 ---
-status: complete
+status: diagnosed
 phase: 06-gap-closure-fixes
 source: 06-01-SUMMARY.md
 started: 2026-03-21T02:00:00Z
@@ -51,7 +51,10 @@ skipped: 2
   reason: "User reported: with a fake token, I'm still getting {\"status\":\"connected\"}."
   severity: major
   test: 2
-  root_cause: ""
-  artifacts: []
-  missing: []
-  debug_session: ""
+  root_cause: "PaperlessClient.test_connection() hits GET /api/ which is the DRF browsable API root — returns 200 regardless of auth. The 401/403 check never triggers because /api/ doesn't enforce authentication."
+  artifacts:
+    - path: "src/saneless/paperless.py"
+      issue: "test_connection() uses /api/ endpoint which doesn't require auth"
+  missing:
+    - "Change test endpoint from /api/ to an auth-requiring endpoint like /api/tags/?page_size=1"
+  debug_session: ".planning/debug/paperless-token-test.md"
