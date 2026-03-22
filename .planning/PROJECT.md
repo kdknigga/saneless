@@ -49,6 +49,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ External app.js replacing all inline scripts and hx-on attributes — Phase 12
 - ✓ CSS spacing normalized to PicoCSS design token grid (no !important) — Phase 12
 - ✓ CLI table truncation with terminal-aware column widths — Phase 12
+- ✓ Containerized scanner discovery via SANE_NET_HOSTS env var injection from scanner.host config — Phase 14
 - ✓ Consume directory fallback — Phase 4
 - ✓ CLI: `saneless jobs` — Phase 4
 - ✓ pip-installable package (pyproject.toml, PyPI) — Phase 4
@@ -104,4 +105,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-22 after Phase 13 completion — review hardening: disk space pre-flight, duplex mismatch recovery, typed PipelineEvent enum, exception sanitization, config writability validation, periodic job pruning, empty page detection toggle, Docker Compose docs*
+*Last updated: 2026-03-22 after Phase 14 completion — containerized scanner detection via SANE_NET_HOSTS env var wiring from scanner.host config*
