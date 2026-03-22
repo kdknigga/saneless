@@ -250,12 +250,12 @@ Plans:
 **Goal:** Complete user-facing documentation site with all four Diataxis quadrants (tutorials, how-to guides, reference, explanation) published via MkDocs Material to GitHub Pages
 **Requirements**: D-01, D-02, D-03, D-04, D-05, D-06, D-07, D-08, D-09, D-10, D-11, D-12, D-13, D-14, D-15, D-16, D-17, D-18
 **Depends on:** Phase 14
-**Plans:** 1/4 plans executed
+**Plans:** 2/4 plans executed
 
 Plans:
 - [x] 15-01-PLAN.md -- MkDocs scaffolding (config, theme, GitHub Actions, landing page) and "Scan Your First Document" tutorial
 - [ ] 15-02-PLAN.md -- How-to guides: install, Docker Compose, scan profiles, ADF duplex, scanner host discovery, CLI scripting
-- [ ] 15-03-PLAN.md -- Reference pages: CLI commands, configuration, environment variables, web API, Docker
+- [x] 15-03-PLAN.md -- Reference pages: CLI commands, configuration, environment variables, web API, Docker
 - [ ] 15-04-PLAN.md -- Explanation pages: architecture, empty page detection, consume directory fallback; README docs link
 
 **Success Criteria** (what must be TRUE):
