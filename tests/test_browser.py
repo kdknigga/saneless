@@ -91,6 +91,8 @@ def browser_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str
     scanner = _BrowserTestScanner()
     app = create_app(settings, scanner)
 
+    # Note: uvicorn.Server.capture_signals already skips signal handling
+    # when running in a non-main thread, so no special config is needed.
     config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
     server = uvicorn.Server(config)
 

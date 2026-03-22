@@ -131,7 +131,7 @@ async def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
         logger.warning("Paperless connection test failed: %s", exc)
         return JSONResponse(
             status_code=502,
-            content={"status": "error", "detail": str(exc)},
+            content={"status": "error", "detail": type(exc).__name__},
         )
 
 
