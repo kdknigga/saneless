@@ -9,7 +9,7 @@ generation logic uses pure functions for easy testing.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import tomlkit
 
@@ -155,16 +155,17 @@ def generate_profiles(
 
     for source in capabilities.sources:
         slug = source_to_slug(source)
-        kwargs: dict[str, object] = {
-            "source": source,
-            "resolution": resolution,
-            "mode": mode,
-            "auto_generated": True,
-        }
+        auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
         if source.lower() == "auto":
             has_flatbed = any("flatbed" in s.lower() for s in capabilities.sources)
-            kwargs["auto_source_mode"] = "flatbed" if has_flatbed else "adf"
-        profiles[slug] = ProfileConfig(**kwargs)
+            auto_source_mode = "adf" if not has_flatbed else "flatbed"
+        profiles[slug] = ProfileConfig(
+            source=source,
+            resolution=resolution,
+            mode=mode,
+            auto_generated=True,
+            auto_source_mode=auto_source_mode,
+        )
 
     # Set default to flatbed if available
     flatbed_sources = [s for s in capabilities.sources if "flatbed" in s.lower()]
