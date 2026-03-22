@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import socket
 import sys
 from pathlib import Path
@@ -30,9 +31,16 @@ from .pipeline import PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
 from .web.app import create_app
 
-__all__ = ["cli"]
+__all__ = ["_truncate", "cli"]
 
 logger = logging.getLogger(__name__)
+
+
+def _truncate(value: str, width: int) -> str:
+    """Truncate string to width, appending ellipsis if exceeding limit."""
+    if len(value) <= width:
+        return value
+    return value[: width - 1] + "\u2026"
 
 
 @click.group()
@@ -163,12 +171,23 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
         ]
         click.echo(json.dumps(data, indent=2))
     else:
-        # Table header
-        header = f"{'Name':<30} {'Vendor':<15} {'Model':<20} {'Type'}"
+        # Table header with terminal-aware column widths
+        cols = shutil.get_terminal_size((80, 24)).columns
+        name_w = max(20, cols - 45)
+        vendor_w = 15
+        model_w = 20
+        header = (
+            f"{'Name':<{name_w}} {'Vendor':<{vendor_w}} {'Model':<{model_w}} {'Type'}"
+        )
         click.echo(header)
-        click.echo("-" * len(header))
+        click.echo("-" * min(len(header), cols))
         for d in device_list:
-            click.echo(f"{d.name:<30} {d.vendor:<15} {d.model:<20} {d.device_type}")
+            click.echo(
+                f"{_truncate(d.name, name_w):<{name_w}} "
+                f"{_truncate(d.vendor, vendor_w):<{vendor_w}} "
+                f"{_truncate(d.model, model_w):<{model_w}} "
+                f"{d.device_type}"
+            )
 
     if capabilities:
         click.echo()
@@ -213,13 +232,22 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                 )
             )
         else:
-            header = f"{'Timestamp':<22} {'Profile':<15} {'Title':<30} {'Status'}"
+            cols = shutil.get_terminal_size((80, 24)).columns
+            ts_w = 22
+            profile_w = 15
+            title_w = max(15, cols - 50)
+            header = (
+                f"{'Timestamp':<{ts_w}} {'Profile':<{profile_w}} "
+                f"{'Title':<{title_w}} {'Status'}"
+            )
             click.echo(header)
-            click.echo("-" * len(header))
+            click.echo("-" * min(len(header), cols))
             for j in recent:
                 click.echo(
-                    f"{j.created_at.strftime('%Y-%m-%d %H:%M:%S'):<22} "
-                    f"{j.profile:<15} {j.title:<30} {j.state.value}"
+                    f"{j.created_at.strftime('%Y-%m-%d %H:%M:%S'):<{ts_w}} "
+                    f"{_truncate(j.profile, profile_w):<{profile_w}} "
+                    f"{_truncate(j.title, title_w):<{title_w}} "
+                    f"{j.state.value}"
                 )
     finally:
         store.close()
