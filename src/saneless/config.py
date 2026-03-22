@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from pydantic_settings.main import InitSettingsSource
 
 __all__ = [
+    "DEFAULT_RESOLUTION",
     "OutputConfig",
     "PaperlessConfig",
     "ProfileConfig",
@@ -33,6 +34,13 @@ __all__ = [
     "Settings",
     "load_settings",
 ]
+
+DEFAULT_RESOLUTION = 300
+"""Default scan resolution in DPI.
+
+300 DPI is the minimum recommended by Tesseract OCR and the industry
+standard for professional document scanning. See Phase 11 research.
+"""
 
 
 class ScannerConfig(BaseModel):
@@ -56,7 +64,7 @@ class ProfileConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     source: str = "Flatbed"
-    resolution: int = 300
+    resolution: int = DEFAULT_RESOLUTION
     mode: str = "color"
     default_tags: list[int] = []
     default_correspondent: int | None = None
