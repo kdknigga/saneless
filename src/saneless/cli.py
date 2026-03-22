@@ -22,7 +22,7 @@ from .auto_profiles import (
     resolve_config_path,
     write_profiles_to_config,
 )
-from .config import load_settings
+from .config import load_settings, validate_settings_dirs
 from .exceptions import PaperlessError, ScanError
 from .job import JobStore
 from .logging_config import configure_logging
@@ -63,6 +63,7 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
 
     try:
         settings = load_settings(config_path)
+        validate_settings_dirs(settings)
     except Exception as exc:
         click.echo(f"Configuration error: {exc}", err=True)
         sys.exit(2)

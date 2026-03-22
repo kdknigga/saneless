@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from saneless.config import validate_settings_dirs
 from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
 from saneless.worker import ScanWorker
@@ -77,6 +78,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         """Manage worker lifecycle and job pruning on startup/shutdown."""
+        validate_settings_dirs(settings)
         worker.start()
         job_store.prune(
             settings.output.history_retention_days,

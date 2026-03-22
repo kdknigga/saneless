@@ -8,6 +8,7 @@ always be present in the configuration.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -33,6 +34,7 @@ __all__ = [
     "ScannerConfig",
     "Settings",
     "load_settings",
+    "validate_settings_dirs",
 ]
 
 DEFAULT_RESOLUTION = 300
@@ -71,6 +73,7 @@ class ProfileConfig(BaseModel):
     default_title_template: str = Field(default="", alias="title")
     empty_page_mean_threshold: float = 250.0
     empty_page_stddev_threshold: float = 5.0
+    enable_empty_page_detection: bool = True
     auto_generated: bool = False
 
 
@@ -86,6 +89,7 @@ class OutputConfig(BaseModel):
     history_max_rows: int = 500
     paperless_task_timeout: int = 300
     paperless_cache_ttl_seconds: int = 60
+    min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
 
@@ -181,6 +185,43 @@ def _build_settings(
             raise ConfigError(msg) from exc
 
         raise
+
+
+def validate_settings_dirs(settings: Settings) -> None:
+    """
+    Fail fast with ConfigError if tmp_dir or consume_dir are not writable.
+
+    Validates directory writability at startup so permission errors surface
+    immediately rather than mid-scan. Per D-13, raises ConfigError (not
+    ValueError) for writability failures.
+
+    Args:
+        settings: Application settings to validate.
+
+    Raises:
+        ConfigError: If any configured directory is not writable.
+
+    """
+    tmp = Path(settings.output.tmp_dir)
+    if tmp.exists() and not os.access(tmp, os.W_OK):
+        msg = f"tmp_dir is not writable: {tmp}"
+        raise ConfigError(msg)
+    if not tmp.exists():
+        parent = tmp.parent
+        if parent.exists() and not os.access(parent, os.W_OK):
+            msg = f"tmp_dir parent is not writable: {parent}"
+            raise ConfigError(msg)
+    consume = settings.paperless.consume_dir
+    if consume:
+        consume_path = Path(consume)
+        if consume_path.exists() and not os.access(consume_path, os.W_OK):
+            msg = f"consume_dir is not writable: {consume_path}"
+            raise ConfigError(msg)
+        if not consume_path.exists():
+            parent = consume_path.parent
+            if parent.exists() and not os.access(parent, os.W_OK):
+                msg = f"consume_dir parent is not writable: {parent}"
+                raise ConfigError(msg)
 
 
 def load_settings(config_path: str | None = None) -> Settings:
