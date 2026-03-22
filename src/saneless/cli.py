@@ -27,7 +27,7 @@ from .exceptions import PaperlessError, ScanError
 from .job import JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
-from .pipeline import PipelineRequest, run_pipeline
+from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
 from .web.app import create_app
 
@@ -107,8 +107,19 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         settings.paperless.consume_dir,
     )
 
-    def status_callback(msg: str) -> None:
-        click.echo(msg)
+    _event_labels: dict[PipelineEvent, str] = {
+        PipelineEvent.SCANNING: "Scanning...",
+        PipelineEvent.AWAITING_FLIP: "Awaiting flip...",
+        PipelineEvent.SCANNING_REVERSE: "Scanning reverse sides...",
+        PipelineEvent.ASSEMBLING: "Assembling PDF...",
+        PipelineEvent.UPLOADING: "Uploading to paperless-ngx...",
+    }
+
+    def status_callback(event: PipelineEvent) -> None:
+        if event == PipelineEvent.DONE:
+            click.echo(f"Done: {title}")
+        else:
+            click.echo(_event_labels.get(event, str(event)))
 
     try:
         request = PipelineRequest(
