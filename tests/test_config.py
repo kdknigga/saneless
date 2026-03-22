@@ -8,8 +8,11 @@ import pytest
 
 from saneless.config import (
     DEFAULT_RESOLUTION,
+    OutputConfig,
     ProfileConfig,
+    Settings,
     load_settings,
+    validate_settings_dirs,
 )
 from saneless.exceptions import (
     ConfigError,
@@ -270,3 +273,55 @@ class TestDefaultResolution:
         """ProfileConfig resolution default matches DEFAULT_RESOLUTION."""
         profile = ProfileConfig()
         assert profile.resolution == DEFAULT_RESOLUTION
+
+
+class TestEmptyPageDetectionToggle:
+    """Empty page detection toggle on ProfileConfig."""
+
+    def test_enable_empty_page_detection_default_true(self) -> None:
+        """ProfileConfig has enable_empty_page_detection defaulting to True."""
+        profile = ProfileConfig()
+        assert profile.enable_empty_page_detection is True
+
+    def test_enable_empty_page_detection_false(self) -> None:
+        """ProfileConfig accepts enable_empty_page_detection=False."""
+        profile = ProfileConfig(enable_empty_page_detection=False)
+        assert profile.enable_empty_page_detection is False
+
+
+class TestMinFreeSpaceMb:
+    """OutputConfig min_free_space_mb field."""
+
+    def test_min_free_space_mb_default(self) -> None:
+        """OutputConfig has min_free_space_mb defaulting to 500."""
+        output = OutputConfig()
+        assert output.min_free_space_mb == 500
+
+
+class TestValidateSettingsDirs:
+    """Writability validation via validate_settings_dirs."""
+
+    def test_validate_writable_tmp_dir_passes(self, tmp_path: Path) -> None:
+        """No error when tmp_dir is writable."""
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(tmp_path)),
+            profiles={"default": ProfileConfig()},
+        )
+        # Should not raise
+        validate_settings_dirs(settings)
+
+    def test_validate_unwritable_tmp_dir_fails_with_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Unwritable tmp_dir raises ConfigError with 'not writable' message."""
+        unwritable = tmp_path / "readonly"
+        unwritable.mkdir()
+        unwritable.chmod(0o444)
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(unwritable)),
+            profiles={"default": ProfileConfig()},
+        )
+        with pytest.raises(ConfigError, match="not writable"):
+            validate_settings_dirs(settings)
+        # Restore permissions for cleanup
+        unwritable.chmod(0o755)

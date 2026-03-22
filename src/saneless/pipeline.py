@@ -249,21 +249,25 @@ def run_pipeline(
         for img in images:
             img.info.pop("exif", None)
 
-        # Step 2: Filter empty pages
-        filtered = filter_empty_pages(
-            images,
-            mean_threshold=profile.empty_page_mean_threshold,
-            stddev_threshold=profile.empty_page_stddev_threshold,
-        )
-        if len(filtered) < len(images):
-            logger.info(
-                "Empty page filter: %d -> %d pages",
-                len(images),
-                len(filtered),
+        # Step 2: Filter empty pages (gated on profile toggle, per D-17)
+        if profile.enable_empty_page_detection:
+            filtered = filter_empty_pages(
+                images,
+                mean_threshold=profile.empty_page_mean_threshold,
+                stddev_threshold=profile.empty_page_stddev_threshold,
             )
-        if not filtered:
-            msg = "All pages were detected as empty"
-            raise ScanError(msg)
+            if len(filtered) < len(images):
+                logger.info(
+                    "Empty page filter: %d -> %d pages",
+                    len(images),
+                    len(filtered),
+                )
+            if not filtered:
+                msg = "All pages were detected as empty"
+                raise ScanError(msg)
+        else:
+            filtered = images
+            logger.info("Empty page detection disabled for profile")
 
         # Step 3: Assemble PDF
         notify("Assembling PDF...")

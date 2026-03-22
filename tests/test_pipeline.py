@@ -659,6 +659,45 @@ class TestExifStripped:
                 assert "exif" not in img.info
 
 
+class TestEmptyPageDetectionToggle:
+    """Empty page detection toggle gating in pipeline."""
+
+    def test_empty_page_filter_skipped_when_disabled(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """When enable_empty_page_detection=False, all images kept (none filtered)."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].enable_empty_page_detection = False
+
+        # Use images that would normally be filtered as empty
+        empty_pages = [_make_empty_image(), _make_empty_image()]
+        content_page = _make_content_image()
+        all_pages = [content_page, *empty_pages]
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = iter(all_pages)
+
+        request = PipelineRequest(profile_name="default", title="Toggle Test")
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+            # All 3 images should be kept since detection is disabled
+            called_images = mock_assemble.call_args[0][0]
+            assert len(called_images) == 3
+
+
 class TestFlatbedStillWorks:
     """Flatbed regression tests."""
 
