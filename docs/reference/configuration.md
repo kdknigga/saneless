@@ -59,7 +59,8 @@ Scan profiles define scanner settings and default metadata. At least one profile
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `source` | string | `"Flatbed"` | Scan source: `Flatbed`, `ADF`, `ADF Duplex` |
+| `source` | string | `"Flatbed"` | Scan source: `Flatbed`, `ADF`, `ADF Duplex`, `Auto` |
+| `auto_source_mode` | string | `"flatbed"` | When source is `"Auto"`: route as `"flatbed"` (single page) or `"adf"` (multi-page feeder). Ignored for explicit sources. |
 | `resolution` | int | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `Color`, `Gray`, `Lineart` |
 | `default_tags` | int[] | `[]` | Paperless-ngx tag IDs to apply automatically |
@@ -118,4 +119,10 @@ resolution = 300
 mode = "Color"
 default_tags = [1]
 title = "Letter"
+
+[profiles.auto-scan]
+source = "Auto"
+auto_source_mode = "adf"
+resolution = 300
+mode = "Color"
 ```
