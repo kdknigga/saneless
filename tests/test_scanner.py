@@ -686,6 +686,76 @@ class TestSaneBackendPageValidation:
         assert "exif" not in pages[0].info
 
 
+class TestAutoSourceRouting:
+    """Auto source conditional routing via auto_source_mode."""
+
+    def test_auto_source_adf_routes_to_adf_path(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """scan_pages with source='Auto' and auto_source_mode='adf' uses ADF path."""
+        # Add "Auto" to available sources
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev.get_options = lambda: [  # type: ignore[assignment]
+            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", "Auto"]),
+            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
+            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
+        ]
+        settings = ScanSettings(
+            source="Auto", resolution=300, mode="color", auto_source_mode="adf"
+        )
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        # ADF path yields 3 pages via multi_scan
+        assert len(pages) == 3
+
+    def test_auto_source_flatbed_routes_to_flatbed_path(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """scan_pages with source='Auto' and auto_source_mode='flatbed' uses flatbed path."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev.get_options = lambda: [  # type: ignore[assignment]
+            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", "Auto"]),
+            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
+            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
+        ]
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source="Auto", resolution=300, mode="color", auto_source_mode="flatbed"
+        )
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        # Flatbed path yields 1 page via snap
+        assert len(pages) == 1
+        mock_dev._snap_impl.assert_called_once()
+
+    def test_explicit_adf_ignores_auto_source_mode(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """Explicit ADF source ignores auto_source_mode setting."""
+        settings = ScanSettings(
+            source="ADF", resolution=300, mode="color", auto_source_mode="flatbed"
+        )
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        # ADF always uses ADF path regardless of auto_source_mode
+        assert len(pages) == 3
+
+    def test_explicit_flatbed_ignores_auto_source_mode(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """Explicit Flatbed source ignores auto_source_mode setting."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="color", auto_source_mode="adf"
+        )
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        # Flatbed always uses flatbed path regardless of auto_source_mode
+        assert len(pages) == 1
+        mock_dev._snap_impl.assert_called_once()
+
+
 class TestSaneBackendPerPageTimeout:
     """Per-page timeout tests."""
 
