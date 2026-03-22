@@ -64,6 +64,9 @@ class MockSaneDev:
         self._multi_scan_error: BaseException | None = None
         self._snap_impl: MagicMock | None = None
 
+    def start(self) -> None:
+        """Initiate SANE scan cycle (no-op in mock)."""
+
     def snap(self) -> Image.Image:
         """Return a simple test image, or delegate to _snap_impl if set."""
         if self._snap_impl is not None:
@@ -176,6 +179,9 @@ class _FakeSaneDevice:
         """Return empty options list."""
         return []
 
+    def start(self) -> None:
+        """Initiate SANE scan cycle (no-op in mock)."""
+
     def snap(self) -> Image.Image:
         """Return a test image."""
         return Image.new("RGB", (100, 100), "white")
@@ -254,6 +260,18 @@ class TestScanSettings:
         assert settings.source == "Flatbed"
         assert settings.resolution == 300
         assert settings.mode == "color"
+
+    def test_auto_source_mode_default_flatbed(self) -> None:
+        """ScanSettings defaults auto_source_mode to 'flatbed'."""
+        settings = ScanSettings(source="Auto", resolution=300, mode="Color")
+        assert settings.auto_source_mode == "flatbed"
+
+    def test_auto_source_mode_adf(self) -> None:
+        """ScanSettings accepts auto_source_mode='adf'."""
+        settings = ScanSettings(
+            source="Auto", resolution=300, mode="Color", auto_source_mode="adf"
+        )
+        assert settings.auto_source_mode == "adf"
 
 
 # ---------------------------------------------------------------------------

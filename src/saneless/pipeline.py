@@ -343,6 +343,7 @@ def run_pipeline(
         source=profile.source,
         resolution=profile.resolution,
         mode=profile.mode,
+        auto_source_mode=profile.auto_source_mode,
     )
 
     # Ensure tmp_dir exists

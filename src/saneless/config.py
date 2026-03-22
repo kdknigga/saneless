@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_settings import (
@@ -68,6 +68,7 @@ class ProfileConfig(BaseModel):
     source: str = "Flatbed"
     resolution: int = DEFAULT_RESOLUTION
     mode: str = "color"
+    auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
     default_tags: list[int] = []
     default_correspondent: int | None = None
     default_title_template: str = Field(default="", alias="title")
