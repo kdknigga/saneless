@@ -24,12 +24,27 @@ if TYPE_CHECKING:
     from saneless.config import Settings
     from saneless.scanner.base import ScannerBackend
 
-__all__ = ["create_app"]
+__all__ = ["create_app", "humanize_state"]
 
 logger = logging.getLogger(__name__)
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
+
+_STATE_LABELS: dict[str, str] = {
+    "PENDING": "Pending",
+    "SCANNING": "Scanning",
+    "AWAITING_FLIP": "Waiting for flip",
+    "ASSEMBLING": "Assembling",
+    "UPLOADING": "Uploading",
+    "DONE": "Complete",
+    "ERROR": "Failed",
+}
+
+
+def humanize_state(value: str) -> str:
+    """Convert a JobState enum value to a human-readable label."""
+    return _STATE_LABELS.get(value, value)
 
 
 def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
@@ -82,6 +97,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     app.state.paperless = paperless
     app.state.cache = cache
     app.state.templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
+    app.state.templates.env.filters["humanize_state"] = humanize_state
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)
