@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from saneless.config import (
+    DEFAULT_RESOLUTION,
     ProfileConfig,
     load_settings,
 )
@@ -256,3 +257,16 @@ empty_page_stddev_threshold = 10.0
         profile = settings.profiles["default"]
         assert profile.empty_page_mean_threshold == 240.0
         assert profile.empty_page_stddev_threshold == 10.0
+
+
+class TestDefaultResolution:
+    """DEFAULT_RESOLUTION constant validation."""
+
+    def test_constant_value(self) -> None:
+        """DEFAULT_RESOLUTION is 300 DPI per Tesseract OCR recommendation."""
+        assert DEFAULT_RESOLUTION == 300
+
+    def test_profile_default_matches_constant(self) -> None:
+        """ProfileConfig resolution default matches DEFAULT_RESOLUTION."""
+        profile = ProfileConfig()
+        assert profile.resolution == DEFAULT_RESOLUTION

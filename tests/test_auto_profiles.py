@@ -13,7 +13,7 @@ from saneless.auto_profiles import (
     source_to_slug,
     write_profiles_to_config,
 )
-from saneless.config import ProfileConfig, Settings
+from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
 from saneless.scanner.base import DeviceCapabilities
 
 if TYPE_CHECKING:
@@ -57,17 +57,22 @@ class TestPickClosestResolution:
     """Resolution selection logic."""
 
     def test_exact_match(self) -> None:
-        """Returns 300 when it is available."""
-        assert pick_closest_resolution([150, 300, 600], target=300) == 300
+        """Returns DEFAULT_RESOLUTION when it is available."""
+        assert (
+            pick_closest_resolution([150, 300, 600], target=DEFAULT_RESOLUTION)
+            == DEFAULT_RESOLUTION
+        )
 
     def test_nearest_when_no_exact(self) -> None:
-        """Returns nearest resolution when 300 is not available."""
-        result = pick_closest_resolution([150, 600], target=300)
+        """Returns nearest resolution when DEFAULT_RESOLUTION is not available."""
+        result = pick_closest_resolution([150, 600], target=DEFAULT_RESOLUTION)
         assert result in (150, 600)
 
     def test_empty_returns_target(self) -> None:
         """Returns target when no resolutions available."""
-        assert pick_closest_resolution([], target=300) == 300
+        assert (
+            pick_closest_resolution([], target=DEFAULT_RESOLUTION) == DEFAULT_RESOLUTION
+        )
 
 
 class TestPickPreferredMode:
