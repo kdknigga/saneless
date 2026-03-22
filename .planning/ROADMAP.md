@@ -183,3 +183,13 @@ Plans:
 Plans:
 - [ ] 10-01-PLAN.md -- Core auto_profiles module: pure generation functions, TOML persistence, tomlkit dep, ProfileConfig auto_generated field (TDD)
 - [ ] 10-02-PLAN.md -- CLI auto-profiles command and worker lazy trigger integration
+
+### Phase 11: Review and adjust default DPI setting
+
+**Goal:** Validate 300 DPI as the optimal default for document scanning (Tesseract OCR minimum recommendation) and consolidate the duplicated DPI value into a single DEFAULT_RESOLUTION constant
+**Requirements**: DPI-01
+**Depends on:** Phase 10
+**Plans:** 1 plan
+
+Plans:
+- [ ] 11-01-PLAN.md -- Consolidate DEFAULT_RESOLUTION constant in config.py, update auto_profiles.py and tests
