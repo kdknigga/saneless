@@ -228,3 +228,19 @@ Plans:
   7. `ProfileConfig.enable_empty_page_detection` boolean toggle exists and defaults to True
   8. Browser test Uvicorn server sets `install_signal_handlers=False` to prevent ValueError in non-main thread
   9. docker-compose.yml includes a comment warning that config.toml must exist on host before first run
+
+### Phase 14: Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable
+
+**Goal:** Containerized saneless discovers network scanners when user sets `scanner.host` in config -- the application wires this into SANE's net backend via the `SANE_NET_HOSTS` environment variable before `sane.init()`
+**Requirements**: NET-01, NET-02, NET-03, NET-04
+**Depends on:** Phase 13
+**Plans:** 1 plan
+
+Plans:
+- [ ] 14-01-PLAN.md -- Wire scanner.host into SANE_NET_HOSTS env var, update CLI call sites, add docker-compose example
+
+**Success Criteria** (what must be TRUE):
+  1. `SaneBackend(host="192.168.1.50")` sets `SANE_NET_HOSTS=192.168.1.50` before `sane.init()`
+  2. If `SANE_NET_HOSTS` is already set externally, the application does not override it
+  3. All 4 CLI commands pass `settings.scanner.host` to the `SaneBackend` constructor
+  4. `docker-compose.yml` documents `SANELESS_SCANNER__HOST` as a commented-out example

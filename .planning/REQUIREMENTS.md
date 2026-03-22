@@ -100,6 +100,13 @@
 - [x] **RH-08**: Uvicorn test server disables signal handlers when run in non-main thread
 - [x] **RH-09**: Docker Compose config documents requirement for host config.toml to exist before first run
 
+### Network Scanner Discovery
+
+- [ ] **NET-01**: SaneBackend sets SANE_NET_HOSTS environment variable when scanner.host config is non-empty, before sane.init()
+- [ ] **NET-02**: SaneBackend does not override an externally-set SANE_NET_HOSTS (e.g. from Docker -e or /etc/sane.d/net.conf)
+- [ ] **NET-03**: All CLI commands (scan, devices, serve, auto-profiles) pass settings.scanner.host to SaneBackend constructor
+- [ ] **NET-04**: Docker Compose example documents SANELESS_SCANNER__HOST env var for network scanner discovery
+
 ## v2 Requirements
 
 ### Notifications
@@ -189,14 +196,18 @@
 | PLSS-06 | Phase 4 | Complete |
 | CLI-03 | Phase 4 | Complete |
 | DPI-01 | Phase 11 | Complete |
+| NET-01 | Phase 14 | Pending |
+| NET-02 | Phase 14 | Pending |
+| NET-03 | Phase 14 | Pending |
+| NET-04 | Phase 14 | Pending |
 
 **Coverage:**
-- v1 requirements: 50 total
-- Mapped to phases: 50
+- v1 requirements: 54 total
+- Mapped to phases: 54
 - Unmapped: 0
-- Satisfied: 48
-- Pending (gap closure): 2 (PLSS-03, UI-02)
+- Satisfied: 50
+- Pending: 4 (NET-01, NET-02, NET-03, NET-04)
 
 ---
 *Requirements defined: 2026-03-20*
-*Last updated: 2026-03-20 after roadmap creation*
+*Last updated: 2026-03-22 after Phase 14 planning*
