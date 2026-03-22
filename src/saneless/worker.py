@@ -13,6 +13,12 @@ import queue
 import threading
 from typing import TYPE_CHECKING
 
+from .auto_profiles import (
+    generate_profiles,
+    is_bare_default,
+    resolve_config_path,
+    write_profiles_to_config,
+)
 from .exceptions import ConfigError, FeederEmptyError, PaperlessError, ScanError
 from .job import ErrorCategory, JobState
 from .pipeline import PipelineRequest, run_pipeline
@@ -58,6 +64,7 @@ class ScanWorker:
         self._abort_event: threading.Event | None = None
         self._transition_event = threading.Event()
         self._current_job_id: str | None = None
+        self._auto_generated = False
 
     def start(self) -> None:
         """Start the worker thread."""
@@ -149,6 +156,40 @@ class ScanWorker:
                 break
             self._process_job(item)
 
+    def _maybe_auto_generate(self) -> None:
+        """Auto-generate profiles from scanner if only bare default exists."""
+        if self._auto_generated:
+            return
+        self._auto_generated = True  # Only try once regardless of outcome
+
+        if not is_bare_default(self._settings):
+            return
+
+        try:
+            devices = self._scanner.get_devices()
+            if not devices:
+                logger.warning("Auto-profiles: no scanners found, using bare default")
+                return
+            device_id = self._settings.scanner.device or devices[0].name
+            caps = self._scanner.get_capabilities(device_id)
+            profiles = generate_profiles(caps)
+            config_path = resolve_config_path()
+            written = write_profiles_to_config(config_path, profiles)
+            # Update in-memory settings
+            for name, profile in profiles.items():
+                self._settings.profiles[name] = profile
+            if written:
+                logger.info(
+                    "Auto-generated %d profile(s): %s",
+                    len(written),
+                    ", ".join(written),
+                )
+        except Exception:
+            logger.warning(
+                "Auto-profiles: scanner unreachable, using bare default",
+                exc_info=True,
+            )
+
     def _process_job(self, job: Job) -> None:
         """
         Execute a single scan job through the pipeline.
@@ -158,6 +199,7 @@ class ScanWorker:
 
         """
         self._current_job_id = job.id
+        self._maybe_auto_generate()
         self._job_store.update_state(job.id, JobState.SCANNING)
         self._transition_event.set()
 

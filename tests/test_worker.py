@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,7 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.job import ErrorCategory, Job, JobState, JobStore
+from saneless.scanner.base import DeviceCapabilities, DeviceInfo
 from saneless.worker import ScanWorker
 
 if TYPE_CHECKING:
@@ -785,5 +787,178 @@ class TestScanWorkerQueuing:
 
             assert _get(store, job1.id).state == JobState.DONE
             assert _get(store, job2.id).state == JobState.DONE
+        finally:
+            store.close()
+
+
+class TestLazyAutoGenerate:
+    """Worker lazy auto-profile generation tests."""
+
+    @staticmethod
+    def _mock_caps_scanner(mock_scanner: MagicMock) -> None:
+        """Configure mock scanner with devices and capabilities."""
+        mock_scanner.get_devices.return_value = [
+            DeviceInfo(
+                name="test:device:001",
+                vendor="Test",
+                model="Scanner",
+                device_type="scanner",
+            ),
+        ]
+        mock_scanner.get_capabilities.return_value = DeviceCapabilities(
+            sources=["Flatbed", "ADF"],
+            resolutions=[150, 300, 600],
+            modes=["Color", "Gray"],
+        )
+
+    def test_lazy_auto_generate_on_bare_default(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Worker auto-generates profiles when only bare default exists."""
+        self._mock_caps_scanner(mock_scanner)
+        # Ensure settings have only bare default
+        assert len(default_settings.profiles) == 1
+        assert "default" in default_settings.profiles
+
+        # Patch resolve_config_path to use tmp dir
+        config_file = tmp_path / "saneless.toml"
+        monkeypatch.setattr(
+            "saneless.worker.resolve_config_path",
+            lambda *_a, **_k: config_file,
+        )
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+        )
+
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Auto Gen Test")
+            worker.submit(job)
+
+            time.sleep(0.5)
+            worker.stop()
+
+            # Profiles should now include generated ones
+            assert len(default_settings.profiles) > 1
+            assert "flatbed-scan" in default_settings.profiles
+        finally:
+            store.close()
+
+    def test_lazy_auto_generate_skips_customized(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker does not auto-generate when profiles are already customized."""
+        # Add a custom profile so it's no longer bare default
+        default_settings.profiles["photo"] = ProfileConfig(
+            source="Flatbed", resolution=600, mode="Color"
+        )
+
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+        )
+
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Custom Test")
+            worker.submit(job)
+
+            time.sleep(0.5)
+            worker.stop()
+
+            # get_capabilities should not have been called
+            mock_scanner.get_capabilities.assert_not_called()
+        finally:
+            store.close()
+
+    def test_lazy_auto_generate_scanner_unreachable(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Worker falls back to bare default if scanner is unreachable."""
+        mock_scanner.get_devices.side_effect = RuntimeError("Connection refused")
+
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+        )
+
+        store = JobStore()
+        try:
+            with caplog.at_level(logging.WARNING):
+                worker = ScanWorker(
+                    mock_scanner, mock_paperless, default_settings, store
+                )
+                worker.start()
+
+                job = store.create_job("default", "Unreachable Test")
+                worker.submit(job)
+
+                time.sleep(0.5)
+                worker.stop()
+
+            # Job should still complete (fallback to bare default)
+            fetched = _get(store, job.id)
+            assert fetched.state == JobState.DONE
+            assert "scanner unreachable" in caplog.text
+        finally:
+            store.close()
+
+    def test_lazy_auto_generate_only_once(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Worker only attempts auto-generation once across multiple jobs."""
+        self._mock_caps_scanner(mock_scanner)
+
+        config_file = tmp_path / "saneless.toml"
+        monkeypatch.setattr(
+            "saneless.worker.resolve_config_path",
+            lambda *_a, **_k: config_file,
+        )
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+        )
+
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job1 = store.create_job("default", "Job 1")
+            job2 = store.create_job("default", "Job 2")
+            worker.submit(job1)
+            worker.submit(job2)
+
+            time.sleep(1.0)
+            worker.stop()
+
+            # get_capabilities called exactly once, not twice
+            assert mock_scanner.get_capabilities.call_count == 1
         finally:
             store.close()
