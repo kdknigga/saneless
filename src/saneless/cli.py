@@ -16,6 +16,11 @@ from pathlib import Path
 import click
 import uvicorn
 
+from .auto_profiles import (
+    generate_profiles,
+    resolve_config_path,
+    write_profiles_to_config,
+)
 from .config import load_settings
 from .exceptions import PaperlessError, ScanError
 from .job import JobStore
@@ -253,3 +258,39 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         log_level=settings.output.log_level.lower(),
         access_log=True,
     )
+
+
+@cli.command(name="auto-profiles")
+@click.option("--force", is_flag=True, help="Overwrite existing profiles.")
+@click.pass_context
+def auto_profiles(ctx: click.Context, *, force: bool) -> None:
+    """Generate scan profiles from scanner capabilities."""
+    settings = ctx.obj["settings"]
+    config_path_str: str | None = (
+        ctx.parent.params.get("config_path") if ctx.parent else None
+    )
+
+    scanner = SaneBackend()
+    device_list = scanner.get_devices()
+    if not device_list:
+        click.echo("No scanners found.", err=True)
+        sys.exit(1)
+
+    # Use configured device or first discovered device
+    device_id = settings.scanner.device or device_list[0].name
+    caps = scanner.get_capabilities(device_id)
+    profiles = generate_profiles(caps)
+
+    config_path = resolve_config_path(config_path_str)
+    written = write_profiles_to_config(config_path, profiles, force=force)
+
+    if not written:
+        click.echo("No new profiles written (use --force to overwrite).")
+        return
+
+    click.echo(f"Generated {len(written)} profile(s) in {config_path}:")
+    for name in written:
+        p = profiles[name]
+        click.echo(
+            f"  {name}: source={p.source}, resolution={p.resolution}, mode={p.mode}"
+        )
