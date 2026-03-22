@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 12-01-PLAN.md
-last_updated: "2026-03-22T12:48:01.912Z"
+stopped_at: Completed 13-01-PLAN.md
+last_updated: "2026-03-22T14:40:27.344Z"
 last_activity: 2026-03-22
 progress:
-  total_phases: 12
+  total_phases: 13
   completed_phases: 12
-  total_plans: 28
-  completed_plans: 28
+  total_plans: 31
+  completed_plans: 29
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 12 — ui-polish-humanize-enum-labels-add-accessible-button-labels-fix-cli-table-truncation-replace-inline-htmx-scripts-normalize-spacing-to-design-token-grid
+**Current focus:** Phase 13 — review-hardening-cross-ai-review-findings
 
 ## Current Position
 
-Phase: 12 (ui-polish-humanize-enum-labels-add-accessible-button-labels-fix-cli-table-truncation-replace-inline-htmx-scripts-normalize-spacing-to-design-token-grid) — EXECUTING
-Plan: 2 of 2 (COMPLETE)
+Phase: 13 (review-hardening-cross-ai-review-findings) — EXECUTING
+Plan: 2 of 3
 
 ## Performance Metrics
 
@@ -74,6 +74,7 @@ Plan: 2 of 2 (COMPLETE)
 | Phase 11 P01 | 2min | 2 tasks | 4 files |
 | Phase 12 P02 | 2min | 2 tasks | 2 files |
 | Phase 12 P01 | 3min | 3 tasks | 9 files |
+| Phase 13 P01 | 4min | 2 tasks | 10 files |
 
 ## Accumulated Context
 
@@ -139,6 +140,8 @@ Recent decisions affecting current work:
 - [Phase 12]: Dynamic column widths: name_w = max(20, cols - 45) for devices, title_w = max(15, cols - 50) for jobs
 - [Phase 12]: humanize_state as Jinja2 filter registered on template env rather than template-level macro
 - [Phase 12]: External app.js with IIFE pattern for HTMX event delegation instead of inline scripts
+- [Phase 13]: Standalone validate_settings_dirs() instead of Pydantic model_validator -- ConfigError required per D-13
+- [Phase 13]: RH-08 uvicorn signal handler fix not needed -- current uvicorn already skips signals in non-main threads
 
 ### Roadmap Evolution
 
@@ -166,6 +169,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-22
-Last session: 2026-03-22T12:43:23.533Z
-Stopped at: Completed 12-01-PLAN.md
+Last session: 2026-03-22T14:40:27.341Z
+Stopped at: Completed 13-01-PLAN.md
 Resume file: None

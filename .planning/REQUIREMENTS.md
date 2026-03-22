@@ -93,12 +93,12 @@
 - [ ] **RH-01**: System checks available disk space before multi-page scans and fails fast if insufficient for estimated page count at current DPI
 - [ ] **RH-02**: Manual duplex page count mismatch saves front pages as partial PDF to consume directory instead of discarding all scanned data
 - [ ] **RH-03**: Worker state transitions use typed enum events instead of string matching against log messages
-- [ ] **RH-04**: Paperless test endpoint sanitizes exception messages in 502 responses to prevent leaking tokens or internal IPs
-- [ ] **RH-05**: Config validation checks tmp_dir and consume_dir are writable at startup, failing fast on permission errors
+- [x] **RH-04**: Paperless test endpoint sanitizes exception messages in 502 responses to prevent leaking tokens or internal IPs
+- [x] **RH-05**: Config validation checks tmp_dir and consume_dir are writable at startup, failing fast on permission errors
 - [ ] **RH-06**: Job history pruning runs periodically during runtime, not only at startup
-- [ ] **RH-07**: ProfileConfig has enable_empty_page_detection boolean toggle to bypass blank detection without threshold manipulation
-- [ ] **RH-08**: Uvicorn test server disables signal handlers when run in non-main thread
-- [ ] **RH-09**: Docker Compose config documents requirement for host config.toml to exist before first run
+- [x] **RH-07**: ProfileConfig has enable_empty_page_detection boolean toggle to bypass blank detection without threshold manipulation
+- [x] **RH-08**: Uvicorn test server disables signal handlers when run in non-main thread
+- [x] **RH-09**: Docker Compose config documents requirement for host config.toml to exist before first run
 
 ## v2 Requirements
 
