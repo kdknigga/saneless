@@ -102,10 +102,10 @@
 
 ### Network Scanner Discovery
 
-- [ ] **NET-01**: SaneBackend sets SANE_NET_HOSTS environment variable when scanner.host config is non-empty, before sane.init()
-- [ ] **NET-02**: SaneBackend does not override an externally-set SANE_NET_HOSTS (e.g. from Docker -e or /etc/sane.d/net.conf)
-- [ ] **NET-03**: All CLI commands (scan, devices, serve, auto-profiles) pass settings.scanner.host to SaneBackend constructor
-- [ ] **NET-04**: Docker Compose example documents SANELESS_SCANNER__HOST env var for network scanner discovery
+- [x] **NET-01**: SaneBackend sets SANE_NET_HOSTS environment variable when scanner.host config is non-empty, before sane.init()
+- [x] **NET-02**: SaneBackend does not override an externally-set SANE_NET_HOSTS (e.g. from Docker -e or /etc/sane.d/net.conf)
+- [x] **NET-03**: All CLI commands (scan, devices, serve, auto-profiles) pass settings.scanner.host to SaneBackend constructor
+- [x] **NET-04**: Docker Compose example documents SANELESS_SCANNER__HOST env var for network scanner discovery
 
 ## v2 Requirements
 
@@ -196,10 +196,10 @@
 | PLSS-06 | Phase 4 | Complete |
 | CLI-03 | Phase 4 | Complete |
 | DPI-01 | Phase 11 | Complete |
-| NET-01 | Phase 14 | Pending |
-| NET-02 | Phase 14 | Pending |
-| NET-03 | Phase 14 | Pending |
-| NET-04 | Phase 14 | Pending |
+| NET-01 | Phase 14 | Complete |
+| NET-02 | Phase 14 | Complete |
+| NET-03 | Phase 14 | Complete |
+| NET-04 | Phase 14 | Complete |
 
 **Coverage:**
 - v1 requirements: 54 total

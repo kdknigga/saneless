@@ -234,10 +234,10 @@ Plans:
 **Goal:** Containerized saneless discovers network scanners when user sets `scanner.host` in config -- the application wires this into SANE's net backend via the `SANE_NET_HOSTS` environment variable before `sane.init()`
 **Requirements**: NET-01, NET-02, NET-03, NET-04
 **Depends on:** Phase 13
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 
 Plans:
-- [ ] 14-01-PLAN.md -- Wire scanner.host into SANE_NET_HOSTS env var, update CLI call sites, add docker-compose example
+- [x] 14-01-PLAN.md -- Wire scanner.host into SANE_NET_HOSTS env var, update CLI call sites, add docker-compose example
 
 **Success Criteria** (what must be TRUE):
   1. `SaneBackend(host="192.168.1.50")` sets `SANE_NET_HOSTS=192.168.1.50` before `sane.init()`

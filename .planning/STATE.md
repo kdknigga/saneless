@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 13-03-PLAN.md
-last_updated: "2026-03-22T15:01:18.763Z"
+stopped_at: Completed 14-01-PLAN.md
+last_updated: "2026-03-22T19:44:42.417Z"
 last_activity: 2026-03-22
 progress:
-  total_phases: 13
-  completed_phases: 13
-  total_plans: 31
-  completed_plans: 31
+  total_phases: 14
+  completed_phases: 14
+  total_plans: 32
+  completed_plans: 32
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 13 — review-hardening-cross-ai-review-findings
+**Current focus:** Phase 14 — Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable
 
 ## Current Position
 
-Phase: 13
-Plan: Not started
+Phase: 14 (Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable) — EXECUTING
+Plan: 1 of 1
 
 ## Performance Metrics
 
@@ -77,6 +77,7 @@ Plan: Not started
 | Phase 13 P01 | 4min | 2 tasks | 10 files |
 | Phase 13 P02 | 4min | 2 tasks | 4 files |
 | Phase 13 P03 | 5min | 1 tasks | 2 files |
+| Phase 14 P01 | 3min | 2 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -147,6 +148,8 @@ Recent decisions affecting current work:
 - [Phase 13]: Combined Task 1+2 commit due to tight callback type coupling between pipeline and worker
 - [Phase 13]: PipelineEvent StrEnum with is-identity dispatch replacing string matching in worker
 - [Phase 13]: _scan_manual_duplex returns (fronts, backs) tuple on mismatch for graceful degradation instead of ScanError
+- [Phase 14]: SANE_NET_HOSTS set before sane.init() -- env var must exist before SANE probes backends
+- [Phase 14]: Externally-set SANE_NET_HOSTS takes priority over config file scanner.host value
 
 ### Roadmap Evolution
 
@@ -155,6 +158,7 @@ Recent decisions affecting current work:
 - Phase 10 added: Automatic scanner profile creation
 - Phase 11 added: Review and adjust default DPI setting
 - Phase 12 added: UI polish: humanize enum labels, add accessible button labels, fix CLI table truncation, replace inline HTMX scripts, normalize spacing to design token grid
+- Phase 14 added: Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable
 
 ### Pending Todos
 
@@ -174,6 +178,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-22
-Last session: 2026-03-22T14:57:10.630Z
-Stopped at: Completed 13-03-PLAN.md
+Last session: 2026-03-22T19:44:42.414Z
+Stopped at: Completed 14-01-PLAN.md
 Resume file: None
