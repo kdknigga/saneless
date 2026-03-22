@@ -12,7 +12,7 @@ import tomlkit
 from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
-from saneless.cli import cli
+from saneless.cli import _truncate, cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -727,3 +727,77 @@ class TestAutoProfiles:
         result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
         assert result.exit_code == 0
         assert "No new profiles written" in result.output
+
+
+class TestTruncation:
+    """Tests for the _truncate helper and CLI table truncation behavior."""
+
+    def test_truncate_short_string(self) -> None:
+        """Short string within width is returned unchanged."""
+        assert _truncate("hello", 10) == "hello"
+
+    def test_truncate_exact_width(self) -> None:
+        """String exactly matching width is returned unchanged."""
+        assert _truncate("hello", 5) == "hello"
+
+    def test_truncate_long_string(self) -> None:
+        """String exceeding width is truncated with ellipsis character."""
+        result = _truncate("a very long device name", 10)
+        assert result == "a very lo\u2026"
+        assert len(result) == 10
+
+    def test_devices_truncation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Devices table truncates long device names with ellipsis."""
+        long_name = "x" * 50
+
+        class LongNameScanner:
+            """Scanner returning a device with a very long name."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Return a device with a 50-character name."""
+                return [DeviceInfo(long_name, "Vendor", "Model", "scanner")]
+
+            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+                """Return minimal capabilities."""
+                return DeviceCapabilities(
+                    sources=["Flatbed"],
+                    resolutions=[300],
+                    modes=["color"],
+                )
+
+        # Force a narrow terminal so truncation kicks in
+        monkeypatch.setattr(
+            "shutil.get_terminal_size",
+            lambda _f=(80, 24): type("TermSize", (), {"columns": 80, "lines": 24})(),
+        )
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=LongNameScanner)
+        result = runner.invoke(cli, ["devices"])
+        assert result.exit_code == 0
+        assert "\u2026" in result.output
+        assert long_name not in result.output
+
+    def test_jobs_truncation(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Jobs table truncates long titles with ellipsis."""
+        long_title = "T" * 50
+        db_path = str(tmp_path / "saneless.db")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        store = JobStore(db_path=db_path)
+        store.create_job(profile="default", title=long_title)
+        store.close()
+
+        # Force a narrow terminal so truncation kicks in
+        monkeypatch.setattr(
+            "shutil.get_terminal_size",
+            lambda _f=(80, 24): type("TermSize", (), {"columns": 80, "lines": 24})(),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        assert "\u2026" in result.output
