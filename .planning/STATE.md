@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: unknown
-stopped_at: Completed 15-04-PLAN.md
-last_updated: "2026-03-22T20:42:56.639Z"
+stopped_at: Completed 16-01-PLAN.md
+last_updated: "2026-03-22T23:05:41.459Z"
 last_activity: 2026-03-22
 progress:
-  total_phases: 15
+  total_phases: 17
   completed_phases: 15
-  total_plans: 36
-  completed_plans: 36
+  total_plans: 38
+  completed_plans: 37
 ---
 
 # Project State
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 15 — create-user-facing-documentation-using-the-di-taxis-approach
+**Current focus:** Phase 16 — when-a-scanner-advertised-auto-mode-it-should-be-configurable-by-the-user-if-that-means-flatbed-mode-or-adf-mode
 
 ## Current Position
 
-Phase: 15
-Plan: Not started
+Phase: 16 (when-a-scanner-advertised-auto-mode-it-should-be-configurable-by-the-user-if-that-means-flatbed-mode-or-adf-mode) — EXECUTING
+Plan: 2 of 2
 
 ## Performance Metrics
 
@@ -82,6 +82,7 @@ Plan: Not started
 | Phase 15 P03 | 2min | 2 tasks | 5 files |
 | Phase 15 P02 | 3min | 2 tasks | 6 files |
 | Phase 15 P04 | 2min | 2 tasks | 4 files |
+| Phase 16 P01 | 2min | 2 tasks | 6 files |
 
 ## Accumulated Context
 
@@ -158,6 +159,8 @@ Recent decisions affecting current work:
 - [Phase 15]: Grouped env vars by section for scanability; documented profile env var limitation
 - [Phase 15]: Used tabbed content for pipx vs pip install alternatives in bare metal guide
 - [Phase 15]: Cross-linked explanation pages to related how-to guides for actionable follow-up
+- [Phase 16]: Auto source override placed after _is_adf_source() call, preserving D-05
+- [Phase 16]: Literal type on ProfileConfig for validation; plain str on ScanSettings dataclass
 
 ### Roadmap Evolution
 
@@ -168,6 +171,8 @@ Recent decisions affecting current work:
 - Phase 12 added: UI polish: humanize enum labels, add accessible button labels, fix CLI table truncation, replace inline HTMX scripts, normalize spacing to design token grid
 - Phase 14 added: Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable
 - Phase 15 added: Create user-facing documentation using the Diátaxis approach
+- Phase 16 added: When a scanner advertised auto mode, it should be configurable by the user if that means flatbed mode or ADF mode
+- Phase 17 added: Fix Paperless upload error: datetime format and title type mismatch in API payload
 
 ### Pending Todos
 
@@ -187,6 +192,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-22
-Last session: 2026-03-22T20:38:52.386Z
-Stopped at: Completed 15-04-PLAN.md
+Last session: 2026-03-22T23:05:41.457Z
+Stopped at: Completed 16-01-PLAN.md
 Resume file: None
