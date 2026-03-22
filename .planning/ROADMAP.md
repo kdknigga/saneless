@@ -267,3 +267,32 @@ Plans:
   6. No screenshots in any documentation page
   7. README has a Documentation section linking to the docs site without duplicating content
   8. GitHub Actions workflow deploys docs to GitHub Pages on push to main
+
+### Phase 16: When a scanner advertised auto mode, it should be configurable by the user if that means flatbed mode or ADF mode
+
+**Goal:** Users can configure whether a scanner's "Auto" source routes to flatbed (single-page) or ADF (multi-page) scanning via a per-profile `auto_source_mode` setting, with smart defaults in auto-generated profiles
+**Requirements**: D-01, D-02, D-03, D-04, D-05, D-06, D-07, D-08, D-09, D-10
+**Depends on:** Phase 15
+**Plans:** 2 plans
+
+Plans:
+- [ ] 16-01-PLAN.md -- Config + data models + scan routing: auto_source_mode on ProfileConfig/ScanSettings, pipeline bridge, scan_pages conditional routing
+- [ ] 16-02-PLAN.md -- Auto-profile generation + docs: source_to_slug Auto handling, smart auto_source_mode defaults, TOML persistence, config reference update
+
+**Success Criteria** (what must be TRUE):
+  1. `ProfileConfig(auto_source_mode="adf")` validates successfully; invalid values are rejected
+  2. `scan_pages()` routes "Auto" source to ADF path when `auto_source_mode="adf"` and flatbed when `"flatbed"`
+  3. Explicit sources (Flatbed, ADF, ADF Duplex) are completely unaffected by `auto_source_mode`
+  4. Auto-generated profiles for "Auto" source default to "adf" when no Flatbed source exists, "flatbed" otherwise
+  5. `source_to_slug("Auto")` returns `"auto-scan"`
+  6. Configuration reference docs list the `auto_source_mode` field with description
+
+### Phase 17: Fix Paperless upload error: datetime format and title type mismatch in API payload
+
+**Goal:** [To be planned]
+**Requirements**: TBD
+**Depends on:** Phase 16
+**Plans:** 0 plans
+
+Plans:
+- [ ] TBD (run /gsd:plan-phase 17 to break down)
