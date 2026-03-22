@@ -189,7 +189,7 @@ Plans:
 **Goal:** Validate 300 DPI as the optimal default for document scanning (Tesseract OCR minimum recommendation) and consolidate the duplicated DPI value into a single DEFAULT_RESOLUTION constant
 **Requirements**: DPI-01
 **Depends on:** Phase 10
-**Plans:** 1 plan
+**Plans:** 1/1 plans complete
 
 Plans:
 - [ ] 11-01-PLAN.md -- Consolidate DEFAULT_RESOLUTION constant in config.py, update auto_profiles.py and tests
