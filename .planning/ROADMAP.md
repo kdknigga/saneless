@@ -211,11 +211,11 @@ Plans:
 **Goal:** Address 9 hardening items identified by cross-AI plan review (Gemini CLI) -- disk space pre-flight checks, manual duplex data preservation, typed state machine events, exception sanitization, config writability validation, periodic job pruning, empty page detection toggle, threaded Uvicorn signal fix, and Docker Compose documentation
 **Requirements**: RH-01, RH-02, RH-03, RH-04, RH-05, RH-06, RH-07, RH-08, RH-09
 **Depends on:** Phase 12
-**Plans:** 1/3 plans executed
+**Plans:** 2/3 plans executed
 
 Plans:
 - [x] 13-01-PLAN.md -- Simple independent fixes: exception sanitization, config writability validation, empty page toggle, Uvicorn signal fix, Docker Compose docs
-- [ ] 13-02-PLAN.md -- Core pipeline hardening: PipelineEvent typed enum, disk space pre-flight check, post-job pruning
+- [x] 13-02-PLAN.md -- Core pipeline hardening: PipelineEvent typed enum, disk space pre-flight check, post-job pruning
 - [ ] 13-03-PLAN.md -- Manual duplex mismatch recovery: save partial PDFs and upload both to paperless-ngx
 
 **Success Criteria** (what must be TRUE):
