@@ -66,3 +66,12 @@ mode = "color"
 ```
 
 Or use environment variables: `SANELESS_SCANNER__HOST`, `SANELESS_PAPERLESS__URL`, etc.
+
+## Documentation
+
+Full documentation is available at **[saneless.github.io](https://kris-knigga.github.io/saneless/)**.
+
+- [Scan Your First Document](https://kris-knigga.github.io/saneless/tutorials/scan-your-first-document/) -- step-by-step tutorial
+- [How-To Guides](https://kris-knigga.github.io/saneless/how-to/install-bare-metal/) -- installation, Docker, profiles, duplex, CLI
+- [Configuration Reference](https://kris-knigga.github.io/saneless/reference/configuration/) -- all TOML options and defaults
+- [CLI Reference](https://kris-knigga.github.io/saneless/reference/cli-commands/) -- commands, flags, exit codes
