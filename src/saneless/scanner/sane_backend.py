@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import TYPE_CHECKING, Any, Protocol
@@ -173,9 +174,21 @@ class SaneBackend(ScannerBackend):
     are called on all code paths.
     """
 
-    def __init__(self) -> None:
-        """Initialize SANE and store the library version."""
+    def __init__(self, host: str = "") -> None:
+        """Initialize SANE, optionally configuring network host discovery."""
         _ensure_sane()
+        # SANE_NET_HOSTS tells the sane-net backend which hosts to probe for
+        # scanners.  Multiple hosts are separated by colons — see sane-net(5).
+        # Only set from config when not already present in the environment
+        # (explicit env var takes priority over config file).
+        if host and "SANE_NET_HOSTS" not in os.environ:
+            os.environ["SANE_NET_HOSTS"] = host
+            logger.info("SANE net host discovery configured: %s", host)
+        elif host and "SANE_NET_HOSTS" in os.environ:
+            logger.info(
+                "SANE_NET_HOSTS already set externally (%s), ignoring scanner.host config",
+                os.environ["SANE_NET_HOSTS"],
+            )
         self._sane_version = sane.init()
         logger.info("SANE initialized, version %s", self._sane_version)
 
