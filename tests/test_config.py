@@ -319,7 +319,7 @@ class TestAutoSourceMode:
     def test_auto_source_mode_invalid_raises(self) -> None:
         """ProfileConfig rejects invalid auto_source_mode values."""
         with pytest.raises(ValueError, match="auto_source_mode"):
-            ProfileConfig(auto_source_mode="invalid")
+            ProfileConfig.model_validate({"auto_source_mode": "invalid"})
 
 
 class TestValidateSettingsDirs:
