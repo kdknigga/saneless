@@ -21,7 +21,7 @@ from .auto_profiles import (
 )
 from .exceptions import ConfigError, FeederEmptyError, PaperlessError, ScanError
 from .job import ErrorCategory, JobState
-from .pipeline import PipelineRequest, run_pipeline
+from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
 
 if TYPE_CHECKING:
     from .config import Settings
@@ -218,16 +218,18 @@ class ScanWorker:
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
             self._job_store.update_thumbnail(_jid, thumb)
 
-        def _status_cb(msg: str, _jid: str = job.id) -> None:
-            logger.info(msg)
-            if msg == "Awaiting flip...":
+        def _status_cb(event: PipelineEvent, _jid: str = job.id) -> None:
+            logger.info("Pipeline event: %s", event.value)
+            if event is PipelineEvent.AWAITING_FLIP:
                 self._transition_event.clear()
                 self._job_store.update_state(_jid, JobState.AWAITING_FLIP)
-            elif msg == "Assembling PDF...":
+            elif event is PipelineEvent.ASSEMBLING:
                 self._job_store.update_state(_jid, JobState.ASSEMBLING)
                 self._transition_event.set()
-            elif msg == "Uploading to paperless-ngx...":
+            elif event is PipelineEvent.UPLOADING:
                 self._job_store.update_state(_jid, JobState.UPLOADING)
+                self._transition_event.set()
+            elif event is PipelineEvent.SCANNING_REVERSE:
                 self._transition_event.set()
 
         try:
@@ -262,3 +264,7 @@ class ScanWorker:
             self._flip_event = None
             self._abort_event = None
             self._current_job_id = None
+            self._job_store.prune(
+                self._settings.output.history_retention_days,
+                self._settings.output.history_max_rows,
+            )

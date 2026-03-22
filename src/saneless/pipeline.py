@@ -8,9 +8,11 @@ is automatically cleaned up on success or failure.
 from __future__ import annotations
 
 import logging
+import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -29,7 +31,19 @@ if TYPE_CHECKING:
     from saneless.paperless import PaperlessClient
     from saneless.scanner.base import ScannerBackend
 
-__all__ = ["PipelineRequest", "run_pipeline"]
+__all__ = ["PipelineEvent", "PipelineRequest", "run_pipeline"]
+
+
+class PipelineEvent(StrEnum):
+    """Events emitted by the scan pipeline to report progress."""
+
+    SCANNING = "SCANNING"
+    AWAITING_FLIP = "AWAITING_FLIP"
+    SCANNING_REVERSE = "SCANNING_REVERSE"
+    ASSEMBLING = "ASSEMBLING"
+    UPLOADING = "UPLOADING"
+    DONE = "DONE"
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +56,39 @@ class PipelineRequest:
     title: str
     tags: list[int] | None = None
     correspondent: int | None = None
-    status_callback: Callable[[str], None] | None = None
+    status_callback: Callable[[PipelineEvent], None] | None = None
     thumbnail_callback: Callable[[str], None] | None = None
     flip_event: threading.Event | None = None
     abort_event: threading.Event | None = None
 
 
-def _noop_callback(_msg: str) -> None:
+def _noop_callback(_event: PipelineEvent) -> None:
     """Default no-op status callback."""
+
+
+def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
+    """
+    Raise ScanError if insufficient disk space in tmp_dir.
+
+    Args:
+        tmp_dir: Path to the temporary directory used for scanning.
+        min_free_mb: Minimum free space required in megabytes.
+
+    Raises:
+        ScanError: If free space is below the required threshold.
+
+    """
+    path = Path(tmp_dir)
+    if not path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(path)
+    free_mb = usage.free // (1024 * 1024)
+    if free_mb < min_free_mb:
+        msg = (
+            f"Insufficient disk space: {free_mb} MB free in {path}, "
+            f"{min_free_mb} MB required (configure min_free_space_mb to adjust)"
+        )
+        raise ScanError(msg)
 
 
 def _is_manual_duplex(source: str) -> bool:
@@ -94,7 +133,7 @@ def _scan_manual_duplex(
     device_id: str,
     scan_settings: ScanSettings,
     request: PipelineRequest,
-    notify: Callable[[str], None],
+    notify: Callable[[PipelineEvent], None],
 ) -> list[Image.Image]:
     """
     Perform a two-pass manual duplex scan with flip coordination.
@@ -124,7 +163,7 @@ def _scan_manual_duplex(
 
     # Signal awaiting flip
     if request.flip_event is not None:
-        notify("Awaiting flip...")
+        notify(PipelineEvent.AWAITING_FLIP)
         request.flip_event.wait()
 
         # Check if aborted
@@ -133,7 +172,7 @@ def _scan_manual_duplex(
             raise ScanError(msg)
 
     # Pass B: scan backs
-    notify("Scanning reverse sides...")
+    notify(PipelineEvent.SCANNING_REVERSE)
     back_pages = list(scanner.scan_pages(device_id, scan_settings))
     logger.info("Pass B: scanned %d back page(s)", len(back_pages))
 
@@ -226,12 +265,13 @@ def run_pipeline(
 
     # Ensure tmp_dir exists
     Path(settings.output.tmp_dir).mkdir(parents=True, exist_ok=True)
+    _check_disk_space(settings.output.tmp_dir, settings.output.min_free_space_mb)
 
     with tempfile.TemporaryDirectory(dir=settings.output.tmp_dir) as tmp_dir:
         tmp_path = Path(tmp_dir)
 
         # Step 1: Scan
-        notify("Scanning...")
+        notify(PipelineEvent.SCANNING)
         logger.info(
             "Scanning with profile '%s' on device '%s'",
             request.profile_name,
@@ -270,12 +310,12 @@ def run_pipeline(
             logger.info("Empty page detection disabled for profile")
 
         # Step 3: Assemble PDF
-        notify("Assembling PDF...")
+        notify(PipelineEvent.ASSEMBLING)
         pdf_path = assemble_pdf(filtered, tmp_path)
         logger.info("PDF assembled: %s", pdf_path)
 
         # Step 4: Upload
-        notify("Uploading to paperless-ngx...")
+        notify(PipelineEvent.UPLOADING)
         created = datetime.now(tz=UTC).isoformat()
         task_uuid = paperless.upload_document(
             pdf_path,
@@ -294,7 +334,7 @@ def run_pipeline(
         else:
             result = {"status": "FALLBACK", "path": settings.paperless.consume_dir}
 
-        notify(f"Done: {request.title}")
+        notify(PipelineEvent.DONE)
         logger.info("Pipeline complete for '%s'", request.title)
 
     return result
