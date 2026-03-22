@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, cast
 
 import tomlkit
 
-from saneless.config import ProfileConfig, Settings
+from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
 
 if TYPE_CHECKING:
     from saneless.scanner.base import DeviceCapabilities
@@ -60,14 +60,14 @@ def source_to_slug(source: str) -> str:
 
 def pick_closest_resolution(
     resolutions: list[int],
-    target: int = 300,
+    target: int = DEFAULT_RESOLUTION,
 ) -> int:
     """
     Pick the resolution closest to target from available options.
 
     Args:
         resolutions: Available resolution values from scanner.
-        target: Preferred resolution (defaults to 300 DPI).
+        target: Preferred resolution (defaults to DEFAULT_RESOLUTION DPI).
 
     Returns:
         The closest available resolution, or target if list is empty.
@@ -146,7 +146,9 @@ def generate_profiles(
 
     """
     profiles: dict[str, ProfileConfig] = {}
-    resolution = pick_closest_resolution(capabilities.resolutions, target=300)
+    resolution = pick_closest_resolution(
+        capabilities.resolutions, target=DEFAULT_RESOLUTION
+    )
     mode = pick_preferred_mode(capabilities.modes, preferred="Color")
 
     for source in capabilities.sources:
