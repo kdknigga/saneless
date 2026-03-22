@@ -63,6 +63,7 @@ class ProfileConfig(BaseModel):
     default_title_template: str = Field(default="", alias="title")
     empty_page_mean_threshold: float = 250.0
     empty_page_stddev_threshold: float = 5.0
+    auto_generated: bool = False
 
 
 class OutputConfig(BaseModel):
