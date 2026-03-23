@@ -113,4 +113,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-22 after Phase 16 completion — configurable auto source mode (flatbed/ADF routing for Auto scanner sources)*
+*Last updated: 2026-03-23 after Phase 17 completion — fixed Paperless upload payload (date-only format, data/files split)*
