@@ -289,10 +289,18 @@ Plans:
 
 ### Phase 17: Fix Paperless upload error: datetime format and title type mismatch in API payload
 
-**Goal:** [To be planned]
-**Requirements**: TBD
+**Goal:** Fix two bugs in Paperless-ngx upload: datetime format sends full ISO 8601 instead of date-only YYYY-MM-DD, and form fields are incorrectly packed into httpx files= parameter instead of data=
+**Requirements**: D-01, D-02, D-03, D-04, D-05, D-06
 **Depends on:** Phase 16
-**Plans:** 0 plans
+**Plans:** 1 plans
 
 Plans:
-- [ ] TBD (run /gsd:plan-phase 17 to break down)
+- [ ] 17-01-PLAN.md -- Fix datetime format to date-only, refactor upload_document to use data= + files= split, add tests
+
+**Success Criteria** (what must be TRUE):
+  1. Both pipeline call sites use `strftime("%Y-%m-%d")` instead of `isoformat()` for the created field
+  2. `upload_document()` sends form fields (title, created, correspondent, tags) via httpx `data=` parameter
+  3. `upload_document()` sends PDF binary via httpx `files=` parameter with application/pdf content type
+  4. `FileTypes` import is removed from paperless.py
+  5. All existing tests pass with no regressions
+  6. New test verifies form fields have no filename attribute (data= encoding) while PDF has filename attribute (files= encoding)
