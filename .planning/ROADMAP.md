@@ -292,10 +292,10 @@ Plans:
 **Goal:** Fix two bugs in Paperless-ngx upload: datetime format sends full ISO 8601 instead of date-only YYYY-MM-DD, and form fields are incorrectly packed into httpx files= parameter instead of data=
 **Requirements**: D-01, D-02, D-03, D-04, D-05, D-06
 **Depends on:** Phase 16
-**Plans:** 1 plans
+**Plans:** 1/1 plans complete
 
 Plans:
-- [ ] 17-01-PLAN.md -- Fix datetime format to date-only, refactor upload_document to use data= + files= split, add tests
+- [x] 17-01-PLAN.md -- Fix datetime format to date-only, refactor upload_document to use data= + files= split, add tests
 
 **Success Criteria** (what must be TRUE):
   1. Both pipeline call sites use `strftime("%Y-%m-%d")` instead of `isoformat()` for the created field
