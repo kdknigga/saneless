@@ -115,7 +115,37 @@ class TestUploadDocument:
             _transport=transport,
         )
         client.upload_document(sample_pdf, title="Test", created="2026-03-20")
-        assert "2026-03-20" in captured_data["content"]
+        content = captured_data["content"]
+        assert "2026-03-20" in content
+        # Ensure no ISO 8601 time component (T...) after the date value
+        date_segment = content.split("2026-03-20")[1].split("\r\n")[0]
+        assert "T" not in date_segment
+        client.close()
+
+    def test_form_fields_sent_as_data_not_files(self, sample_pdf: Path) -> None:
+        """Form fields (title, created) use data= parameter, PDF uses files= parameter."""
+        captured_data: dict[str, bytes] = {}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            captured_data["body"] = _request.content
+            return httpx.Response(200, json="task-id")
+
+        transport = _make_transport(handler)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            _transport=transport,
+        )
+        client.upload_document(sample_pdf, title="Test Doc", created="2026-03-22")
+        body = captured_data["body"].decode("utf-8", errors="replace")
+        # Document field has filename attribute (file upload via files=)
+        assert 'name="document"; filename=' in body
+        # Title field has NO filename attribute (form data via data=)
+        assert 'name="title"' in body
+        assert 'name="title"; filename=' not in body
+        # Created field has NO filename attribute (form data via data=)
+        assert 'name="created"' in body
+        assert 'name="created"; filename=' not in body
         client.close()
 
     def test_upload_retry_on_network_error(self, sample_pdf: Path) -> None:
