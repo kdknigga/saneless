@@ -131,7 +131,7 @@ def _handle_duplex_mismatch(
     )
 
     notify(PipelineEvent.UPLOADING)
-    created = datetime.now(tz=UTC).isoformat()
+    created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     title = request.title
     paperless.upload_document(
         fronts_pdf,
@@ -418,7 +418,7 @@ def run_pipeline(
 
         # Step 4: Upload
         notify(PipelineEvent.UPLOADING)
-        created = datetime.now(tz=UTC).isoformat()
+        created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
         task_uuid = paperless.upload_document(
             pdf_path,
             request.title,

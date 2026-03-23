@@ -13,14 +13,10 @@ import logging
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import httpx
 
 from .exceptions import PaperlessError
-
-if TYPE_CHECKING:
-    from httpx._types import FileTypes
 
 __all__ = ["PaperlessClient"]
 
@@ -96,28 +92,23 @@ class PaperlessClient:
                 or if the server returns a 4xx error.
 
         """
-        fields: list[tuple[str, str]] = [("title", title)]
+        data: dict[str, str | list[str]] = {"title": title}
         if created is not None:
-            fields.append(("created", created))
+            data["created"] = created
         if correspondent is not None:
-            fields.append(("correspondent", str(correspondent)))
-        fields.extend(("tags", str(tag_id)) for tag_id in tags or [])
+            data["correspondent"] = str(correspondent)
+        if tags:
+            data["tags"] = [str(tag_id) for tag_id in tags]
 
         last_error: Exception | None = None
 
         for attempt in range(self._max_retries):
             try:
                 with pdf_path.open("rb") as f:
-                    # Combine form fields and file into a single multipart
-                    # files list for httpx. This avoids issues with mixing
-                    # data= and files= parameters.
-                    multipart_files: list[tuple[str, FileTypes]] = [
-                        *fields,
-                        ("document", (pdf_path.name, f, "application/pdf")),
-                    ]
                     response = self._client.post(
                         "/api/documents/post_document/",
-                        files=multipart_files,
+                        data=data,
+                        files={"document": (pdf_path.name, f, "application/pdf")},
                     )
                 response.raise_for_status()
                 task_id = response.json()
