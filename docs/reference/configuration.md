@@ -61,6 +61,7 @@ Scan profiles define scanner settings and default metadata. At least one profile
 |-------|------|---------|-------------|
 | `source` | string | `"Flatbed"` | Scan source: `Flatbed`, `ADF`, `ADF Duplex`, `Auto` |
 | `auto_source_mode` | string | `"flatbed"` | When source is `"Auto"`: route as `"flatbed"` (single page) or `"adf"` (multi-page feeder). Ignored for explicit sources. |
+| `paper_size` | string | `"full"` | Constrain scan area to a standard paper size. Presets: `full` (entire scanner bed), `a3`, `a4`, `a5`, `letter`, `legal`. Sets SANE geometry options when supported; falls back to post-scan crop otherwise. |
 | `resolution` | int | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `Color`, `Gray`, `Lineart` |
 | `default_tags` | int[] | `[]` | Paperless-ngx tag IDs to apply automatically |
@@ -108,6 +109,7 @@ mode = "Color"
 source = "ADF"
 resolution = 200
 mode = "Gray"
+paper_size = "letter"
 default_tags = [3, 7]
 default_correspondent = 12
 title = "Receipt"

@@ -345,6 +345,19 @@ class TestTomlWriting:
         content = config_file.read_text()
         assert "auto_source_mode" not in content
 
+    def test_auto_generated_profiles_omit_paper_size(self, tmp_path: Path) -> None:
+        """Auto-generated profiles do not write paper_size to TOML (default omitted)."""
+        caps = DeviceCapabilities(
+            sources=["Flatbed", "ADF"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        config_file = tmp_path / "auto_config.toml"
+        write_profiles_to_config(config_file, profiles)
+        content = config_file.read_text()
+        assert "paper_size" not in content
+
     def test_creates_new_file(self, tmp_path: Path) -> None:
         """Creates config file if it does not exist."""
         config_file = tmp_path / "new_config.toml"
