@@ -52,6 +52,10 @@ class MockSaneDev:
         self.mode = "color"
         self.resolution = 300
         self.source = "Flatbed"
+        self.tl_x: float = 0.0
+        self.tl_y: float = 0.0
+        self.br_x: float = 0.0
+        self.br_y: float = 0.0
         self._cancel_called = False
         self._close_called = False
         self._snap_calls: list[dict] = []
@@ -171,6 +175,10 @@ class _FakeSaneDevice:
         self.mode: str = "color"
         self.resolution: int = 300
         self.source: str = "Flatbed"
+        self.tl_x: float = 0.0
+        self.tl_y: float = 0.0
+        self.br_x: float = 0.0
+        self.br_y: float = 0.0
         self._multi_scan_fn = multi_scan or (lambda: iter([]))
         self._cancel_fn = cancel or (lambda: None)
         self._close_fn = close or (lambda: None)
@@ -875,3 +883,175 @@ class TestSaneBackendADFCleanup:
         # Note: iterator_deleted may or may not appear depending on GC,
         # but cancel should always be called
         assert "cancel_called" in operations
+
+
+# ---------------------------------------------------------------------------
+# Paper size geometry and crop fallback tests
+# ---------------------------------------------------------------------------
+
+
+class _NoGeometryDevice:
+    """Mock device that raises AttributeError on geometry attribute assignment."""
+
+    def __init__(self, pages: list[Image.Image] | None = None) -> None:
+        """Initialize device that rejects geometry options."""
+        self.mode: str = "color"
+        self.resolution: int = 300
+        self.source: str = "Flatbed"
+        self._pages = pages or [_make_content_image()]
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Reject geometry attributes, accept everything else."""
+        if name in {"tl_x", "tl_y", "br_x", "br_y"}:
+            msg = f"Device does not support option '{name}'"
+            raise AttributeError(msg)
+        super().__setattr__(name, value)
+
+    def get_options(self) -> list[tuple]:
+        """Return sample options with source."""
+        return [
+            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF"]),
+            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
+            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
+        ]
+
+    def start(self) -> None:
+        """Initiate SANE scan cycle (no-op in mock)."""
+
+    def snap(self) -> Image.Image:
+        """Return first page image."""
+        return self._pages[0]
+
+    def multi_scan(self) -> Iterator[Image.Image]:
+        """Return iterator over pages."""
+        return iter(self._pages)
+
+    def cancel(self) -> None:
+        """Cancel (no-op in mock)."""
+
+    def close(self) -> None:
+        """Close (no-op in mock)."""
+
+
+class TestPaperSizeGeometry:
+    """Paper size geometry option setting tests."""
+
+    def test_a4_sets_geometry(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """When paper_size='a4', dev.br_x=210.0 and dev.br_y=297.0."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (2500, 3600), "white")
+        )
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="color", paper_size="a4"
+        )
+        list(sane_backend.scan_pages("test:device:001", settings))
+        assert mock_dev.br_x == 210.0
+        assert mock_dev.br_y == 297.0
+        assert mock_dev.tl_x == 0.0
+        assert mock_dev.tl_y == 0.0
+
+    def test_full_no_geometry(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """When paper_size='full', no geometry options are set on device."""
+        mock_dev = mock_sane_module._mock_dev
+        # Reset to known values
+        mock_dev.tl_x = -1.0
+        mock_dev.tl_y = -1.0
+        mock_dev.br_x = -1.0
+        mock_dev.br_y = -1.0
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="color", paper_size="full"
+        )
+        list(sane_backend.scan_pages("test:device:001", settings))
+        # Geometry should be unchanged (not set by scan_pages)
+        assert mock_dev.tl_x == -1.0
+        assert mock_dev.br_x == -1.0
+
+    def test_letter_sets_geometry(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """When paper_size='letter', dev.br_x=215.9 and dev.br_y=279.4."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (2600, 3400), "white")
+        )
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="color", paper_size="letter"
+        )
+        list(sane_backend.scan_pages("test:device:001", settings))
+        expected_br_x = 215.9
+        expected_br_y = 279.4
+        assert mock_dev.br_x == expected_br_x
+        assert mock_dev.br_y == expected_br_y
+
+    def test_geometry_failure_still_completes(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """When geometry setting raises, scan still completes (fallback to crop)."""
+        no_geom_dev = _NoGeometryDevice()
+        object.__setattr__(mock_sane_module, "_mock_dev", no_geom_dev)
+
+        backend = SaneBackend()
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="color", paper_size="a4"
+        )
+        pages = list(backend.scan_pages("test:device:001", settings))
+        assert len(pages) == 1
+
+
+class TestPaperSizeCropFallback:
+    """Pillow crop fallback when geometry options are unavailable."""
+
+    def test_crop_fallback_when_geometry_fails(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """When geometry fails, scanned image is cropped to paper dimensions."""
+        # Create a large image (larger than A4 at 300 DPI)
+        large_img = _make_content_image(width=3000, height=4000)
+        no_geom_dev = _NoGeometryDevice(pages=[large_img])
+        object.__setattr__(mock_sane_module, "_mock_dev", no_geom_dev)
+
+        backend = SaneBackend()
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="color", paper_size="a4"
+        )
+        pages = list(backend.scan_pages("test:device:001", settings))
+        assert len(pages) == 1
+        # A4 at 300 DPI: 210*300/25.4=2480, 297*300/25.4=3507
+        assert pages[0].size == (2480, 3507)
+
+    def test_full_no_crop(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """When paper_size='full', image is yielded at original size."""
+        mock_dev = mock_sane_module._mock_dev
+        original_img = Image.new("RGB", (5000, 6000), "white")
+        mock_dev._snap_impl = MagicMock(return_value=original_img)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="color", paper_size="full"
+        )
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        assert len(pages) == 1
+        assert pages[0].size == (5000, 6000)
+
+    def test_adf_crop_fallback(self, mock_sane_module: MockSaneModule) -> None:
+        """ADF pages are cropped when geometry options are unavailable."""
+        large_pages = [
+            _make_content_image(width=3000, height=4000),
+            _make_content_image(width=3000, height=4000),
+        ]
+        no_geom_dev = _NoGeometryDevice(pages=large_pages)
+        object.__setattr__(mock_sane_module, "_mock_dev", no_geom_dev)
+
+        backend = SaneBackend()
+        settings = ScanSettings(
+            source="ADF", resolution=300, mode="color", paper_size="a4"
+        )
+        pages = list(backend.scan_pages("test:device:001", settings))
+        assert len(pages) == 2
+        for page in pages:
+            assert page.size == (2480, 3507)
