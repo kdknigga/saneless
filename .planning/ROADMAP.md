@@ -310,7 +310,7 @@ Plans:
 **Goal:** Users can constrain the scan area to standard paper dimensions (A4, Letter, Legal, etc.) per profile via a `paper_size` setting, using SANE geometry options at the hardware level with a Pillow crop fallback when geometry is unavailable
 **Requirements**: PS-01, PS-02, PS-03, PS-04, PS-05, PS-06
 **Depends on:** Phase 17
-**Plans:** 2 plans
+**Plans:** 0/2 plans executed
 
 Plans:
 - [ ] 18-01-PLAN.md -- Paper sizes module, config field, data model, pipeline bridge, scanner geometry setting, and Pillow crop fallback with tests

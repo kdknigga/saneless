@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: unknown
-stopped_at: Phase 18 context gathered
-last_updated: "2026-03-24T03:14:41.829Z"
-last_activity: 2026-03-23
+status: Ready to execute
+stopped_at: Completed 18-01-PLAN.md
+last_updated: "2026-03-24T11:31:50.309Z"
+last_activity: 2026-03-24
 progress:
   total_phases: 18
   completed_phases: 17
-  total_plans: 39
+  total_plans: 41
   completed_plans: 39
 ---
 
@@ -20,12 +20,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 17 — fix-paperless-upload-error-datetime-format-and-title-type-mismatch-in-api-payload
+**Current focus:** Phase 18 — automatic-scanned-page-size-detection-or-user-specified-paper-size-to-avoid-capturing-the-full-scanner-bed
 
 ## Current Position
 
-Phase: 17
-Plan: Not started
+Phase: 18 (automatic-scanned-page-size-detection-or-user-specified-paper-size-to-avoid-capturing-the-full-scanner-bed) — EXECUTING
+Plan: 2 of 2
 
 ## Performance Metrics
 
@@ -85,6 +85,7 @@ Plan: Not started
 | Phase 16 P01 | 2min | 2 tasks | 6 files |
 | Phase 16 P02 | 2min | 2 tasks | 3 files |
 | Phase 17 P01 | 2min | 2 tasks | 3 files |
+| Phase 18 P01 | 10min | 2 tasks | 7 files |
 
 ## Accumulated Context
 
@@ -167,6 +168,9 @@ Recent decisions affecting current work:
 - [Phase 16]: Only write auto_source_mode to TOML when non-default (keep config clean)
 - [Phase 16]: Auto-only scanner defaults to adf mode for multi-page capability
 - [Phase 17]: Removed FileTypes import entirely; tags as list in data dict for httpx repeated field encoding
+- [Phase 18]: Inline Literal in ProfileConfig instead of PaperSize import to satisfy TC001 without noqa
+- [Phase 18]: Geometry attributes added to SaneDevice Protocol for type-safe access
+- [Phase 18]: Extracted _set_geometry/_maybe_crop helpers for PLR0912/PLR0915 compliance
 
 ### Roadmap Evolution
 
@@ -198,7 +202,7 @@ None yet.
 
 ## Session Continuity
 
-Last activity: 2026-03-23
-Last session: 2026-03-24T03:14:41.826Z
-Stopped at: Phase 18 context gathered
-Resume file: .planning/phases/18-automatic-scanned-page-size-detection-or-user-specified-paper-size-to-avoid-capturing-the-full-scanner-bed/18-CONTEXT.md
+Last activity: 2026-03-24
+Last session: 2026-03-24T11:31:50.306Z
+Stopped at: Completed 18-01-PLAN.md
+Resume file: None
