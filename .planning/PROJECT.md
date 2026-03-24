@@ -113,4 +113,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-23 after Phase 17 completion — fixed Paperless upload payload (date-only format, data/files split)*
+*Last updated: 2026-03-24 after Phase 18 completion — added paper_size config for constraining scan area to standard dimensions (A4, Letter, Legal, etc.) via SANE geometry + Pillow crop fallback*
