@@ -48,6 +48,7 @@ class ScanSettings:
     resolution: int
     mode: str
     auto_source_mode: str = "flatbed"
+    paper_size: str = "full"
 
 
 class ScannerBackend(ABC):

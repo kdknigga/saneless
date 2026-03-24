@@ -69,6 +69,7 @@ class ProfileConfig(BaseModel):
     resolution: int = DEFAULT_RESOLUTION
     mode: str = "color"
     auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
+    paper_size: Literal["full", "a3", "a4", "a5", "letter", "legal"] = "full"
     default_tags: list[int] = []
     default_correspondent: int | None = None
     default_title_template: str = Field(default="", alias="title")
