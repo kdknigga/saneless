@@ -24,6 +24,7 @@ import PIL.Image
 from PIL import Image, ImageStat
 
 from saneless.exceptions import FeederEmptyError, ScanError
+from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -88,6 +89,70 @@ def _as_image(obj: object) -> Image.Image:
         msg = f"Expected Image, got {type(obj)}"
         raise TypeError(msg)
     return obj
+
+
+def _set_geometry(dev: SaneDevice, paper_size: str) -> bool:
+    """
+    Set SANE geometry options for paper size constraint.
+
+    SANE devices expose geometry options (tl_x, tl_y, br_x, br_y) as
+    dynamic attributes.  Not all scanners support them, so assignment
+    failures are caught and cause a fallback to Pillow cropping.
+
+    Args:
+        dev: Open SANE device handle.
+        paper_size: Paper size key (e.g. ``"a4"``).
+
+    Returns:
+        True if geometry was set successfully, False otherwise.
+
+    """
+    if paper_size == "full":
+        return False
+    dims = PAPER_SIZES_MM.get(paper_size)
+    if dims is None:
+        return False
+    width_mm, height_mm = dims
+    try:
+        dev.tl_x = 0.0
+        dev.tl_y = 0.0
+        dev.br_x = width_mm
+        dev.br_y = height_mm
+    except Exception:
+        logger.warning(
+            "Scanner does not support geometry options, will crop after scanning",
+        )
+        return False
+    logger.info(
+        "Scan area set to %s: %.1f x %.1f mm",
+        paper_size,
+        width_mm,
+        height_mm,
+    )
+    return True
+
+
+def _maybe_crop(
+    image: Image.Image,
+    settings: ScanSettings,
+    *,
+    geometry_set: bool,
+) -> Image.Image:
+    """
+    Apply Pillow crop fallback when geometry options were not set.
+
+    Args:
+        image: Scanned page image.
+        settings: Scan settings with paper_size and resolution.
+        geometry_set: Whether SANE geometry was already applied.
+
+    Returns:
+        Cropped image, or original if no crop needed.
+
+    """
+    if settings.paper_size != "full" and not geometry_set:
+        return crop_to_paper_size(image, settings.paper_size, settings.resolution)
+    return image
 
 
 def _is_adf_source(source: str) -> bool:
@@ -157,6 +222,10 @@ class SaneDevice(Protocol):
     mode: str
     resolution: int
     source: str
+    tl_x: float
+    tl_y: float
+    br_x: float
+    br_y: float
 
     def get_options(self) -> list: ...
     def start(self) -> None: ...
@@ -421,6 +490,9 @@ class SaneBackend(ScannerBackend):
             if has_source_option:
                 dev.source = effective_source
 
+            # Set scan area geometry for paper size constraint (D-01)
+            geometry_set = _set_geometry(dev, settings.paper_size)
+
             use_adf = _is_adf_source(effective_source)
 
             # D-04: Override for "Auto" source using config-driven routing
@@ -434,7 +506,8 @@ class SaneBackend(ScannerBackend):
 
             if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
-                yield from self._scan_adf_pages(dev)
+                for page in self._scan_adf_pages(dev):
+                    yield _maybe_crop(page, settings, geometry_set=geometry_set)
             else:
                 # Flatbed: start() initiates the SANE data channel, then
                 # snap() drains it via sane_read() loop.  Without start()
@@ -443,4 +516,4 @@ class SaneBackend(ScannerBackend):
                 image = dev.snap()
                 # Strip EXIF from flatbed scans too
                 image.info.pop("exif", None)
-                yield image
+                yield _maybe_crop(image, settings, geometry_set=geometry_set)

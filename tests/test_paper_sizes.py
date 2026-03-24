@@ -102,7 +102,7 @@ class TestProfileConfigPaperSize:
     def test_invalid_raises_validation_error(self) -> None:
         """ProfileConfig(paper_size='invalid') raises ValidationError."""
         with pytest.raises(ValidationError):
-            ProfileConfig(paper_size="invalid")
+            ProfileConfig.model_validate({"paper_size": "invalid"})
 
 
 class TestScanSettingsPaperSize:
