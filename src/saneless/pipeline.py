@@ -344,6 +344,7 @@ def run_pipeline(
         resolution=profile.resolution,
         mode=profile.mode,
         auto_source_mode=profile.auto_source_mode,
+        paper_size=profile.paper_size,
     )
 
     # Ensure tmp_dir exists
