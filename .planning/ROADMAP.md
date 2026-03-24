@@ -304,3 +304,23 @@ Plans:
   4. `FileTypes` import is removed from paperless.py
   5. All existing tests pass with no regressions
   6. New test verifies form fields have no filename attribute (data= encoding) while PDF has filename attribute (files= encoding)
+
+### Phase 18: Automatic scanned page size detection or user-specified paper size to avoid capturing the full scanner bed
+
+**Goal:** Users can constrain the scan area to standard paper dimensions (A4, Letter, Legal, etc.) per profile via a `paper_size` setting, using SANE geometry options at the hardware level with a Pillow crop fallback when geometry is unavailable
+**Requirements**: PS-01, PS-02, PS-03, PS-04, PS-05, PS-06
+**Depends on:** Phase 17
+**Plans:** 2 plans
+
+Plans:
+- [ ] 18-01-PLAN.md -- Paper sizes module, config field, data model, pipeline bridge, scanner geometry setting, and Pillow crop fallback with tests
+- [ ] 18-02-PLAN.md -- Configuration docs update and auto-profile default verification
+
+**Success Criteria** (what must be TRUE):
+  1. `ProfileConfig(paper_size="a4")` validates successfully; invalid values are rejected by Literal type
+  2. Default `paper_size` is `"full"` -- existing behavior completely unchanged (zero-change upgrade path)
+  3. `scan_pages()` sets SANE `br_x`/`br_y`/`tl_x`/`tl_y` geometry options when `paper_size` is not `"full"`
+  4. When scanner geometry options are unavailable, scanned images are cropped with Pillow to target paper dimensions
+  5. `paper_size` flows from `ProfileConfig` through `ScanSettings` to `scan_pages()` following the established `auto_source_mode` pattern
+  6. Auto-generated profiles default to `paper_size = "full"` and do not write it to TOML
+  7. Configuration reference documentation lists `paper_size` field with all preset values
