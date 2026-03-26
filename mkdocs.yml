@@ -37,8 +37,10 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - Tutorials:
-    - Scan Your First Document: tutorials/scan-your-first-document.md
+  - Getting Started:
+    - Quick Start: getting-started/quick-start.md
+    - First CLI Scan: getting-started/first-cli-scan.md
+    - First Web UI Scan: getting-started/first-web-ui-scan.md
   - How-To Guides:
     - Install on Bare Metal: how-to/install-bare-metal.md
     - Deploy with Docker Compose: how-to/deploy-docker-compose.md
