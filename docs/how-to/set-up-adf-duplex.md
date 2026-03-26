@@ -68,6 +68,11 @@ saneless scan --profile manual-duplex --title "Double-sided doc"
 
 In the CLI, saneless prompts you to flip the pages between passes. In the web UI, a flip prompt with Continue and Cancel buttons appears automatically.
 
+!!! info "Auto source scanners"
+    If your scanner reports only an `Auto` source instead of `ADF` or `ADF Duplex`, you can
+    route it to multi-page ADF behavior by setting `auto_source_mode = "adf"` in your profile.
+    See [Configure Scan Profiles](configure-scan-profiles.md#auto-source) for details.
+
 ## Empty page detection
 
 When scanning duplex documents, blank back sides are common. saneless detects and removes empty pages by default using luminance analysis. This is controlled per profile:
