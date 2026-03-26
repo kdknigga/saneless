@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: Milestone complete
-stopped_at: Phase 19 context gathered
-last_updated: "2026-03-26T13:12:08.644Z"
-last_activity: 2026-03-24
+stopped_at: Completed 19-02-PLAN.md
+last_updated: "2026-03-26T13:43:57.696Z"
+last_activity: 2026-03-26
 progress:
   total_phases: 19
-  completed_phases: 18
-  total_plans: 41
-  completed_plans: 41
+  completed_phases: 19
+  total_plans: 43
+  completed_plans: 43
 ---
 
 # Project State
@@ -20,11 +20,11 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 18 — automatic-scanned-page-size-detection-or-user-specified-paper-size-to-avoid-capturing-the-full-scanner-bed
+**Current focus:** Phase 19 — write-user-facing-docs-including-a-full-getting-started-section-that-walks-a-new-user-through-setup-and-first-scan-using-the-di-taxis-model
 
 ## Current Position
 
-Phase: 18
+Phase: 19
 Plan: Not started
 
 ## Performance Metrics
@@ -87,6 +87,8 @@ Plan: Not started
 | Phase 17 P01 | 2min | 2 tasks | 3 files |
 | Phase 18 P01 | 10min | 2 tasks | 7 files |
 | Phase 18 P02 | 1min | 1 tasks | 2 files |
+| Phase 19 P01 | 2min | 2 tasks | 3 files |
+| Phase 19 P02 | 1min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -173,6 +175,8 @@ Recent decisions affecting current work:
 - [Phase 18]: Geometry attributes added to SaneDevice Protocol for type-safe access
 - [Phase 18]: Extracted _set_geometry/_maybe_crop helpers for PLR0912/PLR0915 compliance
 - [Phase 18]: paper_size placed after auto_source_mode in profiles table for logical grouping
+- [Phase 19]: Docker tab first in Quick Start per D-03; pipx over pip for bare metal; no screenshots per D-08
+- [Phase 19]: Getting Started placed first after Home in nav per D-01; old Tutorials removed per D-04
 
 ### Roadmap Evolution
 
@@ -205,7 +209,7 @@ None yet.
 
 ## Session Continuity
 
-Last activity: 2026-03-24
-Last session: 2026-03-26T13:12:08.641Z
-Stopped at: Phase 19 context gathered
-Resume file: .planning/phases/19-write-user-facing-docs-including-a-full-getting-started-section-that-walks-a-new-user-through-setup-and-first-scan-using-the-di-taxis-model/19-CONTEXT.md
+Last activity: 2026-03-26
+Last session: 2026-03-26T13:39:34.358Z
+Stopped at: Completed 19-02-PLAN.md
+Resume file: None

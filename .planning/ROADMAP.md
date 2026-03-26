@@ -330,10 +330,10 @@ Plans:
 **Goal:** Add a Getting Started top-level section (Quick Start, First CLI Scan, First Web UI Scan) to the docs site and weave auto_source_mode and paper_size documentation into existing how-to guides
 **Requirements**: DOC-GS-01, DOC-GS-02, DOC-GS-03, DOC-GS-04, DOC-FW-01, DOC-FW-02
 **Depends on:** Phase 18
-**Plans:** 2 plans
+**Plans:** 2/2 plans complete
 
 Plans:
-- [ ] 19-01-PLAN.md -- Getting Started pages: Quick Start (Docker-first), First Web UI Scan, First CLI Scan (relocated + refreshed tutorial)
+- [x] 19-01-PLAN.md -- Getting Started pages: Quick Start (Docker-first), First Web UI Scan, First CLI Scan (relocated + refreshed tutorial)
 - [ ] 19-02-PLAN.md -- Feature weaving (auto_source_mode, paper_size into how-to guides), nav update, landing page, old tutorial cleanup, build validation
 
 **Success Criteria** (what must be TRUE):
