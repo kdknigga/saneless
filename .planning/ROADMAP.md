@@ -324,3 +324,24 @@ Plans:
   5. `paper_size` flows from `ProfileConfig` through `ScanSettings` to `scan_pages()` following the established `auto_source_mode` pattern
   6. Auto-generated profiles default to `paper_size = "full"` and do not write it to TOML
   7. Configuration reference documentation lists `paper_size` field with all preset values
+
+### Phase 19: Write user-facing docs including a full getting started section that walks a new user through setup and first scan using the Diataxis model
+
+**Goal:** Add a Getting Started top-level section (Quick Start, First CLI Scan, First Web UI Scan) to the docs site and weave auto_source_mode and paper_size documentation into existing how-to guides
+**Requirements**: DOC-GS-01, DOC-GS-02, DOC-GS-03, DOC-GS-04, DOC-FW-01, DOC-FW-02
+**Depends on:** Phase 18
+**Plans:** 2 plans
+
+Plans:
+- [ ] 19-01-PLAN.md -- Getting Started pages: Quick Start (Docker-first), First Web UI Scan, First CLI Scan (relocated + refreshed tutorial)
+- [ ] 19-02-PLAN.md -- Feature weaving (auto_source_mode, paper_size into how-to guides), nav update, landing page, old tutorial cleanup, build validation
+
+**Success Criteria** (what must be TRUE):
+  1. `uv run mkdocs build --strict` exits 0 with no warnings or broken links
+  2. Getting Started is the first nav section after Home, with Quick Start, First CLI Scan, and First Web UI Scan pages
+  3. Quick Start prioritizes Docker + Web UI path with bare metal as tab alternative
+  4. First CLI Scan references Python 3.14 and pipx (not 3.12 or pip)
+  5. auto_source_mode documented in Configure Scan Profiles and Set Up ADF Duplex how-to guides
+  6. paper_size documented in Configure Scan Profiles how-to guide
+  7. Tutorials nav section removed; old tutorial file deleted
+  8. No screenshots in any documentation page
