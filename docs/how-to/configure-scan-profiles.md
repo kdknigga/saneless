@@ -62,6 +62,8 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | `enable_empty_page_detection` | bool | `true` | Remove blank pages from scans |
 | `empty_page_mean_threshold` | float | `250.0` | Mean luminance threshold for blank detection (higher = stricter) |
 | `empty_page_stddev_threshold` | float | `5.0` | Standard deviation threshold for blank detection |
+| `auto_source_mode` | string | `"flatbed"` | When source is `"Auto"`: `"flatbed"` for single-page or `"adf"` for multi-page feeder |
+| `paper_size` | string | `"full"` | Constrain scan area: `"full"`, `"a3"`, `"a4"`, `"a5"`, `"letter"`, `"legal"` |
 | `auto_generated` | bool | `false` | Set by `auto-profiles`; marks machine-generated profiles |
 
 ## Source values
@@ -73,6 +75,47 @@ The `source` field determines how pages are fed to the scanner:
 - **`"ADF Duplex"`** -- Hardware duplex via ADF. The scanner scans both sides of each page automatically (requires hardware support).
 
 For manual two-pass duplex scanning, see [Set Up ADF Duplex Scanning](set-up-adf-duplex.md).
+
+## Auto source
+
+Some scanners expose only an `Auto` source instead of separate `Flatbed` and `ADF` entries.
+When you set `source = "Auto"`, saneless needs to know whether to treat it as a single-page
+flatbed scan or a multi-page ADF scan. The `auto_source_mode` field controls this:
+
+| `auto_source_mode` | Behavior |
+|---|---|
+| `"flatbed"` (default) | Single page, like Flatbed |
+| `"adf"` | Multi-page feeder, like ADF |
+
+```toml
+[profiles.auto-scan]
+source = "Auto"
+auto_source_mode = "adf"
+resolution = 300
+mode = "Color"
+```
+
+See [Configuration reference](../reference/configuration.md) for all profile fields.
+
+## Paper size
+
+By default, saneless scans the entire scanner bed. If your documents are a standard size,
+set `paper_size` to crop the scan area automatically:
+
+```toml
+[profiles.letters]
+source = "ADF"
+resolution = 300
+mode = "Color"
+paper_size = "letter"
+```
+
+Available presets: `full` (default -- entire bed), `a3`, `a4`, `a5`, `letter`, `legal`.
+
+When your scanner supports SANE geometry options, saneless sets the scan area at the hardware
+level. Otherwise, it crops the image after scanning.
+
+See [Configuration reference](../reference/configuration.md) for all profile fields.
 
 ## Auto-generated profiles
 
