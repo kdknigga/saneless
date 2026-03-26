@@ -3,11 +3,11 @@ gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
 status: Milestone complete
-stopped_at: Completed 18-02-PLAN.md
-last_updated: "2026-03-24T11:41:43.084Z"
+stopped_at: Phase 19 context gathered
+last_updated: "2026-03-26T13:12:08.644Z"
 last_activity: 2026-03-24
 progress:
-  total_phases: 18
+  total_phases: 19
   completed_phases: 18
   total_plans: 41
   completed_plans: 41
@@ -186,6 +186,7 @@ Recent decisions affecting current work:
 - Phase 16 added: When a scanner advertised auto mode, it should be configurable by the user if that means flatbed mode or ADF mode
 - Phase 17 added: Fix Paperless upload error: datetime format and title type mismatch in API payload
 - Phase 18 added: Automatic scanned page size detection or user-specified paper size to avoid capturing the full scanner bed
+- Phase 19 added: Write user-facing docs including a full getting started section that walks a new user through setup and first scan using the Diátaxis model
 
 ### Pending Todos
 
@@ -205,6 +206,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-03-24
-Last session: 2026-03-24T11:36:32.339Z
-Stopped at: Completed 18-02-PLAN.md
-Resume file: None
+Last session: 2026-03-26T13:12:08.641Z
+Stopped at: Phase 19 context gathered
+Resume file: .planning/phases/19-write-user-facing-docs-including-a-full-getting-started-section-that-walks-a-new-user-through-setup-and-first-scan-using-the-di-taxis-model/19-CONTEXT.md
