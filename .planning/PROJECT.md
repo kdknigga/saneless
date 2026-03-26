@@ -62,6 +62,9 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ 5 reference pages (CLI, config, env vars, web API, Docker) — Phase 15
 - ✓ 3 explanation pages (architecture, empty-page detection, consume-dir fallback) — Phase 15
 - ✓ README documentation section with docs site link — Phase 15
+- ✓ Getting Started section (Quick Start, First CLI Scan, First Web UI Scan) as top-level nav — Phase 19
+- ✓ auto_source_mode and paper_size woven into how-to guides — Phase 19
+- ✓ Tutorial relocated from tutorials/ to getting-started/, refreshed for Python 3.14 — Phase 19
 
 ### Active
 
@@ -113,4 +116,4 @@ None — all v1 requirements validated.
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
 ---
-*Last updated: 2026-03-24 after Phase 18 completion — added paper_size config for constraining scan area to standard dimensions (A4, Letter, Legal, etc.) via SANE geometry + Pillow crop fallback*
+*Last updated: 2026-03-26 after Phase 19 completion — added Getting Started section (Quick Start, First CLI Scan, First Web UI Scan) and wove auto_source_mode/paper_size into how-to guides*
