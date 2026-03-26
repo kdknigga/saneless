@@ -4,11 +4,13 @@ SANE scanner to paperless-ngx bridge. Web UI and CLI for triggering scans, assem
 
 ---
 
-## Tutorials
+## Getting Started
 
-**New to saneless? Start here.** These tutorials walk you through the basics from installation to your first successful scan.
+**New to saneless? Start here.** Get from installation to your first scan in minutes.
 
-- [Scan Your First Document](tutorials/scan-your-first-document.md) -- Install saneless, configure your scanner and paperless-ngx, scan a document, and verify it arrived.
+- [Quick Start](getting-started/quick-start.md) -- Five-minute path from install to your first document in paperless-ngx.
+- [First CLI Scan](getting-started/first-cli-scan.md) -- Step-by-step CLI tutorial: install, configure, scan, verify.
+- [First Web UI Scan](getting-started/first-web-ui-scan.md) -- Walk through the web interface to scan a document.
 
 ## How-To Guides
 
