@@ -310,3 +310,5 @@ $RECYCLE.BIN/
 .playwright-mcp/
 
 saneless.toml
+
+.claude/worktrees/
