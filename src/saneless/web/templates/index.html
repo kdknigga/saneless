@@ -19,7 +19,7 @@
         <input type="text" name="title" id="title-input"
                placeholder="Document title (auto-generated if empty)">
 
-        <label>
+        <label for="tags-select">
             Tags
             <button type="button"
                     hx-post="/api/cache/invalidate?resource=tags"
@@ -36,7 +36,7 @@
             {% endfor %}
         </select>
 
-        <label>
+        <label for="correspondent-select">
             Correspondent
             <button type="button"
                     hx-post="/api/cache/invalidate?resource=correspondents"
@@ -55,8 +55,8 @@
         </select>
 
         <button type="submit" id="scan-btn"
-                {% if job and job.state.value in ["PENDING", "SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}disabled aria-busy="true"{% endif %}>
-            {% if job and job.state.value in ["PENDING", "SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}Scanning...{% else %}Scan{% endif %}
+                {% if job and job.state.value in ["PENDING", "SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}disabled{% if job.state.value != "AWAITING_FLIP" %} aria-busy="true"{% endif %}{% endif %}>
+            {% if job and job.state.value == "AWAITING_FLIP" %}Waiting for flip&#8230;{% elif job and job.state.value in ["PENDING", "SCANNING", "ASSEMBLING", "UPLOADING"] %}Scanning&#8230;{% else %}Scan{% endif %}
         </button>
     </form>
 </article>

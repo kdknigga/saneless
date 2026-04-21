@@ -18,10 +18,10 @@
       <p aria-busy="true">Uploading to paperless-ngx...</p>
     {% elif job.state.value == "DONE" %}
       <p class="status-done">&#10003; Done: {{ job.title }}</p>
-      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" style="display:none"></div>
+      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
     {% elif job.state.value == "ERROR" %}
       <p role="alert" class="status-error">&#10007; Error: {{ job.error }}</p>
-      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" style="display:none"></div>
+      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
     {% endif %}
     {% if job.thumbnail %}
       <img src="data:image/jpeg;base64,{{ job.thumbnail }}" alt="First page preview" class="thumbnail">

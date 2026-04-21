@@ -45,7 +45,6 @@
     width: auto;
     padding: 0.25rem 0.5rem;
     margin-left: 0.5rem;
-    font-size: 0.9rem;
     border: none;
     background: transparent;
     cursor: pointer;
@@ -75,7 +74,7 @@ article > .history-table-wrap {
     }
 
     #history-body td {
-        font-size: 0.85rem;
+        font-size: 0.875rem;
         white-space: normal;
         word-break: break-word;
     }
@@ -84,6 +83,11 @@ article > .history-table-wrap {
         table-layout: fixed;
         width: 100%;
     }
+}
+
+/* htmx trigger elements that should not be visible */
+.htmx-hidden {
+    display: none;
 }
 
 /* Screen reader only -- visually hidden but accessible */
