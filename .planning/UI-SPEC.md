@@ -82,8 +82,6 @@ Pico base spacing tokens inherited (not overridden): `--pico-spacing` ≈ 1rem (
 | `.thumbnail` max-width | 200px | First-page preview; becomes `100%` on viewport ≤ 576px |
 | `.thumbnail` max-height | 300px | First-page preview |
 | `.flip-illustration svg` width | 120px | Duplex flip diagrams |
-| Mobile history font-size | 0.85rem (13.6px) | Applied below 576px |
-| `.refresh-btn` font-size | 0.9rem (14.4px) | Inline refresh control |
 
 Exceptions:
 - Screen-reader `.sr-only` uses `1px`/`-1px` sizes per the standard visually-hidden pattern. This is a11y technique, not layout spacing.
@@ -93,7 +91,7 @@ Exceptions:
 
 | Breakpoint | Trigger | Behavior |
 |------------|---------|----------|
-| ≤ 576px | `@media (max-width: 576px)` | Flip illustration stacks vertically; thumbnail fills width; history table switches to fixed layout, 0.85rem font, word-break wrapping |
+| ≤ 576px | `@media (max-width: 576px)` | Flip illustration stacks vertically; thumbnail fills width; history table switches to fixed layout, reduced font, word-break wrapping |
 
 One breakpoint only. PicoCSS default breakpoints govern container widths and are not overridden.
 
@@ -101,20 +99,27 @@ One breakpoint only. PicoCSS default breakpoints govern container widths and are
 
 ## Typography
 
-All typography inherits from PicoCSS v2. saneless overrides only two font sizes.
+All typography inherits from PicoCSS v2. The type scale is constrained to four tiers.
 
 | Role | Size | Weight | Line Height | Source |
 |------|------|--------|-------------|--------|
-| Body (paragraphs, form labels, options) | Pico default `1rem` (16px) | 400 | Pico default ~1.5 | Pico |
 | Heading 1 (`<h1>saneless</h1>`) | Pico `--pico-font-size-h1` | 700 | Pico default ~1.125 | Pico (`base.html`) |
 | Heading 2 (`<h2>Scan</h2>`, `<h2>Job History</h2>`) | Pico `--pico-font-size-h2` | 700 | Pico default ~1.125 | Pico (`index.html`) |
-| Small/meta (flip caption text) | Pico `<small>` ≈ 0.875rem (14px) | 400 | inherited | Pico (`flip.html`) |
-| Refresh button | 0.9rem (14.4px) | inherit | inherit | `app.css:.refresh-btn` |
-| Mobile history cells | 0.85rem (13.6px) below 576px | inherit | inherit | `app.css @media` |
+| Body | `1rem` (16px) | 400 | Pico default ~1.5 | Pico — paragraphs, form labels, select options, refresh button, mobile history cells |
+| Small | `0.875rem` (14px) | 400 | inherited | Pico `<small>` default — flip caption metadata, secondary/meta text |
 
 Font stack (Pico default): `system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, Cantarell, Noto Sans, sans-serif`. No custom fonts loaded.
 
 Two weights effectively in use: **400 (regular body/labels)** and **700 (headings, Pico default)**.
+
+### Implementation notes (non-scale overrides)
+
+The project's CSS contains two legacy per-element font-size overrides that are **not** distinct type scale tiers — they are micro-adjustments within the Body tier and should be treated as such by the checker and implementers:
+
+- `.refresh-btn { font-size: 0.9rem }` (14.4px) — collapses into the **Body** tier. Recommended: remove this override and inherit `1rem` so the refresh control matches its sibling label copy.
+- `@media (max-width: 576px) .history-table td/th { font-size: 0.85rem }` (13.6px) — collapses into the **Body** tier. Recommended: either remove the override (let the table shrink via `table-layout: fixed` + word-break alone) or promote to the **Small** tier at `0.875rem` for consistency with `<small>`.
+
+Neither override constitutes a new type scale entry. Future phases should normalize these to one of the four declared tiers.
 
 ---
 
@@ -245,6 +250,13 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 - No exclamation marks, no emoji, no brand voice adjectives.
 - Placeholders describe behavior, not hints ("auto-generated if empty").
 
+### Deliberate design decisions
+
+The following patterns would flag on generic copywriting heuristics but are **intentional** product decisions for saneless. They are documented here so downstream checkers, auditors, and future contributors do not "fix" them as defects:
+
+- **Primary CTA is a single word — `Scan`.** saneless has one purpose: scan a document and upload it to paperless-ngx. A verb-noun CTA (`Scan document`, `Start scan`) would add noise without disambiguating anything. The single-word form is retained deliberately.
+- **`Abort scan` has no confirmation dialog.** Scan sessions are time-sensitive (paper is in the feeder, user is standing at the hardware). An immediate abort matches the physical workflow — a modal would interrupt the user's focus at exactly the wrong moment. Data loss is bounded: aborting only discards the in-flight scan, not any completed job or uploaded document. Instant-action was chosen over confirm-then-act on purpose.
+
 ### Known copy inconsistencies (candidates for future normalization)
 
 1. Correspondent "none" option reads `No correspondent` in the initial index render but `-- None --` after htmx hydration. Recommend picking one.
@@ -278,7 +290,7 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 
 - Native `<form>` submit via htmx; no client-side validation.
 - Multi-select (`<select multiple>`) uses native browser UI — no custom token picker.
-- No confirmation dialogs anywhere.
+- No confirmation dialogs anywhere (see "Deliberate design decisions" above for the Abort rationale).
 - Only state mutation the user can perform mid-job is Continue / Abort during `AWAITING_FLIP`.
 
 ### Polling / transport
@@ -311,7 +323,7 @@ Not currently present (documented for checker awareness, not necessarily gaps):
 - No skip-link (single-page form, no repeating nav)
 - No focus-visible overrides (relies on Pico defaults)
 - No prefers-reduced-motion overrides (no project animations; htmx spinner is Pico-provided)
-- No destructive-action confirmation dialog — Abort scan is one click
+- No destructive-action confirmation dialog — Abort scan is one click (intentional; see Copywriting)
 - No toast system — all feedback lives in `#status-area`
 
 ---
