@@ -207,10 +207,11 @@ None yet.
 |---|-------------|------|--------|-----------|
 | 260320-j26 | Fix all linter and type checker failures in pre-commit | 2026-03-20 | bb774c7 | [260320-j26-fix-linter-and-type-checker-failures-in-](./quick/260320-j26-fix-linter-and-type-checker-failures-in-/) |
 | 260420-bkr | Commit outstanding changes (gitignore, debug notes, phase scaffolds 16-19) | 2026-04-20 | 226426c | [260420-bkr-commit-outstanding-changes](./quick/260420-bkr-commit-outstanding-changes/) |
+| 260424-wtc | Remove orphaned agent worktrees | 2026-04-24 | 8686793 | [260424-wtc-remove-orphaned-agent-worktrees](./quick/260424-wtc-remove-orphaned-agent-worktrees/) |
 
 ## Session Continuity
 
-Last activity: 2026-04-20 - Completed quick task 260420-bkr: commit outstanding changes
+Last activity: 2026-04-24 - Completed quick task 260424-wtc: Remove orphaned agent worktrees
 Last session: 2026-03-26T13:39:34.358Z
 Stopped at: Completed 19-02-PLAN.md
 Resume file: None
