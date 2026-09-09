@@ -890,32 +890,44 @@ Note: the repo currently has `sha_pinning_required: false` in its Actions settin
 
 ---
 
-## Open Questions
+## Open Questions (ALL RESOLVED)
 
-### 1. The repository has never been pushed — what becomes `master`? **(BLOCKING — needs the user)**
+> Resolved 2026-09-09 during planning. Each answer is threaded into CONTEXT.md and/or a specific plan task; the original analysis is kept below for traceability.
+
+### 1. The repository has never been pushed — what becomes `master`? **(RESOLVED → D-20..D-25)**
+
+> **RESOLVED:** option (b). Push `autodev`'s work and open a PR into `master` — **which the user merges, never Claude (D-21)**. Additionally: `.planning/` is stripped via `uvx git-filter-repo` (D-22, D-25), and the repo is switched to private before the first push (D-23). Implemented by Plans 20-02 and 20-03.
 
 - **What we know:** `github.com/kdknigga/scanless` is empty (zero refs, `409 Git Repository is empty`). Locally, `master` = 1 commit ("Initial commit"), `autodev` = 334 commits and holds all real work, `development` = 1 commit, plus two `worktree-agent-*` branches. No branch has an upstream. `[VERIFIED]`
 - **What's unclear:** the branch-reconciliation strategy. Options include: (a) fast-forward/reset local `master` to `autodev` and push `master` as the single published branch; (b) push `autodev` first, open a PR into `master`, and let the CI gate itself validate the merge (elegant, but requires `master` to exist remotely first and requires `ci.yml` to be on `autodev`); (c) push all branches and keep working on `autodev` with PRs into `master`. `.planning/config.json` has `git.branching_strategy: "none"` and `use_worktrees: true`, which does not settle it.
 - **Recommendation:** put this to the user before planning finalises. It changes the task sequence materially, and it interacts with Pitfall 2 (once the ruleset is active, direct pushes to `master` are rejected — including the very push that would publish the work).
 - **Hard ordering constraint regardless of choice:** publish → `ci.yml` on a branch → green run → read back check names → create ruleset. The ruleset must be last.
 
-### 2. Should the ruleset also add a `pull_request` rule?
+### 2. Should the ruleset also add a `pull_request` rule? **(RESOLVED — no)**
+
+> **RESOLVED:** do not add it; the `required_status_checks` rule already achieves D-03. Plan 20-04 Task 1 explicitly excludes it and surfaces it at the Task 3 checkpoint for the user to revisit.
 
 - **What we know:** `required_status_checks` already blocks direct pushes as a side effect ("commits must first be pushed to another ref where the checks pass"). A separate `pull_request` rule would make the PR requirement explicit and enable review/thread settings. All five of its parameters are required.
 - **What's unclear:** CONTEXT.md D-03 says only "a red run blocks merge"; a PR requirement is adjacent but not decided.
 - **Recommendation:** default to **not** adding it (the status-check rule already achieves D-03's stated goal with fewer moving parts), and surface it to the user as a one-line question.
 
-### 3. `strict_required_status_checks_policy` — `true` or `false`?
+### 3. `strict_required_status_checks_policy` — `true` or `false`? **(RESOLVED — false)**
+
+> **RESOLVED:** `false`, per the recommendation below. Set explicitly in Plan 20-04 Task 1's POST body.
 
 - **What we know:** `true` means "topic branch must be up to date with base before merging"; it is the GitHub UI default but must be sent explicitly via the API.
 - **Recommendation:** `false` for a single-maintainer repo — `true` forces a rebase-and-rerun every time `master` moves. Cheap to flip later via `PUT`.
 
-### 4. Should `bypass_actors` include the repository-admin role?
+### 4. Should `bypass_actors` include the repository-admin role? **(RESOLVED — `[]`, user-confirmed)**
+
+> **RESOLVED:** `[]` by default, but the consequence is disclosed to the user at Plan 20-02's blocking checkpoint and echoed again immediately before the write in Plan 20-04 Task 1. The executor may not decide it unilaterally in either direction.
 
 - **What we know:** repo admins are **not** exempt by default. With `bypass_actors: []`, the maintainer must use PRs for all future `master` changes.
 - **Recommendation:** `[]` (no bypass) — it matches D-04's "`--no-verify` no longer bypasses the gate" spirit. But it is a real workflow change and belongs in `CONTRIBUTING.md`, and the user should be told rather than surprised.
 
-### 5. Do the three `# type: ignore[...]` sites get real fixes or `# ty: ignore[...]`?
+### 5. Do the three `# type: ignore[...]` sites get real fixes or `# ty: ignore[...]`? **(RESOLVED — real fixes)**
+
+> **RESOLVED:** real fixes, per CLAUDE.md's no-suppressions rule (D-16). PATTERNS.md found an in-repo precedent for each site, so no suppression swap is needed. Implemented by Plan 20-05.
 
 - **What we know:** CLAUDE.md forbids suppressions; the three existing ones already violate that rule; the exact sites and ty rule names are known (Pitfall 8). pyrefly is clean at 1.2.0, so there is no cross-checker conflict to navigate.
 - **Recommendation:** real fixes, and treat removing the three suppressions as a small bonus win of D-16. If a real fix proves infeasible at `src/saneless/config.py:168` (pydantic-settings' dynamic `__init__` kwargs are genuinely hard to type), raise it rather than silently converting the syntax.
