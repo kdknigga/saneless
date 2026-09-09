@@ -14,6 +14,8 @@ Requirements: **CI-01**, **TEST-07**.
 
 **Out of scope:** the CI-02 naming grep guard (Phase 31), any change to `release.yml` or `docs.yml` (Phase 31, M-26/N-31), a browser-test job (Phase 26, alongside htmx/PicoCSS vendoring and the C-10 regression test).
 
+**Also in scope, forced by an empty remote (see D-20..D-24):** switching the repo to private, the first push, a filtered (`.planning/`-stripped) branch, and an unmerged pull request. **Merging that PR is out of scope permanently — see D-21.**
+
 </domain>
 
 <decisions>
@@ -57,6 +59,18 @@ Requirements: **CI-01**, **TEST-07**.
 - **D-17:** **Sequence: CI first, proven green on the locked versions, then the bump as a separate commit.** All four checks pass clean at `ty` 0.0.24 / `pyrefly` 0.57.1 / `ruff` 0.15.7 today (verified during discussion), so the workflow's first run is green and the gate is proven working before anything else moves. A red run after the bump then unambiguously implicates the bump rather than the workflow. Do not collapse these into one commit.
 - **D-18:** SHA-pin the actions **`ci.yml` introduces**, each with a `# vX.Y.Z` trailing comment, and add **`.github/dependabot.yml`** with the `github-actions` ecosystem **in the same commit** — pinning without Dependabot freezes the pins forever, including the security fixes pinning exists to control (research Pitfall 19).
 - **D-19:** `release.yml` and `docs.yml` pinning, and `zizmor`, are **Phase 31's**. `zizmor` was specifically declined as a CI step here: it would add a sixth check to a gate CI-01 defines as five, and a finding against Phase 31's known-broken `release.yml` would redden CI over a file this phase deliberately does not own.
+
+### Repository publication (added 2026-09-09 after research surfaced an empty remote)
+
+Research found — and I independently confirmed — that `github.com/kdknigga/scanless` **has never been pushed to**: `git ls-remote origin` returns no refs at all. Locally `master` is a single root commit (`a87b3dd`, no `.planning/` in its tree) and `autodev` holds 335 commits, 334 ahead of `master` and 0 behind. No branch has an upstream. Phase 20's success criteria are unreachable until this is resolved, so the following were decided with the user:
+
+- **D-20:** Push `autodev`'s work and **open a pull request into `master`**. The gate's first run therefore happens on a real PR, which is what success criteria 1 and 2 describe ("visible on the pull request").
+- **D-21: DO NOT MERGE THE PULL REQUEST.** The user does all merging, without exception. No plan task, no executor step, and no subagent may run `gh pr merge` or `git merge` into `master`. The phase's terminal state is "PR open and green (or red, for the seeded break), handed to the user." If a plan draft contains a merge step, it is wrong and must be removed. This is a standing user rule, not a phase-local preference.
+- **D-22:** **`.planning/` is stripped from everything pushed.** The planning trail — roadmaps, the 2026-09-09 code review, research, discussion logs, debug write-ups — stays local. Use `/gsd-pr-branch`, which exists precisely to build a clean branch filtering out `.planning/` commits. Consequence the plan must account for: pushed history is rewritten and permanently diverges from local history, so every later push needs the same filtering. `master`'s root commit contains no `.planning/` and so survives filtering unchanged.
+- **D-23:** **The repository is switched to private before the first push.** It is currently PUBLIC and empty (verified: `gh repo view` → `"visibility":"PUBLIC"`). Making it private must be the *first* outward-facing action in the phase — after a push it is too late. CI, rulesets, and Actions all work on private repos. GHCR/PyPI publishing visibility is Phase 31's problem, not this phase's.
+- **D-24:** No secrets are published by this. Verified before deciding: `saneless.toml` is gitignored (`.gitignore:312`) and untracked, no token- or key-shaped strings exist in any tracked file, `site/` is not committed. `.planning/debug/paperless-token-test.md` discusses a token-validation *bug* and contains no credential — and is stripped by D-22 regardless.
+
+**Ordering these impose on the plan:** repo→private → push `master` → build filtered branch from `autodev` → push it → open PR (do not merge) → CI runs on the PR → read check names back from the run → apply the ruleset → seeded-break PR → then the D-16 bump. Note that `ci.yml` must be committed *before* the filtered branch is built, or there is no workflow on the PR head for `pull_request` to trigger.
 
 ### Claude's Discretion
 
