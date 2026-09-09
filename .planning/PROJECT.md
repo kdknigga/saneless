@@ -8,6 +8,25 @@ saneless is an open-source tool that bridges SANE-compatible network scanners (e
 
 A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata — without touching any other tool.
 
+## Current Milestone: v2.0 Prep for release
+
+**Goal:** Resolve every finding in the 2026-09-09 comprehensive code review (`.planning/reviews/2026-09-09-code-review.md`) so saneless ships as a trustworthy, appliance-grade release under its real name (`kdknigga/scanless`).
+
+**Target features:**
+- Honest outcomes: typed pipeline results, `FALLBACK` job state, scans never deleted on upload failure, unique PDF names (C-03, C-04, C-05, M-22)
+- Working manual duplex: `duplex` profile field, CLI flip prompt, flip timeout, visible reverse-pass state (C-01, C-02, M-02, M-07)
+- Truthful scanner layer: one source classifier, real error messages, geometry/DPI correctness, fakes that model real python-sane (C-06, M-11..M-16, M-32)
+- Robust worker and web layer: locked job store, unkillable worker with 429 backpressure, sync routes, crash recovery, server-owned Scan button, single state enum (C-07, C-09, C-10, M-01, M-03, M-05)
+- Strict configuration: forbid unknown keys, refuse missing `--config`, XDG/`~` expansion, validated log level, default profile always emitted, atomic merged writes, `SecretStr` (C-08, M-04, M-09, M-10, M-18..M-21, M-24)
+- Exception translation at every module boundary (M-17, N-06, N-08)
+- Delivery: CI on every push, fixed release workflow, `kdknigga/scanless` naming everywhere, container logging/port/mount fixes, `.dockerignore` (M-25..M-31)
+- Geometry, memory, timeouts: DPI in PDFs, spool pages to disk, safe cancel, flatbed timeout (M-06, M-08, M-12, M-13)
+- Hermetic, fast, meaningful test suite (M-33, M-34, N-18, N-24, N-40)
+- Full minor/nit sweep of N-01..N-45
+- Appliance layer: status strip + `saneless doctor`, page counts, plain-language errors, human profile labels generated at startup, one place for the token, queue visibility and owner-only flip prompt, help text and phone-friendly tag picker, trust-model and "which setup do I have" docs (U-01..U-10)
+
+**Key context:** Phases continue from 20. Review section 10 gives an ordered remediation plan (steps 1-11) that the roadmap follows, since each step's tests protect the next. The ten CRITICAL fixes are prerequisites for the appliance layer. No git tags.
+
 ## Requirements
 
 ### Validated
@@ -68,7 +87,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 
 ### Active
 
-None — all v1 requirements validated.
+v2.0 requirements are defined in `.planning/REQUIREMENTS.md` (derived from the 2026-09-09 code review: 10 CRITICAL, 34 MAJOR, 45 MINOR/NIT, 10 USABILITY findings).
 
 ### Out of Scope
 
@@ -115,5 +134,22 @@ None — all v1 requirements validated.
 | Two-stage Dockerfile with uv_build | Lean OCI image — build stage creates wheel, runtime has only libsane + curl | ✓ Good |
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
 
+## Evolution
+
+This document evolves at phase transitions and milestone boundaries.
+
+**After each phase transition** (via `/gsd-transition`):
+1. Requirements invalidated? → Move to Out of Scope with reason
+2. Requirements validated? → Move to Validated with phase reference
+3. New requirements emerged? → Add to Active
+4. Decisions to log? → Add to Key Decisions
+5. "What This Is" still accurate? → Update if drifted
+
+**After each milestone** (via `/gsd-complete-milestone`):
+1. Full review of all sections
+2. Core Value check — still the right priority?
+3. Audit Out of Scope — reasons still valid?
+4. Update Context with current state
+
 ---
-*Last updated: 2026-03-26 after Phase 19 completion — added Getting Started section (Quick Start, First CLI Scan, First Web UI Scan) and wove auto_source_mode/paper_size into how-to guides*
+*Last updated: 2026-09-09 — started milestone v2.0 Prep for release, driven by the 2026-09-09 comprehensive code review*
