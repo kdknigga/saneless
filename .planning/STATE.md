@@ -3,14 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Prep for release
 status: planning
-last_updated: "2026-09-09T19:20:12.699Z"
+last_updated: "2026-09-09T20:05:00.000Z"
 last_activity: 2026-09-09
 progress:
-  total_phases: 0
+  total_phases: 13
   completed_phases: 0
   total_plans: 0
   completed_plans: 0
   percent: 0
+roadmap: .planning/ROADMAP.md
 ---
 
 # Project State
@@ -20,14 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 19 — write-user-facing-docs-including-a-full-getting-started-section-that-walks-a-new-user-through-setup-and-first-scan-using-the-di-taxis-model
+**Current focus:** Phase 20 — CI Gate (first phase of milestone v2.0)
+**Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: Not started (defining requirements)
+Phase: 20 — CI Gate (not started)
 Plan: —
-Status: Defining requirements
-Last activity: 2026-09-09 — Milestone v2.0 started
+Status: Roadmap approved; ready for `/gsd-plan-phase 20`
+Progress: [--------------------] 0/13 phases
+Last activity: 2026-09-09 — v2.0 roadmap created (13 phases, 118 requirements mapped)
 
 ## Performance Metrics
 
@@ -182,6 +185,8 @@ Recent decisions affecting current work:
 
 ### Roadmap Evolution
 
+**Milestone v2.0 (Phases 20-32)** — derived from the reconciled 13-phase spine in `.planning/research/SUMMARY.md`. Load-bearing orderings: CI first (20); job-store lock + migration ladder (22) before typed results (23); scanner truthfulness (24) before manual duplex (25); `output.data_dir` with `failed/` preservation (23); config-directory mount with atomic config write (27); htmx vendoring with the Scan-button fix (26); appliance layer (30) after honest outcomes, scanner truth, and exception translation; delivery/identity (31) then suite hygiene (32) last.
+
 - Phase 8 added: Audit lint and type checker ignores and noqas and fix them
 - Phase 9 added: Enable pytest strict mode and ensure all tests pass the same linting and type checking quality checks as normal code
 - Phase 10 added: Automatic scanner profile creation
@@ -213,7 +218,7 @@ None yet.
 
 ## Session Continuity
 
-Last activity: 2026-04-24 - Completed quick task 260424-wtc: Remove orphaned agent worktrees
-Last session: 2026-03-26T13:39:34.358Z
-Stopped at: Completed 19-02-PLAN.md
+Last activity: 2026-09-09 - Created v2.0 ROADMAP.md and filled REQUIREMENTS.md traceability (118/118 mapped)
+Last session: 2026-09-09T20:05:00.000Z
+Stopped at: Roadmap created; next step is `/gsd-plan-phase 20`
 Resume file: None

@@ -1,347 +1,248 @@
 # Roadmap: saneless
 
+**Milestone:** v2.0 "Prep for release"
+**Requirements:** `.planning/REQUIREMENTS.md` (118 v2.0 requirements)
+**Research:** `.planning/research/SUMMARY.md`
+**Review under remediation:** `.planning/reviews/2026-09-09-code-review.md`
+**Previous milestone:** v1.0, archived at `.planning/milestones/v1.0-ROADMAP.md` (ended at Phase 19)
+
 ## Overview
 
-saneless delivers a scan-to-paperless-ngx bridge in four phases, structured bottom-up by dependency chain. Phase 1 proves the entire pipeline end-to-end (config, scanner abstraction, PDF assembly, paperless upload) via CLI. Phase 2 adds ADF multi-page and duplex scanning -- the hardest and most differentiating features. Phase 3 wraps the stable backend in a web UI with live status, metadata controls, and job history. Phase 4 packages everything for deployment as a pip package and OCI container.
+v2.0 is a hardening milestone on a working appliance. Every requirement resolves a finding from the 2026-09-09 comprehensive code review. The phase order is not the review's own section-10 order: it is the reconciled dependency spine from research, which fixes five places where following the review literally would reintroduce a bug it is trying to fix.
+
+The spine is built on one discipline — **every phase leaves the suite green, and its own tests could not have passed before it.** That is why CI lands first (Phase 20) with zero source changes, why the vocabulary and the job-store migration ladder land before anything that needs a new column or a new state (Phases 21–22), why scanner ground truth is fixed before duplex correctness is asserted against it (Phase 24 before 25), and why the user-visible appliance layer comes only after honest outcomes, truthful scanner errors, and exception translation already exist to feed it (Phase 30).
+
+Five orderings are load-bearing and must not be rearranged during planning:
+
+1. **CI first.** Without it, "green" means "green on one developer's machine."
+2. **Job-store lock and `PRAGMA user_version` migration ladder (Phase 22) before typed results (Phase 23).** All result columns are added in one migration so no later phase reaches for another bare `ALTER TABLE ... except: pass`.
+3. **Scanner truthfulness (Phase 24) before manual duplex (Phase 25).** The backend's own blank-page removal changes duplex page parity, and duplex tests written against untruthful SANE fakes assert a system that will not exist after Phase 24.
+4. **`output.data_dir` (OUTC-09, M-30's sibling finding N-39) in the same phase as `failed/` preservation (Phase 23), and the config-*directory* mount (CFG-09 / M-30) in the same phase as the atomic config write (CFG-08 / M-10, Phase 27).** `os.replace` returns `EBUSY` over a bind-mounted file, so a "durable write" shipped without the mount fix is broken on day one for the deployment the docs recommend.
+5. **htmx/PicoCSS vendoring (ROBU-09) in the same phase as the Scan-button fix (ROBU-04), Phase 26.** The C-10 browser regression test runs in a CI sandbox with no egress; CDN-loaded assets make it impossible.
+
+**Documentation is cross-cutting.** Each phase corrects the sentences in `docs/` and `README.md` that described the behaviour it changed, in that same phase. DOCS-01 sits in Phase 31 only as the final audit that all 34 rows of review section 8 are now true.
 
 ## Phases
 
 **Phase Numbering:**
-- Integer phases (1, 2, 3): Planned milestone work
-- Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
+- Integer phases (20, 21, 22...): Planned milestone work, continuing from v1.0's Phase 19
+- Decimal phases (22.1, 22.2): Urgent insertions (marked with INSERTED)
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Core Pipeline** - Scanner abstraction, flatbed scan, PDF assembly, paperless-ngx upload, config, CLI
-- [ ] **Phase 2: ADF and Multi-Page** - ADF scanning, hardware duplex, manual duplex, empty page detection, thumbnails
-- [ ] **Phase 3: Web UI** - Browser interface with profiles, metadata, live status, job history, health endpoint
-- [ ] **Phase 4: Packaging and Deployment** - pip package, OCI container, consume directory fallback
-- [ ] **Phase 5: Web Server Launch Command** - `saneless serve` CLI command, web logging, Dockerfile CMD
-- [ ] **Phase 6: Gap Closure Fixes** - Paperless test route, worker intermediate states
-- [ ] **Phase 7: Tech Debt Cleanup** - python-sane packaging, Starlette deprecation, error typing, flip timing, Playwright browser tests
-- [x] **Phase 13: Review Hardening** - Disk space checks, duplex data preservation, typed state events, exception sanitization, config validation, periodic pruning, empty page toggle, signal handler fix, Docker docs (completed 2026-03-22)
+- [ ] **Phase 20: CI Gate** - GitHub Actions runs lint, format, both type checkers, and the non-browser suite on every push; `pytest-timeout` guards against hangs
+- [ ] **Phase 21: Vocabulary and Contracts** - One `JobState`, one label map, one `ErrorCategory`, one `classify_source()`, and typed `ScanResult`/`UploadResult`, with zero behaviour change
+- [ ] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration
+- [ ] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI
+- [ ] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane
+- [ ] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass
+- [ ] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets
+- [ ] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible
+- [ ] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback
+- [ ] **Phase 29: Geometry, Memory, and Timeouts** - Pages spooled to disk in explicit order, safe cancel, shared flatbed/ADF timeout, guarded `sane.init()`
+- [ ] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt
+- [ ] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/scanless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected
+- [ ] **Phase 32: Suite Hygiene and Minor Sweep** - Hermetic tests, no `time.sleep`, no low-value tests, and the remaining N-01..N-45 sweep
 
 ## Phase Details
 
-### Phase 1: Core Pipeline
-**Goal**: A user can run a CLI command that discovers a scanner, performs a flatbed scan, assembles a PDF, and uploads it to paperless-ngx with metadata
-**Depends on**: Nothing (first phase)
-**Requirements**: SCAN-01, SCAN-02, SCAN-03, PROF-01, PROF-02, PDF-01, PDF-02, PLSS-01, PLSS-02, PLSS-03, CONF-01, CONF-02, CONF-03, ARCH-01, ARCH-02, ARCH-03, LOG-01, LOG-02, LOG-04, CLI-01, CLI-02
+### Phase 20: CI Gate
+**Goal**: Every push and pull request is provably green — ruff, ruff format, ty, pyrefly, and the non-browser pytest suite run in GitHub Actions and a red run blocks merge — so every phase that follows can be trusted, with the contributing docs updated in-phase to describe the gate
+**Depends on**: Nothing (first phase of v2.0)
+**Requirements**: CI-01, TEST-07
 **Success Criteria** (what must be TRUE):
-  1. User can run `saneless devices` and see a list of available SANE scanners on the network
-  2. User can run `saneless scan` and a flatbed scan produces a PDF that appears in paperless-ngx with the specified title
-  3. User can define scan profiles in a TOML config file and select one via `--profile` flag
-  4. Configuration loads from TOML file with environment variable overrides, and invalid config fails at startup with a clear error
-  5. Scanner operations go through an abstraction layer that isolates python-sane behind clean interface methods
-**Plans**: 5 plans
+  1. A push with a ruff violation, a `ty` error, a `pyrefly` error, or a failing test produces a red GitHub Actions run that blocks merge
+  2. A clean push produces a green run that exercises all five checks, and the run is visible on the pull request
+  3. A test that hangs is killed by `pytest-timeout` with a per-test traceback instead of consuming the CI job's full time budget
+**Plans**: TBD
 
-Plans:
-- [ ] 01-01-PLAN.md -- Foundation: dependencies, config (pydantic-settings TOML + env), exceptions, logging
-- [ ] 01-02-PLAN.md -- Core modules: scanner abstraction (ABC + SaneBackend), PDF assembly (img2pdf), paperless-ngx client
-- [ ] 01-03-PLAN.md -- Integration: job model, worker thread, pipeline orchestration, Click CLI commands
-- [ ] 01-04-PLAN.md -- Gap closure: XDG-compliant log path default, graceful mkdir error handling
-- [ ] 01-05-PLAN.md -- Gap closure: user-friendly TOML structure errors, title alias for default_title_template
+Note: zero source changes in this phase. The naming grep guard (CI-02) is deliberately deferred to Phase 31, where the rename it guards actually lands — adding it here would make CI red from its first run.
 
-### Phase 2: ADF and Multi-Page
-**Goal**: Users can scan multi-page documents from the ADF in all modes (simplex, hardware duplex, manual duplex) with automatic empty page removal
-**Depends on**: Phase 1
-**Requirements**: SCAN-04, SCAN-05, SCAN-06, SCAN-07, SCAN-08, SCAN-09, SCAN-10, SCAN-11, SCAN-12
+### Phase 21: Vocabulary and Contracts
+**Goal**: The words the system uses about itself exist exactly once and are enforceable by the type checkers — one `JobState` enum, one active-state list, one state-to-label map, one `ErrorCategory`, one `classify_source()`, and typed pipeline results — with no behaviour change and the docs that named the old `"fallback"` string updated in-phase
+**Depends on**: Phase 20
+**Requirements**: CTR-01, CTR-02, CTR-03, CTR-04, CTR-05
 **Success Criteria** (what must be TRUE):
-  1. User can load a stack of pages into the ADF and get a single multi-page PDF with all pages in order
-  2. User can perform a manual duplex scan (two passes) and the system correctly interleaves front and back pages, rejecting mismatched page counts
-  3. Empty pages are automatically detected and discarded before PDF assembly, with configurable thresholds per profile
-  4. A thumbnail of the first scanned page is generated and available for downstream display
-  5. Attempting to ADF-scan with an empty feeder produces a specific "No paper detected in feeder" error, not a generic failure
-**Plans**: 3 plans
+  1. A parametrised test proves every `JobState` member has a label and appears in exactly one active-state list, and the worker, web templates, and CLI all read them from the same module
+  2. `classify_source()` returns the correct `SourceKind` for "Automatic Document Feeder", "ADF Front", "ADF Duplex", "Flatbed", "Auto", and vendor variants, and it is the only classification rule in the codebase
+  3. The pipeline returns a typed `ScanResult` and `upload_document` returns a typed `UploadResult`; the `"fallback"` magic string is absent from `src/`, `tests/`, and `docs/`
+  4. Existing imports from `job.py` still resolve (re-exports), and the whole suite passes unchanged
+**Plans**: TBD
 
-Plans:
-- [ ] 02-01-PLAN.md -- Foundation types + page processing: config thresholds, AWAITING_FLIP state, FeederEmptyError, empty page detection, thumbnail generation
-- [ ] 02-02-PLAN.md -- ADF scanner extension: multi_scan() for ADF/duplex sources, page validation, empty feeder detection, EXIF stripping
-- [ ] 02-03-PLAN.md -- Pipeline + worker integration: manual duplex interleaving, empty page filtering, thumbnail callbacks, AWAITING_FLIP event coordination
-
-### Phase 3: Web UI
-**Goal**: Users can perform all scanning operations from a browser on any device on the LAN, with live feedback, metadata entry, and job history
-**Depends on**: Phase 2
-**Requirements**: UI-01, UI-02, UI-03, UI-04, UI-05, UI-06, UI-07, UI-08, PROF-03, PLSS-04, PLSS-05, HLTH-01, HLTH-02, LOG-03
+### Phase 22: Job Store Hardening
+**Goal**: The job store is safe under concurrency and can evolve its schema honestly — an `RLock` around every public method, a `PRAGMA user_version` migration ladder that opens a v1.0 database cleanly, and every result column this milestone will ever need added in one migration — with the storage docs updated in-phase
+**Depends on**: Phase 21
+**Requirements**: STOR-01, STOR-02, STOR-03, STOR-04, STOR-05
 **Success Criteria** (what must be TRUE):
-  1. User can open the web UI in a browser, select a profile, enter metadata (title, tags, correspondent), and click Scan to start a job
-  2. UI shows live status updates (idle/scanning/assembling/uploading/done/error) and displays the first-page thumbnail once available
-  3. For manual duplex scans, UI shows a flip prompt with Continue and Cancel buttons and the scan button is disabled while a job is in progress
-  4. User can browse job history showing timestamp, profile, title, and outcome -- with old entries automatically pruned
-  5. `GET /health` returns 200 when the system is healthy and 503 when the worker thread is down, requiring no authentication
-**Plans**: 4 plans
+  1. Two threads calling any mix of `JobStore` methods for 200 rounds complete with zero exceptions and no interleaved-transaction corruption
+  2. A database file written by v1.0 opens, migrates through the ladder, and reports the current `user_version`; the bare `ALTER TABLE ... except: pass` is gone
+  3. The job table carries `outcome`, `pages_scanned`, `pages_removed`, `pages_uploaded`, `warning`, and `owner_token` after a single migration step, even though most stay unused until later phases
+  4. `fail_active_jobs()` marks every non-terminal job FAILED with a "server restarted" reason, and `list_pending()` returns queued jobs in creation order
+  5. The row-to-`Job` mapping and its column list appear exactly once, and `prune()` reports its count from one statement
+**Plans**: TBD
 
-Plans:
-- [ ] 03-00-PLAN.md -- Wave 0: xfail test stubs and httpx dev dependency for Nyquist compliance
-- [ ] 03-01-PLAN.md -- Backend extensions and FastAPI web application scaffold (app factory, cache, routes, health endpoint)
-- [ ] 03-02-PLAN.md -- Complete Jinja2 templates with HTMX interactions (scan form, status polling, flip prompt, job history)
-- [ ] 03-03-PLAN.md -- Test suite for web endpoints, cache, and JobStore extensions
-
-### Phase 4: Packaging and Deployment
-**Goal**: Users can install saneless via pip or deploy it as an OCI container with minimal configuration
-**Depends on**: Phase 3
-**Requirements**: PKG-01, PKG-02, PKG-03, PLSS-06, CLI-03
+### Phase 23: Honest Outcomes and Never Lose a Scan
+**Goal**: A job's recorded state is always the truth and a scanned document is never destroyed by a downstream failure — Paperless failures and timeouts raise, consume-directory delivery is recorded as `FALLBACK`, unrecoverable uploads preserve the PDF under a durable `data_dir/failed/` with a unique name and correct DPI — with every doc sentence that promised the old silent-DONE behaviour rewritten in-phase
+**Depends on**: Phase 22
+**Requirements**: OUTC-01, OUTC-02, OUTC-03, OUTC-04, OUTC-05, OUTC-06, OUTC-07, OUTC-08, OUTC-09, OUTC-10
 **Success Criteria** (what must be TRUE):
-  1. User can `pip install saneless` and run the application with no additional build steps
-  2. OCI container image runs without `--privileged`, includes a working HEALTHCHECK, and is published to GHCR
-  3. User can configure a consume directory fallback that deposits PDFs to a local path when paperless-ngx API is unavailable
-  4. User can run `saneless jobs` to view recent job history from the command line
-**Plans**: 2 plans
+  1. A Paperless task ending FAILURE, or a poll that exceeds its monotonic deadline, records the job FAILED with the Paperless message — never DONE — and a PDF still exists on disk whose path is named in the job error
+  2. A PDF that reaches only the consume directory records the job as `FALLBACK` with a warning, rendered distinctly from DONE in the status area, the history table, and `saneless jobs`
+  3. When upload and consume-directory fallback both fail after N pages, the assembled PDF is in `<data_dir>/failed/` under a unique name and no page image or PDF was deleted on that path
+  4. An A4 page scanned at 300 DPI produces a PDF with a 595 x 842 pt MediaBox, and two jobs with the same title produce two distinct PDF file names
+  5. A parametrised end-to-end test drives the real worker and pipeline with a stub scanner through SUCCESS, Paperless FAILURE, TIMEOUT, consume-dir fallback, and duplex mismatch, asserting persisted state, outcome, page counts, and file preservation for each
+**Plans**: TBD
 
-Plans:
-- [ ] 04-01-PLAN.md -- CLI `jobs` command and consume directory fallback completion
-- [ ] 04-02-PLAN.md -- PyPI metadata, Dockerfile, Docker Compose, and GitHub Actions release workflow
+Note: the preservation `try/except` must span both `upload_document` and `poll_task`. Wrapping only the upload call means a correct FAILURE raise unwinds the `TemporaryDirectory` and deletes the document this phase exists to protect.
 
-### Phase 5: Web Server Launch Command
-**Goal**: Users can start the web server via `saneless serve` and deploy via Docker container with working healthcheck
-**Depends on**: Phase 4
-**Requirements**: UI-01, UI-02, UI-03, UI-04, UI-05, UI-06, UI-07, UI-08, PROF-03, PLSS-04, PLSS-05, HLTH-01, HLTH-02, LOG-01, LOG-02, LOG-03, PKG-02
-**Gap Closure:** Closes GAP-01, integration gaps (cli->web, web->logging), broken flows (web UI, container deployment)
+### Phase 24: Scanner Truthfulness
+**Goal**: The scanner layer reports what actually happened — the single `classify_source()` drives every feeder decision, real SANE errors carry their real messages, geometry and DPI are read from the device rather than assumed, and the test doubles behave like python-sane 2.9.2 — with the scanner-discovery and ADF docs corrected in-phase
+**Depends on**: Phase 23
+**Requirements**: SCNR-01, SCNR-02, SCNR-03, SCNR-04, SCNR-05, SCNR-06, SCNR-07, SCNR-08
 **Success Criteria** (what must be TRUE):
-  1. User can run `saneless serve` and the web UI is accessible in a browser at the configured host/port
-  2. Web server startup calls `configure_logging()` so logs go to the configured rotating file, not Python's default logger
-  3. Docker container starts with `CMD ["serve"]`, healthcheck passes, and container stays running
-**Plans**: 1 plans
+  1. A device whose feeder is named "Automatic Document Feeder" scans a full stack, and auto-profiles never collapses two distinct feeder sources into one slug
+  2. A first-page SANE error other than the exact "Document feeder out of documents" message surfaces as a `ScanError` carrying the SANE text, never as "No paper detected"
+  3. The backend drops no pages on its own; blank-page removal happens only in the pipeline, only when the profile enables it, and manual-duplex page parity survives
+  4. Geometry is written only when the device reports `tl_x`/`tl_y`/`br_x`/`br_y` with units read from the option descriptor; a test proves the Pillow crop fallback is reachable and uses the resolution read back after all options are set
+  5. The rewritten fakes match real python-sane semantics (unknown option stored silently, bad value for a known option raises `_sane.error`, structurally wrong access raises `AttributeError`), and an opt-in integration test drives the real SANE `test` backend through a `SANE_CONFIG_DIR` scoped to `tmp_path` to pull ten pages from a long feeder name
+**Plans**: TBD
 
-Plans:
-- [ ] 05-01-PLAN.md -- Add `saneless serve` CLI command with uvicorn, Dockerfile CMD, and tests
-
-### Phase 6: Gap Closure Fixes
-**Goal**: Close remaining requirement gaps -- paperless test endpoint route and worker intermediate status states
-**Depends on**: Phase 5
-**Requirements**: PLSS-03, UI-02
-**Gap Closure:** Closes GAP-02 (PLSS-03 route), GAP-03 (UI-02 intermediate states)
+### Phase 25: Manual Duplex
+**Goal**: Manual duplex actually works and is honest about where it is — `duplex` is its own profile field, `source` is passed to SANE verbatim, exactly one place decides the strategy, a required `FlipCoordinator` with a timeout serves both CLI and web, and pass B is visible — with the ADF duplex how-to rewritten in-phase to stop documenting `source = "Manual Duplex"` as current
+**Depends on**: Phase 24
+**Requirements**: DPLX-01, DPLX-02, DPLX-03, DPLX-04, DPLX-05, DPLX-06, DPLX-07
 **Success Criteria** (what must be TRUE):
-  1. `GET /api/paperless/test` returns JSON with connection status distinguishing connected/token_rejected/unreachable
-  2. Worker emits ASSEMBLING state before PDF assembly and UPLOADING state before paperless upload, visible in web UI status polling
-**Plans**: 2 plans
+  1. A legacy config with `source = "Manual Duplex"` still loads and scans, is translated to `duplex = "manual"` at config load with a deprecation warning, and `source` is never inspected for strategy anywhere in the codebase
+  2. `saneless scan` with a manual-duplex profile prompts "Flip the stack and press Enter" on stdin and completes a two-pass scan; starting manual duplex with no coordinator is refused before the scanner is opened
+  3. A flip wait that exceeds the timeout fails the job with a clear message and releases the scanner for the next job
+  4. During pass B the job reports `SCANNING_REVERSE`, Abort at the flip prompt cancels the job, and `wait_transition` no longer exists
+  5. A write-then-load round trip proves auto-profiles always emits a `default` profile for flatbed-only, feeder-only, and mixed devices
+**Plans**: TBD
 
-Plans:
-- [ ] 06-01-PLAN.md -- Paperless test route, worker ASSEMBLING/UPLOADING state transitions, and tests
-- [ ] 06-02-PLAN.md -- Gap closure: fix test_connection to use auth-requiring endpoint (/api/tags/) instead of /api/
-
-### Phase 7: Tech Debt Cleanup
-**Goal**: Address accumulated tech debt from v1.0 milestone audit — packaging gaps, deprecation warnings, error handling clarity, flip flow timing, and browser rendering verification
-**Depends on**: Phase 6
-**Requirements**: PKG-01, UI-01, UI-02, UI-03, ARCH-02
-**Tech Debt Closure:** Closes 5 of 6 tech debt items from v1.0 audit (1 deferred: physical scanner verification)
+### Phase 26: Worker and Web Robustness
+**Goal**: The server survives everything the pipeline can throw at it and the browser always reflects reality — a guarded worker loop, 429 backpressure that is actually visible, blocking routes declared `def`, crash recovery at startup, and a server-owned Scan button served from vendored assets that work on an offline LAN — with the deployment and API docs updated in-phase
+**Depends on**: Phase 25
+**Requirements**: ROBU-01, ROBU-02, ROBU-03, ROBU-04, ROBU-05, ROBU-06, ROBU-07, ROBU-08, ROBU-09, ROBU-10, ROBU-11
 **Success Criteria** (what must be TRUE):
-  1. `python-sane` is a mandatory dependency in `pyproject.toml` and Dockerfile installs it correctly
-  2. Zero Starlette `TemplateResponse` deprecation warnings across all 13 call sites
-  3. `JobState` distinguishes error categories (feeder, config, scanner, upload) rather than relying on error message text
-  4. POST to `/api/flip/continue` returns response only after worker has transitioned out of `AWAITING_FLIP` state
-  5. Playwright tests verify PicoCSS/HTMX rendering, live status polling, and flip prompt UI in a real browser
-**Plans**: 2 plans
+  1. A pipeline, job-store, or `prune` exception is logged with `exc_info` and the worker keeps serving the next job
+  2. Submitting past a full queue returns 429 with `Retry-After` and a message the user can actually see in the status area, the event loop never blocks, and shutdown never blocks on the worker
+  3. `/health` answers while a scan is running, and concurrent threadpool requests neither stampede the metadata cache nor mutate profiles mid-iteration
+  4. Jobs left non-terminal by a crash are FAILED with a "server restarted" reason before the worker starts, and profiles are generated at startup from the config path that was actually loaded
+  5. A browser test in CI with no CDN egress clicks Scan, waits for the terminal status, and asserts `#scan-btn` is enabled again with no duplicate `id="scan-btn"` in the DOM and `app.js` deleted
+**Plans**: TBD
 
-Plans:
-- [ ] 07-01-PLAN.md -- Backend hardening: python-sane mandatory dep, ErrorCategory enum, typed exception handling, flip timing synchronization
-- [ ] 07-02-PLAN.md -- Playwright browser tests for PicoCSS rendering, HTMX polling, flip prompt UI, scan form
+Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 must be paired with an explicit `htmx-config` override or it is invisible — reintroducing the exact C-10 symptom this phase fixes. Worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper here, not in Phase 32.
+
+**UI hint**: yes
+
+### Phase 27: Configuration Strictness
+**Goal**: A wrong config is caught at load with a message that names the right place, and a config rewrite is durable on the deployment the docs recommend — nested `extra="forbid"` with full-`loc` error rendering, atomic UTF-8 comment-preserving writes, `~`/XDG expansion, validated log level, `SecretStr` token — with the configuration reference and compose example updated in-phase
+**Depends on**: Phase 26
+**Requirements**: CFG-01, CFG-02, CFG-03, CFG-04, CFG-05, CFG-06, CFG-07, CFG-08, CFG-09, CFG-10, CFG-11
+**Success Criteria** (what must be TRUE):
+  1. A typo'd key under `[paperless]` is rejected at load with a message naming `paperless`, the bad key, and the valid keys; a `--config` path that does not exist exits 2 naming the path
+  2. `~` and `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` are honoured for config and data locations, an invalid `log_level` is rejected, and `-v` sets the effective level to DEBUG
+  3. `auto-profiles --force` succeeds against the documented Docker Compose mount, replaces only the keys it generates, and leaves `default_tags` and hand-written profiles untouched
+  4. The Paperless token never appears in `repr(settings)`, logs, or error messages, while the loaded config path and the env-sourced keys are logged at INFO on startup
+  5. `saneless <subcommand> --help` works with no valid configuration file, and a blank title falls back to the profile's documented `title` key
+**Plans**: TBD
+
+Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship together. `os.replace` over a bind-mounted *file* returns `EBUSY`, so shipping the atomic write alone delivers a durable-write feature that is broken for the documented deployment.
+
+### Phase 28: Exception Translation
+**Goal**: No third-party exception type escapes a module boundary and no user ever sees a traceback — SANE, httpx, all seven img2pdf error classes, and tomllib errors are wrapped at their call sites with their original messages, and the CLI prints one line with a non-zero exit code — with the troubleshooting docs updated in-phase
+**Depends on**: Phase 27
+**Requirements**: EXC-01, EXC-02, EXC-03, EXC-04, EXC-05
+**Success Criteria** (what must be TRUE):
+  1. A parametrised test per third-party library proves each boundary raises the saneless exception type carrying the original message, never the third-party type
+  2. `saneless scan` against a bad config, a broken scanner, an unreachable Paperless, and an unassemblable PDF each print one line and exit non-zero; a missing `python-sane` import prints an install hint
+  3. A scan that produces zero pages says "No pages were scanned", and says "All pages were blank" only when detection actually removed them — never a bare `ValueError`
+  4. A user abort at the flip prompt is recorded as a cancelled job, not a scanner failure, and every job failure is logged with `exc_info`
+**Plans**: TBD
+
+### Phase 29: Geometry, Memory, and Timeouts
+**Goal**: A long scan is ordered, bounded in memory, and cancellable without wedging the process — pages spooled to disk with explicit ordered records, a shared ADF/flatbed timeout that waits for the cancelled read, and `sane.init()`/`sane.exit()` guarded as process-global — with the architecture explanation page updated in-phase
+**Depends on**: Phase 28
+**Requirements**: HARD-01, HARD-02, HARD-03, HARD-04, HARD-05
+**Success Criteria** (what must be TRUE):
+  1. A 12-page scan with distinct per-page content comes out in order 1..12, duplex interleave reorders the page records rather than the filesystem, and peak memory stays bounded by roughly one page
+  2. A mid-batch scanner error after N pages keeps those N pages and reports the error with the count
+  3. A fake with a blocking read proves `close()` is never called while the read is blocked, and the process still exits — a stuck read never blocks `docker stop` or `pytest`
+  4. The flatbed path enforces the same timeout and image validation as the ADF path
+  5. `sane.init()` runs once per process behind a re-entry guard, `sane.exit()` runs at shutdown, and neither is reachable from a request path
+**Plans**: TBD
+
+### Phase 30: Appliance Layer
+**Goal**: A non-technical household member can tell at a glance whether the appliance is healthy and what a failure means — one shared check list behind both `saneless doctor` and a cached status strip, page counts on every terminal job, plain-language errors with a next step, human profile labels, queue position, and an owner-only flip prompt — with help text and the docs for each new surface written in-phase
+**Depends on**: Phase 29
+**Requirements**: APPL-01, APPL-02, APPL-03, APPL-04, APPL-05, APPL-06, APPL-07, APPL-08, APPL-09, APPL-10, APPL-11, APPL-12
+**Success Criteria** (what must be TRUE):
+  1. `saneless doctor` runs the shared checks (scanner, Paperless, profiles, fallback, data dir) and exits non-zero on a placeholder token or any other red check; the index page shows the same checks, refreshed on load and by a button
+  2. The status strip stays fast with the scanner host unplugged and is skipped entirely while a scan is active, so it never contends with the exclusive scanner
+  3. Every terminal job shows pages scanned, pages removed as blank, and pages uploaded; manual duplex shows front and back counts during pass B; a queued job says "Waiting for '<title>' to finish (N ahead of you)"
+  4. Every user-facing error shows a plain-language message and a suggested next step, with the raw technical detail inside a collapsed disclosure
+  5. Two browser contexts show the owner the Continue/Abort flip prompt (with confirmation on Abort) and the non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels with descriptions, feeder-first on sheet-fed scanners, and say so on the strip when the config mount is read-only
+**Plans**: TBD
+
+**UI hint**: yes
+
+### Phase 31: Delivery, Identity, and Documentation Accuracy
+**Goal**: The project ships under its real name with a release path proven end to end and documentation that does not lie — `kdknigga/scanless` everywhere behind a CI grep guard, SHA-pinned actions with scoped permissions, container logging/port/user/`.dockerignore` fixes, and every one of review section 8's 34 false claims corrected as this milestone's final documentation audit
+**Depends on**: Phase 30
+**Requirements**: CI-02, DLVR-01, DLVR-02, DLVR-03, DLVR-04, DLVR-05, DLVR-06, DLVR-07, DLVR-08, DLVR-09, DLVR-10, DOCS-01, DOCS-02, DOCS-03, DOCS-04, DOCS-05, DOCS-06
+**Success Criteria** (what must be TRUE):
+  1. No shipped file references `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, or `ghcr.io/kris-knigga/saneless`, and CI fails if one reappears (excluding `.planning/` and `site/`); the PyPI distribution name stays `saneless`
+  2. A pre-release tag runs the entire release workflow green end to end, verified by an actual `pip install` and `docker pull` from a clean machine — not by reading the workflow file
+  3. Container logs appear in `docker logs`, the example config / `EXPOSE` / `HEALTHCHECK` agree on one port, the container runs non-root from digest-pinned bases with a `WORKDIR`, and a `.dockerignore` allow-list keeps secrets, `.planning/`, and tests out of the build context
+  4. All actions are SHA-pinned with Dependabot, every job has a `permissions:` block, a zizmor audit runs in CI, the wheel carries the LICENSE via PEP 639, and `saneless --version` prints the installed version
+  5. A reader following README and the docs site hits no false claim: every row of review section 8 is either corrected or the behaviour now matches, `saneless scan` examples run as written, and the new "Which setup do I have?" and trust-model pages resolve from the quick-start prerequisites
+**Plans**: TBD
+
+### Phase 32: Suite Hygiene and Minor Sweep
+**Goal**: The test suite is hermetic, fast, and meaningful, and the last correctness nits are gone — isolated `HOME`/`XDG`/cwd, no `time.sleep`, no assertion-free or duplicate tests, and the remaining N-01..N-45 sweep including the final one-implementation-each audit — with any doc sentence touched by a sweep item updated in-phase
+**Depends on**: Phase 31
+**Requirements**: TEST-01, TEST-02, TEST-03, TEST-04, TEST-05, TEST-06, SWP-01, SWP-02, SWP-03, SWP-04, SWP-05, SWP-06, SWP-07, SWP-08, SWP-09, SWP-10, SWP-11, SWP-12, SWP-13, SWP-14
+**Success Criteria** (what must be TRUE):
+  1. The suite passes with `HOME` pointed at an empty directory and the working directory isolated, and no `time.sleep` remains anywhere in `tests/`
+  2. A `pytest --cov` line diff proves no coverage was lost by the tests removed, and scanner and CLI tests assert what their names and docstrings claim
+  3. The data-loss and negative-path tests all exist and pass: upload failure preserves the PDF, Paperless FAILURE maps to FAILED, the worker survives a raising `prune`, two-thread store access is clean, and the flip timeout fails the job
+  4. No `# noqa` or `# type: ignore` remains in `src/` or `tests/`, `MAX_IMAGE_PIXELS` is set in one place, `configure_logging` is idempotent, and the job-db-path / slug-rule / active-state / label-map duplication inventory has one implementation each
+  5. `devices --json --capabilities` pipes cleanly to `jq`, `serve` handles IPv6 hosts and `--port 0`, the metadata cache serves stale data on error with the cause logged, and no comment in `src/` cites a planning artefact
+**Plans**: TBD
 
 ## Progress
 
-**Execution Order:**
-Phases execute in numeric order: 1 -> 2 -> 3 -> 4
-
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Core Pipeline | 0/4 | Planning complete | - |
-| 2. ADF and Multi-Page | 0/3 | Planning complete | - |
-| 3. Web UI | 1/4 | In Progress|  |
-| 4. Packaging and Deployment | 0/2 | Planning complete | - |
-| 5. Web Server Launch Command | 0/1 | Planning complete | - |
-| 6. Gap Closure Fixes | 0/1 | Planning complete | - |
-| 7. Tech Debt Cleanup | 0/2 | Planning complete | - |
+| 20. CI Gate | 0/? | Not started | - |
+| 21. Vocabulary and Contracts | 0/? | Not started | - |
+| 22. Job Store Hardening | 0/? | Not started | - |
+| 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
+| 24. Scanner Truthfulness | 0/? | Not started | - |
+| 25. Manual Duplex | 0/? | Not started | - |
+| 26. Worker and Web Robustness | 0/? | Not started | - |
+| 27. Configuration Strictness | 0/? | Not started | - |
+| 28. Exception Translation | 0/? | Not started | - |
+| 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
+| 30. Appliance Layer | 0/? | Not started | - |
+| 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
+| 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 
-### Phase 8: Audit Lint and Type Checker Ignores
+## Research Flags
 
-**Goal:** Zero unjustified suppressions in production code -- fix every fixable # noqa and # type: ignore, document remaining justified ones, tighten per-file-ignores
-**Requirements**: AUDIT-01, AUDIT-02, AUDIT-03, AUDIT-04
-**Depends on:** Phase 7
-**Plans:** 1/1 plans complete
+Phases worth a `--research-phase` pass during planning (from `.planning/research/SUMMARY.md`):
 
-Plans:
-- [ ] 08-01-PLAN.md -- Fix httpx type: ignore, document justified suppressions, tighten per-file-ignores
+| Phase | Why |
+|-------|-----|
+| 26 | The single-flight cache lock and the exact `htmx-config` `responseHandling` JSON shape are narrow but easy to get subtly wrong — verify against the installed htmx 2.0.10 before writing the browser test |
+| 27 | The "unknown top-level env var ignored, unknown nested env var rejected" asymmetry is MEDIUM confidence; the bind-mount `EBUSY` behaviour needs a throwaway `docker run` to confirm |
+| 30 | The owner-token cookie mechanism (lifetime, reload behaviour, fail-open escape hatch) is genuinely novel here and should be prototyped small |
 
-### Phase 9: Enable Pytest Strict Mode and Test Quality Parity
+Safe to skip research: Phase 20 (mechanical), Phase 21 (pure refactor, fully specified), Phase 28 (mechanical wrapping at identified call sites).
 
-**Goal:** Full test quality parity with production code -- type annotations, docstrings, and lint compliance on all test files, with pytest strict mode enforcing warnings-as-errors and strict markers
-**Requirements**: TQUAL-01, TQUAL-02, TQUAL-03, TQUAL-04, TQUAL-05, TQUAL-06, TQUAL-07
-**Depends on:** Phase 8
-**Plans:** 2/3 plans executed
+## Coverage
 
-Plans:
-- [ ] 09-01-PLAN.md -- Fix type checker errors in test files, replace mock patterns with concrete stubs, remove ty/pyrefly exclusions
-- [ ] 09-02-PLAN.md -- Add type annotations, docstrings, move lazy imports to top-level, remove ANN/PLC0415 per-file-ignores
-- [ ] 09-03-PLAN.md -- Fix ResourceWarning from unclosed SQLite connections, enable pytest strict configuration
+All 118 v2.0 requirements are mapped to exactly one phase. See the Traceability table in `.planning/REQUIREMENTS.md`.
 
-### Phase 10: Automatic scanner profile creation
-
-**Goal:** Users get scan profiles auto-generated from scanner capabilities on first use, and can explicitly regenerate via `saneless auto-profiles` CLI command
-**Requirements**: AP-01, AP-02, AP-03, AP-04, AP-05, AP-06, AP-07, AP-08, AP-09
-**Depends on:** Phase 9
-**Plans:** 2/2 plans complete
-
-Plans:
-- [ ] 10-01-PLAN.md -- Core auto_profiles module: pure generation functions, TOML persistence, tomlkit dep, ProfileConfig auto_generated field (TDD)
-- [ ] 10-02-PLAN.md -- CLI auto-profiles command and worker lazy trigger integration
-
-### Phase 11: Review and adjust default DPI setting
-
-**Goal:** Validate 300 DPI as the optimal default for document scanning (Tesseract OCR minimum recommendation) and consolidate the duplicated DPI value into a single DEFAULT_RESOLUTION constant
-**Requirements**: DPI-01
-**Depends on:** Phase 10
-**Plans:** 1/1 plans complete
-
-Plans:
-- [ ] 11-01-PLAN.md -- Consolidate DEFAULT_RESOLUTION constant in config.py, update auto_profiles.py and tests
-
-### Phase 12: UI polish: humanize enum labels, add accessible button labels, fix CLI table truncation, replace inline HTMX scripts, normalize spacing to design token grid
-
-**Goal:** Cosmetic and accessibility polish across web UI and CLI -- humanize raw enum labels, add ARIA attributes to icon buttons, extract inline scripts to external JS, normalize CSS spacing to PicoCSS design token grid, and fix CLI table truncation with terminal-aware column widths
-**Requirements**: P12-01, P12-02, P12-03, P12-04, P12-05
-**Depends on:** Phase 11
-**Plans:** 2/2 plans complete
-
-Plans:
-- [ ] 12-01-PLAN.md -- Web UI polish: humanize_state Jinja2 filter, accessible button labels, extract inline scripts to app.js, normalize CSS spacing, copywriting fixes
-- [ ] 12-02-PLAN.md -- CLI table truncation: _truncate helper with terminal-aware column widths for devices and jobs commands
-
-### Phase 13: Review hardening -- cross-AI review findings
-
-**Goal:** Address 9 hardening items identified by cross-AI plan review (Gemini CLI) -- disk space pre-flight checks, manual duplex data preservation, typed state machine events, exception sanitization, config writability validation, periodic job pruning, empty page detection toggle, threaded Uvicorn signal fix, and Docker Compose documentation
-**Requirements**: RH-01, RH-02, RH-03, RH-04, RH-05, RH-06, RH-07, RH-08, RH-09
-**Depends on:** Phase 12
-**Plans:** 3/3 plans complete
-
-Plans:
-- [x] 13-01-PLAN.md -- Simple independent fixes: exception sanitization, config writability validation, empty page toggle, Uvicorn signal fix, Docker Compose docs
-- [x] 13-02-PLAN.md -- Core pipeline hardening: PipelineEvent typed enum, disk space pre-flight check, post-job pruning
-- [x] 13-03-PLAN.md -- Manual duplex mismatch recovery: save partial PDFs and upload both to paperless-ngx
-
-**Success Criteria** (what must be TRUE):
-  1. Multi-page scan pipeline checks disk space before starting and raises a clear error if estimated space exceeds available
-  2. Manual duplex page count mismatch saves front pages as partial PDF to consume directory, not silently discarded
-  3. Worker state transitions use a typed enum callback, not string comparison against log messages
-  4. `GET /api/paperless/test` 502 response contains sanitized error detail, never raw exception strings with tokens or IPs
-  5. Config validation at startup fails fast if tmp_dir or consume_dir paths are not writable
-  6. Job history is pruned periodically during runtime (not only at application startup)
-  7. `ProfileConfig.enable_empty_page_detection` boolean toggle exists and defaults to True
-  8. Browser test Uvicorn server sets `install_signal_handlers=False` to prevent ValueError in non-main thread
-  9. docker-compose.yml includes a comment warning that config.toml must exist on host before first run
-
-### Phase 14: Enable containerized scanner detection by wiring scanner.host config into SANE net backend via SANE_NET_HOSTS environment variable
-
-**Goal:** Containerized saneless discovers network scanners when user sets `scanner.host` in config -- the application wires this into SANE's net backend via the `SANE_NET_HOSTS` environment variable before `sane.init()`
-**Requirements**: NET-01, NET-02, NET-03, NET-04
-**Depends on:** Phase 13
-**Plans:** 1/1 plans complete
-
-Plans:
-- [x] 14-01-PLAN.md -- Wire scanner.host into SANE_NET_HOSTS env var, update CLI call sites, add docker-compose example
-
-**Success Criteria** (what must be TRUE):
-  1. `SaneBackend(host="192.168.1.50")` sets `SANE_NET_HOSTS=192.168.1.50` before `sane.init()`
-  2. If `SANE_NET_HOSTS` is already set externally, the application does not override it
-  3. All 4 CLI commands pass `settings.scanner.host` to the `SaneBackend` constructor
-  4. `docker-compose.yml` documents `SANELESS_SCANNER__HOST` as a commented-out example
-
-### Phase 15: Create user-facing documentation using the Diataxis approach
-
-**Goal:** Complete user-facing documentation site with all four Diataxis quadrants (tutorials, how-to guides, reference, explanation) published via MkDocs Material to GitHub Pages
-**Requirements**: D-01, D-02, D-03, D-04, D-05, D-06, D-07, D-08, D-09, D-10, D-11, D-12, D-13, D-14, D-15, D-16, D-17, D-18
-**Depends on:** Phase 14
-**Plans:** 4/4 plans complete
-
-Plans:
-- [x] 15-01-PLAN.md -- MkDocs scaffolding (config, theme, GitHub Actions, landing page) and "Scan Your First Document" tutorial
-- [x] 15-02-PLAN.md -- How-to guides: install, Docker Compose, scan profiles, ADF duplex, scanner host discovery, CLI scripting
-- [x] 15-03-PLAN.md -- Reference pages: CLI commands, configuration, environment variables, web API, Docker
-- [x] 15-04-PLAN.md -- Explanation pages: architecture, empty page detection, consume directory fallback; README docs link
-
-**Success Criteria** (what must be TRUE):
-  1. `uv run mkdocs build --strict` exits 0 with all 16 pages (index + 15 content pages)
-  2. Documentation site has four clearly separated Diataxis quadrants in navigation
-  3. Tutorial walks new user from install to verified scan in paperless-ngx
-  4. All how-to guides have prerequisites sections and copy-paste commands
-  5. Reference pages are terse and complete with all CLI flags, config fields, env vars, and API endpoints
-  6. No screenshots in any documentation page
-  7. README has a Documentation section linking to the docs site without duplicating content
-  8. GitHub Actions workflow deploys docs to GitHub Pages on push to main
-
-### Phase 16: When a scanner advertised auto mode, it should be configurable by the user if that means flatbed mode or ADF mode
-
-**Goal:** Users can configure whether a scanner's "Auto" source routes to flatbed (single-page) or ADF (multi-page) scanning via a per-profile `auto_source_mode` setting, with smart defaults in auto-generated profiles
-**Requirements**: D-01, D-02, D-03, D-04, D-05, D-06, D-07, D-08, D-09, D-10
-**Depends on:** Phase 15
-**Plans:** 2/2 plans complete
-
-Plans:
-- [x] 16-01-PLAN.md -- Config + data models + scan routing: auto_source_mode on ProfileConfig/ScanSettings, pipeline bridge, scan_pages conditional routing
-- [x] 16-02-PLAN.md -- Auto-profile generation + docs: source_to_slug Auto handling, smart auto_source_mode defaults, TOML persistence, config reference update
-
-**Success Criteria** (what must be TRUE):
-  1. `ProfileConfig(auto_source_mode="adf")` validates successfully; invalid values are rejected
-  2. `scan_pages()` routes "Auto" source to ADF path when `auto_source_mode="adf"` and flatbed when `"flatbed"`
-  3. Explicit sources (Flatbed, ADF, ADF Duplex) are completely unaffected by `auto_source_mode`
-  4. Auto-generated profiles for "Auto" source default to "adf" when no Flatbed source exists, "flatbed" otherwise
-  5. `source_to_slug("Auto")` returns `"auto-scan"`
-  6. Configuration reference docs list the `auto_source_mode` field with description
-
-### Phase 17: Fix Paperless upload error: datetime format and title type mismatch in API payload
-
-**Goal:** Fix two bugs in Paperless-ngx upload: datetime format sends full ISO 8601 instead of date-only YYYY-MM-DD, and form fields are incorrectly packed into httpx files= parameter instead of data=
-**Requirements**: D-01, D-02, D-03, D-04, D-05, D-06
-**Depends on:** Phase 16
-**Plans:** 1/1 plans complete
-
-Plans:
-- [x] 17-01-PLAN.md -- Fix datetime format to date-only, refactor upload_document to use data= + files= split, add tests
-
-**Success Criteria** (what must be TRUE):
-  1. Both pipeline call sites use `strftime("%Y-%m-%d")` instead of `isoformat()` for the created field
-  2. `upload_document()` sends form fields (title, created, correspondent, tags) via httpx `data=` parameter
-  3. `upload_document()` sends PDF binary via httpx `files=` parameter with application/pdf content type
-  4. `FileTypes` import is removed from paperless.py
-  5. All existing tests pass with no regressions
-  6. New test verifies form fields have no filename attribute (data= encoding) while PDF has filename attribute (files= encoding)
-
-### Phase 18: Automatic scanned page size detection or user-specified paper size to avoid capturing the full scanner bed
-
-**Goal:** Users can constrain the scan area to standard paper dimensions (A4, Letter, Legal, etc.) per profile via a `paper_size` setting, using SANE geometry options at the hardware level with a Pillow crop fallback when geometry is unavailable
-**Requirements**: PS-01, PS-02, PS-03, PS-04, PS-05, PS-06
-**Depends on:** Phase 17
-**Plans:** 2/2 plans complete
-
-Plans:
-- [x] 18-01-PLAN.md -- Paper sizes module, config field, data model, pipeline bridge, scanner geometry setting, and Pillow crop fallback with tests
-- [ ] 18-02-PLAN.md -- Configuration docs update and auto-profile default verification
-
-**Success Criteria** (what must be TRUE):
-  1. `ProfileConfig(paper_size="a4")` validates successfully; invalid values are rejected by Literal type
-  2. Default `paper_size` is `"full"` -- existing behavior completely unchanged (zero-change upgrade path)
-  3. `scan_pages()` sets SANE `br_x`/`br_y`/`tl_x`/`tl_y` geometry options when `paper_size` is not `"full"`
-  4. When scanner geometry options are unavailable, scanned images are cropped with Pillow to target paper dimensions
-  5. `paper_size` flows from `ProfileConfig` through `ScanSettings` to `scan_pages()` following the established `auto_source_mode` pattern
-  6. Auto-generated profiles default to `paper_size = "full"` and do not write it to TOML
-  7. Configuration reference documentation lists `paper_size` field with all preset values
-
-### Phase 19: Write user-facing docs including a full getting started section that walks a new user through setup and first scan using the Diataxis model
-
-**Goal:** Add a Getting Started top-level section (Quick Start, First CLI Scan, First Web UI Scan) to the docs site and weave auto_source_mode and paper_size documentation into existing how-to guides
-**Requirements**: DOC-GS-01, DOC-GS-02, DOC-GS-03, DOC-GS-04, DOC-FW-01, DOC-FW-02
-**Depends on:** Phase 18
-**Plans:** 2/2 plans complete
-
-Plans:
-- [x] 19-01-PLAN.md -- Getting Started pages: Quick Start (Docker-first), First Web UI Scan, First CLI Scan (relocated + refreshed tutorial)
-- [ ] 19-02-PLAN.md -- Feature weaving (auto_source_mode, paper_size into how-to guides), nav update, landing page, old tutorial cleanup, build validation
-
-**Success Criteria** (what must be TRUE):
-  1. `uv run mkdocs build --strict` exits 0 with no warnings or broken links
-  2. Getting Started is the first nav section after Home, with Quick Start, First CLI Scan, and First Web UI Scan pages
-  3. Quick Start prioritizes Docker + Web UI path with bare metal as tab alternative
-  4. First CLI Scan references Python 3.14 and pipx (not 3.12 or pip)
-  5. auto_source_mode documented in Configure Scan Profiles and Set Up ADF Duplex how-to guides
-  6. paper_size documented in Configure Scan Profiles how-to guide
-  7. Tutorials nav section removed; old tutorial file deleted
-  8. No screenshots in any documentation page
+---
+*Roadmap created: 2026-09-09*

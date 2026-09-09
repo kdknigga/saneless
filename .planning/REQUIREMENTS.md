@@ -212,13 +212,131 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (filled by roadmap) | | |
+| CI-01 | Phase 20 — CI Gate | Pending |
+| CI-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| CTR-01 | Phase 21 — Vocabulary and Contracts | Pending |
+| CTR-02 | Phase 21 — Vocabulary and Contracts | Pending |
+| CTR-03 | Phase 21 — Vocabulary and Contracts | Pending |
+| CTR-04 | Phase 21 — Vocabulary and Contracts | Pending |
+| CTR-05 | Phase 21 — Vocabulary and Contracts | Pending |
+| STOR-01 | Phase 22 — Job Store Hardening | Pending |
+| STOR-02 | Phase 22 — Job Store Hardening | Pending |
+| STOR-03 | Phase 22 — Job Store Hardening | Pending |
+| STOR-04 | Phase 22 — Job Store Hardening | Pending |
+| STOR-05 | Phase 22 — Job Store Hardening | Pending |
+| OUTC-01 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-02 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-03 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-04 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-05 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-06 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-07 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-08 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-09 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-10 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| SCNR-01 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-02 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-03 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-04 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-05 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-06 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-07 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-08 | Phase 24 — Scanner Truthfulness | Pending |
+| DPLX-01 | Phase 25 — Manual Duplex | Pending |
+| DPLX-02 | Phase 25 — Manual Duplex | Pending |
+| DPLX-03 | Phase 25 — Manual Duplex | Pending |
+| DPLX-04 | Phase 25 — Manual Duplex | Pending |
+| DPLX-05 | Phase 25 — Manual Duplex | Pending |
+| DPLX-06 | Phase 25 — Manual Duplex | Pending |
+| DPLX-07 | Phase 25 — Manual Duplex | Pending |
+| ROBU-01 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-02 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-03 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-04 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-05 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-06 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-07 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-08 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-09 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-10 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-11 | Phase 26 — Worker and Web Robustness | Pending |
+| CFG-01 | Phase 27 — Configuration Strictness | Pending |
+| CFG-02 | Phase 27 — Configuration Strictness | Pending |
+| CFG-03 | Phase 27 — Configuration Strictness | Pending |
+| CFG-04 | Phase 27 — Configuration Strictness | Pending |
+| CFG-05 | Phase 27 — Configuration Strictness | Pending |
+| CFG-06 | Phase 27 — Configuration Strictness | Pending |
+| CFG-07 | Phase 27 — Configuration Strictness | Pending |
+| CFG-08 | Phase 27 — Configuration Strictness | Pending |
+| CFG-09 | Phase 27 — Configuration Strictness | Pending |
+| CFG-10 | Phase 27 — Configuration Strictness | Pending |
+| CFG-11 | Phase 27 — Configuration Strictness | Pending |
+| EXC-01 | Phase 28 — Exception Translation | Pending |
+| EXC-02 | Phase 28 — Exception Translation | Pending |
+| EXC-03 | Phase 28 — Exception Translation | Pending |
+| EXC-04 | Phase 28 — Exception Translation | Pending |
+| EXC-05 | Phase 28 — Exception Translation | Pending |
+| HARD-01 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
+| HARD-02 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
+| HARD-03 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
+| HARD-04 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
+| HARD-05 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
+| APPL-01 | Phase 30 — Appliance Layer | Pending |
+| APPL-02 | Phase 30 — Appliance Layer | Pending |
+| APPL-03 | Phase 30 — Appliance Layer | Pending |
+| APPL-04 | Phase 30 — Appliance Layer | Pending |
+| APPL-05 | Phase 30 — Appliance Layer | Pending |
+| APPL-06 | Phase 30 — Appliance Layer | Pending |
+| APPL-07 | Phase 30 — Appliance Layer | Pending |
+| APPL-08 | Phase 30 — Appliance Layer | Pending |
+| APPL-09 | Phase 30 — Appliance Layer | Pending |
+| APPL-10 | Phase 30 — Appliance Layer | Pending |
+| APPL-11 | Phase 30 — Appliance Layer | Pending |
+| APPL-12 | Phase 30 — Appliance Layer | Pending |
+| DLVR-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-06 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-07 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-08 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-09 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-10 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-06 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| TEST-01 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| TEST-02 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| TEST-03 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| TEST-04 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| TEST-05 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| TEST-06 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| TEST-07 | Phase 20 — CI Gate | Pending |
+| SWP-01 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-02 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-03 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-04 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-05 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-06 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-07 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-08 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-09 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-10 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-11 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-12 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-13 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| SWP-14 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 
 **Coverage:**
 - v2.0 requirements: 118 total
-- Mapped to phases: 0
-- Unmapped: 118
+- Mapped to phases: 118
+- Unmapped: 0
+- Phases: 13 (Phase 20 through Phase 32)
 
 ---
 *Requirements defined: 2026-09-09*
-*Last updated: 2026-09-09 after milestone v2.0 research*
+*Last updated: 2026-09-09 after milestone v2.0 roadmap creation*
