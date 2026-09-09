@@ -54,9 +54,16 @@ Decimal phases appear between their surrounding integers in numeric order.
   1. A push with a ruff violation, a `ty` error, a `pyrefly` error, or a failing test produces a red GitHub Actions run that blocks merge
   2. A clean push produces a green run that exercises all five checks, and the run is visible on the pull request
   3. A test that hangs is killed by `pytest-timeout` with a per-test traceback instead of consuming the CI job's full time budget
-**Plans**: TBD
+**Plans**: 5 plans
 
-Note: zero source changes in this phase. The naming grep guard (CI-02) is deliberately deferred to Phase 31, where the rename it guards actually lands — adding it here would make CI red from its first run.
+Plans:
+- [ ] 20-01-PLAN.md — pytest-timeout hang guard, ci.yml + dependabot.yml, CONTRIBUTING.md
+- [ ] 20-02-PLAN.md — repo to private, .planning-stripped branch built locally, publication checkpoint
+- [ ] 20-03-PLAN.md — push master + filtered branch, open PR (never merged), green run, read check contexts
+- [ ] 20-04-PLAN.md — master branch ruleset via gh api + read-back, one seeded break proving red
+- [ ] 20-05-PLAN.md — ty/pyrefly bump, three suppressions removed with real fixes, green run on the PR
+
+Note: the earlier "zero source changes in this phase" note is SUPERSEDED by CONTEXT.md D-16 — bumping `ty` and `pyrefly` and fixing the resulting type errors is planned work in Phase 20 (Plan 05), landing as a separate, later commit than `ci.yml` per D-17. The naming grep guard (CI-02) is deliberately deferred to Phase 31, where the rename it guards actually lands — adding it here would make CI red from its first run.
 
 ### Phase 21: Vocabulary and Contracts
 **Goal**: The words the system uses about itself exist exactly once and are enforceable by the type checkers — one `JobState` enum, one active-state list, one state-to-label map, one `ErrorCategory`, one `classify_source()`, and typed pipeline results — with no behaviour change and the docs that named the old `"fallback"` string updated in-phase
