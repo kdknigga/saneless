@@ -15,11 +15,11 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 
 ### Contracts and Vocabulary
 
-- [ ] **CTR-01**: There is exactly one `JobState` enum, one active-state list, and one state-to-label map, shared by the worker, web templates, and CLI; `job.py` re-exports them so existing imports keep working [M-05]
+- [x] **CTR-01**: There is exactly one `JobState` enum, one active-state list, and one state-to-label map, shared by the worker, web templates, and CLI; `job.py` re-exports them so existing imports keep working [M-05]
 - [ ] **CTR-02**: The pipeline returns a typed `ScanResult` (outcome enum SUCCESS/FALLBACK/FAILED, pages scanned, pages removed as blank, pages uploaded, warning text) instead of a value nobody reads [C-03, N-38]
-- [ ] **CTR-03**: `upload_document` returns a typed `UploadResult`; the `"fallback"` magic string and every reader of it in `src/`, `tests/`, and `docs/` are deleted [C-03, N-38]
-- [ ] **CTR-04**: A single `classify_source()` in `scanner/base.py` returns a `SourceKind` (FLATBED, FEEDER, FEEDER_DUPLEX, AUTO, UNKNOWN) for any SANE source string, including "Automatic Document Feeder", "ADF Front", "ADF Duplex", and vendor variants, and is the only classification rule in the codebase [C-06, N-09]
-- [ ] **CTR-05**: `ErrorCategory` lives with `JobState` and is the input to a single user-message map; no template, route, or CLI output classifies errors by string matching [N-14, U-05]
+- [x] **CTR-03**: `upload_document` returns a typed `UploadResult`; the `"fallback"` magic string and every reader of it in `src/`, `tests/`, and `docs/` are deleted [C-03, N-38]
+- [x] **CTR-04**: A single `classify_source()` in `scanner/base.py` returns a `SourceKind` (FLATBED, FEEDER, FEEDER_DUPLEX, AUTO, UNKNOWN) for any SANE source string, including "Automatic Document Feeder", "ADF Front", "ADF Duplex", and vendor variants, and is the only classification rule in the codebase [C-06, N-09]
+- [x] **CTR-05**: `ErrorCategory` lives with `JobState` and is the input to a single user-message map; no template, route, or CLI output classifies errors by string matching [N-14, U-05]
 
 ### Job Store
 
@@ -214,11 +214,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 |-------------|-------|--------|
 | CI-01 | Phase 20 — CI Gate | Complete |
 | CI-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
-| CTR-01 | Phase 21 — Vocabulary and Contracts | Pending |
-| CTR-02 | Phase 21 — Vocabulary and Contracts | Pending |
-| CTR-03 | Phase 21 — Vocabulary and Contracts | Pending |
-| CTR-04 | Phase 21 — Vocabulary and Contracts | Pending |
-| CTR-05 | Phase 21 — Vocabulary and Contracts | Pending |
+| CTR-01 | Phase 21 — Vocabulary and Contracts | Complete |
+| CTR-02 | Phase 21 — Vocabulary and Contracts | Partial — typed `ScanResult` shipped; `ScanOutcome.FAILED` deferred to Phase 23 with the code path that produces it (D-07) |
+| CTR-03 | Phase 21 — Vocabulary and Contracts | Complete |
+| CTR-04 | Phase 21 — Vocabulary and Contracts | Complete |
+| CTR-05 | Phase 21 — Vocabulary and Contracts | Complete |
 | STOR-01 | Phase 22 — Job Store Hardening | Pending |
 | STOR-02 | Phase 22 — Job Store Hardening | Pending |
 | STOR-03 | Phase 22 — Job Store Hardening | Pending |
