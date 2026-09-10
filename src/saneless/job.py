@@ -602,6 +602,22 @@ class JobStore:
             rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
         return [self._row_to_job(row) for row in rows]
 
+    # The two declarations below carry no behaviour yet.  They exist in this
+    # commit because the project-wide `ty` hook resolves attributes across the
+    # whole tree, so a test naming a method that does not exist blocks the
+    # commit outright.  The RED/GREEN split that matters is the behavioural
+    # one, and it is intact: both raise, and every test of them is red.
+
+    @_locked
+    def list_pending(self) -> list[Job]:
+        """Raise until the GREEN commit gives this method its behaviour."""
+        raise NotImplementedError
+
+    @_locked
+    def fail_active_jobs(self, reason: str = "Interrupted by restart") -> int:
+        """Raise until the GREEN commit gives this method its behaviour."""
+        raise NotImplementedError
+
     @_locked
     def prune(self, max_age_days: int = 7, max_rows: int = 500) -> int:
         """
