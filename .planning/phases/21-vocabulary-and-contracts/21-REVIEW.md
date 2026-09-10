@@ -32,10 +32,18 @@ findings:
   warning: 5
   info: 6
   total: 12
-status: issues_found
+status: resolved
 ---
 
 # Phase 21: Code Review Report
+
+> **RESOLVED 2026-09-10.** CR-01 was reviewed with the user and the shipped
+> behaviour kept -- see `21-CONTEXT.md` D-11 (amended) and commit `e6de95e`.
+> WR-01..WR-05 and IN-02, IN-04, IN-05, IN-06 are fixed in commit `da52230`.
+> IN-01 (fallow public surfaces) and IN-03 (remaining hand-derived
+> classification in `generate_profiles`) require no change this phase: the
+> first is sanctioned by D-12/D-07, the second is Phase 24's explicit
+> deferral. Suite after fixes: 507 passed, 8 browser, all five checks clean.
 
 **Reviewed:** 2026-09-10
 **Depth:** deep
