@@ -60,8 +60,9 @@ class ScanOutcome(StrEnum):
 
     SUCCESS = "SUCCESS"
     FALLBACK = "FALLBACK"
-    # FAILED belongs to the ADF fallback work; it is added together with the
-    # code path that produces it, not ahead of it.
+    # FAILED belongs to the honest-outcomes work, which decides whether a
+    # failure is a returned outcome or a raised exception. It is added together
+    # with the code path that produces it, not ahead of it.
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
