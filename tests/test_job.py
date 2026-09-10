@@ -415,8 +415,8 @@ def _seed_queue(store: JobStore) -> list[str]:
     Create QUEUE_ROWS jobs whose created_at order is the reverse of insertion order.
 
     Backdating by raw SQL is what ``_insert_shuffled`` already does for the prune
-    cases.  It keeps the ordering deterministic without a sleep: D-32 leaves the
-    two existing ``time.sleep`` calls alone and this phase adds none.
+    cases.  It keeps the ordering deterministic without sleeping: D-32 leaves the
+    two existing sleeps in the prune tests alone, and this phase adds no third.
 
     Args:
         store: The store to write to.
