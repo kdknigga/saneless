@@ -60,6 +60,69 @@ another -- which is exactly how the ``thumbnail`` column came to exist in
 ``CREATE TABLE`` while no statement that needed it ever learned about it.
 """
 
+_COLUMN_LIST = ", ".join(_COLUMNS)
+"""The column list every statement in this module names, written out once.
+
+Derived from ``_COLUMNS`` so the two can never drift apart.
+"""
+
+_PLACEHOLDERS = ", ".join("?" for _ in _COLUMNS)
+"""One bound ``?`` per column, for the ``INSERT``.
+
+Derived from ``_COLUMNS`` for the same reason ``_COLUMN_LIST`` is: a column
+added to the tuple brings its placeholder along with it, so the two lists
+cannot fall out of step.
+"""
+
+_SELECT_JOBS = "SELECT"
+"""The ``SELECT`` verb, held under a name rather than written into a statement.
+
+Interpolating a column list is unavoidable -- SQL cannot parameterise an
+identifier -- and here it is safe: the only interpolated values are
+``_COLUMN_LIST`` and ``_PLACEHOLDERS``, both derived at import from the
+module-level ``_COLUMNS`` tuple literal, which no caller-supplied value can
+reach.  Every runtime value is a bound ``?`` parameter.  Holding the verb
+under a name is also what lets the statements below be built once at import
+instead of rebuilt on every call.
+"""
+
+_INSERT_JOBS = "INSERT INTO jobs"
+"""The ``INSERT`` verb and its target table, held under a name.
+
+The safety argument is ``_SELECT_JOBS``'s: the only interpolated values are
+``_COLUMN_LIST`` and ``_PLACEHOLDERS``, both module-level derivations that no
+caller can influence.
+"""
+
+_UPDATE_JOBS = "UPDATE jobs"
+"""The ``UPDATE`` verb and its target table, held under a name.
+
+Declared here so every statement in this module is assembled the same way.
+Nothing is built from it yet -- the ``UPDATE`` statements that will use it
+belong to the lock-and-transaction work, not to this change.  Its safety
+argument is ``_SELECT_JOBS``'s.
+"""
+
+_DELETE_JOBS = "DELETE FROM jobs"
+"""The ``DELETE`` verb and its target table, held under a name.
+
+Declared for the same reason as ``_UPDATE_JOBS`` and likewise used by nothing
+yet: the single-statement ``prune()`` that will use it is a later change.  Its
+safety argument is ``_SELECT_JOBS``'s.
+"""
+
+_SELECT_ALL = f"{_SELECT_JOBS} {_COLUMN_LIST} FROM jobs"
+"""Read every column of every job, in ``_COLUMNS`` order."""
+
+_SELECT_BY_ID = f"{_SELECT_ALL} WHERE id = ?"
+"""Read a single job by its primary key."""
+
+_SELECT_RECENT = f"{_SELECT_ALL} ORDER BY created_at DESC LIMIT ?"
+"""Read the newest jobs first, up to a bound limit."""
+
+_INSERT = f"{_INSERT_JOBS} ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS})"
+"""Write one job, naming every column so physical column order never matters."""
+
 _S3_COLUMNS: frozenset[str] = frozenset(
     {
         "id",
@@ -278,6 +341,50 @@ class JobStore:
             self._conn.close()
             raise
 
+    def _row_to_job(self, row: sqlite3.Row) -> Job:
+        """
+        Convert one jobs row into a Job.
+
+        The only row-to-``Job`` conversion in this module.  It is private and
+        undecorated deliberately: ``sqlite3`` connection context managers do
+        not nest, so an inner ``with conn:`` commits the outer transaction.
+        Shared logic therefore has to live in a helper a public method can
+        call without going through another public method.
+
+        Every access is by name.  A database migrated from the pre-``thumbnail``
+        shape by the old bare ``ALTER`` carries ``error_category`` last while a
+        freshly created one carries it sixth, so physical column order is not a
+        contract and no ordinal may be used here.  (``sqlite3.Row`` keys are
+        case-insensitive; nothing here relies on that, and nothing should.)
+
+        Args:
+            row: A jobs row fetched over this store's own connection.
+
+        Returns:
+            The job the row records.
+
+        """
+        return Job(
+            id=row["id"],
+            profile=row["profile"],
+            title=row["title"],
+            state=JobState(row["state"]),
+            error=row["error"],
+            error_category=(
+                ErrorCategory(row["error_category"]) if row["error_category"] else None
+            ),
+            tags=json.loads(row["tags"]),
+            correspondent=row["correspondent"],
+            thumbnail=row["thumbnail"],
+            created_at=datetime.fromisoformat(row["created_at"]),
+            outcome=ScanOutcome(row["outcome"]) if row["outcome"] else None,
+            pages_scanned=row["pages_scanned"],
+            pages_removed=row["pages_removed"],
+            pages_uploaded=row["pages_uploaded"],
+            warning=row["warning"],
+            owner_token=row["owner_token"],
+        )
+
     def create_job(
         self,
         profile: str,
@@ -300,32 +407,36 @@ class JobStore:
             The newly created Job instance.
 
         """
-        job = Job(
-            id=str(uuid.uuid4()),
-            profile=profile,
-            title=title,
-            tags=tags or [],
-            correspondent=correspondent,
-            thumbnail=thumbnail,
-        )
+        job_id = str(uuid.uuid4())
         self._conn.execute(
-            "INSERT INTO jobs (id, profile, title, state, error, error_category, "
-            "tags, correspondent, thumbnail, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            _INSERT,
             (
-                job.id,
-                job.profile,
-                job.title,
-                job.state.value,
-                job.error,
-                job.error_category.value if job.error_category else None,
-                json.dumps(job.tags),
-                job.correspondent,
-                job.thumbnail,
-                job.created_at.isoformat(),
+                job_id,
+                profile,
+                title,
+                JobState.PENDING.value,
+                None,  # error
+                None,  # error_category
+                json.dumps(tags or []),
+                correspondent,
+                thumbnail,
+                datetime.now(tz=UTC).isoformat(),
+                # The six result columns are written by nothing in this phase.
+                None,  # outcome
+                None,  # pages_scanned
+                None,  # pages_removed
+                None,  # pages_uploaded
+                None,  # warning
+                None,  # owner_token
             ),
         )
+        # Read the row back inside the same transaction, before the commit:
+        # the caller then gets the job the database holds rather than a second,
+        # hand-built copy of it, which is what keeps the row mapping in exactly
+        # one place.
+        row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
         self._conn.commit()
+        job = self._row_to_job(row)
         logger.debug("Created job %s: %s", job.id, job.title)
         return job
 
@@ -340,26 +451,8 @@ class JobStore:
             The Job if found, None otherwise.
 
         """
-        row = self._conn.execute(
-            "SELECT id, profile, title, state, error, error_category, "
-            "tags, correspondent, thumbnail, created_at "
-            "FROM jobs WHERE id = ?",
-            (job_id,),
-        ).fetchone()
-        if row is None:
-            return None
-        return Job(
-            id=row[0],
-            profile=row[1],
-            title=row[2],
-            state=JobState(row[3]),
-            error=row[4],
-            error_category=ErrorCategory(row[5]) if row[5] else None,
-            tags=json.loads(row[6]),
-            correspondent=row[7],
-            thumbnail=row[8],
-            created_at=datetime.fromisoformat(row[9]),
-        )
+        row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
+        return None if row is None else self._row_to_job(row)
 
     def update_state(
         self,
@@ -416,27 +509,8 @@ class JobStore:
             List of Job instances ordered by creation time descending.
 
         """
-        rows = self._conn.execute(
-            "SELECT id, profile, title, state, error, error_category, "
-            "tags, correspondent, thumbnail, created_at "
-            "FROM jobs ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-        return [
-            Job(
-                id=row[0],
-                profile=row[1],
-                title=row[2],
-                state=JobState(row[3]),
-                error=row[4],
-                error_category=ErrorCategory(row[5]) if row[5] else None,
-                tags=json.loads(row[6]),
-                correspondent=row[7],
-                thumbnail=row[8],
-                created_at=datetime.fromisoformat(row[9]),
-            )
-            for row in rows
-        ]
+        rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
+        return [self._row_to_job(row) for row in rows]
 
     def prune(self, max_age_days: int = 7, max_rows: int = 500) -> int:
         """
