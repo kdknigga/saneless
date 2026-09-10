@@ -754,6 +754,53 @@ class TestWorkerFlipTiming:
         finally:
             store.close()
 
+    def test_transition_event_is_clear_while_awaiting_flip(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The transition event is CLEAR for the whole AWAITING_FLIP window (CTR-01).
+
+        21-CONTEXT.md names the clear-before-write ordering as a concrete
+        instance of what "no behaviour change" means for this phase: the flip
+        window must read as "not busy" to the one-second web poll while a human
+        is being waited on.
+
+        This asserts the event state directly rather than only
+        wait_transition()'s return value.  Deleting the
+        `self._transition_event.clear()` in worker._status_cb makes this test
+        fail; it does not make test_wait_transition_returns_true fail, because
+        by then the event is already set from an earlier write.
+        """
+        default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline", _mock_manual_duplex_pipeline
+        )
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("duplex", "Flip Window Test")
+            worker.submit(job)
+            for _ in range(50):
+                time.sleep(0.05)
+                if _get(store, job.id).state == JobState.AWAITING_FLIP:
+                    break
+            assert _get(store, job.id).state == JobState.AWAITING_FLIP
+
+            # The job is parked on a human. Nothing is in flight, so the
+            # transition event must not be signalled.
+            assert worker.wait_transition(timeout=0.1) is False
+
+            worker.continue_flip()
+            assert worker.wait_transition(timeout=2.0) is True
+            worker.stop()
+        finally:
+            store.close()
+
     def test_wait_transition_timeout(
         self,
         mock_scanner: MagicMock,
@@ -1041,13 +1088,17 @@ class TestWorkerEnumDispatch:
 
             # The states applied are exactly the in-flight ones, in the order
             # the events were emitted.  SCANNING_REVERSE (no JobState) and
-            # DONE (terminal) contribute nothing.
+            # DONE (terminal) contribute nothing -- and neither does SCANNING,
+            # which the worker persisted before starting the pipeline and which
+            # run_pipeline merely re-announces as its first event.  Rewriting it
+            # would blank error/error_category a second time and signal a
+            # transition that did not occur.
             assert from_callback == [
-                JobState.SCANNING,
                 JobState.AWAITING_FLIP,
                 JobState.ASSEMBLING,
                 JobState.UPLOADING,
             ]
+            assert JobState.SCANNING not in from_callback
 
             # DONE is still written -- by the worker, after run_pipeline returned.
             assert states_seen[-1] is JobState.DONE

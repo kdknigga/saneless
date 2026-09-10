@@ -115,19 +115,42 @@ def _app(client: TestClient) -> FastAPI:
     return app
 
 
+def _adopt_as_current_job(client: TestClient, job_id: str) -> None:
+    """
+    Point the live worker at `job_id` without submitting real work.
+
+    This writes ScanWorker._current_job_id directly, which is private. It is the
+    single place in this module that does so, deliberately: the routes read the
+    current job through the worker, and driving it through the real submit path
+    would run a pipeline these rendering tests do not want.
+
+    Safe because no job is ever submitted here, so _process_job's `finally`
+    cannot race the assignment. If the worker's job tracking changes, this one
+    helper is the only thing that needs updating.
+    """
+    _app(client).state.worker._current_job_id = job_id
+
+
 def _job_in_state(client: TestClient, state: JobState) -> None:
     """Create a job, drive it to `state`, and make it the worker's current job."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Render Test")
     job_store.update_state(job.id, state, error="disk on fire")
-    _app(client).state.worker._current_job_id = job.id
+    _adopt_as_current_job(client, job.id)
 
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_history_cell_shows_the_shared_label(
     client: TestClient, state: JobState
 ) -> None:
-    """The history table renders `state_label` for every state (CTR-01)."""
+    """
+    Each state reaches `state_label` in the history table (CTR-01).
+
+    This pins the wiring -- which state is routed through which filter -- not
+    the label text, because the expectation is built from the same function the
+    template calls. The literal strings are pinned separately in
+    tests/test_vocabulary.py; the one below stands alone as a spot check.
+    """
     _job_in_state(client, state)
     response = client.get("/api/jobs/history")
     assert response.status_code == 200
@@ -155,7 +178,12 @@ def test_status_area_polls_only_while_active(
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_status_area_prose(client: TestClient, state: JobState) -> None:
-    """Each state renders its own status markup, byte for byte (UI-03, CTR-01)."""
+    """
+    Each state renders its own status markup (UI-03, CTR-01).
+
+    As above, the busy line is built from `progress_label`, so it pins routing
+    rather than text; the literal spot check below guards the text itself.
+    """
     _job_in_state(client, state)
     text = client.get("/api/jobs/current/status").text
 
@@ -222,3 +250,18 @@ def test_idle_page_button_and_status(client: TestClient) -> None:
     status = client.get("/api/jobs/current/status").text
     assert "<p>Ready to scan.</p>" in status
     assert 'hx-trigger="every 1s"' not in status
+
+
+def test_uploading_renders_its_literal_strings(client: TestClient) -> None:
+    """
+    UPLOADING renders its exact label and prose, independent of the filters.
+
+    The parametrised tests above build their expectations from `state_label` /
+    `progress_label`, so they would pass for any label text. This one hard-codes
+    the strings, so a change to either is caught here as well as in
+    tests/test_vocabulary.py.
+    """
+    _job_in_state(client, JobState.UPLOADING)
+    assert "Uploading" in client.get("/api/jobs/history").text
+    status = client.get("/api/jobs/current/status").text
+    assert '<p aria-busy="true">Uploading to paperless-ngx...</p>' in status

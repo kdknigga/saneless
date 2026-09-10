@@ -191,7 +191,7 @@ def _handle_duplex_mismatch(
     paperless: PaperlessClient,
     request: PipelineRequest,
     notify: Callable[[PipelineEvent], None],
-) -> str:
+) -> tuple[str, bool]:
     """
     Save and upload partial PDFs when duplex page counts mismatch.
 
@@ -206,7 +206,10 @@ def _handle_duplex_mismatch(
         notify: Status callback function.
 
     Returns:
-        Warning message describing the mismatch and recovery action.
+        A (warning, delivered_to_api) pair. The warning describes the mismatch
+        and recovery action; delivered_to_api is True only when BOTH partial
+        PDFs reached the paperless-ngx API. If either fell back to the consume
+        directory the caller must report the run as a fallback, not a success.
 
     """
     fronts, backs = passes
@@ -222,27 +225,28 @@ def _handle_duplex_mismatch(
     notify(PipelineEvent.UPLOADING)
     created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     title = request.title
-    paperless.upload_document(
+    fronts_result = paperless.upload_document(
         fronts_pdf,
         f"{title} (fronts)",
         request.tags,
         request.correspondent,
         created,
     )
-    paperless.upload_document(
+    backs_result = paperless.upload_document(
         backs_pdf,
         f"{title} (backs)",
         request.tags,
         request.correspondent,
         created,
     )
+    delivered = fronts_result.delivered_to_api and backs_result.delivered_to_api
 
     warning = (
         f"Page count mismatch: {len(fronts)} fronts, {len(backs)} backs. "
         f"Partial PDFs saved."
     )
     logger.warning(warning)
-    return warning
+    return warning, delivered
 
 
 def _interleave_duplex(
@@ -461,7 +465,7 @@ def run_pipeline(
                 notify,
             )
             if isinstance(duplex_result, tuple):
-                warning = _handle_duplex_mismatch(
+                warning, delivered = _handle_duplex_mismatch(
                     duplex_result,
                     tmp_path,
                     paperless,
@@ -476,7 +480,9 @@ def run_pipeline(
                 fronts, backs = duplex_result
                 mismatch_pages = len(fronts) + len(backs)
                 return ScanResult(
-                    outcome=ScanOutcome.SUCCESS,
+                    outcome=(
+                        ScanOutcome.SUCCESS if delivered else ScanOutcome.FALLBACK
+                    ),
                     pages_scanned=mismatch_pages,
                     pages_removed=0,
                     pages_uploaded=mismatch_pages,
@@ -509,9 +515,11 @@ def run_pipeline(
             created,
         )
 
-        # Step 5: Poll for result
+        # Step 5: Poll for result.  UploadResult.__post_init__ guarantees a
+        # task_uuid iff the document reached the API, so this test is exactly
+        # `delivered_to_api` and additionally narrows the id to str.
         task_uuid = upload_result.task_uuid
-        if upload_result.delivered_to_api and task_uuid is not None:
+        if task_uuid is not None:
             paperless.poll_task(
                 task_uuid,
                 timeout=settings.output.paperless_task_timeout,

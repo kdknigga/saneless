@@ -87,7 +87,7 @@ Together with ``ACTIVE_STATES`` this partitions ``JobState``: every member is in
 exactly one of the two sets.
 """
 
-BUSY_STATES = ACTIVE_STATES - {JobState.AWAITING_FLIP}
+BUSY_STATES: frozenset[JobState] = ACTIVE_STATES - {JobState.AWAITING_FLIP}
 """Job states where the machine itself is working.
 
 Derived from ``ACTIVE_STATES`` so the two can never drift apart.  The

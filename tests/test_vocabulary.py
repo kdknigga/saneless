@@ -39,26 +39,15 @@ class TestJobStateMembers:
     """JobState membership tests."""
 
     def test_job_state_has_exactly_seven_members(self) -> None:
-        """JobState declares exactly seven lifecycle members (CTR-01)."""
+        """
+        JobState declares exactly seven lifecycle members (CTR-01).
+
+        A count guard, not a name list: adding a member should fail the
+        parametrised completeness tests below -- which force a label and a
+        classification decision -- rather than a hand-written roster that only
+        records what the enum happened to contain when it was written.
+        """
         assert len(list(JobState)) == 7
-
-    def test_job_state_member_names(self) -> None:
-        """JobState names are the seven documented lifecycle states (CTR-01)."""
-        assert [state.name for state in JobState] == [
-            "PENDING",
-            "SCANNING",
-            "AWAITING_FLIP",
-            "ASSEMBLING",
-            "UPLOADING",
-            "DONE",
-            "ERROR",
-        ]
-
-    def test_job_state_has_no_future_phase_members(self) -> None:
-        """JobState does not yet carry FALLBACK or SCANNING_REVERSE (CTR-01)."""
-        names = {state.name for state in JobState}
-        assert "FALLBACK" not in names
-        assert "SCANNING_REVERSE" not in names
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:
@@ -70,14 +59,19 @@ class TestErrorCategoryMembers:
     """ErrorCategory membership tests."""
 
     def test_error_category_member_names(self) -> None:
-        """ErrorCategory names are the five documented categories (CTR-05)."""
-        assert [category.name for category in ErrorCategory] == [
+        """
+        ErrorCategory names are the five documented categories (CTR-05).
+
+        Compared as a set: declaration order is not part of any contract, and
+        pinning it would fail a harmless reordering.
+        """
+        assert {category.name for category in ErrorCategory} == {
             "FEEDER",
             "CONFIG",
             "SCANNER",
             "UPLOAD",
             "UNKNOWN",
-        ]
+        }
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
     def test_error_category_value_equals_name(self, category: ErrorCategory) -> None:
@@ -89,12 +83,13 @@ class TestScanOutcomeMembers:
     """ScanOutcome membership tests."""
 
     def test_scan_outcome_has_exactly_two_members(self) -> None:
-        """ScanOutcome is exactly SUCCESS and FALLBACK (CTR-02)."""
-        assert [outcome.name for outcome in ScanOutcome] == ["SUCCESS", "FALLBACK"]
+        """
+        ScanOutcome is exactly SUCCESS and FALLBACK (CTR-02).
 
-    def test_scan_outcome_has_no_failed_member(self) -> None:
-        """ScanOutcome carries no FAILED member in this phase (CTR-02)."""
-        assert "FAILED" not in {outcome.name for outcome in ScanOutcome}
+        FAILED is added together with the code path that produces it. This is a
+        membership guard, not an assertion that later work has not happened.
+        """
+        assert {outcome.name for outcome in ScanOutcome} == {"SUCCESS", "FALLBACK"}
 
     @pytest.mark.parametrize("outcome", list(ScanOutcome))
     def test_scan_outcome_value_equals_name(self, outcome: ScanOutcome) -> None:
