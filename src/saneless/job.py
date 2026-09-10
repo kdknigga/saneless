@@ -11,15 +11,155 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
+from saneless.exceptions import StorageError
 from saneless.vocabulary import ACTIVE_STATES, BUSY_STATES, ErrorCategory, JobState
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 __all__ = ["ErrorCategory", "Job", "JobState", "JobStore"]
 
 logger = logging.getLogger(__name__)
+
+_S3_COLUMNS: frozenset[str] = frozenset(
+    {
+        "id",
+        "profile",
+        "title",
+        "state",
+        "error",
+        "error_category",
+        "tags",
+        "correspondent",
+        "thumbnail",
+        "created_at",
+    }
+)
+"""The ten columns of the schema this project shipped before ``user_version``.
+
+A frozen historical shape, not a description of the current table: it is what
+migration step 2 requires to be present before it upgrades a pre-existing
+database.  It must never grow when a later step adds a column, or step 2 would
+start rejecting the very databases it had already upgraded.
+"""
+
+_V2_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("outcome", "TEXT"),
+    ("pages_scanned", "INTEGER"),
+    ("pages_removed", "INTEGER"),
+    ("pages_uploaded", "INTEGER"),
+    ("warning", "TEXT"),
+    ("owner_token", "TEXT"),
+)
+"""The six ``(name, SQL type)`` pairs migration step 2 adds to the jobs table.
+
+Every one is nullable and carries no ``DEFAULT``.  ``NULL`` means "never
+recorded", which is true of every row written before this migration and of
+every job that fails before the scanner opens; ``NOT NULL DEFAULT 0`` would
+backfill history with a measured zero that never happened.
+"""
+
+
+def _migrate_v1(conn: sqlite3.Connection, db_path: str) -> None:
+    """
+    Create the jobs table at the schema version 1 shape.
+
+    Args:
+        conn: Open connection to the job database.
+        db_path: Path the connection was opened on, for logging.
+
+    """
+    logger.debug("Creating the jobs table in %s at schema version 1", db_path)
+    conn.execute(
+        """CREATE TABLE jobs (
+            id TEXT PRIMARY KEY,
+            profile TEXT NOT NULL,
+            title TEXT NOT NULL,
+            state TEXT NOT NULL,
+            error TEXT,
+            error_category TEXT,
+            tags TEXT NOT NULL,
+            correspondent INTEGER,
+            thumbnail TEXT,
+            created_at TEXT NOT NULL
+        )"""
+    )
+
+
+def _migrate_v2(conn: sqlite3.Connection, db_path: str) -> None:
+    """
+    Add the six result columns to a jobs table at the version 1 shape.
+
+    Args:
+        conn: Open connection to the job database.
+        db_path: Path the connection was opened on, named in the failure.
+
+    Raises:
+        StorageError: If the jobs table is not at the version 1 shape.  The
+            check runs before the first ``ALTER``, so a rejected database is
+            left exactly as it was found.
+
+    """
+    present = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+    missing = _S3_COLUMNS - present
+    if missing:
+        msg = (
+            f"job database at {db_path} has an unsupported schema: "
+            f"missing column(s) {', '.join(sorted(missing))}"
+        )
+        raise StorageError(msg)
+    for name, sqltype in _V2_COLUMNS:
+        # Both interpolated values come from _V2_COLUMNS, a module-level
+        # literal no caller can reach, and SQL cannot parameterise a column
+        # name or a type name.
+        conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sqltype}")
+    logger.debug("Added the version 2 result columns to %s", db_path)
+
+
+_MIGRATIONS: tuple[Callable[[sqlite3.Connection, str], None], ...] = (
+    _migrate_v1,
+    _migrate_v2,
+)
+"""The ordered migration ladder, where ``index + 1`` is the version it produces.
+
+Both steps take the database path as well as the connection so the tuple stays
+homogeneous, even though only step 2 has anything to name in a failure.
+"""
+
+
+def _migrate(conn: sqlite3.Connection, db_path: str) -> None:
+    """
+    Run every outstanding migration step against a job database.
+
+    Args:
+        conn: Open connection to the job database.
+        db_path: Path the connection was opened on.
+
+    """
+    version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version == 0:
+        legacy = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'"
+        ).fetchone()
+        if legacy is not None:
+            # Nothing ever stamped user_version, so an existing jobs table is
+            # at version 1 rather than at nothing.
+            version = 1
+    for index in range(version, len(_MIGRATIONS)):
+        _MIGRATIONS[index](conn, db_path)
+        # A PRAGMA argument cannot be bound -- "PRAGMA user_version = ?" is a
+        # syntax error -- and index comes from range() over a module-level
+        # tuple, so no caller-supplied value reaches this string.
+        conn.execute(f"PRAGMA user_version = {index + 1}")
+        # Commit per step: a ladder that fails at step N leaves a valid
+        # database at version N - 1 rather than a half-applied one.
+        conn.commit()
 
 
 @dataclass
@@ -74,30 +214,24 @@ class JobStore:
     """
 
     def __init__(self, db_path: str = ":memory:") -> None:
-        """Initialize the job store with a SQLite database connection."""
+        """Open the job store, enable WAL, and run the migration ladder."""
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        # WAL has to be enabled before the connection switches to explicit
+        # transaction control: that switch opens a transaction immediately,
+        # and SQLite refuses a journal-mode change inside a transaction on a
+        # file database while silently reporting "memory" on ":memory:".
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS jobs (
-                id TEXT PRIMARY KEY,
-                profile TEXT NOT NULL,
-                title TEXT NOT NULL,
-                state TEXT NOT NULL,
-                error TEXT,
-                error_category TEXT,
-                tags TEXT NOT NULL,
-                correspondent INTEGER,
-                thumbnail TEXT,
-                created_at TEXT NOT NULL
-            )"""
-        )
-        self._conn.commit()
-        # Migration: add error_category column to existing databases
+        self._conn.autocommit = False
         try:
-            self._conn.execute("ALTER TABLE jobs ADD COLUMN error_category TEXT")
-            self._conn.commit()
-        except sqlite3.OperationalError:
-            pass  # Column already exists
+            _migrate(self._conn, db_path)
+        except Exception:
+            # Release the BEGIN DEFERRED the failed ladder still holds, and
+            # the file handle with it, before the caller sees the failure.
+            self._conn.rollback()
+            self._conn.close()
+            raise
 
     def create_job(
         self,
