@@ -14,12 +14,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 from saneless.exceptions import ConfigError, ScanError
 from saneless.pages import filter_empty_pages, generate_thumbnail
 from saneless.pdf import assemble_pdf
 from saneless.scanner.base import ScanSettings
+from saneless.vocabulary import JobState
 
 if TYPE_CHECKING:
     import threading
@@ -43,6 +44,47 @@ class PipelineEvent(StrEnum):
     ASSEMBLING = "ASSEMBLING"
     UPLOADING = "UPLOADING"
     DONE = "DONE"
+
+    @property
+    def job_state(self) -> JobState | None:
+        """
+        Return the persisted job state this event implies, if any.
+
+        ``None`` means this event changes no persisted state.  Today that is
+        exactly ``SCANNING_REVERSE``: the second pass of a manual-duplex scan
+        is reported to the operator as progress prose, but the job stays in
+        whichever state it was already in because there is no ``JobState``
+        twin for it.  A future member gains one; until then the seam is typed
+        and visible here rather than hidden in a caller's ``if``/``elif``.
+
+        Note that a non-``None`` result is not an instruction to write that
+        state: ``DONE`` is terminal and the worker writes it only after the
+        pipeline has returned.  Callers decide which states they apply.
+
+        Returns:
+            The matching JobState, or None when the event persists nothing.
+
+        Raises:
+            AssertionError: If the value is not a PipelineEvent member.
+
+        """
+        match self:
+            case PipelineEvent.SCANNING:
+                state = JobState.SCANNING
+            case PipelineEvent.AWAITING_FLIP:
+                state = JobState.AWAITING_FLIP
+            case PipelineEvent.SCANNING_REVERSE:
+                # No JobState twin: progress prose only, nothing persisted.
+                state = None
+            case PipelineEvent.ASSEMBLING:
+                state = JobState.ASSEMBLING
+            case PipelineEvent.UPLOADING:
+                state = JobState.UPLOADING
+            case PipelineEvent.DONE:
+                state = JobState.DONE
+            case _:
+                assert_never(self)
+        return state
 
 
 logger = logging.getLogger(__name__)
