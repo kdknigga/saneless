@@ -55,7 +55,7 @@ Task IDs are placeholders until the planner assigns them; the **Requirement**, *
 | 22-03-xx | 03 | 2 | STOR-01 | T-22-03 | Every public `JobStore` method carries the `@_locked` marker — reflective, no exemption list (D-12, D-20) | unit | `uv run pytest tests/test_job.py -k locked_coverage -q` | ❌ W0 | ⬜ pending |
 | 22-03-xx | 03 | 2 | STOR-01 | T-22-03 | No public method calls another public method — `ast` walk (D-24; guards the non-nesting transaction hazard) | unit | `uv run pytest tests/test_job.py -k no_public_self_call -q` | ❌ W0 | ⬜ pending |
 | 22-03-xx | 03 | 2 | STOR-01 | T-22-04 | 2 threads × 200 rounds: zero exceptions **and** the four data invariants (D-14, D-29) | unit | `uv run pytest tests/test_job.py -k stress -q` | ❌ W0 | ⬜ pending |
-| 22-04-xx | 04 | 3 | STOR-04 | — | Existing `test_prune_by_age` / `test_prune_by_count` / `test_prune_no_deletions` pass **unchanged** (D-16 equivalence evidence) | unit | `uv run pytest tests/test_job.py -k prune -q` | ✅ | ⬜ pending |
+| 22-04-xx | 04 | 3 | STOR-04 | — | Existing `test_prune_by_age` / `test_prune_by_count` / `test_prune_no_deletions` pass **unchanged** (D-16 equivalence evidence). Their `time.sleep(0.01)` at `:27`/`:79` stays — see D-32; no sleep gate in this phase | unit | `uv run pytest tests/test_job.py -k prune -q` | ✅ | ⬜ pending |
 | 22-04-xx | 04 | 3 | STOR-04 | T-22-05 | Shuffled-insert-order prune retains exactly the newest `max_rows` (D-30 — pins an undocumented SQLite plan) | unit | `uv run pytest tests/test_job.py -k prune_shuffled -q` | ❌ W0 | ⬜ pending |
 | 22-04-xx | 04 | 3 | STOR-04 | — | `prune()` count exact under a concurrent insert (`cursor.rowcount`, one statement) | unit | `uv run pytest tests/test_job.py -k prune_concurrent -q` | ❌ W0 | ⬜ pending |
 | 22-04-xx | 04 | 3 | STOR-04 | — | `_COLUMNS` is the sole column list; `_row_to_job` the sole mapping (source assertion + no duplicate SELECT list) | unit | `uv run pytest tests/test_job.py -k single_mapping -q` | ❌ W0 | ⬜ pending |
@@ -70,7 +70,7 @@ Task IDs are placeholders until the planner assigns them; the **Requirement**, *
 ## Wave 0 Requirements
 
 - [ ] `tests/test_job.py` — extend the existing 162-line file. **`test_jobstore_migration_adds_column` (line 134) must be REWRITTEN, not restyled** — it builds an S2 database, which under D-05 now correctly raises (D-28).
-- [ ] `tests/test_job.py` — a `tmp_path` file-backed fixture. The file has none today; every test uses `:memory:`, which is precisely why the WAL hazard (D-21) and the migration guard (D-05) are invisible to the current suite.
+- [ ] `tests/test_job.py` — a **named** `tmp_path` file-backed fixture. Note the file is *not* `:memory:`-only: `:134` already takes `tmp_path` and `:149` builds a file-backed store, and `tests/test_cli.py:392,411,522,812` add four more. That coverage is incidental, and the one instance in `test_job.py` is inside the test D-28 rewrites — so the WAL guard must be its own named test rather than relying on it.
 - [ ] S3 and S2 schema fixtures (helper functions constructing the `dc9b8af` and `5bd6158` shapes with raw `sqlite3`, not through `JobStore`).
 - [ ] No framework install needed — pytest, `pytest-timeout` and the config are live from Phase 20.
 
