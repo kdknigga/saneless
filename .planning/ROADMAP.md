@@ -32,7 +32,7 @@ Five orderings are load-bearing and must not be rearranged during planning:
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 20: CI Gate** - GitHub Actions runs lint, format, both type checkers, and the non-browser suite on every push; `pytest-timeout` guards against hangs (completed 2026-09-10)
-- [ ] **Phase 21: Vocabulary and Contracts** - One `JobState`, one label map, one `ErrorCategory`, one `classify_source()`, and typed `ScanResult`/`UploadResult`, with zero behaviour change
+- [x] **Phase 21: Vocabulary and Contracts** - One `JobState`, one label map, one `ErrorCategory`, one `classify_source()`, and typed `ScanResult`/`UploadResult`, with zero behaviour change (completed 2026-09-10)
 - [ ] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration
 - [ ] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI
 - [ ] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane
@@ -97,7 +97,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 21-05-PLAN.md — typed `UploadResult` (atomic across five stub sites) and `ScanResult`; sentinel deleted; the false `FALLBACK` doc claim corrected
+- [x] 21-05-PLAN.md — typed `UploadResult` (atomic across five stub sites) and `ScanResult`; sentinel deleted; the false `FALLBACK` doc claim corrected
 
 Waves: 1 = {21-01, 21-02} · 2 = {21-03, 21-04} · 3 = {21-05}
 
@@ -280,7 +280,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
-| 21. Vocabulary and Contracts | 4/5 | In Progress|  |
+| 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
 | 22. Job Store Hardening | 0/? | Not started | - |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
 | 24. Scanner Truthfulness | 0/? | Not started | - |
