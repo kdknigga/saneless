@@ -21,7 +21,7 @@ created: 2026-09-10
 | **Config file** | `pyproject.toml` (`[tool.pytest.ini_options]`) |
 | **Quick run command** | `uv run pytest tests/test_job.py -q` |
 | **Full suite command** | `uv run pytest -m "not browser" -q` |
-| **Estimated runtime** | ~27 s full suite (Phase 20 baseline, 332 tests); `tests/test_job.py` alone ~1 s |
+| **Estimated runtime** | ~28 s full suite (511 tests, 8 deselected — measured 2026-09-10; the "332" in Phase 20 CONTEXT.md is stale); `tests/test_job.py` alone ~1 s |
 
 **Per-test hang guard:** `timeout = 60`, `timeout_method = "signal"`. The 200-round concurrency test measured **0.28 s** — 0.5 % of budget.
 
