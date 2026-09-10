@@ -606,6 +606,58 @@ class TestSaneBackendADFScan:
         mock_dev._snap_impl.assert_called_once_with()
 
 
+class TestSaneBackendAutomaticDocumentFeeder:
+    """Routing for feeder names that contain no "adf" token (C-06 / D-11)."""
+
+    @staticmethod
+    def _options_with_feeder_source() -> list[tuple]:
+        """Return SANE options whose source constraint is the test backend's."""
+        return [
+            (
+                1,
+                "source",
+                "Scan source",
+                "Source desc",
+                3,
+                0,
+                1,
+                5,
+                ["Flatbed", "Automatic Document Feeder"],
+            ),
+        ]
+
+    def test_automatic_document_feeder_yields_all_pages(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """
+        Automatic Document Feeder uses multi_scan and returns every page (CTR-04).
+
+        The SANE ``test`` backend names its feeder "Automatic Document Feeder",
+        with no "adf" token anywhere in the string. The deleted string-sniffing
+        rule in ``sane_backend`` returned False for it, so the flatbed
+        ``start()``/``snap()`` branch ran and a ten-page stack produced exactly
+        one page. This asserts that ``multi_scan()`` is used instead -- that all
+        3 fake pages come back rather than 1, and that ``snap()`` is never
+        called. This is the C-06 fix and the phase's one authorised behaviour
+        change (D-11); it could not have passed before Phase 21.
+        """
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_with_feeder_source()
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+
+        settings = ScanSettings(
+            source="Automatic Document Feeder", resolution=300, mode="color"
+        )
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 3
+        for page in pages:
+            assert isinstance(page, Image.Image)
+        mock_dev._snap_impl.assert_not_called()
+
+
 class TestSaneBackendDuplex:
     """ADF Duplex scan tests."""
 
