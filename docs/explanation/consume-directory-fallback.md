@@ -63,4 +63,4 @@ If no `consume_dir` is configured, the upload error propagates and the scan job 
 
 This is a deliberate trade-off: saving the document without metadata is better than losing the document entirely. If metadata is critical, re-upload the document through paperless-ngx's web interface after it comes back online.
 
-**The job status shows FALLBACK.** When the consume directory fallback is used, the scan job's final status is `FALLBACK` rather than `DONE`, so users can identify which documents may need metadata corrections in paperless-ngx.
+**The job status does not distinguish the two paths.** When the consume directory fallback is used, the scan job's final status is `DONE`, the same status a direct API upload produces. Nothing in the job history marks the document as one whose title, tags, and correspondent were not applied, so use the paperless-ngx side to spot documents that arrived without metadata.
