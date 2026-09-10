@@ -25,6 +25,7 @@ Five orderings are load-bearing and must not be rearranged during planning:
 ## Phases
 
 **Phase Numbering:**
+
 - Integer phases (20, 21, 22...): Planned milestone work, continuing from v1.0's Phase 19
 - Decimal phases (22.1, 22.2): Urgent insertions (marked with INSERTED)
 
@@ -47,16 +48,20 @@ Decimal phases appear between their surrounding integers in numeric order.
 ## Phase Details
 
 ### Phase 20: CI Gate
+
 **Goal**: Every push and pull request is provably green — ruff, ruff format, ty, pyrefly, and the non-browser pytest suite run in GitHub Actions and a red run blocks merge — so every phase that follows can be trusted, with the contributing docs updated in-phase to describe the gate
 **Depends on**: Nothing (first phase of v2.0)
 **Requirements**: CI-01, TEST-07
 **Success Criteria** (what must be TRUE):
+
   1. A push with a ruff violation, a `ty` error, a `pyrefly` error, or a failing test produces a red GitHub Actions run that blocks merge
   2. A clean push produces a green run that exercises all five checks, and the run is visible on the pull request
   3. A test that hangs is killed by `pytest-timeout` with a per-test traceback instead of consuming the CI job's full time budget
+
 **Plans**: 5 plans
 
 Plans:
+
 - [x] 20-01-PLAN.md — pytest-timeout hang guard, ci.yml + dependabot.yml, CONTRIBUTING.md
 - [x] 20-02-PLAN.md — repo to private, .planning-stripped branch built locally, publication checkpoint
 - [x] 20-03-PLAN.md — push master + filtered branch, open PR (never merged), green run, read check contexts
@@ -66,85 +71,111 @@ Plans:
 Note: the earlier "zero source changes in this phase" note is SUPERSEDED by CONTEXT.md D-16 — bumping `ty` and `pyrefly` and fixing the resulting type errors is planned work in Phase 20 (Plan 05), landing as a separate, later commit than `ci.yml` per D-17. The naming grep guard (CI-02) is deliberately deferred to Phase 31, where the rename it guards actually lands — adding it here would make CI red from its first run.
 
 ### Phase 21: Vocabulary and Contracts
+
 **Goal**: The words the system uses about itself exist exactly once and are enforceable by the type checkers — one `JobState` enum, one active-state list, one state-to-label map, one `ErrorCategory`, one `classify_source()`, and typed pipeline results — with no behaviour change and the docs that named the old `"fallback"` string updated in-phase
 **Depends on**: Phase 20
 **Requirements**: CTR-01, CTR-02, CTR-03, CTR-04, CTR-05
 **Success Criteria** (what must be TRUE):
+
   1. A parametrised test proves every `JobState` member has a label and appears in exactly one active-state list, and the worker, web templates, and CLI all read them from the same module
   2. `classify_source()` returns the correct `SourceKind` for "Automatic Document Feeder", "ADF Front", "ADF Duplex", "Flatbed", "Auto", and vendor variants, and it is the only classification rule in the codebase
   3. The pipeline returns a typed `ScanResult` and `upload_document` returns a typed `UploadResult`; the `"fallback"` magic string is absent from `src/`, `tests/`, and `docs/`
   4. Existing imports from `job.py` still resolve (re-exports), and the whole suite passes unchanged
+
 **Plans**: 5 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 21-01-PLAN.md — `vocabulary.py` (enums, three state classifications, four total lookups behind `assert_never`) + `job.py` re-exports and `Job.is_active`/`is_busy`
 - [ ] 21-02-PLAN.md — `SourceKind` + `classify_source()` in `scanner/base.py`, both existing rules delegated; carries the phase's one authorised behaviour change (D-11 / C-06)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 21-03-PLAN.md — web rewiring: `_STATE_LABELS` and `humanize_state` deleted, filters re-backed, all state literals removed from the three templates
 - [ ] 21-04-PLAN.md — `PipelineEvent.job_state`, worker `_status_cb` collapse, CLI `_event_labels` deleted, `classify_error` moved off `ScanWorker`
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 21-05-PLAN.md — typed `UploadResult` (atomic across five stub sites) and `ScanResult`; sentinel deleted; the false `FALLBACK` doc claim corrected
 
 Waves: 1 = {21-01, 21-02} · 2 = {21-03, 21-04} · 3 = {21-05}
 
 ### Phase 22: Job Store Hardening
+
 **Goal**: The job store is safe under concurrency and can evolve its schema honestly — an `RLock` around every public method, a `PRAGMA user_version` migration ladder that opens a v1.0 database cleanly, and every result column this milestone will ever need added in one migration — with the storage docs updated in-phase
 **Depends on**: Phase 21
 **Requirements**: STOR-01, STOR-02, STOR-03, STOR-04, STOR-05
 **Success Criteria** (what must be TRUE):
+
   1. Two threads calling any mix of `JobStore` methods for 200 rounds complete with zero exceptions and no interleaved-transaction corruption
   2. A database file written by v1.0 opens, migrates through the ladder, and reports the current `user_version`; the bare `ALTER TABLE ... except: pass` is gone
   3. The job table carries `outcome`, `pages_scanned`, `pages_removed`, `pages_uploaded`, `warning`, and `owner_token` after a single migration step, even though most stay unused until later phases
   4. `fail_active_jobs()` marks every non-terminal job FAILED with a "server restarted" reason, and `list_pending()` returns queued jobs in creation order
   5. The row-to-`Job` mapping and its column list appear exactly once, and `prune()` reports its count from one statement
+
 **Plans**: TBD
 
 ### Phase 23: Honest Outcomes and Never Lose a Scan
+
 **Goal**: A job's recorded state is always the truth and a scanned document is never destroyed by a downstream failure — Paperless failures and timeouts raise, consume-directory delivery is recorded as `FALLBACK`, unrecoverable uploads preserve the PDF under a durable `data_dir/failed/` with a unique name and correct DPI — with every doc sentence that promised the old silent-DONE behaviour rewritten in-phase
 **Depends on**: Phase 22
 **Requirements**: OUTC-01, OUTC-02, OUTC-03, OUTC-04, OUTC-05, OUTC-06, OUTC-07, OUTC-08, OUTC-09, OUTC-10
 **Success Criteria** (what must be TRUE):
+
   1. A Paperless task ending FAILURE, or a poll that exceeds its monotonic deadline, records the job FAILED with the Paperless message — never DONE — and a PDF still exists on disk whose path is named in the job error
   2. A PDF that reaches only the consume directory records the job as `FALLBACK` with a warning, rendered distinctly from DONE in the status area, the history table, and `saneless jobs`
   3. When upload and consume-directory fallback both fail after N pages, the assembled PDF is in `<data_dir>/failed/` under a unique name and no page image or PDF was deleted on that path
   4. An A4 page scanned at 300 DPI produces a PDF with a 595 x 842 pt MediaBox, and two jobs with the same title produce two distinct PDF file names
   5. A parametrised end-to-end test drives the real worker and pipeline with a stub scanner through SUCCESS, Paperless FAILURE, TIMEOUT, consume-dir fallback, and duplex mismatch, asserting persisted state, outcome, page counts, and file preservation for each
+
 **Plans**: TBD
 
 Note: the preservation `try/except` must span both `upload_document` and `poll_task`. Wrapping only the upload call means a correct FAILURE raise unwinds the `TemporaryDirectory` and deletes the document this phase exists to protect.
 
 ### Phase 24: Scanner Truthfulness
+
 **Goal**: The scanner layer reports what actually happened — the single `classify_source()` drives every feeder decision, real SANE errors carry their real messages, geometry and DPI are read from the device rather than assumed, and the test doubles behave like python-sane 2.9.2 — with the scanner-discovery and ADF docs corrected in-phase
 **Depends on**: Phase 23
 **Requirements**: SCNR-01, SCNR-02, SCNR-03, SCNR-04, SCNR-05, SCNR-06, SCNR-07, SCNR-08
 **Success Criteria** (what must be TRUE):
+
   1. A device whose feeder is named "Automatic Document Feeder" scans a full stack, and auto-profiles never collapses two distinct feeder sources into one slug
   2. A first-page SANE error other than the exact "Document feeder out of documents" message surfaces as a `ScanError` carrying the SANE text, never as "No paper detected"
   3. The backend drops no pages on its own; blank-page removal happens only in the pipeline, only when the profile enables it, and manual-duplex page parity survives
   4. Geometry is written only when the device reports `tl_x`/`tl_y`/`br_x`/`br_y` with units read from the option descriptor; a test proves the Pillow crop fallback is reachable and uses the resolution read back after all options are set
   5. The rewritten fakes match real python-sane semantics (unknown option stored silently, bad value for a known option raises `_sane.error`, structurally wrong access raises `AttributeError`), and an opt-in integration test drives the real SANE `test` backend through a `SANE_CONFIG_DIR` scoped to `tmp_path` to pull ten pages from a long feeder name
+
 **Plans**: TBD
 
 ### Phase 25: Manual Duplex
+
 **Goal**: Manual duplex actually works and is honest about where it is — `duplex` is its own profile field, `source` is passed to SANE verbatim, exactly one place decides the strategy, a required `FlipCoordinator` with a timeout serves both CLI and web, and pass B is visible — with the ADF duplex how-to rewritten in-phase to stop documenting `source = "Manual Duplex"` as current
 **Depends on**: Phase 24
 **Requirements**: DPLX-01, DPLX-02, DPLX-03, DPLX-04, DPLX-05, DPLX-06, DPLX-07
 **Success Criteria** (what must be TRUE):
+
   1. A legacy config with `source = "Manual Duplex"` still loads and scans, is translated to `duplex = "manual"` at config load with a deprecation warning, and `source` is never inspected for strategy anywhere in the codebase
   2. `saneless scan` with a manual-duplex profile prompts "Flip the stack and press Enter" on stdin and completes a two-pass scan; starting manual duplex with no coordinator is refused before the scanner is opened
   3. A flip wait that exceeds the timeout fails the job with a clear message and releases the scanner for the next job
   4. During pass B the job reports `SCANNING_REVERSE`, Abort at the flip prompt cancels the job, and `wait_transition` no longer exists
   5. A write-then-load round trip proves auto-profiles always emits a `default` profile for flatbed-only, feeder-only, and mixed devices
+
 **Plans**: TBD
 
 ### Phase 26: Worker and Web Robustness
+
 **Goal**: The server survives everything the pipeline can throw at it and the browser always reflects reality — a guarded worker loop, 429 backpressure that is actually visible, blocking routes declared `def`, crash recovery at startup, and a server-owned Scan button served from vendored assets that work on an offline LAN — with the deployment and API docs updated in-phase
 **Depends on**: Phase 25
 **Requirements**: ROBU-01, ROBU-02, ROBU-03, ROBU-04, ROBU-05, ROBU-06, ROBU-07, ROBU-08, ROBU-09, ROBU-10, ROBU-11
 **Success Criteria** (what must be TRUE):
+
   1. A pipeline, job-store, or `prune` exception is logged with `exc_info` and the worker keeps serving the next job
   2. Submitting past a full queue returns 429 with `Retry-After` and a message the user can actually see in the status area, the event loop never blocks, and shutdown never blocks on the worker
   3. `/health` answers while a scan is running, and concurrent threadpool requests neither stampede the metadata cache nor mutate profiles mid-iteration
   4. Jobs left non-terminal by a crash are FAILED with a "server restarted" reason before the worker starts, and profiles are generated at startup from the config path that was actually loaded
   5. A browser test in CI with no CDN egress clicks Scan, waits for the terminal status, and asserts `#scan-btn` is enabled again with no duplicate `id="scan-btn"` in the DOM and `app.js` deleted
+
 **Plans**: TBD
 
 Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 must be paired with an explicit `htmx-config` override or it is invisible — reintroducing the exact C-10 symptom this phase fixes. Worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper here, not in Phase 32.
@@ -152,78 +183,96 @@ Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 m
 **UI hint**: yes
 
 ### Phase 27: Configuration Strictness
+
 **Goal**: A wrong config is caught at load with a message that names the right place, and a config rewrite is durable on the deployment the docs recommend — nested `extra="forbid"` with full-`loc` error rendering, atomic UTF-8 comment-preserving writes, `~`/XDG expansion, validated log level, `SecretStr` token — with the configuration reference and compose example updated in-phase
 **Depends on**: Phase 26
 **Requirements**: CFG-01, CFG-02, CFG-03, CFG-04, CFG-05, CFG-06, CFG-07, CFG-08, CFG-09, CFG-10, CFG-11
 **Success Criteria** (what must be TRUE):
+
   1. A typo'd key under `[paperless]` is rejected at load with a message naming `paperless`, the bad key, and the valid keys; a `--config` path that does not exist exits 2 naming the path
   2. `~` and `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` are honoured for config and data locations, an invalid `log_level` is rejected, and `-v` sets the effective level to DEBUG
   3. `auto-profiles --force` succeeds against the documented Docker Compose mount, replaces only the keys it generates, and leaves `default_tags` and hand-written profiles untouched
   4. The Paperless token never appears in `repr(settings)`, logs, or error messages, while the loaded config path and the env-sourced keys are logged at INFO on startup
   5. `saneless <subcommand> --help` works with no valid configuration file, and a blank title falls back to the profile's documented `title` key
+
 **Plans**: TBD
 
 Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship together. `os.replace` over a bind-mounted *file* returns `EBUSY`, so shipping the atomic write alone delivers a durable-write feature that is broken for the documented deployment.
 
 ### Phase 28: Exception Translation
+
 **Goal**: No third-party exception type escapes a module boundary and no user ever sees a traceback — SANE, httpx, all seven img2pdf error classes, and tomllib errors are wrapped at their call sites with their original messages, and the CLI prints one line with a non-zero exit code — with the troubleshooting docs updated in-phase
 **Depends on**: Phase 27
 **Requirements**: EXC-01, EXC-02, EXC-03, EXC-04, EXC-05
 **Success Criteria** (what must be TRUE):
+
   1. A parametrised test per third-party library proves each boundary raises the saneless exception type carrying the original message, never the third-party type
   2. `saneless scan` against a bad config, a broken scanner, an unreachable Paperless, and an unassemblable PDF each print one line and exit non-zero; a missing `python-sane` import prints an install hint
   3. A scan that produces zero pages says "No pages were scanned", and says "All pages were blank" only when detection actually removed them — never a bare `ValueError`
   4. A user abort at the flip prompt is recorded as a cancelled job, not a scanner failure, and every job failure is logged with `exc_info`
+
 **Plans**: TBD
 
 ### Phase 29: Geometry, Memory, and Timeouts
+
 **Goal**: A long scan is ordered, bounded in memory, and cancellable without wedging the process — pages spooled to disk with explicit ordered records, a shared ADF/flatbed timeout that waits for the cancelled read, and `sane.init()`/`sane.exit()` guarded as process-global — with the architecture explanation page updated in-phase
 **Depends on**: Phase 28
 **Requirements**: HARD-01, HARD-02, HARD-03, HARD-04, HARD-05
 **Success Criteria** (what must be TRUE):
+
   1. A 12-page scan with distinct per-page content comes out in order 1..12, duplex interleave reorders the page records rather than the filesystem, and peak memory stays bounded by roughly one page
   2. A mid-batch scanner error after N pages keeps those N pages and reports the error with the count
   3. A fake with a blocking read proves `close()` is never called while the read is blocked, and the process still exits — a stuck read never blocks `docker stop` or `pytest`
   4. The flatbed path enforces the same timeout and image validation as the ADF path
   5. `sane.init()` runs once per process behind a re-entry guard, `sane.exit()` runs at shutdown, and neither is reachable from a request path
+
 **Plans**: TBD
 
 ### Phase 30: Appliance Layer
+
 **Goal**: A non-technical household member can tell at a glance whether the appliance is healthy and what a failure means — one shared check list behind both `saneless doctor` and a cached status strip, page counts on every terminal job, plain-language errors with a next step, human profile labels, queue position, and an owner-only flip prompt — with help text and the docs for each new surface written in-phase
 **Depends on**: Phase 29
 **Requirements**: APPL-01, APPL-02, APPL-03, APPL-04, APPL-05, APPL-06, APPL-07, APPL-08, APPL-09, APPL-10, APPL-11, APPL-12
 **Success Criteria** (what must be TRUE):
+
   1. `saneless doctor` runs the shared checks (scanner, Paperless, profiles, fallback, data dir) and exits non-zero on a placeholder token or any other red check; the index page shows the same checks, refreshed on load and by a button
   2. The status strip stays fast with the scanner host unplugged and is skipped entirely while a scan is active, so it never contends with the exclusive scanner
   3. Every terminal job shows pages scanned, pages removed as blank, and pages uploaded; manual duplex shows front and back counts during pass B; a queued job says "Waiting for '<title>' to finish (N ahead of you)"
   4. Every user-facing error shows a plain-language message and a suggested next step, with the raw technical detail inside a collapsed disclosure
   5. Two browser contexts show the owner the Continue/Abort flip prompt (with confirmation on Abort) and the non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels with descriptions, feeder-first on sheet-fed scanners, and say so on the strip when the config mount is read-only
+
 **Plans**: TBD
 
 **UI hint**: yes
 
 ### Phase 31: Delivery, Identity, and Documentation Accuracy
+
 **Goal**: The project ships under its real name with a release path proven end to end and documentation that does not lie — `kdknigga/saneless` everywhere behind a CI grep guard, SHA-pinned actions with scoped permissions, container logging/port/user/`.dockerignore` fixes, and every one of review section 8's 34 false claims corrected as this milestone's final documentation audit
 **Depends on**: Phase 30
 **Requirements**: CI-02, DLVR-01, DLVR-02, DLVR-03, DLVR-04, DLVR-05, DLVR-06, DLVR-07, DLVR-08, DLVR-09, DLVR-10, DOCS-01, DOCS-02, DOCS-03, DOCS-04, DOCS-05, DOCS-06
 **Success Criteria** (what must be TRUE):
+
   1. No shipped file references `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, or `ghcr.io/kris-knigga/saneless`, and CI fails if one reappears (excluding `.planning/` and `site/`); the PyPI distribution name stays `saneless`
   2. A pre-release tag runs the entire release workflow green end to end, verified by an actual `pip install` and `docker pull` from a clean machine — not by reading the workflow file
   3. Container logs appear in `docker logs`, the example config / `EXPOSE` / `HEALTHCHECK` agree on one port, the container runs non-root from digest-pinned bases with a `WORKDIR`, and a `.dockerignore` allow-list keeps secrets, `.planning/`, and tests out of the build context
   4. All actions are SHA-pinned with Dependabot, every job has a `permissions:` block, a zizmor audit runs in CI, the wheel carries the LICENSE via PEP 639, and `saneless --version` prints the installed version
   5. A reader following README and the docs site hits no false claim: every row of review section 8 is either corrected or the behaviour now matches, `saneless scan` examples run as written, and the new "Which setup do I have?" and trust-model pages resolve from the quick-start prerequisites
+
 **Plans**: TBD
 
 ### Phase 32: Suite Hygiene and Minor Sweep
+
 **Goal**: The test suite is hermetic, fast, and meaningful, and the last correctness nits are gone — isolated `HOME`/`XDG`/cwd, no `time.sleep`, no assertion-free or duplicate tests, and the remaining N-01..N-45 sweep including the final one-implementation-each audit — with any doc sentence touched by a sweep item updated in-phase
 **Depends on**: Phase 31
 **Requirements**: TEST-01, TEST-02, TEST-03, TEST-04, TEST-05, TEST-06, SWP-01, SWP-02, SWP-03, SWP-04, SWP-05, SWP-06, SWP-07, SWP-08, SWP-09, SWP-10, SWP-11, SWP-12, SWP-13, SWP-14
 **Success Criteria** (what must be TRUE):
+
   1. The suite passes with `HOME` pointed at an empty directory and the working directory isolated, and no `time.sleep` remains anywhere in `tests/`
   2. A `pytest --cov` line diff proves no coverage was lost by the tests removed, and scanner and CLI tests assert what their names and docstrings claim
   3. The data-loss and negative-path tests all exist and pass: upload failure preserves the PDF, Paperless FAILURE maps to FAILED, the worker survives a raising `prune`, two-thread store access is clean, and the flip timeout fails the job
   4. No `# noqa` or `# type: ignore` remains in `src/` or `tests/`, `MAX_IMAGE_PIXELS` is set in one place, `configure_logging` is idempotent, and the job-db-path / slug-rule / active-state / label-map duplication inventory has one implementation each
   5. `devices --json --capabilities` pipes cleanly to `jq`, `serve` handles IPv6 hosts and `--port 0`, the metadata cache serves stale data on error with the cause logged, and no comment in `src/` cites a planning artefact
+
 **Plans**: TBD
 
 ## Progress
