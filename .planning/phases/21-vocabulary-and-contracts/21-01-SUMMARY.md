@@ -258,3 +258,10 @@ in the function's own docstring so a future reader does not "finish" it prematur
   push the frozensets into the template namespace.
 - Adding an eighth `JobState` member without a label arm fails both type checkers — proven,
   not assumed.
+
+## Self-Check: PASSED
+
+All four claimed files exist on disk (`src/saneless/vocabulary.py`,
+`tests/test_vocabulary.py`, `src/saneless/job.py`, `21-01-SUMMARY.md`) and all four claimed
+commits are present in `git log` (`46a1f80`, `643fa99`, `4b16de2`, `41a4b09`), on
+`worktree-agent-a236b096ca6eae625` atop base `51daabc`.
