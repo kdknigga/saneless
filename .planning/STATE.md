@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Prep for release
-status: ready_to_plan
-stopped_at: Phase 20 complete (5/5) — ready to discuss Phase 21
-last_updated: 2026-09-10T14:44:09.464Z
+status: planning
+stopped_at: Phase 21 context gathered
+last_updated: "2026-09-10T16:42:01.091Z"
 last_activity: 2026-09-10
 progress:
   total_phases: 13
@@ -238,6 +238,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
-Last session: 2026-09-10T14:23:22.153Z
-Stopped at: Completed 20-03-PLAN.md
-Resume file: None
+Last session: 2026-09-10T16:42:01.085Z
+Stopped at: Phase 21 context gathered
+Resume file: .planning/phases/21-vocabulary-and-contracts/21-CONTEXT.md
