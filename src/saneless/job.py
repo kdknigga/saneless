@@ -1,0 +1,312 @@
+"""
+Job model with state machine and SQLite persistence.
+
+Tracks scan jobs through their lifecycle (PENDING -> SCANNING ->
+ASSEMBLING -> UPLOADING -> DONE) with SQLite-backed persistence
+for crash recovery and history.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import sqlite3
+import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
+
+__all__ = ["ErrorCategory", "Job", "JobState", "JobStore"]
+
+logger = logging.getLogger(__name__)
+
+
+class JobState(StrEnum):
+    """States in the scan job lifecycle."""
+
+    PENDING = "PENDING"
+    SCANNING = "SCANNING"
+    AWAITING_FLIP = "AWAITING_FLIP"
+    ASSEMBLING = "ASSEMBLING"
+    UPLOADING = "UPLOADING"
+    DONE = "DONE"
+    ERROR = "ERROR"
+
+
+class ErrorCategory(StrEnum):
+    """Categories of errors for programmatic handling."""
+
+    FEEDER = "FEEDER"
+    CONFIG = "CONFIG"
+    SCANNER = "SCANNER"
+    UPLOAD = "UPLOAD"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class Job:
+    """
+    A scan job with metadata and state tracking.
+
+    Attributes:
+        id: Unique job identifier (UUID).
+        profile: Name of the scan profile to use.
+        title: Document title for paperless-ngx.
+        state: Current job lifecycle state.
+        error: Error message if state is ERROR.
+        error_category: Categorized error type for programmatic handling.
+        created_at: Timezone-aware creation timestamp.
+        tags: List of paperless-ngx tag IDs.
+        correspondent: Optional paperless-ngx correspondent ID.
+        thumbnail: Optional base64-encoded JPEG thumbnail string.
+
+    """
+
+    id: str
+    profile: str
+    title: str
+    state: JobState = JobState.PENDING
+    error: str | None = None
+    error_category: ErrorCategory | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(tz=UTC))
+    tags: list[int] = field(default_factory=list)
+    correspondent: int | None = None
+    thumbnail: str | None = None
+
+
+class JobStore:
+    """
+    SQLite-backed persistence for scan jobs.
+
+    Args:
+        db_path: Path to SQLite database file, or ":memory:" for
+            in-memory storage (default).
+
+    """
+
+    def __init__(self, db_path: str = ":memory:") -> None:
+        """Initialize the job store with a SQLite database connection."""
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS jobs (
+                id TEXT PRIMARY KEY,
+                profile TEXT NOT NULL,
+                title TEXT NOT NULL,
+                state TEXT NOT NULL,
+                error TEXT,
+                error_category TEXT,
+                tags TEXT NOT NULL,
+                correspondent INTEGER,
+                thumbnail TEXT,
+                created_at TEXT NOT NULL
+            )"""
+        )
+        self._conn.commit()
+        # Migration: add error_category column to existing databases
+        try:
+            self._conn.execute("ALTER TABLE jobs ADD COLUMN error_category TEXT")
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    def create_job(
+        self,
+        profile: str,
+        title: str,
+        tags: list[int] | None = None,
+        correspondent: int | None = None,
+        thumbnail: str | None = None,
+    ) -> Job:
+        """
+        Create and persist a new job.
+
+        Args:
+            profile: Scan profile name.
+            title: Document title.
+            tags: Optional list of tag IDs.
+            correspondent: Optional correspondent ID.
+            thumbnail: Optional base64-encoded JPEG thumbnail.
+
+        Returns:
+            The newly created Job instance.
+
+        """
+        job = Job(
+            id=str(uuid.uuid4()),
+            profile=profile,
+            title=title,
+            tags=tags or [],
+            correspondent=correspondent,
+            thumbnail=thumbnail,
+        )
+        self._conn.execute(
+            "INSERT INTO jobs (id, profile, title, state, error, error_category, "
+            "tags, correspondent, thumbnail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                job.id,
+                job.profile,
+                job.title,
+                job.state.value,
+                job.error,
+                job.error_category.value if job.error_category else None,
+                json.dumps(job.tags),
+                job.correspondent,
+                job.thumbnail,
+                job.created_at.isoformat(),
+            ),
+        )
+        self._conn.commit()
+        logger.debug("Created job %s: %s", job.id, job.title)
+        return job
+
+    def get_job(self, job_id: str) -> Job | None:
+        """
+        Fetch a job by ID.
+
+        Args:
+            job_id: The UUID string of the job.
+
+        Returns:
+            The Job if found, None otherwise.
+
+        """
+        row = self._conn.execute(
+            "SELECT id, profile, title, state, error, error_category, "
+            "tags, correspondent, thumbnail, created_at "
+            "FROM jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Job(
+            id=row[0],
+            profile=row[1],
+            title=row[2],
+            state=JobState(row[3]),
+            error=row[4],
+            error_category=ErrorCategory(row[5]) if row[5] else None,
+            tags=json.loads(row[6]),
+            correspondent=row[7],
+            thumbnail=row[8],
+            created_at=datetime.fromisoformat(row[9]),
+        )
+
+    def update_state(
+        self,
+        job_id: str,
+        state: JobState,
+        error: str | None = None,
+        error_category: ErrorCategory | None = None,
+    ) -> None:
+        """
+        Update the state (and optionally error) of a job.
+
+        Args:
+            job_id: The UUID string of the job.
+            state: New job state.
+            error: Optional error message (typically set with ERROR state).
+            error_category: Optional error category for programmatic handling.
+
+        """
+        self._conn.execute(
+            "UPDATE jobs SET state = ?, error = ?, error_category = ? WHERE id = ?",
+            (
+                state.value,
+                error,
+                error_category.value if error_category else None,
+                job_id,
+            ),
+        )
+        self._conn.commit()
+        logger.debug("Job %s -> %s", job_id, state.value)
+
+    def update_thumbnail(self, job_id: str, thumbnail: str) -> None:
+        """
+        Update the thumbnail of a job.
+
+        Args:
+            job_id: The UUID string of the job.
+            thumbnail: Base64-encoded JPEG thumbnail string.
+
+        """
+        self._conn.execute(
+            "UPDATE jobs SET thumbnail = ? WHERE id = ?",
+            (thumbnail, job_id),
+        )
+        self._conn.commit()
+
+    def list_recent(self, limit: int = 50) -> list[Job]:
+        """
+        Fetch the most recent jobs ordered newest-first.
+
+        Args:
+            limit: Maximum number of jobs to return.
+
+        Returns:
+            List of Job instances ordered by creation time descending.
+
+        """
+        rows = self._conn.execute(
+            "SELECT id, profile, title, state, error, error_category, "
+            "tags, correspondent, thumbnail, created_at "
+            "FROM jobs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [
+            Job(
+                id=row[0],
+                profile=row[1],
+                title=row[2],
+                state=JobState(row[3]),
+                error=row[4],
+                error_category=ErrorCategory(row[5]) if row[5] else None,
+                tags=json.loads(row[6]),
+                correspondent=row[7],
+                thumbnail=row[8],
+                created_at=datetime.fromisoformat(row[9]),
+            )
+            for row in rows
+        ]
+
+    def prune(self, max_age_days: int = 7, max_rows: int = 500) -> int:
+        """
+        Remove old jobs by age and count limits.
+
+        First deletes jobs older than max_age_days, then trims to
+        max_rows keeping the most recent entries.
+
+        Args:
+            max_age_days: Maximum age in days before a job is pruned.
+            max_rows: Maximum number of jobs to retain.
+
+        Returns:
+            Total number of jobs deleted.
+
+        """
+        before_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+        cutoff = (datetime.now(tz=UTC) - timedelta(days=max_age_days)).isoformat()
+        self._conn.execute(
+            "DELETE FROM jobs WHERE created_at < ?",
+            (cutoff,),
+        )
+
+        self._conn.execute(
+            "DELETE FROM jobs WHERE id NOT IN "
+            "(SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?)",
+            (max_rows,),
+        )
+        self._conn.commit()
+
+        after_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+        deleted = before_count - after_count
+        if deleted > 0:
+            logger.debug("Pruned %d old jobs", deleted)
+        return deleted
+
+    def close(self) -> None:
+        """Close the database connection."""
+        self._conn.close()

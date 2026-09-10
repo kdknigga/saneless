@@ -1,0 +1,32 @@
+{% set active_states = ["PENDING", "SCANNING", "ASSEMBLING", "UPLOADING", "AWAITING_FLIP"] %}
+<div id="status-area"
+     {% if job and job.state.value in active_states %}
+     hx-get="/api/jobs/current/status"
+     hx-trigger="every 1s"
+     hx-swap="outerHTML"
+     {% endif %}>
+  {% if job %}
+    {% if job.state.value == "PENDING" %}
+      <p aria-busy="true">Starting scan...</p>
+    {% elif job.state.value == "SCANNING" %}
+      <p aria-busy="true">Scanning...</p>
+    {% elif job.state.value == "AWAITING_FLIP" %}
+      {% include "partials/flip.html" %}
+    {% elif job.state.value == "ASSEMBLING" %}
+      <p aria-busy="true">Assembling PDF...</p>
+    {% elif job.state.value == "UPLOADING" %}
+      <p aria-busy="true">Uploading to paperless-ngx...</p>
+    {% elif job.state.value == "DONE" %}
+      <p class="status-done">&#10003; Done: {{ job.title }}</p>
+      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+    {% elif job.state.value == "ERROR" %}
+      <p role="alert" class="status-error">&#10007; Error: {{ job.error }}</p>
+      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+    {% endif %}
+    {% if job.thumbnail %}
+      <img src="data:image/jpeg;base64,{{ job.thumbnail }}" alt="First page preview" class="thumbnail">
+    {% endif %}
+  {% else %}
+    <p>Ready to scan.</p>
+  {% endif %}
+</div>

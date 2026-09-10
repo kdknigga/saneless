@@ -1,0 +1,104 @@
+/* saneless -- app-specific layout overrides for PicoCSS */
+
+/* Status area */
+#status-area {
+    margin: 1rem 0;
+    padding: 1rem;
+    border-left: var(--pico-border-width) solid var(--pico-primary);
+    border-radius: var(--pico-border-radius);
+}
+
+/* Status indicators */
+.status-done {
+    color: var(--pico-ins-color, green);
+}
+
+.status-error {
+    color: var(--pico-del-color, red);
+}
+
+/* Thumbnail preview */
+.thumbnail {
+    max-width: 200px;
+    max-height: 300px;
+    margin-top: 0.5rem;
+    border: 1px solid var(--pico-muted-border-color);
+    border-radius: var(--pico-border-radius);
+}
+
+/* Flip illustration */
+.flip-illustration {
+    display: flex;
+    justify-content: center;
+    gap: 2rem;
+    margin: 1rem 0;
+}
+
+.flip-illustration svg {
+    width: 120px;
+    height: auto;
+}
+
+/* Refresh buttons inline with labels */
+.refresh-btn {
+    display: inline;
+    width: auto;
+    padding: 0.25rem 0.5rem;
+    margin-left: 0.5rem;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    color: var(--pico-primary);
+}
+
+.refresh-btn:hover {
+    color: var(--pico-primary-hover);
+}
+
+/* Job history */
+article > .history-table-wrap {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+}
+
+/* Responsive: stack on mobile */
+@media (max-width: 576px) {
+    .flip-illustration {
+        flex-direction: column;
+        align-items: center;
+        gap: 1rem;
+    }
+
+    .thumbnail {
+        max-width: 100%;
+    }
+
+    #history-body td {
+        font-size: 0.875rem;
+        white-space: normal;
+        word-break: break-word;
+    }
+
+    .history-table-wrap table {
+        table-layout: fixed;
+        width: 100%;
+    }
+}
+
+/* htmx trigger elements that should not be visible */
+.htmx-hidden {
+    display: none;
+}
+
+/* Screen reader only -- visually hidden but accessible */
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+}

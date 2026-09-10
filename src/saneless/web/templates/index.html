@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block content %}
+
+{# --- Section 1: Scan Form --- #}
+<article>
+    <h2>Scan</h2>
+    <form hx-post="/api/scan"
+          hx-target="#status-area"
+          hx-swap="outerHTML">
+
+        <label for="profile-select">Profile</label>
+        <select name="profile" id="profile-select">
+            {% for p in profiles %}
+            <option value="{{ p }}">{{ p }}</option>
+            {% endfor %}
+        </select>
+
+        <label for="title-input">Title</label>
+        <input type="text" name="title" id="title-input"
+               placeholder="Document title (auto-generated if empty)">
+
+        <label for="tags-select">
+            Tags
+            <button type="button"
+                    hx-post="/api/cache/invalidate?resource=tags"
+                    hx-target="#tags-select"
+                    hx-swap="innerHTML"
+                    class="refresh-btn"
+                    title="Refresh tags"
+                    aria-label="Refresh tags">&#x21bb;<span class="sr-only">Refresh tags</span></button>
+        </label>
+        <select name="tags" id="tags-select" multiple
+                hx-get="/api/tags" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
+            {% for tag in tags %}
+            <option value="{{ tag.id }}">{{ tag.name }}</option>
+            {% endfor %}
+        </select>
+
+        <label for="correspondent-select">
+            Correspondent
+            <button type="button"
+                    hx-post="/api/cache/invalidate?resource=correspondents"
+                    hx-target="#correspondent-select"
+                    hx-swap="innerHTML"
+                    class="refresh-btn"
+                    title="Refresh correspondents"
+                    aria-label="Refresh correspondents">&#x21bb;<span class="sr-only">Refresh correspondents</span></button>
+        </label>
+        <select name="correspondent" id="correspondent-select"
+                hx-get="/api/correspondents" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
+            <option value="">No correspondent</option>
+            {% for c in correspondents %}
+            <option value="{{ c.id }}">{{ c.name }}</option>
+            {% endfor %}
+        </select>
+
+        <button type="submit" id="scan-btn"
+                {% if job and job.state.value in ["PENDING", "SCANNING", "AWAITING_FLIP", "ASSEMBLING", "UPLOADING"] %}disabled{% if job.state.value != "AWAITING_FLIP" %} aria-busy="true"{% endif %}{% endif %}>
+            {% if job and job.state.value == "AWAITING_FLIP" %}Waiting for flip&#8230;{% elif job and job.state.value in ["PENDING", "SCANNING", "ASSEMBLING", "UPLOADING"] %}Scanning&#8230;{% else %}Scan{% endif %}
+        </button>
+    </form>
+</article>
+
+{# --- Section 2: Status Area --- #}
+{% include "partials/status.html" %}
+
+{# --- Section 3: Job History --- #}
+<article>
+    <h2>Job History</h2>
+    <div class="history-table-wrap">
+        <table role="grid">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Profile</th>
+                    <th>Title</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            {% include "partials/history.html" %}
+        </table>
+    </div>
+</article>
+
+{% endblock %}

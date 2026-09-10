@@ -308,3 +308,8 @@ $RECYCLE.BIN/
 
 .serena/
 .playwright-mcp/
+
+saneless.toml
+
+CLAUDE.md
+.claude/worktrees/
