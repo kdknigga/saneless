@@ -85,11 +85,15 @@ with `git commit --no-verify` still works, but it no longer gets you anything: t
 same checks run again on the pull request, so skipping them locally only moves the
 failure later and makes it slower to find.
 
-## Everything goes through a pull request
+## How `master` is protected
 
-`master` is protected by a branch ruleset with no bypass actors. That means every
-change reaches `master` through a pull request with both required checks green --
-including the maintainer's own changes. There is no direct push path.
+`master` is protected by a branch ruleset requiring both `lint` and `test` to be
+green, and forbidding branch deletion and non-fast-forward pushes. Contributors reach
+`master` through a pull request with both required checks green.
+
+The repository administrator holds a bypass actor on this ruleset, so the maintainer
+retains an emergency path for the cases where the gate must be overridden. The ruleset
+requires green checks rather than requiring a pull request as such.
 
 Dependabot is configured in `.github/dependabot.yml` to bump the SHA-pinned GitHub
 Actions weekly. It watches all workflows in the repository, so it will also open pull
