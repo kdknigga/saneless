@@ -60,7 +60,7 @@ Plans:
 - [x] 20-01-PLAN.md — pytest-timeout hang guard, ci.yml + dependabot.yml, CONTRIBUTING.md
 - [x] 20-02-PLAN.md — repo to private, .planning-stripped branch built locally, publication checkpoint
 - [x] 20-03-PLAN.md — push master + filtered branch, open PR (never merged), green run, read check contexts
-- [ ] 20-04-PLAN.md — master branch ruleset via gh api + read-back, one seeded break proving red
+- [x] 20-04-PLAN.md — master branch ruleset via gh api + read-back, one seeded break proving red
 - [ ] 20-05-PLAN.md — ty/pyrefly bump, three suppressions removed with real fixes, green run on the PR
 
 Note: the earlier "zero source changes in this phase" note is SUPERSEDED by CONTEXT.md D-16 — bumping `ty` and `pyrefly` and fixing the resulting type errors is planned work in Phase 20 (Plan 05), landing as a separate, later commit than `ci.yml` per D-17. The naming grep guard (CI-02) is deliberately deferred to Phase 31, where the rename it guards actually lands — adding it here would make CI red from its first run.
@@ -221,7 +221,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 20. CI Gate | 3/5 | In Progress|  |
+| 20. CI Gate | 4/5 | In Progress|  |
 | 21. Vocabulary and Contracts | 0/? | Not started | - |
 | 22. Job Store Hardening | 0/? | Not started | - |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
