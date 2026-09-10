@@ -67,6 +67,7 @@ class MockSaneDev:
         ]
         self._multi_scan_error: BaseException | None = None
         self._snap_impl: MagicMock | None = None
+        self._options_impl: list[tuple] | None = None
 
     def start(self) -> None:
         """Initiate SANE scan cycle (no-op in mock)."""
@@ -94,11 +95,13 @@ class MockSaneDev:
 
     def get_options(self) -> list[tuple]:
         """
-        Return sample SANE option tuples.
+        Return sample SANE option tuples, or _options_impl if set.
 
         SANE option format:
         (index, name, title, desc, type, unit, size, cap, constraint)
         """
+        if self._options_impl is not None:
+            return self._options_impl
         return [
             (
                 1,
@@ -703,7 +706,7 @@ class TestAutoSourceRouting:
         """scan_pages with source='Auto' and auto_source_mode='adf' uses ADF path."""
         # Add "Auto" to available sources
         mock_dev = mock_sane_module._mock_dev
-        mock_dev.get_options = lambda: [  # type: ignore[assignment]
+        mock_dev._options_impl = [
             (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", "Auto"]),
             (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
             (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
@@ -720,7 +723,7 @@ class TestAutoSourceRouting:
     ) -> None:
         """scan_pages with source='Auto' and auto_source_mode='flatbed' uses flatbed path."""
         mock_dev = mock_sane_module._mock_dev
-        mock_dev.get_options = lambda: [  # type: ignore[assignment]
+        mock_dev._options_impl = [
             (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", "Auto"]),
             (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
             (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
