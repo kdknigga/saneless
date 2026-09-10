@@ -90,6 +90,56 @@ PRUNE_MAX_AGE_DAYS = 3650
 PRUNE_MAX_ROWS = 1_000_000
 """A prune row bound generous enough that the stress rounds delete nothing."""
 
+SHUFFLE_ROWS = 60
+"""Jobs the shuffled-order prune tests insert."""
+
+SHUFFLE_KEEP = 30
+"""Jobs the shuffled-order prune tests ask prune() to retain."""
+
+SHUFFLE_EXPIRED = 20
+"""Rows the second shuffled-order case backdates past its age cutoff."""
+
+SHUFFLE_STRIDE = 37
+"""The step of the fixed permutation the shuffled-order tests apply.
+
+Coprime with SHUFFLE_ROWS, so ``(index * SHUFFLE_STRIDE) % SHUFFLE_ROWS`` walks
+every rank exactly once and no two rows share a created_at.  Written out rather
+than drawn from ``random``: an ordering test that shuffles differently on every
+run cannot be debugged when it fails, and a flaky ordering test is worse than
+no ordering test at all.
+"""
+
+SHUFFLE_AGE_DAYS = 7
+"""The age cutoff the second shuffled-order case prunes against."""
+
+SHUFFLE_OLD_DAYS = 30
+"""How far back the backdated rows are placed -- well past SHUFFLE_AGE_DAYS."""
+
+SHUFFLE_RECENT_HOURS = 2
+"""How far back the non-expired rows start, before their per-rank minute offsets."""
+
+SAFE_AGE_DAYS = 365
+"""An age bound generous enough that a prune under it deletes nothing by age."""
+
+CONCURRENT_ROWS = 20
+"""Jobs the concurrent prune tests insert before racing a create_job against prune."""
+
+CONCURRENT_MAX_ROWS = 5
+"""The row cap the concurrent prune tests prune against -- below CONCURRENT_ROWS."""
+
+RACERS = 2
+"""Threads the concurrent prune test starts on its barrier: one prune, one insert."""
+
+TRANSACTION_VERBS = frozenset(
+    {"BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE"}
+)
+"""Leading SQL verbs that open or close a transaction rather than touch a row.
+
+``Connection.set_trace_callback`` reports the implicit BEGIN and COMMIT that
+``with conn:`` issues alongside the statements the method itself runs.  These
+are what the single-statement assertion filters out.
+"""
+
 
 def _build_s3_schema(db_path: str) -> None:
     """Write a jobs table at the dc9b8af (S3) ten-column shape holding one row."""
@@ -217,6 +267,93 @@ def _read_schema_raw(db_path: str) -> tuple[int, list[str]]:
         return _read_schema(conn)
     finally:
         conn.close()
+
+
+def _shuffled_stamps(count: int, expired: int) -> list[datetime]:
+    """
+    Build count ascending UTC timestamps, the oldest ``expired`` of them long past.
+
+    Every value is UTC, so its ISO-8601 rendering ends ``+00:00``.  Both the
+    prune cutoff comparison and its ORDER BY are lexicographic over these
+    strings and are correct only under that uniformity.
+
+    Args:
+        count: How many timestamps to build.
+        expired: How many of the oldest sit beyond SHUFFLE_AGE_DAYS.
+
+    Returns:
+        The timestamps in ascending order, index 0 being the oldest.
+
+    """
+    now = datetime.now(tz=UTC)
+    old_base = now - timedelta(days=SHUFFLE_OLD_DAYS)
+    recent_base = now - timedelta(hours=SHUFFLE_RECENT_HOURS)
+    return [
+        (old_base if rank < expired else recent_base) + timedelta(minutes=rank)
+        for rank in range(count)
+    ]
+
+
+def _insert_shuffled(store: JobStore, count: int, expired: int) -> list[str]:
+    """
+    Insert count jobs whose created_at order disagrees with their insertion order.
+
+    Rows are written in rowid order and then backdated by raw SQL to the rank a
+    fixed permutation assigns them, so a scan in table order visits them in an
+    order that has nothing to do with created_at.
+
+    Args:
+        store: The store to write to.
+        count: How many jobs to insert.
+        expired: How many of them are backdated past SHUFFLE_AGE_DAYS.
+
+    Returns:
+        The job titles in ascending created_at order, index 0 being the oldest.
+
+    """
+    stamps = _shuffled_stamps(count, expired)
+    ranked = [""] * count
+    for index in range(count):
+        title = f"Job {index:02d}"
+        job = store.create_job(profile="default", title=title)
+        rank = (index * SHUFFLE_STRIDE) % count
+        ranked[rank] = title
+        store._conn.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?",
+            (stamps[rank].isoformat(), job.id),
+        )
+    store._conn.commit()
+    return ranked
+
+
+def _barrier_prune(store: JobStore, barrier: threading.Barrier) -> int:
+    """Wait at the barrier, then prune, returning the count prune reported."""
+    barrier.wait()
+    return store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=CONCURRENT_MAX_ROWS)
+
+
+def _barrier_create(store: JobStore, barrier: threading.Barrier) -> None:
+    """Wait at the barrier, then insert one job into the store prune is pruning."""
+    barrier.wait()
+    store.create_job(profile="default", title="Racer")
+
+
+def _row_touching(traced: list[str]) -> list[str]:
+    """
+    Filter a trace log down to the statements that touch rows.
+
+    Args:
+        traced: Every statement the connection's trace callback reported.
+
+    Returns:
+        Those whose leading verb is not transaction control.
+
+    """
+    return [
+        text
+        for text in traced
+        if (words := text.split()) and words[0].upper() not in TRANSACTION_VERBS
+    ]
 
 
 def test_list_recent() -> None:
@@ -659,4 +796,107 @@ class TestLockDiscipline:
                 assert isinstance(listed_job.state, JobState)
                 assert isinstance(listed_job.tags, list)
         finally:
+            store.close()
+
+
+class TestPruneSingleStatement:
+    """Prune's single-statement shape: shuffled ordering and the count's provenance."""
+
+    def test_prune_shuffled_order_retains_the_newest_rows(self) -> None:
+        """Prune keeps exactly the newest max_rows under shuffled insertion (STOR-04)."""
+        # A pin, not a discriminator.  The single statement is correct only
+        # because SQLite materialises the IN (SELECT ... ORDER BY ... LIMIT ?)
+        # right-hand side as a LIST SUBQUERY before the outer scan begins, and
+        # sqlite.org/isolation.html explicitly declines to guarantee that.  This
+        # machine ships libsqlite 3.34.1 while CI and Docker ship newer, so this
+        # test is what makes a future plan change loud instead of silent.
+        store = JobStore()
+        try:
+            ranked = _insert_shuffled(store, SHUFFLE_ROWS, expired=0)
+
+            deleted = store.prune(max_age_days=SAFE_AGE_DAYS, max_rows=SHUFFLE_KEEP)
+
+            assert deleted == SHUFFLE_ROWS - SHUFFLE_KEEP
+            survivors = {job.title for job in store.list_recent(limit=SHUFFLE_ROWS)}
+            # The identity of the survivors, not merely how many there are: a
+            # re-evaluating plan could keep the wrong rows and still land on the
+            # right count.
+            assert survivors == set(ranked[SHUFFLE_ROWS - SHUFFLE_KEEP :])
+        finally:
+            store.close()
+
+    def test_prune_shuffled_order_with_an_age_cutoff_active(self) -> None:
+        """Prune unions the age and row-cap predicates correctly (STOR-04)."""
+        store = JobStore()
+        try:
+            ranked = _insert_shuffled(store, SHUFFLE_ROWS, expired=SHUFFLE_EXPIRED)
+
+            deleted = store.prune(max_age_days=SHUFFLE_AGE_DAYS, max_rows=SHUFFLE_KEEP)
+
+            assert deleted == SHUFFLE_ROWS - SHUFFLE_KEEP
+            # Both predicates bit: more rows died than the age cutoff alone
+            # accounts for.  The equivalence argument turns on the age-expired
+            # set always being a prefix of the created_at ordering, so this is
+            # the case that exercises the union rather than either half.
+            assert deleted > SHUFFLE_EXPIRED
+            survivors = {job.title for job in store.list_recent(limit=SHUFFLE_ROWS)}
+            assert survivors == set(ranked[SHUFFLE_ROWS - SHUFFLE_KEEP :])
+        finally:
+            store.close()
+
+    def test_prune_concurrent_insert_cannot_corrupt_the_count(self) -> None:
+        """A create_job racing prune cannot make the returned count wrong (STOR-04)."""
+        store = JobStore()
+        try:
+            for index in range(CONCURRENT_ROWS):
+                store.create_job(profile="default", title=f"Row {index:02d}")
+            before = len(store.list_recent(limit=CONCURRENT_ROWS * 2))
+            barrier = threading.Barrier(RACERS, timeout=BARRIER_TIMEOUT)
+
+            with ThreadPoolExecutor(max_workers=RACERS) as pool:
+                pruner = pool.submit(_barrier_prune, store, barrier)
+                creator = pool.submit(_barrier_create, store, barrier)
+                # Future.result() re-raises the worker's exception here; a raw
+                # threading.Thread would bury it in threading.excepthook and
+                # this test would pass green on a broken store.
+                deleted = pruner.result()
+                creator.result()
+
+            after = len(store.list_recent(limit=CONCURRENT_ROWS * 2))
+            # The old before-minus-after arithmetic could be forced to -1.
+            assert deleted >= 0
+            assert deleted <= before
+            # Exactly one insert and one prune ran, in one order or the other,
+            # so this reconciliation holds under both interleavings.
+            assert after == before + 1 - deleted
+        finally:
+            store.close()
+
+    def test_prune_concurrent_window_between_count_and_delete_is_closed(self) -> None:
+        """Prune runs one row-touching statement, leaving no race window (STOR-04)."""
+        store = JobStore()
+        try:
+            for index in range(CONCURRENT_ROWS):
+                store.create_job(profile="default", title=f"Row {index:02d}")
+            traced: list[str] = []
+            store._conn.set_trace_callback(traced.append)
+
+            deleted = store.prune(
+                max_age_days=SAFE_AGE_DAYS, max_rows=CONCURRENT_MAX_ROWS
+            )
+
+            statements = _row_touching(traced)
+            assert deleted == CONCURRENT_ROWS - CONCURRENT_MAX_ROWS
+            # The race the review recorded needed a gap between two counting
+            # reads for a concurrent insert to land in.  One statement is not a
+            # smaller gap; it is no gap, which is why the count is exact rather
+            # than merely serialised behind the store's lock.
+            assert len(statements) == 1, (
+                f"prune() ran {len(statements)} row-touching statements: "
+                f"{'; '.join(statements)}"
+            )
+            assert statements[0].lstrip().upper().startswith("DELETE")
+            assert "COUNT(" not in statements[0].upper()
+        finally:
+            store._conn.set_trace_callback(None)
             store.close()
