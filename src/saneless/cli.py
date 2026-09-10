@@ -29,6 +29,7 @@ from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
+from .vocabulary import progress_label
 from .web.app import create_app
 
 __all__ = ["_truncate", "cli"]
@@ -107,19 +108,19 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         settings.paperless.consume_dir,
     )
 
-    _event_labels: dict[PipelineEvent, str] = {
-        PipelineEvent.SCANNING: "Scanning...",
-        PipelineEvent.AWAITING_FLIP: "Awaiting flip...",
-        PipelineEvent.SCANNING_REVERSE: "Scanning reverse sides...",
-        PipelineEvent.ASSEMBLING: "Assembling PDF...",
-        PipelineEvent.UPLOADING: "Uploading to paperless-ngx...",
-    }
-
     def status_callback(event: PipelineEvent) -> None:
-        if event == PipelineEvent.DONE:
+        state = event.job_state
+        if event is PipelineEvent.DONE:
             click.echo(f"Done: {title}")
+        elif state is None:
+            # SCANNING_REVERSE is the only event that persists no state, so it
+            # is the only one with no progress_label to read.  When it gains a
+            # JobState twin this branch collapses into the general one below.
+            # Branching on `state is None` rather than on the member name is
+            # also what lets the type checkers accept progress_label(state).
+            click.echo("Scanning reverse sides...")
         else:
-            click.echo(_event_labels.get(event, str(event)))
+            click.echo(progress_label(state))
 
     try:
         request = PipelineRequest(
