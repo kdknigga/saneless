@@ -936,7 +936,20 @@ def test_two_threads_200_rounds() -> None:
 | A6 | `frozenset` iteration order instability is worth sorting around | Pitfall 5 | Only reproducibility, never correctness. Cheap to do; not verified by experiment |
 | A7 | `StorageError(SanelessError)` is the right home for the D-05 guard, and Phase 28 will accept rather than re-type it | Mechanic 3 | Phase 28 renames or re-parents it. Low cost either way; the alternative (`ConfigError`) is worse |
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> **All five were resolved after this document was written.** The binding answers live in
+> `22-CONTEXT.md` § "Post-research amendments" and are implemented by the plans. Recorded
+> here so nobody re-opens a settled question from this file.
+>
+> | # | Resolution | Where |
+> |---|---|---|
+> | 1 | Lock-only `@_locked`; `with self._conn:` moves into method bodies | **D-20** — plan 22-03 |
+> | 2 | Module-constant SQL form, with a safety comment. Re-confirmed by the user after a false "tree's first carve-out" argument was corrected | **D-22** — plan 22-01 |
+> | 3 | Keep WAL, set before the autocommit flip, named file-backed test | **D-21** — plan 22-01 |
+> | 4 | Yes — `fail_active_jobs() -> int` from `cursor.rowcount` | Claude's Discretion — plan 22-05 |
+> | 5 | Yes — add the `ast` test; it is load-bearing, not stylistic | **D-24** — plan 22-03 |
+
 
 1. **Does the planner accept the lock-only `@_locked`, diverging from D-12's parenthetical?**
    - What we know: the literal reading is *impossible* — `with self._conn: self._conn.close()` raises, and so does every hand-rolled variant (verified four ways).
