@@ -4,8 +4,8 @@ milestone: v2.0
 milestone_name: Prep for release
 status: executing
 stopped_at: Phase 22 context gathered
-last_updated: "2026-09-10T22:13:15.703Z"
-last_activity: 2026-09-10 -- Phase 22 planning complete
+last_updated: "2026-09-10T22:14:12.758Z"
+last_activity: 2026-09-10 -- Phase 22 execution started
 progress:
   total_phases: 13
   completed_phases: 2
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 21 — Vocabulary and Contracts
+**Current focus:** Phase 22 — job-store-hardening
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 21 (Vocabulary and Contracts) — EXECUTING
-Plan: 1 of 5
-Status: Ready to execute
+Phase: 22 (job-store-hardening) — EXECUTING
+Plan: 1 of 6
+Status: Executing Phase 22
 Progress: [██████████] 100%
-Last activity: 2026-09-10 -- Phase 22 planning complete
+Last activity: 2026-09-10 -- Phase 22 execution started
 
 ## Performance Metrics
 
