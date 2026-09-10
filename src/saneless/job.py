@@ -8,6 +8,7 @@ for crash recovery and history.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import sqlite3
@@ -15,7 +16,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Concatenate
 
 from saneless.exceptions import StorageError
 from saneless.vocabulary import (
@@ -323,6 +324,40 @@ class Job:
         return self.state in BUSY_STATES
 
 
+def _locked[**P, R](
+    method: Callable[Concatenate[JobStore, P], R],
+) -> Callable[Concatenate[JobStore, P], R]:
+    """
+    Serialise a JobStore method on the store's re-entrant lock.
+
+    Takes ``self._lock`` and nothing else.  It deliberately does *not* also
+    open the connection's transaction context: ``Connection.__exit__`` runs
+    after the body and must commit or roll back, so ``with conn: conn.close()``
+    raises ``ProgrammingError: Cannot operate on a closed database`` and
+    ``close()`` could never be decorated.  Even a hand-rolled context manager
+    fails, because ``in_transaction`` itself raises on a closed connection.
+    Each method that executes SQL therefore opens its own ``with self._conn:``
+    in its body, where the transaction boundary is also more legible.
+
+    Args:
+        method: An unbound ``JobStore`` method to serialise.
+
+    Returns:
+        The method, wrapped to hold the store's lock for its whole duration and
+        carrying the ``_LOCKED_MARKER`` attribute the reflective coverage test
+        looks for.
+
+    """
+
+    @functools.wraps(method)
+    def wrapper(self: JobStore, *args: P.args, **kwargs: P.kwargs) -> R:
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    setattr(wrapper, _LOCKED_MARKER, True)
+    return wrapper
+
+
 class JobStore:
     """
     SQLite-backed persistence for scan jobs.
@@ -397,6 +432,7 @@ class JobStore:
             owner_token=row["owner_token"],
         )
 
+    @_locked
     def create_job(
         self,
         profile: str,
@@ -420,38 +456,40 @@ class JobStore:
 
         """
         job_id = str(uuid.uuid4())
-        self._conn.execute(
-            _INSERT,
-            (
-                job_id,
-                profile,
-                title,
-                JobState.PENDING.value,
-                None,  # error
-                None,  # error_category
-                json.dumps(tags or []),
-                correspondent,
-                thumbnail,
-                datetime.now(tz=UTC).isoformat(),
-                # The six result columns are written by nothing in this phase.
-                None,  # outcome
-                None,  # pages_scanned
-                None,  # pages_removed
-                None,  # pages_uploaded
-                None,  # warning
-                None,  # owner_token
-            ),
-        )
-        # Read the row back inside the same transaction, before the commit:
-        # the caller then gets the job the database holds rather than a second,
-        # hand-built copy of it, which is what keeps the row mapping in exactly
-        # one place.
-        row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                _INSERT,
+                (
+                    job_id,
+                    profile,
+                    title,
+                    JobState.PENDING.value,
+                    None,  # error
+                    None,  # error_category
+                    json.dumps(tags or []),
+                    correspondent,
+                    thumbnail,
+                    datetime.now(tz=UTC).isoformat(),
+                    # The six result columns are written by nothing in this
+                    # phase.
+                    None,  # outcome
+                    None,  # pages_scanned
+                    None,  # pages_removed
+                    None,  # pages_uploaded
+                    None,  # warning
+                    None,  # owner_token
+                ),
+            )
+            # Read the row back inside the same transaction, before the commit:
+            # the caller then gets the job the database holds rather than a
+            # second, hand-built copy of it, which is what keeps the row
+            # mapping in exactly one place.
+            row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
         job = self._row_to_job(row)
         logger.debug("Created job %s: %s", job.id, job.title)
         return job
 
+    @_locked
     def get_job(self, job_id: str) -> Job | None:
         """
         Fetch a job by ID.
@@ -463,9 +501,11 @@ class JobStore:
             The Job if found, None otherwise.
 
         """
-        row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
+        with self._conn:
+            row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
         return None if row is None else self._row_to_job(row)
 
+    @_locked
     def update_state(
         self,
         job_id: str,
@@ -483,18 +523,19 @@ class JobStore:
             error_category: Optional error category for programmatic handling.
 
         """
-        self._conn.execute(
-            "UPDATE jobs SET state = ?, error = ?, error_category = ? WHERE id = ?",
-            (
-                state.value,
-                error,
-                error_category.value if error_category else None,
-                job_id,
-            ),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE jobs SET state = ?, error = ?, error_category = ? WHERE id = ?",
+                (
+                    state.value,
+                    error,
+                    error_category.value if error_category else None,
+                    job_id,
+                ),
+            )
         logger.debug("Job %s -> %s", job_id, state.value)
 
+    @_locked
     def update_thumbnail(self, job_id: str, thumbnail: str) -> None:
         """
         Update the thumbnail of a job.
@@ -504,12 +545,13 @@ class JobStore:
             thumbnail: Base64-encoded JPEG thumbnail string.
 
         """
-        self._conn.execute(
-            "UPDATE jobs SET thumbnail = ? WHERE id = ?",
-            (thumbnail, job_id),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.execute(
+                "UPDATE jobs SET thumbnail = ? WHERE id = ?",
+                (thumbnail, job_id),
+            )
 
+    @_locked
     def list_recent(self, limit: int = 50) -> list[Job]:
         """
         Fetch the most recent jobs ordered newest-first.
@@ -521,9 +563,11 @@ class JobStore:
             List of Job instances ordered by creation time descending.
 
         """
-        rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
+        with self._conn:
+            rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
         return [self._row_to_job(row) for row in rows]
 
+    @_locked
     def prune(self, max_age_days: int = 7, max_rows: int = 500) -> int:
         """
         Remove old jobs by age and count limits.
@@ -539,28 +583,35 @@ class JobStore:
             Total number of jobs deleted.
 
         """
-        before_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        with self._conn:
+            before_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
 
-        cutoff = (datetime.now(tz=UTC) - timedelta(days=max_age_days)).isoformat()
-        self._conn.execute(
-            "DELETE FROM jobs WHERE created_at < ?",
-            (cutoff,),
-        )
+            cutoff = (datetime.now(tz=UTC) - timedelta(days=max_age_days)).isoformat()
+            self._conn.execute(
+                "DELETE FROM jobs WHERE created_at < ?",
+                (cutoff,),
+            )
 
-        self._conn.execute(
-            "DELETE FROM jobs WHERE id NOT IN "
-            "(SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?)",
-            (max_rows,),
-        )
-        self._conn.commit()
+            self._conn.execute(
+                "DELETE FROM jobs WHERE id NOT IN "
+                "(SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?)",
+                (max_rows,),
+            )
 
-        after_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            # Counted before the commit, inside the same transaction: a count
+            # taken after it would be a second read of a table another thread
+            # may already have written to.
+            after_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
 
         deleted = before_count - after_count
         if deleted > 0:
             logger.debug("Pruned %d old jobs", deleted)
         return deleted
 
+    @_locked
     def close(self) -> None:
         """Close the database connection."""
+        # No `with self._conn:` here, deliberately.  Connection.__exit__ runs
+        # after the body and must commit or roll back a connection the body has
+        # already closed, which raises "Cannot operate on a closed database".
         self._conn.close()
