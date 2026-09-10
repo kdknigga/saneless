@@ -87,6 +87,31 @@ added to the tuple brings its placeholder along with it, so the two lists
 cannot fall out of step.
 """
 
+_ACTIVE_STATE_VALUES: tuple[str, ...] = tuple(sorted(s.value for s in ACTIVE_STATES))
+"""The stored TEXT value of every job state that counts as still in flight.
+
+Derived from ``ACTIVE_STATES`` rather than written out, so a state added to that
+frozenset in a later phase is picked up by ``_FAIL_ACTIVE`` without anyone
+editing this module -- which is the whole point of the vocabulary owning the
+partition.  ``ACTIVE_STATES`` and ``TERMINAL_STATES`` partition ``JobState``, so
+what this tuple excludes is exactly the completed jobs.
+
+``sorted()`` because ``ACTIVE_STATES`` is a ``frozenset``: its iteration order
+varies per process with ``PYTHONHASHSEED``.  The *result* is correct either way,
+but an unsorted bind makes a failing test's parameter dump irreproducible across
+runs and makes the assembled SQL text vary between processes, which defeats
+``sqlite3``'s statement cache.
+"""
+
+_ACTIVE_MARKS = ", ".join("?" for _ in _ACTIVE_STATE_VALUES)
+"""One bound ``?`` per active state, for ``_FAIL_ACTIVE``'s ``IN`` clause.
+
+Derived from ``_ACTIVE_STATE_VALUES`` for the same reason ``_PLACEHOLDERS`` is
+derived from ``_COLUMNS``: the run of placeholders and the tuple bound against it
+cannot fall out of step.  Only the *length* of the tuple reaches the SQL text;
+every value is a bound parameter.
+"""
+
 _SELECT_JOBS = "SELECT"
 """The ``SELECT`` verb, held under a name rather than written into a statement.
 
@@ -110,10 +135,8 @@ caller can influence.
 _UPDATE_JOBS = "UPDATE jobs"
 """The ``UPDATE`` verb and its target table, held under a name.
 
-Declared here so every statement in this module is assembled the same way.
-Nothing is built from it yet -- the ``UPDATE`` statements that will use it
-belong to the lock-and-transaction work, not to this change.  Its safety
-argument is ``_SELECT_JOBS``'s.
+Declared here so every statement in this module is assembled the same way, and
+consumed by ``_FAIL_ACTIVE`` below.  Its safety argument is ``_SELECT_JOBS``'s.
 """
 
 _DELETE_JOBS = "DELETE FROM jobs"
@@ -132,8 +155,38 @@ _SELECT_BY_ID = f"{_SELECT_ALL} WHERE id = ?"
 _SELECT_RECENT = f"{_SELECT_ALL} ORDER BY created_at DESC LIMIT ?"
 """Read the newest jobs first, up to a bound limit."""
 
+_LIST_PENDING = f"{_SELECT_ALL} WHERE state = ? ORDER BY created_at ASC"
+"""Read the queued jobs oldest-first -- the order they will be worked in.
+
+Ascending, the opposite of ``_SELECT_RECENT``: history reads newest-first, a
+queue reads oldest-first.  One bound parameter, the state value, which is
+``JobState.PENDING.value`` at the only call site -- the literal string is never
+written into the statement text.  Its safety argument is ``_SELECT_JOBS``'s: the
+only interpolated value is the module-level ``_SELECT_ALL``.
+
+Like ``_PRUNE``'s, the ``ORDER BY`` is lexicographic over ``created_at``'s
+ISO-8601 strings and is correct only because every writer stamps UTC.
+"""
+
 _INSERT = f"{_INSERT_JOBS} ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS})"
 """Write one job, naming every column so physical column order never matters."""
+
+_FAIL_ACTIVE = (
+    f"{_UPDATE_JOBS} SET state = ?, error = ? WHERE state IN ({_ACTIVE_MARKS})"
+)
+"""Move every still-in-flight job to a failed state with a given error text.
+
+Bound parameters, in this order: the target state value, the error text, then one
+per entry of ``_ACTIVE_STATE_VALUES``.  Its safety argument is
+``_SELECT_JOBS``'s, extended one step: the only interpolated values are the
+module-level ``_UPDATE_JOBS`` literal and a run of ``?`` characters whose LENGTH
+comes from a module-level tuple.  Every runtime value -- the target state, the
+caller-supplied reason, each active-state value -- is a bound parameter.
+
+``json_each(?)`` would make the statement fully static and was verified to work
+here, but JSON1 was a compile-time option before SQLite 3.38, so it would add a
+soft dependency on an extension this module otherwise does not need.
+"""
 
 _NEWEST_IDS = f"{_SELECT_JOBS} id FROM jobs ORDER BY created_at DESC LIMIT ?"
 """The ids of the newest jobs, up to a bound limit -- ``_PRUNE``'s subquery.
@@ -602,21 +655,83 @@ class JobStore:
             rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
         return [self._row_to_job(row) for row in rows]
 
-    # The two declarations below carry no behaviour yet.  They exist in this
-    # commit because the project-wide `ty` hook resolves attributes across the
-    # whole tree, so a test naming a method that does not exist blocks the
-    # commit outright.  The RED/GREEN split that matters is the behavioural
-    # one, and it is intact: both raise, and every test of them is red.
-
     @_locked
     def list_pending(self) -> list[Job]:
-        """Raise until the GREEN commit gives this method its behaviour."""
-        raise NotImplementedError
+        """
+        Fetch the queued jobs oldest-first.
+
+        Ascending ``created_at``, the opposite of ``list_recent``'s newest-first
+        history ordering: this is a queue, and the oldest entry is the next one
+        to be worked.  ``PENDING`` is the only state a job that has not started
+        can be in, so the predicate is a single bound scalar rather than the
+        variable-length ``IN`` ``fail_active_jobs`` needs -- but the state value
+        is still bound rather than written into the statement text.
+
+        This method has NO production caller in this phase.  Showing a job its
+        position in the queue is APPL-08, which belongs to Phase 30; until then
+        its tests are its only consumer.
+
+        Returns:
+            List of Job instances awaiting a scanner, ordered by creation time
+            ascending.
+
+        """
+        with self._conn:
+            rows = self._conn.execute(
+                _LIST_PENDING, (JobState.PENDING.value,)
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
 
     @_locked
     def fail_active_jobs(self, reason: str = "Interrupted by restart") -> int:
-        """Raise until the GREEN commit gives this method its behaviour."""
-        raise NotImplementedError
+        """
+        Fail every job still in flight, for recovery after an unclean restart.
+
+        A job left mid-scan by a killed process has no worker behind it any
+        more, so it would otherwise sit in an active state for ever and the UI
+        would poll it for ever.  Every row whose state is in ``ACTIVE_STATES``
+        moves to ``JobState.ERROR`` carrying ``reason``.
+
+        The predicate is derived from ``ACTIVE_STATES`` rather than listed by
+        hand, which buys two things: ``ACTIVE_STATES`` and ``TERMINAL_STATES``
+        partition ``JobState``, so it provably cannot reach a completed job's
+        recorded history; and a state added to that frozenset in a later phase
+        is covered here with no edit to this method.
+
+        "FAILED" throughout STOR-05 and the roadmap criteria means this
+        ``JobState.ERROR``.  There is no ``JobState.FAILED``, and none is added:
+        the value is persisted as SQLite TEXT and read back through the enum
+        constructor, so adding or renaming a member is a data migration.
+
+        ``error_category`` is deliberately not written.  It is recorded by
+        ``update_state`` today and read by nothing, and the phase that gives it
+        a consumer has to decide whether the field earns its place at all -- a
+        second unread writer here would work against that.  ``UNKNOWN`` would
+        additionally be the wrong value: an interrupted restart is not an
+        unknown failure, it is a precisely known one.
+
+        This method has NO production caller in this phase.  Calling it at
+        startup, before the worker thread begins, is ROBU-05 and belongs to
+        Phase 26; the defaulted ``reason`` is the seam that phase needs, and the
+        returned count is what lets a caller -- today, only the tests -- learn
+        what happened without a second query.
+
+        Args:
+            reason: The error text recorded on every job this fails.
+
+        Returns:
+            How many jobs were moved to ERROR.
+
+        """
+        with self._conn:
+            failed = self._conn.execute(
+                _FAIL_ACTIVE,
+                (JobState.ERROR.value, reason, *_ACTIVE_STATE_VALUES),
+            ).rowcount
+
+        if failed > 0:
+            logger.debug("Failed %d in-flight job(s): %s", failed, reason)
+        return failed
 
     @_locked
     def prune(self, max_age_days: int = 7, max_rows: int = 500) -> int:
