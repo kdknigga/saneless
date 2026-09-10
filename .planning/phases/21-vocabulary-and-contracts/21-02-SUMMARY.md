@@ -297,3 +297,9 @@ backup when convenient.
 ---
 *Phase: 21-vocabulary-and-contracts*
 *Completed: 2026-09-10*
+
+## Self-Check: PASSED
+
+- All modified/created files verified present on disk.
+- All three commit hashes verified present in the object store: `ebb506c`, `f5cc2fa`, `4ab49da`.
+- `tests/test_auto_profiles.py` verified absent from every commit in this plan (N-09 guard unedited).
