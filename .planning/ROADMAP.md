@@ -114,7 +114,18 @@ Waves: 1 = {21-01, 21-02} · 2 = {21-03, 21-04} · 3 = {21-05}
   4. `fail_active_jobs()` marks every non-terminal job FAILED with a "server restarted" reason, and `list_pending()` returns queued jobs in creation order
   5. The row-to-`Job` mapping and its column list appear exactly once, and `prune()` reports its count from one statement
 
-**Plans**: TBD
+**Plans**: 6 plans
+
+Plans:
+
+- [ ] 22-01-PLAN.md — `StorageError`, the `PRAGMA user_version` migration ladder, and the WAL-before-autocommit open sequence
+- [ ] 22-02-PLAN.md — one `_COLUMNS` tuple, six new `Job` fields, one `_row_to_job`
+- [ ] 22-03-PLAN.md — the `@_locked` decorator, per-body transactions, and the three structural/concurrency tests
+- [ ] 22-04-PLAN.md — `prune()` as one `DELETE` reporting `cursor.rowcount`
+- [ ] 22-05-PLAN.md — `fail_active_jobs()` and `list_pending()`, derived from `ACTIVE_STATES`
+- [ ] 22-06-PLAN.md — storage docs corrected, phase-level green gate and traceability
+
+Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the waves are strictly sequential (1 through 6) -- this phase offers no same-wave parallelism.
 
 ### Phase 23: Honest Outcomes and Never Lose a Scan
 
