@@ -19,9 +19,8 @@ from .auto_profiles import (
     resolve_config_path,
     write_profiles_to_config,
 )
-from .exceptions import ConfigError, FeederEmptyError, PaperlessError, ScanError
-from .job import ErrorCategory, JobState
 from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
+from .vocabulary import ACTIVE_STATES, BUSY_STATES, JobState, classify_error
 
 if TYPE_CHECKING:
     from .config import Settings
@@ -127,27 +126,6 @@ class ScanWorker:
         """ID of the currently processing job, or None."""
         return self._current_job_id
 
-    def _categorize_error(self, exc: Exception) -> ErrorCategory:
-        """
-        Map an exception to its error category.
-
-        Args:
-            exc: The caught exception.
-
-        Returns:
-            The appropriate ErrorCategory value.
-
-        """
-        if isinstance(exc, FeederEmptyError):
-            return ErrorCategory.FEEDER
-        if isinstance(exc, ConfigError):
-            return ErrorCategory.CONFIG
-        if isinstance(exc, ScanError):
-            return ErrorCategory.SCANNER
-        if isinstance(exc, PaperlessError):
-            return ErrorCategory.UPLOAD
-        return ErrorCategory.UNKNOWN
-
     def _run(self) -> None:
         """Worker loop: process jobs until sentinel None received."""
         while True:
@@ -220,17 +198,23 @@ class ScanWorker:
 
         def _status_cb(event: PipelineEvent, _jid: str = job.id) -> None:
             logger.info("Pipeline event: %s", event.value)
-            if event is PipelineEvent.AWAITING_FLIP:
+            state = event.job_state
+            if state is None or state not in ACTIVE_STATES:
+                # Nothing to persist from inside the pipeline.  SCANNING_REVERSE
+                # carries no state at all, and DONE is terminal: the worker
+                # writes it only once run_pipeline has returned and its
+                # temporary directory is gone, never from in here.
+                self._transition_event.set()
+                return
+            if state in BUSY_STATES:
+                self._job_store.update_state(_jid, state)
+                self._transition_event.set()
+            else:
+                # AWAITING_FLIP: clear before the write so the UI, which polls
+                # once a second, never shows "busy" while a human is being
+                # waited on.
                 self._transition_event.clear()
-                self._job_store.update_state(_jid, JobState.AWAITING_FLIP)
-            elif event is PipelineEvent.ASSEMBLING:
-                self._job_store.update_state(_jid, JobState.ASSEMBLING)
-                self._transition_event.set()
-            elif event is PipelineEvent.UPLOADING:
-                self._job_store.update_state(_jid, JobState.UPLOADING)
-                self._transition_event.set()
-            elif event is PipelineEvent.SCANNING_REVERSE:
-                self._transition_event.set()
+                self._job_store.update_state(_jid, state)
 
         try:
             request = PipelineRequest(
@@ -252,7 +236,7 @@ class ScanWorker:
             self._job_store.update_state(job.id, JobState.DONE)
             self._transition_event.set()
         except Exception as exc:
-            category = self._categorize_error(exc)
+            category = classify_error(exc)
             self._job_store.update_state(
                 job.id,
                 JobState.ERROR,

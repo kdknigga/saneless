@@ -975,8 +975,9 @@ class TestWorkerEnumDispatch:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Worker transitions to ASSEMBLING when receiving PipelineEvent.ASSEMBLING."""
+        """Worker applies only ACTIVE_STATES from inside the pipeline callback."""
         states_seen: list[JobState] = []
+        from_callback: list[JobState] = []
         store = JobStore()
         try:
             original_update = store.update_state
@@ -1000,8 +1001,14 @@ class TestWorkerEnumDispatch:
                 _settings: object,
                 request: PipelineRequest,
             ) -> None:
+                # Snapshot only what the callback itself writes, so the
+                # worker's own pre-pipeline SCANNING and post-pipeline DONE
+                # writes cannot be mistaken for callback output.
+                start = len(states_seen)
                 if request.status_callback:
-                    request.status_callback(PipelineEvent.ASSEMBLING)
+                    for event in PipelineEvent:
+                        request.status_callback(event)
+                from_callback.extend(states_seen[start:])
 
             monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -1010,7 +1017,26 @@ class TestWorkerEnumDispatch:
             worker.submit(job)
             time.sleep(0.5)
             worker.stop()
+
             assert JobState.ASSEMBLING in states_seen
+
+            # A job must never be marked DONE from inside run_pipeline: that
+            # happens before the pipeline's temporary directory is cleaned up
+            # and is visible to the one-second web poll.
+            assert JobState.DONE not in from_callback
+
+            # The states applied are exactly the in-flight ones, in the order
+            # the events were emitted.  SCANNING_REVERSE (no JobState) and
+            # DONE (terminal) contribute nothing.
+            assert from_callback == [
+                JobState.SCANNING,
+                JobState.AWAITING_FLIP,
+                JobState.ASSEMBLING,
+                JobState.UPLOADING,
+            ]
+
+            # DONE is still written -- by the worker, after run_pipeline returned.
+            assert states_seen[-1] is JobState.DONE
         finally:
             store.close()
 
