@@ -118,11 +118,28 @@ Waves: 1 = {21-01, 21-02} · 2 = {21-03, 21-04} · 3 = {21-05}
 
 Plans:
 
+**Wave 1**
+
 - [ ] 22-01-PLAN.md — `StorageError`, the `PRAGMA user_version` migration ladder, and the WAL-before-autocommit open sequence
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 22-02-PLAN.md — one `_COLUMNS` tuple, six new `Job` fields, one `_row_to_job`
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 22-03-PLAN.md — the `@_locked` decorator, per-body transactions, and the three structural/concurrency tests
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 22-04-PLAN.md — `prune()` as one `DELETE` reporting `cursor.rowcount`
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 22-05-PLAN.md — `fail_active_jobs()` and `list_pending()`, derived from `ACTIVE_STATES`
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 22-06-PLAN.md — storage docs corrected, phase-level green gate and traceability
 
 Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the waves are strictly sequential (1 through 6) -- this phase offers no same-wave parallelism.
