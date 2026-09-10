@@ -87,8 +87,8 @@ Note: the earlier "zero source changes in this phase" note is SUPERSEDED by CONT
 Plans:
 **Wave 1**
 
-- [ ] 21-01-PLAN.md — `vocabulary.py` (enums, three state classifications, four total lookups behind `assert_never`) + `job.py` re-exports and `Job.is_active`/`is_busy`
-- [ ] 21-02-PLAN.md — `SourceKind` + `classify_source()` in `scanner/base.py`, both existing rules delegated; carries the phase's one authorised behaviour change (D-11 / C-06)
+- [x] 21-01-PLAN.md — `vocabulary.py` (enums, three state classifications, four total lookups behind `assert_never`) + `job.py` re-exports and `Job.is_active`/`is_busy`
+- [x] 21-02-PLAN.md — `SourceKind` + `classify_source()` in `scanner/base.py`, both existing rules delegated; carries the phase's one authorised behaviour change (D-11 / C-06)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -280,7 +280,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
-| 21. Vocabulary and Contracts | 0/? | Not started | - |
+| 21. Vocabulary and Contracts | 2/5 | In Progress|  |
 | 22. Job Store Hardening | 0/? | Not started | - |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
 | 24. Scanner Truthfulness | 0/? | Not started | - |
