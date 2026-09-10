@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Prep for release
 status: executing
-stopped_at: Completed 20-02-PLAN.md
-last_updated: "2026-09-10T13:29:18.322Z"
+stopped_at: Completed 20-03-PLAN.md
+last_updated: "2026-09-10T13:45:36.132Z"
 last_activity: 2026-09-10
 progress:
   total_phases: 13
   completed_phases: 0
   total_plans: 5
-  completed_plans: 2
+  completed_plans: 3
   percent: 0
 ---
 
@@ -27,9 +27,9 @@ See: .planning/PROJECT.md (updated 2026-03-21)
 ## Current Position
 
 Phase: 20 (ci-gate) — EXECUTING
-Plan: 3 of 5
+Plan: 4 of 5
 Status: Ready to execute
-Progress: [████░░░░░░] 40%
+Progress: [██████░░░░] 60%
 Last activity: 2026-09-10
 
 ## Performance Metrics
@@ -96,6 +96,7 @@ Last activity: 2026-09-10
 | Phase 19 P02 | 1min | 3 tasks | 5 files |
 | Phase 20 P01 | 6min | 3 tasks | 5 files |
 | Phase 20 P02 | 10min | 3 tasks | 0 files |
+| Phase 20 P03 | 11min | 3 tasks | 0 files |
 
 ## Accumulated Context
 
@@ -194,6 +195,9 @@ Recent decisions affecting current work:
 - [Phase 20-02]: kdknigga/scanless is PRIVATE with zero refs on the remote; defaultBranchRef is empty, so Plan 04's ruleset must target refs/heads/master explicitly
 - [Phase 20-02]: bypass_actors: [] remains UNANSWERED -- Plan 04 must treat the ruleset bypass list as an open user input, not a settled decision
 - [Phase 20-02]: Verification greps must use 'command grep' -- the shell's grep is a ugrep wrapper whose -qv exit status is wrong and it misclassified 7 commits in the history audit
+- [Phase 20-03]: Plan 04's required_status_checks contexts are exactly `lint` and `test`, read back from GET /commits/{sha}/check-runs, with GitHub Actions integration_id 15368
+- [Phase 20-03]: Do NOT require copilot-pull-request-reviewer in the master ruleset -- it posts under the same app id 15368 but comes from an account-level Copilot workflow outside this repo, so requiring it would deadlock master if the setting is ever disabled
+- [Phase 20-03]: The first push of master made it GitHub's default branch automatically; no gh repo edit --default-branch was needed
 
 ### Roadmap Evolution
 
@@ -231,6 +235,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
-Last session: 2026-09-10T13:29:18.316Z
-Stopped at: Completed 20-02-PLAN.md
-Resume file: .planning/phases/20-ci-gate/20-03-PLAN.md
+Last session: 2026-09-10T13:45:28.316Z
+Stopped at: Completed 20-03-PLAN.md
+Resume file: .planning/phases/20-ci-gate/20-04-PLAN.md

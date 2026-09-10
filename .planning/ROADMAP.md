@@ -59,7 +59,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 Plans:
 - [x] 20-01-PLAN.md — pytest-timeout hang guard, ci.yml + dependabot.yml, CONTRIBUTING.md
 - [x] 20-02-PLAN.md — repo to private, .planning-stripped branch built locally, publication checkpoint
-- [ ] 20-03-PLAN.md — push master + filtered branch, open PR (never merged), green run, read check contexts
+- [x] 20-03-PLAN.md — push master + filtered branch, open PR (never merged), green run, read check contexts
 - [ ] 20-04-PLAN.md — master branch ruleset via gh api + read-back, one seeded break proving red
 - [ ] 20-05-PLAN.md — ty/pyrefly bump, three suppressions removed with real fixes, green run on the PR
 
@@ -221,7 +221,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 20. CI Gate | 2/5 | In Progress|  |
+| 20. CI Gate | 3/5 | In Progress|  |
 | 21. Vocabulary and Contracts | 0/? | Not started | - |
 | 22. Job Store Hardening | 0/? | Not started | - |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
