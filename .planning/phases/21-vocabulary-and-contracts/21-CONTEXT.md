@@ -72,6 +72,11 @@ The user delegated every gray area in this phase ("All good, no need to discuss.
     - The counter-scenario the review raised — a flatbed-only device with no `source` option using a manual-duplex profile — is undocumented; the docs place manual duplex in the ADF. It is not covered by tests and was not verified against hardware.
 
     **The authorised behaviour change for this phase therefore covers duplex-named sources as well as feeder-token names.** Phase 24 still owns `UNKNOWN` routing and any broader "not-flatbed means multi-page" default.
+
+  - **EVIDENCE CORRECTION, same day, from the security audit (W-01).** The decision above was taken partly on the belief — inherited from `21-RESEARCH.md` assumption A2 and written into plan 21-02's threat register — that the downside was *bounded*: "`multi_scan()` on a single-sheet path yields one page, which is today's behaviour." **That is false.** `python-sane`'s `_SaneIterator.__next__` terminates only on the exact message `"Document feeder out of documents"`; on non-feeder hardware `start()`/`snap()` keep succeeding, there is no page cap, the 120s timeout is per-page rather than per-job, and `pipeline.py` materialises the generator with `list(...)`. So the counter-scenario is unbounded pages and unbounded memory, or — if page 0 raises — a hard failure mislabelled "No paper detected in feeder".
+    - This does **not** reverse the decision: the documented ADF workflow was genuinely broken before and is genuinely fixed now, and the flatbed-plus-manual-duplex configuration remains undocumented and is now warned against in `docs/how-to/set-up-adf-duplex.md`.
+    - It does change the *character* of the residual risk from "bounded, one page" to "unbounded, no code control, documentation-only mitigation". Recorded here so nobody re-derives the false bound from A2 or from the plan text.
+    - The iteration guard is carried into Phase 24 — see the note under its ROADMAP entry.
   - Phase 24 still owns: wiring the classifier into the remaining sites, the `auto_source_mode` routing at `sane_backend.py:496-504`, real SANE error messages, geometry and read-back DPI, and fakes that model real python-sane.
 
 ### What stays invisible to users

@@ -148,6 +148,8 @@ Note: the preservation `try/except` must span both `upload_document` and `poll_t
 
 **Plans**: TBD
 
+Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/21-vocabulary-and-contracts/21-SECURITY.md`): **`_scan_adf_pages` has no page cap.** `python-sane`'s `_SaneIterator.__next__` stops only on the exact string `"Document feeder out of documents"`, so on hardware that is not a feeder `start()`/`snap()` keep succeeding and the loop does not terminate. The per-page timeout does not bound it — a succeeding scan satisfies it every iteration — and `pipeline.py` calls `list(scanner.scan_pages(...))`, so unbounded pages means unbounded memory. This is reachable today because Phase 21 routes any `"duplex"`-named source to `multi_scan()` (D-11 AMENDED) and `scan_pages` validates the source against the device only when `has_source_option` is true. Phase 21 accepted the risk with a documentation-only control; this phase should add the iteration guard. Criterion 2 above already covers the other half — the bare `except Exception` that reports every first-page failure as "No paper detected in feeder".
+
 ### Phase 25: Manual Duplex
 
 **Goal**: Manual duplex actually works and is honest about where it is — `duplex` is its own profile field, `source` is passed to SANE verbatim, exactly one place decides the strategy, a required `FlipCoordinator` with a timeout serves both CLI and web, and pass B is visible — with the ADF duplex how-to rewritten in-phase to stop documenting `source = "Manual Duplex"` as current
