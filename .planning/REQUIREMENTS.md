@@ -23,11 +23,11 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 
 ### Job Store
 
-- [ ] **STOR-01**: Two threads can call any mix of `JobStore` methods concurrently for 200 rounds without an exception (an `RLock` around every public method; public methods never call other public methods) [C-07]
-- [ ] **STOR-02**: Schema changes use a `PRAGMA user_version` migration ladder; a v1.0 database file opens and migrates cleanly; the bare `ALTER TABLE ... except: pass` is gone [N-13]
-- [ ] **STOR-03**: The job table carries `outcome`, `pages_scanned`, `pages_removed`, `pages_uploaded`, `warning`, and `owner_token` columns, added in one migration so later phases never add columns ad hoc [C-03, U-02, U-06]
-- [ ] **STOR-04**: The row-to-`Job` mapping and column list exist once in `job.py`, and `prune()` reports its count from a single statement [N-17]
-- [ ] **STOR-05**: `JobStore` exposes `fail_active_jobs()` (marks every non-terminal job FAILED with a "server restarted" reason) and `list_pending()` ordered by creation time [M-03, U-06]
+- [x] **STOR-01**: Two threads can call any mix of `JobStore` methods concurrently for 200 rounds without an exception (an `RLock` around every public method; public methods never call other public methods) [C-07]
+- [x] **STOR-02**: Schema changes use a `PRAGMA user_version` migration ladder; a v1.0 database file opens and migrates cleanly; the bare `ALTER TABLE ... except: pass` is gone [N-13]
+- [x] **STOR-03**: The job table carries `outcome`, `pages_scanned`, `pages_removed`, `pages_uploaded`, `warning`, and `owner_token` columns, added in one migration so later phases never add columns ad hoc [C-03, U-02, U-06]
+- [x] **STOR-04**: The row-to-`Job` mapping and column list exist once in `job.py`, and `prune()` reports its count from a single statement [N-17]
+- [x] **STOR-05**: `JobStore` exposes `fail_active_jobs()` (marks every non-terminal job FAILED with a "server restarted" reason) and `list_pending()` ordered by creation time [M-03, U-06]
 
 ### Honest Outcomes and Never Lose a Scan
 
@@ -219,11 +219,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CTR-03 | Phase 21 — Vocabulary and Contracts | Complete |
 | CTR-04 | Phase 21 — Vocabulary and Contracts | Complete |
 | CTR-05 | Phase 21 — Vocabulary and Contracts | Complete |
-| STOR-01 | Phase 22 — Job Store Hardening | Pending |
-| STOR-02 | Phase 22 — Job Store Hardening | Pending |
-| STOR-03 | Phase 22 — Job Store Hardening | Pending |
-| STOR-04 | Phase 22 — Job Store Hardening | Pending |
-| STOR-05 | Phase 22 — Job Store Hardening | Pending |
+| STOR-01 | Phase 22 — Job Store Hardening | Complete |
+| STOR-02 | Phase 22 — Job Store Hardening | Complete |
+| STOR-03 | Phase 22 — Job Store Hardening | Complete |
+| STOR-04 | Phase 22 — Job Store Hardening | Complete |
+| STOR-05 | Phase 22 — Job Store Hardening | Complete |
 | OUTC-01 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
 | OUTC-02 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
 | OUTC-03 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |

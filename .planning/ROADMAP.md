@@ -33,7 +33,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 20: CI Gate** - GitHub Actions runs lint, format, both type checkers, and the non-browser suite on every push; `pytest-timeout` guards against hangs (completed 2026-09-10)
 - [x] **Phase 21: Vocabulary and Contracts** - One `JobState`, one label map, one `ErrorCategory`, one `classify_source()`, and typed `ScanResult`/`UploadResult`, with zero behaviour change (completed 2026-09-10)
-- [ ] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration
+- [x] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration (completed 2026-09-10)
 - [ ] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI
 - [ ] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane
 - [ ] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass
@@ -140,7 +140,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 22-06-PLAN.md — storage docs corrected, phase-level green gate and traceability
+- [x] 22-06-PLAN.md — storage docs corrected, phase-level green gate and traceability
 
 Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the waves are strictly sequential (1 through 6) -- this phase offers no same-wave parallelism.
 
@@ -311,7 +311,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 |-------|----------------|--------|-----------|
 | 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
-| 22. Job Store Hardening | 5/6 | In Progress|  |
+| 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
 | 24. Scanner Truthfulness | 0/? | Not started | - |
 | 25. Manual Duplex | 0/? | Not started | - |
