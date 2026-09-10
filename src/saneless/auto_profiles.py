@@ -9,11 +9,12 @@ generation logic uses pure functions for easy testing.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, assert_never, cast
 
 import tomlkit
 
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
+from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
     from saneless.scanner.base import DeviceCapabilities
@@ -29,13 +30,28 @@ __all__ = [
 ]
 
 
+def _slugify(lower: str) -> str:
+    """
+    Slugify an already-lowercased source name.
+
+    Args:
+        lower: Lowercased SANE source name.
+
+    Returns:
+        The name with spaces and underscores replaced by hyphens.
+
+    """
+    return lower.replace(" ", "-").replace("_", "-")
+
+
 def source_to_slug(source: str) -> str:
     """
     Convert a SANE source name to a profile slug.
 
-    Maps common scanner source names to descriptive, URL-safe slugs.
-    Handles flatbed, ADF simplex, ADF duplex, and falls back to a
-    basic slugification for unknown source types.
+    Dispatches on ``classify_source`` -- the codebase's single
+    source-classification rule -- and turns the resulting SourceKind into a
+    descriptive, URL-safe slug, falling back to a basic slugification for
+    source names that match no rule.
 
     Args:
         source: SANE source name string (e.g., "Flatbed", "ADF Duplex").
@@ -45,19 +61,25 @@ def source_to_slug(source: str) -> str:
 
     """
     lower = source.lower()
-    if lower == "auto":
-        return "auto-scan"
-    if "flatbed" in lower:
-        return "flatbed-scan"
-    if "duplex" in lower:
-        return "adf-duplex"
-    if "back" in lower:
-        # ADF Back is not simplex or duplex -- use fallback slugification
-        return lower.replace(" ", "-").replace("_", "-")
-    if "adf" in lower or "document feeder" in lower or "feeder" in lower:
-        return "adf-simplex"
-    # Fallback: slugify the source name
-    return lower.replace(" ", "-").replace("_", "-")
+    match classify_source(source):
+        case SourceKind.AUTO:
+            slug = "auto-scan"
+        case SourceKind.FLATBED:
+            slug = "flatbed-scan"
+        case SourceKind.FEEDER_DUPLEX:
+            slug = "adf-duplex"
+        case SourceKind.FEEDER:
+            # Not a thin passthrough: "ADF Back" classifies as FEEDER because
+            # it IS a feeder for routing purposes, but it must not slug to
+            # "adf-simplex" or it collides with "ADF Front" (the N-09 defect).
+            # "Which scan path do I take?" and "what do I name this profile?"
+            # are different questions with different equivalence classes.
+            slug = _slugify(lower) if "back" in lower else "adf-simplex"
+        case SourceKind.UNKNOWN:
+            slug = _slugify(lower)
+        case unhandled:
+            assert_never(unhandled)
+    return slug
 
 
 def pick_closest_resolution(
