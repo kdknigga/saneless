@@ -1,7 +1,8 @@
 """
-JobStore list, prune, and error category tests.
+JobStore migration, list, prune, and error category tests.
 
-Covers requirements: UI-05, UI-06, PKG-01.
+Covers requirements: UI-05, UI-06, PKG-01, STOR-01, STOR-02, STOR-03, STOR-04,
+STOR-05.
 """
 
 from __future__ import annotations
@@ -11,10 +12,108 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+import pytest
+
+from saneless.exceptions import StorageError
 from saneless.job import ErrorCategory, Job, JobState, JobStore
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+HEAD_VERSION = 2
+"""The schema version a fully migrated job database reports."""
+
+HEAD_COLUMN_COUNT = 16
+"""The number of columns the jobs table carries at HEAD_VERSION."""
+
+S2_COLUMNS = (
+    "id",
+    "profile",
+    "title",
+    "state",
+    "error",
+    "tags",
+    "correspondent",
+    "thumbnail",
+    "created_at",
+)
+"""The nine columns of the 5bd6158 (S2) shape -- no error_category."""
+
+V2_COLUMNS = (
+    "outcome",
+    "pages_scanned",
+    "pages_removed",
+    "pages_uploaded",
+    "warning",
+    "owner_token",
+)
+"""The six columns migration step 2 adds, spelled out independently of job.py."""
+
+
+def _build_s3_schema(db_path: str) -> None:
+    """Write a jobs table at the dc9b8af (S3) ten-column shape holding one row."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, profile TEXT NOT NULL, title TEXT NOT NULL,
+            state TEXT NOT NULL, error TEXT, error_category TEXT,
+            tags TEXT NOT NULL, correspondent INTEGER, thumbnail TEXT,
+            created_at TEXT NOT NULL
+        )"""
+        )
+        conn.execute(
+            "INSERT INTO jobs (id, profile, title, state, error, error_category, "
+            "tags, correspondent, thumbnail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-1",
+                "default",
+                "Legacy Doc",
+                JobState.DONE.value,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+                datetime.now(tz=UTC).isoformat(),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_s2_schema(db_path: str) -> None:
+    """Write a jobs table at the 5bd6158 (S2) shape, which has no error_category."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """CREATE TABLE jobs (
+            id TEXT PRIMARY KEY, profile TEXT NOT NULL, title TEXT NOT NULL,
+            state TEXT NOT NULL, error TEXT, tags TEXT NOT NULL,
+            correspondent INTEGER, thumbnail TEXT, created_at TEXT NOT NULL
+        )"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _read_schema(conn: sqlite3.Connection) -> tuple[int, list[str]]:
+    """Return the (user_version, column names) a connection reports for jobs."""
+    version: int = conn.execute("PRAGMA user_version").fetchone()[0]
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(jobs)")]
+    return version, columns
+
+
+def _read_schema_raw(db_path: str) -> tuple[int, list[str]]:
+    """Return the schema a fresh raw connection sees, bypassing JobStore."""
+    conn = sqlite3.connect(db_path)
+    try:
+        return _read_schema(conn)
+    finally:
+        conn.close()
 
 
 def test_list_recent() -> None:
@@ -131,32 +230,87 @@ class TestErrorCategory:
         finally:
             store.close()
 
-    def test_jobstore_migration_adds_column(self, tmp_path: Path) -> None:
-        """Opening a pre-existing DB without error_category column succeeds."""
-        db_path = str(tmp_path / "migrate.db")
-        # Create old-schema DB
-        conn = sqlite3.connect(db_path)
-        conn.execute(
-            """CREATE TABLE jobs (
-            id TEXT PRIMARY KEY, profile TEXT NOT NULL, title TEXT NOT NULL,
-            state TEXT NOT NULL, error TEXT, tags TEXT NOT NULL,
-            correspondent INTEGER, thumbnail TEXT, created_at TEXT NOT NULL
-        )"""
-        )
-        conn.commit()
-        conn.close()
-        # Open with new JobStore -- should add error_category column
+
+class TestMigrationLadder:
+    """PRAGMA user_version migration ladder tests."""
+
+    def test_fresh_store_runs_the_whole_migration(self) -> None:
+        """A fresh in-memory store opens at the head schema version (STOR-02)."""
+        store = JobStore()
+        try:
+            version, columns = _read_schema(store._conn)
+            assert version == HEAD_VERSION
+            assert len(columns) == HEAD_COLUMN_COUNT
+        finally:
+            store.close()
+
+    def test_migration_legacy_s3_database_joins_the_ladder(
+        self, tmp_path: Path
+    ) -> None:
+        """A legacy S3 database migrates to head and keeps its rows (STOR-02)."""
+        db_path = str(tmp_path / "legacy.db")
+        _build_s3_schema(db_path)
+
         store = JobStore(db_path=db_path)
         try:
-            job = store.create_job("default", "Migration Test")
-            store.update_state(
-                job.id,
-                JobState.ERROR,
-                error="test",
-                error_category=ErrorCategory.CONFIG,
-            )
-            fetched = store.get_job(job.id)
+            version, columns = _read_schema(store._conn)
+            assert version == HEAD_VERSION
+            assert len(columns) == HEAD_COLUMN_COUNT
+            assert set(V2_COLUMNS) <= set(columns)
+
+            legacy = store.get_job("legacy-1")
+            assert legacy is not None
+            assert legacy.title == "Legacy Doc"
+        finally:
+            store.close()
+
+    def test_migration_guard_rejects_an_s2_database(self, tmp_path: Path) -> None:
+        """An S2 database raises StorageError and is left untouched (STOR-02)."""
+        db_path = str(tmp_path / "s2.db")
+        _build_s2_schema(db_path)
+
+        with pytest.raises(StorageError, match="error_category") as exc_info:
+            JobStore(db_path=db_path)
+
+        assert db_path in str(exc_info.value)
+
+        version, columns = _read_schema_raw(db_path)
+        assert version == 0
+        assert columns == list(S2_COLUMNS)
+
+    def test_migration_idempotent_on_reopen(self, tmp_path: Path) -> None:
+        """Reopening an already-migrated database changes nothing (STOR-03)."""
+        db_path = str(tmp_path / "reopen.db")
+
+        store = JobStore(db_path=db_path)
+        job_id = store.create_job("default", "Persistent Doc").id
+        store.close()
+
+        reopened = JobStore(db_path=db_path)
+        try:
+            version, columns = _read_schema(reopened._conn)
+            assert version == HEAD_VERSION
+            assert len(columns) == HEAD_COLUMN_COUNT
+
+            fetched = reopened.get_job(job_id)
             assert fetched is not None
-            assert fetched.error_category == ErrorCategory.CONFIG
+            assert fetched.title == "Persistent Doc"
+        finally:
+            reopened.close()
+
+    def test_journal_mode_is_wal_on_a_file_database(self, tmp_path: Path) -> None:
+        """
+        A file-backed store reads back WAL journalling (STOR-02).
+
+        WAL must be set before the connection flips to explicit transaction
+        control: SQLite refuses the switch inside a transaction on a file
+        database while returning "memory" without error on ":memory:", so an
+        in-memory-only suite cannot see the ordering mistake.
+        """
+        db_path = str(tmp_path / "wal.db")
+        store = JobStore(db_path=db_path)
+        try:
+            mode = store._conn.execute("PRAGMA journal_mode").fetchone()[0]
+            assert mode == "wal"
         finally:
             store.close()

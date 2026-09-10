@@ -11,6 +11,7 @@ __all__ = [
     "PaperlessError",
     "SanelessError",
     "ScanError",
+    "StorageError",
 ]
 
 
@@ -32,3 +33,7 @@ class FeederEmptyError(ScanError):
 
 class PaperlessError(SanelessError):
     """Paperless-ngx API operation failure."""
+
+
+class StorageError(SanelessError):
+    """Job store schema or persistence failure."""
