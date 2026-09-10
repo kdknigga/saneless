@@ -20,6 +20,7 @@ from saneless.pipeline import (
     run_pipeline,
 )
 from saneless.scanner.base import ScannerBackend
+from saneless.vocabulary import JobState
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -831,3 +832,21 @@ class TestPipelineEventEnum:
         assert len(events) > 0
         for event in events:
             assert isinstance(event, PipelineEvent)
+
+    @pytest.mark.parametrize("event", list(PipelineEvent))
+    def test_job_state_projection_is_total(self, event: PipelineEvent) -> None:
+        """Every PipelineEvent projects to a JobState or explicitly to None (CTR-01)."""
+        state = event.job_state
+        assert state is None or isinstance(state, JobState)
+
+    def test_job_state_projection_mapping(self) -> None:
+        """Each state-changing event names the state the worker persists (CTR-01)."""
+        assert PipelineEvent.SCANNING.job_state is JobState.SCANNING
+        assert PipelineEvent.AWAITING_FLIP.job_state is JobState.AWAITING_FLIP
+        assert PipelineEvent.ASSEMBLING.job_state is JobState.ASSEMBLING
+        assert PipelineEvent.UPLOADING.job_state is JobState.UPLOADING
+        assert PipelineEvent.DONE.job_state is JobState.DONE
+
+    def test_scanning_reverse_has_no_job_state(self) -> None:
+        """SCANNING_REVERSE changes no persisted state, so it maps to None (CTR-01)."""
+        assert PipelineEvent.SCANNING_REVERSE.job_state is None
