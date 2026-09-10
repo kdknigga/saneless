@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Prep for release
 status: executing
-stopped_at: Completed 20-01-PLAN.md
-last_updated: "2026-09-10T13:13:50.121Z"
-last_activity: 2026-09-10 -- Completed 20-01-PLAN.md
+stopped_at: Completed 20-02-PLAN.md
+last_updated: "2026-09-10T13:29:18.322Z"
+last_activity: 2026-09-10
 progress:
   total_phases: 13
   completed_phases: 0
   total_plans: 5
-  completed_plans: 1
+  completed_plans: 2
   percent: 0
 ---
 
@@ -27,9 +27,9 @@ See: .planning/PROJECT.md (updated 2026-03-21)
 ## Current Position
 
 Phase: 20 (ci-gate) — EXECUTING
-Plan: 2 of 5
+Plan: 3 of 5
 Status: Ready to execute
-Progress: [██░░░░░░░░] 20%
+Progress: [████░░░░░░] 40%
 Last activity: 2026-09-10
 
 ## Performance Metrics
@@ -95,6 +95,7 @@ Last activity: 2026-09-10
 | Phase 19 P01 | 2min | 2 tasks | 3 files |
 | Phase 19 P02 | 1min | 3 tasks | 5 files |
 | Phase 20 P01 | 6min | 3 tasks | 5 files |
+| Phase 20 P02 | 10min | 3 tasks | 0 files |
 
 ## Accumulated Context
 
@@ -188,6 +189,11 @@ Recent decisions affecting current work:
 - [Phase 20-01]: CI actions pinned to full 40-hex SHAs with version comments, paired with dependabot.yml in the same commit so pins stay maintained
 - [Phase 20-01]: libsane-dev apt step before uv sync --locked in every CI job -- python-sane is sdist-only and compiles against sane/sane.h
 - [Phase 20-01]: CONTRIBUTING.md follows README.md GitHub markdown dialect, not the mkdocs-material dialect used under docs/
+- [Phase 20-02]: git-filter-repo must run as --refs master..autodev --partial -- whole-history filtering drops the SSH gpgsig on root commit a87b3dd, changing its SHA to 18d7911 and destroying the PR merge base
+- [Phase 20-02]: Filtered PR branch is autodev-filtered -- 112 commits, zero .planning/ paths in every commit, based on the original signed master root a87b3dd
+- [Phase 20-02]: kdknigga/scanless is PRIVATE with zero refs on the remote; defaultBranchRef is empty, so Plan 04's ruleset must target refs/heads/master explicitly
+- [Phase 20-02]: bypass_actors: [] remains UNANSWERED -- Plan 04 must treat the ruleset bypass list as an open user input, not a settled decision
+- [Phase 20-02]: Verification greps must use 'command grep' -- the shell's grep is a ugrep wrapper whose -qv exit status is wrong and it misclassified 7 commits in the history audit
 
 ### Roadmap Evolution
 
@@ -225,6 +231,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
-Last session: 2026-09-10T13:13:25.238Z
-Stopped at: Completed 20-01-PLAN.md
-Resume file: .planning/phases/20-ci-gate/20-02-PLAN.md
+Last session: 2026-09-10T13:29:18.316Z
+Stopped at: Completed 20-02-PLAN.md
+Resume file: .planning/phases/20-ci-gate/20-03-PLAN.md
