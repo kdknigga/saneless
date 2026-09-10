@@ -124,7 +124,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 22-02-PLAN.md — one `_COLUMNS` tuple, six new `Job` fields, one `_row_to_job`
+- [x] 22-02-PLAN.md — one `_COLUMNS` tuple, six new `Job` fields, one `_row_to_job`
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -311,7 +311,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 |-------|----------------|--------|-----------|
 | 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
-| 22. Job Store Hardening | 1/6 | In Progress|  |
+| 22. Job Store Hardening | 2/6 | In Progress|  |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
 | 24. Scanner Truthfulness | 0/? | Not started | - |
 | 25. Manual Duplex | 0/? | Not started | - |
