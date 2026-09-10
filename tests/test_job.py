@@ -7,6 +7,8 @@ STOR-05.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
@@ -14,8 +16,10 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from saneless import job as job_module
 from saneless.exceptions import StorageError
 from saneless.job import ErrorCategory, Job, JobState, JobStore
+from saneless.vocabulary import ScanOutcome
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -105,6 +109,22 @@ def _read_schema(conn: sqlite3.Connection) -> tuple[int, list[str]]:
     version: int = conn.execute("PRAGMA user_version").fetchone()[0]
     columns = [row[1] for row in conn.execute("PRAGMA table_info(jobs)")]
     return version, columns
+
+
+def _job_source() -> str:
+    """Return the source text of saneless.job for the structural assertions."""
+    return inspect.getsource(job_module)
+
+
+def _count_job_constructions(node: ast.AST) -> int:
+    """Count ``Job(...)`` constructor calls anywhere beneath an AST node."""
+    return sum(
+        1
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Name)
+        and child.func.id == "Job"
+    )
 
 
 def _read_schema_raw(db_path: str) -> tuple[int, list[str]]:
@@ -314,3 +334,158 @@ class TestMigrationLadder:
             assert mode == "wal"
         finally:
             store.close()
+
+
+class TestResultColumns:
+    """The six result columns, the one column list, and the one row mapping."""
+
+    def test_job_result_columns_default_to_none(self) -> None:
+        """A bare Job exposes all six result columns, every one None (STOR-03)."""
+        job = Job(id="test", profile="default", title="Test")
+        assert job.outcome is None
+        assert job.pages_scanned is None
+        assert job.pages_removed is None
+        assert job.pages_uploaded is None
+        assert job.warning is None
+        assert job.owner_token is None
+
+    def test_created_job_result_columns_stay_none(self) -> None:
+        """Nothing in this phase writes the six result columns (STOR-03)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Unwritten")
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.outcome is None
+            assert fetched.pages_scanned is None
+            assert fetched.pages_removed is None
+            assert fetched.pages_uploaded is None
+            assert fetched.warning is None
+            assert fetched.owner_token is None
+        finally:
+            store.close()
+
+    def test_outcome_roundtrip_preserves_value_and_python_type(self) -> None:
+        """Each result column reads back with its value and its type (STOR-03)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Result Doc")
+            store._conn.execute(
+                "UPDATE jobs SET outcome = ?, pages_scanned = ?, pages_removed = ?, "
+                "pages_uploaded = ?, warning = ?, owner_token = ? WHERE id = ?",
+                (
+                    ScanOutcome.SUCCESS.value,
+                    12,
+                    1,
+                    11,
+                    "front/back mismatch",
+                    "tok-abc",
+                    created.id,
+                ),
+            )
+            store._conn.commit()
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            # The value AND the Python type: sqlite3.Row.__getitem__ is typed
+            # Any, so neither ty nor pyrefly can catch a column that comes back
+            # as the wrong type.  These assertions are the only control.
+            assert fetched.outcome is ScanOutcome.SUCCESS
+            assert isinstance(fetched.outcome, ScanOutcome)
+            assert fetched.pages_scanned == 12
+            assert isinstance(fetched.pages_scanned, int)
+            assert fetched.pages_removed == 1
+            assert isinstance(fetched.pages_removed, int)
+            assert fetched.pages_uploaded == 11
+            assert isinstance(fetched.pages_uploaded, int)
+            assert fetched.warning == "front/back mismatch"
+            assert isinstance(fetched.warning, str)
+            assert fetched.owner_token == "tok-abc"
+            assert isinstance(fetched.owner_token, str)
+        finally:
+            store.close()
+
+    def test_outcome_roundtrip_of_a_null_column_is_none(self) -> None:
+        """A NULL outcome reads back as None, not as a ScanOutcome (STOR-03)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Null Outcome")
+            store._conn.execute(
+                "UPDATE jobs SET outcome = NULL WHERE id = ?",
+                (created.id,),
+            )
+            store._conn.commit()
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.outcome is None
+            assert not isinstance(fetched.outcome, ScanOutcome)
+        finally:
+            store.close()
+
+    def test_outcome_roundtrip_survives_list_recent(self) -> None:
+        """list_recent uses the same mapping get_job does (STOR-04)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Listed Doc")
+            store._conn.execute(
+                "UPDATE jobs SET outcome = ?, pages_scanned = ? WHERE id = ?",
+                (ScanOutcome.FALLBACK.value, 7, created.id),
+            )
+            store._conn.commit()
+
+            listed = store.list_recent()
+            assert len(listed) == 1
+            assert listed[0].outcome is ScanOutcome.FALLBACK
+            assert listed[0].pages_scanned == 7
+            assert isinstance(listed[0].pages_scanned, int)
+        finally:
+            store.close()
+
+    def test_single_mapping_column_list_matches_the_live_schema(self) -> None:
+        """_COLUMNS is exactly the fresh table's column set (STOR-04)."""
+        assert len(job_module._COLUMNS) == HEAD_COLUMN_COUNT
+        store = JobStore()
+        try:
+            _version, columns = _read_schema(store._conn)
+            assert set(job_module._COLUMNS) == set(columns)
+        finally:
+            store.close()
+
+    def test_single_mapping_ladder_reconciles_with_the_column_list(self) -> None:
+        """The ladder and the live column list cannot drift apart (STOR-04)."""
+        ladder = job_module._S3_COLUMNS | {
+            name for name, _sqltype in job_module._V2_COLUMNS
+        }
+        assert ladder == set(job_module._COLUMNS)
+
+    def test_single_mapping_has_no_handwritten_select_list(self) -> None:
+        """No hand-written SELECT column list survives in job.py (STOR-04)."""
+        assert "SELECT id, profile" not in _job_source()
+
+    def test_single_mapping_defines_exactly_one_row_to_job(self) -> None:
+        """Exactly one function converts a database row into a Job (STOR-04)."""
+        tree = ast.parse(_job_source())
+        definitions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name == "_row_to_job"
+        ]
+        assert len(definitions) == 1
+
+    def test_single_mapping_constructs_a_job_in_one_place(self) -> None:
+        """JobStore builds a Job only inside _row_to_job (STOR-04)."""
+        tree = ast.parse(_job_source())
+        store = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "JobStore"
+        )
+        row_to_job = next(
+            node
+            for node in store.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_row_to_job"
+        )
+        assert _count_job_constructions(store) == 1
+        assert _count_job_constructions(row_to_job) == 1
