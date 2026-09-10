@@ -51,6 +51,28 @@ class TestSourceToSlug:
         """Auto source maps to auto-scan slug."""
         assert source_to_slug("Auto") == "auto-scan"
 
+    def test_duplex_outranks_flatbed(self) -> None:
+        """
+        A name carrying both "flatbed" and "duplex" slugs as duplex (CTR-04).
+
+        classify_source tests duplex before flatbed, deliberately and in that
+        order (scanner/base.py). The pre-consolidation implementation tested
+        flatbed first, so this name used to slug "flatbed-scan". No other case
+        in this class distinguishes the two orders -- without this test the
+        precedence is implied rather than asserted.
+        """
+        assert source_to_slug("Flatbed Duplex") == "adf-duplex"
+
+    def test_auto_is_matched_exactly_not_as_a_substring(self) -> None:
+        """
+        "Automatic Document Feeder" is a feeder, not an Auto source (CTR-04).
+
+        The name begins with the letters "auto"; a substring test would slug it
+        "auto-scan" and route a stack of pages down the single-page path.
+        """
+        assert source_to_slug("Automatic Document Feeder") == "adf-simplex"
+        assert source_to_slug("Auto") == "auto-scan"
+
     def test_auto_source_case_insensitive(self) -> None:
         """Auto source mapping is case-insensitive."""
         assert source_to_slug("auto") == "auto-scan"
