@@ -6,16 +6,21 @@ Covers requirements: CTR-01, CTR-02, CTR-05.
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import cast
 
 import pytest
 
+import saneless.job
 from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
     PaperlessError,
     ScanError,
 )
+from saneless.job import ErrorCategory as JobErrorCategory
+from saneless.job import Job
+from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
@@ -292,3 +297,68 @@ class TestClassifyError:
         """FeederEmptyError is checked before its ScanError base class (CTR-05)."""
         assert issubclass(FeederEmptyError, ScanError)
         assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
+
+
+class TestJobModuleReExports:
+    """saneless.job re-export tests."""
+
+    def test_job_module_re_exports_the_same_job_state(self) -> None:
+        """saneless.job.JobState is the vocabulary object, not a copy (CTR-01)."""
+        assert saneless.job.JobState is JobState
+
+    def test_job_module_re_exports_the_same_error_category(self) -> None:
+        """saneless.job.ErrorCategory is the vocabulary object, not a copy (CTR-05)."""
+        assert saneless.job.ErrorCategory is ErrorCategory
+
+    def test_existing_from_import_still_resolves(self) -> None:
+        """The long-standing `from saneless.job import ...` spelling still works (CTR-01)."""
+        assert JobErrorCategory is ErrorCategory
+        assert JobJobState is JobState
+
+    def test_job_module_declares_no_enum_of_its_own(self) -> None:
+        """job.py owns no enum definition any more (CTR-01)."""
+        assert JobState.__module__ == "saneless.vocabulary"
+        assert ErrorCategory.__module__ == "saneless.vocabulary"
+
+
+class TestJobActivityProperties:
+    """Job.is_active / Job.is_busy tests."""
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (JobState.PENDING, (True, True)),
+            (JobState.SCANNING, (True, True)),
+            (JobState.AWAITING_FLIP, (True, False)),
+            (JobState.ASSEMBLING, (True, True)),
+            (JobState.UPLOADING, (True, True)),
+            (JobState.DONE, (False, False)),
+            (JobState.ERROR, (False, False)),
+        ],
+    )
+    def test_job_reports_activity(
+        self,
+        state: JobState,
+        expected: tuple[bool, bool],
+    ) -> None:
+        """A Job answers is_active/is_busy for every lifecycle state (CTR-01)."""
+        job = Job(id="j", profile="default", title="t", state=state)
+        assert (job.is_active, job.is_busy) == expected
+
+    def test_awaiting_flip_is_active_but_not_busy(self) -> None:
+        """A flip prompt leaves the job in flight while the machine idles (CTR-01)."""
+        job = Job(id="j", profile="default", title="t", state=JobState.AWAITING_FLIP)
+        assert job.is_active
+        assert not job.is_busy
+
+    def test_done_is_neither_active_nor_busy(self) -> None:
+        """A finished job is neither in flight nor working (CTR-01)."""
+        job = Job(id="j", profile="default", title="t", state=JobState.DONE)
+        assert not job.is_active
+        assert not job.is_busy
+
+    def test_properties_are_not_dataclass_fields(self) -> None:
+        """is_active/is_busy are properties, so they stay out of __init__ (CTR-01)."""
+        field_names = {f.name for f in fields(Job)}
+        assert "is_active" not in field_names
+        assert "is_busy" not in field_names

@@ -14,33 +14,12 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
+
+from saneless.vocabulary import ACTIVE_STATES, BUSY_STATES, ErrorCategory, JobState
 
 __all__ = ["ErrorCategory", "Job", "JobState", "JobStore"]
 
 logger = logging.getLogger(__name__)
-
-
-class JobState(StrEnum):
-    """States in the scan job lifecycle."""
-
-    PENDING = "PENDING"
-    SCANNING = "SCANNING"
-    AWAITING_FLIP = "AWAITING_FLIP"
-    ASSEMBLING = "ASSEMBLING"
-    UPLOADING = "UPLOADING"
-    DONE = "DONE"
-    ERROR = "ERROR"
-
-
-class ErrorCategory(StrEnum):
-    """Categories of errors for programmatic handling."""
-
-    FEEDER = "FEEDER"
-    CONFIG = "CONFIG"
-    SCANNER = "SCANNER"
-    UPLOAD = "UPLOAD"
-    UNKNOWN = "UNKNOWN"
 
 
 @dataclass
@@ -72,6 +51,16 @@ class Job:
     tags: list[int] = field(default_factory=list)
     correspondent: int | None = None
     thumbnail: str | None = None
+
+    @property
+    def is_active(self) -> bool:
+        """Whether this job is still in flight (not DONE or ERROR)."""
+        return self.state in ACTIVE_STATES
+
+    @property
+    def is_busy(self) -> bool:
+        """Whether the machine is working (active, but not waiting for a human)."""
+        return self.state in BUSY_STATES
 
 
 class JobStore:
