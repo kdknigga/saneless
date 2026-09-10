@@ -6,8 +6,16 @@ Covers requirements: CTR-01, CTR-02, CTR-05.
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
+from saneless.exceptions import (
+    ConfigError,
+    FeederEmptyError,
+    PaperlessError,
+    ScanError,
+)
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
@@ -15,6 +23,10 @@ from saneless.vocabulary import (
     ErrorCategory,
     JobState,
     ScanOutcome,
+    classify_error,
+    error_message,
+    progress_label,
+    state_label,
 )
 
 
@@ -132,3 +144,151 @@ class TestStateClassifications:
     def test_busy_states_is_a_subset_of_active_states(self) -> None:
         """No state can be busy without also being active (CTR-01)."""
         assert BUSY_STATES <= ACTIVE_STATES
+
+
+class TestStateLabel:
+    """state_label short-label lookup tests."""
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (JobState.PENDING, "Pending"),
+            (JobState.SCANNING, "Scanning"),
+            (JobState.AWAITING_FLIP, "Waiting for flip"),
+            (JobState.ASSEMBLING, "Assembling"),
+            (JobState.UPLOADING, "Uploading"),
+            (JobState.DONE, "Complete"),
+            (JobState.ERROR, "Failed"),
+        ],
+    )
+    def test_state_label_strings(self, state: JobState, expected: str) -> None:
+        """state_label returns the label the history table has always shown (CTR-01)."""
+        assert state_label(state) == expected
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_state_label_is_complete(self, state: JobState) -> None:
+        """Every JobState has a label that is not just its raw value (CTR-01)."""
+        label = state_label(state)
+        assert label
+        assert label != state.value
+
+
+class TestProgressLabel:
+    """progress_label progress-prose lookup tests."""
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (JobState.PENDING, "Starting scan..."),
+            (JobState.SCANNING, "Scanning..."),
+            (JobState.AWAITING_FLIP, "Awaiting flip..."),
+            (JobState.ASSEMBLING, "Assembling PDF..."),
+            (JobState.UPLOADING, "Uploading to paperless-ngx..."),
+        ],
+    )
+    def test_progress_label_strings(self, state: JobState, expected: str) -> None:
+        """progress_label returns the prose the status area has always shown (CTR-01)."""
+        assert progress_label(state) == expected
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_progress_label_is_complete(self, state: JobState) -> None:
+        """Every JobState has progress prose that is not its raw value (CTR-01)."""
+        label = progress_label(state)
+        assert label
+        assert label != state.value
+
+    def test_terminal_states_have_progress_prose_for_totality(self) -> None:
+        """DONE and ERROR carry prose purely so the lookup stays total (CTR-01)."""
+        assert progress_label(JobState.DONE) == "Complete"
+        assert progress_label(JobState.ERROR) == "Failed"
+
+
+class TestErrorMessage:
+    """error_message category-message lookup tests."""
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_message_is_complete(self, category: ErrorCategory) -> None:
+        """Every ErrorCategory has a plain-language message (CTR-05)."""
+        message = error_message(category)
+        assert message
+        assert message != category.value
+
+    def test_error_message_strings(self) -> None:
+        """error_message returns developer-authored prose, not exception text (CTR-05)."""
+        assert error_message(ErrorCategory.FEEDER) == (
+            "The document feeder is empty or jammed."
+        )
+        assert error_message(ErrorCategory.CONFIG) == (
+            "The saneless configuration is invalid."
+        )
+        assert error_message(ErrorCategory.SCANNER) == (
+            "The scanner could not complete the scan."
+        )
+        assert error_message(ErrorCategory.UPLOAD) == (
+            "The document could not be sent to paperless-ngx."
+        )
+        assert error_message(ErrorCategory.UNKNOWN) == "Something went wrong."
+
+
+class TestUnrecognisedValue:
+    """Total-lookup fall-through behaviour tests."""
+
+    def test_state_label_raises_on_unrecognised_value(self) -> None:
+        """
+        state_label raises rather than echoing an unknown value back (CTR-01).
+
+        Raising is safe here because ``Job.state`` is only ever built through
+        ``JobState(row[3])`` in ``JobStore.get_job`` and ``JobStore.list_recent``,
+        which already rejects any value the enum does not name -- so an
+        unrecognised value cannot reach a template.  That matters: a raising
+        filter inside a Jinja render escapes ``TemplateResponse`` as a bare
+        HTTP 500, and htmx 2 does not swap non-2xx bodies, so the observable
+        failure would be the status area freezing silently while the one-second
+        poll keeps hammering the server.  ``typing.assert_never`` raises
+        ``AssertionError`` from a real ``raise`` statement, so ``python -O``
+        does not strip the guard.
+        """
+        bad = cast("JobState", "UNKNOWN")
+        with pytest.raises(AssertionError):
+            state_label(bad)
+
+    def test_progress_label_raises_on_unrecognised_value(self) -> None:
+        """progress_label raises on a value outside JobState (CTR-01)."""
+        bad = cast("JobState", "UNKNOWN")
+        with pytest.raises(AssertionError):
+            progress_label(bad)
+
+    def test_error_message_raises_on_unrecognised_value(self) -> None:
+        """error_message raises on a value outside ErrorCategory (CTR-05)."""
+        bad = cast("ErrorCategory", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            error_message(bad)
+
+
+class TestClassifyError:
+    """classify_error exception-to-category mapping tests."""
+
+    def test_feeder_empty_error_is_feeder(self) -> None:
+        """FeederEmptyError classifies as FEEDER (CTR-05)."""
+        assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
+
+    def test_config_error_is_config(self) -> None:
+        """ConfigError classifies as CONFIG (CTR-05)."""
+        assert classify_error(ConfigError("bad toml")) is ErrorCategory.CONFIG
+
+    def test_scan_error_is_scanner(self) -> None:
+        """ScanError classifies as SCANNER (CTR-05)."""
+        assert classify_error(ScanError("device busy")) is ErrorCategory.SCANNER
+
+    def test_paperless_error_is_upload(self) -> None:
+        """PaperlessError classifies as UPLOAD (CTR-05)."""
+        assert classify_error(PaperlessError("http 500")) is ErrorCategory.UPLOAD
+
+    def test_unrelated_exception_is_unknown(self) -> None:
+        """An exception outside the saneless hierarchy is UNKNOWN (CTR-05)."""
+        assert classify_error(ValueError("who knows")) is ErrorCategory.UNKNOWN
+
+    def test_feeder_empty_wins_over_its_scan_error_base(self) -> None:
+        """FeederEmptyError is checked before its ScanError base class (CTR-05)."""
+        assert issubclass(FeederEmptyError, ScanError)
+        assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
