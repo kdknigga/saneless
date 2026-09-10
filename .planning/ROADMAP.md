@@ -92,8 +92,8 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 21-03-PLAN.md — web rewiring: `_STATE_LABELS` and `humanize_state` deleted, filters re-backed, all state literals removed from the three templates
-- [ ] 21-04-PLAN.md — `PipelineEvent.job_state`, worker `_status_cb` collapse, CLI `_event_labels` deleted, `classify_error` moved off `ScanWorker`
+- [x] 21-03-PLAN.md — web rewiring: `_STATE_LABELS` and `humanize_state` deleted, filters re-backed, all state literals removed from the three templates
+- [x] 21-04-PLAN.md — `PipelineEvent.job_state`, worker `_status_cb` collapse, CLI `_event_labels` deleted, `classify_error` moved off `ScanWorker`
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -280,7 +280,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
-| 21. Vocabulary and Contracts | 2/5 | In Progress|  |
+| 21. Vocabulary and Contracts | 4/5 | In Progress|  |
 | 22. Job Store Hardening | 0/? | Not started | - |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
 | 24. Scanner Truthfulness | 0/? | Not started | - |
