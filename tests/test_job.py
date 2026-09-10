@@ -21,7 +21,7 @@ import pytest
 from saneless import job as job_module
 from saneless.exceptions import StorageError
 from saneless.job import ErrorCategory, Job, JobState, JobStore
-from saneless.vocabulary import ScanOutcome
+from saneless.vocabulary import ACTIVE_STATES, TERMINAL_STATES, ScanOutcome
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -139,6 +139,35 @@ TRANSACTION_VERBS = frozenset(
 ``with conn:`` issues alongside the statements the method itself runs.  These
 are what the single-statement assertion filters out.
 """
+
+RESTART_REASON = "Interrupted by restart"
+"""The reason ``fail_active_jobs()`` records when the caller names none.
+
+Spelled out here rather than imported from ``job.py``, so a change to that
+default surfaces as a visible test failure instead of a constant that silently
+agrees with whatever the source now says.
+"""
+
+CUSTOM_REASON = "server restarted"
+"""The caller-supplied reason the custom-reason case passes.
+
+STOR-05's own prose asks for "a 'server restarted' reason" while M-03's
+prescription is the ``Interrupted by restart`` default; a defaulted parameter
+satisfies both, and this constant is what proves the parameter is honoured.
+"""
+
+QUEUE_ROWS = 6
+"""Jobs the ``list_pending()`` ordering case creates."""
+
+QUEUE_MOVED = (1, 3)
+"""Insertion indices the ordering case moves out of PENDING.
+
+One goes to an active non-PENDING state and one to a terminal state, so the
+case rules out both "every active job" and "every job" as the predicate.
+"""
+
+QUEUE_BASE_HOURS = 1
+"""How far back the ordering case's oldest queued job is backdated."""
 
 
 def _build_s3_schema(db_path: str) -> None:
@@ -354,6 +383,60 @@ def _row_touching(traced: list[str]) -> list[str]:
         for text in traced
         if (words := text.split()) and words[0].upper() not in TRANSACTION_VERBS
     ]
+
+
+def _seed_one_per_state(store: JobStore) -> dict[str, JobState]:
+    """
+    Create one job in every JobState, each carrying an error text of its own.
+
+    Iterates ``JobState`` itself rather than a hand-written roster, so a member
+    added in a later phase is covered here without editing this helper.  Every
+    job is given a distinct ``error`` before the call under test, which is what
+    lets the terminal rows be asserted unchanged rather than merely
+    still-terminal.  ``error_category`` is left ``None`` on purpose.
+
+    Args:
+        store: The store to write to.
+
+    Returns:
+        A mapping from job id to the state that job was moved into.
+
+    """
+    seeded: dict[str, JobState] = {}
+    for state in JobState:
+        job = store.create_job(profile="default", title=f"Job in {state.value}")
+        store.update_state(job.id, state, error=f"before {state.value}")
+        seeded[job.id] = state
+    return seeded
+
+
+def _seed_queue(store: JobStore) -> list[str]:
+    """
+    Create QUEUE_ROWS jobs whose created_at order is the reverse of insertion order.
+
+    Backdating by raw SQL is what ``_insert_shuffled`` already does for the prune
+    cases.  It keeps the ordering deterministic without sleeping: D-32 leaves the
+    two existing sleeps in the prune tests alone, and this phase adds no third.
+
+    Args:
+        store: The store to write to.
+
+    Returns:
+        The job ids in insertion order -- index 0 is the NEWEST by created_at.
+
+    """
+    base = datetime.now(tz=UTC) - timedelta(hours=QUEUE_BASE_HOURS)
+    ids: list[str] = []
+    for index in range(QUEUE_ROWS):
+        job = store.create_job(profile="default", title=f"Queued {index:02d}")
+        ids.append(job.id)
+        stamp = base + timedelta(minutes=QUEUE_ROWS - 1 - index)
+        store._conn.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?",
+            (stamp.isoformat(), job.id),
+        )
+    store._conn.commit()
+    return ids
 
 
 def test_list_recent() -> None:
@@ -899,4 +982,172 @@ class TestPruneSingleStatement:
             assert "COUNT(" not in statements[0].upper()
         finally:
             store._conn.set_trace_callback(None)
+            store.close()
+
+
+class TestQueryMethods:
+    """fail_active_jobs() and list_pending(): the two STOR-05 query methods."""
+
+    def test_fail_active_jobs_moves_every_active_job_to_error(self) -> None:
+        """fail_active_jobs fails every active job and reports how many (STOR-05)."""
+        store = JobStore()
+        try:
+            seeded = _seed_one_per_state(store)
+
+            failed = store.fail_active_jobs()
+
+            assert failed == len(ACTIVE_STATES)
+            for job_id, original in seeded.items():
+                job = store.get_job(job_id)
+                assert job is not None
+                if original in ACTIVE_STATES:
+                    assert job.state == JobState.ERROR
+                    assert job.error == RESTART_REASON
+                else:
+                    # Not merely "still terminal": the same state AND the same
+                    # error text it carried before the call.  A predicate that
+                    # over-reached would rewrite completed job history, and the
+                    # error text is where that would show first.
+                    assert original in TERMINAL_STATES
+                    assert job.state == original
+                    assert job.error == f"before {original.value}"
+        finally:
+            store.close()
+
+    def test_fail_active_jobs_with_nothing_active_returns_zero(self) -> None:
+        """fail_active_jobs on a settled store changes nothing (STOR-05)."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="Finished")
+            store.update_state(job.id, JobState.DONE)
+
+            failed = store.fail_active_jobs()
+
+            assert failed == 0
+            settled = store.get_job(job.id)
+            assert settled is not None
+            assert settled.state == JobState.DONE
+            assert settled.error is None
+        finally:
+            store.close()
+
+    def test_fail_active_jobs_honours_a_custom_reason(self) -> None:
+        """A caller-supplied reason is the text recorded on the failed row (STOR-05)."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="In flight")
+            store.update_state(job.id, JobState.SCANNING)
+
+            failed = store.fail_active_jobs(reason=CUSTOM_REASON)
+
+            assert failed == 1
+            stopped = store.get_job(job.id)
+            assert stopped is not None
+            assert stopped.state == JobState.ERROR
+            assert stopped.error == CUSTOM_REASON
+        finally:
+            store.close()
+
+    def test_fail_active_jobs_leaves_error_category_unset(self) -> None:
+        """fail_active_jobs writes no error_category on the rows it fails (STOR-05)."""
+        # A deliberate assertion, not an omission.  N-14 records error_category
+        # as written but never read, Phase 21's D-12 left it unwired, and Phase
+        # 30 (APPL-04) owns giving it a consumer -- a second unread writer here
+        # would work against the milestone that has to justify or delete the
+        # field.  ErrorCategory.UNKNOWN would additionally be wrong: an
+        # interrupted restart is not an unknown failure.
+        store = JobStore()
+        try:
+            seeded = _seed_one_per_state(store)
+
+            store.fail_active_jobs()
+
+            for job_id in seeded:
+                job = store.get_job(job_id)
+                assert job is not None
+                assert job.error_category is None
+        finally:
+            store.close()
+
+    def test_fail_active_jobs_transitions_exactly_the_active_states(self) -> None:
+        """The states fail_active_jobs moves are exactly ACTIVE_STATES (STOR-05)."""
+        store = JobStore()
+        try:
+            seeded = _seed_one_per_state(store)
+
+            store.fail_active_jobs()
+
+            transitioned = set()
+            for job_id, original in seeded.items():
+                job = store.get_job(job_id)
+                assert job is not None
+                if job.state != original:
+                    transitioned.add(original)
+            # Computed from the real frozenset rather than spelled out.  This is
+            # what makes Phase 23's FALLBACK and Phase 25's SCANNING_REVERSE get
+            # picked up the moment they join ACTIVE_STATES, with no edit to
+            # fail_active_jobs -- and what fails loudly if the predicate is ever
+            # hand-written back into a fixed list.
+            assert transitioned == ACTIVE_STATES
+            # The seeding covered the whole enum, so "exactly ACTIVE_STATES" is
+            # a statement about every state and not only about the ones seeded.
+            assert set(seeded.values()) == ACTIVE_STATES | TERMINAL_STATES
+        finally:
+            store.close()
+
+    def test_job_state_has_no_failed_member(self) -> None:
+        """FAILED in the STOR-05 prose means the existing JobState.ERROR (STOR-05)."""
+        # D-19, pinned as a test because a future reader taking the requirement
+        # prose literally could reasonably invent a JobState.FAILED.  The value
+        # is persisted as SQLite TEXT and read back through the enum
+        # constructor, so adding or renaming a member is a data migration.
+        assert "FAILED" not in JobState.__members__
+        assert JobState.ERROR.value == "ERROR"
+
+    def test_list_pending_returns_only_pending_jobs_oldest_first(self) -> None:
+        """list_pending returns the still-queued jobs in creation order (STOR-05)."""
+        store = JobStore()
+        try:
+            ids = _seed_queue(store)
+            store.update_state(ids[QUEUE_MOVED[0]], JobState.SCANNING)
+            store.update_state(ids[QUEUE_MOVED[1]], JobState.DONE)
+
+            pending = store.list_pending()
+
+            # created_at descends with the insertion index, so ascending
+            # created_at order is the reverse of insertion order.  Spelling the
+            # expectation this way makes the test fail under DESC (list_recent's
+            # ordering) and under raw insertion order alike.
+            expected = [
+                f"Queued {index:02d}"
+                for index in reversed(range(QUEUE_ROWS))
+                if index not in QUEUE_MOVED
+            ]
+            assert [job.title for job in pending] == expected
+        finally:
+            store.close()
+
+    def test_list_pending_on_an_empty_store_returns_an_empty_list(self) -> None:
+        """list_pending on a store with no jobs returns an empty list (STOR-05)."""
+        store = JobStore()
+        try:
+            assert store.list_pending() == []
+        finally:
+            store.close()
+
+    def test_list_pending_returns_jobs_in_the_pending_state(self) -> None:
+        """Every object list_pending returns is a PENDING Job (STOR-05)."""
+        store = JobStore()
+        try:
+            ids = _seed_queue(store)
+            store.update_state(ids[QUEUE_MOVED[0]], JobState.UPLOADING)
+
+            pending = store.list_pending()
+
+            assert len(pending) == QUEUE_ROWS - 1
+            for job in pending:
+                assert isinstance(job, Job)
+                assert job.state == JobState.PENDING
+                assert isinstance(job.tags, list)
+        finally:
             store.close()
