@@ -132,7 +132,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 22-04-PLAN.md — `prune()` as one `DELETE` reporting `cursor.rowcount`
+- [x] 22-04-PLAN.md — `prune()` as one `DELETE` reporting `cursor.rowcount`
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -311,7 +311,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 |-------|----------------|--------|-----------|
 | 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
-| 22. Job Store Hardening | 3/6 | In Progress|  |
+| 22. Job Store Hardening | 4/6 | In Progress|  |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
 | 24. Scanner Truthfulness | 0/? | Not started | - |
 | 25. Manual Duplex | 0/? | Not started | - |
