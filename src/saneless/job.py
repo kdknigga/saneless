@@ -119,9 +119,8 @@ argument is ``_SELECT_JOBS``'s.
 _DELETE_JOBS = "DELETE FROM jobs"
 """The ``DELETE`` verb and its target table, held under a name.
 
-Declared for the same reason as ``_UPDATE_JOBS`` and likewise used by nothing
-yet: the single-statement ``prune()`` that will use it is a later change.  Its
-safety argument is ``_SELECT_JOBS``'s.
+Declared for the same reason as ``_UPDATE_JOBS``, and consumed by ``_PRUNE``
+below.  Its safety argument is ``_SELECT_JOBS``'s.
 """
 
 _SELECT_ALL = f"{_SELECT_JOBS} {_COLUMN_LIST} FROM jobs"
@@ -135,6 +134,42 @@ _SELECT_RECENT = f"{_SELECT_ALL} ORDER BY created_at DESC LIMIT ?"
 
 _INSERT = f"{_INSERT_JOBS} ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS})"
 """Write one job, naming every column so physical column order never matters."""
+
+_NEWEST_IDS = f"{_SELECT_JOBS} id FROM jobs ORDER BY created_at DESC LIMIT ?"
+"""The ids of the newest jobs, up to a bound limit -- ``_PRUNE``'s subquery.
+
+Held apart from ``_PRUNE`` for the same reason ``_SELECT_JOBS`` holds the verb:
+``S608`` matches ``select ... from`` anywhere in an interpolated string's
+literal text, not only at its start, so a nested ``SELECT`` written inline would
+trip it -- and a lint suppression is not available to silence it.  Behind a
+name, both halves are ordinary constants and the rule has nothing to flag.
+"""
+
+_PRUNE = f"{_DELETE_JOBS} WHERE created_at < ? OR id NOT IN ({_NEWEST_IDS})"
+"""Delete every job past the age cutoff or outside the newest ``max_rows``.
+
+Two bound parameters, in this order: the ISO-8601 cutoff, then the row cap.  Its
+safety argument is ``_SELECT_JOBS``'s -- the only interpolated value is the
+module-level ``_DELETE_JOBS`` literal, and both runtime values are bound ``?``.
+
+**Both comparisons are lexicographic over strings.**  ``created_at`` is written
+as ``datetime.now(tz=UTC).isoformat()``, so every value ends ``+00:00``, and the
+``<`` cutoff and the ``ORDER BY`` are correct *only* because of that uniformity.
+A single non-UTC timestamp reaching this column -- a ``-05:00`` offset, say --
+would make both the cutoff and the ordering silently wrong, and nothing here
+would raise.  Anyone adding a writer to this column meets this note first.
+
+The two predicates are a *union*, not a sequence, and that is equivalent to
+deleting by age and then trimming to a row cap: both order by ``created_at``, so
+the age-expired rows are always a prefix of the oldest and the union of the two
+sets is exactly what the sequential form produced.  The equivalence rests in
+turn on SQLite evaluating the ``IN (SELECT ... ORDER BY ... LIMIT ?)`` right-hand
+side into a ``LIST SUBQUERY`` before the outer scan begins, so it never observes
+its own partial deletions.  SQLite does not document that as a guarantee, so it
+is pinned by the shuffled-insert-order tests in ``tests/test_job.py`` rather than
+by contract: if a future libsqlite changes the plan, those go red instead of
+this statement quietly under-deleting.
+"""
 
 _S3_COLUMNS: frozenset[str] = frozenset(
     {
@@ -572,8 +607,19 @@ class JobStore:
         """
         Remove old jobs by age and count limits.
 
-        First deletes jobs older than max_age_days, then trims to
-        max_rows keeping the most recent entries.
+        One ``DELETE`` removes every job older than ``max_age_days`` together
+        with every job outside the newest ``max_rows``, and reports how many
+        rows it removed.  The two predicates are a union rather than a sequence;
+        ``_PRUNE`` carries the argument for why that is the same set the old
+        delete-by-age-then-trim composition produced, and the UTC assumption
+        both halves rest on.
+
+        The count comes from the statement itself.  The two ``SELECT COUNT(*)``
+        reads this used to subtract straddled the deletes, so an insert landing
+        between them made the answer wrong -- a scratch test drove it to ``-1``.
+        A single statement leaves no gap for an insert to land in, which is a
+        stronger guarantee than serialising the method behind the store's lock:
+        it holds against writers on other connections too.
 
         Args:
             max_age_days: Maximum age in days before a job is pruned.
@@ -583,27 +629,10 @@ class JobStore:
             Total number of jobs deleted.
 
         """
+        cutoff = (datetime.now(tz=UTC) - timedelta(days=max_age_days)).isoformat()
         with self._conn:
-            before_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            deleted = self._conn.execute(_PRUNE, (cutoff, max_rows)).rowcount
 
-            cutoff = (datetime.now(tz=UTC) - timedelta(days=max_age_days)).isoformat()
-            self._conn.execute(
-                "DELETE FROM jobs WHERE created_at < ?",
-                (cutoff,),
-            )
-
-            self._conn.execute(
-                "DELETE FROM jobs WHERE id NOT IN "
-                "(SELECT id FROM jobs ORDER BY created_at DESC LIMIT ?)",
-                (max_rows,),
-            )
-
-            # Counted before the commit, inside the same transaction: a count
-            # taken after it would be a second read of a table another thread
-            # may already have written to.
-            after_count = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-
-        deleted = before_count - after_count
         if deleted > 0:
             logger.debug("Pruned %d old jobs", deleted)
         return deleted
