@@ -1,0 +1,364 @@
+"""
+Tests for the shared saneless vocabulary module.
+
+Covers requirements: CTR-01, CTR-02, CTR-05.
+"""
+
+from __future__ import annotations
+
+from dataclasses import fields
+from typing import cast
+
+import pytest
+
+import saneless.job
+from saneless.exceptions import (
+    ConfigError,
+    FeederEmptyError,
+    PaperlessError,
+    ScanError,
+)
+from saneless.job import ErrorCategory as JobErrorCategory
+from saneless.job import Job
+from saneless.job import JobState as JobJobState
+from saneless.vocabulary import (
+    ACTIVE_STATES,
+    BUSY_STATES,
+    TERMINAL_STATES,
+    ErrorCategory,
+    JobState,
+    ScanOutcome,
+    classify_error,
+    error_message,
+    progress_label,
+    state_label,
+)
+
+
+class TestJobStateMembers:
+    """JobState membership tests."""
+
+    def test_job_state_has_exactly_seven_members(self) -> None:
+        """JobState declares exactly seven lifecycle members (CTR-01)."""
+        assert len(list(JobState)) == 7
+
+    def test_job_state_member_names(self) -> None:
+        """JobState names are the seven documented lifecycle states (CTR-01)."""
+        assert [state.name for state in JobState] == [
+            "PENDING",
+            "SCANNING",
+            "AWAITING_FLIP",
+            "ASSEMBLING",
+            "UPLOADING",
+            "DONE",
+            "ERROR",
+        ]
+
+    def test_job_state_has_no_future_phase_members(self) -> None:
+        """JobState does not yet carry FALLBACK or SCANNING_REVERSE (CTR-01)."""
+        names = {state.name for state in JobState}
+        assert "FALLBACK" not in names
+        assert "SCANNING_REVERSE" not in names
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_job_state_value_equals_name(self, state: JobState) -> None:
+        """Every JobState value is identical to its member name (CTR-01)."""
+        assert state.value == state.name
+
+
+class TestErrorCategoryMembers:
+    """ErrorCategory membership tests."""
+
+    def test_error_category_member_names(self) -> None:
+        """ErrorCategory names are the five documented categories (CTR-05)."""
+        assert [category.name for category in ErrorCategory] == [
+            "FEEDER",
+            "CONFIG",
+            "SCANNER",
+            "UPLOAD",
+            "UNKNOWN",
+        ]
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_category_value_equals_name(self, category: ErrorCategory) -> None:
+        """Every ErrorCategory value is identical to its member name (CTR-05)."""
+        assert category.value == category.name
+
+
+class TestScanOutcomeMembers:
+    """ScanOutcome membership tests."""
+
+    def test_scan_outcome_has_exactly_two_members(self) -> None:
+        """ScanOutcome is exactly SUCCESS and FALLBACK (CTR-02)."""
+        assert [outcome.name for outcome in ScanOutcome] == ["SUCCESS", "FALLBACK"]
+
+    def test_scan_outcome_has_no_failed_member(self) -> None:
+        """ScanOutcome carries no FAILED member in this phase (CTR-02)."""
+        assert "FAILED" not in {outcome.name for outcome in ScanOutcome}
+
+    @pytest.mark.parametrize("outcome", list(ScanOutcome))
+    def test_scan_outcome_value_equals_name(self, outcome: ScanOutcome) -> None:
+        """Every ScanOutcome value is identical to its member name (CTR-02)."""
+        assert outcome.value == outcome.name
+
+
+class TestStateClassifications:
+    """ACTIVE_STATES / TERMINAL_STATES / BUSY_STATES classification tests."""
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_every_state_is_active_xor_terminal(self, state: JobState) -> None:
+        """Each JobState is either active or terminal, never both (CTR-01)."""
+        assert (state in ACTIVE_STATES) ^ (state in TERMINAL_STATES)
+
+    def test_classifications_cover_every_state(self) -> None:
+        """ACTIVE_STATES and TERMINAL_STATES together are all of JobState (CTR-01)."""
+        assert set(JobState) == ACTIVE_STATES | TERMINAL_STATES
+
+    def test_classifications_do_not_overlap(self) -> None:
+        """ACTIVE_STATES and TERMINAL_STATES share no member (CTR-01)."""
+        assert not (ACTIVE_STATES & TERMINAL_STATES)
+
+    def test_active_states_membership(self) -> None:
+        """ACTIVE_STATES is the five in-flight lifecycle states (CTR-01)."""
+        assert (
+            frozenset(
+                {
+                    JobState.PENDING,
+                    JobState.SCANNING,
+                    JobState.AWAITING_FLIP,
+                    JobState.ASSEMBLING,
+                    JobState.UPLOADING,
+                }
+            )
+            == ACTIVE_STATES
+        )
+
+    def test_terminal_states_membership(self) -> None:
+        """TERMINAL_STATES is exactly DONE and ERROR (CTR-01)."""
+        assert frozenset({JobState.DONE, JobState.ERROR}) == TERMINAL_STATES
+
+    def test_busy_states_is_derived_from_active_states(self) -> None:
+        """BUSY_STATES is ACTIVE_STATES minus AWAITING_FLIP (CTR-01)."""
+        assert ACTIVE_STATES - {JobState.AWAITING_FLIP} == BUSY_STATES
+
+    def test_awaiting_flip_is_active_but_not_busy(self) -> None:
+        """AWAITING_FLIP is in flight but the machine is idle then (CTR-01)."""
+        assert JobState.AWAITING_FLIP in ACTIVE_STATES
+        assert JobState.AWAITING_FLIP not in BUSY_STATES
+
+    def test_busy_states_is_a_subset_of_active_states(self) -> None:
+        """No state can be busy without also being active (CTR-01)."""
+        assert BUSY_STATES <= ACTIVE_STATES
+
+
+class TestStateLabel:
+    """state_label short-label lookup tests."""
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (JobState.PENDING, "Pending"),
+            (JobState.SCANNING, "Scanning"),
+            (JobState.AWAITING_FLIP, "Waiting for flip"),
+            (JobState.ASSEMBLING, "Assembling"),
+            (JobState.UPLOADING, "Uploading"),
+            (JobState.DONE, "Complete"),
+            (JobState.ERROR, "Failed"),
+        ],
+    )
+    def test_state_label_strings(self, state: JobState, expected: str) -> None:
+        """state_label returns the label the history table has always shown (CTR-01)."""
+        assert state_label(state) == expected
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_state_label_is_complete(self, state: JobState) -> None:
+        """Every JobState has a label that is not just its raw value (CTR-01)."""
+        label = state_label(state)
+        assert label
+        assert label != state.value
+
+
+class TestProgressLabel:
+    """progress_label progress-prose lookup tests."""
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (JobState.PENDING, "Starting scan..."),
+            (JobState.SCANNING, "Scanning..."),
+            (JobState.AWAITING_FLIP, "Awaiting flip..."),
+            (JobState.ASSEMBLING, "Assembling PDF..."),
+            (JobState.UPLOADING, "Uploading to paperless-ngx..."),
+        ],
+    )
+    def test_progress_label_strings(self, state: JobState, expected: str) -> None:
+        """progress_label returns the prose the status area has always shown (CTR-01)."""
+        assert progress_label(state) == expected
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_progress_label_is_complete(self, state: JobState) -> None:
+        """Every JobState has progress prose that is not its raw value (CTR-01)."""
+        label = progress_label(state)
+        assert label
+        assert label != state.value
+
+    def test_terminal_states_have_progress_prose_for_totality(self) -> None:
+        """DONE and ERROR carry prose purely so the lookup stays total (CTR-01)."""
+        assert progress_label(JobState.DONE) == "Complete"
+        assert progress_label(JobState.ERROR) == "Failed"
+
+
+class TestErrorMessage:
+    """error_message category-message lookup tests."""
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_message_is_complete(self, category: ErrorCategory) -> None:
+        """Every ErrorCategory has a plain-language message (CTR-05)."""
+        message = error_message(category)
+        assert message
+        assert message != category.value
+
+    def test_error_message_strings(self) -> None:
+        """error_message returns developer-authored prose, not exception text (CTR-05)."""
+        assert error_message(ErrorCategory.FEEDER) == (
+            "The document feeder is empty or jammed."
+        )
+        assert error_message(ErrorCategory.CONFIG) == (
+            "The saneless configuration is invalid."
+        )
+        assert error_message(ErrorCategory.SCANNER) == (
+            "The scanner could not complete the scan."
+        )
+        assert error_message(ErrorCategory.UPLOAD) == (
+            "The document could not be sent to paperless-ngx."
+        )
+        assert error_message(ErrorCategory.UNKNOWN) == "Something went wrong."
+
+
+class TestUnrecognisedValue:
+    """Total-lookup fall-through behaviour tests."""
+
+    def test_state_label_raises_on_unrecognised_value(self) -> None:
+        """
+        state_label raises rather than echoing an unknown value back (CTR-01).
+
+        Raising is safe here because ``Job.state`` is only ever built through
+        ``JobState(row[3])`` in ``JobStore.get_job`` and ``JobStore.list_recent``,
+        which already rejects any value the enum does not name -- so an
+        unrecognised value cannot reach a template.  That matters: a raising
+        filter inside a Jinja render escapes ``TemplateResponse`` as a bare
+        HTTP 500, and htmx 2 does not swap non-2xx bodies, so the observable
+        failure would be the status area freezing silently while the one-second
+        poll keeps hammering the server.  ``typing.assert_never`` raises
+        ``AssertionError`` from a real ``raise`` statement, so ``python -O``
+        does not strip the guard.
+        """
+        bad = cast("JobState", "UNKNOWN")
+        with pytest.raises(AssertionError):
+            state_label(bad)
+
+    def test_progress_label_raises_on_unrecognised_value(self) -> None:
+        """progress_label raises on a value outside JobState (CTR-01)."""
+        bad = cast("JobState", "UNKNOWN")
+        with pytest.raises(AssertionError):
+            progress_label(bad)
+
+    def test_error_message_raises_on_unrecognised_value(self) -> None:
+        """error_message raises on a value outside ErrorCategory (CTR-05)."""
+        bad = cast("ErrorCategory", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            error_message(bad)
+
+
+class TestClassifyError:
+    """classify_error exception-to-category mapping tests."""
+
+    def test_feeder_empty_error_is_feeder(self) -> None:
+        """FeederEmptyError classifies as FEEDER (CTR-05)."""
+        assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
+
+    def test_config_error_is_config(self) -> None:
+        """ConfigError classifies as CONFIG (CTR-05)."""
+        assert classify_error(ConfigError("bad toml")) is ErrorCategory.CONFIG
+
+    def test_scan_error_is_scanner(self) -> None:
+        """ScanError classifies as SCANNER (CTR-05)."""
+        assert classify_error(ScanError("device busy")) is ErrorCategory.SCANNER
+
+    def test_paperless_error_is_upload(self) -> None:
+        """PaperlessError classifies as UPLOAD (CTR-05)."""
+        assert classify_error(PaperlessError("http 500")) is ErrorCategory.UPLOAD
+
+    def test_unrelated_exception_is_unknown(self) -> None:
+        """An exception outside the saneless hierarchy is UNKNOWN (CTR-05)."""
+        assert classify_error(ValueError("who knows")) is ErrorCategory.UNKNOWN
+
+    def test_feeder_empty_wins_over_its_scan_error_base(self) -> None:
+        """FeederEmptyError is checked before its ScanError base class (CTR-05)."""
+        assert issubclass(FeederEmptyError, ScanError)
+        assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
+
+
+class TestJobModuleReExports:
+    """saneless.job re-export tests."""
+
+    def test_job_module_re_exports_the_same_job_state(self) -> None:
+        """saneless.job.JobState is the vocabulary object, not a copy (CTR-01)."""
+        assert saneless.job.JobState is JobState
+
+    def test_job_module_re_exports_the_same_error_category(self) -> None:
+        """saneless.job.ErrorCategory is the vocabulary object, not a copy (CTR-05)."""
+        assert saneless.job.ErrorCategory is ErrorCategory
+
+    def test_existing_from_import_still_resolves(self) -> None:
+        """The long-standing `from saneless.job import ...` spelling still works (CTR-01)."""
+        assert JobErrorCategory is ErrorCategory
+        assert JobJobState is JobState
+
+    def test_job_module_declares_no_enum_of_its_own(self) -> None:
+        """job.py owns no enum definition any more (CTR-01)."""
+        assert JobState.__module__ == "saneless.vocabulary"
+        assert ErrorCategory.__module__ == "saneless.vocabulary"
+
+
+class TestJobActivityProperties:
+    """Job.is_active / Job.is_busy tests."""
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            (JobState.PENDING, (True, True)),
+            (JobState.SCANNING, (True, True)),
+            (JobState.AWAITING_FLIP, (True, False)),
+            (JobState.ASSEMBLING, (True, True)),
+            (JobState.UPLOADING, (True, True)),
+            (JobState.DONE, (False, False)),
+            (JobState.ERROR, (False, False)),
+        ],
+    )
+    def test_job_reports_activity(
+        self,
+        state: JobState,
+        expected: tuple[bool, bool],
+    ) -> None:
+        """A Job answers is_active/is_busy for every lifecycle state (CTR-01)."""
+        job = Job(id="j", profile="default", title="t", state=state)
+        assert (job.is_active, job.is_busy) == expected
+
+    def test_awaiting_flip_is_active_but_not_busy(self) -> None:
+        """A flip prompt leaves the job in flight while the machine idles (CTR-01)."""
+        job = Job(id="j", profile="default", title="t", state=JobState.AWAITING_FLIP)
+        assert job.is_active
+        assert not job.is_busy
+
+    def test_done_is_neither_active_nor_busy(self) -> None:
+        """A finished job is neither in flight nor working (CTR-01)."""
+        job = Job(id="j", profile="default", title="t", state=JobState.DONE)
+        assert not job.is_active
+        assert not job.is_busy
+
+    def test_properties_are_not_dataclass_fields(self) -> None:
+        """is_active/is_busy are properties, so they stay out of __init__ (CTR-01)."""
+        field_names = {f.name for f in fields(Job)}
+        assert "is_active" not in field_names
+        assert "is_busy" not in field_names
