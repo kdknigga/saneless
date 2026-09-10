@@ -10,7 +10,7 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 
 ### CI Gate
 
-- [ ] **CI-01**: Every push and pull request runs ruff check, ruff format --check, ty, pyrefly, and the non-browser pytest suite in GitHub Actions, and a red run blocks merge [M-25]
+- [x] **CI-01**: Every push and pull request runs ruff check, ruff format --check, ty, pyrefly, and the non-browser pytest suite in GitHub Actions, and a red run blocks merge [M-25]
 - [ ] **CI-02**: CI fails if any shipped file references `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, or `ghcr.io/kris-knigga/saneless` (grep guard, excluding `.planning/` and `site/`) [M-27]
 
 ### Contracts and Vocabulary
@@ -152,7 +152,7 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 - [ ] **TEST-04**: Scanner tests assert what their names claim (init-once, read-back resolution, geometry presence) [N-05]
 - [ ] **TEST-05**: CLI tests read back files they claim to verify, docstrings match behaviour, and `--force` is verified by file content [N-33]
 - [ ] **TEST-06**: Data-loss and negative paths have tests: upload failure preserves the PDF, Paperless FAILURE maps to FAILED, worker survives a raising prune, two-thread store access, and the flip timeout [M-33]
-- [ ] **TEST-07**: `pytest-timeout` guards the suite so a hung thread test cannot block CI forever [M-33]
+- [x] **TEST-07**: `pytest-timeout` guards the suite so a hung thread test cannot block CI forever [M-33]
 
 ### Minor Sweep
 
@@ -212,7 +212,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| CI-01 | Phase 20 — CI Gate | Pending |
+| CI-01 | Phase 20 — CI Gate | Complete |
 | CI-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | CTR-01 | Phase 21 — Vocabulary and Contracts | Pending |
 | CTR-02 | Phase 21 — Vocabulary and Contracts | Pending |
@@ -315,7 +315,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | TEST-04 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | TEST-05 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | TEST-06 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
-| TEST-07 | Phase 20 — CI Gate | Pending |
+| TEST-07 | Phase 20 — CI Gate | Complete |
 | SWP-01 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | SWP-02 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | SWP-03 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |

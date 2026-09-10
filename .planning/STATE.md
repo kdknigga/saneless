@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Prep for release
-status: Roadmap approved; ready for `/gsd-plan-phase 20`
-stopped_at: Phase 20 planned (5 plans, verification passed)
-last_updated: "2026-09-09T23:21:16.061Z"
-last_activity: 2026-09-09 — v2.0 roadmap created (13 phases, 118 requirements mapped)
+status: executing
+stopped_at: Completed 20-01-PLAN.md
+last_updated: "2026-09-10T13:13:50.121Z"
+last_activity: 2026-09-10 -- Completed 20-01-PLAN.md
 progress:
   total_phases: 13
   completed_phases: 0
   total_plans: 5
-  completed_plans: 0
+  completed_plans: 1
   percent: 0
 ---
 
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 20 — CI Gate (first phase of milestone v2.0)
+**Current focus:** Phase 20 — ci-gate
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 20 — CI Gate (not started)
-Plan: —
-Status: Roadmap approved; ready for `/gsd-plan-phase 20`
-Progress: [--------------------] 0/13 phases
-Last activity: 2026-09-09 — v2.0 roadmap created (13 phases, 118 requirements mapped)
+Phase: 20 (ci-gate) — EXECUTING
+Plan: 2 of 5
+Status: Ready to execute
+Progress: [██░░░░░░░░] 20%
+Last activity: 2026-09-10
 
 ## Performance Metrics
 
@@ -94,6 +94,7 @@ Last activity: 2026-09-09 — v2.0 roadmap created (13 phases, 118 requirements 
 | Phase 18 P02 | 1min | 1 tasks | 2 files |
 | Phase 19 P01 | 2min | 2 tasks | 3 files |
 | Phase 19 P02 | 1min | 3 tasks | 5 files |
+| Phase 20 P01 | 6min | 3 tasks | 5 files |
 
 ## Accumulated Context
 
@@ -182,6 +183,11 @@ Recent decisions affecting current work:
 - [Phase 18]: paper_size placed after auto_source_mode in profiles table for logical grouping
 - [Phase 19]: Docker tab first in Quick Start per D-03; pipx over pip for bare metal; no screenshots per D-08
 - [Phase 19]: Getting Started placed first after Home in nav per D-01; old Tutorials removed per D-04
+- [Phase 20-01]: pytest-timeout dependency + timeout ini keys must land in one commit -- --strict-config makes an unknown ini key a hard error on every pytest run
+- [Phase 20-01]: timeout_method = signal, not thread -- thread calls os._exit(1) and kills teardown plus the rest of the suite
+- [Phase 20-01]: CI actions pinned to full 40-hex SHAs with version comments, paired with dependabot.yml in the same commit so pins stay maintained
+- [Phase 20-01]: libsane-dev apt step before uv sync --locked in every CI job -- python-sane is sdist-only and compiles against sane/sane.h
+- [Phase 20-01]: CONTRIBUTING.md follows README.md GitHub markdown dialect, not the mkdocs-material dialect used under docs/
 
 ### Roadmap Evolution
 
@@ -218,7 +224,7 @@ None yet.
 
 ## Session Continuity
 
-Last activity: 2026-09-09 - Created v2.0 ROADMAP.md and filled REQUIREMENTS.md traceability (118/118 mapped)
-Last session: 2026-09-09T23:21:16.056Z
-Stopped at: Phase 20 planned (5 plans, verification passed)
-Resume file: .planning/phases/20-ci-gate/20-01-PLAN.md
+Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
+Last session: 2026-09-10T13:13:25.238Z
+Stopped at: Completed 20-01-PLAN.md
+Resume file: .planning/phases/20-ci-gate/20-02-PLAN.md
