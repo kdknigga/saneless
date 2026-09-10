@@ -462,7 +462,7 @@ def run_pipeline(
         # Step 4: Upload
         notify(PipelineEvent.UPLOADING)
         created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
-        task_uuid = paperless.upload_document(
+        upload_result = paperless.upload_document(
             pdf_path,
             request.title,
             request.tags,
@@ -471,7 +471,8 @@ def run_pipeline(
         )
 
         # Step 5: Poll for result
-        if task_uuid != "fallback":
+        task_uuid = upload_result.task_uuid
+        if upload_result.delivered_to_api and task_uuid is not None:
             result = paperless.poll_task(
                 task_uuid,
                 timeout=settings.output.paperless_task_timeout,

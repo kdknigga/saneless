@@ -55,7 +55,9 @@ class TestUploadDocument:
             _transport=transport,
         )
         result = client.upload_document(sample_pdf, title="Test Doc")
-        assert result == task_uuid
+        assert result.delivered_to_api is True
+        assert result.task_uuid == task_uuid
+        assert result.consume_dir_path is None
         client.close()
 
     def test_upload_with_tags(self, sample_pdf: Path) -> None:
@@ -167,7 +169,8 @@ class TestUploadDocument:
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Retry Test")
-        assert result == "task-id-ok"
+        assert result.delivered_to_api is True
+        assert result.task_uuid == "task-id-ok"
         assert call_count["n"] == 3
         client.close()
 
@@ -228,11 +231,15 @@ class TestUploadDocument:
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Fallback")
-        assert result == "fallback"
+        assert result.delivered_to_api is False
+        assert result.task_uuid is None
         # PDF should have been copied to consume dir
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
         assert copied[0].name == "test.pdf"
+        # The result names the exact file the PDF was copied to -- something
+        # the old magic-string sentinel could not carry.
+        assert result.consume_dir_path == copied[0]
         client.close()
 
 
@@ -422,11 +429,12 @@ class TestConsumeDir:
             max_retries=1,
         )
         result = client.upload_document(sample_pdf, title="Auto-create test")
-        assert result == "fallback"
+        assert result.delivered_to_api is False
         assert consume_dir.exists()
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
         assert copied[0].name == "test.pdf"
+        assert result.consume_dir_path == consume_dir / "test.pdf"
         client.close()
 
     def test_consume_dir_works_when_exists(
@@ -449,9 +457,10 @@ class TestConsumeDir:
             max_retries=1,
         )
         result = client.upload_document(sample_pdf, title="Existing dir test")
-        assert result == "fallback"
+        assert result.delivered_to_api is False
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
+        assert result.consume_dir_path == consume_dir / "test.pdf"
         client.close()
 
     def test_consume_dir_logs_warning_on_create(
