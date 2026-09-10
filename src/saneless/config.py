@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic_settings import (
@@ -159,13 +159,27 @@ class Settings(BaseSettings):
 _VALID_SECTIONS = ("scanner", "paperless", "output", "profiles")
 
 
+class _SettingsFactory(Protocol):
+    """
+    Callable view of ``Settings`` that accepts the private ``_toml_file`` kwarg.
+
+    ``_toml_file`` is not a declared field on ``Settings``; it is a private init
+    kwarg popped out of ``init_kwargs`` by ``settings_customise_sources``. This
+    protocol describes the constructor signature that mechanism really provides.
+    """
+
+    def __call__(self, *, _toml_file: Path) -> Settings:
+        """Construct ``Settings`` from an explicit TOML file path."""
+        ...
+
+
 def _build_settings(
     toml_file: Path | None = None,
 ) -> Settings:
     """Build Settings, converting extra-field errors to user-friendly messages."""
     try:
         if toml_file is not None:
-            return Settings(_toml_file=toml_file)  # type: ignore[call-arg] -- ty cannot see BaseSettings dynamic __init__ kwargs
+            return cast("_SettingsFactory", Settings)(_toml_file=toml_file)
         return Settings()
     except ValidationError as exc:
         extra_fields: list[str] = []
