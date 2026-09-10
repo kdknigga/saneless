@@ -33,7 +33,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.web.app import create_app, humanize_state
+from saneless.web.app import create_app
 
 
 def _app(client: TestClient) -> FastAPI:
@@ -367,15 +367,6 @@ def test_correspondent_placeholder(client: TestClient) -> None:
     response = client.get("/")
     assert "No correspondent" in response.text
     assert "-- None --" not in response.text
-
-
-def test_humanize_state_filter_unit() -> None:
-    """humanize_state converts enum values to human-readable labels (P12-01)."""
-    assert humanize_state("DONE") == "Complete"
-    assert humanize_state("ERROR") == "Failed"
-    assert humanize_state("SCANNING") == "Scanning"
-    assert humanize_state("AWAITING_FLIP") == "Waiting for flip"
-    assert humanize_state("UNKNOWN") == "UNKNOWN"
 
 
 def test_css_spacing_normalized() -> None:

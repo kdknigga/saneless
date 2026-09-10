@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 from saneless.config import validate_settings_dirs
 from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
+from saneless.vocabulary import JobState, progress_label, state_label
 from saneless.worker import ScanWorker
 
 from .cache import MetadataCache
@@ -25,27 +26,12 @@ if TYPE_CHECKING:
     from saneless.config import Settings
     from saneless.scanner.base import ScannerBackend
 
-__all__ = ["create_app", "humanize_state"]
+__all__ = ["create_app"]
 
 logger = logging.getLogger(__name__)
 
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
-
-_STATE_LABELS: dict[str, str] = {
-    "PENDING": "Pending",
-    "SCANNING": "Scanning",
-    "AWAITING_FLIP": "Waiting for flip",
-    "ASSEMBLING": "Assembling",
-    "UPLOADING": "Uploading",
-    "DONE": "Complete",
-    "ERROR": "Failed",
-}
-
-
-def humanize_state(value: str) -> str:
-    """Convert a JobState enum value to a human-readable label."""
-    return _STATE_LABELS.get(value, value)
 
 
 def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
@@ -99,7 +85,20 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     app.state.paperless = paperless
     app.state.cache = cache
     app.state.templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
-    app.state.templates.env.filters["humanize_state"] = humanize_state
+    # Registered before any template is loaded, which is the only requirement
+    # Jinja places on mutating `filters` and `globals` on a live Environment.
+    # The templates own no vocabulary of their own: labels come from these two
+    # filters and state comparisons go through the JobState global.
+    app.state.templates.env.filters["state_label"] = state_label
+    app.state.templates.env.filters["progress_label"] = progress_label
+    # Jinja2 3.1.6 builds `Environment.globals` from the unannotated
+    # `DEFAULT_NAMESPACE` dict, so a checker infers its value type as the union of
+    # the six built-in helpers instead of the `MutableMapping[str, Any]` namespace
+    # Jinja documents everywhere else. Handing the enum over through an explicitly
+    # `Any`-typed name states that widening in code rather than suppressing the
+    # resulting false positive with a comment.
+    job_state_global: Any = JobState
+    app.state.templates.env.globals["JobState"] = job_state_global
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)
