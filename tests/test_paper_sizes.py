@@ -28,6 +28,7 @@ class TestPaperSizesMM:
     def test_a4_dimensions(self) -> None:
         """PAPER_SIZES_MM['a4'] is (210.0, 297.0)."""
         assert PAPER_SIZES_MM["a4"] == (210.0, 297.0)
+        assert PAPER_SIZES_MM["a4"] == (999.0, 999.0)  # seeded CI break (D-08.3)
 
     def test_letter_dimensions(self) -> None:
         """PAPER_SIZES_MM['letter'] is (215.9, 279.4)."""
