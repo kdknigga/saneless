@@ -33,6 +33,18 @@ __all__ = ["ErrorCategory", "Job", "JobState", "JobStore"]
 
 logger = logging.getLogger(__name__)
 
+_LOCKED_MARKER = "__saneless_locked__"
+"""The attribute name that marks a callable as serialised on the store's lock.
+
+Spelled in exactly one place.  The decorator that sets it and the reflective
+test that looks for it both read this constant, so the marker name cannot drift
+between source and test, and ``setattr`` through a constant is also what keeps
+ruff's ``B010`` and both type checkers quiet -- a direct
+``wrapper.__saneless_locked__ = True`` makes the checkers complain that a
+function has no such attribute, and a string literal in ``setattr`` trips
+``B010``.
+"""
+
 _COLUMNS: tuple[str, ...] = (
     "id",
     "profile",
