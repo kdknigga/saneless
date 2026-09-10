@@ -196,15 +196,28 @@ class ScanWorker:
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
             self._job_store.update_thumbnail(_jid, thumb)
 
+        # The worker persisted SCANNING just above, before starting the
+        # pipeline.  run_pipeline re-announces it as its first event; rewriting
+        # the state we just wrote would blank error/error_category a second
+        # time and signal a transition that did not happen.
+        persisted_state = JobState.SCANNING
+
         def _status_cb(event: PipelineEvent, _jid: str = job.id) -> None:
+            nonlocal persisted_state
             logger.info("Pipeline event: %s", event.value)
             state = event.job_state
-            if state is None or state not in ACTIVE_STATES:
-                # Nothing to persist from inside the pipeline.  SCANNING_REVERSE
-                # carries no state at all, and DONE is terminal: the worker
-                # writes it only once run_pipeline has returned and its
-                # temporary directory is gone, never from in here.
+            if state is None:
+                # SCANNING_REVERSE carries no persisted state, but the pass
+                # boundary is a transition a flip waiter must observe.
                 self._transition_event.set()
+                return
+            if state not in ACTIVE_STATES:
+                # DONE is terminal.  The worker writes it, and signals the
+                # transition, only once run_pipeline has returned and its
+                # temporary directory is gone -- never from in here.
+                return
+            if state is persisted_state:
+                # Already persisted; not a transition.
                 return
             if state in BUSY_STATES:
                 self._job_store.update_state(_jid, state)
@@ -215,6 +228,7 @@ class ScanWorker:
                 # waited on.
                 self._transition_event.clear()
                 self._job_store.update_state(_jid, state)
+            persisted_state = state
 
         try:
             request = PipelineRequest(

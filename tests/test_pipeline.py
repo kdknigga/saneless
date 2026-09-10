@@ -507,6 +507,76 @@ class TestManualDuplex:
         assert result.pages_removed == 0
         assert result.pages_uploaded == 5
 
+    def test_duplex_mismatch_reports_fallback_when_upload_falls_back(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A mismatch whose partial PDFs only reached the consume dir is FALLBACK.
+
+        The mismatch path uploads twice. If either upload fell back, the run did
+        not reach paperless-ngx and must not claim SUCCESS -- that is precisely
+        the lie ScanOutcome.FALLBACK exists to prevent (CTR-02).
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        mock_paperless.upload_document.return_value = UploadResult(
+            delivered_to_api=False,
+            consume_dir_path=tmp_path / "consume" / "doc.pdf",
+        )
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [
+            iter([_make_content_image() for _ in range(3)]),
+            iter([_make_content_image() for _ in range(2)]),
+        ]
+
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=PipelineRequest(profile_name="default", title="Mismatch Fallback"),
+        )
+
+        assert result.outcome is ScanOutcome.FALLBACK
+        assert result.warning is not None
+        assert "Page count mismatch" in result.warning
+        mock_paperless.poll_task.assert_not_called()
+
+    def test_duplex_mismatch_is_fallback_when_only_one_upload_falls_back(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A partially-delivered mismatch is still FALLBACK, not SUCCESS (CTR-02)."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        mock_paperless.upload_document.side_effect = [
+            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
+            UploadResult(
+                delivered_to_api=False,
+                consume_dir_path=tmp_path / "consume" / "backs.pdf",
+            ),
+        ]
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [
+            iter([_make_content_image() for _ in range(3)]),
+            iter([_make_content_image() for _ in range(2)]),
+        ]
+
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=PipelineRequest(profile_name="default", title="Half Delivered"),
+        )
+
+        assert result.outcome is ScanOutcome.FALLBACK
+
     def test_duplex_match_still_interleaves_normally(
         self,
         mock_paperless: MagicMock,

@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from saneless.exceptions import PaperlessError
-from saneless.paperless import PaperlessClient
+from saneless.paperless import PaperlessClient, UploadResult
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -509,3 +509,80 @@ class TestAuthHeader:
         client.test_connection()
         assert captured_headers["auth"] == "Token my-secret-token"
         client.close()
+
+
+class TestUploadResultContract:
+    """UploadResult cannot represent a destination it did not reach (CTR-03)."""
+
+    def test_api_delivery_carries_a_task_uuid(self) -> None:
+        """A result claiming API delivery must carry the task id (CTR-03)."""
+        result = UploadResult(delivered_to_api=True, task_uuid="abc-123")
+        assert result.task_uuid == "abc-123"
+        assert result.consume_dir_path is None
+
+    def test_consume_dir_delivery_carries_a_path(self, tmp_path: Path) -> None:
+        """A result claiming consume-dir delivery must carry the path (CTR-03)."""
+        dest = tmp_path / "consume" / "doc.pdf"
+        result = UploadResult(delivered_to_api=False, consume_dir_path=dest)
+        assert result.consume_dir_path == dest
+        assert result.task_uuid is None
+
+    def test_api_delivery_without_task_uuid_is_rejected(self) -> None:
+        """
+        delivered_to_api=True with no task id is unconstructible (CTR-03).
+
+        This is the state the old "fallback" sentinel could not express and the
+        typed result must not silently allow: run_pipeline reads the presence of
+        a task id to decide SUCCESS vs FALLBACK, so such a result would report a
+        document that reached paperless-ngx as a consume-directory fallback.
+        """
+        with pytest.raises(ValueError, match="requires a task_uuid"):
+            UploadResult(delivered_to_api=True)
+
+    def test_consume_dir_delivery_without_path_is_rejected(self) -> None:
+        """delivered_to_api=False with no path is unconstructible (CTR-03)."""
+        with pytest.raises(ValueError, match="requires a consume_dir_path"):
+            UploadResult(delivered_to_api=False)
+
+    def test_the_two_destinations_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        """A result cannot claim both destinations at once (CTR-03)."""
+        dest = tmp_path / "consume" / "doc.pdf"
+        with pytest.raises(ValueError, match="cannot carry a consume_dir_path"):
+            UploadResult(
+                delivered_to_api=True,
+                task_uuid="abc-123",
+                consume_dir_path=dest,
+            )
+        with pytest.raises(ValueError, match="cannot carry a task_uuid"):
+            UploadResult(
+                delivered_to_api=False,
+                task_uuid="abc-123",
+                consume_dir_path=dest,
+            )
+
+    def test_null_task_id_from_paperless_is_rejected(self, sample_pdf: Path) -> None:
+        """
+        A JSON null task id raises instead of becoming the string "None".
+
+        `str(response.json())` would turn a null body into "None" -- truthy and
+        not None -- which then reaches poll_task as if it were a real task id.
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                content=b"null",
+                headers={"content-type": "application/json"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        client = PaperlessClient(
+            "http://localhost:8000",
+            "token",
+            _transport=transport,
+        )
+        try:
+            with pytest.raises(PaperlessError, match="no task ID"):
+                client.upload_document(sample_pdf, "Null Task")
+        finally:
+            client.close()

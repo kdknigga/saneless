@@ -26,11 +26,43 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class UploadResult:
-    """Where a document ended up when upload_document returned."""
+    """
+    Where a document ended up when upload_document returned.
+
+    The two destinations are mutually exclusive and the payload field for each
+    is required, enforced in __post_init__.  A result that claimed API delivery
+    while carrying no task UUID would be reported downstream as a
+    consume-directory fallback -- the replacement for the old "fallback"
+    sentinel must not be able to lie about itself the way the sentinel could.
+
+    Attributes:
+        delivered_to_api: True when paperless-ngx accepted the upload.
+        task_uuid: Paperless task id. Present iff delivered_to_api is True.
+        consume_dir_path: Where the PDF was copied instead. Present iff
+            delivered_to_api is False.
+
+    """
 
     delivered_to_api: bool
     task_uuid: str | None = None
     consume_dir_path: Path | None = None
+
+    def __post_init__(self) -> None:
+        """Reject the two contradictory combinations."""
+        if self.delivered_to_api:
+            if self.task_uuid is None:
+                msg = "delivered_to_api=True requires a task_uuid"
+                raise ValueError(msg)
+            if self.consume_dir_path is not None:
+                msg = "delivered_to_api=True cannot carry a consume_dir_path"
+                raise ValueError(msg)
+        else:
+            if self.consume_dir_path is None:
+                msg = "delivered_to_api=False requires a consume_dir_path"
+                raise ValueError(msg)
+            if self.task_uuid is not None:
+                msg = "delivered_to_api=False cannot carry a task_uuid"
+                raise ValueError(msg)
 
 
 class PaperlessClient:
@@ -125,6 +157,11 @@ class PaperlessClient:
                     )
                 response.raise_for_status()
                 task_id = response.json()
+                if task_id is None:
+                    # A JSON null body would otherwise become the string
+                    # "None" -- truthy, not None, and polled as a real task id.
+                    msg = "Paperless accepted the upload but returned no task ID"
+                    raise PaperlessError(msg)
                 logger.info("Upload succeeded, task ID: %s", task_id)
                 return UploadResult(delivered_to_api=True, task_uuid=str(task_id))
 
