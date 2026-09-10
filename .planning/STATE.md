@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Prep for release
 status: executing
-stopped_at: Phase 21 complete — verified 4/4, 1 manual UAT item open
-last_updated: "2026-09-10T19:54:13.558Z"
+stopped_at: Phase 22 context gathered
+last_updated: "2026-09-10T21:11:10.380Z"
 last_activity: 2026-09-10 -- Phase 21 execution started
 progress:
   total_phases: 13
@@ -238,6 +238,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
-Last session: 2026-09-10T19:54:13.553Z
-Stopped at: Phase 21 complete — verified 4/4, 1 manual UAT item open
-Resume file: .planning/phases/21-vocabulary-and-contracts/21-VERIFICATION.md
+Last session: 2026-09-10T21:11:10.374Z
+Stopped at: Phase 22 context gathered
+Resume file: .planning/phases/22-job-store-hardening/22-CONTEXT.md
