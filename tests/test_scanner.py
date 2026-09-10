@@ -20,6 +20,8 @@ from saneless.scanner.base import (
     DeviceInfo,
     ScannerBackend,
     ScanSettings,
+    SourceKind,
+    classify_source,
 )
 from saneless.scanner.sane_backend import SaneBackend
 
@@ -283,6 +285,72 @@ class TestScanSettings:
             source="Auto", resolution=300, mode="Color", auto_source_mode="adf"
         )
         assert settings.auto_source_mode == "adf"
+
+
+# ---------------------------------------------------------------------------
+# Source classification tests (CTR-04)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifySource:
+    """The single source-classification rule in the codebase."""
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ("Flatbed", SourceKind.FLATBED),
+            # The real-world spellings of the SANE `test`, Brother, epson, sharp
+            # and umax feeders.  Their lowercase form STARTS WITH "auto", so the
+            # AUTO rule must be an exact equality test and must never be a
+            # substring test -- a substring test classifies these as AUTO, sends
+            # them down the single-page branch, and restores the C-06 defect.
+            ("Automatic Document Feeder", SourceKind.FEEDER),
+            ("Automatic Document Feeder(left aligned)", SourceKind.FEEDER),
+            ("Automatic Document Feeder(centrally aligned)", SourceKind.FEEDER),
+            ("Document Feeder", SourceKind.FEEDER),
+            ("ADF", SourceKind.FEEDER),
+            # "ADF Back" is a feeder for ROUTING purposes even though it must
+            # not share a profile slug with "ADF Front" (N-09).
+            ("ADF Front", SourceKind.FEEDER),
+            ("ADF Back", SourceKind.FEEDER),
+            ("ADF Duplex", SourceKind.FEEDER_DUPLEX),
+            ("Adf-duplex", SourceKind.FEEDER_DUPLEX),
+            ("ADF Manual Duplex", SourceKind.FEEDER_DUPLEX),
+            # Ambiguity A -- Fujitsu's "Card Duplex" contains "duplex" and no
+            # feeder token, so it classifies FEEDER_DUPLEX and starts routing to
+            # multi_scan().  Deliberate: a card-feed path IS a sheet path, and
+            # requiring a feeder token AND "duplex" would mis-route real
+            # Fujitsu hardware.
+            ("Card Duplex", SourceKind.FEEDER_DUPLEX),
+            # Ambiguity B -- "Manual Duplex" is this project's own pseudo-source
+            # (docs/how-to/set-up-adf-duplex.md).  Its exposure is narrow and
+            # Phase 25 deletes the source-overloading entirely, so no special
+            # case is built for it here.
+            ("Manual Duplex", SourceKind.FEEDER_DUPLEX),
+            ("Auto", SourceKind.AUTO),
+            ("auto", SourceKind.AUTO),
+            ("  Auto  ", SourceKind.AUTO),
+            ("Transparency Adapter", SourceKind.UNKNOWN),
+            ("TMA Slides", SourceKind.UNKNOWN),
+            ("TMA Negatives", SourceKind.UNKNOWN),
+            # Bell+Howell's manual tray is single-page: "feed" is not "feeder".
+            ("Manual Feed Tray", SourceKind.UNKNOWN),
+        ],
+    )
+    def test_classify_source(self, source: str, expected: SourceKind) -> None:
+        """Harvested real-world SANE source names classify correctly (CTR-04)."""
+        assert classify_source(source) is expected
+
+    def test_uses_feeder_true_for_feeder_kinds(self) -> None:
+        """FEEDER and FEEDER_DUPLEX feed a stack of sheets (CTR-04)."""
+        assert SourceKind.FEEDER.uses_feeder
+        assert SourceKind.FEEDER_DUPLEX.uses_feeder
+
+    def test_uses_feeder_false_for_single_page_kinds(self) -> None:
+        """FLATBED, AUTO, and UNKNOWN take the single-page path (CTR-04)."""
+        assert not SourceKind.FLATBED.uses_feeder
+        assert not SourceKind.AUTO.uses_feeder
+        assert not SourceKind.UNKNOWN.uses_feeder
 
 
 # ---------------------------------------------------------------------------
