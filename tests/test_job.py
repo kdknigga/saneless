@@ -10,7 +10,9 @@ from __future__ import annotations
 import ast
 import inspect
 import sqlite3
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -52,6 +54,41 @@ V2_COLUMNS = (
     "owner_token",
 )
 """The six columns migration step 2 adds, spelled out independently of job.py."""
+
+PUBLIC_METHOD_FLOOR = 7
+"""The number of public JobStore methods that exist today.
+
+A floor, not a roster.  The reflective lock-coverage test asserts the
+enumeration found at least this many, so a predicate that silently matches
+nothing -- the way a reflective test quietly dies -- cannot pass.
+"""
+
+STRESS_ROUNDS = 200
+"""Rounds of mixed reads and writes each stress worker runs."""
+
+STRESS_WORKERS = 2
+"""Threads the stress test runs concurrently against one shared store."""
+
+BARRIER_TIMEOUT = 30.0
+"""Seconds a stress worker waits at the start barrier before giving up.
+
+Inside the project's 60 s per-test timeout, so a worker that never arrives
+fails the test with a BrokenBarrierError instead of hanging the suite.
+"""
+
+STRESS_STATES = (
+    JobState.SCANNING,
+    JobState.ASSEMBLING,
+    JobState.UPLOADING,
+    JobState.DONE,
+)
+"""The states the stress workers cycle through, one per round."""
+
+PRUNE_MAX_AGE_DAYS = 3650
+"""A prune age bound generous enough that the stress rounds delete nothing."""
+
+PRUNE_MAX_ROWS = 1_000_000
+"""A prune row bound generous enough that the stress rounds delete nothing."""
 
 
 def _build_s3_schema(db_path: str) -> None:
@@ -125,6 +162,52 @@ def _count_job_constructions(node: ast.AST) -> int:
         and isinstance(child.func, ast.Name)
         and child.func.id == "Job"
     )
+
+
+def _job_store_classdef() -> ast.ClassDef:
+    """Return the JobStore class definition parsed out of saneless.job."""
+    tree = ast.parse(_job_source())
+    return next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name == "JobStore"
+    )
+
+
+def _public_self_calls(method: ast.FunctionDef) -> list[str]:
+    """Return the names of every public ``self.<name>(...)`` call in a method."""
+    names: list[str] = []
+    for node in ast.walk(method):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "self"
+            and not func.attr.startswith("_")
+        ):
+            names.append(func.attr)
+    return names
+
+
+def _stress_worker(
+    store: JobStore,
+    barrier: threading.Barrier,
+    seen: dict[str, JobState],
+    guard: threading.Lock,
+) -> None:
+    """Run STRESS_ROUNDS of mixed JobStore traffic against a shared store."""
+    barrier.wait()
+    for index in range(STRESS_ROUNDS):
+        job = store.create_job(profile="default", title=f"Stress {index}")
+        state = STRESS_STATES[index % len(STRESS_STATES)]
+        store.update_state(job.id, state)
+        store.get_job(job.id)
+        store.list_recent(limit=10)
+        store.prune(max_age_days=PRUNE_MAX_AGE_DAYS, max_rows=PRUNE_MAX_ROWS)
+        with guard:
+            seen[job.id] = state
 
 
 def _read_schema_raw(db_path: str) -> tuple[int, list[str]]:
@@ -489,3 +572,91 @@ class TestResultColumns:
         )
         assert _count_job_constructions(store) == 1
         assert _count_job_constructions(row_to_job) == 1
+
+
+class TestLockDiscipline:
+    """Lock coverage, the no-public-self-call rule, and the concurrency claim."""
+
+    def test_locked_coverage_spans_every_public_method(self) -> None:
+        """Every public JobStore method carries the lock marker (STOR-01)."""
+        # Blind spot, recorded deliberately: inspect.isfunction does not see a
+        # public @property.  JobStore has none today; if one is ever added this
+        # test will not notice that it is unserialised.
+        public = [
+            (name, member)
+            for name, member in inspect.getmembers(JobStore, inspect.isfunction)
+            if not name.startswith("_")
+        ]
+        assert len(public) >= PUBLIC_METHOD_FLOOR, (
+            f"the enumeration found only {len(public)} public methods; a "
+            f"reflective test that matches nothing passes vacuously"
+        )
+        # No opt-out list -- not for close(), not for anything.  A hand-written
+        # roster of excused names is where the next one gets quietly added.
+        unlocked = sorted(
+            name
+            for name, member in public
+            if getattr(member, job_module._LOCKED_MARKER, False) is not True
+        )
+        assert unlocked == [], (
+            f"public JobStore methods missing the @_locked marker: "
+            f"{', '.join(unlocked)}"
+        )
+
+    def test_no_public_method_calls_another_public_method(self) -> None:
+        """No public JobStore method calls another public method (STOR-01)."""
+        # A correctness rule, not style: sqlite3 connection context managers do
+        # not nest, so an inner `with conn:` commits the OUTER transaction and
+        # half the caller's work lands early.  RLock re-entrancy prevents the
+        # deadlock; nothing prevents the incorrectness, and ruff cannot see it.
+        store = _job_store_classdef()
+        offenders = [
+            f"{method.name} -> {callee}"
+            for method in store.body
+            if isinstance(method, ast.FunctionDef) and not method.name.startswith("_")
+            for callee in _public_self_calls(method)
+        ]
+        assert offenders == [], (
+            f"public JobStore methods calling other public methods: "
+            f"{', '.join(offenders)}"
+        )
+
+    def test_stress_two_threads_survive_two_hundred_rounds(self) -> None:
+        """Two threads run 200 rounds of mixed traffic uncorrupted (STOR-01)."""
+        store = JobStore()
+        seen: dict[str, JobState] = {}
+        guard = threading.Lock()
+        barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
+        try:
+            with ThreadPoolExecutor(max_workers=STRESS_WORKERS) as pool:
+                futures = [
+                    pool.submit(_stress_worker, store, barrier, seen, guard)
+                    for _ in range(STRESS_WORKERS)
+                ]
+                for future in futures:
+                    # Future.result() re-raises the worker's exception here.  A
+                    # raw threading.Thread swallows it into threading.excepthook
+                    # and this test would pass green on a broken store.
+                    future.result()
+
+            # 1. Every insert committed exactly once -- none lost, none doubled.
+            assert len(seen) == STRESS_WORKERS * STRESS_ROUNDS
+
+            # 2. Each job reads back with the last state its own thread set.  A
+            #    half-committed UPDATE surfaces here as a stale state.
+            for job_id, expected in seen.items():
+                fetched = store.get_job(job_id)
+                assert fetched is not None
+                assert fetched.state == expected
+                # 4. Deserialisation succeeded rather than incidentally.
+                assert isinstance(fetched.state, JobState)
+                assert isinstance(fetched.tags, list)
+
+            # 3. The row count reconciles with what the workers recorded.
+            listed = store.list_recent(limit=STRESS_WORKERS * STRESS_ROUNDS * 2)
+            assert len(listed) == len(seen)
+            for listed_job in listed:
+                assert isinstance(listed_job.state, JobState)
+                assert isinstance(listed_job.tags, list)
+        finally:
+            store.close()
