@@ -30,7 +30,7 @@ Five orderings are load-bearing and must not be rearranged during planning:
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 20: CI Gate** - GitHub Actions runs lint, format, both type checkers, and the non-browser suite on every push; `pytest-timeout` guards against hangs
+- [x] **Phase 20: CI Gate** - GitHub Actions runs lint, format, both type checkers, and the non-browser suite on every push; `pytest-timeout` guards against hangs (completed 2026-09-10)
 - [ ] **Phase 21: Vocabulary and Contracts** - One `JobState`, one label map, one `ErrorCategory`, one `classify_source()`, and typed `ScanResult`/`UploadResult`, with zero behaviour change
 - [ ] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration
 - [ ] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI
@@ -61,7 +61,7 @@ Plans:
 - [x] 20-02-PLAN.md — repo to private, .planning-stripped branch built locally, publication checkpoint
 - [x] 20-03-PLAN.md — push master + filtered branch, open PR (never merged), green run, read check contexts
 - [x] 20-04-PLAN.md — master branch ruleset via gh api + read-back, one seeded break proving red
-- [ ] 20-05-PLAN.md — ty/pyrefly bump, three suppressions removed with real fixes, green run on the PR
+- [x] 20-05-PLAN.md — ty/pyrefly bump, three suppressions removed with real fixes, green run on the PR
 
 Note: the earlier "zero source changes in this phase" note is SUPERSEDED by CONTEXT.md D-16 — bumping `ty` and `pyrefly` and fixing the resulting type errors is planned work in Phase 20 (Plan 05), landing as a separate, later commit than `ci.yml` per D-17. The naming grep guard (CI-02) is deliberately deferred to Phase 31, where the rename it guards actually lands — adding it here would make CI red from its first run.
 
@@ -221,7 +221,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 20. CI Gate | 4/5 | In Progress|  |
+| 20. CI Gate | 5/5 | Complete   | 2026-09-10 |
 | 21. Vocabulary and Contracts | 0/? | Not started | - |
 | 22. Job Store Hardening | 0/? | Not started | - |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
