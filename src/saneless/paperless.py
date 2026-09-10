@@ -12,15 +12,25 @@ from __future__ import annotations
 import logging
 import shutil
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 
 from .exceptions import PaperlessError
 
-__all__ = ["PaperlessClient"]
+__all__ = ["PaperlessClient", "UploadResult"]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class UploadResult:
+    """Where a document ended up when upload_document returned."""
+
+    delivered_to_api: bool
+    task_uuid: str | None = None
+    consume_dir_path: Path | None = None
 
 
 class PaperlessClient:
@@ -67,7 +77,7 @@ class PaperlessClient:
         tags: list[int] | None = None,
         correspondent: int | None = None,
         created: str | None = None,
-    ) -> str:
+    ) -> UploadResult:
         """
         Upload a PDF document to paperless-ngx.
 
@@ -84,8 +94,11 @@ class PaperlessClient:
             created: Optional creation date string (e.g. "2026-03-20").
 
         Returns:
-            Task UUID string from paperless-ngx, or "fallback" if
-            the file was copied to the consume directory.
+            An UploadResult. On success ``delivered_to_api`` is True and
+            ``task_uuid`` carries the paperless-ngx task id. When the
+            retries are exhausted and a consume directory is configured,
+            ``delivered_to_api`` is False and ``consume_dir_path`` names
+            the file the PDF was copied to.
 
         Raises:
             PaperlessError: If upload fails and no fallback is available,
@@ -113,7 +126,7 @@ class PaperlessClient:
                 response.raise_for_status()
                 task_id = response.json()
                 logger.info("Upload succeeded, task ID: %s", task_id)
-                return str(task_id)
+                return UploadResult(delivered_to_api=True, task_uuid=str(task_id))
 
             except (httpx.ConnectError, httpx.TimeoutException) as exc:
                 last_error = exc
@@ -152,7 +165,7 @@ class PaperlessClient:
             dest = dest_dir / pdf_path.name
             shutil.copy2(pdf_path, dest)
             logger.warning("All retries exhausted. Copied PDF to %s", dest)
-            return "fallback"
+            return UploadResult(delivered_to_api=False, consume_dir_path=dest)
 
         msg = f"Upload failed after {self._max_retries} retries"
         raise PaperlessError(msg) from last_error

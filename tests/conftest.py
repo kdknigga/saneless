@@ -15,6 +15,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.paperless import UploadResult
 from saneless.scanner.base import ScannerBackend
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
@@ -133,6 +134,8 @@ def content_page_image() -> Image.Image:
 def mock_paperless() -> MagicMock:
     """Return a mock PaperlessClient that succeeds."""
     paperless = MagicMock()
-    paperless.upload_document.return_value = "mock-task-uuid"
+    paperless.upload_document.return_value = UploadResult(
+        delivered_to_api=True, task_uuid="mock-task-uuid"
+    )
     paperless.poll_task.return_value = {"status": "SUCCESS"}
     return paperless
