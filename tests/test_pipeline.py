@@ -11,6 +11,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from saneless.exceptions import PaperlessError, ScanError
+from saneless.paperless import UploadResult
 from saneless.pipeline import (
     PipelineEvent,
     PipelineRequest,
@@ -151,7 +152,9 @@ class TestRunPipeline:
     ) -> None:
         """After upload, pipeline calls poll_task with returned UUID."""
         default_settings.output.tmp_dir = str(tmp_path)
-        mock_paperless.upload_document.return_value = "task-uuid-123"
+        mock_paperless.upload_document.return_value = UploadResult(
+            delivered_to_api=True, task_uuid="task-uuid-123"
+        )
         mock_paperless.poll_task.return_value = {"status": "SUCCESS"}
 
         request = PipelineRequest(profile_name="default", title="Poll Doc")

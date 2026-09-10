@@ -22,6 +22,7 @@ from saneless.config import (
 )
 from saneless.exceptions import PaperlessError, ScanError
 from saneless.job import JobStore
+from saneless.paperless import UploadResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
 
 if TYPE_CHECKING:
@@ -139,9 +140,11 @@ def _patch_cli(
             def __init__(self, *_args: object, **_kwargs: object) -> None:
                 """Accept and ignore all constructor arguments."""
 
-            def upload_document(self, *_args: object, **_kwargs: object) -> str:
-                """Return a fake task UUID."""
-                return "mock-task-uuid"
+            def upload_document(
+                self, *_args: object, **_kwargs: object
+            ) -> UploadResult:
+                """Return a delivered upload result carrying a fake task UUID."""
+                return UploadResult(delivered_to_api=True, task_uuid="mock-task-uuid")
 
             def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
                 """Return a successful task result."""
@@ -250,7 +253,7 @@ class TestScanCommand:
             def __init__(self, *_a: object, **_kw: object) -> None:
                 """Accept and ignore all constructor arguments."""
 
-            def upload_document(self, *_a: object, **_kw: object) -> None:
+            def upload_document(self, *_a: object, **_kw: object) -> UploadResult:
                 """Raise a paperless error."""
                 msg = "Server down"
                 raise PaperlessError(msg)
