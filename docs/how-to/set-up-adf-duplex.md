@@ -43,6 +43,12 @@ saneless scan --profile duplex --title "Contract"
 
 For scanners without hardware duplex, saneless coordinates a two-pass scan: first the front sides, then the back sides. saneless reverses and interleaves the pages to produce the correct page order.
 
+!!! note "Manual duplex needs a document feeder"
+    Manual duplex feeds the same stack through the ADF twice. A source name
+    containing "duplex" is treated as a feeder source, so each pass acquires the
+    whole stack. It is not a flatbed workflow -- on a flatbed-only scanner, use a
+    plain flatbed profile and scan each side as its own job.
+
 The manual duplex flow:
 
 1. Load pages face-up in the ADF
