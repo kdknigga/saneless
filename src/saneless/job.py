@@ -18,7 +18,13 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from saneless.exceptions import StorageError
-from saneless.vocabulary import ACTIVE_STATES, BUSY_STATES, ErrorCategory, JobState
+from saneless.vocabulary import (
+    ACTIVE_STATES,
+    BUSY_STATES,
+    ErrorCategory,
+    JobState,
+    ScanOutcome,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,6 +32,33 @@ if TYPE_CHECKING:
 __all__ = ["ErrorCategory", "Job", "JobState", "JobStore"]
 
 logger = logging.getLogger(__name__)
+
+_COLUMNS: tuple[str, ...] = (
+    "id",
+    "profile",
+    "title",
+    "state",
+    "error",
+    "error_category",
+    "tags",
+    "correspondent",
+    "thumbnail",
+    "created_at",
+    "outcome",
+    "pages_scanned",
+    "pages_removed",
+    "pages_uploaded",
+    "warning",
+    "owner_token",
+)
+"""Every column the jobs table carries at the head schema version.
+
+The one place the live column list is spelled.  Every ``SELECT`` and every
+``INSERT`` in this module derives its column list and its placeholders from
+this tuple, so a column cannot be added to one statement and forgotten in
+another -- which is exactly how the ``thumbnail`` column came to exist in
+``CREATE TABLE`` while no statement that needed it ever learned about it.
+"""
 
 _S3_COLUMNS: frozenset[str] = frozenset(
     {
@@ -178,6 +211,12 @@ class Job:
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
         thumbnail: Optional base64-encoded JPEG thumbnail string.
+        outcome: How the scan resolved, once a scan has recorded one.
+        pages_scanned: Pages the scanner produced, once a scan has counted them.
+        pages_removed: Pages discarded as blank, once a scan has counted them.
+        pages_uploaded: Pages sent to paperless-ngx, once a scan has counted them.
+        warning: A note about something odd that did not fail the scan.
+        owner_token: The browser token recorded with the submission, if one was.
 
     """
 
@@ -191,6 +230,12 @@ class Job:
     tags: list[int] = field(default_factory=list)
     correspondent: int | None = None
     thumbnail: str | None = None
+    outcome: ScanOutcome | None = None
+    pages_scanned: int | None = None
+    pages_removed: int | None = None
+    pages_uploaded: int | None = None
+    warning: str | None = None
+    owner_token: str | None = None
 
     @property
     def is_active(self) -> bool:
