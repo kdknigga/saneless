@@ -45,10 +45,10 @@ Measured twice independently (discussion + research), with and without `pytest-t
 | TEST-07 | A hung test is killed with a per-test traceback and the suite continues | integration | throwaway file + `uv run pytest <file> -o timeout=3` → expect `1 failed, 1 passed` | ❌ transient, not committed (see note) | ⬜ pending |
 | TEST-07 | No new warning under `filterwarnings = ["error"]` | smoke | full suite green after adding the plugin | ✅ | ⬜ pending |
 | CI-01 | All five checks pass locally | smoke | `uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check && uv run pytest -m "not browser"` | ✅ | ⬜ pending |
-| CI-01 (D-23) | Repo is private before any push | e2e (out-of-repo) | `gh repo view kdknigga/scanless --json isPrivate --jq .isPrivate` → `true` | ✅ gh | ⬜ pending |
+| CI-01 (D-23) | Repo is private before any push | e2e (out-of-repo) | `gh repo view kdknigga/saneless --json isPrivate --jq .isPrivate` → `true` | ✅ gh | ⬜ pending |
 | CI-01 (D-22) | Pushed branch contains no `.planning/` | e2e (out-of-repo) | `git ls-tree -r --name-only <pushed-ref> \| grep -c '^\.planning/'` → `0` | ✅ git | ⬜ pending |
 | CI-01 | The workflow triggers and completes green on the PR | e2e (out-of-repo) | `gh run list --workflow=ci.yml --limit 1 --json conclusion,headBranch,event` → `conclusion == "success"`, `event == "pull_request"` | ✅ gh | ⬜ pending |
-| CI-01 (D-05) | **Both** check runs are reported by the GitHub Actions app | e2e (out-of-repo) | `gh api repos/kdknigga/scanless/commits/$SHA/check-runs --jq '[.check_runs[].name]'` → both job names present | ✅ gh | ⬜ pending |
+| CI-01 (D-05) | **Both** check runs are reported by the GitHub Actions app | e2e (out-of-repo) | `gh api repos/kdknigga/saneless/commits/$SHA/check-runs --jq '[.check_runs[].name]'` → both job names present | ✅ gh | ⬜ pending |
 | CI-01 (D-08.3) | A seeded one-line break turns the run red | e2e (out-of-repo) | throwaway branch → PR → `gh run watch` → `conclusion == "failure"` | ✅ gh | ⬜ pending |
 | CI-01 (D-03) | Ruleset exists, is `active`, targets `refs/heads/master`, requires **both** contexts | e2e (out-of-repo) | the `gh api …/rulesets/$RID --jq` read-back in RESEARCH.md § Code Examples | ✅ gh | ⬜ pending |
 | CI-01 (D-16) | Bumped checkers pass clean | smoke | `uv run ty check && uv run pyrefly check` | ✅ (pyrefly already 0; ty needs 3 fixes) | ⬜ pending |

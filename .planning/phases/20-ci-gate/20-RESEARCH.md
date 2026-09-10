@@ -15,7 +15,7 @@
 
 - **D-01:** The canonical branch is **`master`**. There is no `main`. The review's own `ci.yml` snippet (`push: { branches: [main] }`) is wrong for this repo and must not be copied literally. `origin/HEAD` is not set locally.
 - **D-02:** Triggers are `push: { branches: [master] }` and `pull_request: {}`. Direct pushes to `master` and every PR from any branch are gated. `development`, `autodev`, and the `worktree-agent-*` branches do not run the gate until they open a PR — deliberate, so in-progress agent commits neither burn Actions minutes nor produce red runs from half-finished work.
-- **D-03:** "A red run blocks merge" is delivered by **applying a branch ruleset on `master` via `gh api`** during the phase, then reading it back to prove it stuck — not by documenting a click-path. `gh` is already authenticated as `kdknigga` with the canonical remote `git@github.com:kdknigga/scanless.git`, so this is executable in-phase.
+- **D-03:** "A red run blocks merge" is delivered by **applying a branch ruleset on `master` via `gh api`** during the phase, then reading it back to prove it stuck — not by documenting a click-path. `gh` is already authenticated as `kdknigga` with the canonical remote `git@github.com:kdknigga/saneless.git`, so this is executable in-phase.
 - **D-04:** The contributing docs live in a **new root `CONTRIBUTING.md`** (none exists today). Root placement is deliberate: GitHub surfaces it in the PR and issue UI. It must describe the five checks, the `libsane-dev` prerequisite, `uv sync --locked`, running `uv run prek run` locally, and that `--no-verify` no longer bypasses the gate.
 
 **Job layout and workflow scope**
@@ -85,7 +85,7 @@ Almost everything CONTEXT.md decided is directly implementable, and this session
 
 The highest-risk unknown named in the brief — how the required status check's *name* must be spelled — is now settled from GitHub's own documentation source: for a workflow check the name format is **`<job name>`**, and "required status checks do not take workflow, matrix, or event trigger types into account." The full ruleset REST schema was extracted from GitHub's OpenAPI description, including the non-obvious fact that `strict_required_status_checks_policy` is a **required** parameter, and that the `workflows` rule (which would sidestep job names entirely) is **GHEC/GHES-only** and therefore unavailable to this free public repo.
 
-**One finding, however, invalidates the phase's central assumption.** `github.com/kdknigga/scanless` is an **empty repository** — zero refs, `size: 0`, and `GET /commits` returns `409 Git Repository is empty`. Locally, `master` holds a single "Initial commit" and is **333 commits behind `autodev`**, where all real work lives, and no branch has an upstream. Nothing has ever been pushed. Until a push happens there can be no Actions run, no check-run names to reference, and no PR — so success criteria 1 and 2 are unreachable and the ruleset would be created against names that have never been reported. This is not a research gap; it is a sequencing and branch-reconciliation decision that CONTEXT.md's 19 decisions do not cover, and it needs the user before planning completes.
+**One finding, however, invalidates the phase's central assumption.** `github.com/kdknigga/saneless` is an **empty repository** — zero refs, `size: 0`, and `GET /commits` returns `409 Git Repository is empty`. Locally, `master` holds a single "Initial commit" and is **333 commits behind `autodev`**, where all real work lives, and no branch has an upstream. Nothing has ever been pushed. Until a push happens there can be no Actions run, no check-run names to reference, and no PR — so success criteria 1 and 2 are unreachable and the ruleset would be created against names that have never been reported. This is not a research gap; it is a sequencing and branch-reconciliation decision that CONTEXT.md's 19 decisions do not cover, and it needs the user before planning completes.
 
 **Primary recommendation:** Resolve the publish-and-branch-reconciliation question with the user first; then land `ci.yml` + `dependabot.yml` + `pytest-timeout` on a pushed branch, let it go green, read the **actual** check-run names back from `GET /commits/{sha}/check-runs`, create the ruleset from those exact strings with `do_not_enforce_on_create: true`, read it back, and only then take the `ty`/`pyrefly` bump as a separate commit fixing the 3 known ty diagnostics.
 
@@ -277,7 +277,7 @@ If a job omits `name:`, GitHub displays the **job id** (the YAML key) instead. B
 
 ```bash
 SHA=$(git rev-parse HEAD)
-gh api "repos/kdknigga/scanless/commits/$SHA/check-runs" \
+gh api "repos/kdknigga/saneless/commits/$SHA/check-runs" \
   --jq '.check_runs[] | "\(.name)\tapp=\(.app.slug)\tid=\(.app.id)\tconclusion=\(.conclusion)"'
 ```
 
@@ -326,11 +326,11 @@ Idempotency matters because the phase may need to re-run: there is **no `PATCH`*
 | Probe | Result |
 |---|---|
 | `git ls-remote origin` | exit 0, **zero refs** |
-| `gh api repos/kdknigga/scanless --jq '{size,pushed_at}'` | `{"size":0,"pushed_at":"2026-03-20T19:52:10Z"}` (== `created_at`) |
-| `gh api repos/kdknigga/scanless/commits` | `409 — Git Repository is empty.` |
-| `gh api repos/kdknigga/scanless/branches` | `[]` |
-| `gh api repos/kdknigga/scanless/rulesets` | `[]` |
-| `gh api repos/kdknigga/scanless/branches/master/protection` | `404 — Branch not found` |
+| `gh api repos/kdknigga/saneless --jq '{size,pushed_at}'` | `{"size":0,"pushed_at":"2026-03-20T19:52:10Z"}` (== `created_at`) |
+| `gh api repos/kdknigga/saneless/commits` | `409 — Git Repository is empty.` |
+| `gh api repos/kdknigga/saneless/branches` | `[]` |
+| `gh api repos/kdknigga/saneless/rulesets` | `[]` |
+| `gh api repos/kdknigga/saneless/branches/master/protection` | `404 — Branch not found` |
 | `git rev-list --count master` | **1** ("Initial commit", `a87b3dd`) |
 | `git rev-list --count autodev` | **334** (`951c2d0 docs(state): record phase 20 context session`) |
 | `git rev-list --left-right --count master...autodev` | `0  333` — master is 333 behind autodev |
@@ -514,7 +514,7 @@ Using `github.head_ref || github.ref` also keeps a PR's runs in their own group 
 
 **What goes wrong:** `POST /rulesets` returns 403 mid-plan.
 
-**What is known:** `gh` is authenticated as `kdknigga` with an OAuth token (`gho_…`) carrying scopes `gist, read:org, repo`, and `gh api repos/kdknigga/scanless --jq .permissions` reports `{"admin":true,…}`. Admin-only *read* endpoints succeed with this token — `GET /actions/permissions` → `{"enabled":true,"allowed_actions":"all","sha_pinning_required":false}`, `GET /actions/permissions/workflow` → `{"default_workflow_permissions":"read",…}`, `GET /hooks` → `[]`, `GET /rulesets` → `[]` (not 403). `[VERIFIED: this session]`
+**What is known:** `gh` is authenticated as `kdknigga` with an OAuth token (`gho_…`) carrying scopes `gist, read:org, repo`, and `gh api repos/kdknigga/saneless --jq .permissions` reports `{"admin":true,…}`. Admin-only *read* endpoints succeed with this token — `GET /actions/permissions` → `{"enabled":true,"allowed_actions":"all","sha_pinning_required":false}`, `GET /actions/permissions/workflow` → `{"default_workflow_permissions":"read",…}`, `GET /hooks` → `[]`, `GET /rulesets` → `[]` (not 403). `[VERIFIED: this session]`
 
 That is strong evidence the token can also write, but the write path was **not** exercised (research does not mutate repo settings). Confidence: MEDIUM-HIGH.
 
@@ -641,7 +641,7 @@ dev = [
 ### Creating the ruleset (D-03)
 
 ```bash
-OWNER_REPO=kdknigga/scanless
+OWNER_REPO=kdknigga/saneless
 
 # 1. Read the ACTUAL check names off the green run's head commit.
 SHA=$(git rev-parse HEAD)
@@ -771,11 +771,11 @@ Exactly the D-13 behaviour: one red test with a traceback, the following test st
 | Category | Items Found | Action Required |
 |---|---|---|
 | Stored data | **None** — this phase adds no persistence and touches no database. Verified: no `src/` change except D-16 type fixes | none |
-| Live service config | **`kdknigga/scanless` branch ruleset** — lives in GitHub repo settings, **not** in git. Currently `GET /rulesets` → `[]`. Also: `default_workflow_permissions: "read"`, `allowed_actions: "all"`, `sha_pinning_required: false` (repo Actions settings, also not in git) | Ruleset applied via `gh api` and verified by read-back (D-03). Actions settings left as-is |
+| Live service config | **`kdknigga/saneless` branch ruleset** — lives in GitHub repo settings, **not** in git. Currently `GET /rulesets` → `[]`. Also: `default_workflow_permissions: "read"`, `allowed_actions: "all"`, `sha_pinning_required: false` (repo Actions settings, also not in git) | Ruleset applied via `gh api` and verified by read-back (D-03). Actions settings left as-is |
 | OS-registered state | **None** — no scheduled tasks, no services, no daemons involved | none |
 | Secrets / env vars | **None new.** `ci.yml` needs no secrets; the default `GITHUB_TOKEN` with `permissions: contents: read` suffices. Repo default workflow permission is already `read` | none |
 | Build artifacts / installed packages | **`.venv` must be re-synced** after `uv add --dev pytest-timeout` and again after the `ty`/`pyrefly` bump, or local `prek` runs the old versions. Also: `slopcheck install` during research installed `ty 0.0.80` / `pyrefly 1.2.0` / `pytest-timeout 2.4.0` into the **pyenv global** site-packages (project `.venv` verified unaffected) | `uv sync` after each dependency change; no action for the pyenv global install |
-| **Remote git state (the critical one)** | `github.com/kdknigga/scanless` has **zero refs** — nothing has ever been pushed. Local `master` = 1 commit; `autodev` = 334 commits; no upstream on any branch | **Publish the repository.** See Open Question 1 |
+| **Remote git state (the critical one)** | `github.com/kdknigga/saneless` has **zero refs** — nothing has ever been pushed. Local `master` = 1 commit; `autodev` = 334 commits; no upstream on any branch | **Publish the repository.** See Open Question 1 |
 
 **The canonical question — after every file in the repo is updated, what runtime systems still have stale/absent state?** Answer: the GitHub remote itself (empty) and the branch ruleset (absent). Both are addressed by explicit plan tasks; neither is visible to a `git status` or a grep.
 
@@ -826,7 +826,7 @@ Measured this session: **332 passed, 8 deselected, 26.8s** — matches the CONTE
 | TEST-07 | A hung test is killed with a traceback and the suite continues | integration | throwaway file + `uv run pytest <file> -o timeout=3` → expect `1 failed, 1 passed` | ❌ transient, not committed (see note) |
 | CI-01 | All five checks pass locally | smoke | `uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check && uv run pytest -m "not browser"` | ✅ |
 | CI-01 | The workflow triggers and completes green on GitHub | e2e (out-of-repo) | `gh run list --workflow=ci.yml --limit 1 --json conclusion,headBranch,event` → `conclusion == "success"` | ❌ requires published repo |
-| CI-01 | Both check runs are reported by the GitHub Actions app | e2e (out-of-repo) | `gh api repos/kdknigga/scanless/commits/$SHA/check-runs --jq '[.check_runs[].name]'` | ❌ requires published repo |
+| CI-01 | Both check runs are reported by the GitHub Actions app | e2e (out-of-repo) | `gh api repos/kdknigga/saneless/commits/$SHA/check-runs --jq '[.check_runs[].name]'` | ❌ requires published repo |
 | CI-01 | A seeded one-line break turns the run red (D-08.3) | e2e (out-of-repo) | push throwaway branch, open PR, `gh run watch` → `conclusion == "failure"` | ❌ requires published repo |
 | CI-01 | The ruleset exists, is `active`, targets `refs/heads/master`, and requires **both** contexts | e2e (out-of-repo) | the `gh api …/rulesets/$RID --jq` read-back in § Code Examples | ❌ requires published repo |
 | CI-01 (D-16) | Bumped checkers pass clean | smoke | `uv run ty check && uv run pyrefly check` | ✅ (pyrefly already 0; ty needs the 3 fixes) |
@@ -898,7 +898,7 @@ Note: the repo currently has `sha_pinning_required: false` in its Actions settin
 
 > **RESOLVED:** option (b). Push `autodev`'s work and open a PR into `master` — **which the user merges, never Claude (D-21)**. Additionally: `.planning/` is stripped via `uvx git-filter-repo` (D-22, D-25), and the repo is switched to private before the first push (D-23). Implemented by Plans 20-02 and 20-03.
 
-- **What we know:** `github.com/kdknigga/scanless` is empty (zero refs, `409 Git Repository is empty`). Locally, `master` = 1 commit ("Initial commit"), `autodev` = 334 commits and holds all real work, `development` = 1 commit, plus two `worktree-agent-*` branches. No branch has an upstream. `[VERIFIED]`
+- **What we know:** `github.com/kdknigga/saneless` is empty (zero refs, `409 Git Repository is empty`). Locally, `master` = 1 commit ("Initial commit"), `autodev` = 334 commits and holds all real work, `development` = 1 commit, plus two `worktree-agent-*` branches. No branch has an upstream. `[VERIFIED]`
 - **What's unclear:** the branch-reconciliation strategy. Options include: (a) fast-forward/reset local `master` to `autodev` and push `master` as the single published branch; (b) push `autodev` first, open a PR into `master`, and let the CI gate itself validate the merge (elegant, but requires `master` to exist remotely first and requires `ci.yml` to be on `autodev`); (c) push all branches and keep working on `autodev` with PRs into `master`. `.planning/config.json` has `git.branching_strategy: "none"` and `use_worktrees: true`, which does not settle it.
 - **Recommendation:** put this to the user before planning finalises. It changes the task sequence materially, and it interacts with Pitfall 2 (once the ruleset is active, direct pushes to `master` are rejected — including the very push that would publish the work).
 - **Hard ordering constraint regardless of choice:** publish → `ci.yml` on a branch → green run → read back check names → create ruleset. The ruleset must be last.
@@ -938,7 +938,7 @@ Note: the repo currently has `sha_pinning_required: false` in its Actions settin
 
 ### Primary (HIGH confidence)
 
-- **Direct measurement on this machine, 2026-09-09** — suite runs with/without `pytest-timeout` and with/without Playwright browsers; `ty` 0.0.24 vs 0.0.80 suppression repro; `pyrefly` 1.2.0 dry-run; `git` topology; `gh api` probes against `kdknigga/scanless`.
+- **Direct measurement on this machine, 2026-09-09** — suite runs with/without `pytest-timeout` and with/without Playwright browsers; `ty` 0.0.24 vs 0.0.80 suppression repro; `pyrefly` 1.2.0 dry-run; `git` topology; `gh api` probes against `kdknigga/saneless`.
 - **GitHub REST OpenAPI description** — `github/rest-api-description` `descriptions/api.github.com/dereferenced/api.github.com.deref.json` — full ruleset POST schema, all rule type enums, `bypass_actors` schema, required parameters.
 - **github/docs source** — `content/repositories/.../managing-rulesets/troubleshooting-rules.md` (check-name format), `.../available-rules-for-rulesets.md` (status-check rule semantics, strict vs loose), `content/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/auto-update-actions.md` (dependabot.yml), `data/features/repo-rules-required-workflows.yml` (GHEC/GHES gating).
 - **Context7 `/astral-sh/uv`** — `dev` group synced by default; `--locked` semantics; `default-groups`; `UV_NO_DEV`.

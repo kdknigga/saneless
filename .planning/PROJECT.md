@@ -10,7 +10,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 
 ## Current Milestone: v2.0 Prep for release
 
-**Goal:** Resolve every finding in the 2026-09-09 comprehensive code review (`.planning/reviews/2026-09-09-code-review.md`) so saneless ships as a trustworthy, appliance-grade release under its real name (`kdknigga/scanless`).
+**Goal:** Resolve every finding in the 2026-09-09 comprehensive code review (`.planning/reviews/2026-09-09-code-review.md`) so saneless ships as a trustworthy, appliance-grade release under its real name (`kdknigga/saneless`).
 
 **Target features:**
 - Honest outcomes: typed pipeline results, `FALLBACK` job state, scans never deleted on upload failure, unique PDF names (C-03, C-04, C-05, M-22)
@@ -19,7 +19,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - Robust worker and web layer: locked job store, unkillable worker with 429 backpressure, sync routes, crash recovery, server-owned Scan button, single state enum (C-07, C-09, C-10, M-01, M-03, M-05)
 - Strict configuration: forbid unknown keys, refuse missing `--config`, XDG/`~` expansion, validated log level, default profile always emitted, atomic merged writes, `SecretStr` (C-08, M-04, M-09, M-10, M-18..M-21, M-24)
 - Exception translation at every module boundary (M-17, N-06, N-08)
-- Delivery: CI on every push, fixed release workflow, `kdknigga/scanless` naming everywhere, container logging/port/mount fixes, `.dockerignore` (M-25..M-31)
+- Delivery: CI on every push, fixed release workflow, `kdknigga/saneless` naming everywhere, container logging/port/mount fixes, `.dockerignore` (M-25..M-31)
 - Geometry, memory, timeouts: DPI in PDFs, spool pages to disk, safe cancel, flatbed timeout (M-06, M-08, M-12, M-13)
 - Hermetic, fast, meaningful test suite (M-33, M-34, N-18, N-24, N-40)
 - Full minor/nit sweep of N-01..N-45

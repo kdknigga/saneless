@@ -41,7 +41,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback
 - [ ] **Phase 29: Geometry, Memory, and Timeouts** - Pages spooled to disk in explicit order, safe cancel, shared flatbed/ADF timeout, guarded `sane.init()`
 - [ ] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt
-- [ ] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/scanless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected
+- [ ] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/saneless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected
 - [ ] **Phase 32: Suite Hygiene and Minor Sweep** - Hermetic tests, no `time.sleep`, no low-value tests, and the remaining N-01..N-45 sweep
 
 ## Phase Details
@@ -194,7 +194,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 **UI hint**: yes
 
 ### Phase 31: Delivery, Identity, and Documentation Accuracy
-**Goal**: The project ships under its real name with a release path proven end to end and documentation that does not lie — `kdknigga/scanless` everywhere behind a CI grep guard, SHA-pinned actions with scoped permissions, container logging/port/user/`.dockerignore` fixes, and every one of review section 8's 34 false claims corrected as this milestone's final documentation audit
+**Goal**: The project ships under its real name with a release path proven end to end and documentation that does not lie — `kdknigga/saneless` everywhere behind a CI grep guard, SHA-pinned actions with scoped permissions, container logging/port/user/`.dockerignore` fixes, and every one of review section 8's 34 false claims corrected as this milestone's final documentation audit
 **Depends on**: Phase 30
 **Requirements**: CI-02, DLVR-01, DLVR-02, DLVR-03, DLVR-04, DLVR-05, DLVR-06, DLVR-07, DLVR-08, DLVR-09, DLVR-10, DOCS-01, DOCS-02, DOCS-03, DOCS-04, DOCS-05, DOCS-06
 **Success Criteria** (what must be TRUE):

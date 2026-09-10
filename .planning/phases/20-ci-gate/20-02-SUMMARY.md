@@ -9,7 +9,7 @@ requires:
   - phase: 20-01
     provides: ".github/workflows/ci.yml, .github/dependabot.yml and CONTRIBUTING.md in the tree -- the filtered branch head must already carry the workflow or the PR has nothing to trigger"
 provides:
-  - "kdknigga/scanless visibility = PRIVATE, read back as true, with the remote still holding zero refs"
+  - "kdknigga/saneless visibility = PRIVATE, read back as true, with the remote still holding zero refs"
   - "Local branch autodev-filtered: 112 commits based on master's original root a87b3dd, zero .planning/ paths in any commit, unpushed"
   - "A fresh credential sweep over all 331 tracked files, clean"
   - "Authorization for Plan 03 to push and open the PR, and for Plan 04 to apply the ruleset -- auto-approved, provenance recorded below"
@@ -46,7 +46,7 @@ completed: 2026-09-10
 
 # Phase 20 Plan 02: Pre-Publication Gate Summary
 
-**`kdknigga/scanless` switched PUBLIC to PRIVATE while its remote still held zero refs, and a 112-commit `autodev-filtered` branch built with `git-filter-repo` on a throwaway clone -- every `.planning/` blob gone from every commit, the signed root commit `a87b3dd` intact as the PR base, and nothing pushed.**
+**`kdknigga/saneless` switched PUBLIC to PRIVATE while its remote still held zero refs, and a 112-commit `autodev-filtered` branch built with `git-filter-repo` on a throwaway clone -- every `.planning/` blob gone from every commit, the signed root commit `a87b3dd` intact as the PR base, and nothing pushed.**
 
 ## Performance
 
@@ -58,7 +58,7 @@ completed: 2026-09-10
 
 ## Accomplishments
 
-- `kdknigga/scanless` is **private** (`{"isPrivate":true,"visibility":"PRIVATE"}`), changed while `git ls-remote origin` still returned zero refs -- the D-23 window was met, not merely hoped for.
+- `kdknigga/saneless` is **private** (`{"isPrivate":true,"visibility":"PRIVATE"}`), changed while `git ls-remote origin` still returned zero refs -- the D-23 window was met, not merely hoped for.
 - Local branch **`autodev-filtered`** (head `99154e2`) exists with **112 commits**, **zero `.planning/` paths in its head tree and in all 112 commit diffs**, and `git merge-base master autodev-filtered` = `a87b3dd` so the pull request has a real base.
 - The filter changed **no published file**: the full `git ls-tree -r` listing of `autodev-filtered` and of `autodev` with `.planning/` excluded is byte-identical -- same paths, same modes, same blob SHAs.
 - The working repo was **not** rewritten: 346 commits on `autodev` before and after, `origin` still configured, `master` still `a87b3dd`, zero tags. The scratch clone is deleted.
@@ -120,7 +120,7 @@ Stronger than the plan required: `git diff --stat autodev-filtered:src autodev:s
 ```text
 git rev-list --count autodev   -> 346   (captured before filter-repo ran; identical after)
 git rev-parse master           -> a87b3ddf45b094bb03dedc88a8aade5cd73d33c4
-git remote -v                  -> origin  git@github.com:kdknigga/scanless.git (fetch/push)
+git remote -v                  -> origin  git@github.com:kdknigga/saneless.git (fetch/push)
 git branch --show-current      -> autodev
 git tag | wc -l                -> 0
 scratch clone directory        -> deleted
@@ -148,8 +148,8 @@ Plan 01 and the phase-20 planning work landed 7 commits into `master..autodev` i
 ## Repository state, for Plan 04
 
 ```text
-gh repo view kdknigga/scanless --json isPrivate,visibility  -> {"isPrivate":true,"visibility":"PRIVATE"}
-gh repo view kdknigga/scanless --json defaultBranchRef      -> {"defaultBranchRef":{"name":""}}
+gh repo view kdknigga/saneless --json isPrivate,visibility  -> {"isPrivate":true,"visibility":"PRIVATE"}
+gh repo view kdknigga/saneless --json defaultBranchRef      -> {"defaultBranchRef":{"name":""}}
 git ls-remote origin                                        -> no refs (0 lines)
 ```
 

@@ -148,7 +148,7 @@ was visible as a diff rather than as a fait accompli:
   path to `master`; everyone and everything else is still gated. This is the user's explicit override
   of the plan's D-03 default of `[]`."*
 
-`gh api repos/kdknigga/scanless/rulesets` returned `[]` immediately beforehand, so no pre-existing
+`gh api repos/kdknigga/saneless/rulesets` returned `[]` immediately beforehand, so no pre-existing
 ruleset was replaced and no second ruleset was created.
 
 ### Resolving the bypass actor from the API rather than guessing
@@ -162,10 +162,10 @@ of a hardcoded guess:
 acceptance would be known to be meaningful rather than silently ignored:
 
 ```text
-POST /repos/kdknigga/scanless/rulesets   {"actor_id": 999999, "actor_type": "RepositoryRole", ...}
+POST /repos/kdknigga/saneless/rulesets   {"actor_id": 999999, "actor_type": "RepositoryRole", ...}
   -> 422 {"message":"Validation Failed",
           "errors":["Invalid bypass actor: '{{actor_id: 999999}, {actor_type: RepositoryRole}}'"]}
-GET  /repos/kdknigga/scanless/rulesets  ->  []      # nothing was created by the rejected probe
+GET  /repos/kdknigga/saneless/rulesets  ->  []      # nothing was created by the rejected probe
 ```
 
 **2. Get the role's NAME from the API, not from community lore** — the REST read-back returns only a
@@ -186,7 +186,7 @@ resolution the plan asked for.
 
 **3. Confirm it actually applies to this user** — the REST read-back carries
 `"current_user_can_bypass": "always"`, GitHub's own evaluation of the authenticated identity against
-the bypass list. `gh api repos/kdknigga/scanless/collaborators` shows exactly one admin, `kdknigga`,
+the bypass list. `gh api repos/kdknigga/saneless/collaborators` shows exactly one admin, `kdknigga`,
 so the bypass currently grants exactly one human an escape hatch.
 
 > A fourth approach was tried and **failed to prove anything**, recorded so it is not retried:
@@ -196,7 +196,7 @@ so the bypass currently grants exactly one human an escape hatch.
 
 ### THE READ-BACK — full verbatim JSON (the proof D-03 asks for)
 
-`gh api repos/kdknigga/scanless/rulesets/22777879`:
+`gh api repos/kdknigga/saneless/rulesets/22777879`:
 
 ```json
 {
@@ -204,7 +204,7 @@ so the bypass currently grants exactly one human an escape hatch.
     "name": "master gate",
     "target": "branch",
     "source_type": "Repository",
-    "source": "kdknigga/scanless",
+    "source": "kdknigga/saneless",
     "enforcement": "active",
     "conditions": {
         "ref_name": {
@@ -252,10 +252,10 @@ so the bypass currently grants exactly one human an escape hatch.
     "current_user_can_bypass": "always",
     "_links": {
         "self": {
-            "href": "https://api.github.com/repos/kdknigga/scanless/rulesets/22777879"
+            "href": "https://api.github.com/repos/kdknigga/saneless/rulesets/22777879"
         },
         "html": {
-            "href": "https://github.com/kdknigga/scanless/rules/22777879"
+            "href": "https://github.com/kdknigga/saneless/rules/22777879"
         }
     }
 }
@@ -264,10 +264,10 @@ so the bypass currently grants exactly one human an escape hatch.
 The plan's own `--jq` projection, run verbatim:
 
 ```text
-gh api repos/kdknigga/scanless/rulesets --jq '.[] | {id, name, target, enforcement}'
+gh api repos/kdknigga/saneless/rulesets --jq '.[] | {id, name, target, enforcement}'
   -> {"enforcement":"active","id":22777879,"name":"master gate","target":"branch"}
 
-gh api repos/kdknigga/scanless/rulesets/22777879 --jq '{name, target, enforcement, refs: ..., checks: ..., other: ...}'
+gh api repos/kdknigga/saneless/rulesets/22777879 --jq '{name, target, enforcement, refs: ..., checks: ..., other: ...}'
   -> {"checks":["lint@15368","test@15368"],
       "enforcement":"active",
       "name":"master gate",
@@ -346,7 +346,7 @@ ty type checker ..... Passed       pyrefly type checker ... Passed
 
 ### The run
 
-**Red run: [34486527413](https://github.com/kdknigga/scanless/actions/runs/34486527413)**
+**Red run: [34486527413](https://github.com/kdknigga/saneless/actions/runs/34486527413)**
 
 ```text
 gh run list --workflow=ci.yml --limit 1 --json conclusion,event,headBranch
@@ -361,9 +361,9 @@ gh run view 34486527413 --json jobs
 
 | Piece | Run | Result |
 |---|---|---|
-| Green (Plan 03) | [34483634690](https://github.com/kdknigga/scanless/actions/runs/34483634690) | `success`, `pull_request`, all five checks executed |
-| Red (this plan) | [34486527413](https://github.com/kdknigga/scanless/actions/runs/34486527413) | `failure`, `pull_request`, `test` red / `lint` green |
-| Ruleset read-back | [rules/22777879](https://github.com/kdknigga/scanless/rules/22777879) | `active`, both contexts pinned to app 15368 |
+| Green (Plan 03) | [34483634690](https://github.com/kdknigga/saneless/actions/runs/34483634690) | `success`, `pull_request`, all five checks executed |
+| Red (this plan) | [34486527413](https://github.com/kdknigga/saneless/actions/runs/34486527413) | `failure`, `pull_request`, `test` red / `lint` green |
+| Ruleset read-back | [rules/22777879](https://github.com/kdknigga/saneless/rules/22777879) | `active`, both contexts pinned to app 15368 |
 
 **The other job's conclusion (D-05, as the acceptance criteria require):** `lint` finished
 `success` in 46s while `test` failed in 54s. Both ran in parallel; one being green while the other is
@@ -405,7 +405,7 @@ the same base branch at the same moment:
 
 | PR | Head | Checks | `mergeStateStatus` |
 |---|---|---|---|
-| [#1](https://github.com/kdknigga/scanless/pull/1) (real, green) | `autodev-filtered` | `lint` SUCCESS (required), `test` SUCCESS (required) | **`CLEAN`** |
+| [#1](https://github.com/kdknigga/saneless/pull/1) (real, green) | `autodev-filtered` | `lint` SUCCESS (required), `test` SUCCESS (required) | **`CLEAN`** |
 | #2 (seeded break, red) | `seeded-break-d08-3` | `lint` SUCCESS (required), `test` **FAILURE** (required) | **`BLOCKED`** |
 
 This is the strongest evidence produced by the phase for success criterion 1, and it was not something
@@ -415,7 +415,7 @@ the plan asked for — the plan's criteria stop at the read-back. `mergeable` wa
 ### Cleanup — every trace removed
 
 ```text
-gh pr close 2                        -> ✓ Closed pull request kdknigga/scanless#2   (NEVER merged)
+gh pr close 2                        -> ✓ Closed pull request kdknigga/saneless#2   (NEVER merged)
 gh pr view 2 --json state,mergedAt   -> {"state":"CLOSED","mergedAt":null}
 git push origin --delete seeded-break-d08-3 -> - [deleted]  seeded-break-d08-3
 git worktree remove <scratch>/seedwt --force ; git worktree prune
@@ -450,7 +450,7 @@ user's two direct answers (`bypass_actors`, visibility) which are folded into Ta
 
 1. **Ruleset read-back** — the full verbatim JSON, above.
 2. **Green and red run URLs side by side** — the table in Task 2, plus the read-back = the three D-08 pieces.
-3. **The real PR** — [#1](https://github.com/kdknigga/scanless/pull/1), `OPEN`, `mergedAt: null`, both checks `isRequired: true`.
+3. **The real PR** — [#1](https://github.com/kdknigga/saneless/pull/1), `OPEN`, `mergedAt: null`, both checks `isRequired: true`.
 4. **`origin/master` unchanged, no tag** — `a87b3dd…`, 0 tags local and remote.
 5. **The optional `pull_request` rule** — see below. **Not added.**
 6. **Bypass lock-out** — `current_user_can_bypass: "always"`; the owner is the sole admin and retains an emergency path to `master`.
@@ -581,7 +581,7 @@ enumerate local branches definitively.
   explicit user decision.** The register specified `bypass_actors: []`. The user chose a
   repository-admin bypass with `bypass_mode: always` so an emergency path exists. Residual risk, stated
   plainly: **the repository owner can push a red change to `master` at will, and so could any future
-  collaborator granted the admin role.** Today `gh api repos/kdknigga/scanless/collaborators` lists
+  collaborator granted the admin role.** Today `gh api repos/kdknigga/saneless/collaborators` lists
   exactly one admin (`kdknigga`), so the bypass is currently one person wide. `enforcement` remains
   `active` — the gate was not softened to `evaluate` to achieve this.
 - **T-20-18** (Tampering, history rewrite or deletion of `master`): **mitigated** — `deletion` and
@@ -612,7 +612,7 @@ None.
 
 ## User Setup Required
 
-1. **Pull request [#1](https://github.com/kdknigga/scanless/pull/1) is open, green, and now gated** —
+1. **Pull request [#1](https://github.com/kdknigga/saneless/pull/1) is open, green, and now gated** —
    both `lint` and `test` show as *required*, `mergeStateStatus: CLEAN`. Merging it is the user's
    decision alone; no plan or agent will merge it.
 2. **The `pull_request` rule type is still undecided** (add now / Phase 31 / never). It was not added.

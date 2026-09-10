@@ -60,7 +60,7 @@ Every CRITICAL finding and most MAJOR findings were demonstrated by executing co
 
 **The operator's view.** Section 11 re-examines the project from the chair of a non-developer running the container at home for their family, which is the project's stated goal of feeling like an appliance. It adds ten `U-` findings, four of them new (the compose template's placeholder token overrides the config file, the UI never shows a page count, there is no status or test view, and the flip prompt is shared by every viewer) and ends with a prioritised definition of what appliance-grade would mean here.
 
-**Repository naming.** The canonical remote is `git@github.com:kdknigga/scanless.git`. Every reference to `github.com/kris-knigga/saneless`, `ghcr.io/kris-knigga/saneless`, or `kris-knigga.github.io/saneless` in shipped files is wrong and must be updated to the `kdknigga/scanless` forms; M-27 lists all 24 lines in nine files.
+**Repository naming.** The canonical remote is `git@github.com:kdknigga/saneless.git`. Every reference to `github.com/kris-knigga/saneless`, `ghcr.io/kris-knigga/saneless`, or `kris-knigga.github.io/saneless` in shipped files is wrong and must be updated to the `kdknigga/saneless` forms; M-27 lists all 24 lines in nine files.
 
 **What to do first.** Section 10 gives an ordered remediation plan. The short version: fix the contract bugs in the pipeline and worker (C-01 through C-05, C-09) as one coherent change with end-to-end tests, then the scanner-classification and thread-safety bugs (C-06, C-07), then the two one-liners (C-08, C-10), then stand up CI (M-25) so the suite runs somewhere nobody can bypass.
 
@@ -723,31 +723,31 @@ Make the release workflow's test job reuse it via `workflow_call` so the gate is
 
 **How to fix.** Use `pypa/gh-action-pypi-publish@release/v1` or pin a full tag or SHA; install `libsane-dev` before `uv sync`; run `pytest -m "not browser"` or add `uv run playwright install --with-deps chromium`; add a job that asserts the tag equals `project.version` so a `v1.0.0` tag cannot publish a wheel labelled `0.1.0`.
 
-#### M-27 — Every published name in the repository differs from the actual remote; update the docs to `kdknigga/scanless`
+#### M-27 — Every published name in the repository differs from the actual remote; update the docs to `kdknigga/saneless`
 - **Dimension:** Documentation, Consistency · **Confidence:** Confirmed (lead checked `git remote -v`) · **Found by:** OPS-04
-- **Decision (from the project owner, 2026-09-09):** the remote `git@github.com:kdknigga/scanless.git` is canonical. Documentation and configuration must be updated to match it; the remote is not being renamed.
+- **Decision (from the project owner, 2026-09-09):** the remote `git@github.com:kdknigga/saneless.git` is canonical. Documentation and configuration must be updated to match it; the remote is not being renamed.
 
-**What.** Every user-facing reference says `kris-knigga/saneless`: the GitHub URLs in `pyproject.toml`, the image `ghcr.io/kris-knigga/saneless:latest`, the docs site `kris-knigga.github.io/saneless`, and the README's link text `saneless.github.io`. The release workflow is already correct: it publishes the image as `ghcr.io/${{ github.repository }}`, which resolves to `ghcr.io/kdknigga/scanless`, so after a release the compose file and docs would pull an image name that does not exist. Today every one of these URLs returns 404.
+**What.** Every user-facing reference says `kris-knigga/saneless`: the GitHub URLs in `pyproject.toml`, the image `ghcr.io/kris-knigga/saneless:latest`, the docs site `kris-knigga.github.io/saneless`, and the README's link text `saneless.github.io`. The release workflow is already correct: it publishes the image as `ghcr.io/${{ github.repository }}`, which resolves to `ghcr.io/kdknigga/saneless`, so after a release the compose file and docs would pull an image name that does not exist. Today every one of these URLs returns 404.
 
 **Why it matters.** A reader of the README is told `pip install saneless` and `docker run ghcr.io/kris-knigga/saneless` as if they work. The principle: a name that appears in many files should be derived from, or verified against, the one source of truth, which is the remote.
 
-**How to fix.** Replace every occurrence in the shipped files with the `kdknigga/scanless` forms. The PyPI distribution name `saneless` is independent of the repository name and can stay; only URLs and the image name change. The complete list in tracked, shipped files (the `.planning/` history and the generated `site/` are excluded; regenerate `site/` after the change):
+**How to fix.** Replace every occurrence in the shipped files with the `kdknigga/saneless` forms. The PyPI distribution name `saneless` is independent of the repository name and can stay; only URLs and the image name change. The complete list in tracked, shipped files (the `.planning/` history and the generated `site/` are excluded; regenerate `site/` after the change):
 
 | File | Lines | Current | Change to |
 |---|---|---|---|
-| `pyproject.toml` | 41, 42, 43 | `https://github.com/kris-knigga/saneless` (`Homepage`, `Repository`, `Issues`) | `https://github.com/kdknigga/scanless` (`/issues` for Issues) |
-| `mkdocs.yml` | 3 | `site_url: https://kris-knigga.github.io/saneless/` | `https://kdknigga.github.io/scanless/` |
-| `mkdocs.yml` | 4, 5 | `repo_url` and `repo_name` with `kris-knigga/saneless` | `https://github.com/kdknigga/scanless`, `kdknigga/scanless` |
-| `docker-compose.yml` | 12 | `image: ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/scanless:latest` |
-| `docker-compose.yml` | 18 | `# See: https://github.com/kris-knigga/saneless#configuration` | `https://github.com/kdknigga/scanless#configuration` |
-| `README.md` | 37 | `docker run ... ghcr.io/kris-knigga/saneless` | `ghcr.io/kdknigga/scanless` |
-| `README.md` | 72 | link text `saneless.github.io`, URL `kris-knigga.github.io/saneless/` | text and URL `kdknigga.github.io/scanless/` |
-| `README.md` | 74, 75, 76, 77 | four doc links under `kris-knigga.github.io/saneless/` (74 also points at a page that does not exist, N-29) | `kdknigga.github.io/scanless/...` |
-| `docs/getting-started/quick-start.md` | 21 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/scanless:latest` |
-| `docs/getting-started/first-cli-scan.md` | 38 | `ghcr.io/kris-knigga/saneless` | `ghcr.io/kdknigga/scanless` |
-| `docs/how-to/deploy-docker-compose.md` | 48, 69 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/scanless:latest` |
-| `docs/how-to/scanner-host-discovery.md` | 35 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/scanless:latest` |
-| `docs/reference/docker.md` | 9, 51, 65, 83, 101 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/scanless:latest` |
+| `pyproject.toml` | 41, 42, 43 | `https://github.com/kris-knigga/saneless` (`Homepage`, `Repository`, `Issues`) | `https://github.com/kdknigga/saneless` (`/issues` for Issues) |
+| `mkdocs.yml` | 3 | `site_url: https://kris-knigga.github.io/saneless/` | `https://kdknigga.github.io/saneless/` |
+| `mkdocs.yml` | 4, 5 | `repo_url` and `repo_name` with `kris-knigga/saneless` | `https://github.com/kdknigga/saneless`, `kdknigga/saneless` |
+| `docker-compose.yml` | 12 | `image: ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/saneless:latest` |
+| `docker-compose.yml` | 18 | `# See: https://github.com/kris-knigga/saneless#configuration` | `https://github.com/kdknigga/saneless#configuration` |
+| `README.md` | 37 | `docker run ... ghcr.io/kris-knigga/saneless` | `ghcr.io/kdknigga/saneless` |
+| `README.md` | 72 | link text `saneless.github.io`, URL `kris-knigga.github.io/saneless/` | text and URL `kdknigga.github.io/saneless/` |
+| `README.md` | 74, 75, 76, 77 | four doc links under `kris-knigga.github.io/saneless/` (74 also points at a page that does not exist, N-29) | `kdknigga.github.io/saneless/...` |
+| `docs/getting-started/quick-start.md` | 21 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/saneless:latest` |
+| `docs/getting-started/first-cli-scan.md` | 38 | `ghcr.io/kris-knigga/saneless` | `ghcr.io/kdknigga/saneless` |
+| `docs/how-to/deploy-docker-compose.md` | 48, 69 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/saneless:latest` |
+| `docs/how-to/scanner-host-discovery.md` | 35 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/saneless:latest` |
+| `docs/reference/docker.md` | 9, 51, 65, 83, 101 | `ghcr.io/kris-knigga/saneless:latest` | `ghcr.io/kdknigga/saneless:latest` |
 
 One command finds them all and nothing else (24 lines in nine files today):
 
@@ -1003,7 +1003,7 @@ Reviewers checked concrete, testable claims in `README.md` and `docs/` against t
 | 16 | `README.md:44` | `saneless scan  # Scan a document` | `--title` is required |
 | 17 | `README.md:63` | `source = "flatbed"` | Compared case-sensitively; every SANE backend spells it `"Flatbed"` |
 | 18 | `README.md:74` | Link to `tutorials/scan-your-first-document/` | No such page; the tutorial is `getting-started/first-cli-scan/` |
-| 19 | `README.md:37, 72-77` and eight other files (24 lines) | `ghcr.io/kris-knigga/saneless`, `github.com/kris-knigga/saneless`, `kris-knigga.github.io/saneless` | Remote is `kdknigga/scanless`; all URLs 404. Decision: update every reference to the `kdknigga/scanless` forms (M-27 has the full list) |
+| 19 | `README.md:37, 72-77` and eight other files (24 lines) | `ghcr.io/kris-knigga/saneless`, `github.com/kris-knigga/saneless`, `kris-knigga.github.io/saneless` | Remote is `kdknigga/saneless`; all URLs 404. Decision: update every reference to the `kdknigga/saneless` forms (M-27 has the full list) |
 | 20 | `docs/how-to/deploy-docker-compose.md:27-28` | Container "will fail to start if the file is missing" | Starts with defaults; Docker creates a directory at that path (M-30) |
 | 21 | `docs/reference/docker.md:42`, `saneless.toml.example:11` | `web_port` is a common override for Docker; example sets 8081 | Healthcheck and EXPOSE are fixed at 8080 (M-29) |
 | 22 | `docs/reference/web-api.md:124-136` | Flip endpoints return "HTML partial with updated job status" | Continue returns the unchanged flip prompt; abort may return "Ready to scan." (M-02) |
@@ -1073,7 +1073,7 @@ The order below groups fixes so that each step leaves the suite green and each s
 
 **Step 6: Translate exceptions at every boundary (M-17, N-06, N-08; half a day).** Wrap SANE, httpx, and img2pdf errors; add `ConfigError` handling and a python-sane import guard to the CLI; log with `exc_info` in the worker; make `load_settings` raise one type.
 
-**Step 7: Stand up delivery (M-25 through M-31; half a day).** A CI workflow that runs ruff, ty, pyrefly, and pytest on every push; fix the release workflow's three failures; update the 24 lines in nine files that name `kris-knigga/saneless` to `kdknigga/scanless` (M-27 lists them) and add the grep as a CI check; add `-v` to the container command or a stderr handler for containers; align the example config port with the healthcheck; mount the config directory rather than the file; add `.dockerignore`.
+**Step 7: Stand up delivery (M-25 through M-31; half a day).** A CI workflow that runs ruff, ty, pyrefly, and pytest on every push; fix the release workflow's three failures; update the 24 lines in nine files that name `kris-knigga/saneless` to `kdknigga/saneless` (M-27 lists them) and add the grep as a CI check; add `-v` to the container command or a stderr handler for containers; align the example config port with the healthcheck; mount the config directory rather than the file; add `.dockerignore`.
 
 **Step 8: Fix the geometry, memory, and timeouts (M-06, M-08, M-12, M-13; one to two days).** Pass DPI through to the PDF; spool pages to disk as they arrive; wait for the cancelled read before closing; give the flatbed path the same timeout.
 
@@ -1239,7 +1239,7 @@ The ten most user-visible code defects (C-01 through C-10) are prerequisites for
 - Ran `generate_profiles` with sources `["ADF", "ADF Duplex"]`: no `default` profile (C-08).
 - Ran the Playwright scan-cycle test against a real uvicorn server: button still disabled after `.status-done` appeared, with the swap event's detail target disconnected (C-10).
 - Read the installed `sane.py` `__setattr__`: unknown option names are stored silently (M-15).
-- Ran `git remote -v` and `git ls-remote` against the PyPI publish action: remote is `kdknigga/scanless`; no `v1.12` ref exists (M-26, M-27).
+- Ran `git remote -v` and `git ls-remote` against the PyPI publish action: remote is `kdknigga/saneless`; no `v1.12` ref exists (M-26, M-27).
 
 **Agent verification artefacts** live in the session scratchpad at `/tmp/claude-1000/-home-kris-git-saneless/8fb87bbe-41f7-42a6-84dd-3ff208355f8f/scratchpad/` (session-specific; copy anything worth keeping) and are reusable as regression tests: `pipe/test_pipe_claims.py` (10 tests), `pipe/test_autoprof_claims.py` (5), `pipe/test_manual_source_claim.py` (2), `pipe/verify_pdf.py`, `core/threads_jobstore.py` and `threads_jobstore_locked.py`, `core/verify_config.py`, `core/verify_paperless.py`, `core/test_scratch_worker.py`, `core/test_scratch_core.py`, `exp1_caps_and_adf.py` through `exp9_exit_join.py` (real SANE `test` backend), `test_scratch_init.py`, `test_scratch_browser_button.py`, `test_scratch_web.py`, `test_scratch_worker2.py`, `test_ops_verify.py`, `xc_verify_test.py` (8 tests), `test_hygiene.py`, and `deadcode.py`. The SANE experiments use `SANE_CONFIG_DIR` pointing at a directory whose `dll.conf` contains only `test`, which works on this machine because `libsane-test.so` is installed.
 

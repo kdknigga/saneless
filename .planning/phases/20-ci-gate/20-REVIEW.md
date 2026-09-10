@@ -263,7 +263,7 @@ I checked the repository's security settings directly:
  "secret_scanning_non_provider_patterns": {"status": "disabled"}}
 ```
 
-`GET /repos/kdknigga/scanless/dependabot/alerts` → `403 "Dependabot alerts are disabled for this
+`GET /repos/kdknigga/saneless/dependabot/alerts` → `403 "Dependabot alerts are disabled for this
 repository."` and `GET .../automated-security-fixes` → `{"enabled": false}`.
 
 **Concrete failure scenario.** A CVE is published for `pillow` (a direct dependency used to process
@@ -292,8 +292,8 @@ updates:
 ```
 
 ```bash
-gh api -X PUT repos/kdknigga/scanless/vulnerability-alerts
-gh api -X PUT repos/kdknigga/scanless/automated-security-fixes
+gh api -X PUT repos/kdknigga/saneless/vulnerability-alerts
+gh api -X PUT repos/kdknigga/saneless/automated-security-fixes
 ```
 
 If the volume of PRs is the concern, enabling alerts + security updates alone (without version

@@ -124,8 +124,8 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 
 ### Delivery and Identity
 
-- [ ] **DLVR-01**: Every reference to `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, and `ghcr.io/kris-knigga/saneless` in shipped files (24 lines in nine files) is updated to the `kdknigga/scanless` forms; the PyPI distribution name stays `saneless` [M-27, doc row 19]
-- [ ] **DLVR-02**: The release workflow succeeds end to end: PyPI trusted publisher and GHCR package configured for `kdknigga/scanless`, the unresolvable `pypa/gh-action-pypi-publish@v1.12` ref fixed, and a pre-release tag rehearsed against TestPyPI verified by a `pip install` and `docker pull` from a clean machine [M-26]
+- [ ] **DLVR-01**: Every reference to `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, and `ghcr.io/kris-knigga/saneless` in shipped files (24 lines in nine files) is updated to the `kdknigga/saneless` forms; the PyPI distribution name stays `saneless` [M-27, doc row 19]
+- [ ] **DLVR-02**: The release workflow succeeds end to end: PyPI trusted publisher and GHCR package configured for `kdknigga/saneless`, the unresolvable `pypa/gh-action-pypi-publish@v1.12` ref fixed, and a pre-release tag rehearsed against TestPyPI verified by a `pip install` and `docker pull` from a clean machine [M-26]
 - [ ] **DLVR-03**: All GitHub Actions are pinned to commit SHAs with a Dependabot config, every job has a `permissions:` block, and a workflow audit (zizmor) runs in CI [N-31]
 - [ ] **DLVR-04**: Container logs appear in `docker logs` (stderr handler enabled in the container command) [M-28]
 - [ ] **DLVR-05**: The example config, `EXPOSE`, and `HEALTHCHECK` agree on one port [M-29, doc row 21]

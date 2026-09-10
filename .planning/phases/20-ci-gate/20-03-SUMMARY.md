@@ -12,7 +12,7 @@ requires:
     provides: ".github/workflows/ci.yml on the filtered branch head -- without it the pull_request trigger has nothing to run"
 provides:
   - "origin/master = a87b3dd and origin/autodev-filtered = 99154e2 on the private remote; GitHub default_branch resolved to master"
-  - "Open, unmerged pull request kdknigga/scanless#1 (autodev-filtered -> master)"
+  - "Open, unmerged pull request kdknigga/saneless#1 (autodev-filtered -> master)"
   - "Green ci.yml run 34483634690, event=pull_request, both jobs success, all five checks executed"
   - "The verbatim required_status_checks contexts for Plan 04: `lint` and `test`, integration_id 15368"
   - "The warning that a THIRD check-run (copilot-pull-request-reviewer) exists on the head commit under the same app id and must NOT be required"
@@ -46,7 +46,7 @@ completed: 2026-09-10
 
 # Phase 20 Plan 03: Publish and Prove the Gate Summary
 
-**`master` and `autodev-filtered` are on the private remote with zero `.planning/` paths anywhere in the published history, pull request [#1](https://github.com/kdknigga/scanless/pull/1) is open and unmerged, and its `pull_request`-triggered `ci.yml` run finished green with all five checks executed — and the check-run names Plan 04 needs were read back off the head commit rather than guessed from the YAML, which is how the unexpected third check-run was found.**
+**`master` and `autodev-filtered` are on the private remote with zero `.planning/` paths anywhere in the published history, pull request [#1](https://github.com/kdknigga/saneless/pull/1) is open and unmerged, and its `pull_request`-triggered `ci.yml` run finished green with all five checks executed — and the check-run names Plan 04 needs were read back off the head commit rather than guessed from the YAML, which is how the unexpected third check-run was found.**
 
 ## Performance
 
@@ -58,7 +58,7 @@ completed: 2026-09-10
 
 ## THE DELIVERABLE FOR PLAN 04 — check-run contexts, read verbatim from the API
 
-Queried read-only via `gh api repos/kdknigga/scanless/commits/99154e21f14d6f1211318789725473afadd497b0/check-runs`.
+Queried read-only via `gh api repos/kdknigga/saneless/commits/99154e21f14d6f1211318789725473afadd497b0/check-runs`.
 
 | `name` (verbatim) | `app.slug` | `app.id` | `conclusion` | Source |
 |---|---|---|---|---|
@@ -118,8 +118,8 @@ git push -u origin autodev-filtered  # * [new branch] autodev-filtered -> autode
 | Check | Result |
 |---|---|
 | `git ls-remote --heads origin` | exactly 2: `refs/heads/master` = `a87b3dd…`, `refs/heads/autodev-filtered` = `99154e2…` |
-| `gh api repos/kdknigga/scanless/branches --jq '[.[].name]'` | `["autodev-filtered","master"]` |
-| `gh api repos/kdknigga/scanless/tags --jq length` | **0** |
+| `gh api repos/kdknigga/saneless/branches --jq '[.[].name]'` | `["autodev-filtered","master"]` |
+| `gh api repos/kdknigga/saneless/tags --jq length` | **0** |
 | `gh repo view --json isPrivate,defaultBranchRef` | `{"private":true,"default":"master"}` |
 
 **The default branch resolved to `master` on its own.** Plan 02 recorded `defaultBranchRef` as empty (the repo had no refs); the first `git push origin master` both created the ref and made it the default, so the fallback `gh repo edit --default-branch master` in the plan's action was not needed and was not run. Plan 04's decision to target `refs/heads/master` explicitly remains correct regardless.
@@ -144,11 +144,11 @@ The fetched SHAs matched the pushed ones exactly, so the remote holds the same o
 
 ## Task 2 — the pull request and the green run
 
-**Pull request: [kdknigga/scanless#1](https://github.com/kdknigga/scanless/pull/1)** — `autodev-filtered` → `master`, title *"v2.0 prep: publish application history and add the CI gate"*, head `99154e21f14d6f1211318789725473afadd497b0`.
+**Pull request: [kdknigga/saneless#1](https://github.com/kdknigga/saneless/pull/1)** — `autodev-filtered` → `master`, title *"v2.0 prep: publish application history and add the CI gate"*, head `99154e21f14d6f1211318789725473afadd497b0`.
 
 The body describes the application and the new gate (the two jobs, the five checks, `libsane-dev` before `uv sync --locked`, SHA-pinned actions with Dependabot, `pytest-timeout`, the deferred browser job) and **cites no `.planning/` path and no internal review** (T-20-15). It closes by stating the PR is left open for the repository owner to merge.
 
-**Run: [34483634690](https://github.com/kdknigga/scanless/actions/runs/34483634690)**
+**Run: [34483634690](https://github.com/kdknigga/saneless/actions/runs/34483634690)**
 
 ```text
 gh run list --workflow=ci.yml --limit 1 --json conclusion,headBranch,event
@@ -189,7 +189,7 @@ gh pr view 1 --json state,mergedAt,mergeStateStatus
   -> {"state":"OPEN","mergedAt":null,"mergeStateStatus":"CLEAN"}
 git ls-remote origin refs/heads/master
   -> a87b3ddf45b094bb03dedc88a8aade5cd73d33c4    (unchanged, the original signed root commit)
-gh api repos/kdknigga/scanless/tags --jq length
+gh api repos/kdknigga/saneless/tags --jq length
   -> 0
 ```
 
@@ -261,7 +261,7 @@ None.
 
 **Two things need the user's attention:**
 
-1. **Pull request [#1](https://github.com/kdknigga/scanless/pull/1) is open and green** on the now-private `kdknigga/scanless`. Merging it is the user's decision alone; no plan or agent will merge it.
+1. **Pull request [#1](https://github.com/kdknigga/saneless/pull/1) is open and green** on the now-private `kdknigga/saneless`. Merging it is the user's decision alone; no plan or agent will merge it.
 2. **`bypass_actors: []` is still unanswered** and blocks Plan 04. With an empty bypass list, every future change to `master` — including the user's own, as repository admin — must go through a pull request with both `lint` and `test` green, with no escape hatch for anyone.
 
 ## Next Phase Readiness

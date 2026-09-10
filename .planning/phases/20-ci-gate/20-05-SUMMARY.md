@@ -9,7 +9,7 @@ requires:
   - phase: 20-04
     provides: "Active `master gate` ruleset requiring lint@15368 and test@15368, and PR #1 open on autodev-filtered -- the gate this bump had to pass through"
   - phase: 20-03
-    provides: "PR #1 (https://github.com/kdknigga/scanless/pull/1) and the pushed autodev-filtered branch the bump is cherry-picked onto"
+    provides: "PR #1 (https://github.com/kdknigga/saneless/pull/1) and the pushed autodev-filtered branch the bump is cherry-picked onto"
 provides:
   - "ty 0.0.80 and pyrefly 1.2.0 in pyproject.toml and uv.lock, both reporting zero errors"
   - "Zero `# type: ignore` comments anywhere in src/ or tests/ -- all three replaced by real typing constructs"
@@ -323,7 +323,7 @@ was built to produce.
 
 | Invariant | Value |
 |---|---|
-| PR #1 | **`OPEN`**, `mergedAt: null` — https://github.com/kdknigga/scanless/pull/1 |
+| PR #1 | **`OPEN`**, `mergedAt: null` — https://github.com/kdknigga/saneless/pull/1 |
 | `refs/heads/master` | `a87b3ddf45b094bb03dedc88a8aade5cd73d33c4` — unchanged |
 | Tags | `gh api .../tags` → `0`; `git ls-remote --tags origin` → `0` lines |
 | Ruleset | untouched |

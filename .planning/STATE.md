@@ -195,7 +195,7 @@ Recent decisions affecting current work:
 - [Phase 20-01]: CONTRIBUTING.md follows README.md GitHub markdown dialect, not the mkdocs-material dialect used under docs/
 - [Phase 20-02]: git-filter-repo must run as --refs master..autodev --partial -- whole-history filtering drops the SSH gpgsig on root commit a87b3dd, changing its SHA to 18d7911 and destroying the PR merge base
 - [Phase 20-02]: Filtered PR branch is autodev-filtered -- 112 commits, zero .planning/ paths in every commit, based on the original signed master root a87b3dd
-- [Phase 20-02]: kdknigga/scanless is PRIVATE with zero refs on the remote; defaultBranchRef is empty, so Plan 04's ruleset must target refs/heads/master explicitly
+- [Phase 20-02]: kdknigga/saneless is PRIVATE with zero refs on the remote; defaultBranchRef is empty, so Plan 04's ruleset must target refs/heads/master explicitly
 - [Phase 20-02]: bypass_actors: [] remains UNANSWERED -- Plan 04 must treat the ruleset bypass list as an open user input, not a settled decision
 - [Phase 20-02]: Verification greps must use 'command grep' -- the shell's grep is a ugrep wrapper whose -qv exit status is wrong and it misclassified 7 commits in the history audit
 - [Phase 20-03]: Plan 04's required_status_checks contexts are exactly `lint` and `test`, read back from GET /commits/{sha}/check-runs, with GitHub Actions integration_id 15368
