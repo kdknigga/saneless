@@ -20,6 +20,8 @@ from saneless.scanner.base import (
     DeviceInfo,
     ScannerBackend,
     ScanSettings,
+    SourceKind,
+    classify_source,
 )
 from saneless.scanner.sane_backend import SaneBackend
 
@@ -286,6 +288,72 @@ class TestScanSettings:
 
 
 # ---------------------------------------------------------------------------
+# Source classification tests (CTR-04)
+# ---------------------------------------------------------------------------
+
+
+class TestClassifySource:
+    """The single source-classification rule in the codebase."""
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ("Flatbed", SourceKind.FLATBED),
+            # The real-world spellings of the SANE `test`, Brother, epson, sharp
+            # and umax feeders.  Their lowercase form STARTS WITH "auto", so the
+            # AUTO rule must be an exact equality test and must never be a
+            # substring test -- a substring test classifies these as AUTO, sends
+            # them down the single-page branch, and restores the C-06 defect.
+            ("Automatic Document Feeder", SourceKind.FEEDER),
+            ("Automatic Document Feeder(left aligned)", SourceKind.FEEDER),
+            ("Automatic Document Feeder(centrally aligned)", SourceKind.FEEDER),
+            ("Document Feeder", SourceKind.FEEDER),
+            ("ADF", SourceKind.FEEDER),
+            # "ADF Back" is a feeder for ROUTING purposes even though it must
+            # not share a profile slug with "ADF Front" (N-09).
+            ("ADF Front", SourceKind.FEEDER),
+            ("ADF Back", SourceKind.FEEDER),
+            ("ADF Duplex", SourceKind.FEEDER_DUPLEX),
+            ("Adf-duplex", SourceKind.FEEDER_DUPLEX),
+            ("ADF Manual Duplex", SourceKind.FEEDER_DUPLEX),
+            # Ambiguity A -- Fujitsu's "Card Duplex" contains "duplex" and no
+            # feeder token, so it classifies FEEDER_DUPLEX and starts routing to
+            # multi_scan().  Deliberate: a card-feed path IS a sheet path, and
+            # requiring a feeder token AND "duplex" would mis-route real
+            # Fujitsu hardware.
+            ("Card Duplex", SourceKind.FEEDER_DUPLEX),
+            # Ambiguity B -- "Manual Duplex" is this project's own pseudo-source
+            # (docs/how-to/set-up-adf-duplex.md).  Its exposure is narrow and
+            # Phase 25 deletes the source-overloading entirely, so no special
+            # case is built for it here.
+            ("Manual Duplex", SourceKind.FEEDER_DUPLEX),
+            ("Auto", SourceKind.AUTO),
+            ("auto", SourceKind.AUTO),
+            ("  Auto  ", SourceKind.AUTO),
+            ("Transparency Adapter", SourceKind.UNKNOWN),
+            ("TMA Slides", SourceKind.UNKNOWN),
+            ("TMA Negatives", SourceKind.UNKNOWN),
+            # Bell+Howell's manual tray is single-page: "feed" is not "feeder".
+            ("Manual Feed Tray", SourceKind.UNKNOWN),
+        ],
+    )
+    def test_classify_source(self, source: str, expected: SourceKind) -> None:
+        """Harvested real-world SANE source names classify correctly (CTR-04)."""
+        assert classify_source(source) is expected
+
+    def test_uses_feeder_true_for_feeder_kinds(self) -> None:
+        """FEEDER and FEEDER_DUPLEX feed a stack of sheets (CTR-04)."""
+        assert SourceKind.FEEDER.uses_feeder
+        assert SourceKind.FEEDER_DUPLEX.uses_feeder
+
+    def test_uses_feeder_false_for_single_page_kinds(self) -> None:
+        """FLATBED, AUTO, and UNKNOWN take the single-page path (CTR-04)."""
+        assert not SourceKind.FLATBED.uses_feeder
+        assert not SourceKind.AUTO.uses_feeder
+        assert not SourceKind.UNKNOWN.uses_feeder
+
+
+# ---------------------------------------------------------------------------
 # ABC contract tests
 # ---------------------------------------------------------------------------
 
@@ -536,6 +604,58 @@ class TestSaneBackendADFScan:
 
         assert len(pages) == 1
         mock_dev._snap_impl.assert_called_once_with()
+
+
+class TestSaneBackendAutomaticDocumentFeeder:
+    """Routing for feeder names that contain no "adf" token (C-06 / D-11)."""
+
+    @staticmethod
+    def _options_with_feeder_source() -> list[tuple]:
+        """Return SANE options whose source constraint is the test backend's."""
+        return [
+            (
+                1,
+                "source",
+                "Scan source",
+                "Source desc",
+                3,
+                0,
+                1,
+                5,
+                ["Flatbed", "Automatic Document Feeder"],
+            ),
+        ]
+
+    def test_automatic_document_feeder_yields_all_pages(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """
+        Automatic Document Feeder uses multi_scan and returns every page (CTR-04).
+
+        The SANE ``test`` backend names its feeder "Automatic Document Feeder",
+        with no "adf" token anywhere in the string. The deleted string-sniffing
+        rule in ``sane_backend`` returned False for it, so the flatbed
+        ``start()``/``snap()`` branch ran and a ten-page stack produced exactly
+        one page. This asserts that ``multi_scan()`` is used instead -- that all
+        3 fake pages come back rather than 1, and that ``snap()`` is never
+        called. This is the C-06 fix and the phase's one authorised behaviour
+        change (D-11); it could not have passed before Phase 21.
+        """
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_with_feeder_source()
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+
+        settings = ScanSettings(
+            source="Automatic Document Feeder", resolution=300, mode="color"
+        )
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 3
+        for page in pages:
+            assert isinstance(page, Image.Image)
+        mock_dev._snap_impl.assert_not_called()
 
 
 class TestSaneBackendDuplex:

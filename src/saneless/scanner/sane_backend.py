@@ -30,6 +30,7 @@ from saneless.scanner.base import (
     DeviceInfo,
     ScannerBackend,
     ScanSettings,
+    classify_source,
 )
 
 if TYPE_CHECKING:
@@ -153,11 +154,6 @@ def _maybe_crop(
     if settings.paper_size != "full" and not geometry_set:
         return crop_to_paper_size(image, settings.paper_size, settings.resolution)
     return image
-
-
-def _is_adf_source(source: str) -> bool:
-    """Check if the source string indicates an ADF source."""
-    return "adf" in source.lower()
 
 
 def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
@@ -493,7 +489,7 @@ class SaneBackend(ScannerBackend):
             # Set scan area geometry for paper size constraint (D-01)
             geometry_set = _set_geometry(dev, settings.paper_size)
 
-            use_adf = _is_adf_source(effective_source)
+            use_adf = classify_source(effective_source).uses_feeder
 
             # D-04: Override for "Auto" source using config-driven routing
             if effective_source == "Auto":
