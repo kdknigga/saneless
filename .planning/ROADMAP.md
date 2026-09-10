@@ -74,7 +74,16 @@ Note: the earlier "zero source changes in this phase" note is SUPERSEDED by CONT
   2. `classify_source()` returns the correct `SourceKind` for "Automatic Document Feeder", "ADF Front", "ADF Duplex", "Flatbed", "Auto", and vendor variants, and it is the only classification rule in the codebase
   3. The pipeline returns a typed `ScanResult` and `upload_document` returns a typed `UploadResult`; the `"fallback"` magic string is absent from `src/`, `tests/`, and `docs/`
   4. Existing imports from `job.py` still resolve (re-exports), and the whole suite passes unchanged
-**Plans**: TBD
+**Plans**: 5 plans
+
+Plans:
+- [ ] 21-01-PLAN.md — `vocabulary.py` (enums, three state classifications, four total lookups behind `assert_never`) + `job.py` re-exports and `Job.is_active`/`is_busy`
+- [ ] 21-02-PLAN.md — `SourceKind` + `classify_source()` in `scanner/base.py`, both existing rules delegated; carries the phase's one authorised behaviour change (D-11 / C-06)
+- [ ] 21-03-PLAN.md — web rewiring: `_STATE_LABELS` and `humanize_state` deleted, filters re-backed, all state literals removed from the three templates
+- [ ] 21-04-PLAN.md — `PipelineEvent.job_state`, worker `_status_cb` collapse, CLI `_event_labels` deleted, `classify_error` moved off `ScanWorker`
+- [ ] 21-05-PLAN.md — typed `UploadResult` (atomic across five stub sites) and `ScanResult`; sentinel deleted; the false `FALLBACK` doc claim corrected
+
+Waves: 1 = {21-01, 21-02} · 2 = {21-03, 21-04} · 3 = {21-05}
 
 ### Phase 22: Job Store Hardening
 **Goal**: The job store is safe under concurrency and can evolve its schema honestly — an `RLock` around every public method, a `PRAGMA user_version` migration ladder that opens a v1.0 database cleanly, and every result column this milestone will ever need added in one migration — with the storage docs updated in-phase
