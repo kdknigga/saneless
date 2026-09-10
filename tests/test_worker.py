@@ -14,8 +14,9 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.job import ErrorCategory, Job, JobState, JobStore
-from saneless.pipeline import PipelineEvent
+from saneless.pipeline import PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
+from saneless.vocabulary import ScanOutcome
 from saneless.worker import ScanWorker
 
 if TYPE_CHECKING:
@@ -188,7 +189,7 @@ class TestScanWorker:
             # Mock run_pipeline to succeed
             monkeypatch.setattr(
                 "saneless.worker.run_pipeline",
-                lambda *_args, **_kwargs: {"status": "SUCCESS"},
+                lambda *_args, **_kwargs: _success_result(),
             )
 
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -217,7 +218,7 @@ class TestScanWorker:
         store = JobStore()
         try:
 
-            def failing_pipeline(*_args: object, **_kwargs: object) -> None:
+            def failing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
                 msg = "Scanner on fire"
                 raise RuntimeError(msg)
 
@@ -243,12 +244,22 @@ class TestScanWorker:
             store.close()
 
 
+def _success_result() -> ScanResult:
+    """Return the ScanResult a successful pipeline run would produce."""
+    return ScanResult(
+        outcome=ScanOutcome.SUCCESS,
+        pages_scanned=1,
+        pages_removed=0,
+        pages_uploaded=1,
+    )
+
+
 def _mock_manual_duplex_pipeline(
     _scanner: object,
     _paperless: object,
     _settings: object,
     request: PipelineRequest,
-) -> dict[str, str]:
+) -> ScanResult:
     """Simulate pipeline behavior for manual duplex tests."""
     if request.thumbnail_callback:
         request.thumbnail_callback("dGh1bWI=")  # base64 "thumb"
@@ -259,7 +270,7 @@ def _mock_manual_duplex_pipeline(
         if request.abort_event and request.abort_event.is_set():
             msg = "Manual duplex scan cancelled by user"
             raise ScanError(msg)
-    return {"status": "SUCCESS"}
+    return _success_result()
 
 
 class TestScanWorkerManualDuplex:
@@ -405,11 +416,11 @@ class TestScanWorkerManualDuplex:
             _paperless: object,
             _settings: object,
             request: PipelineRequest,
-        ) -> dict[str, str]:
+        ) -> ScanResult:
             """Capture pipeline request events."""
             captured_request["flip_event"] = request.flip_event
             captured_request["abort_event"] = request.abort_event
-            return {"status": "SUCCESS"}
+            return _success_result()
 
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
@@ -508,9 +519,10 @@ class TestWorkerIntermediateStates:
                 _paperless: object,
                 _settings: object,
                 request: PipelineRequest,
-            ) -> None:
+            ) -> ScanResult:
                 if request.status_callback:
                     request.status_callback(PipelineEvent.ASSEMBLING)
+                return _success_result()
 
             monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -554,9 +566,10 @@ class TestWorkerIntermediateStates:
                 _paperless: object,
                 _settings: object,
                 request: PipelineRequest,
-            ) -> None:
+            ) -> ScanResult:
                 if request.status_callback:
                     request.status_callback(PipelineEvent.UPLOADING)
+                return _success_result()
 
             monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -582,7 +595,7 @@ class TestWorkerErrorCategories:
     ) -> None:
         """FeederEmptyError sets ErrorCategory.FEEDER."""
 
-        def failing(*_a: object, **_k: object) -> None:
+        def failing(*_a: object, **_k: object) -> ScanResult:
             msg = "No paper"
             raise FeederEmptyError(msg)
 
@@ -609,7 +622,7 @@ class TestWorkerErrorCategories:
     ) -> None:
         """ScanError sets ErrorCategory.SCANNER."""
 
-        def failing(*_a: object, **_k: object) -> None:
+        def failing(*_a: object, **_k: object) -> ScanResult:
             msg = "Scanner jam"
             raise ScanError(msg)
 
@@ -636,7 +649,7 @@ class TestWorkerErrorCategories:
     ) -> None:
         """PaperlessError sets ErrorCategory.UPLOAD."""
 
-        def failing(*_a: object, **_k: object) -> None:
+        def failing(*_a: object, **_k: object) -> ScanResult:
             msg = "Upload failed"
             raise PaperlessError(msg)
 
@@ -663,7 +676,7 @@ class TestWorkerErrorCategories:
     ) -> None:
         """ConfigError sets ErrorCategory.CONFIG."""
 
-        def failing(*_a: object, **_k: object) -> None:
+        def failing(*_a: object, **_k: object) -> ScanResult:
             msg = "Bad config"
             raise ConfigError(msg)
 
@@ -690,7 +703,7 @@ class TestWorkerErrorCategories:
     ) -> None:
         """Generic Exception sets ErrorCategory.UNKNOWN."""
 
-        def failing(*_a: object, **_k: object) -> None:
+        def failing(*_a: object, **_k: object) -> ScanResult:
             msg = "Mystery"
             raise RuntimeError(msg)
 
@@ -770,7 +783,7 @@ class TestScanWorkerQueuing:
         """Two submitted jobs are both processed to DONE (SCAN-11)."""
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+            lambda *_args, **_kwargs: _success_result(),
         )
 
         store = JobStore()
@@ -834,7 +847,7 @@ class TestLazyAutoGenerate:
         )
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+            lambda *_args, **_kwargs: _success_result(),
         )
 
         store = JobStore()
@@ -869,7 +882,7 @@ class TestLazyAutoGenerate:
 
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+            lambda *_args, **_kwargs: _success_result(),
         )
 
         store = JobStore()
@@ -901,7 +914,7 @@ class TestLazyAutoGenerate:
 
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+            lambda *_args, **_kwargs: _success_result(),
         )
 
         store = JobStore()
@@ -943,7 +956,7 @@ class TestLazyAutoGenerate:
         )
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: {"status": "SUCCESS"},
+            lambda *_args, **_kwargs: _success_result(),
         )
 
         store = JobStore()
@@ -1000,7 +1013,7 @@ class TestWorkerEnumDispatch:
                 _paperless: object,
                 _settings: object,
                 request: PipelineRequest,
-            ) -> None:
+            ) -> ScanResult:
                 # Snapshot only what the callback itself writes, so the
                 # worker's own pre-pipeline SCANNING and post-pipeline DONE
                 # writes cannot be mistaken for callback output.
@@ -1009,6 +1022,7 @@ class TestWorkerEnumDispatch:
                     for event in PipelineEvent:
                         request.status_callback(event)
                 from_callback.extend(states_seen[start:])
+                return _success_result()
 
             monkeypatch.setattr("saneless.worker.run_pipeline", fake_pipeline)
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
@@ -1060,7 +1074,7 @@ class TestWorkerEnumDispatch:
             monkeypatch.setattr(store, "prune", tracking_prune)
             monkeypatch.setattr(
                 "saneless.worker.run_pipeline",
-                lambda *_args, **_kwargs: {"status": "SUCCESS"},
+                lambda *_args, **_kwargs: _success_result(),
             )
 
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)

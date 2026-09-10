@@ -15,13 +15,14 @@ from saneless.paperless import UploadResult
 from saneless.pipeline import (
     PipelineEvent,
     PipelineRequest,
+    ScanResult,
     _check_disk_space,
     _interleave_duplex,
     _is_manual_duplex,
     run_pipeline,
 )
 from saneless.scanner.base import ScannerBackend
-from saneless.vocabulary import JobState
+from saneless.vocabulary import JobState, ScanOutcome
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -50,7 +51,8 @@ class TestRunPipeline:
             request=request,
         )
 
-        assert result is not None
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is None
         mock_scanner.scan_pages.assert_called_once()
         mock_paperless.upload_document.assert_called_once()
 
@@ -496,9 +498,14 @@ class TestManualDuplex:
         assert "(fronts)" in first_call[0][1]
         assert "(backs)" in second_call[0][1]
 
-        # Returns DONE with warning, not ERROR
-        assert result["status"] == "DONE"
-        assert "Page count mismatch: 3 fronts, 2 backs" in result["warning"]
+        # Returns SUCCESS with a warning, not an error
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        assert "Page count mismatch: 3 fronts, 2 backs" in result.warning
+        # Both partial PDFs count as uploaded pages
+        assert result.pages_scanned == 5
+        assert result.pages_removed == 0
+        assert result.pages_uploaded == 5
 
     def test_duplex_match_still_interleaves_normally(
         self,
@@ -534,7 +541,7 @@ class TestManualDuplex:
 
             # Normal path: single PDF uploaded
             mock_paperless.upload_document.assert_called_once()
-            assert "warning" not in result
+            assert result.warning is None
 
     def test_manual_duplex_empty_page_after_interleave(
         self,
@@ -853,3 +860,101 @@ class TestPipelineEventEnum:
     def test_scanning_reverse_has_no_job_state(self) -> None:
         """SCANNING_REVERSE changes no persisted state, so it maps to None (CTR-01)."""
         assert PipelineEvent.SCANNING_REVERSE.job_state is None
+
+
+class TestScanResultContract:
+    """run_pipeline's typed ScanResult return (CTR-03)."""
+
+    def test_success_outcome_and_page_counts(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Three pages scanned, one blank dropped, two uploaded."""
+        default_settings.output.tmp_dir = str(tmp_path)
+
+        all_pages = [
+            _make_content_image("black"),
+            _make_empty_image(),
+            _make_content_image("red"),
+        ]
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = iter(all_pages)
+
+        request = PipelineRequest(profile_name="default", title="Counts Test")
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert isinstance(result, ScanResult)
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_scanned == 3
+        assert result.pages_removed == 1
+        assert result.pages_uploaded == 2
+        assert result.warning is None
+
+    def test_pages_removed_zero_when_detection_disabled(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """With empty-page detection off nothing is removed, blanks included."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].enable_empty_page_detection = False
+
+        all_pages = [_make_content_image(), _make_empty_image(), _make_empty_image()]
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = iter(all_pages)
+
+        request = PipelineRequest(profile_name="default", title="No Filter Test")
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert result.pages_scanned == 3
+        assert result.pages_removed == 0
+        assert result.pages_uploaded == 3
+
+    def test_fallback_outcome_when_not_delivered_to_api(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """An upload that only reached the consume dir reports FALLBACK."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        mock_paperless.upload_document.return_value = UploadResult(
+            delivered_to_api=False,
+            consume_dir_path=tmp_path / "consume" / "doc.pdf",
+        )
+
+        request = PipelineRequest(profile_name="default", title="Fallback Doc")
+        result = run_pipeline(
+            scanner=mock_scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=request,
+        )
+
+        assert result.outcome is ScanOutcome.FALLBACK
+        assert result.warning is None
+        mock_paperless.poll_task.assert_not_called()

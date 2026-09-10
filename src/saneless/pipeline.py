@@ -20,7 +20,7 @@ from saneless.exceptions import ConfigError, ScanError
 from saneless.pages import filter_empty_pages, generate_thumbnail
 from saneless.pdf import assemble_pdf
 from saneless.scanner.base import ScanSettings
-from saneless.vocabulary import JobState
+from saneless.vocabulary import JobState, ScanOutcome
 
 if TYPE_CHECKING:
     import threading
@@ -28,11 +28,11 @@ if TYPE_CHECKING:
 
     from PIL import Image
 
-    from saneless.config import Settings
+    from saneless.config import ProfileConfig, Settings
     from saneless.paperless import PaperlessClient
     from saneless.scanner.base import ScannerBackend
 
-__all__ = ["PipelineEvent", "PipelineRequest", "run_pipeline"]
+__all__ = ["PipelineEvent", "PipelineRequest", "ScanResult", "run_pipeline"]
 
 
 class PipelineEvent(StrEnum):
@@ -104,6 +104,17 @@ class PipelineRequest:
     abort_event: threading.Event | None = None
 
 
+@dataclass
+class ScanResult:
+    """How a scan pipeline run resolved, and how many pages it moved."""
+
+    outcome: ScanOutcome
+    pages_scanned: int
+    pages_removed: int
+    pages_uploaded: int
+    warning: str | None = None
+
+
 def _noop_callback(_event: PipelineEvent) -> None:
     """Default no-op status callback."""
 
@@ -131,6 +142,42 @@ def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
             f"{min_free_mb} MB required (configure min_free_space_mb to adjust)"
         )
         raise ScanError(msg)
+
+
+def _drop_empty_pages(
+    images: list[Image.Image],
+    profile: ProfileConfig,
+) -> list[Image.Image]:
+    """
+    Drop blank pages when the profile enables empty-page detection.
+
+    Args:
+        images: The scanned pages, in order.
+        profile: The profile whose toggle and thresholds apply.
+
+    Returns:
+        The pages to assemble: filtered when detection is on, the input
+        list unchanged when it is off.
+
+    Raises:
+        ScanError: If every page was detected as empty.
+
+    """
+    if not profile.enable_empty_page_detection:
+        logger.info("Empty page detection disabled for profile")
+        return images
+
+    filtered = filter_empty_pages(
+        images,
+        mean_threshold=profile.empty_page_mean_threshold,
+        stddev_threshold=profile.empty_page_stddev_threshold,
+    )
+    if len(filtered) < len(images):
+        logger.info("Empty page filter: %d -> %d pages", len(images), len(filtered))
+    if not filtered:
+        msg = "All pages were detected as empty"
+        raise ScanError(msg)
+    return filtered
 
 
 def _is_manual_duplex(source: str) -> bool:
@@ -349,7 +396,7 @@ def run_pipeline(
     paperless: PaperlessClient,
     settings: Settings,
     request: PipelineRequest,
-) -> dict:
+) -> ScanResult:
     """
     Run the full scan-to-upload pipeline.
 
@@ -364,7 +411,8 @@ def run_pipeline(
         request: Pipeline request parameters.
 
     Returns:
-        Task result dict from paperless-ngx polling.
+        A ScanResult naming how the run resolved and how many pages were
+        scanned, dropped as empty, and uploaded.
 
     Raises:
         ConfigError: If the profile or device is not configured.
@@ -425,7 +473,15 @@ def run_pipeline(
                     "Pipeline complete for '%s' (duplex mismatch recovery)",
                     request.title,
                 )
-                return {"status": "DONE", "warning": warning}
+                fronts, backs = duplex_result
+                mismatch_pages = len(fronts) + len(backs)
+                return ScanResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    pages_scanned=mismatch_pages,
+                    pages_removed=0,
+                    pages_uploaded=mismatch_pages,
+                    warning=warning,
+                )
             images = duplex_result
         else:
             images = _scan_simplex(scanner, device_id, scan_settings, request)
@@ -435,24 +491,7 @@ def run_pipeline(
             img.info.pop("exif", None)
 
         # Step 2: Filter empty pages (gated on profile toggle, per D-17)
-        if profile.enable_empty_page_detection:
-            filtered = filter_empty_pages(
-                images,
-                mean_threshold=profile.empty_page_mean_threshold,
-                stddev_threshold=profile.empty_page_stddev_threshold,
-            )
-            if len(filtered) < len(images):
-                logger.info(
-                    "Empty page filter: %d -> %d pages",
-                    len(images),
-                    len(filtered),
-                )
-            if not filtered:
-                msg = "All pages were detected as empty"
-                raise ScanError(msg)
-        else:
-            filtered = images
-            logger.info("Empty page detection disabled for profile")
+        filtered = _drop_empty_pages(images, profile)
 
         # Step 3: Assemble PDF
         notify(PipelineEvent.ASSEMBLING)
@@ -473,12 +512,20 @@ def run_pipeline(
         # Step 5: Poll for result
         task_uuid = upload_result.task_uuid
         if upload_result.delivered_to_api and task_uuid is not None:
-            result = paperless.poll_task(
+            paperless.poll_task(
                 task_uuid,
                 timeout=settings.output.paperless_task_timeout,
             )
+            outcome = ScanOutcome.SUCCESS
         else:
-            result = {"status": "FALLBACK", "path": settings.paperless.consume_dir}
+            outcome = ScanOutcome.FALLBACK
+
+        result = ScanResult(
+            outcome=outcome,
+            pages_scanned=len(images),
+            pages_removed=len(images) - len(filtered),
+            pages_uploaded=len(filtered),
+        )
 
         notify(PipelineEvent.DONE)
         logger.info("Pipeline complete for '%s'", request.title)
