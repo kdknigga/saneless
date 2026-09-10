@@ -2,9 +2,9 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Prep for release
-status: verifying
-stopped_at: Completed 20-03-PLAN.md
-last_updated: "2026-09-10T14:23:29.271Z"
+status: ready_to_plan
+stopped_at: Phase 20 complete (5/5) — ready to discuss Phase 21
+last_updated: 2026-09-10T14:44:09.464Z
 last_activity: 2026-09-10
 progress:
   total_phases: 13
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 20 — ci-gate
+**Current focus:** Phase 21 — vocabulary and contracts
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 20 (ci-gate) — EXECUTING
-Plan: 5 of 5
-Status: Phase complete — ready for verification
+Phase: 21
+Plan: Not started
+Status: Ready to plan
 Progress: [██████████] 100%
 Last activity: 2026-09-10
 
@@ -36,7 +36,7 @@ Last activity: 2026-09-10
 
 **Velocity:**
 
-- Total plans completed: 3
+- Total plans completed: 8
 - Average duration: 5min
 - Total execution time: 0.27 hours
 
@@ -45,6 +45,7 @@ Last activity: 2026-09-10
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 01-core-pipeline | 3 | 16min | 5min |
+| 20 | 5 | - | - |
 
 **Recent Trend:**
 

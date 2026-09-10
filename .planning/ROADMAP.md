@@ -221,7 +221,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 20. CI Gate | 5/5 | Complete   | 2026-09-10 |
+| 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
 | 21. Vocabulary and Contracts | 0/? | Not started | - |
 | 22. Job Store Hardening | 0/? | Not started | - |
 | 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
