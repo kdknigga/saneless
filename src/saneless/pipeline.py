@@ -7,6 +7,7 @@ is automatically cleaned up on success or failure.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import tempfile
@@ -16,7 +17,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, assert_never
 
-from saneless.exceptions import ConfigError, ScanError
+from saneless.exceptions import (
+    ConfigError,
+    PaperlessError,
+    SanelessError,
+    ScanError,
+)
 from saneless.pages import filter_empty_pages, generate_thumbnail
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.scanner.base import ScanSettings
@@ -24,7 +30,7 @@ from saneless.vocabulary import JobState, ScanOutcome
 
 if TYPE_CHECKING:
     import threading
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator, Sequence
 
     from PIL import Image
 
@@ -156,6 +162,88 @@ def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
             f"{min_free_mb} MB required (configure min_free_space_mb to adjust)"
         )
         raise ScanError(msg)
+
+
+@contextlib.contextmanager
+def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
+    """
+    Move assembled PDFs out of harm's way when delivery fails, then re-raise.
+
+    ``run_pipeline`` does its work inside a ``TemporaryDirectory``, so any
+    exception raised after assembly unwinds that directory and deletes the
+    finished scan. This guard opens before the upload and closes after the
+    poll, still *inside* that directory, and relocates every PDF it was given
+    to ``failed_dir`` before letting the exception continue. A guard opened
+    outside the temporary directory would run after the scan was already gone,
+    which is the trap this whole phase is named after.
+
+    **The caught type is ``Exception``, deliberately.** The guard is narrow in
+    *span* -- it covers the upload and the poll and nothing else -- and broad
+    in *type*. Inside that window a bug in our own code is precisely when the
+    scan most needs keeping, and nothing is masked, because the exception is
+    always re-raised with the original chained on ``__cause__``.
+    ``KeyboardInterrupt`` and ``SystemExit`` derive from ``BaseException`` and
+    pass through untouched. D-06's 2026-09-11 amendment settled this against
+    the narrower ``PaperlessError`` alternative; narrowing it later would be a
+    change of behaviour, not a tidy-up, so please do not relitigate it here.
+
+    The relocation goes through ``shutil`` rather than a bare rename:
+    ``data_dir`` and ``tmp_dir`` are independent settings and may sit on
+    different filesystems, where ``Path.rename`` raises ``EXDEV``, while
+    ``shutil`` falls back to copy-then-unlink. The destination is always a full
+    explicit path, never the bare directory -- handed a directory, ``shutil``
+    raises ``shutil.Error`` on a basename collision, and ``shutil.Error`` does
+    **not** inherit from ``OSError``, so it would escape the handler below and
+    mask the delivery failure with a confusing traceback. The explicit-path
+    form renames straight through; its silent-overwrite behaviour is a
+    non-event because :func:`saneless.pdf.build_pdf_filename` keys every name
+    on the job id.
+
+    Args:
+        pdf_paths: The assembled PDFs to rescue, in the order they should be
+            reported. Paths that no longer exist are skipped, and if none of
+            them survive the original exception is re-raised untouched.
+        failed_dir: The durable directory to move them into. It is created
+            here rather than only at startup, because ``data_dir`` may have
+            been removed since it was validated.
+
+    Yields:
+        Nothing. The block it wraps is the delivery attempt itself.
+
+    Raises:
+        PaperlessError: When the move itself fails -- naming both the delivery
+            failure and the preservation failure, because a user told only
+            that the upload failed while the scan was also destroyed has been
+            actively misinformed -- and when a non-saneless exception escaped
+            the delivery window, since rebuilding an arbitrary third-party
+            exception from a single string is not safe.
+        SanelessError: Otherwise the original exception's own type, re-raised
+            with the destination path appended to its message so the job error
+            names the file the operator has to go and find.
+
+    """
+    try:
+        yield
+    except Exception as exc:
+        destinations: list[Path] = []
+        try:
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            for pdf_path in pdf_paths:
+                if not pdf_path.exists():
+                    continue
+                destination = failed_dir / pdf_path.name
+                shutil.move(pdf_path, destination)
+                destinations.append(destination)
+        except OSError as move_exc:
+            msg = f"{exc}. The scan could NOT be preserved to {failed_dir}: {move_exc}"
+            raise PaperlessError(msg) from exc
+        if not destinations:
+            raise
+        preserved = ", ".join(str(destination) for destination in destinations)
+        msg = f"{exc}. The scan was preserved at {preserved}"
+        if isinstance(exc, SanelessError):
+            raise type(exc)(msg) from exc
+        raise PaperlessError(msg) from exc
 
 
 def _drop_empty_pages(
@@ -444,6 +532,11 @@ def run_pipeline(
     uploads to paperless-ngx, and polls for task completion. All
     temporary files are cleaned up automatically via TemporaryDirectory.
 
+    The one thing that deliberately escapes that cleanup is the assembled PDF
+    when delivery fails: the upload and the poll run inside a preservation
+    guard that relocates the finished scan to ``settings.output.failed_dir``
+    and names the destination in the exception it re-raises.
+
     Args:
         scanner: Scanner backend instance.
         paperless: Paperless-ngx API client.
@@ -457,7 +550,9 @@ def run_pipeline(
     Raises:
         ConfigError: If the profile or device is not configured.
         ScanError: If scanning fails.
-        PaperlessError: If upload or polling fails.
+        PaperlessError: If upload or polling fails. The message names where
+            the assembled PDF was preserved, or -- if preservation failed
+            too -- reports both failures.
 
     """
     notify = request.status_callback or _noop_callback
@@ -548,29 +643,37 @@ def run_pipeline(
         )
         logger.info("PDF assembled: %s", pdf_path)
 
-        # Step 4: Upload
+        # Step 4: Upload and poll, both inside the preservation guard.  The
+        # guard opens before the upload and closes after the poll, and it sits
+        # INSIDE the TemporaryDirectory: a guard placed outside would run after
+        # the directory -- and the finished scan with it -- were already gone.
         notify(PipelineEvent.UPLOADING)
         created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
-        upload_result = paperless.upload_document(
-            pdf_path,
-            request.title,
-            request.tags,
-            request.correspondent,
-            created,
-        )
-
-        # Step 5: Poll for result.  UploadResult.__post_init__ guarantees a
-        # task_uuid iff the document reached the API, so this test is exactly
-        # `delivered_to_api` and additionally narrows the id to str.
-        task_uuid = upload_result.task_uuid
-        if task_uuid is not None:
-            paperless.poll_task(
-                task_uuid,
-                timeout=settings.output.paperless_task_timeout,
+        with _preserving([pdf_path], settings.output.failed_dir):
+            upload_result = paperless.upload_document(
+                pdf_path,
+                request.title,
+                request.tags,
+                request.correspondent,
+                created,
             )
-            outcome = ScanOutcome.SUCCESS
-        else:
-            outcome = ScanOutcome.FALLBACK
+
+            # Step 5: Poll for result.  UploadResult.__post_init__ guarantees a
+            # task_uuid iff the document reached the API, so this test is
+            # exactly `delivered_to_api` and additionally narrows the id to str.
+            task_uuid = upload_result.task_uuid
+            if task_uuid is not None:
+                # The return value is discarded on purpose, and that is now
+                # correct rather than a bug: since plan 23-04 a successful poll
+                # means "it returned" and a failed one means "it raised".  Do
+                # not re-add a status check on the result.
+                paperless.poll_task(
+                    task_uuid,
+                    timeout=settings.output.paperless_task_timeout,
+                )
+                outcome = ScanOutcome.SUCCESS
+            else:
+                outcome = ScanOutcome.FALLBACK
 
         result = ScanResult(
             outcome=outcome,
