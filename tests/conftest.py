@@ -23,6 +23,8 @@ from saneless.paperless import UploadResult
 from saneless.scanner.base import ScannerBackend
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from saneless.job import Job, JobStore
     from saneless.vocabulary import JobState
 
@@ -210,3 +212,20 @@ def wait_for_state(
         raise RuntimeError(msg)
     assert found is not None
     return found
+
+
+@pytest.fixture(name="wait_for_state")
+def _wait_for_state_fixture() -> Callable[..., Job]:
+    """
+    Hand the wait_for_state helper to a test module.
+
+    pytest 9 imports test modules in ``importlib`` mode, so ``tests/`` never
+    lands on ``sys.path`` and ``from conftest import wait_for_state`` raises
+    ``ModuleNotFoundError``.  A fixture is the supported route for a conftest
+    helper, and it is the only one that also keeps ty and pyrefly happy.
+
+    Returns:
+        The wait_for_state function itself, uncalled.
+
+    """
+    return wait_for_state

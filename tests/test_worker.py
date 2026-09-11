@@ -13,13 +13,14 @@ from saneless.exceptions import (
     PaperlessError,
     ScanError,
 )
-from saneless.job import ErrorCategory, Job, JobState, JobStore
+from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
 from saneless.pipeline import PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
-from saneless.vocabulary import ScanOutcome
+from saneless.vocabulary import TERMINAL_STATES, ScanOutcome
 from saneless.worker import ScanWorker
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
     from unittest.mock import MagicMock
 
@@ -1038,9 +1039,11 @@ class TestWorkerEnumDispatch:
         """Worker applies only ACTIVE_STATES from inside the pipeline callback."""
         states_seen: list[JobState] = []
         from_callback: list[JobState] = []
+        finished_states: list[JobState] = []
         store = JobStore()
         try:
             original_update = store.update_state
+            original_finish = store.finish_job
 
             def tracking_update(
                 job_id: str,
@@ -1053,7 +1056,24 @@ class TestWorkerEnumDispatch:
                     job_id, state, error=error, error_category=error_category
                 )
 
+            def tracking_finish(
+                job_id: str,
+                state: JobState,
+                result: JobResult | None = None,
+                error: str | None = None,
+                error_category: ErrorCategory | None = None,
+            ) -> None:
+                finished_states.append(state)
+                original_finish(
+                    job_id,
+                    state,
+                    result=result,
+                    error=error,
+                    error_category=error_category,
+                )
+
             monkeypatch.setattr(store, "update_state", tracking_update)
+            monkeypatch.setattr(store, "finish_job", tracking_finish)
 
             def fake_pipeline(
                 _scanner: object,
@@ -1100,8 +1120,13 @@ class TestWorkerEnumDispatch:
             ]
             assert JobState.SCANNING not in from_callback
 
-            # DONE is still written -- by the worker, after run_pipeline returned.
-            assert states_seen[-1] is JobState.DONE
+            # DONE is still written by the worker, after run_pipeline returned
+            # -- but through finish_job now, not update_state.  update_state's
+            # SQL is an unconditional SET that never names the six result
+            # columns (D-04), so the terminal write cannot go through it
+            # without blanking the outcome and page counts it just recorded.
+            assert JobState.DONE not in states_seen
+            assert finished_states == [JobState.DONE]
         finally:
             store.close()
 
@@ -1141,5 +1166,276 @@ class TestWorkerEnumDispatch:
                 default_settings.output.history_retention_days,
                 default_settings.output.history_max_rows,
             )
+        finally:
+            store.close()
+
+
+FALLBACK_WARNING = "Saved to the consume directory; title and tags not applied"
+"""The warning a consume-directory delivery carries back to the worker."""
+
+MISMATCH_WARNING = "Front pass had 5 pages, back pass had 4"
+"""The warning a duplex page-count mismatch carries back to the worker."""
+
+
+def _fallback_result() -> ScanResult:
+    """Return the ScanResult a consume-directory delivery would produce."""
+    return ScanResult(
+        outcome=ScanOutcome.FALLBACK,
+        pages_scanned=3,
+        pages_removed=1,
+        pages_uploaded=2,
+        warning=FALLBACK_WARNING,
+    )
+
+
+def _mismatch_result() -> ScanResult:
+    """Return the ScanResult a duplex page-count mismatch would produce."""
+    return ScanResult(
+        outcome=ScanOutcome.SUCCESS,
+        pages_scanned=9,
+        pages_removed=1,
+        pages_uploaded=8,
+        warning=MISMATCH_WARNING,
+    )
+
+
+class TestWorkerFinish:
+    """The worker consumes the pipeline's ScanResult instead of discarding it."""
+
+    # Every assertion here reads the persisted row back through the store
+    # rather than inspecting mock call arguments.  The bug being fixed was a
+    # discarded return value, and only the row proves it was consumed.
+
+    def test_finish_passes_the_job_id_into_the_pipeline_request(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """The assembled PDF is named from this job's id (OUTC-05)."""
+        store = JobStore()
+        captured: list[PipelineRequest] = []
+
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            captured.append(request)
+            return _success_result()
+
+        try:
+            monkeypatch.setattr("saneless.worker.run_pipeline", capturing_pipeline)
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Named Doc")
+            worker.submit(job)
+            wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            assert len(captured) == 1
+            assert captured[0].job_id == job.id
+        finally:
+            store.close()
+
+    def test_finish_persists_done_for_a_success_outcome(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A SUCCESS outcome becomes DONE, with its counts (OUTC-01)."""
+        store = JobStore()
+        try:
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: _success_result(),
+            )
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Success Doc")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            assert finished.state is JobState.DONE
+            assert finished.outcome is ScanOutcome.SUCCESS
+            assert finished.pages_scanned == 1
+            assert finished.pages_removed == 0
+            assert finished.pages_uploaded == 1
+            assert finished.warning is None
+            assert finished.error is None
+        finally:
+            store.close()
+
+    def test_finish_persists_fallback_for_a_fallback_outcome(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A FALLBACK outcome becomes FALLBACK, never DONE (OUTC-02)."""
+        store = JobStore()
+        try:
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: _fallback_result(),
+            )
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Fallback Doc")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            # FALLBACK, and therefore not DONE: pyrefly narrows the state
+            # after this assertion, so spelling "not DONE" out as a second
+            # assert is an always-true comparison it rejects.
+            assert finished.state is JobState.FALLBACK
+            assert finished.outcome is ScanOutcome.FALLBACK
+            assert finished.warning == FALLBACK_WARNING
+            assert finished.pages_scanned == 3
+            assert finished.pages_removed == 1
+            assert finished.pages_uploaded == 2
+        finally:
+            store.close()
+
+    def test_finish_persists_a_duplex_mismatch_warning(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A mismatch warning survives alongside a SUCCESS outcome (OUTC-03)."""
+        store = JobStore()
+        try:
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: _mismatch_result(),
+            )
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Mismatch Doc")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            assert finished.state is JobState.DONE
+            assert finished.outcome is ScanOutcome.SUCCESS
+            assert finished.warning == MISMATCH_WARNING
+            assert finished.pages_scanned == 9
+            assert finished.pages_removed == 1
+            assert finished.pages_uploaded == 8
+        finally:
+            store.close()
+
+    def test_finish_persists_error_and_leaves_the_counts_null(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A raising pipeline records ERROR and records no counts (OUTC-01)."""
+        store = JobStore()
+
+        def failing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
+            msg = "Paperless said no"
+            raise PaperlessError(msg)
+
+        try:
+            monkeypatch.setattr("saneless.worker.run_pipeline", failing_pipeline)
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Doomed Doc")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            assert finished.state is JobState.ERROR
+            assert finished.error == "Paperless said no"
+            assert finished.error_category is ErrorCategory.UPLOAD
+            # NULL, not 0.  A job that failed before the scanner opened has
+            # not measured zero pages (Phase 22 D-08).
+            assert finished.outcome is None
+            assert finished.warning is None
+            assert finished.pages_scanned is None
+            assert finished.pages_removed is None
+            assert finished.pages_uploaded is None
+        finally:
+            store.close()
+
+    def test_finish_signals_a_transition_for_a_fallback_outcome(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A UI waiter is released on FALLBACK as it is on DONE (OUTC-02)."""
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+
+            def clearing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
+                # Clear as the pipeline's last act, so any set observed after
+                # this point can only be the worker's terminal write.  Waiting
+                # on the event rather than polling the row also removes the
+                # window between the finish_job commit and the set().
+                worker._transition_event.clear()
+                return _fallback_result()
+
+            monkeypatch.setattr("saneless.worker.run_pipeline", clearing_pipeline)
+            worker.start()
+
+            job = store.create_job("default", "Fallback Waiter")
+            worker.submit(job)
+            assert worker.wait_transition(timeout=2.0) is True
+            worker.stop()
+
+            fetched = _get(store, job.id)
+            assert fetched.state is JobState.FALLBACK
+        finally:
+            store.close()
+
+    def test_finish_prunes_history_after_a_fallback_outcome(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """The finally block still runs on the new terminal path (STOR-05)."""
+        store = JobStore()
+        try:
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: _fallback_result(),
+            )
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+
+            job = store.create_job("default", "Pruned Doc")
+            worker.submit(job)
+            wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+
+            assert worker.current_job_id is None
         finally:
             store.close()
