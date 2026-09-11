@@ -1,12 +1,19 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
+# Git shims installed by `prek install`; worktrees share them via core.hooksPath.
+default_install_hook_types: [pre-commit, pre-merge-commit, pre-push]
+# Hooks with no `stages:` run at commit time only, never at merge or push, where a
+# file-modifying hook would abort the operation.
+default_stages: [pre-commit]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
+        stages: [pre-commit]
       - id: check-ast
       - id: check-executables-have-shebangs
+        stages: [pre-commit]
       - id: check-json
       - id: check-merge-conflict
       - id: check-symlinks
@@ -19,12 +26,14 @@ repos:
       - id: detect-aws-credentials
       - id: detect-private-key
       - id: end-of-file-fixer
+        stages: [pre-commit]
       - id: fix-byte-order-marker
       - id: mixed-line-ending
         args: ["--fix=lf"]
       - id: pretty-format-json
       - id: sort-simple-yaml
       - id: trailing-whitespace
+        stages: [pre-commit]
 
   - repo: https://gitlab.com/bmares/check-json5
     rev: v1.0.1
@@ -45,9 +54,12 @@ repos:
 
   - repo: local
     hooks:
+      # Commit time checks src/ only, so a TDD RED commit (a test naming a symbol
+      # that does not exist yet) can land. tests/ is checked in full when the
+      # branch is merged with --no-ff or pushed, by the two "(full)" hooks below.
       - id: ty-checker
-        name: ty type checker
-        entry: uv run ty check
+        name: ty type checker (src)
+        entry: uv run ty check src
         language: system
         types: [python]
         pass_filenames: false
@@ -59,9 +71,27 @@ repos:
       # directory (a `.claude/worktrees/` git worktree) has every source file
       # filtered out and the hook fails with "No Python files matched".
       - id: pyrefly-checker
-        name: pyrefly type checker
+        name: pyrefly type checker (src)
+        entry: uv run pyrefly check src
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
+
+      - id: ty-checker-full
+        name: ty type checker (full)
+        entry: uv run ty check
+        language: system
+        types: [python]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      - id: pyrefly-checker-full
+        name: pyrefly type checker (full)
         entry: uv run pyrefly check src tests
         language: system
         types: [python]
         pass_filenames: false
         always_run: true
+        stages: [pre-merge-commit, pre-push]
