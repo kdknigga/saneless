@@ -9,6 +9,7 @@ __all__ = [
     "ConfigError",
     "FeederEmptyError",
     "PaperlessError",
+    "PaperlessTimeoutError",
     "SanelessError",
     "ScanError",
     "StorageError",
@@ -33,6 +34,10 @@ class FeederEmptyError(ScanError):
 
 class PaperlessError(SanelessError):
     """Paperless-ngx API operation failure."""
+
+
+class PaperlessTimeoutError(PaperlessError):
+    """Paperless-ngx did not resolve a consume task before the deadline."""
 
 
 class StorageError(SanelessError):
