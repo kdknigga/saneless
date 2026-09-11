@@ -1042,7 +1042,13 @@ class TestScanResultContract:
         )
 
         assert result.outcome is ScanOutcome.FALLBACK
-        assert result.warning is None
+        # OUTC-02: the FALLBACK state says the document took the other route;
+        # the warning says what that route did not do.  A state on its own
+        # leaves the user to guess why their title and tags never appeared.
+        assert result.warning is not None
+        assert "consume directory" in result.warning
+        assert str(tmp_path / "consume" / "doc.pdf") in result.warning
+        assert "title, tags and correspondent" in result.warning
         mock_paperless.poll_task.assert_not_called()
 
 
