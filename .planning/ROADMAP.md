@@ -194,9 +194,9 @@ Note (added 2026-09-11 from Phase 23 research): criterion 6 / OUTC-11 was not in
 **Plans**: 4 plans in 2 waves
 
 Plans:
-- [ ] 23.1-01-PLAN.md — dark palette engaged, app-owned fallback amber, T1/T2/T3 computed-colour tests with mutation checks, master UI-SPEC convention (wave 1, TDD)
-- [ ] 23.1-02-PLAN.md — type checks split: src-only at commit, full at pre-merge-commit and pre-push; CI pyrefly paths; CONTRIBUTING and CLAUDE.md (wave 1)
-- [ ] 23.1-03-PLAN.md — every pathless pyrefly command under .planning/ rewritten to name src tests, residue enumerated and justified (wave 1)
+- [x] 23.1-01-PLAN.md — dark palette engaged, app-owned fallback amber, T1/T2/T3 computed-colour tests with mutation checks, master UI-SPEC convention (wave 1, TDD)
+- [x] 23.1-02-PLAN.md — type checks split: src-only at commit, full at pre-merge-commit and pre-push; CI pyrefly paths; CONTRIBUTING and CLAUDE.md (wave 1)
+- [x] 23.1-03-PLAN.md — every pathless pyrefly command under .planning/ rewritten to name src tests, residue enumerated and justified (wave 1)
 - [ ] 23.1-04-PLAN.md — three prek shims installed from the main checkout, D-07 RED/commit/merge/push demonstrations, CI and ruleset read-backs, close-out (wave 2)
 
 **Why this is an insertion rather than end-of-milestone work.** GATE-01/02 affect every phase from 24 to 32: all eight Phase 23 executors independently hit the same wall, and each spent real effort rediscovering it. Fixing it once here compounds across the nine phases that follow. DARK-01/02 are not urgent in the same way and are here only because the user asked for one phase covering both.

@@ -4,8 +4,8 @@ milestone: v2.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 23.1 context gathered
-last_updated: "2026-09-11T21:54:35.173Z"
-last_activity: 2026-09-11 -- Phase 23.1 planning complete
+last_updated: "2026-09-11T21:55:48.911Z"
+last_activity: 2026-09-11 -- Phase 23.1 execution started
 progress:
   total_phases: 14
   completed_phases: 4
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 22 — job-store-hardening
+**Current focus:** Phase 23.1 — dark-mode-and-the-commit-gate
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 22 — COMPLETE
-Plan: 6 of 6
-Status: Ready to execute
+Phase: 23.1 (dark-mode-and-the-commit-gate) — EXECUTING
+Plan: 1 of 4
+Status: Executing Phase 23.1
 Progress: [██████████] 100%
-Last activity: 2026-09-11 -- Phase 23.1 planning complete
+Last activity: 2026-09-11 -- Phase 23.1 execution started
 
 ## Performance Metrics
 
