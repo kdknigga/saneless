@@ -10,7 +10,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image, ImageDraw
 
-from saneless.exceptions import PaperlessError, ScanError
+from saneless.exceptions import (
+    PaperlessError,
+    PaperlessTimeoutError,
+    ScanError,
+)
 from saneless.paperless import UploadResult
 from saneless.pipeline import (
     PipelineEvent,
@@ -22,7 +26,12 @@ from saneless.pipeline import (
     run_pipeline,
 )
 from saneless.scanner.base import ScannerBackend
-from saneless.vocabulary import JobState, ScanOutcome
+from saneless.vocabulary import (
+    ErrorCategory,
+    JobState,
+    ScanOutcome,
+    classify_error,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -84,7 +93,11 @@ class TestRunPipeline:
         tmp_path: Path,
     ) -> None:
         """Paperless raises PaperlessError -> pipeline raises PaperlessError."""
+        # data_dir is pointed at tmp_path too: a failing delivery now preserves
+        # the assembled PDF into <data_dir>/failed/, and a test must not write
+        # that into the shared default outside pytest's own temp directory.
         default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.data_dir = str(tmp_path / "state")
 
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
@@ -1028,3 +1041,387 @@ class TestScanResultContract:
         assert result.outcome is ScanOutcome.FALLBACK
         assert result.warning is None
         mock_paperless.poll_task.assert_not_called()
+
+
+def _isolate_dirs(settings: Settings, tmp_path: Path) -> Path:
+    """
+    Put ``tmp_dir`` and ``data_dir`` on separate subtrees, return the failed dir.
+
+    They must not share a root. The temp-cleanup assertions walk ``tmp_dir``
+    demanding that no directory survives a run, while ``failed/`` is a
+    directory that is *meant* to survive -- so a ``data_dir`` nested under
+    ``tmp_dir`` would make a correct preservation look like a leaked temporary
+    directory. Separate subtrees also mirror the real deployment, where scratch
+    space and durable state are different volumes.
+
+    Args:
+        settings: The settings object to repoint, mutated in place.
+        tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        The ``failed/`` directory the preservation guard will move into. It
+        does not exist yet; the guard is responsible for creating it.
+
+    """
+    settings.output.tmp_dir = str(tmp_path / "scratch")
+    settings.output.data_dir = str(tmp_path / "state")
+    return settings.output.failed_dir
+
+
+def _one_page_scanner() -> MagicMock:
+    """Return a scanner backend yielding a single page with content."""
+    scanner = MagicMock(spec=ScannerBackend)
+    scanner.scan_pages.return_value = iter([_make_content_image()])
+    return scanner
+
+
+def _delivering_to_api(task_uuid: str = "task-uuid-1") -> MagicMock:
+    """Return a paperless client whose upload reaches the API and polls clean."""
+    paperless = MagicMock()
+    paperless.upload_document.return_value = UploadResult(
+        delivered_to_api=True, task_uuid=task_uuid
+    )
+    paperless.poll_task.return_value = None
+    return paperless
+
+
+class TestPreservation:
+    """The preservation guard: a failed delivery must never destroy the scan."""
+
+    def test_preserves_the_pdf_when_upload_raises(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """An exhausted upload with no consume dir leaves the PDF in failed/."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Upload Raises", job_id="job-a"
+                ),
+            )
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert preserved[0].stat().st_size > 0
+
+    def test_preserves_the_pdf_when_poll_reports_a_paperless_failure(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A Paperless FAILURE after a successful upload still preserves the PDF.
+
+        This is the case the whole phase is named after: a guard wrapped around
+        only the upload would let this raise unwind the temporary directory and
+        delete the finished scan.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.side_effect = PaperlessError("Paperless reported FAILURE")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Poll Fails", job_id="job-b"
+                ),
+            )
+
+        paperless.poll_task.assert_called_once()
+        assert len(list(failed_dir.glob("*.pdf"))) == 1
+
+    def test_preserves_the_pdf_when_poll_times_out(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """D-10: a timeout is ambiguous, so the local copy is kept too."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.side_effect = PaperlessTimeoutError(
+            "Timed out after 300s waiting for task task-uuid-1"
+        )
+
+        with pytest.raises(PaperlessTimeoutError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Poll Times Out", job_id="job-c"
+                ),
+            )
+
+        assert len(list(failed_dir.glob("*.pdf"))) == 1
+        # The subclass survives the re-raise, so a caller that narrows to a
+        # timeout deliberately (D-11) still can.
+        assert type(excinfo.value) is PaperlessTimeoutError
+
+    def test_preserved_destination_is_named_in_the_raised_message(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """OUTC-04: the user must be told where the scan went."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Named Path", job_id="job-d"
+                ),
+            )
+
+        preserved = next(iter(failed_dir.glob("*.pdf")))
+        message = str(excinfo.value)
+        assert str(preserved) in message
+        assert "Upload failed" in message
+
+    def test_preserving_chains_the_original_exception(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The original type and traceback survive on __cause__."""
+        _isolate_dirs(default_settings, tmp_path)
+        original = PaperlessError("Upload failed")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = original
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Chained", job_id="job-e"
+                ),
+            )
+
+        assert excinfo.value.__cause__ is original
+
+    def test_preserved_paperless_failure_still_classifies_as_upload(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The escaping exception needs no new classify_error arm."""
+        _isolate_dirs(default_settings, tmp_path)
+        paperless = _delivering_to_api()
+        paperless.poll_task.side_effect = PaperlessError("Paperless reported FAILURE")
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Classified", job_id="job-f"
+                ),
+            )
+
+        assert classify_error(excinfo.value) is ErrorCategory.UPLOAD
+
+    def test_preserving_maps_a_foreign_exception_to_a_paperless_error(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A non-saneless exception in the delivery window is a delivery failure.
+
+        The guard spans nothing but the upload and the poll, so from the job's
+        point of view an arbitrary exception there is a delivery failure -- and
+        rebuilding an arbitrary third-party exception from a single string is
+        not safe, so the re-raise uses PaperlessError instead.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = RuntimeError("something odd")
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Foreign", job_id="job-g"
+                ),
+            )
+
+        assert len(list(failed_dir.glob("*.pdf"))) == 1
+        assert isinstance(excinfo.value.__cause__, RuntimeError)
+        assert "something odd" in str(excinfo.value)
+
+    def test_preservation_creates_a_missing_failed_dir(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """data_dir may have vanished since startup validation."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        assert not failed_dir.exists()
+
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Makes Dir", job_id="job-h"
+                ),
+            )
+
+        assert failed_dir.is_dir()
+
+    def test_a_failed_preservation_reports_both_failures(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Being told only "upload failed" while the scan was destroyed is a lie.
+
+        ``failed_dir`` is made a regular file, so the guard's own mkdir raises
+        and the move can never run.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+
+        original = PaperlessError("Upload failed")
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = original
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Both Fail", job_id="job-i"
+                ),
+            )
+
+        message = str(excinfo.value)
+        assert "Upload failed" in message
+        assert str(failed_dir) in message
+        assert "NOT" in message
+        assert excinfo.value.__cause__ is original
+
+    def test_nothing_is_preserved_when_delivery_succeeds(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A clean run must not create failed/ at all."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+
+        result = run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=_delivering_to_api(),
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Clean Run", job_id="job-j"
+            ),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert not failed_dir.exists()
+
+    def test_two_preserved_scans_sharing_a_title_are_two_files(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Two jobs with the same title must not overwrite each other in failed/.
+
+        ``shutil.move`` onto an explicit destination path overwrites silently,
+        so this only holds because the job id is part of the file name.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        for job_id in ("job-first", "job-second"):
+            with pytest.raises(PaperlessError):
+                run_pipeline(
+                    scanner=_one_page_scanner(),
+                    paperless=paperless,
+                    settings=default_settings,
+                    request=PipelineRequest(
+                        profile_name="default",
+                        title="Same Title Twice",
+                        job_id=job_id,
+                    ),
+                )
+
+        preserved = sorted(path.name for path in failed_dir.glob("*.pdf"))
+        assert len(preserved) == 2
+        assert preserved[0] != preserved[1]
+
+    def test_only_the_pdf_is_preserved_no_page_images(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """D-07: assemble_pdf already deleted every page PNG before returning."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Pdf Only", job_id="job-k"
+                ),
+            )
+
+        assert sorted(path.suffix for path in failed_dir.iterdir()) == [".pdf"]
+
+    def test_preservation_leaves_no_leftover_temp_directories(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The TemporaryDirectory still unwinds; only the PDF escaped it."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_one_page_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Leftovers", job_id="job-l"
+                ),
+            )
+
+        scratch = tmp_path / "scratch"
+        assert [item for item in scratch.iterdir() if item.is_dir()] == []
+        assert len(list(failed_dir.glob("*.pdf"))) == 1
