@@ -71,7 +71,7 @@
 ## Pre-commit Hook Brittleness
 
 **Type checkers always run on all Python files:**
-- Issue: `.pre-commit-config.yaml` (lines 48-62) runs `ty check` and `pyrefly check` with `pass_filenames=false` and `always_run=true`
+- Issue: `.pre-commit-config.yaml` (lines 48-62) runs `ty check` and `pyrefly check src tests` with `pass_filenames=false` and `always_run=true`
 - Files: `.pre-commit-config.yaml` (lines 46-62)
 - Impact: Every commit runs full type checks even for trivial changes; commits will fail if any file has type issues; developers may bypass hooks with `--no-verify`
 - Fix approach: Consider setting `pass_filenames=true` for better performance; add safety to catch type regressions before they happen

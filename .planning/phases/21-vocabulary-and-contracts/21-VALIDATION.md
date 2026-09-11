@@ -37,7 +37,7 @@ type-check trio is therefore part of the per-task sampling command, not just the
 ## Sampling Rate
 
 - **After every task commit:**
-  `uv run ruff check . && uv run ty check && uv run pyrefly check && uv run pytest -q -m "not browser" <touched test module>`
+  `uv run ruff check . && uv run ty check && uv run pyrefly check src tests && uv run pytest -q -m "not browser" <touched test module>`
 - **After every plan wave:** `uv run pytest -m "not browser"` — must be **≥ 332 passed, 0 failed**
 - **After any template edit:** additionally `uv run pytest -m browser` (templates are the one surface no type checker guards)
 - **Before `/gsd-verify-work`:** all five CONTRIBUTING checks green, plus both grep gates
@@ -77,7 +77,7 @@ type-check trio is therefore part of the per-task sampling command, not just the
 | 21-05-02 | 21-05 | 3 | CTR-02 | — | N/A | unit | `uv run pytest -q tests/test_pipeline.py::TestManualDuplex` | ✅ edit `:496-497`, `:531` | ⬜ pending |
 | 21-05-03 | 21-05 | 3 | CTR-03 | — | N/A | grep gate | `! command grep -rn '"fallback"' src/ tests/` | plan step, not suite | ⬜ pending |
 | 21-05-03 | 21-05 | 3 | CTR-03 | — | N/A | grep gate | `! command grep -rn 'FALLBACK' docs/ README.md` | plan step, not suite | ⬜ pending |
-| all | all | all | all | — | N/A | type gate | `uv run ty check && uv run pyrefly check` — **the phase's actual enforcement mechanism** | ✅ Ph20 CI | ⬜ pending |
+| all | all | all | all | — | N/A | type gate | `uv run ty check && uv run pyrefly check src tests` — **the phase's actual enforcement mechanism** | ✅ Ph20 CI | ⬜ pending |
 | all | all | all | all | — | N/A | lint gate | `uv run ruff check . && uv run ruff format --check .` (watch `PLR0911`) | ✅ Ph20 CI | ⬜ pending |
 | all | all | all | all | — | N/A | full suite | `uv run pytest -m "not browser"` — **≥ 332 passed** | ✅ | ⬜ pending |
 

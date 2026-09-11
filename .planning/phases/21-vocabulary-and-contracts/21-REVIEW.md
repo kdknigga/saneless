@@ -84,7 +84,7 @@ rather than taking them on trust:
   `| safe` anywhere under `web/`; every route renders through the one
   `app.state.templates` environment that carries the `JobState` global.
 - Gate is green: 498 passed / 8 deselected, `ruff check`, `ruff format --check`,
-  `ty check` and `pyrefly check` all clean. No `# noqa` or `# type: ignore` added.
+  `ty check` and `pyrefly check src tests` all clean. No `# noqa` or `# type: ignore` added.
 
 What the diff gets wrong is concentrated in one place: **the source-classification
 unification reaches further than D-11 authorised.** D-11 licenses one behaviour

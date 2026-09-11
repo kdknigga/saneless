@@ -19,16 +19,16 @@ created: 2026-03-21
 |----------|-------|
 | **Framework** | pytest 9.x + ruff 0.15.x + ty 0.0.21 + pyrefly 0.55.x |
 | **Config file** | pyproject.toml |
-| **Quick run command** | `uv run ruff check . && uv run ty check && uv run pyrefly check` |
-| **Full suite command** | `uv run ruff check . && uv run ty check && uv run pyrefly check && uv run pytest tests/ -q` |
+| **Quick run command** | `uv run ruff check . && uv run ty check && uv run pyrefly check src tests` |
+| **Full suite command** | `uv run ruff check . && uv run ty check && uv run pyrefly check src tests && uv run pytest tests/ -q` |
 | **Estimated runtime** | ~30 seconds |
 
 ---
 
 ## Sampling Rate
 
-- **After every task commit:** Run `uv run ruff check . && uv run ty check && uv run pyrefly check`
-- **After every plan wave:** Run `uv run ruff check . && uv run ty check && uv run pyrefly check && uv run pytest tests/ -q`
+- **After every task commit:** Run `uv run ruff check . && uv run ty check && uv run pyrefly check src tests`
+- **After every plan wave:** Run `uv run ruff check . && uv run ty check && uv run pyrefly check src tests && uv run pytest tests/ -q`
 - **Before `/gsd:verify-work`:** Full suite must be green
 - **Max feedback latency:** 30 seconds
 
@@ -39,7 +39,7 @@ created: 2026-03-21
 | Task ID | Plan | Wave | Requirement | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|-----------|-------------------|-------------|--------|
 | 08-01-01 | 01 | 1 | CODE-QUALITY | lint+type | `uv run ruff check src/ && uv run ty check` | ✅ | ⬜ pending |
-| 08-01-02 | 01 | 1 | CODE-QUALITY | lint+type | `uv run ruff check . && uv run ty check && uv run pyrefly check` | ✅ | ⬜ pending |
+| 08-01-02 | 01 | 1 | CODE-QUALITY | lint+type | `uv run ruff check . && uv run ty check && uv run pyrefly check src tests` | ✅ | ⬜ pending |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 

@@ -111,7 +111,7 @@ Reviewed files: `src/saneless/auto_profiles.py`, `src/saneless/config.py`, `src/
 | ruff check .    | 0 errors     |
 | ruff format .   | clean        |
 | ty check        | 0 errors     |
-| pyrefly check   | 0 errors     |
+| pyrefly check src tests   | 0 errors     |
 | pytest (full)   | 262 passed   |
 | pytest (phase)  | 36 passed (28 + 4 + 4) |
 

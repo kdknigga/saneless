@@ -192,7 +192,7 @@ uv run ruff check --select PLR0915,PLR0912,PLR0913 tests/
 ```bash
 uv run ruff check .
 uv run ty check
-uv run pyrefly check
+uv run pyrefly check src tests
 uv run pytest -x
 ```
 
@@ -226,12 +226,12 @@ No technology changes relevant. Ruff, ty, and pyrefly are all current versions.
 | Req ID | Behavior | Test Type | Automated Command | File Exists? |
 |--------|----------|-----------|-------------------|-------------|
 | AUDIT-01 | All production noqa comments justified or removed | lint | `uv run ruff check src/` | N/A (lint check) |
-| AUDIT-02 | All production type: ignore comments justified or removed | type-check | `uv run ty check && uv run pyrefly check` | N/A (type check) |
+| AUDIT-02 | All production type: ignore comments justified or removed | type-check | `uv run ty check && uv run pyrefly check src tests` | N/A (type check) |
 | AUDIT-03 | Per-file-ignores tightened where possible | lint | `uv run ruff check .` | N/A (lint check) |
 | AUDIT-04 | No regressions in test suite | unit | `uv run pytest -x` | tests/ (226 tests) |
 
 ### Sampling Rate
-- **Per task commit:** `uv run ruff check . && uv run ty check && uv run pyrefly check && uv run pytest -x`
+- **Per task commit:** `uv run ruff check . && uv run ty check && uv run pyrefly check src tests && uv run pytest -x`
 - **Per wave merge:** `uv run prek run && uv run pytest`
 - **Phase gate:** Full suite green before `/gsd:verify-work`
 

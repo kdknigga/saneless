@@ -86,7 +86,7 @@ No anti-patterns detected.
 | `uv run ruff check .` | All files | 0 errors |
 | `uv run ruff format --check .` | All files | 0 format issues |
 | `uv run ty check` | All files | 0 errors |
-| `uv run pyrefly check` | All files | 0 errors |
+| `uv run pyrefly check src tests` | All files | 0 errors |
 
 ### Human Verification Required
 

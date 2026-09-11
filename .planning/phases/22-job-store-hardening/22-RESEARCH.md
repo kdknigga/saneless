@@ -137,7 +137,7 @@ DDL and `PRAGMA` are not in that list. So under the legacy default, `with self._
 
 ### Mechanic 2 — `@_locked` and the type checkers (item 2)
 
-**VERIFIED (executed).** The following passed `ruff check`, `ruff format --check`, `ty check` and `pyrefly check` with **zero** diagnostics when placed in `src/saneless/`:
+**VERIFIED (executed).** The following passed `ruff check`, `ruff format --check`, `ty check` and `pyrefly check src tests` with **zero** diagnostics when placed in `src/saneless/`:
 
 ```python
 def _locked[**P, R](
@@ -895,7 +895,7 @@ def test_two_threads_200_rounds() -> None:
 | STOR-05 | `fail_active_jobs()` marks every `ACTIVE_STATES` row `ERROR` with the reason, returns the count, leaves terminal rows alone | unit | `uv run pytest tests/test_job.py::test_fail_active_jobs -x` | ❌ Wave 0 |
 | STOR-05 | `fail_active_jobs()`'s predicate is derived from `ACTIVE_STATES`, not hand-listed | unit | `uv run pytest tests/test_job.py::test_fail_active_covers_every_active_state -x` | ❌ Wave 0 — *Phase 21 D-09 pattern* |
 | STOR-05 | `list_pending()` returns only `PENDING`, oldest first | unit | `uv run pytest tests/test_job.py::test_list_pending_order -x` | ❌ Wave 0 |
-| all | ruff, ruff format, ty, pyrefly clean; **zero new suppressions** | gate | `uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check` | ✅ CI-01 |
+| all | ruff, ruff format, ty, pyrefly clean; **zero new suppressions** | gate | `uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check src tests` | ✅ CI-01 |
 | all | Nothing else regressed | gate | `uv run pytest -m "not browser" -q` | ✅ 332 baseline |
 
 ### Sampling Rate

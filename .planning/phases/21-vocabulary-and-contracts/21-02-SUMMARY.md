@@ -211,7 +211,7 @@ nothing).
 - **Found during:** Task 1, at the first `git commit` (the `pyrefly-checker` pre-commit hook
   failed with exit 1).
 - **Issue:** This worktree lives at `<repo>/.claude/worktrees/agent-.../`, and the repo's own
-  `.gitignore:314` ignores `.claude/worktrees/`. `uv run pyrefly check` (exactly what the
+  `.gitignore:314` ignores `.claude/worktrees/`. `uv run pyrefly check src tests` (exactly what the
   pre-commit hook runs, with no path arguments) therefore reported
   *"No Python files matched patterns"* and exited 1 — it type-checked **nothing**. This is a
   worktree-path artifact, not a code defect: `uv run pyrefly check src tests` reported

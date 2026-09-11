@@ -132,7 +132,7 @@ error[invalid-assignment]: Object of type `() -> list[tuple[int, str, str, str, 
 Found 3 diagnostics
 ```
 
-`uv run pyrefly check` immediately after the bump:
+`uv run pyrefly check src tests` immediately after the bump:
 
 ```text
  INFO Checking project configured at `/home/kris/git/saneless/pyproject.toml`
@@ -243,7 +243,7 @@ The full five-check sequence on the bumped toolchain, all locally green:
 | `uv run ruff check .` | All checks passed! |
 | `uv run ruff format --check .` | 37 files already formatted |
 | `uv run ty check` | **All checks passed!** (exit 0) |
-| `uv run pyrefly check` | **0 errors** (exit 0) |
+| `uv run pyrefly check src tests` | **0 errors** (exit 0) |
 | `uv run pytest -m "not browser"` | **332 passed, 8 deselected in 26.82s** (exit 0) |
 
 Suite counts are identical to the pre-bump baseline (332/8), so nothing was deleted, skipped or

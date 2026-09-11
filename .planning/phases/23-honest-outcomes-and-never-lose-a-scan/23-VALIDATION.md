@@ -33,7 +33,7 @@ Strictness already in force (do not weaken to make a test pass): `filterwarnings
 ## Sampling Rate
 
 - **After every task commit:** `uv run ruff check . && uv run ruff format --check . && uv run pytest <touched test module> -x -q`
-- **After every plan wave:** `uv run pytest && uv run ty check && uv run pyrefly check`
+- **After every plan wave:** `uv run pytest && uv run ty check && uv run pyrefly check src tests`
 - **Before `/gsd-verify-work`:** full suite green and both type checkers clean — this is the Phase 20 CI gate's exact contract
 - **Max feedback latency:** < 60 s
 

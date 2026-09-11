@@ -1072,7 +1072,7 @@ is implementable without one; only the API-version *confirmation* needs it.
 ### Sampling Rate
 
 - **Per task commit:** `uv run ruff check . && uv run ruff format --check . && uv run pytest <touched test module> -x -q`
-- **Per wave merge:** `uv run pytest && uv run ty check && uv run pyrefly check`
+- **Per wave merge:** `uv run pytest && uv run ty check && uv run pyrefly check src tests`
 - **Phase gate:** full suite green + both type checkers clean before `/gsd-verify-work` (this is the
   Phase 20 CI gate's exact contract).
 
@@ -1167,7 +1167,7 @@ Directives the planner must verify compliance against:
   `uv add --dev pikepdf`.
 - **`prek`**, not `pre-commit`: `uv run prek run`.
 - **All five gates must pass with zero errors or warnings:** `uv run ruff check .`,
-  `uv run ruff format .`, `uv run ty check`, `uv run pyrefly check`, and the test suite.
+  `uv run ruff format .`, `uv run ty check`, `uv run pyrefly check src tests`, and the test suite.
 - **No suppression.** No `# type: ignore`, no `# noqa`, no disabling rules. Relevant traps this phase
   will hit: `ANN` (annotate everything, including the new `finish_job` keyword-only parameters),
   `D` (docstrings on every public function — `finish_job`, `job_state_for`, `ConnectionStatus`,

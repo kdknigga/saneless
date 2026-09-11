@@ -211,7 +211,7 @@ uv add --dev "ty@latest" "pyrefly@latest"
    │  ruff check            │      │  pytest -m             │
    │  ruff format --check   │      │    "not browser"       │
    │  ty check              │      │    (pytest-timeout=60  │
-   │  pyrefly check         │      │     from pyproject)    │
+   │  pyrefly check src tests         │      │     from pyproject)    │
    └───────────┬────────────┘      └───────────┬────────────┘
                │                                │
                ▼  check run "lint"              ▼  check run "test"
@@ -464,7 +464,7 @@ ty 0.0.80 no longer honours `# type: ignore` when it carries **any** bracketed c
 
 **What was feared:** D-16 predicted fallout from crossing 1.0.
 
-**What actually happens** `[VERIFIED: uvx --from 'pyrefly==1.2.0' pyrefly check --python-interpreter-path .venv/bin/python`]:
+**What actually happens** `[VERIFIED: uvx --from 'pyrefly==1.2.0' pyrefly check src tests --python-interpreter-path .venv/bin/python`]:
 
 ```
  INFO Checking project configured at `/home/kris/git/saneless/pyproject.toml`
@@ -566,7 +566,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run ty check
-      - run: uv run pyrefly check
+      - run: uv run pyrefly check src tests
 
   test:
     name: test
@@ -824,12 +824,12 @@ Measured this session: **332 passed, 8 deselected, 26.8s** — matches the CONTE
 | TEST-07 | `pytest-timeout` is installed and its ini keys are accepted under `--strict-config` | smoke | `uv run pytest -m "not browser" -q` (a bad ini key is a hard error under `--strict-config`) | ✅ existing suite |
 | TEST-07 | Config values are actually `timeout=60`, `method=signal` | smoke | `uv run pytest --collect-only -q 2>&1 \| head -1` after adding `-o timeout=…`, or `grep -A2 'timeout' pyproject.toml` | ✅ config assertion |
 | TEST-07 | A hung test is killed with a traceback and the suite continues | integration | throwaway file + `uv run pytest <file> -o timeout=3` → expect `1 failed, 1 passed` | ❌ transient, not committed (see note) |
-| CI-01 | All five checks pass locally | smoke | `uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check && uv run pytest -m "not browser"` | ✅ |
+| CI-01 | All five checks pass locally | smoke | `uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check src tests && uv run pytest -m "not browser"` | ✅ |
 | CI-01 | The workflow triggers and completes green on GitHub | e2e (out-of-repo) | `gh run list --workflow=ci.yml --limit 1 --json conclusion,headBranch,event` → `conclusion == "success"` | ❌ requires published repo |
 | CI-01 | Both check runs are reported by the GitHub Actions app | e2e (out-of-repo) | `gh api repos/kdknigga/saneless/commits/$SHA/check-runs --jq '[.check_runs[].name]'` | ❌ requires published repo |
 | CI-01 | A seeded one-line break turns the run red (D-08.3) | e2e (out-of-repo) | push throwaway branch, open PR, `gh run watch` → `conclusion == "failure"` | ❌ requires published repo |
 | CI-01 | The ruleset exists, is `active`, targets `refs/heads/master`, and requires **both** contexts | e2e (out-of-repo) | the `gh api …/rulesets/$RID --jq` read-back in § Code Examples | ❌ requires published repo |
-| CI-01 (D-16) | Bumped checkers pass clean | smoke | `uv run ty check && uv run pyrefly check` | ✅ (pyrefly already 0; ty needs the 3 fixes) |
+| CI-01 (D-16) | Bumped checkers pass clean | smoke | `uv run ty check && uv run pyrefly check src tests` | ✅ (pyrefly already 0; ty needs the 3 fixes) |
 
 > **Note on the hang test:** committing a permanently-hanging test to the suite would add 60s to every run. The D-08-style approach is right here too — demonstrate it once with a throwaway file and delete it, capturing the output as evidence. Do **not** add a `@pytest.mark.timeout(1)`-plus-`sleep(5)` test to `tests/` as a "regression test"; it is a test of pytest-timeout, not of this project.
 

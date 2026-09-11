@@ -329,7 +329,7 @@ Workflow requirements the milestone must satisfy:
 - `sudo apt-get install -y libsane-dev` **before** `uv sync --locked` — `python-sane` 2.9.2 is sdist-only and compiles against `sane/sane.h`.
 - `uv sync --locked` (not bare `uv sync`) so CI fails on a stale lock.
 - `uv run pytest -m "not browser"` in the fast gate; a separate job with `uv run playwright install --with-deps chromium` for the browser tests (needed for C-10's regression test).
-- `uv run ty check` **and** `uv run pyrefly check` — the project's own mandatory gates, absent from the release workflow today.
+- `uv run ty check` **and** `uv run pyrefly check src tests` — the project's own mandatory gates, absent from the release workflow today.
 - A tag-vs-`project.version` assertion job before publishing.
 - `git grep -n -e kris-knigga -e 'saneless\.github\.io' -- ':!.planning' ':!site'` as a CI step (M-27); must print nothing.
 - Build docs with `uv run mkdocs` so the lock's `mkdocs-material` 9.7.7 is used, not an unpinned `pip install`.

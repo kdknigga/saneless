@@ -289,8 +289,8 @@ No Rule 1, 2, or 4 situations arose. No authentication gates. No checkpoints.
 uv run ruff check .                                -> All checks passed!
 uv run ruff format --check .                       -> 40 files already formatted
 uv run ty check                                    -> All checks passed!
-uv run pyrefly check                               -> 0 errors  (src; see deviation 2)
-uv run pyrefly check <7 explicit paths>            -> 0 errors
+uv run pyrefly check src tests                               -> 0 errors  (src; see deviation 2)
+uv run pyrefly check src/… tests/… (7 explicit paths) -> 0 errors
 uv run pytest -m "not browser"                     -> 498 passed, 8 deselected
 uv run pytest -m browser                           ->   8 passed, 498 deselected
 ```

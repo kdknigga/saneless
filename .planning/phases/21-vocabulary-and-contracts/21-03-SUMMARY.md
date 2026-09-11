@@ -282,7 +282,7 @@ At the final commit:
 uv run ruff check .                            -> All checks passed!
 uv run ruff format --check .                   -> 40 files already formatted
 uv run ty check                                -> All checks passed!
-uv run pyrefly check                           -> 0 errors  (src; see deviation 3)
+uv run pyrefly check src tests                           -> 0 errors  (src; see deviation 3)
 uv run pyrefly check src/saneless/web/app.py \
      tests/test_web.py \
      tests/test_web_state_rendering.py         -> 0 errors

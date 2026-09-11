@@ -689,7 +689,7 @@ while time.monotonic() < deadline:
 - **Dimension:** Tests, Design · **Confidence:** Confirmed · **Found by:** OPS-02
 - **Location:** `.github/workflows/` (only `docs.yml` and `release.yml`), `.pre-commit-config.yaml:46-62`
 
-**What.** No workflow is triggered on push or pull request. The only job that runs tests is the release workflow's `test` job, which fires solely on version tags, and even that runs ruff and pytest but never `ty check` or `pyrefly check`, the two type checkers the project's own rules declare mandatory. The pre-commit hooks can be skipped with `--no-verify` and do not run pytest at all.
+**What.** No workflow is triggered on push or pull request. The only job that runs tests is the release workflow's `test` job, which fires solely on version tags, and even that runs ruff and pytest but never `ty check` or `pyrefly check src tests`, the two type checkers the project's own rules declare mandatory. The pre-commit hooks can be skipped with `--no-verify` and do not run pytest at all.
 
 **Why it matters.** Anyone can push code that fails the type checkers or the suite and nobody finds out until a release tag is cut, at which point the release itself fails (M-26). The principle: the quality gate must run on a machine nobody can bypass, before merge.
 
@@ -707,7 +707,7 @@ jobs:
       - uses: astral-sh/setup-uv@v7
       - run: uv sync --locked
       - run: uv run ruff check . && uv run ruff format --check .
-      - run: uv run ty check && uv run pyrefly check
+      - run: uv run ty check && uv run pyrefly check src tests
       - run: uv run pytest -m "not browser"
 ```
 
@@ -918,7 +918,7 @@ These are worth fixing when you touch the file. Each entry is deliberately short
 
 **N-37 (XC-15, SCAN-20) — Dead code.** `scanner/__init__.py:11-27` defines a module `__getattr__` to lazily import `SaneBackend`, but every importer, including `cli.py:31`, imports from `saneless.scanner.sane_backend` directly, and `sane_backend` already defers the C-extension import itself; coverage shows lines 22-27 never execute, and `__all__` lists a name that is not a real attribute. `PaperSize` is exported but only tests reference it. Delete the `__getattr__` (or make the one caller use it) and import `PaperSize` where the Literal is retyped.
 
-**N-38 (XC-16) — Stringly-typed protocols make the type checkers blind exactly where modules meet.** `upload_document` returns a task id or the magic string `"fallback"`; `test_connection` returns one of three magic strings; `poll_task` and `run_pipeline` return dictionaries keyed by convention; tags and correspondents are `list[dict[str, object]]`; every route reads services through `request.app.state`, which is `Any`, so ty and pyrefly check none of the route bodies. The project pays for two type checkers, yet its most bug-prone seams are invisible to them: C-03 is literally a dictionary key nobody read. Use a `NamedTuple` for the upload outcome, a `StrEnum` for connection status, a `PipelineResult` dataclass, `TypedDict`s for the rows, and a typed `AppServices` object retrieved through one helper so route bodies are checked.
+**N-38 (XC-16) — Stringly-typed protocols make the type checkers blind exactly where modules meet.** `upload_document` returns a task id or the magic string `"fallback"`; `test_connection` returns one of three magic strings; `poll_task` and `run_pipeline` return dictionaries keyed by convention; tags and correspondents are `list[dict[str, object]]`; every route reads services through `request.app.state`, which is `Any`, so ty and pyrefly check src tests none of the route bodies. The project pays for two type checkers, yet its most bug-prone seams are invisible to them: C-03 is literally a dictionary key nobody read. Use a `NamedTuple` for the upload outcome, a `StrEnum` for connection status, a `PipelineResult` dataclass, `TypedDict`s for the rows, and a typed `AppServices` object retrieved through one helper so route bodies are checked.
 
 **N-39 (XC-17) — Job history lives in `tmp_dir`, which defaults to the system temp directory.** `saneless.db` sits next to scratch scan files under a path many distributions clear on reboot or by `systemd-tmpfiles`, while the docs promise seven-day retention and the module docstring promises crash recovery. State that must outlive a reboot belongs under the XDG state directory, where the log file already goes. Add `output.state_dir` and derive the database path from it in one place.
 
@@ -1230,7 +1230,7 @@ The ten most user-visible code defects (C-01 through C-10) are prerequisites for
 
 **Process.** Six review agents ran in parallel, each assigned a slice of the codebase and instructed to read every line of its files, apply all Google checklist dimensions, verify runtime claims by executing throwaway scripts outside the repository, and mark each finding Confirmed or Likely. Slices: scanner backend (`SCAN`), pipeline and auto-profiles (`PIPE`), Paperless client, job store, config, and logging (`CORE`), worker and web (`WEB`), CLI, packaging, deployment, and docs (`OPS`), and a cross-cutting pass over architecture, consistency, comments, and whole-suite test quality with a coverage run (`XC`). The lead reviewer then read all six reports, merged duplicates, re-verified every CRITICAL finding and the highest-impact MAJOR findings by reading the cited code and re-executing the agents' scripts, and wrote this document. The repository was not modified at any point; `git status` was clean throughout. After the code pass, the lead re-read the quick start, compose file, example config, and web templates from a non-developer operator's perspective and wrote section 11; the project owner supplied the repository-naming decision recorded in M-27.
 
-**Baseline at commit e905f64.** `uv run ruff check .`: no issues. `uv run ruff format --check .`: 37 files already formatted. `uv run ty check`: all checks passed. `uv run pyrefly check`: 0 errors. `uv run pytest`: 340 passed, including browser tests.
+**Baseline at commit e905f64.** `uv run ruff check .`: no issues. `uv run ruff format --check .`: 37 files already formatted. `uv run ty check`: all checks passed. `uv run pyrefly check src tests`: 0 errors. `uv run pytest`: 340 passed, including browser tests.
 
 **Lead re-verification, in addition to reading the cited lines.**
 - Loaded a config with `hostname` under `[scanner]` and `resoluton = 600` under `[profiles.default]`: no error, resolution 300 (M-18). Confirmed the token appears in `repr(Settings)` and is not currently logged (N-15).
