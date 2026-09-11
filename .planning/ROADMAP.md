@@ -158,7 +158,18 @@ Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the w
   5. A parametrised end-to-end test drives the real worker and pipeline with a stub scanner through SUCCESS, Paperless FAILURE, TIMEOUT, consume-dir fallback, and duplex mismatch, asserting persisted state, outcome, page counts, and file preservation for each
   6. `poll_task` reaches a terminal status against BOTH a v9-shaped (bare list, uppercase status, `result`) and a v10-shaped (paginated `{"count","results"}`, lowercase status, `result_data.error_message`) `/api/tasks/` response, and `PaperlessClient` sends an explicit API-version `Accept` header
 
-**Plans**: TBD
+**Plans**: 9 plans in 5 waves
+
+Plans:
+- [ ] 23-01-PLAN.md — Wave 0 test scaffolding, JobState.FALLBACK, job_state_for, PaperlessTimeoutError, ConnectionStatus (wave 1)
+- [ ] 23-02-PLAN.md — output.data_dir, db_path/failed_dir properties, entry points, Dockerfile and compose (wave 1)
+- [ ] 23-03-PLAN.md — filename sanitiser, unique PDF naming, fixed-DPI layout, PipelineRequest.job_id (wave 1)
+- [ ] 23-04-PLAN.md — paperless API-version pin, v9/v10 parsing, raising poll_task, ConnectionStatus, atomic consume-dir rename (wave 2)
+- [ ] 23-05-PLAN.md — FALLBACK rendering in status partial, history table, CSS, app.js, CLI, and UI-SPEC (wave 2)
+- [ ] 23-06-PLAN.md — the preservation guard spanning upload_document and poll_task, plus duplex parity (wave 3)
+- [ ] 23-07-PLAN.md — JobStore.finish_job and the worker consuming the ScanResult (wave 4)
+- [ ] 23-08-PLAN.md — the parametrised five-outcome end-to-end test (wave 5)
+- [ ] 23-09-PLAN.md — documentation sweep: fallback status, connection statuses, data_dir, upgrade note (wave 5)
 
 Note: the preservation `try/except` must span both `upload_document` and `poll_task`. Wrapping only the upload call means a correct FAILURE raise unwinds the `TemporaryDirectory` and deletes the document this phase exists to protect.
 
