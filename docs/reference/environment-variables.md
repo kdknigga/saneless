@@ -42,6 +42,7 @@ Settings are resolved in this order (highest to lowest priority):
 | Variable | Config Path | Type | Example |
 |----------|-------------|------|---------|
 | `SANELESS_OUTPUT__TMP_DIR` | `output.tmp_dir` | string | `/tmp/saneless` |
+| `SANELESS_OUTPUT__DATA_DIR` | `output.data_dir` | string | `/var/lib/saneless` |
 | `SANELESS_OUTPUT__LOG_FILE` | `output.log_file` | string | `/var/log/saneless.log` |
 | `SANELESS_OUTPUT__LOG_LEVEL` | `output.log_level` | string | `DEBUG` |
 | `SANELESS_OUTPUT__LOG_MAX_BYTES` | `output.log_max_bytes` | int | `10485760` |
@@ -61,3 +62,5 @@ Settings are resolved in this order (highest to lowest priority):
 - **Docker deployments** commonly use environment variables for `SANELESS_PAPERLESS__URL`, `SANELESS_PAPERLESS__TOKEN`, and `SANELESS_SCANNER__HOST` while mounting a TOML file for profile definitions.
 
 - **Multiple scanner hosts** can be specified in `SANELESS_SCANNER__HOST` using colon separation: `192.168.1.50:192.168.1.51`.
+
+- **`SANELESS_OUTPUT__DATA_DIR` is durable state, `SANELESS_OUTPUT__TMP_DIR` is not.** `data_dir` holds the job database (`saneless.db`) and the `failed/` directory of scans that could not be delivered to paperless-ngx; it defaults to `~/.local/state/saneless` and must survive restarts. `tmp_dir` is scratch space for the scan in progress and can be thrown away. The official container image already sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless`, so you only need to set it yourself if you mount the volume somewhere else.
