@@ -33,8 +33,9 @@ The `/health` endpoint returns 200 when the worker thread is alive, 503 when it 
 
 `/var/lib/saneless` is not optional, and it is not the same kind of directory
 `/tmp/saneless` is. When a scan cannot be delivered to paperless-ngx at all --
-the API fails, the consumption task reports a failure, or the task does not
-finish before `paperless_task_timeout` expires -- saneless moves the assembled
+the upload fails and no consume directory is configured, paperless-ngx rejects
+the upload outright, the consumption task reports a failure, or the task has not
+finished when `paperless_task_timeout` expires -- saneless moves the assembled
 PDF into `/var/lib/saneless/failed/`. That copy is then the only remaining copy
 of the document. Pruning the volume, or leaving it unmounted so that it vanishes
 when the container is recreated, destroys scans that were never ingested.
@@ -51,11 +52,13 @@ or rotates anything in it.** That is deliberate: automatically removing a file
 there would destroy the only copy of a scanned document. Draining the directory
 is an operator task.
 
-- One PDF is written per unrecoverable delivery. Each one corresponds to a job
-  the web UI shows as **Failed**, whose error message names that exact path.
+- One PDF is written per unrecoverable delivery -- two for an ADF duplex scan
+  whose halves were uploaded separately. Each file corresponds to a job the web
+  UI shows as **Failed**, whose error message names that exact path.
 - Once the directory holds 20 or more PDFs, saneless logs a WARNING each time it
   preserves another, naming the file count, the total size and the path. Watch
-  for it in the container log; it is the only automatic signal you get.
+  for it in the container log: individual failures show up as failed jobs, but
+  that warning is the only signal that the directory as a whole is filling up.
 - To drain it: confirm the documents are in paperless-ngx, or re-ingest the PDFs
   by copying them into the paperless-ngx consume directory, then delete the
   files you have accounted for.
