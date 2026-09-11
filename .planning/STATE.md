@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: completed
-stopped_at: Phase 23.1 inserted, not yet planned
-last_updated: "2026-09-11T18:46:57.439Z"
+stopped_at: Phase 23.1 UI-SPEC approved
+last_updated: "2026-09-11T20:22:06.740Z"
 last_activity: 2026-09-10 -- Phase 22 marked complete
 progress:
   total_phases: 14
@@ -239,6 +239,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
-Last session: 2026-09-11T18:46:57.433Z
-Stopped at: Phase 23.1 inserted, not yet planned
-Resume file: .planning/ROADMAP.md
+Last session: 2026-09-11T20:22:06.734Z
+Stopped at: Phase 23.1 UI-SPEC approved
+Resume file: .planning/phases/23.1-dark-mode-and-the-commit-gate/23.1-UI-SPEC.md
