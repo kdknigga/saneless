@@ -78,6 +78,25 @@ preserved. "File Exists ❌ W0" means Wave 0 must create it before the implement
 - [ ] `tests/test_vocabulary.py` — update the four hand-written lists (the parametrised cases self-update)
 - [ ] `tests/test_paperless.py` — rewrite the three `TestPollTask` cases from return-value to raise semantics; add non-200, empty-list-tolerance, and v9/v10 API-shape cases; parametrise `test_connection`
 - [ ] `uv add --dev pikepdf` — promote the existing `img2pdf` transitive dependency to an explicit dev dependency
+### Pre-existing test breakage this phase causes (found by pattern mapping, verified 2026-09-11)
+
+None of these are flagged by RESEARCH.md. Each is an existing green test that **this phase turns
+red**, so each needs a Wave 0 fix before the implementing task lands:
+
+- [ ] `tests/conftest.py:133-140` — the `mock_paperless` fixture sets
+      `poll_task.return_value = {"status": "SUCCESS"}`, encoding the *old* return-a-dict contract.
+      It cannot express the FAILURE or TIMEOUT e2e cases once `poll_task` raises instead.
+- [ ] `tests/test_cli.py::TestJobsCommand` (all 7 methods, e.g. `:402`, `:421`) — each builds
+      `db_path = str(tmp_path / "saneless.db")` while setting `tmp_dir=str(tmp_path)`. Once
+      `cli.py:227` reads `settings.output.db_path` (derived from `data_dir`, D-16), the CLI opens a
+      *different* database than the test populated, and every case silently sees zero jobs.
+- [ ] `tests/test_pdf.py::TestAssemblePdf` (7 call sites, `:18`–`:81`) — all call
+      `assemble_pdf([img], tmp_path)` positionally and break the moment D-09 adds a `filename`
+      argument. Decide deliberately whether `filename` is required (update all 7) or defaulted
+      (keeps them green but weakens D-09's "unique from birth" guarantee at the type level).
+
+### Remaining Wave 0 items
+
 - [ ] `tests/conftest.py` — add a `wait_for_state(store, job_id, state, timeout)` polling helper. The existing worker tests use a flat `time.sleep(0.5)` 20+ times; ROBU-03 formalises this in Phase 26, but OUTC-10 needs it now and a shared helper avoids adding a 21st sleep.
 
 No other new conftest fixtures are required — `default_settings`, `mock_scanner`, `sample_pil_images`
