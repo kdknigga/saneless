@@ -46,10 +46,23 @@ saneless jobs --json --limit 5
     "profile": "default",
     "title": "Invoice March 2026",
     "state": "DONE",
-    "created_at": "2026-03-22T14:30:00"
+    "created_at": "2026-03-22T14:30:00",
+    "outcome": "SUCCESS",
+    "warning": null
   }
 ]
 ```
+
+`state` is always the raw uppercase enum value — `PENDING`, `SCANNING`,
+`AWAITING_FLIP`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR` or `FALLBACK` — so
+it is safe to compare against in a script. The human-readable labels the table
+view prints ("Complete", "Failed", "Saved to folder") never appear in `--json`.
+
+`outcome` is `"SUCCESS"`, `"FALLBACK"` or `null`, and `warning` carries a note
+about something odd that did not fail the scan, or `null`. A job whose `state`
+is `FALLBACK` was scanned and saved, but paperless-ngx did not accept it over
+the API, so the PDF went to the consume directory and its title, tags and
+correspondent were not applied.
 
 ## Exit codes
 
