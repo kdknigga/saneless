@@ -51,10 +51,16 @@ Tests the connection to the configured paperless-ngx instance.
 
 | Status Code | Body | Condition |
 |-------------|------|-----------|
-| 200 | `{"status": "connected"}` | Successful connection with valid token |
-| 200 | `{"status": "token_rejected"}` | Server reachable but token is invalid |
-| 200 | `{"status": "unreachable"}` | Server is not reachable |
-| 502 | `{"status": "error", "detail": "..."}` | Unexpected failure |
+| 200 | `{"status": "connected"}` | paperless-ngx answered with a 2xx |
+| 200 | `{"status": "token_rejected"}` | Server reachable, token rejected (401 or 403) |
+| 200 | `{"status": "not_found"}` | Server reachable, but the paperless-ngx API is not at the configured URL (404) |
+| 200 | `{"status": "server_error"}` | Server reachable, but answered 5xx or any other unclassified non-2xx |
+| 200 | `{"status": "unreachable"}` | Server is not reachable (connection refused, DNS failure, connect or read timeout) |
+| 502 | `{"status": "error", "detail": "..."}` | Unexpected failure inside saneless while running the test |
+
+The five 200 values are the complete set, and each is a stable wire contract: `connected`
+is returned for a 2xx and nothing else, so a 404 or a 500 is now reported as its own
+outcome rather than as a working connection.
 
 ---
 
@@ -79,7 +85,7 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 
 Returns the current or most recent job status. Used by HTMX polling to update the status indicator.
 
-**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`.
+**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`.
 
 ---
 
