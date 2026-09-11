@@ -59,7 +59,7 @@ class TestAssemblePdf:
     def test_assemble_single_page(self, tmp_path: Path) -> None:
         """Single image produces a valid PDF file."""
         img = Image.new("RGB", (100, 100), "white")
-        pdf_path = assemble_pdf([img], tmp_path)
+        pdf_path = assemble_pdf([img], tmp_path, filename="single.pdf", dpi=300)
 
         assert pdf_path.exists()
         assert pdf_path.stat().st_size > 0
@@ -73,14 +73,12 @@ class TestAssemblePdf:
             Image.new("RGB", (200, 200), "red"),
             Image.new("RGB", (150, 150), "blue"),
         ]
-        single_pdf = assemble_pdf([images[0]], tmp_path / "single")
-        (tmp_path / "single").mkdir(exist_ok=True)
-        single_pdf = assemble_pdf([images[0]], tmp_path / "single")
+        single_dir = tmp_path / "single"
+        single_pdf = assemble_pdf([images[0]], single_dir, filename="one.pdf", dpi=300)
         single_size = single_pdf.stat().st_size
 
         multi_dir = tmp_path / "multi"
-        multi_dir.mkdir()
-        multi_pdf = assemble_pdf(images, multi_dir)
+        multi_pdf = assemble_pdf(images, multi_dir, filename="many.pdf", dpi=300)
         multi_size = multi_pdf.stat().st_size
 
         assert multi_size > single_size
@@ -88,7 +86,7 @@ class TestAssemblePdf:
     def test_temp_files_cleaned_on_success(self, tmp_path: Path) -> None:
         """Temporary PNG files are removed after successful assembly."""
         img = Image.new("RGB", (100, 100), "white")
-        assemble_pdf([img], tmp_path)
+        assemble_pdf([img], tmp_path, filename="clean.pdf", dpi=300)
 
         # After assembly, no .png temp files should remain
         # (they were in a TemporaryDirectory that was cleaned up)
@@ -105,15 +103,25 @@ class TestAssemblePdf:
             msg = "fake img2pdf error"
             raise RuntimeError(msg)
 
+        def fake_layout_fun(*_args: object, **_kwargs: object) -> None:
+            return None
+
         monkeypatch.setattr(
             pdf_mod,
             "img2pdf",
-            type("FakeImg2Pdf", (), {"convert": staticmethod(fake_convert)})(),
+            type(
+                "FakeImg2Pdf",
+                (),
+                {
+                    "convert": staticmethod(fake_convert),
+                    "get_fixed_dpi_layout_fun": staticmethod(fake_layout_fun),
+                },
+            )(),
         )
 
         img = Image.new("RGB", (100, 100), "white")
         with pytest.raises(RuntimeError, match="fake img2pdf error"):
-            pdf_mod.assemble_pdf([img], tmp_path)
+            pdf_mod.assemble_pdf([img], tmp_path, filename="boom.pdf", dpi=300)
 
         # Temp dir should still be cleaned up
         png_files = list(tmp_path.rglob("*.png"))
@@ -122,10 +130,11 @@ class TestAssemblePdf:
     def test_output_path(self, tmp_path: Path) -> None:
         """Output PDF is written to the specified directory with .pdf extension."""
         img = Image.new("RGB", (100, 100), "white")
-        pdf_path = assemble_pdf([img], tmp_path)
+        pdf_path = assemble_pdf([img], tmp_path, filename="named.pdf", dpi=300)
 
         assert isinstance(pdf_path, Path)
         assert pdf_path.parent == tmp_path
+        assert pdf_path.name == "named.pdf"
         assert pdf_path.suffix == ".pdf"
 
 
@@ -278,7 +287,7 @@ class TestMediaBox:
         """An exact A4 raster at 300 DPI yields a 595 x 842 pt MediaBox."""
         # Rounded, never compared exactly: the true value is 595.2 x 841.92.
         img = Image.new("RGB", (2480, 3508), "white")
-        pdf_path = assemble_pdf([img], tmp_path)
+        pdf_path = assemble_pdf([img], tmp_path, filename="a4.pdf", dpi=300)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
@@ -290,7 +299,7 @@ class TestMediaBox:
         # img2pdf.default_dpi is 96, so an unlayouted 2480 x 3508 raster
         # becomes 1860 x 2631 pt.  Seeing that means no layout_fun was passed.
         img = Image.new("RGB", (2480, 3508), "white")
-        pdf_path = assemble_pdf([img], tmp_path)
+        pdf_path = assemble_pdf([img], tmp_path, filename="a4.pdf", dpi=300)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
@@ -303,7 +312,7 @@ class TestMediaBox:
         cropped = crop_to_paper_size(Image.new("RGB", (2600, 3700), "white"), "a4", 300)
         assert cropped.size == (2480, 3507)
 
-        pdf_path = assemble_pdf([cropped], tmp_path)
+        pdf_path = assemble_pdf([cropped], tmp_path, filename="a4.pdf", dpi=300)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
@@ -317,7 +326,7 @@ class TestMediaBox:
             Image.new("RGB", (2480, 3508), "white"),
             Image.new("RGB", (1240, 1754), "white"),
         ]
-        pdf_path = assemble_pdf(images, tmp_path)
+        pdf_path = assemble_pdf(images, tmp_path, filename="mixed.pdf", dpi=300)
 
         with pikepdf.open(pdf_path) as pdf:
             boxes = [_rounded_media_box(page) for page in pdf.pages]
