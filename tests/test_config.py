@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -21,9 +22,6 @@ from saneless.exceptions import (
     SanelessError,
     ScanError,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 class TestLoadSettingsFromToml:
@@ -349,3 +347,101 @@ class TestValidateSettingsDirs:
             validate_settings_dirs(settings)
         # Restore permissions for cleanup
         unwritable.chmod(0o755)
+
+    def test_validate_writable_data_dir_passes(self, tmp_path: Path) -> None:
+        """No error when data_dir is writable."""
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+            profiles={"default": ProfileConfig()},
+        )
+        # Should not raise
+        validate_settings_dirs(settings)
+
+    def test_validate_unwritable_data_dir_fails_with_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Unwritable data_dir raises ConfigError with 'not writable' message."""
+        unwritable = tmp_path / "readonly"
+        unwritable.mkdir()
+        unwritable.chmod(0o444)
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(unwritable)),
+            profiles={"default": ProfileConfig()},
+        )
+        with pytest.raises(ConfigError, match="not writable"):
+            validate_settings_dirs(settings)
+        # Restore permissions for cleanup
+        unwritable.chmod(0o755)
+
+    def test_validate_missing_data_dir_unwritable_parent_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing data_dir under an unwritable parent raises ConfigError."""
+        parent = tmp_path / "readonly"
+        parent.mkdir()
+        parent.chmod(0o444)
+        settings = Settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path), data_dir=str(parent / "saneless")
+            ),
+            profiles={"default": ProfileConfig()},
+        )
+        with pytest.raises(ConfigError, match="not writable"):
+            validate_settings_dirs(settings)
+        # Restore permissions for cleanup
+        parent.chmod(0o755)
+
+
+class TestDataDir:
+    """OutputConfig.data_dir and its computed db_path / failed_dir properties."""
+
+    def test_data_dir_default_is_under_local_state(self) -> None:
+        """The default data_dir is a str ending in .local/state/saneless."""
+        data_dir = OutputConfig().data_dir
+        assert isinstance(data_dir, str)
+        assert data_dir.endswith(".local/state/saneless")
+
+    def test_data_dir_default_is_not_the_temp_dir(self) -> None:
+        """The default data_dir is not tmp_dir and is not under the temp root."""
+        config = OutputConfig()
+        assert config.data_dir != config.tmp_dir
+        assert not config.data_dir.startswith(tempfile.gettempdir())
+
+    def test_db_path_is_saneless_db_under_data_dir(self) -> None:
+        """db_path is <data_dir>/saneless.db as a Path."""
+        config = OutputConfig(data_dir="/x")
+        assert config.db_path == Path("/x/saneless.db")
+        assert isinstance(config.db_path, Path)
+
+    def test_failed_dir_is_failed_under_data_dir(self) -> None:
+        """failed_dir is <data_dir>/failed as a Path."""
+        config = OutputConfig(data_dir="/x")
+        assert config.failed_dir == Path("/x/failed")
+        assert isinstance(config.failed_dir, Path)
+
+    def test_computed_paths_are_read_only(self) -> None:
+        """db_path and failed_dir are properties with no setter, not fields."""
+        for name in ("db_path", "failed_dir"):
+            descriptor = OutputConfig.__dict__[name]
+            assert isinstance(descriptor, property)
+            assert descriptor.fset is None
+            assert name not in OutputConfig.model_fields
+
+    def test_computed_paths_do_no_filesystem_io(self, tmp_path: Path) -> None:
+        """Reading db_path and failed_dir creates nothing on disk."""
+        target = tmp_path / "state"
+        config = OutputConfig(data_dir=str(target))
+        assert config.db_path == target / "saneless.db"
+        assert config.failed_dir == target / "failed"
+        assert not target.exists()
+
+    def test_data_dir_env_var_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SANELESS_OUTPUT__DATA_DIR overrides the default data_dir."""
+        monkeypatch.chdir(tmp_path)
+        override = tmp_path / "custom-state"
+        monkeypatch.setenv("SANELESS_OUTPUT__DATA_DIR", str(override))
+        settings = load_settings()
+        assert settings.output.data_dir == str(override)
+        assert settings.output.db_path == override / "saneless.db"

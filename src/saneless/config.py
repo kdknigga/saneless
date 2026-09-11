@@ -83,6 +83,11 @@ class OutputConfig(BaseModel):
     """Output and logging configuration."""
 
     tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
+    # Durable state: the job database and preserved scans. Deliberately NOT
+    # under tmp_dir, which is disposable scratch space. The hardcoded
+    # Path.home() form matches log_file below so Phase 27's XDG expansion
+    # changes both defaults in a single edit; no env var is consulted here.
+    data_dir: str = str(Path.home() / ".local" / "state" / "saneless")
     log_file: str = str(Path.home() / ".local" / "state" / "saneless" / "saneless.log")
     log_level: str = "INFO"
     log_max_bytes: int = 10_485_760
@@ -94,6 +99,32 @@ class OutputConfig(BaseModel):
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
+
+    @property
+    def db_path(self) -> Path:
+        """
+        Location of the job history database.
+
+        Creates nothing; callers are responsible for making data_dir exist.
+
+        Returns:
+            The path to saneless.db inside data_dir.
+
+        """
+        return Path(self.data_dir) / "saneless.db"
+
+    @property
+    def failed_dir(self) -> Path:
+        """
+        Directory holding scans preserved after a failed pipeline run.
+
+        Creates nothing; callers are responsible for making it exist.
+
+        Returns:
+            The path to the failed/ directory inside data_dir.
+
+        """
+        return Path(self.data_dir) / "failed"
 
 
 class Settings(BaseSettings):
@@ -205,10 +236,11 @@ def _build_settings(
 
 def validate_settings_dirs(settings: Settings) -> None:
     """
-    Fail fast with ConfigError if tmp_dir or consume_dir are not writable.
+    Fail fast with ConfigError if tmp_dir, data_dir or consume_dir are unwritable.
 
     Validates directory writability at startup so permission errors surface
-    immediately rather than mid-scan. Per D-13, raises ConfigError (not
+    immediately rather than mid-scan, or - for data_dir - at the moment a
+    failed scan needs preserving. Per D-13, raises ConfigError (not
     ValueError) for writability failures.
 
     Args:
@@ -226,6 +258,15 @@ def validate_settings_dirs(settings: Settings) -> None:
         parent = tmp.parent
         if parent.exists() and not os.access(parent, os.W_OK):
             msg = f"tmp_dir parent is not writable: {parent}"
+            raise ConfigError(msg)
+    data = Path(settings.output.data_dir)
+    if data.exists() and not os.access(data, os.W_OK):
+        msg = f"data_dir is not writable: {data}"
+        raise ConfigError(msg)
+    if not data.exists():
+        parent = data.parent
+        if parent.exists() and not os.access(parent, os.W_OK):
+            msg = f"data_dir parent is not writable: {parent}"
             raise ConfigError(msg)
     consume = settings.paperless.consume_dir
     if consume:
