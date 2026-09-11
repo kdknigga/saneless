@@ -55,9 +55,10 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         consume_dir=settings.paperless.consume_dir,
     )
     Path(settings.output.tmp_dir).mkdir(parents=True, exist_ok=True)
-    job_store = JobStore(
-        db_path=str(Path(settings.output.tmp_dir) / "saneless.db"),
-    )
+    # sqlite3.connect does not create parent directories, so data_dir must
+    # exist before JobStore opens the database.
+    Path(settings.output.data_dir).mkdir(parents=True, exist_ok=True)
+    job_store = JobStore(db_path=str(settings.output.db_path))
     cache = MetadataCache(ttl=settings.output.paperless_cache_ttl_seconds)
     worker = ScanWorker(scanner, paperless, settings, job_store)
 

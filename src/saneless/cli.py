@@ -224,8 +224,11 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
 def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     """List recent scan job history."""
     settings = ctx.obj["settings"]
-    db_path = str(Path(settings.output.tmp_dir) / "saneless.db")
-    store = JobStore(db_path=db_path)
+    # sqlite3.connect does not create parent directories, so data_dir must
+    # exist before JobStore opens the database. Deliberately not hidden inside
+    # the db_path property: a property with a filesystem side effect surprises.
+    Path(settings.output.data_dir).mkdir(parents=True, exist_ok=True)
+    store = JobStore(db_path=str(settings.output.db_path))
     try:
         recent = store.list_recent(limit=limit)
         if as_json:
