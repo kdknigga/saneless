@@ -185,13 +185,19 @@ Note (added 2026-09-11 from Phase 23 research): criterion 6 / OUTC-11 was not in
 **Requirements**: DARK-01, DARK-02, DARK-03, GATE-01, GATE-02, GATE-03
 **Success Criteria** (what must be TRUE):
 
-  1. With `prefers-color-scheme: dark`, a Playwright test asserts `body`'s **computed** background is Pico's dark surface rather than the light one, and that test fails if `data-theme="auto"` is restored
+  1. With `prefers-color-scheme: dark`, a Playwright test asserts the root element's (`document.documentElement`) **computed** background is Pico's dark surface rather than the light one, and that test fails if `data-theme="auto"` is restored. *(Amended in 23.1: `body` is transparent in both schemes because Pico paints the page surface on `:root`, so reading `body` could never pass.)*
   2. `.status-done`, `.status-error` and `.status-fallback` each measure at least 4.5:1 against the surface in **both** schemes, asserted by computed-colour tests rather than by eye
   3. A test file referencing a symbol that does not exist yet can be committed with hooks enabled and no suppression of any kind
   4. A deliberate type error is still rejected before it can reach master — proven at whichever gate now owns that job
   5. No verification command in `.planning/`, the hooks, or CI uses bare `uv run pyrefly check`
 
-**Plans**: TBD
+**Plans**: 4 plans in 2 waves
+
+Plans:
+- [ ] 23.1-01-PLAN.md — dark palette engaged, app-owned fallback amber, T1/T2/T3 computed-colour tests with mutation checks, master UI-SPEC convention (wave 1, TDD)
+- [ ] 23.1-02-PLAN.md — type checks split: src-only at commit, full at pre-merge-commit and pre-push; CI pyrefly paths; CONTRIBUTING and CLAUDE.md (wave 1)
+- [ ] 23.1-03-PLAN.md — every pathless pyrefly command under .planning/ rewritten to name src tests, residue enumerated and justified (wave 1)
+- [ ] 23.1-04-PLAN.md — three prek shims installed from the main checkout, D-07 RED/commit/merge/push demonstrations, CI and ruleset read-backs, close-out (wave 2)
 
 **Why this is an insertion rather than end-of-milestone work.** GATE-01/02 affect every phase from 24 to 32: all eight Phase 23 executors independently hit the same wall, and each spent real effort rediscovering it. Fixing it once here compounds across the nine phases that follow. DARK-01/02 are not urgent in the same way and are here only because the user asked for one phase covering both.
 
@@ -247,6 +253,8 @@ Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/
 **Plans**: TBD
 
 Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 must be paired with an explicit `htmx-config` override or it is invisible — reintroducing the exact C-10 symptom this phase fixes. Worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper here, not in Phase 32.
+
+Note (added in 23.1, DARK-03 coupling): when ROBU-09 vendors Pico, follow `23.1-UI-SPEC.md` § "Coupling contract for Phase 26 (ROBU-09)": vendor `pico.min.css` 2.1.1 only; do not vendor `pico.colors.css`; reintroduce no `data-theme` on `<html>`; keep the `--saneless-status-fallback` block; and move the DARK-01/DARK-02 browser tests into CI once the assets are local.
 
 **UI hint**: yes
 
