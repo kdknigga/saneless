@@ -182,6 +182,10 @@ None for this plan. Operators upgrading an existing Docker deployment should not
 - Plan 23-09 inherits the doc sweep: `docs/reference/docker.md:30,106,114` and `docs/how-to/deploy-docker-compose.md:53,64` still show `/tmp/saneless`, plus the D-14 upgrade note.
 - Phase 27 inherits two textually identical `Path.home() / ".local" / "state"` defaults in `config.py` to convert in one edit.
 
+## Self-Check: PASSED
+
+All modified files present on disk; all four commits (`8d5f13c`, `81e9698`, `d4736e6`, `b9cf058`) present in `git log`.
+
 ---
 *Phase: 23-honest-outcomes-and-never-lose-a-scan*
 *Completed: 2026-09-11*
