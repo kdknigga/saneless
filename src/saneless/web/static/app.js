@@ -24,7 +24,12 @@
     document.addEventListener("htmx:afterSwap", function (evt) {
         var target = evt.detail.target;
         if (!target || target.id !== "status-area") return;
-        if (target.querySelector(".status-done") || target.querySelector(".status-error")) {
+        // All three terminal states re-enable the button. Omitting the
+        // consume-directory fallback would leave a successful-but-degraded
+        // scan looking like a locked-up app until the user reloaded the page.
+        if (target.querySelector(".status-done") ||
+            target.querySelector(".status-error") ||
+            target.querySelector(".status-fallback")) {
             resetScanButton();
         }
     });
