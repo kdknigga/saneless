@@ -904,6 +904,7 @@ dependencies = [
 dev = [
     { name = "httpx" },
     { name = "mkdocs-material" },
+    { name = "pikepdf" },
     { name = "playwright" },
     { name = "prek" },
     { name = "pyrefly" },
@@ -933,6 +934,7 @@ requires-dist = [
 dev = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "mkdocs-material", specifier = ">=9.7.6" },
+    { name = "pikepdf", specifier = ">=10.5.1" },
     { name = "playwright", specifier = ">=1.58.0" },
     { name = "prek", specifier = ">=0.3.5" },
     { name = "pyrefly", specifier = ">=1.2.0" },

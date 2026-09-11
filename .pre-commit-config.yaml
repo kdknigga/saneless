@@ -55,7 +55,13 @@ repos:
 
       - id: pyrefly-checker
         name: pyrefly type checker
-        entry: uv run pyrefly check
+        # Name the source trees explicitly. Pyrefly's default project-excludes
+        # heuristics skip any path containing a hidden directory component, so
+        # a checkout living under a dot-directory (a git worktree in
+        # .claude/worktrees/, say) matches zero files and the bare invocation
+        # exits 1 having checked nothing. Explicit paths bypass the heuristic;
+        # src and tests are the only directories here that contain Python.
+        entry: uv run pyrefly check src tests
         language: system
         types: [python]
         pass_filenames: false
