@@ -253,7 +253,7 @@ exactly as written.
 uv run ruff check .                                   -> All checks passed!
 uv run ruff format --check .                          -> 39 files already formatted
 uv run ty check                                       -> All checks passed!
-uv run pyrefly check                                  -> 0 errors  (src; see deviation 1)
+uv run pyrefly check src tests                                  -> 0 errors  (src; see deviation 1)
 uv run pyrefly check src/saneless/pipeline.py \
         src/saneless/worker.py src/saneless/cli.py \
         tests/test_pipeline.py tests/test_worker.py \

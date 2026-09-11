@@ -100,7 +100,7 @@ Each task was committed atomically:
 - **Issue:** Removing ty/pyrefly exclusions exposed errors in test_web.py (client.app.state access, StubScanner param names) and test_worker.py (Job|None narrowing, method reassignment)
 - **Fix:** Added _app() helper for TestClient type narrowing, _get() helper for Job|None narrowing, monkeypatch.setattr for method replacement, fixed StubScanner param names
 - **Files modified:** tests/test_web.py, tests/test_worker.py
-- **Verification:** uv run ty check and uv run pyrefly check both pass clean
+- **Verification:** uv run ty check and uv run pyrefly check src tests both pass clean
 - **Committed in:** 3a2d7af (Task 2 commit)
 
 **2. [Rule 3 - Blocking] Added ARG per-file-ignore for test files**

@@ -26,7 +26,7 @@ created: 2026-09-10
 **Per-test hang guard:** `timeout = 60`, `timeout_method = "signal"`. The 200-round concurrency test measured **0.28 s** — 0.5 % of budget.
 
 **Static gates (all must be clean, no suppressions — CLAUDE.md):**
-`uv run ruff check .` · `uv run ruff format --check .` · `uv run ty check` · `uv run pyrefly check`
+`uv run ruff check .` · `uv run ruff format --check .` · `uv run ty check` · `uv run pyrefly check src tests`
 
 ---
 
@@ -61,7 +61,7 @@ Task IDs are placeholders until the planner assigns them; the **Requirement**, *
 | 22-04-xx | 04 | 3 | STOR-04 | — | `_COLUMNS` is the sole column list; `_row_to_job` the sole mapping (source assertion + no duplicate SELECT list) | unit | `uv run pytest tests/test_job.py -k single_mapping -q` | ✅ | ✅ green |
 | 22-05-xx | 05 | 3 | STOR-05 | — | `fail_active_jobs()` moves every non-terminal job to `JobState.ERROR` with a "server restarted" reason, terminal rows untouched (D-19) | unit | `uv run pytest tests/test_job.py -k fail_active -q` | ✅ | ✅ green |
 | 22-05-xx | 05 | 3 | STOR-05 | — | `list_pending()` returns queued jobs in creation order; predicate derived from `ACTIVE_STATES`, params `sorted()` (D-26) | unit | `uv run pytest tests/test_job.py -k list_pending -q` | ✅ | ✅ green |
-| 22-06-xx | 06 | 4 | STOR-01..05 | — | Whole suite green; all four static gates clean with zero suppressions | integration | `uv run pytest -m "not browser" -q && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check` | ✅ | ✅ green |
+| 22-06-xx | 06 | 4 | STOR-01..05 | — | Whole suite green; all four static gates clean with zero suppressions | integration | `uv run pytest -m "not browser" -q && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pyrefly check src tests` | ✅ | ✅ green |
 
 *Status: ⬜ pending · ✅ green · ❌ red · ⚠️ flaky*
 
@@ -80,7 +80,7 @@ rather than to the tree, and neither changes what is covered:
    is still what found the stale expression, because the stale row was never part of the
    chain -- the chain runs the whole suite, not the `-k` slices.
 
-The final integration row's `uv run pyrefly check` was run as `uv run pyrefly check src tests`.
+The final integration row's `uv run pyrefly check src tests` was run as `uv run pyrefly check src tests`.
 A bare `pyrefly check` cannot work inside a `.claude/worktrees/` executor checkout: the path is
 matched by `.gitignore:314`, so pyrefly checks nothing and exits 1. The explicit-path form
 reports `0 errors`. The authoritative bare invocation belongs to the post-merge run on the main

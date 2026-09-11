@@ -127,7 +127,7 @@ Full five-check sequence, run locally on the locked `ruff` 0.15.7 / `ty` 0.0.24 
 uv run ruff check .            -> No issues found
 uv run ruff format --check .   -> 37 files already formatted
 uv run ty check                -> All checks passed!
-uv run pyrefly check           -> INFO 0 errors
+uv run pyrefly check src tests           -> INFO 0 errors
 uv run pytest -m "not browser" -> 332 passed, 8 deselected in 26.78s
 ```
 

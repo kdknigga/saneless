@@ -238,7 +238,7 @@ def test_form_fields_sent_as_data_not_files(self, sample_pdf: Path) -> None:
 ### Sampling Rate
 - **Per task commit:** `uv run pytest tests/test_paperless.py tests/test_pipeline.py -x`
 - **Per wave merge:** `uv run pytest`
-- **Phase gate:** Full suite green + `uv run ruff check .` + `uv run ty check` + `uv run pyrefly check`
+- **Phase gate:** Full suite green + `uv run ruff check .` + `uv run ty check` + `uv run pyrefly check src tests`
 
 ### Wave 0 Gaps
 - [ ] New test for D-06: form fields sent as `data=` not `files=` in `tests/test_paperless.py`

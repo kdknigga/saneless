@@ -105,7 +105,7 @@ These are as authoritative as the locked decisions. The planner must not recomme
 | Directive | Consequence for this phase |
 |-----------|---------------------------|
 | Python 3.14, `uv` (not pip/poetry/conda) | All commands are `uv run ...`. Verified: Python 3.14.2. |
-| **All four checks must pass with zero errors:** `ruff check`, `ruff format --check`, `ty check`, `pyrefly check` | The `PLR0911` finding below is a hard CI blocker, not a style nit. |
+| **All four checks must pass with zero errors:** `ruff check`, `ruff format --check`, `ty check`, `pyrefly check src tests` | The `PLR0911` finding below is a hard CI blocker, not a style nit. |
 | **"Fix reported issues properly. Do not suppress errors with `# type: ignore`, `# noqa`, or by disabling rules."** | The `PLR0911` fix must be structural (single-return form). Raising `pylint.max-returns` in `pyproject.toml` is "disabling a rule" and is forbidden. |
 | No mypy or pyright | Only `ty` and `pyrefly` verdicts matter — and **they disagree on match-pattern narrowing**. See the pattern table. |
 | Ruff `D` rules require docstrings on all public modules, classes, and functions | `vocabulary.py` needs a module docstring; every enum, function, and dataclass needs one. |
@@ -118,7 +118,7 @@ These are as authoritative as the locked decisions. The planner must not recomme
 uv run ruff check .
 uv run ruff format --check .
 uv run ty check
-uv run pyrefly check
+uv run pyrefly check src tests
 uv run pytest -m "not browser"
 ```
 
@@ -353,7 +353,7 @@ def state_label(state: JobState) -> str:
 Verified against all four gates:
 - `ruff check` → clean (one return statement)
 - `ty check` → clean when total; `error[type-assertion-failure] ... Inferred type of argument is Literal[JobState.ERROR]` when a member is dropped
-- `pyrefly check` → clean when total; `ERROR Argument Literal[JobState.ERROR] is not assignable to parameter arg with type Never [bad-argument-type]` when a member is dropped
+- `pyrefly check src tests` → clean when total; `ERROR Argument Literal[JobState.ERROR] is not assignable to parameter arg with type Never [bad-argument-type]` when a member is dropped
 - runtime → returns the label; raises `AssertionError: Expected code to be unreachable, but got: 'ZZZ'` for an unknown value
 
 `[VERIFIED: executed — all four gates, both the complete and the deliberately-incomplete variant]`
@@ -847,7 +847,7 @@ grep -rn 'FALLBACK' src/                   # only ScanOutcome.FALLBACK should re
 
 ### Pitfall 2: `ty` and `pyrefly` disagree about which patterns narrow
 
-**What goes wrong:** a `match` written with raw string patterns or `.value` patterns passes `ty check` cleanly and then fails `pyrefly check` with `Argument JobState is not assignable to parameter arg with type Never` — the `assert_never` reports the *whole enum type*, not a missing member, which reads like a bug in the code rather than a pattern-syntax problem. Conversely a guarded arm passes `pyrefly`... no: it passes `ty` and fails `pyrefly`.
+**What goes wrong:** a `match` written with raw string patterns or `.value` patterns passes `ty check` cleanly and then fails `pyrefly check src tests` with `Argument JobState is not assignable to parameter arg with type Never` — the `assert_never` reports the *whole enum type*, not a missing member, which reads like a bug in the code rather than a pattern-syntax problem. Conversely a guarded arm passes `pyrefly`... no: it passes `ty` and fails `pyrefly`.
 **Why it happens:** a `StrEnum` member is also a `str`. `ty` treats a string literal pattern as matching the corresponding enum member and narrows; `pyrefly` does not narrow at all. Guards are the mirror image — `pyrefly` correctly refuses to count a conditionally-taken arm as consuming the member, `ty` incorrectly does.
 **How to avoid:** bare member patterns only. No `.value`. No string literals. No `if` guards in the case clause.
 **Warning signs:** `pyrefly` reports the bare enum type (`JobState`) rather than a specific `Literal[JobState.X]` — that means "narrowing didn't happen", not "you missed a member".
@@ -1221,13 +1221,13 @@ This phase is a rename/refactor, so this section is mandatory. The canonical que
 | CTR-04 | `source_to_slug` still distinguishes ADF Front from ADF Back | unit | `uv run pytest -q tests/test_auto_profiles.py::TestSourceToSlug` | ✅ (must stay green unedited) |
 | CTR-05 | Every `ErrorCategory` member has a user message | unit (parametrised over `list(ErrorCategory)`) | `uv run pytest -q tests/test_vocabulary.py::test_every_category_has_a_message` | ❌ Wave 0 |
 | CTR-05 | `classify_error` maps each exception type correctly | unit | `uv run pytest -q tests/test_worker.py -k ErrorCategory` | ✅ |
-| **all** | Exhaustiveness is actually enforced | type-check gate | `uv run ty check && uv run pyrefly check` | ✅ (Phase 20 CI) |
+| **all** | Exhaustiveness is actually enforced | type-check gate | `uv run ty check && uv run pyrefly check src tests` | ✅ (Phase 20 CI) |
 | **all** | `PLR0911` and the rest of the lint gate | lint gate | `uv run ruff check . && uv run ruff format --check .` | ✅ (Phase 20 CI) |
 | **all** | Nothing else regressed | full suite | `uv run pytest -m "not browser"` — must return **332+ passed** | ✅ |
 
 ### Sampling Rate
 
-- **Per task commit:** `uv run ruff check . && uv run ty check && uv run pyrefly check && uv run pytest -q -m "not browser" <the touched test module>` — the type-check trio is non-negotiable here because it *is* the phase's enforcement mechanism, and a missing enum arm is invisible to pytest.
+- **Per task commit:** `uv run ruff check . && uv run ty check && uv run pyrefly check src tests && uv run pytest -q -m "not browser" <the touched test module>` — the type-check trio is non-negotiable here because it *is* the phase's enforcement mechanism, and a missing enum arm is invisible to pytest.
 - **Per wave merge:** `uv run pytest -m "not browser"` (~27 s) — must be ≥ 332 passed, 0 failed.
 - **After any template edit:** additionally `uv run pytest -m browser`. Templates are the one surface no type checker guards.
 - **Phase gate:** all five CONTRIBUTING checks green, plus the two grep gates, before `/gsd-verify-work`.
@@ -1341,7 +1341,7 @@ This phase changes no authentication, authorisation, session, network, or storag
 
 ### Primary (HIGH confidence) — executed in this repository on 2026-09-10
 
-- **Type-checker pattern matrix** — probe module written to `src/saneless/_probe.py`, checked with `uv run ty check`, `uv run pyrefly check`, `uv run ruff check`, then deleted; tree verified clean via `git status --porcelain` (0 lines). Ten pattern variants, each in complete and deliberately-incomplete form.
+- **Type-checker pattern matrix** — probe module written to `src/saneless/_probe.py`, checked with `uv run ty check`, `uv run pyrefly check src tests`, `uv run ruff check`, then deleted; tree verified clean via `git status --porcelain` (0 lines). Ten pattern variants, each in complete and deliberately-incomplete form.
 - **`PLR0911` finding** — `uv run ruff check` on a 7-arm / 7-return `match`: `PLR0911 Too many return statements (7 > 6)`.
 - **`upload_document` blast radius** — `tests/conftest.py` and `src/saneless/pipeline.py` temporarily modified, `uv run pytest -q -m "not browser"` run twice, both files restored from backups, tree verified clean. Result: `18 failed, 314 passed, 8 deselected`.
 - **Baseline** — `uv run pytest -q -m "not browser"` → `332 passed, 8 deselected in 26.83s`.

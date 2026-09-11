@@ -384,7 +384,7 @@ click.echo(
 
 - **Per task commit:** `uv run pytest tests/test_web.py tests/test_cli.py -x -q`
 - **Per wave merge:** `uv run pytest -x -q`
-- **Phase gate:** Full suite green + `uv run ruff check .` + `uv run ty check` + `uv run pyrefly check`
+- **Phase gate:** Full suite green + `uv run ruff check .` + `uv run ty check` + `uv run pyrefly check src tests`
 
 ### Wave 0 Gaps
 

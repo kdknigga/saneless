@@ -22,7 +22,7 @@ human_verification: []
 | #  | Truth                                                                 | Status     | Evidence                                                                            |
 |----|-----------------------------------------------------------------------|------------|-------------------------------------------------------------------------------------|
 | 1  | ty check runs on tests/ and passes clean                              | VERIFIED   | `uv run ty check` exits 0; ty section in pyproject.toml has no exclude             |
-| 2  | pyrefly check runs on tests/ and passes clean                         | VERIFIED   | `uv run pyrefly check` reports 0 errors; pyrefly section has no project_excludes   |
+| 2  | pyrefly check src tests runs on tests/ and passes clean                         | VERIFIED   | `uv run pyrefly check src tests` reports 0 errors; pyrefly section has no project_excludes   |
 | 3  | All type: ignore comments in test files are eliminated                | VERIFIED   | grep for "type: ignore" across all tests/*.py returns 0 matches                    |
 | 4  | All 226 existing tests pass                                           | VERIFIED   | `uv run pytest -x -q` exits 0 with "226 passed"                                   |
 | 5  | Every test function and fixture has a return type annotation          | VERIFIED   | ruff check passes with ANN in select and no ANN exemption for tests               |
@@ -69,7 +69,7 @@ Despite this documentation gap, the functional goals described by each requireme
 | Requirement | Source Plan | Functional Description (from ROADMAP/PLAN context)    | Status   | Evidence                                                       |
 |-------------|-------------|-------------------------------------------------------|----------|----------------------------------------------------------------|
 | TQUAL-01    | 09-01       | ty check covers tests/ with zero errors               | VERIFIED | uv run ty check exits 0; no exclude in [tool.ty.src]          |
-| TQUAL-02    | 09-01       | pyrefly check covers tests/ with zero errors          | VERIFIED | uv run pyrefly check reports 0 errors; no project_excludes    |
+| TQUAL-02    | 09-01       | pyrefly check src tests covers tests/ with zero errors          | VERIFIED | uv run pyrefly check src tests reports 0 errors; no project_excludes    |
 | TQUAL-03    | 09-02       | All test functions have return type annotations       | VERIFIED | ruff passes with ANN; no ANN in tests per-file-ignores        |
 | TQUAL-04    | 09-02       | All test parameters have type annotations             | VERIFIED | ruff passes with ANN; 0 ANN violations                        |
 | TQUAL-05    | 09-02       | All public test code has docstrings; lazy imports moved | VERIFIED | ruff passes with D; PLC0415 absent from tests per-file-ignores |

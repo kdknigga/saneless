@@ -251,7 +251,7 @@ always `uv run <tool>`, never bare `ruff`/`pytest`/`ty`, and `uv run prek run` (
 uv run ruff check .
 uv run ruff format --check .
 uv run ty check
-uv run pyrefly check
+uv run pyrefly check src tests
 uv run pytest -m "not browser"
 ```
 
@@ -384,14 +384,14 @@ modified `get_options` needs a docstring — every existing method in these mock
 
       - id: pyrefly-checker
         name: pyrefly type checker
-        entry: uv run pyrefly check
+        entry: uv run pyrefly check src tests
         language: system
         types: [python]
         pass_filenames: false
         always_run: true
 ```
 
-CI's four lint/type commands must be `uv run ty check` and `uv run pyrefly check` verbatim
+CI's four lint/type commands must be `uv run ty check` and `uv run pyrefly check src tests` verbatim
 (no flags — RESEARCH.md Pitfall 9 notes pyrefly 1.x renamed `--python-interpreter`, which only
 matters if flags are ever added). CI adds the fifth check, `uv run pytest -m "not browser"`,
 which `prek` does not run.

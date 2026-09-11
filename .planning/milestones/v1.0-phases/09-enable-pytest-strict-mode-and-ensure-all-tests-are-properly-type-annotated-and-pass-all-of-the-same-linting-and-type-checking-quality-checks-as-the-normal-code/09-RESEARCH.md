@@ -263,7 +263,7 @@ filterwarnings = ["error"]
 - Fix test_scanner.py: replace mock patterns with concrete stubs, eliminate 6 `type: ignore`
 - Remove `exclude = ["tests/"]` from ty config
 - Remove `project_excludes = ["tests/"]` from pyrefly config
-- Verify: `uv run ty check` and `uv run pyrefly check` pass clean
+- Verify: `uv run ty check` and `uv run pyrefly check src tests` pass clean
 
 ### Plan 2: Annotations + Docstrings + Lazy Imports (Large, mechanical)
 - Add return type annotations to ~211 functions missing them
@@ -276,7 +276,7 @@ filterwarnings = ["error"]
 ### Plan 3: Pytest Strict + Verification (Small-medium)
 - Fix unclosed SQLite connections (ResourceWarning) -- likely a `job_store` fixture with cleanup
 - Add strict pytest configuration to pyproject.toml
-- Full verification: `uv run pytest`, `uv run ruff check .`, `uv run ty check`, `uv run pyrefly check`, `uv run prek run`
+- Full verification: `uv run pytest`, `uv run ruff check .`, `uv run ty check`, `uv run pyrefly check src tests`, `uv run prek run`
 
 ## Validation Architecture
 
@@ -292,13 +292,13 @@ filterwarnings = ["error"]
 | Req ID | Behavior | Test Type | Automated Command | File Exists? |
 |--------|----------|-----------|-------------------|-------------|
 | N/A | ty passes on tests/ | lint | `uv run ty check` | N/A (tool check) |
-| N/A | pyrefly passes on tests/ | lint | `uv run pyrefly check` | N/A (tool check) |
+| N/A | pyrefly passes on tests/ | lint | `uv run pyrefly check src tests` | N/A (tool check) |
 | N/A | ruff passes without test exemptions | lint | `uv run ruff check .` | N/A (tool check) |
 | N/A | pytest strict mode works | unit | `uv run pytest` | Existing 226 tests |
 | N/A | filterwarnings=error no failures | unit | `uv run pytest` | Existing 226 tests |
 
 ### Sampling Rate
-- **Per task commit:** `uv run pytest -x && uv run ruff check . && uv run ty check && uv run pyrefly check`
+- **Per task commit:** `uv run pytest -x && uv run ruff check . && uv run ty check && uv run pyrefly check src tests`
 - **Per wave merge:** Full suite: `uv run prek run`
 - **Phase gate:** All tools green before verification
 

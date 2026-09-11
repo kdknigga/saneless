@@ -23,7 +23,7 @@ re_verification: false
 | 2  | The httpx multipart type: ignore in paperless.py is removed and replaced with proper typing | VERIFIED | `type: ignore[arg-type]` absent; `FileTypes` imported under TYPE_CHECKING guard; `multipart_files: list[tuple[str, FileTypes]]` on line 114 |
 | 3  | The config.py type: ignore[call-arg] has a justification comment explaining WHY it is needed | VERIFIED | Line 153: `# type: ignore[call-arg] -- ty cannot see BaseSettings dynamic __init__ kwargs` |
 | 4  | Per-file-ignores for tests are tightened to only rules that actually produce violations | VERIFIED | Reduced from 10 rules to 6; TCH, T201, PLR0915, PLR0912, PLR0913 removed; each retained rule has TOML comment |
-| 5  | All linters and type checkers pass clean: ruff check, ty check, pyrefly check | VERIFIED | `uv run ruff check .` exits 0; `uv run ty check` exits 0; `uv run pyrefly check` exits 0 (0 errors) |
+| 5  | All linters and type checkers pass clean: ruff check, ty check, pyrefly check src tests | VERIFIED | `uv run ruff check .` exits 0; `uv run ty check` exits 0; `uv run pyrefly check src tests` exits 0 (0 errors) |
 | 6  | All 226+ tests pass without regression | VERIFIED | `uv run pytest -x -q`: 226 passed in 24.17s |
 
 **Score:** 6/6 truths verified

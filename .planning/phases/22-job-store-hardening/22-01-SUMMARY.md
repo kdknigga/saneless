@@ -68,7 +68,7 @@ completed: 2026-09-10
 - `src/saneless/job.py` gained `_S3_COLUMNS`, `_V2_COLUMNS`, `_migrate_v1`, `_migrate_v2`, `_MIGRATIONS` and `_migrate`, and a rewritten `__init__`. The schema is now spelled in exactly one place.
 - The D-05 guard reads `PRAGMA table_info(jobs)` and raises before the first `ALTER`, so a rejected database is left at `user_version = 0` with its original nine columns -- asserted by reopening the file with a fresh raw connection.
 - `__init__` sets `row_factory`, enables WAL, *then* flips `autocommit = False`, and rolls back plus closes before re-raising. `self._lock` exists for plan 22-03.
-- Full suite: **511 passed**. `ruff check`, `ruff format --check`, `ty check` and `pyrefly check` all clean, with zero suppressions added anywhere.
+- Full suite: **511 passed**. `ruff check`, `ruff format --check`, `ty check` and `pyrefly check src tests` all clean, with zero suppressions added anywhere.
 
 ## Task Commits
 

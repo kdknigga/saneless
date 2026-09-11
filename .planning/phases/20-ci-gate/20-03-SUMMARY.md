@@ -169,7 +169,7 @@ lint  Run uv sync --locked               Resolved 70 packages / Installed 70 pac
 lint  Run uv run ruff check .            All checks passed!
 lint  Run uv run ruff format --check .   37 files already formatted
 lint  Run uv run ty check                All checks passed!
-lint  Run uv run pyrefly check           INFO 0 errors
+lint  Run uv run pyrefly check src tests           INFO 0 errors
 test  Install SANE development headers   Setting up libsane-dev:amd64 (1.2.1-7build4) ...
 test  Run uv sync --locked               Resolved 70 packages / Installed 70 packages in 390ms
 test  Run uv run pytest -m "not browser"  collected 340 items / 8 deselected / 332 selected

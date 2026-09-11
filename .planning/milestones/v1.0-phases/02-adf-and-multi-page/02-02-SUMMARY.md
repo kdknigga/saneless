@@ -100,7 +100,7 @@ _Note: TDD RED commit was merged into the feat commit due to pre-commit hook req
 - **Issue:** ty could not infer Image.Image type from ThreadPoolExecutor.submit(next, iterator).result()
 - **Fix:** Added _as_image() cast helper with runtime isinstance check
 - **Files modified:** src/saneless/scanner/sane_backend.py
-- **Verification:** ty check passes clean, pyrefly check passes clean
+- **Verification:** ty check passes clean, pyrefly check src tests passes clean
 - **Committed in:** ad43719
 
 ---

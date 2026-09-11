@@ -82,7 +82,7 @@ Data originates from user TOML configuration, flows through Pydantic ProfileConf
 | Ruff linting passes                          | `uv run ruff check .`                                                                                          | All checks passed | PASS |
 | Ruff format check passes                     | `uv run ruff format --check .`                                                                                 | 37 files already formatted | PASS |
 | ty type checking passes                      | `uv run ty check`                                                                                              | All checks passed | PASS |
-| pyrefly type checking passes                 | `uv run pyrefly check`                                                                                         | 0 errors  | PASS   |
+| pyrefly type checking passes                 | `uv run pyrefly check src tests`                                                                                         | 0 errors  | PASS   |
 | Docs strict build passes                     | `uv run mkdocs build --strict`                                                                                 | Built in 0.25s, no errors | PASS |
 
 ---

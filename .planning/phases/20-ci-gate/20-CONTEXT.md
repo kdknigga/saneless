@@ -125,7 +125,7 @@ Research found — and I independently confirmed — that `github.com/kdknigga/s
 ### Reusable Assets
 - `.github/workflows/release.yml` — its `test` job is the closest existing analog for a check job (checkout → `astral-sh/setup-uv` → `uv sync` → ruff → pytest). Useful as a shape reference, but it is missing `libsane-dev`, `--locked`, both type checkers, and the browser exclusion. **Read it; do not edit it** (D-06).
 - `.github/workflows/docs.yml` — the other existing workflow. Also not to be edited here (its `pip install mkdocs-material` problem is N-31, Phase 31).
-- `.pre-commit-config.yaml` lines 41–62 — already runs ruff, ruff-format, `uv run ty check`, and `uv run pyrefly check` as local hooks. The CI job should run the same four commands so local and CI agree; the difference is that CI adds pytest and cannot be skipped with `--no-verify`.
+- `.pre-commit-config.yaml` lines 41–62 — already runs ruff, ruff-format, `uv run ty check`, and `uv run pyrefly check src tests` as local hooks. The CI job should run the same four commands so local and CI agree; the difference is that CI adds pytest and cannot be skipped with `--no-verify`.
 - `pyproject.toml` `[tool.pytest.ini_options]` (line 141) — already has `testpaths`, the registered `browser` marker, `--strict-markers`, `--strict-config`, `xfail_strict`, and `filterwarnings = ["error"]`. `timeout` and `timeout_method` are added into this existing block (D-11).
 - `pyproject.toml` `[dependency-groups].dev` (line 152) — where `pytest-timeout` is added (D-15).
 
@@ -144,7 +144,7 @@ Research found — and I independently confirmed — that `github.com/kdknigga/s
 - GitHub repo settings (`kdknigga/saneless`) — the `master` branch ruleset, applied via `gh api` (D-03). Outside the repo; verified by read-back.
 
 ### Verified baseline (measured during discussion, 2026-09-09)
-- `uv run ruff check .` → no issues. `uv run ruff format --check .` → 37 files already formatted. `uv run ty check` → all checks passed. `uv run pyrefly check` → 0 errors.
+- `uv run ruff check .` → no issues. `uv run ruff format --check .` → 37 files already formatted. `uv run ty check` → all checks passed. `uv run pyrefly check src tests` → 0 errors.
 - `uv run pytest -m "not browser"` → **332 passed, 8 deselected, 26.8s**; slowest test 3.0s.
 - Locked versions: `ty` 0.0.24, `pyrefly` 0.57.1, `ruff` 0.15.7, `pytest` 9.0.2.
 - `gh` authenticated as `kdknigga`; `act` **not** installed.

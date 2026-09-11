@@ -28,7 +28,7 @@ created: 2026-03-21
 ## Sampling Rate
 
 - **After every task commit:** Run `uv run pytest -x -q`
-- **After every plan wave:** Run `uv run pytest && uv run ruff check . && uv run ty check && uv run pyrefly check`
+- **After every plan wave:** Run `uv run pytest && uv run ruff check . && uv run ty check && uv run pyrefly check src tests`
 - **Before `/gsd:verify-work`:** Full suite + all linters must be green
 - **Max feedback latency:** 30 seconds
 
@@ -38,7 +38,7 @@ created: 2026-03-21
 
 | Task ID | Plan | Wave | Requirement | Test Type | Automated Command | File Exists | Status |
 |---------|------|------|-------------|-----------|-------------------|-------------|--------|
-| 09-01-01 | 01 | 1 | Type checker parity | integration | `uv run ty check && uv run pyrefly check` | ✅ | ⬜ pending |
+| 09-01-01 | 01 | 1 | Type checker parity | integration | `uv run ty check && uv run pyrefly check src tests` | ✅ | ⬜ pending |
 | 09-01-02 | 01 | 1 | Stub class fixes | unit | `uv run pytest tests/test_browser.py tests/test_scanner.py -x` | ✅ | ⬜ pending |
 | 09-01-03 | 01 | 1 | None narrowing | unit | `uv run pytest tests/test_job.py -x` | ✅ | ⬜ pending |
 | 09-02-01 | 02 | 2 | ANN compliance | lint | `uv run ruff check tests/ --select ANN` | ✅ | ⬜ pending |

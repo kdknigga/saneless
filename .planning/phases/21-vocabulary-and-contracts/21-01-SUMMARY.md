@@ -107,7 +107,7 @@ checkers, restored the arm.
 
 - `uv run ty check` → exit 1:
   `error[type-assertion-failure]: Argument does not have asserted type 'Never' ... Inferred type of argument is 'Literal[JobState.ERROR]'` at `vocabulary.py:132:13`
-- `uv run pyrefly check` → exit 1:
+- `uv run pyrefly check src tests` → exit 1:
   `ERROR Argument 'Literal[JobState.ERROR]' is not assignable to parameter 'arg' with type 'Never' in function 'typing.assert_never' [bad-argument-type]` at `vocabulary.py:132:26`
 
 Both name the dropped member. After restoring the arm both exit 0. The enforcement is real.
@@ -161,13 +161,13 @@ buys nothing for an object created a handful of times per scan.
   identical to HEAD.
 - **Files modified:** none tracked. `pyrefly.toml` is untracked and dies with the worktree.
 - **Verification that this is not a paper-over:** appended `BAD_PROBE: int = "not an int"`
-  to `vocabulary.py` and re-ran `uv run pyrefly check` — it reported the error, proving the
+  to `vocabulary.py` and re-ran `uv run pyrefly check src tests` — it reported the error, proving the
   configured run genuinely type-checks `src/`. The probe was then deleted.
 - **Residual gap:** even with the explicit includes, pyrefly's project mode still skips the
   `tests` tree in this worktree. Every commit was therefore additionally gated on an
   explicit `uv run pyrefly check tests/test_vocabulary.py tests/test_job.py`, which
   reported `0 errors`. In the main repository (not under a dot-directory) the stock
-  `uv run pyrefly check` covers both trees, so the orchestrator's post-merge verification
+  `uv run pyrefly check src tests` covers both trees, so the orchestrator's post-merge verification
   is unaffected.
 - **Commit:** n/a (no tracked file changed)
 
@@ -208,7 +208,7 @@ buys nothing for an object created a handful of times per scan.
 uv run ruff check .                              -> All checks passed!
 uv run ruff format --check .                     -> 39 files already formatted
 uv run ty check                                  -> All checks passed!
-uv run pyrefly check                             -> 0 errors  (src; see deviation 1)
+uv run pyrefly check src tests                             -> 0 errors  (src; see deviation 1)
 uv run pyrefly check tests/test_vocabulary.py \
                      tests/test_job.py           -> 0 errors
 uv run pytest -m "not browser"                   -> 422 passed, 8 deselected

@@ -154,7 +154,7 @@ Resolved with an **untracked** `pyrefly.toml` at the worktree root (`project-inc
 
 - `uv run pytest tests/ -q` — **555 passed**, 0 failed. (The plan anticipated surviving `list(JobState)` FALLBACK failures owned by 23-05; none are present at this base.)
 - `uv run ty check` — All checks passed.
-- `uv run pyrefly check` — 0 errors.
+- `uv run pyrefly check src tests` — 0 errors.
 - `uv run ruff check .` — No issues found. `uv run ruff format --check .` — 40 files already formatted.
 - No `# type: ignore`, no `# noqa`, no rule disabled anywhere in the diff.
 - `grep -rn '/tmp/saneless' src/` — 0 matches.

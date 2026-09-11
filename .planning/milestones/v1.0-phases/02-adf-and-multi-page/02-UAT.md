@@ -25,7 +25,7 @@ expected: Run `uv run saneless --help`, `uv run saneless scan --help`, `uv run s
 result: pass
 
 ### 4. Code Quality Checks Pass
-expected: Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run ty check`, and `uv run pyrefly check`. All four pass with zero errors or warnings.
+expected: Run `uv run ruff check .`, `uv run ruff format --check .`, `uv run ty check`, and `uv run pyrefly check src tests`. All four pass with zero errors or warnings.
 result: issue
 reported: "1 ty error and lots of pyrefly errors reported."
 severity: major
@@ -40,7 +40,7 @@ skipped: 0
 
 ## Gaps
 
-- truth: "ty check and pyrefly check both pass with zero errors or warnings"
+- truth: "ty check and pyrefly check src tests both pass with zero errors or warnings"
   status: fixed
   reason: "User reported: 1 ty error and lots of pyrefly errors reported."
   severity: major

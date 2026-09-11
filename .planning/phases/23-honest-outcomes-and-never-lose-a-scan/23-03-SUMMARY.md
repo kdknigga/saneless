@@ -73,7 +73,7 @@ completed: 2026-09-11
 - **Two jobs with the same title now produce two files.** Every document previously reached paperless as `output.pdf`, and two preserved scans overwrote each other in `failed/`. Uniqueness now derives from the uuid4 job id.
 - **A4 is A4.** `img2pdf.default_dpi` is 96, so an unlayouted 2480x3508 raster was laid out as 1860x2631 pt. Passing `get_fixed_dpi_layout_fun((dpi, dpi))` — a 2-tuple, not a scalar — yields 595.2 x 841.92, which rounds to the 595 x 842 the roadmap asks for.
 - **The duplex halves get distinct names** (`...-tax-return-fronts.pdf` / `...-tax-return-backs.pdf`), both carrying the job id, so plan 23-06's single preservation guard cannot have one half destroy the other.
-- **Full suite green:** 604 passed. `ruff check`, `ruff format --check`, `ty check` and `pyrefly check` all clean, with no `# type: ignore`, no `# noqa`, and no rule disabled anywhere in the diff.
+- **Full suite green:** 604 passed. `ruff check`, `ruff format --check`, `ty check` and `pyrefly check src tests` all clean, with no `# type: ignore`, no `# noqa`, and no rule disabled anywhere in the diff.
 
 ## Task Commits
 
@@ -110,7 +110,7 @@ TDD gate sequence verified in `git log`: `test(...)` → `feat(...)` → `test(.
 
 - **Found during:** Task 1 (first commit attempt)
 - **Issue:** This executor runs in a worktree at `.claude/worktrees/agent-*`, and `.claude/worktrees/` is in the repo's `.gitignore` (line 314). Pyrefly's `use-ignore-files` is on by default, so every source file was filtered out and the hook failed with `No Python files matched patterns`. This blocked *every* commit in the plan, and `--no-verify` is forbidden.
-- **Fix:** Changed the hook entry from `uv run pyrefly check` to `uv run pyrefly check src tests`, with a comment explaining why. Per pyrefly's documentation (confirmed via Context7): `use-ignore-files` "is bypassed when files are explicitly specified for checking." Naming the paths is the documented mechanism, not a workaround, and it behaves identically from the main checkout.
+- **Fix:** Changed the hook entry from `uv run pyrefly check src tests` to `uv run pyrefly check src tests`, with a comment explaining why. Per pyrefly's documentation (confirmed via Context7): `use-ignore-files` "is bypassed when files are explicitly specified for checking." Naming the paths is the documented mechanism, not a workaround, and it behaves identically from the main checkout.
 - **Files modified:** `.pre-commit-config.yaml`
 - **Verification:** `uv run pyrefly check src tests` reports 0 errors; the hook passed on all four commits.
 - **Committed in:** `215ce60`

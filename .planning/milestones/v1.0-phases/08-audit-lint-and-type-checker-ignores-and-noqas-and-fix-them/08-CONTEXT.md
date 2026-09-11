@@ -76,7 +76,7 @@ Test files are out of scope for ty/pyrefly coverage (that's Phase 9). Test-inher
 - Mock object attribute assignment in tests — type: ignore may be unavoidable without Protocol stubs
 
 ### Integration Points
-- All changes must pass: `uv run ruff check .`, `uv run ty check`, `uv run pyrefly check`, `uv run prek run`
+- All changes must pass: `uv run ruff check .`, `uv run ty check`, `uv run pyrefly check src tests`, `uv run prek run`
 - 226 tests must continue passing after any changes
 
 </code_context>
