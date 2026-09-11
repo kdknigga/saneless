@@ -28,6 +28,7 @@ __all__ = [
     "ScanOutcome",
     "classify_error",
     "error_message",
+    "job_state_for",
     "progress_label",
     "state_label",
 ]
@@ -43,6 +44,7 @@ class JobState(StrEnum):
     UPLOADING = "UPLOADING"
     DONE = "DONE"
     ERROR = "ERROR"
+    FALLBACK = "FALLBACK"
 
 
 class ErrorCategory(StrEnum):
@@ -56,13 +58,18 @@ class ErrorCategory(StrEnum):
 
 
 class ScanOutcome(StrEnum):
-    """How a scan attempt resolved."""
+    """
+    How a scan attempt resolved.
+
+    There is no ``FAILED`` member, and there is not going to be one: a failure
+    raises.  The ``outcome`` column therefore stays ``NULL`` on the error path
+    and ``JobState.ERROR`` carries the failure on its own.  A returned
+    ``FAILED`` would record the same fact in a second column, and two columns
+    about a job with exactly one fate are two columns that can disagree.
+    """
 
     SUCCESS = "SUCCESS"
     FALLBACK = "FALLBACK"
-    # FAILED belongs to the honest-outcomes work, which decides whether a
-    # failure is a returned outcome or a raised exception. It is added together
-    # with the code path that produces it, not ahead of it.
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
@@ -80,7 +87,9 @@ A job in one of these states has not reached an outcome yet, so the UI keeps
 polling it.
 """
 
-TERMINAL_STATES: frozenset[JobState] = frozenset({JobState.DONE, JobState.ERROR})
+TERMINAL_STATES: frozenset[JobState] = frozenset(
+    {JobState.DONE, JobState.ERROR, JobState.FALLBACK}
+)
 """Job states where the job has reached its final outcome.
 
 Together with ``ACTIVE_STATES`` this partitions ``JobState``: every member is in
@@ -131,6 +140,8 @@ def state_label(state: JobState) -> str:
             label = "Complete"
         case JobState.ERROR:
             label = "Failed"
+        case JobState.FALLBACK:
+            label = "Saved to folder"
         case _:
             assert_never(state)
     return label
@@ -145,10 +156,10 @@ def progress_label(state: JobState) -> str:
     to what shipped before -- including the literal three-period spelling of
     the trailing ellipsis, which is three ASCII periods and not U+2026.
 
-    ``DONE`` and ``ERROR`` have no progress prose in production: the status
-    partial and the CLI both branch structurally for those two.  Their arms
-    exist so the lookup is total and a future member cannot be forgotten; they
-    have no production caller in this phase.
+    ``DONE``, ``ERROR`` and ``FALLBACK`` have no progress prose in production:
+    the status partial and the CLI both branch structurally for the three
+    terminal states.  Their arms exist so the lookup is total and a future
+    member cannot be forgotten; they have no production caller in this phase.
 
     Args:
         state: The job state to describe.
@@ -175,9 +186,47 @@ def progress_label(state: JobState) -> str:
             label = "Complete"
         case JobState.ERROR:
             label = "Failed"
+        case JobState.FALLBACK:
+            label = "Saved to folder"
         case _:
             assert_never(state)
     return label
+
+
+def job_state_for(outcome: ScanOutcome) -> JobState:
+    """
+    Return the terminal job state a resolved scan outcome implies.
+
+    A ``ScanOutcome`` only exists once the pipeline has finished, so every arm
+    lands in ``TERMINAL_STATES``.  ``FALLBACK`` gets a state of its own rather
+    than being folded into ``DONE``: the document reached the consume directory
+    but its title, tags and correspondent were not applied, and calling that
+    "Complete" is the silent success this vocabulary exists to remove.
+
+    This is a ``match`` with ``assert_never`` and not a
+    ``dict[ScanOutcome, JobState]`` on purpose.  A dict missing a member draws
+    no diagnostic from either ``ty`` or ``pyrefly``; the same enum in a match
+    is caught by both, at edit time, before a third outcome can fall silently
+    through an ``else``.
+
+    Args:
+        outcome: The outcome the pipeline resolved to.
+
+    Returns:
+        The terminal JobState to persist for that outcome.
+
+    Raises:
+        AssertionError: If the value is not a ScanOutcome member.
+
+    """
+    match outcome:
+        case ScanOutcome.SUCCESS:
+            state = JobState.DONE
+        case ScanOutcome.FALLBACK:
+            state = JobState.FALLBACK
+        case _:
+            assert_never(outcome)
+    return state
 
 
 def error_message(category: ErrorCategory) -> str:
