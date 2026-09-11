@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 23.1 context gathered
-last_updated: "2026-09-11T21:55:48.911Z"
+status: ready_to_plan
+stopped_at: Phase 23.1 complete (4/4) — ready to discuss Phase 24
+last_updated: 2026-09-11T22:31:44.764Z
 last_activity: 2026-09-11 -- Phase 23.1 execution started
 progress:
   total_phases: 14
   completed_phases: 4
   total_plans: 29
-  completed_plans: 25
+  completed_plans: 29
   percent: 29
 ---
 
@@ -21,22 +21,22 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 23.1 — dark-mode-and-the-commit-gate
+**Current focus:** Phase 24 — scanner truthfulness
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 23.1 (dark-mode-and-the-commit-gate) — EXECUTING
-Plan: 1 of 4
-Status: Executing Phase 23.1
+Phase: 24
+Plan: Not started
+Status: Ready to plan
 Progress: [██████████] 100%
-Last activity: 2026-09-11 -- Phase 23.1 execution started
+Last activity: 2026-09-11
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 8
+- Total plans completed: 12
 - Average duration: 5min
 - Total execution time: 0.27 hours
 
@@ -46,6 +46,7 @@ Last activity: 2026-09-11 -- Phase 23.1 execution started
 |-------|-------|-------|----------|
 | 01-core-pipeline | 3 | 16min | 5min |
 | 20 | 5 | - | - |
+| 23.1 | 4 | - | - |
 
 **Recent Trend:**
 
