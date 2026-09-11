@@ -81,6 +81,7 @@ def browser_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_dir),
+            data_dir=str(tmp_dir),
             log_file=str(tmp_dir / "saneless.log"),
         ),
         profiles={

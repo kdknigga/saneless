@@ -79,6 +79,7 @@ def test_settings(tmp_path: Path) -> Settings:
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
         ),
         profiles={
             "default": ProfileConfig(),

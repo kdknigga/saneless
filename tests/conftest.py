@@ -27,6 +27,9 @@ if TYPE_CHECKING:
     from saneless.vocabulary import JobState
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
+# Keeps the suite out of the developer's real ~/.local/state/saneless, which is
+# where data_dir would otherwise resolve once a test builds a JobStore.
+_TEST_DATA = str(Path(tempfile.gettempdir()) / "saneless-test" / "data")
 _TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
 
 _POLL_INTERVAL = 0.02
@@ -101,6 +104,7 @@ def default_settings() -> Settings:
         ),
         output=OutputConfig(
             tmp_dir=_TEST_TMP,
+            data_dir=_TEST_DATA,
             log_file=_TEST_LOG,
         ),
         profiles={"default": ProfileConfig()},

@@ -17,7 +17,9 @@ services:
       # Create it with at minimum: [profiles.default] and [paperless] sections.
       # See: https://github.com/kris-knigga/saneless#configuration
       - ./config.toml:/etc/saneless/config.toml:ro
-      - saneless-data:/tmp/saneless
+      # Durable state: job database and preserved scans. /tmp/saneless is
+      # deliberately NOT mounted -- it is disposable scratch space.
+      - saneless-data:/var/lib/saneless
     environment:
       - SANELESS_PAPERLESS__URL=http://paperless:8000
       - SANELESS_PAPERLESS__TOKEN=changeme
