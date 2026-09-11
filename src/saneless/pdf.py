@@ -21,9 +21,38 @@ from PIL import Image
 # 600 DPI A4 color = ~34.8M pixels; 1200 DPI = ~139M pixels.
 PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
 
-__all__ = ["assemble_pdf"]
+__all__ = ["assemble_pdf", "build_pdf_filename", "sanitise_title_for_filename"]
 
 logger = logging.getLogger(__name__)
+
+
+def sanitise_title_for_filename(title: str) -> str:
+    """
+    Reduce a user-supplied title to a safe single path segment.
+
+    Args:
+        title: The title as typed by the operator.
+
+    Returns:
+        A lowercase ``[a-z0-9-]`` slug, or the empty string.
+
+    """
+    raise NotImplementedError
+
+
+def build_pdf_filename(job_id: str, title: str) -> str:
+    """
+    Compose the unique file name for one job's assembled PDF.
+
+    Args:
+        job_id: The job's identifier.
+        title: The title as typed by the operator.
+
+    Returns:
+        A single ``.pdf`` file name.
+
+    """
+    raise NotImplementedError
 
 
 def assemble_pdf(images: list[Image.Image], output_dir: Path) -> Path:
