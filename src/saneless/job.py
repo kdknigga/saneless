@@ -30,7 +30,7 @@ from saneless.vocabulary import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-__all__ = ["ErrorCategory", "Job", "JobState", "JobStore"]
+__all__ = ["ErrorCategory", "Job", "JobResult", "JobState", "JobStore"]
 
 logger = logging.getLogger(__name__)
 
@@ -412,6 +412,45 @@ class Job:
         return self.state in BUSY_STATES
 
 
+@dataclass(frozen=True)
+class JobResult:
+    """
+    Everything a finished scan recorded, bundled into one argument.
+
+    It exists to keep :meth:`JobStore.finish_job` within ruff's ``PLR0913``
+    limit of five non-``self`` parameters.  :meth:`JobStore.create_job` sits
+    exactly at that limit and passes, which is the evidence both that five is
+    the ceiling and that ``self`` is not counted; spelling these five facts out
+    as individual parameters alongside ``job_id``, ``state``, ``error`` and
+    ``error_category`` would make nine.
+
+    The fields deliberately mirror :class:`saneless.pipeline.ScanResult`
+    *without* importing it.  ``job.py`` importing ``pipeline.py`` would invert
+    the dependency direction -- the pipeline is the layer that knows about
+    persistence, not the reverse -- so the worker does the field-for-field copy
+    at its single call site instead.  Taking a ``ScanResult`` directly, and
+    raising the ``PLR0913`` limit, were both weighed and rejected for those two
+    reasons respectively.
+
+    Every field is optional, because a caller that has no result to record
+    passes no ``JobResult`` at all rather than a zero-filled one.
+
+    Attributes:
+        outcome: How the scan resolved.
+        warning: A note about something odd that did not fail the scan.
+        pages_scanned: Pages the scanner produced.
+        pages_removed: Pages discarded as blank.
+        pages_uploaded: Pages sent to paperless-ngx.
+
+    """
+
+    outcome: ScanOutcome | None
+    warning: str | None
+    pages_scanned: int | None
+    pages_removed: int | None
+    pages_uploaded: int | None
+
+
 def _locked[**P, R](
     method: Callable[Concatenate[JobStore, P], R],
 ) -> Callable[Concatenate[JobStore, P], R]:
@@ -558,8 +597,11 @@ class JobStore:
                     correspondent,
                     thumbnail,
                     datetime.now(tz=UTC).isoformat(),
-                    # The six result columns are written by nothing in this
-                    # phase.
+                    # A new job has recorded nothing yet, so every result
+                    # column starts NULL -- deliberately, because NULL means
+                    # "never recorded" rather than a measured zero.  finish_job
+                    # is the writer of the first five, once the run ends;
+                    # owner_token still has no writer.
                     None,  # outcome
                     None,  # pages_scanned
                     None,  # pages_removed
@@ -622,6 +664,63 @@ class JobStore:
                 ),
             )
         logger.debug("Job %s -> %s", job_id, state.value)
+
+    @_locked
+    def finish_job(
+        self,
+        job_id: str,
+        state: JobState,
+        result: JobResult | None = None,
+        error: str | None = None,
+        error_category: ErrorCategory | None = None,
+    ) -> None:
+        """
+        Record a job's terminal state together with everything the run produced.
+
+        The only writer of the five result columns, and the reason
+        :meth:`update_state` is not.  ``update_state``'s SQL is an
+        unconditional ``SET state, error, error_category``; naming the result
+        columns there would blank them on every in-flight SCANNING /
+        ASSEMBLING / UPLOADING transition, so the terminal write is a separate
+        method rather than an extra argument.
+
+        State, outcome, warning, the three counts and the error all land in one
+        ``UPDATE``.  The web request thread reads this row while the worker
+        thread writes it, and a two-statement version would let it observe a
+        job that had finished but had not yet recorded how.
+
+        Omitting ``result`` leaves ``outcome``, ``warning`` and all three page
+        counts NULL rather than zero.  NULL means "never recorded"; ``0`` means
+        "counted, and there were none".  A job that failed before the scanner
+        opened has not measured zero pages, and writing ``0`` would make those
+        two states indistinguishable for the life of the row.
+
+        Args:
+            job_id: The UUID string of the job.
+            state: The terminal state to record.
+            result: What the run recorded, or None when it recorded nothing.
+            error: Optional error message (typically set with ERROR state).
+            error_category: Optional error category for programmatic handling.
+
+        """
+        with self._conn:
+            self._conn.execute(
+                "UPDATE jobs SET state = ?, outcome = ?, warning = ?, "
+                "pages_scanned = ?, pages_removed = ?, pages_uploaded = ?, "
+                "error = ?, error_category = ? WHERE id = ?",
+                (
+                    state.value,
+                    result.outcome.value if result and result.outcome else None,
+                    result.warning if result else None,
+                    result.pages_scanned if result else None,
+                    result.pages_removed if result else None,
+                    result.pages_uploaded if result else None,
+                    error,
+                    error_category.value if error_category else None,
+                    job_id,
+                ),
+            )
+        logger.debug("Job %s finished as %s", job_id, state.value)
 
     @_locked
     def update_thumbnail(self, job_id: str, thumbnail: str) -> None:
