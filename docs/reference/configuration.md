@@ -40,7 +40,8 @@ Output, logging, and web server settings.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `tmp_dir` | string | `"/tmp/saneless"` | Temporary directory for scan files and SQLite database |
+| `tmp_dir` | string | `"/tmp/saneless"` | Scratch space for the scan in progress; its contents are deleted as each scan finishes and nothing durable is kept here |
+| `data_dir` | string | `"~/.local/state/saneless"` | Durable state: the job database (`saneless.db`) and `failed/`, where scans that could not be delivered to paperless-ngx are preserved. Must survive restarts. The container image sets this to `/var/lib/saneless` |
 | `log_file` | string | `"~/.local/state/saneless/saneless.log"` | Log file path (XDG state directory) |
 | `log_level` | string | `"INFO"` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `log_max_bytes` | int | `10485760` | Max log file size before rotation (10 MB) |
@@ -88,6 +89,7 @@ consume_dir = ""
 
 [output]
 tmp_dir = "/tmp/saneless"
+data_dir = "/var/lib/saneless"
 log_file = "/var/log/saneless/saneless.log"
 log_level = "INFO"
 log_max_bytes = 10485760
