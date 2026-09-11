@@ -31,18 +31,18 @@ Evidence paths (all absolute):
 |----------|-------|
 | Tool | none (no shadcn, no Tailwind, no build step) |
 | Preset | not applicable |
-| Component library | PicoCSS v2 (`@picocss/pico@2`, classless) via jsDelivr CDN |
+| Component library | PicoCSS v2 (`@picocss/pico@2.1.1`, classless) via jsDelivr CDN; `pico.colors.css` not shipped (DARK-03) |
 | Interaction library | htmx v2.0.8 via jsDelivr CDN |
 | Templating | Jinja2 served by FastAPI |
 | Icon library | none — Unicode glyphs only (`U+21BB` refresh, `U+2713` checkmark, `U+2717` cross, `U+2192` rightwards arrow) plus two inline SVG illustrations in `flip.html` |
 | Font | PicoCSS default system stack (`--pico-font-family`): `system-ui, -apple-system, "Segoe UI", Roboto, ...` |
-| Theme mode | `data-theme="auto"` is set, but Pico v2 requires the attribute to be *absent* for automatic dark; the page renders light in practice (see Color) |
+| Theme mode | automatic, from the OS `prefers-color-scheme`; `<html>` carries no `data-theme` attribute (Pico v2 engages automatic dark only when it is absent); `<meta name="color-scheme" content="light dark">` is present |
 | Layout container | PicoCSS `.container` applied to `<header>` and `<main>` |
 
 ### Design philosophy
 
 - Classless semantic HTML — styling is driven almost entirely by element type (`<article>`, `<form>`, `<label>`, `<select>`, `<button>`, `<table role="grid">`) rather than utility classes.
-- Zero build step — stylesheets and scripts are CDN-hosted; `/static/app.css` and `/static/app.js` contain only thin app-specific overrides (113 lines CSS, 43 lines JS).
+- Zero build step — stylesheets and scripts are CDN-hosted; `/static/app.css` and `/static/app.js` contain only thin app-specific overrides (128 lines CSS, 43 lines JS).
 - Server-rendered HTML partials; htmx orchestrates async swaps. No SPA, no client-side router, no reactive framework.
 
 ### Project-specific classes (exhaustive)
@@ -57,7 +57,7 @@ The only non-Pico classes defined in `app.css`:
 | `.refresh-btn` | Inline, transparent circular-arrow button beside tag/correspondent labels | `index.html` |
 | `.status-done` | Success color (uses `--pico-ins-color`) for status text and history cell | `status.html`, `history.html` |
 | `.status-error` | Error color (uses `--pico-del-color`) for error text and history cell | `status.html`, `history.html` |
-| `.status-fallback` | Warning color (amber) for a consume-directory fallback — a degraded success, so deliberately neither the ins green nor the del red. Uses `var(--pico-color-amber-600, #a16207)`; PicoCSS v2 ships its colour palette in a separate `pico.colors.css` that `base.html` does not link, so the literal `#a16207` is what renders today | `status.html`, `history.html` |
+| `.status-fallback` | Warning color (amber) for a consume-directory fallback — a degraded success, so deliberately neither the ins green nor the del red. Uses `var(--saneless-status-fallback)`: `#a16207` in light (4.92:1) and `#ca8a04` in dark (6.11:1) | `status.html`, `history.html` |
 | `.history-table-wrap` | Horizontal scroll wrapper for job history table on narrow viewports | `index.html` |
 | `.sr-only` | Screen-reader-only text for icon-only button labels | `index.html` (refresh buttons) |
 
@@ -126,21 +126,34 @@ Neither override constitutes a new type scale entry. Future phases should normal
 
 ## Color
 
-Color is delegated to PicoCSS v2 semantic tokens. Every `app.css` colour is written as `var(--pico-token, fallback)`; the one literal hex in the file is the fallback on `.status-fallback`, because Pico's amber lives in the palette file described below rather than among the semantic tokens.
+Color is delegated to PicoCSS v2 semantic tokens. Nearly every `app.css` colour is written as `var(--pico-token, fallback)`; the only literal hexes in the file are the light and dark values of `--saneless-status-fallback`, the single scheme-dependent colour the app owns, because Pico has no amber among its semantic tokens.
 
-**Two findings recorded in Phase 23, both verified against the CDN build actually linked by `base.html`:**
+**Two findings recorded in Phase 23, resolved in Phase 23.1, both verified against the CDN build linked by `base.html`:**
 
-1. `pico.min.css` carries the semantic tokens (`--pico-ins-color`, `--pico-del-color`, …) but **not** the colour palette (`--pico-color-amber-600` and friends) — that ships separately as `pico.colors.css`, which the page does not link. So `.status-fallback`'s `var(--pico-color-amber-600, #a16207)` falls through to the literal amber today. Linking `pico.colors.css` would make the token resolve with no further change.
-2. `base.html` sets `data-theme="auto"`, but Pico v2's automatic dark rule is scoped to `:root:not([data-theme])` — the attribute has to be *absent*, not `"auto"` (that was the Pico v1 spelling). The page therefore renders in the light palette regardless of OS preference. This is pre-existing, predates Phase 23, and is **not** fixed here; it is recorded so it is a known defect rather than a silent one.
+1. `pico.min.css` carries the semantic tokens (`--pico-ins-color`, `--pico-del-color`, …) but **not** the colour palette — that ships separately as `pico.colors.css`, which the page does not link. Linking it would **not** have been the no-op Phase 23 assumed: Pico v2.1.1's `--pico-color-amber-600` is `#785800`, not the `#a16207` the app renders, and `#785800` measures 2.74:1 on the dark surface — a worse failure than the one being fixed. The palette file is therefore not shipped (DARK-03), and `.status-fallback` reads the app-owned `--saneless-status-fallback` instead.
+2. `base.html` set `data-theme="auto"`, but Pico v2's automatic dark rule is scoped to `:root:not([data-theme])` — the attribute has to be *absent*, not `"auto"` (that was the Pico v1 spelling). The attribute was removed in Phase 23.1, so the OS preference is now honoured.
 
-| Role | Token | Usage |
-|------|-------|-------|
-| Dominant (60%) background/surface | `--pico-background-color` | Body, main, article surfaces |
-| Secondary (30%) surface | `--pico-card-background-color`, `--pico-muted-border-color` | `<article>` cards (Scan form, Job History), thumbnail border |
-| Accent (10%) primary | `--pico-primary`, `--pico-primary-hover` | `#status-area` left border; refresh button color; primary `<button type="submit">` (Pico default); htmx `aria-busy` spinner |
-| Success semantic | `--pico-ins-color` (fallback `green`) | `.status-done` text: checkmark "Done" row + DONE history cell |
-| Destructive/error semantic | `--pico-del-color` (fallback `red`) | `.status-error` text: error alert + ERROR history cell |
-| Warning semantic | `--pico-color-amber-600` (fallback `#a16207`) | `.status-fallback` text: consume-directory fallback line + inline warning + FALLBACK history cell |
+| Role | Token | Light | Dark | Usage |
+|------|-------|-------|------|-------|
+| Dominant (60%) background/surface | `--pico-background-color` | `#ffffff` | `rgb(19, 23, 31)` | Page surface on `<html>`; also every `td` background |
+| Secondary (30%) surface | `--pico-card-background-color`, `--pico-muted-border-color` | `#ffffff` | `rgb(24, 28, 37)` | `<article>` cards (Scan form, Job History), thumbnail border |
+| Accent (10%) primary | `--pico-primary`, `--pico-primary-hover` | `#0172ad` | `#01aaff` | `#status-area` left border; refresh button color; primary `<button type="submit">` (Pico default); htmx `aria-busy` spinner |
+| Success semantic | `--pico-ins-color` (fallback `green`) | `rgb(29, 106, 84)` | `rgb(98, 175, 154)` | `.status-done` text: checkmark "Done" row + DONE history cell |
+| Destructive/error semantic | `--pico-del-color` (fallback `red`) | `rgb(136, 57, 53)` | `rgb(206, 126, 123)` | `.status-error` text: error alert + ERROR history cell |
+| Warning (app-owned) | `--saneless-status-fallback` | `#a16207` | `#ca8a04` | `.status-fallback` text: consume-directory fallback line + inline warning + FALLBACK history cell |
+
+### Measured status contrast (Chromium-computed, both schemes)
+
+Status text sits on the page surface in `#status-area` and on the `td` background in the history table; those two are the same colour. The card column is the margin for any future placement inside an `<article>`.
+
+| Class | Scheme | Computed colour | vs page / `td` | vs card | AA 4.5:1 |
+|-------|--------|-----------------|----------------|---------|----------|
+| `.status-done` | light | `rgb(29, 106, 84)` | 6.48:1 | 6.48:1 | PASS |
+| `.status-error` | light | `rgb(136, 57, 53)` | 7.83:1 | 7.83:1 | PASS |
+| `.status-fallback` | light | `rgb(161, 98, 7)` | 4.92:1 | 4.92:1 | PASS |
+| `.status-done` | dark | `rgb(98, 175, 154)` | 6.94:1 | 6.59:1 | PASS |
+| `.status-error` | dark | `rgb(206, 126, 123)` | 5.89:1 | 5.60:1 | PASS |
+| `.status-fallback` | dark | `rgb(202, 138, 4)` | 6.11:1 | 5.80:1 | PASS |
 
 **60/30/10 compliance:** the ratio is enforced by Pico's classless defaults rather than by this project. The only app-specific colored surface is the 4px (Pico `--pico-border-width`) left border on `#status-area` painted with `--pico-primary` — the single accent moment on the page.
 
@@ -154,7 +167,13 @@ Destructive/secondary actions:
 - "Abort scan" button uses Pico's `.secondary` class, not a destructive red. This is the only non-primary button style in use.
 - Actual error visuals use `--pico-del-color` for text, never for buttons.
 
-No dark-mode-specific overrides are written in `app.css`; Pico variables handle both themes automatically.
+### Dark-scheme convention (established in Phase 23.1)
+
+1. A scheme-dependent colour the app owns is an **app-namespaced custom property** (`--saneless-*`), declared on `:root` with its light value.
+2. Its dark value is declared **twice**, with selectors that mirror Pico v2's exactly: `@media only screen and (prefers-color-scheme: dark) { :root:not([data-theme]) }` and `[data-theme="dark"]`. The forced-dark block costs three lines and stops a future toggle from painting light amber on a dark surface.
+3. Consuming rules read only the custom property (`color: var(--saneless-status-fallback)`), never a hex.
+4. Pico semantic tokens that already swap per scheme are used directly and never overridden.
+5. Every app-owned colour carries a measured contrast ratio for both schemes in this spec.
 
 ---
 
@@ -315,14 +334,14 @@ Current a11y affordances observed in markup:
 |---------|----------------|
 | Page language | `<html lang="en">` |
 | Viewport | `<meta name="viewport" content="width=device-width, initial-scale=1">` |
-| Theme | `data-theme="auto"` is set on `<html>`, but Pico v2 scopes its automatic dark rule to `:root:not([data-theme])`, so the OS preference is **not** honoured today — see the two findings under Color |
+| Theme | The OS `prefers-color-scheme` is honoured, through the *absence* of `data-theme` on `<html>` (what Pico v2's automatic dark rule requires) plus `<meta name="color-scheme" content="light dark">`, which keeps the pre-stylesheet canvas dark for a dark-preference user |
 | Icon-only buttons | Refresh buttons carry `aria-label`, `title`, and `.sr-only` screen-reader text (validated Phase 12) |
 | Busy states | `aria-busy="true"` on `<p>` during PENDING/SCANNING/ASSEMBLING/UPLOADING; `aria-busy` toggled on `#scan-btn` |
 | Error announcements | Error `<p>` carries `role="alert"` for live-region announcement |
 | Data tables | `<table role="grid">` for job history |
 | Action grouping | Flip prompt buttons wrapped in `<div role="group">` |
 | Decorative SVG | Each flip SVG has `aria-label`; captions reinforce with visible `<small>` text |
-| Contrast | Uses PicoCSS semantic tokens (`--pico-ins-color`, `--pico-del-color`) that respect theme contrast. `.status-fallback`'s amber-600 is chosen for the light palette the page actually renders in (4.9:1 on `#fff`) |
+| Contrast | Every status colour is measured in both schemes — see the six-row table under Color. All pass AA; the dark values are 6.94:1 (`.status-done`), 5.89:1 (`.status-error`) and 6.11:1 (`.status-fallback`) against the dark page surface |
 | Labels | Every `<input>` / `<select>` has an associated `<label for="">` or wraps inside `<label>` |
 | Form control IDs | `profile-select`, `title-input`, `tags-select`, `correspondent-select`, `scan-btn` |
 | Thumbnail `alt` | `First page preview` |
@@ -347,7 +366,8 @@ External runtime dependencies (CDN):
 
 | Source | Artifact | Version | Notes |
 |--------|----------|---------|-------|
-| cdn.jsdelivr.net | `@picocss/pico@2/css/pico.min.css` | v2 (major pinned) | Classless stylesheet |
+| cdn.jsdelivr.net | `@picocss/pico@2.1.1/css/pico.min.css` | 2.1.1 (exact) | Classless stylesheet; pinned in Phase 23.1 because the dark-mode tests assert this build's exact surface colours |
+| cdn.jsdelivr.net | `@picocss/pico@2.1.1/css/pico.colors.min.css` | none | Palette file explicitly **not** linked (DARK-03); the app owns its one amber instead |
 | cdn.jsdelivr.net | `htmx.org@2.0.8/dist/htmx.min.js` | 2.0.8 (exact) | Interaction engine |
 
 Supply-chain posture: both assets ship from jsDelivr with SRI not currently applied. That is a known gap (not in scope for this retrospective spec — logged for future hardening).
