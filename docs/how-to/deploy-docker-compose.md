@@ -50,7 +50,7 @@ services:
       - "8080:8080"
     volumes:
       - ./config.toml:/etc/saneless/config.toml:ro
-      - saneless-data:/tmp/saneless
+      - saneless-data:/var/lib/saneless
     environment:
       - SANELESS_PAPERLESS__URL=http://paperless:8000
       - SANELESS_PAPERLESS__TOKEN=your-paperless-api-token
@@ -69,6 +69,7 @@ Key details:
 - **Image:** `ghcr.io/kris-knigga/saneless:latest` includes `libsane` and handles `python-sane` compilation automatically
 - **Port 8080:** The saneless web UI
 - **Config mount:** `./config.toml:/etc/saneless/config.toml:ro` -- read-only bind mount
+- **Data volume:** `saneless-data:/var/lib/saneless` is required, not optional. It holds the job database and the `failed/` directory, where saneless preserves any scan it could not deliver to paperless-ngx. The image already sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless`, so mounting the volume there is all that is needed. See [Docker volumes](../reference/docker.md#volumes) for what accumulates in `failed/` and how to drain it
 - **Shared network:** Both services are on the default Docker Compose network, so `http://paperless:8000` resolves automatically
 - **Network scanners:** Set `SANELESS_SCANNER__HOST=192.168.1.50` to discover scanners on a remote host. See [Scanner Host Discovery](scanner-host-discovery.md) for details
 
@@ -115,3 +116,60 @@ Pull the latest image and recreate the container:
 docker compose pull saneless
 docker compose up -d
 ```
+
+### Upgrading from a pre-`data_dir` release
+
+Earlier releases kept the job database inside the scan scratch directory, and the
+compose file mounted the `saneless-data` volume at `/tmp/saneless`. Durable state now
+has its own setting, `output.data_dir`, which the image points at `/var/lib/saneless`,
+and the compose file above mounts the same named volume there instead.
+
+**saneless does not migrate anything.** It never moves, copies or reads a database
+at the old location; it simply opens `<data_dir>/saneless.db`. What that means for
+you depends on how you deployed.
+
+**Compose deployments keep their history, as long as you reuse the volume.** The
+old mount put `saneless.db` at the root of the `saneless-data` volume, and the new
+mount point is the root of that same volume. Point the `saneless-data` volume at
+`/var/lib/saneless` instead of the old path, leave the volume itself alone, and the
+existing database is found in place. Recreating or deleting the volume is what
+loses the history.
+
+**Bare-metal installs start with empty history.** The old database was at
+`<tmp_dir>/saneless.db`, typically `/tmp/saneless/saneless.db`; the new default is
+`~/.local/state/saneless/saneless.db`. Nothing copies it across. If you want your
+history, stop saneless and move the file yourself:
+
+```bash
+mkdir -p ~/.local/state/saneless
+cp -a /tmp/saneless/saneless.db* ~/.local/state/saneless/
+```
+
+!!! warning "Copy the `-wal` and `-shm` sidecars too"
+    saneless runs SQLite in WAL mode, so the database is up to three files:
+    `saneless.db`, `saneless.db-wal` and `saneless.db-shm`. After an unclean
+    shutdown the `-wal` file holds committed transactions that are not yet in the
+    main file, and copying only `saneless.db` silently loses them. Copy all three
+    -- the `saneless.db*` glob above does -- and only while saneless is stopped.
+
+If you would rather start clean, delete the old files and let saneless create a new
+database. Only job history is at stake either way: the scanned documents are in
+paperless-ngx, and profiles and settings come from `config.toml`. Preserved scans
+are not a concern for this upgrade, because the `failed/` directory is new in this
+release and there is nothing of that kind at the old path.
+
+### What else changed in this release
+
+- Scans that cannot be delivered to paperless-ngx are preserved as PDFs under
+  `<data_dir>/failed/` instead of being deleted, and the job's error message names
+  the file. See [Docker volumes](../reference/docker.md#volumes) for how the
+  directory grows and how to drain it.
+- A scan that fell back to the consume directory now ends in a new `FALLBACK`
+  state, shown as **Saved to folder** in amber rather than being reported as a
+  plain success. `saneless jobs` prints humanised labels (`Complete`, `Failed`,
+  `Saved to folder`) where it used to print the raw enum value;
+  `saneless jobs --json` still reports the raw `state` and now also carries
+  `outcome` and `warning`.
+- `GET /api/paperless/test` gained two outcomes: a 404 from the paperless-ngx API
+  is now `not_found` and a 5xx is `server_error`, where both were previously
+  reported as `connected`. The three original values are unchanged.
