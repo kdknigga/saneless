@@ -3,10 +3,12 @@
 import re
 from pathlib import Path
 
+import pikepdf
 import pytest
 from PIL import Image
 
 import saneless.pdf as pdf_mod
+from saneless.paper_sizes import crop_to_paper_size
 from saneless.pdf import (
     assemble_pdf,
     build_pdf_filename,
@@ -30,6 +32,25 @@ HOSTILE_TITLES = [
 
 JOB_A = "aaaaaaaa-1111-2222-3333-444444444444"
 JOB_B = "bbbbbbbb-1111-2222-3333-444444444444"
+
+
+def _rounded_media_box(page: pikepdf.Page) -> list[int]:
+    """
+    Read a page's MediaBox as four whole points.
+
+    Rounding is not incidental: the true A4-at-300-DPI box is 595.2 x 841.92,
+    and 595.2 x 841.68 for what ``crop_to_paper_size`` actually produces, so an
+    exact comparison against 595 x 842 would never hold.
+
+    Args:
+        page: The page whose MediaBox to read.
+
+    Returns:
+        ``[llx, lly, urx, ury]``, each rounded to the nearest point.
+
+    """
+    box = pikepdf.Rectangle(page.mediabox)
+    return [round(box.llx), round(box.lly), round(box.urx), round(box.ury)]
 
 
 class TestAssemblePdf:
@@ -248,3 +269,60 @@ class TestBuildPdfFilename:
         name = build_pdf_filename(JOB_A, "x" * 500)
 
         assert len(name.encode()) <= 143
+
+
+class TestMediaBox:
+    """Page geometry: a page scanned at N DPI must declare N DPI (OUTC-06)."""
+
+    def test_a4_at_300_dpi_is_an_a4_page(self, tmp_path: Path) -> None:
+        """An exact A4 raster at 300 DPI yields a 595 x 842 pt MediaBox."""
+        # Rounded, never compared exactly: the true value is 595.2 x 841.92.
+        img = Image.new("RGB", (2480, 3508), "white")
+        pdf_path = assemble_pdf([img], tmp_path)
+
+        with pikepdf.open(pdf_path) as pdf:
+            box = _rounded_media_box(pdf.pages[0])
+
+        assert box == [0, 0, 595, 842]
+
+    def test_a4_page_is_not_the_unlayouted_default(self, tmp_path: Path) -> None:
+        """The layout function is provably in play, not passing by accident."""
+        # img2pdf.default_dpi is 96, so an unlayouted 2480 x 3508 raster
+        # becomes 1860 x 2631 pt.  Seeing that means no layout_fun was passed.
+        img = Image.new("RGB", (2480, 3508), "white")
+        pdf_path = assemble_pdf([img], tmp_path)
+
+        with pikepdf.open(pdf_path) as pdf:
+            box = _rounded_media_box(pdf.pages[0])
+
+        assert box != [0, 0, 1860, 2631]
+
+    def test_cropped_a4_also_rounds_to_a4(self, tmp_path: Path) -> None:
+        """What crop_to_paper_size really produces is 2480 x 3507, and still A4."""
+        # int(297 * 300 / 25.4) == 3507, so the exact box is 595.2 x 841.68.
+        cropped = crop_to_paper_size(Image.new("RGB", (2600, 3700), "white"), "a4", 300)
+        assert cropped.size == (2480, 3507)
+
+        pdf_path = assemble_pdf([cropped], tmp_path)
+
+        with pikepdf.open(pdf_path) as pdf:
+            box = _rounded_media_box(pdf.pages[0])
+
+        assert box == [0, 0, 595, 842]
+
+    def test_every_page_gets_the_same_fixed_dpi(self, tmp_path: Path) -> None:
+        """A fixed-DPI layout applies unconditionally, page by page."""
+        images = [
+            Image.new("RGB", (2480, 3508), "white"),
+            Image.new("RGB", (2480, 3508), "white"),
+            Image.new("RGB", (1240, 1754), "white"),
+        ]
+        pdf_path = assemble_pdf(images, tmp_path)
+
+        with pikepdf.open(pdf_path) as pdf:
+            boxes = [_rounded_media_box(page) for page in pdf.pages]
+
+        assert boxes[0] == [0, 0, 595, 842]
+        assert boxes[1] == [0, 0, 595, 842]
+        # Half the pixels at the same DPI is half the page, not a rescaled A4.
+        assert boxes[2] == [0, 0, 298, 421]
