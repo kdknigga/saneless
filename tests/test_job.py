@@ -20,8 +20,13 @@ import pytest
 
 from saneless import job as job_module
 from saneless.exceptions import StorageError
-from saneless.job import ErrorCategory, Job, JobState, JobStore
-from saneless.vocabulary import ACTIVE_STATES, TERMINAL_STATES, ScanOutcome
+from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
+from saneless.vocabulary import (
+    ACTIVE_STATES,
+    TERMINAL_STATES,
+    ScanOutcome,
+    job_state_for,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -68,6 +73,9 @@ STRESS_ROUNDS = 200
 
 STRESS_WORKERS = 2
 """Threads the stress test runs concurrently against one shared store."""
+
+FINISH_OUTCOMES = (ScanOutcome.SUCCESS, ScanOutcome.FALLBACK)
+"""The outcomes the finish_job stress worker alternates between."""
 
 BARRIER_TIMEOUT = 30.0
 """Seconds a stress worker waits at the start barrier before giving up.
@@ -285,6 +293,35 @@ def _stress_worker(
         store.get_job(job.id)
         store.list_recent(limit=10)
         store.prune(max_age_days=PRUNE_MAX_AGE_DAYS, max_rows=PRUNE_MAX_ROWS)
+        with guard:
+            seen[job.id] = state
+
+
+def _finish_stress_worker(
+    store: JobStore,
+    barrier: threading.Barrier,
+    seen: dict[str, JobState],
+    guard: threading.Lock,
+) -> None:
+    """Run STRESS_ROUNDS of interleaved update_state/finish_job traffic."""
+    barrier.wait()
+    for index in range(STRESS_ROUNDS):
+        job = store.create_job(profile="default", title=f"Finish {index}")
+        store.update_state(job.id, JobState.SCANNING)
+        outcome = FINISH_OUTCOMES[index % len(FINISH_OUTCOMES)]
+        state = job_state_for(outcome)
+        store.finish_job(
+            job.id,
+            state,
+            result=JobResult(
+                outcome=outcome,
+                warning=None,
+                pages_scanned=index,
+                pages_removed=0,
+                pages_uploaded=index,
+            ),
+        )
+        store.get_job(job.id)
         with guard:
             seen[job.id] = state
 
@@ -653,7 +690,7 @@ class TestResultColumns:
         assert job.owner_token is None
 
     def test_created_job_result_columns_stay_none(self) -> None:
-        """Nothing in this phase writes the six result columns (STOR-03)."""
+        """A newly created job records nothing, so all six stay NULL (STOR-03)."""
         store = JobStore()
         try:
             created = store.create_job("default", "Unwritten")
@@ -792,6 +829,241 @@ class TestResultColumns:
         )
         assert _count_job_constructions(store) == 1
         assert _count_job_constructions(row_to_job) == 1
+
+
+class TestFinishJob:
+    """The terminal write: what it records, what it leaves NULL, and its lock."""
+
+    def test_finish_job_records_a_successful_run(self) -> None:
+        """A SUCCESS finish persists state, outcome and three counts (OUTC-01)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Finished Doc")
+            store.finish_job(
+                created.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=3,
+                    pages_removed=0,
+                    pages_uploaded=3,
+                ),
+            )
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            # The value AND the Python type: sqlite3.Row.__getitem__ is typed
+            # Any, so neither ty nor pyrefly can catch a column that comes back
+            # as the wrong type.  These assertions are the only control.
+            assert fetched.state is JobState.DONE
+            assert isinstance(fetched.state, JobState)
+            assert fetched.outcome is ScanOutcome.SUCCESS
+            assert isinstance(fetched.outcome, ScanOutcome)
+            assert fetched.warning is None
+            assert fetched.pages_scanned == 3
+            assert isinstance(fetched.pages_scanned, int)
+            assert fetched.pages_removed == 0
+            assert isinstance(fetched.pages_removed, int)
+            assert fetched.pages_uploaded == 3
+            assert isinstance(fetched.pages_uploaded, int)
+            assert fetched.error is None
+            assert fetched.error_category is None
+        finally:
+            store.close()
+
+    def test_finish_job_records_a_fallback_run(self) -> None:
+        """A FALLBACK finish persists FALLBACK, its outcome and warning (OUTC-02)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Fallback Doc")
+            store.finish_job(
+                created.id,
+                JobState.FALLBACK,
+                result=JobResult(
+                    outcome=ScanOutcome.FALLBACK,
+                    warning="Saved to the consume directory; metadata not applied",
+                    pages_scanned=3,
+                    pages_removed=0,
+                    pages_uploaded=3,
+                ),
+            )
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.state is JobState.FALLBACK
+            assert fetched.outcome is ScanOutcome.FALLBACK
+            assert isinstance(fetched.outcome, ScanOutcome)
+            assert fetched.warning is not None
+            assert "metadata not applied" in fetched.warning
+            assert isinstance(fetched.warning, str)
+            assert fetched.pages_uploaded == 3
+        finally:
+            store.close()
+
+    def test_finish_job_records_a_duplex_mismatch_warning(self) -> None:
+        """A warning rides alongside SUCCESS and its counts (OUTC-03)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Mismatch Doc")
+            store.finish_job(
+                created.id,
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning="Front had 5 pages, back had 4",
+                    pages_scanned=9,
+                    pages_removed=1,
+                    pages_uploaded=8,
+                ),
+            )
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.state is JobState.DONE
+            assert fetched.outcome is ScanOutcome.SUCCESS
+            assert fetched.warning == "Front had 5 pages, back had 4"
+            assert fetched.pages_scanned == 9
+            assert fetched.pages_removed == 1
+            assert fetched.pages_uploaded == 8
+        finally:
+            store.close()
+
+    def test_finish_job_failure_leaves_the_counts_null_not_zero(self) -> None:
+        """An ERROR finish records the failure and records no counts (OUTC-01)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Doomed Doc")
+            store.finish_job(
+                created.id,
+                JobState.ERROR,
+                error="boom",
+                error_category=ErrorCategory.UPLOAD,
+            )
+
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.state is JobState.ERROR
+            assert fetched.error == "boom"
+            assert fetched.error_category is ErrorCategory.UPLOAD
+            assert isinstance(fetched.error_category, ErrorCategory)
+            # NULL means "never recorded"; 0 would mean "counted, and there
+            # were none".  A job that failed before the scanner opened has not
+            # measured zero pages, and 0 would erase that distinction forever.
+            assert fetched.outcome is None
+            assert fetched.warning is None
+            assert fetched.pages_scanned is None
+            assert fetched.pages_removed is None
+            assert fetched.pages_uploaded is None
+        finally:
+            store.close()
+
+    def test_finish_job_survives_list_recent(self) -> None:
+        """What finish_job wrote reads back through list_recent too (STOR-04)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Listed Finish")
+            store.finish_job(
+                created.id,
+                JobState.FALLBACK,
+                result=JobResult(
+                    outcome=ScanOutcome.FALLBACK,
+                    warning="folder",
+                    pages_scanned=7,
+                    pages_removed=2,
+                    pages_uploaded=5,
+                ),
+            )
+
+            listed = store.list_recent()
+            assert len(listed) == 1
+            assert listed[0].id == created.id
+            assert listed[0].state is JobState.FALLBACK
+            assert listed[0].outcome is ScanOutcome.FALLBACK
+            assert listed[0].pages_removed == 2
+        finally:
+            store.close()
+
+    def test_finish_job_on_an_unknown_id_is_a_no_op(self) -> None:
+        """An unknown job id neither raises nor touches another row (STOR-02)."""
+        store = JobStore()
+        try:
+            created = store.create_job("default", "Bystander")
+            store.finish_job(
+                "no-such-job",
+                JobState.DONE,
+                result=JobResult(
+                    outcome=ScanOutcome.SUCCESS,
+                    warning=None,
+                    pages_scanned=1,
+                    pages_removed=0,
+                    pages_uploaded=1,
+                ),
+            )
+
+            assert store.get_job("no-such-job") is None
+            fetched = store.get_job(created.id)
+            assert fetched is not None
+            assert fetched.state is JobState.PENDING
+            assert fetched.outcome is None
+        finally:
+            store.close()
+
+    def test_finish_job_carries_the_lock_marker(self) -> None:
+        """finish_job is serialised on the store's lock like every peer (STOR-01)."""
+        assert getattr(JobStore.finish_job, job_module._LOCKED_MARKER, False) is True
+
+    def test_finish_job_calls_no_other_public_method(self) -> None:
+        """finish_job opens its own transaction rather than nesting one (STOR-01)."""
+        # sqlite3 connection context managers do not nest: an inner
+        # `with conn:` commits the OUTER transaction, so half the caller's work
+        # lands early.  _locked is re-entrant, so there is no deadlock to warn
+        # anyone, and ruff cannot see the problem either.
+        store = _job_store_classdef()
+        finish = next(
+            node
+            for node in store.body
+            if isinstance(node, ast.FunctionDef) and node.name == "finish_job"
+        )
+        assert _public_self_calls(finish) == []
+
+    def test_finish_job_writes_every_column_in_one_statement(self) -> None:
+        """One UPDATE carries state, outcome, warning, counts and error (OUTC-01)."""
+        # A half-written terminal row is the failure mode this guards: two
+        # statements could be observed between by the web request thread.
+        finish_source = inspect.getsource(JobStore.finish_job)
+        assert finish_source.count("self._conn.execute") == 1
+        assert finish_source.count("with self._conn:") == 1
+        for column in ("state", "outcome", "warning", *V2_COLUMNS[1:5], "error"):
+            assert f"{column} = ?" in finish_source
+
+    def test_finish_job_stress_two_threads_survive_two_hundred_rounds(self) -> None:
+        """Two threads interleave finish_job and update_state cleanly (STOR-01)."""
+        store = JobStore()
+        seen: dict[str, JobState] = {}
+        guard = threading.Lock()
+        barrier = threading.Barrier(STRESS_WORKERS, timeout=BARRIER_TIMEOUT)
+        try:
+            with ThreadPoolExecutor(max_workers=STRESS_WORKERS) as pool:
+                futures = [
+                    pool.submit(_finish_stress_worker, store, barrier, seen, guard)
+                    for _ in range(STRESS_WORKERS)
+                ]
+                for future in futures:
+                    # Future.result() re-raises the worker's exception here.
+                    future.result()
+
+            assert len(seen) == STRESS_WORKERS * STRESS_ROUNDS
+            for job_id, expected in seen.items():
+                fetched = store.get_job(job_id)
+                assert fetched is not None
+                assert fetched.state == expected
+                assert isinstance(fetched.state, JobState)
+                assert fetched.outcome is not None
+                assert isinstance(fetched.outcome, ScanOutcome)
+                assert job_state_for(fetched.outcome) is fetched.state
+        finally:
+            store.close()
 
 
 class TestLockDiscipline:
