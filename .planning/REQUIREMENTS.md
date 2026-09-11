@@ -16,7 +16,9 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 ### Contracts and Vocabulary
 
 - [x] **CTR-01**: There is exactly one `JobState` enum, one active-state list, and one state-to-label map, shared by the worker, web templates, and CLI; `job.py` re-exports them so existing imports keep working [M-05]
-- [ ] **CTR-02**: The pipeline returns a typed `ScanResult` (outcome enum SUCCESS/FALLBACK/FAILED, pages scanned, pages removed as blank, pages uploaded, warning text) instead of a value nobody reads [C-03, N-38]
+- [x] **CTR-02**: The pipeline returns a typed `ScanResult` (outcome enum SUCCESS/FALLBACK/~~FAILED~~, pages scanned, pages removed as blank, pages uploaded, warning text) instead of a value nobody reads [C-03, N-38]
+
+  **Closed 2026-09-11 with one member fewer than the wording names.** Phase 21 satisfied the *shape* (D-07) and deferred the `FAILED` question here; Phase 23's **D-01 decided against it**. Failures raise rather than return, so a returned `FAILED` is unreachable, and writing one from the worker's `except` branch would encode the same fact as `JobState.ERROR` in a second column with two chances to disagree. Everything else this requirement asks for shipped: `pipeline.ScanResult` carries `outcome`, `pages_scanned`, `pages_removed`, `pages_uploaded` and `warning`, and `worker.py` reads all five — the "value nobody reads" is gone, which is what C-03 and N-38 were about.
 - [x] **CTR-03**: `upload_document` returns a typed `UploadResult`; the `"fallback"` magic string and every reader of it in `src/`, `tests/`, and `docs/` are deleted [C-03, N-38]
 - [x] **CTR-04**: A single `classify_source()` in `scanner/base.py` returns a `SourceKind` (FLATBED, FEEDER, FEEDER_DUPLEX, AUTO, UNKNOWN) for any SANE source string, including "Automatic Document Feeder", "ADF Front", "ADF Duplex", and vendor variants, and is the only classification rule in the codebase [C-06, N-09]
 - [x] **CTR-05**: `ErrorCategory` lives with `JobState` and is the input to a single user-message map; no template, route, or CLI output classifies errors by string matching [N-14, U-05]
@@ -31,17 +33,17 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 
 ### Honest Outcomes and Never Lose a Scan
 
-- [ ] **OUTC-01**: A Paperless task that ends FAILURE or times out raises a `PaperlessError` (or times out as `PaperlessTimeoutError`); the job is recorded FAILED with the Paperless message, never DONE [C-03]
-- [ ] **OUTC-02**: When the PDF reaches only the consume directory, the job is recorded in the `FALLBACK` state with a warning, and the status partial, history table, and CLI `jobs` output all render it distinctly from DONE [C-03, doc row 3, doc row 4]
-- [ ] **OUTC-03**: A manual-duplex front/back count mismatch is recorded with a warning on the job, not a silent DONE [C-03]
-- [ ] **OUTC-04**: When upload and consume-directory fallback both fail, the assembled PDF is moved to `<data_dir>/failed/` with a unique name, the job's error names that path, and no page images or PDF are deleted on that path; the preservation guard spans both `upload_document` and `poll_task` [C-04]
-- [ ] **OUTC-05**: Every assembled PDF has a unique file name (timestamp plus job id plus sanitised title), and the consume-directory copy is written to a `.part` file and renamed atomically [C-05]
-- [ ] **OUTC-06**: Assembled PDFs declare the scan DPI so an A4 page scanned at 300 DPI has an A4 MediaBox (595 x 842 pt), via img2pdf's fixed-DPI layout function [M-06]
-- [ ] **OUTC-07**: `poll_task` raises on any non-200 poll response and computes its deadline from a monotonic clock that includes request time, so the documented timeout is honoured [M-22]
-- [ ] **OUTC-08**: `test_connection` reports "connected" only for a 2xx response; 404 and 5xx are reported as distinct failure modes [N-12]
-- [ ] **OUTC-09**: The job database and the `failed/` directory live under a new `output.data_dir` setting (XDG state by default, `saneless-data` volume in Docker), never under the disposable `tmp_dir` [N-39, U-08]
-- [ ] **OUTC-10**: A parametrised end-to-end test drives the real worker and pipeline with a stub scanner through SUCCESS, Paperless FAILURE, TIMEOUT, consume-dir fallback, and duplex mismatch, asserting the persisted state, outcome, page counts, and file preservation for each [C-03, M-33]
-- [ ] **OUTC-11**: `PaperlessClient` pins the paperless-ngx API version with an explicit `Accept` header and parses both the v9 and v10 `/api/tasks/` response shapes — paginated `{"count","results":[…]}` as well as a bare list, lowercase as well as uppercase status values, and the failure message from `result_data["error_message"]` as well as `result` [Phase 23 research, 2026-09-11]
+- [x] **OUTC-01**: A Paperless task that ends FAILURE or times out raises a `PaperlessError` (or times out as `PaperlessTimeoutError`); the job is recorded FAILED with the Paperless message, never DONE [C-03]
+- [x] **OUTC-02**: When the PDF reaches only the consume directory, the job is recorded in the `FALLBACK` state with a warning, and the status partial, history table, and CLI `jobs` output all render it distinctly from DONE [C-03, doc row 3, doc row 4]
+- [x] **OUTC-03**: A manual-duplex front/back count mismatch is recorded with a warning on the job, not a silent DONE [C-03]
+- [x] **OUTC-04**: When upload and consume-directory fallback both fail, the assembled PDF is moved to `<data_dir>/failed/` with a unique name, the job's error names that path, and no page images or PDF are deleted on that path; the preservation guard spans both `upload_document` and `poll_task` [C-04]
+- [x] **OUTC-05**: Every assembled PDF has a unique file name (timestamp plus job id plus sanitised title), and the consume-directory copy is written to a `.part` file and renamed atomically [C-05]
+- [x] **OUTC-06**: Assembled PDFs declare the scan DPI so an A4 page scanned at 300 DPI has an A4 MediaBox (595 x 842 pt), via img2pdf's fixed-DPI layout function [M-06]
+- [x] **OUTC-07**: `poll_task` raises on any non-200 poll response and computes its deadline from a monotonic clock that includes request time, so the documented timeout is honoured [M-22]
+- [x] **OUTC-08**: `test_connection` reports "connected" only for a 2xx response; 404 and 5xx are reported as distinct failure modes [N-12]
+- [x] **OUTC-09**: The job database and the `failed/` directory live under a new `output.data_dir` setting (XDG state by default, `saneless-data` volume in Docker), never under the disposable `tmp_dir` [N-39, U-08]
+- [x] **OUTC-10**: A parametrised end-to-end test drives the real worker and pipeline with a stub scanner through SUCCESS, Paperless FAILURE, TIMEOUT, consume-dir fallback, and duplex mismatch, asserting the persisted state, outcome, page counts, and file preservation for each [C-03, M-33]
+- [x] **OUTC-11**: `PaperlessClient` pins the paperless-ngx API version with an explicit `Accept` header and parses both the v9 and v10 `/api/tasks/` response shapes — paginated `{"count","results":[…]}` as well as a bare list, lowercase as well as uppercase status values, and the failure message from `result_data["error_message"]` as well as `result` [Phase 23 research, 2026-09-11]
 
   **Why this exists.** `poll_task` (`src/saneless/paperless.py:210-248`) was written against API v9. Current paperless-ngx serves **v10 by default when no version header is sent**, and `PaperlessClient.__init__` sends only `Authorization` — so `isinstance(tasks, list)` is `False`, no terminal status is ever observed, and every poll burns the full timeout. This is invisible today only because `pipeline.py:521-527` discards `poll_task`'s return value and records `SUCCESS` regardless. OUTC-01 and OUTC-07 remove that cover: once timeouts raise and the PDF is preserved on timeout (D-10), **every successful scan would record as FAILED with a stray file in `failed/`** — the exact inversion of this phase's goal. OUTC-01's "records the job FAILED with the Paperless message" also cannot be implemented without resolving which field carries that message.
 
@@ -227,17 +229,17 @@ Which phases cover which requirements. Updated during roadmap creation.
 | STOR-03 | Phase 22 — Job Store Hardening | Complete |
 | STOR-04 | Phase 22 — Job Store Hardening | Complete |
 | STOR-05 | Phase 22 — Job Store Hardening | Complete |
-| OUTC-01 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-02 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-03 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-04 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-05 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-06 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-07 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-08 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-09 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-10 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
-| OUTC-11 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-01 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-02 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-03 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-04 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-05 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-06 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-07 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-08 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-09 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-10 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| OUTC-11 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
 | SCNR-01 | Phase 24 — Scanner Truthfulness | Pending |
 | SCNR-02 | Phase 24 — Scanner Truthfulness | Pending |
 | SCNR-03 | Phase 24 — Scanner Truthfulness | Pending |
