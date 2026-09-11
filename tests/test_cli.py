@@ -24,6 +24,7 @@ from saneless.exceptions import PaperlessError, ScanError
 from saneless.job import JobStore
 from saneless.paperless import UploadResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
+from saneless.vocabulary import JobState, state_label
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -417,6 +418,13 @@ class TestJobsCommand:
             )
         store.close()
 
+    def _populate_one(self, db_path: str, state: JobState, title: str) -> None:
+        """Populate a JobStore at db_path with a single job in `state`."""
+        store = JobStore(db_path=db_path)
+        job = store.create_job(profile="default", title=title)
+        store.update_state(job.id, state)
+        store.close()
+
     def test_jobs_empty(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs with no jobs in DB shows empty output (exit 0)."""
         settings = self._settings_for(tmp_path)
@@ -444,7 +452,10 @@ class TestJobsCommand:
         assert "Status" in result.output
         assert "Test Document 1" in result.output
         assert "Test Document 2" in result.output
-        assert "PENDING" in result.output
+        # Humanised, matching the web UI's register: the table is for people,
+        # `--json` is the machine contract and keeps the raw enum value.
+        assert "Pending" in result.output
+        assert "PENDING" not in result.output
 
     def test_jobs_json_output(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -465,6 +476,78 @@ class TestJobsCommand:
             assert "title" in item
             assert "state" in item
             assert "created_at" in item
+            assert "outcome" in item
+            assert "warning" in item
+
+    def test_jobs_table_shows_fallback_distinctly(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A FALLBACK job reads "Saved to folder", not Complete and not Failed."""
+        settings = self._settings_for(tmp_path)
+        self._populate_one(
+            str(settings.output.db_path), JobState.FALLBACK, "Fallback Doc"
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        assert "Saved to folder" in result.output
+        assert "Complete" not in result.output
+        assert "Failed" not in result.output
+        assert "FALLBACK" not in result.output
+
+    def test_jobs_table_label_survives_a_narrow_terminal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The widest status label still fits, unwrapped, in 80 columns.
+
+        The status column's reserve was sized for the raw enum values, the
+        longest of which was `AWAITING_FLIP`. Humanised labels are longer, and
+        "Saved to folder" is longer than `FALLBACK`, so the reserve is derived
+        from `state_label` rather than hardcoded.
+        """
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        self._populate_one(
+            str(settings.output.db_path), JobState.FALLBACK, "Fallback Doc"
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        assert len(lines) == 3
+        row = lines[2]
+        assert row.endswith("Saved to folder")
+        widest = max(len(state_label(s)) for s in JobState)
+        assert all(len(line) <= 80 for line in lines)
+        # Every other label would fit too, not just this one.
+        assert len(row) - len("Saved to folder") + widest <= 80
+
+    def test_jobs_json_keeps_the_raw_state_value(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        `--json` is a machine contract: the state stays the raw enum value.
+
+        Humanising it would silently break every script that compares against
+        `"DONE"` or `"FALLBACK"`.
+        """
+        settings = self._settings_for(tmp_path)
+        self._populate_one(
+            str(settings.output.db_path), JobState.FALLBACK, "Fallback Doc"
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data[0]["state"] == "FALLBACK"
+        assert "Saved to folder" not in result.output
+        # No writer for either column until plan 23-07, so both read None today.
+        assert data[0]["outcome"] is None
+        assert data[0]["warning"] is None
 
     def test_jobs_limit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --limit 1 with 2 jobs in DB shows only 1 job."""

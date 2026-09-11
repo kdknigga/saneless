@@ -21,7 +21,7 @@ Evidence paths (all absolute):
 - `/home/kris/git/saneless/src/saneless/web/templates/partials/flip.html`
 - `/home/kris/git/saneless/src/saneless/web/static/app.css`
 - `/home/kris/git/saneless/src/saneless/web/static/app.js`
-- `/home/kris/git/saneless/src/saneless/web/app.py` (Jinja filter `humanize_state`)
+- `/home/kris/git/saneless/src/saneless/web/app.py` (registers the `state_label` and `progress_label` Jinja filters and the `JobState` template global; the labels themselves live in `src/saneless/vocabulary.py`)
 
 ---
 
@@ -34,15 +34,15 @@ Evidence paths (all absolute):
 | Component library | PicoCSS v2 (`@picocss/pico@2`, classless) via jsDelivr CDN |
 | Interaction library | htmx v2.0.8 via jsDelivr CDN |
 | Templating | Jinja2 served by FastAPI |
-| Icon library | none — Unicode glyphs only (`U+21BB` refresh, `U+2713` checkmark, `U+2717` cross) plus two inline SVG illustrations in `flip.html` |
+| Icon library | none — Unicode glyphs only (`U+21BB` refresh, `U+2713` checkmark, `U+2717` cross, `U+2192` rightwards arrow) plus two inline SVG illustrations in `flip.html` |
 | Font | PicoCSS default system stack (`--pico-font-family`): `system-ui, -apple-system, "Segoe UI", Roboto, ...` |
-| Theme mode | `data-theme="auto"` — follows OS light/dark preference |
+| Theme mode | `data-theme="auto"` is set, but Pico v2 requires the attribute to be *absent* for automatic dark; the page renders light in practice (see Color) |
 | Layout container | PicoCSS `.container` applied to `<header>` and `<main>` |
 
 ### Design philosophy
 
 - Classless semantic HTML — styling is driven almost entirely by element type (`<article>`, `<form>`, `<label>`, `<select>`, `<button>`, `<table role="grid">`) rather than utility classes.
-- Zero build step — stylesheets and scripts are CDN-hosted; `/static/app.css` and `/static/app.js` contain only thin app-specific overrides (102 lines CSS, 39 lines JS).
+- Zero build step — stylesheets and scripts are CDN-hosted; `/static/app.css` and `/static/app.js` contain only thin app-specific overrides (113 lines CSS, 43 lines JS).
 - Server-rendered HTML partials; htmx orchestrates async swaps. No SPA, no client-side router, no reactive framework.
 
 ### Project-specific classes (exhaustive)
@@ -57,6 +57,7 @@ The only non-Pico classes defined in `app.css`:
 | `.refresh-btn` | Inline, transparent circular-arrow button beside tag/correspondent labels | `index.html` |
 | `.status-done` | Success color (uses `--pico-ins-color`) for status text and history cell | `status.html`, `history.html` |
 | `.status-error` | Error color (uses `--pico-del-color`) for error text and history cell | `status.html`, `history.html` |
+| `.status-fallback` | Warning color (amber) for a consume-directory fallback — a degraded success, so deliberately neither the ins green nor the del red. Uses `var(--pico-color-amber-600, #a16207)`; PicoCSS v2 ships its colour palette in a separate `pico.colors.css` that `base.html` does not link, so the literal `#a16207` is what renders today | `status.html`, `history.html` |
 | `.history-table-wrap` | Horizontal scroll wrapper for job history table on narrow viewports | `index.html` |
 | `.sr-only` | Screen-reader-only text for icon-only button labels | `index.html` (refresh buttons) |
 
@@ -125,7 +126,12 @@ Neither override constitutes a new type scale entry. Future phases should normal
 
 ## Color
 
-Color is delegated to PicoCSS v2 semantic tokens; `data-theme="auto"` toggles light/dark via OS preference. The project does not hard-code hex values.
+Color is delegated to PicoCSS v2 semantic tokens. Every `app.css` colour is written as `var(--pico-token, fallback)`; the one literal hex in the file is the fallback on `.status-fallback`, because Pico's amber lives in the palette file described below rather than among the semantic tokens.
+
+**Two findings recorded in Phase 23, both verified against the CDN build actually linked by `base.html`:**
+
+1. `pico.min.css` carries the semantic tokens (`--pico-ins-color`, `--pico-del-color`, …) but **not** the colour palette (`--pico-color-amber-600` and friends) — that ships separately as `pico.colors.css`, which the page does not link. So `.status-fallback`'s `var(--pico-color-amber-600, #a16207)` falls through to the literal amber today. Linking `pico.colors.css` would make the token resolve with no further change.
+2. `base.html` sets `data-theme="auto"`, but Pico v2's automatic dark rule is scoped to `:root:not([data-theme])` — the attribute has to be *absent*, not `"auto"` (that was the Pico v1 spelling). The page therefore renders in the light palette regardless of OS preference. This is pre-existing, predates Phase 23, and is **not** fixed here; it is recorded so it is a known defect rather than a silent one.
 
 | Role | Token | Usage |
 |------|-------|-------|
@@ -134,6 +140,7 @@ Color is delegated to PicoCSS v2 semantic tokens; `data-theme="auto"` toggles li
 | Accent (10%) primary | `--pico-primary`, `--pico-primary-hover` | `#status-area` left border; refresh button color; primary `<button type="submit">` (Pico default); htmx `aria-busy` spinner |
 | Success semantic | `--pico-ins-color` (fallback `green`) | `.status-done` text: checkmark "Done" row + DONE history cell |
 | Destructive/error semantic | `--pico-del-color` (fallback `red`) | `.status-error` text: error alert + ERROR history cell |
+| Warning semantic | `--pico-color-amber-600` (fallback `#a16207`) | `.status-fallback` text: consume-directory fallback line + inline warning + FALLBACK history cell |
 
 **60/30/10 compliance:** the ratio is enforced by Pico's classless defaults rather than by this project. The only app-specific colored surface is the 4px (Pico `--pico-border-width`) left border on `#status-area` painted with `--pico-primary` — the single accent moment on the page.
 
@@ -168,13 +175,13 @@ Inventory of every interactive/presentational component currently shipped.
 | Correspondent refresh button | Mirror of tag refresh | `index.html` | |
 | Primary scan button | `<button type="submit" id="scan-btn">` | `index.html` | Disabled + `aria-busy="true"` during active job; label swaps to `Scanning...` / `Scanning\u2026` |
 | Status area | `<div id="status-area">` polling itself `hx-get="/api/jobs/current/status" hx-trigger="every 1s"` when active | `partials/status.html` | Only polls when state is PENDING/SCANNING/ASSEMBLING/UPLOADING/AWAITING_FLIP |
-| Status states | Six presentations: Starting/Scanning/AwaitingFlip/Assembling/Uploading/Done/Error/Idle | `partials/status.html` | Each uses `aria-busy="true"` on the `<p>` during non-terminal in-progress states |
+| Status states | Nine presentations: Starting/Scanning/AwaitingFlip/Assembling/Uploading/Done/Error/Fallback/Idle | `partials/status.html` | Each uses `aria-busy="true"` on the `<p>` during non-terminal in-progress states. Fallback renders two `.status-fallback` paragraphs — the outcome line and the inline `{job.warning}` — and, unlike Error, carries no `role="alert"`: a fallback is a degradation, not a failure |
 | Thumbnail preview | `<img class="thumbnail">` with base64 data URI | `partials/status.html` | alt text "First page preview" |
 | Duplex flip prompt | `.flip-prompt` with two-paragraph instructions, `.flip-illustration` SVG pair, and `<div role="group">` with Continue + Abort buttons | `partials/flip.html` | Abort uses Pico `.secondary` |
 | Flip SVGs | Inline SVGs with `aria-label`; "Long edge (correct)" shows curved arrow + checkmark, "Short edge (incorrect)" shows X mark | `partials/flip.html` | `currentColor` strokes follow theme |
 | Job history card | `<article>` with `<h2>` + `.history-table-wrap` + `<table role="grid">` | `index.html` | Card 2 |
-| Job history table | 4 columns: Time (YYYY-MM-DD HH:MM), Profile, Title, Status | `partials/history.html` | Status cell applies `.status-done` / `.status-error` |
-| Humanized state labels | Jinja filter `humanize_state` maps enum values → "Pending", "Scanning", "Awaiting flip", "Assembling PDF", "Uploading", "Complete", "Failed" | `app.py:_STATE_LABELS` | Presented in history Status column |
+| Job history table | 4 columns: Time (YYYY-MM-DD HH:MM), Profile, Title, Status | `partials/history.html` | Status cell applies `.status-done` / `.status-error` / `.status-fallback` |
+| Humanized state labels | Jinja filter `state_label` maps enum values → "Pending", "Scanning", "Waiting for flip", "Assembling", "Uploading", "Complete", "Failed", "Saved to folder" | `vocabulary.py:state_label`, registered as a filter in `app.py` | Presented in history Status column, and (since Phase 23) in the `saneless jobs` table |
 | Empty history | Single `<tr><td colspan="4">No scan history yet.</td></tr>` | `partials/history.html` | |
 
 **Component count:** 18 distinct UI elements across 7 template files.
@@ -218,6 +225,7 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | UPLOADING | `Uploading to paperless-ngx...` | `<p aria-busy="true">` |
 | DONE | `✓ Done: {job.title}` (U+2713) | `.status-done` |
 | ERROR | `✗ Error: {job.error}` (U+2717) | `role="alert"` + `.status-error` |
+| FALLBACK | `→ Saved to folder: {job.title}` (U+2192), then `{job.warning}` on its own line when a warning is recorded | `.status-fallback` on both paragraphs; no `role="alert"` |
 
 ### Duplex flip prompt (`partials/flip.html`)
 
@@ -239,13 +247,13 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | Card heading | `Job History` |
 | Columns | `Time`, `Profile`, `Title`, `Status` |
 | Empty state | `No scan history yet.` |
-| Humanized status labels | `Pending`, `Scanning`, `Awaiting flip`, `Assembling PDF`, `Uploading`, `Complete`, `Failed` |
+| Humanized status labels | `Pending`, `Scanning`, `Waiting for flip`, `Assembling`, `Uploading`, `Complete`, `Failed`, `Saved to folder` |
 
 ### Copy style guide (observed)
 
 - Sentence case for all UI strings; no title case.
 - In-progress statuses end with `...` (three ASCII dots), not ellipsis.
-- Success/error prefixed by glyphs (`✓` / `✗`), not emoji.
+- Terminal statuses prefixed by glyphs (`✓` / `✗` / `→`), not emoji. Text-presentation code points only: U+26A0 WARNING SIGN was considered for the fallback line in Phase 23 and rejected because it has an emoji presentation by default on most platforms.
 - Destructive confirmations are absent — "Abort scan" proceeds immediately without a modal.
 - No exclamation marks, no emoji, no brand voice adjectives.
 - Placeholders describe behavior, not hints ("auto-generated if empty").
@@ -278,12 +286,12 @@ The following patterns would flag on generic copywriting heuristics but are **in
 | Correspondent refresh | `POST /api/cache/invalidate?resource=correspondents` | `#correspondent-select` | `innerHTML` |
 | Flip continue | `POST /api/flip/continue` | `#status-area` | `outerHTML` |
 | Flip abort | `POST /api/flip/abort` | `#status-area` | `outerHTML` |
-| Terminal DONE/ERROR hidden history reload | `GET /api/jobs/history` on `load` | `#history-body` | `outerHTML` |
+| Terminal DONE/ERROR/FALLBACK hidden history reload | `GET /api/jobs/history` on `load` | `#history-body` | `outerHTML` |
 
 ### Button lifecycle (app.js)
 
 - On `htmx:beforeRequest` for the scan form: disable `#scan-btn`, set `aria-busy="true"`, label → `Scanning…`.
-- On `htmx:afterSwap` of `#status-area`: if the swapped content contains `.status-done` or `.status-error`, re-enable the button, clear busy, restore label to `Scan`.
+- On `htmx:afterSwap` of `#status-area`: if the swapped content contains `.status-done`, `.status-error` or `.status-fallback` — i.e. any terminal state — re-enable the button, clear busy, restore label to `Scan`. Every terminal state must be named here; omitting one leaves the button permanently disabled until the user reloads the page.
 - All JS is IIFE-wrapped in `"use strict"`. No globals, no inline scripts, no `hx-on` attributes (normalized in Phase 12).
 
 ### Form semantics
@@ -295,7 +303,7 @@ The following patterns would flag on generic copywriting heuristics but are **in
 
 ### Polling / transport
 
-- Live status polling interval: **1 second** (`hx-trigger="every 1s"`). Polling is self-limiting: only the active-state branches of `status.html` include the `hx-get`; terminal states render a static element, so the poll stops naturally on DONE/ERROR.
+- Live status polling interval: **1 second** (`hx-trigger="every 1s"`). Polling is self-limiting: only the active-state branches of `status.html` include the `hx-get`; terminal states render a static element, so the poll stops naturally on DONE/ERROR/FALLBACK.
 
 ---
 
@@ -307,14 +315,14 @@ Current a11y affordances observed in markup:
 |---------|----------------|
 | Page language | `<html lang="en">` |
 | Viewport | `<meta name="viewport" content="width=device-width, initial-scale=1">` |
-| Theme | `data-theme="auto"` honors OS light/dark preference |
+| Theme | `data-theme="auto"` is set on `<html>`, but Pico v2 scopes its automatic dark rule to `:root:not([data-theme])`, so the OS preference is **not** honoured today — see the two findings under Color |
 | Icon-only buttons | Refresh buttons carry `aria-label`, `title`, and `.sr-only` screen-reader text (validated Phase 12) |
 | Busy states | `aria-busy="true"` on `<p>` during PENDING/SCANNING/ASSEMBLING/UPLOADING; `aria-busy` toggled on `#scan-btn` |
 | Error announcements | Error `<p>` carries `role="alert"` for live-region announcement |
 | Data tables | `<table role="grid">` for job history |
 | Action grouping | Flip prompt buttons wrapped in `<div role="group">` |
 | Decorative SVG | Each flip SVG has `aria-label`; captions reinforce with visible `<small>` text |
-| Contrast | Uses PicoCSS semantic tokens (`--pico-ins-color`, `--pico-del-color`) that respect theme contrast |
+| Contrast | Uses PicoCSS semantic tokens (`--pico-ins-color`, `--pico-del-color`) that respect theme contrast. `.status-fallback`'s amber-600 is chosen for the light palette the page actually renders in (4.9:1 on `#fff`) |
 | Labels | Every `<input>` / `<select>` has an associated `<label for="">` or wraps inside `<label>` |
 | Form control IDs | `profile-select`, `title-input`, `tags-select`, `correspondent-select`, `scan-btn` |
 | Thumbnail `alt` | `First page preview` |

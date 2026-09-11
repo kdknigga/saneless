@@ -12,12 +12,15 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from fastapi import FastAPI
     from playwright.sync_api import Page
+
+    from saneless.job import JobStore
 
 import pytest
 import uvicorn
@@ -36,6 +39,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
+from saneless.vocabulary import JobState
 from saneless.web.app import create_app
 
 
@@ -68,8 +72,24 @@ class _BrowserTestScanner(ScannerBackend):
         yield Image.new("RGB", (100, 100), "white")
 
 
+class _BrowserServer(NamedTuple):
+    """
+    The live test server: its base URL and the app object behind it.
+
+    Yielding only the URL made the server a black box -- a test could look at
+    the idle page and nothing else, because there was no way to put a job into
+    a given state. Carrying the app alongside the URL is what lets a test drive
+    a job to FALLBACK and then look at it through a real browser.
+    """
+
+    url: str
+    app: FastAPI
+
+
 @pytest.fixture(scope="session")
-def browser_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
+def browser_server(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[_BrowserServer]:
     """Start a real uvicorn server for browser tests."""
     tmp_dir = tmp_path_factory.mktemp("browser")
     test_token = "fake-token"
@@ -111,10 +131,16 @@ def browser_server_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str
 
     # Get actual assigned port
     port = server.servers[0].sockets[0].getsockname()[1]
-    yield f"http://127.0.0.1:{port}"
+    yield _BrowserServer(url=f"http://127.0.0.1:{port}", app=app)
 
     server.should_exit = True
     thread.join(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def browser_server_url(browser_server: _BrowserServer) -> str:
+    """Return the live server's base URL, for tests that need nothing else."""
+    return browser_server.url
 
 
 @pytest.mark.browser
@@ -206,3 +232,172 @@ class TestFlipPromptUI:
         page.goto(browser_server_url)
         scan_btn = page.locator("button[type='submit'], input[type='submit']").first
         assert scan_btn.is_visible()
+
+
+# Builds one <p> per status class, reads the colour the cascade actually
+# resolved, and removes it again. Reading all three from the same live page is
+# the only way to compare them: only one status renders at a time, so there is
+# never a moment when all three exist in the document on their own.
+_PROBE_STATUS_COLOURS = """
+() => {
+    const out = {};
+    for (const cls of ["status-done", "status-error", "status-fallback"]) {
+        const probe = document.createElement("p");
+        probe.className = cls;
+        probe.textContent = "probe";
+        document.body.appendChild(probe);
+        out[cls] = getComputedStyle(probe).color;
+        probe.remove();
+    }
+    return out;
+}
+"""
+
+# Mimics what app.js does on htmx:beforeRequest, so the afterSwap handler has
+# something to undo. Calling the real handler is not possible from a test: it
+# lives inside an IIFE and exposes no globals, by design.
+_DISABLE_SCAN_BUTTON = """
+() => {
+    const btn = document.getElementById("scan-btn");
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+    btn.textContent = "Scanning\\u2026";
+}
+"""
+
+_SWAP_STATUS_AREA = """
+() => htmx.ajax("GET", "/api/jobs/current/status",
+                {target: "#status-area", swap: "outerHTML"})
+"""
+
+
+@pytest.mark.browser
+class TestFallbackStatusRendering:
+    """
+    The FALLBACK status render, proven in a browser rather than by grep.
+
+    Three of this phase's claims are only checkable here: that the amber is a
+    different colour from the success green and the failure red once the
+    cascade has resolved (D-05), that the Scan button recovers after a fallback
+    swap (T-23-23), and that the history table refreshes (T-23-24). A template
+    assertion cannot see any of them -- the first is a cascade outcome, and the
+    other two depend on JavaScript and htmx actually running.
+    """
+
+    @pytest.fixture
+    def fallback_page(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> Iterator[Page]:
+        """Drive the live app's current job to FALLBACK, then clear it again."""
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        job = job_store.create_job(profile="default", title="Fallback Doc")
+        job_store.update_state(job.id, JobState.FALLBACK)
+        # No warning writer lands until plan 23-07; the column is written
+        # directly so the inline warning paragraph has something to render.
+        with job_store._conn:
+            job_store._conn.execute(
+                "UPDATE jobs SET warning = ? WHERE id = ?",
+                ("Title, tags and correspondent were not applied.", job.id),
+            )
+        app.state.worker._current_job_id = job.id
+        try:
+            yield page
+        finally:
+            # The server is session-scoped, so a job left as "current" would
+            # follow every later test onto the idle page.
+            app.state.worker._current_job_id = None
+
+    def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
+        """Load the page under an emulated OS colour-scheme preference."""
+        page.emulate_media(color_scheme=scheme)
+        page.goto(url)
+        page.wait_for_selector("#status-area .status-fallback")
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_fallback_copy_and_class_render(
+        self,
+        fallback_page: Page,
+        browser_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """The status area shows the arrow, the title and the warning."""
+        self._goto(fallback_page, browser_server.url, scheme)
+        status = fallback_page.locator("#status-area")
+        text = status.inner_text()
+        assert "→ Saved to folder: Fallback Doc" in text
+        assert "Title, tags and correspondent were not applied." in text
+        assert status.locator("p.status-fallback").count() == 2
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_fallback_colour_differs_from_done_and_error(
+        self,
+        fallback_page: Page,
+        browser_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        Amber resolves to a colour that is neither the ins green nor the del red.
+
+        This is the mechanical proof of D-05's "visually distinct from both",
+        and it is run under both colour schemes because a token that is legible
+        in one and invisible in the other is not distinct at all.
+        """
+        self._goto(fallback_page, browser_server.url, scheme)
+        colours = fallback_page.evaluate(_PROBE_STATUS_COLOURS)
+        assert len(set(colours.values())) == 3, colours
+
+        rendered = fallback_page.evaluate(
+            "() => getComputedStyle("
+            "document.querySelector('#status-area p.status-fallback')).color"
+        )
+        # The probe measured the class; this proves the real markup wears it.
+        assert rendered == colours["status-fallback"]
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_scan_button_re_enables_after_a_fallback_swap(
+        self,
+        fallback_page: Page,
+        browser_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        A fallback swap releases the Scan button (T-23-23).
+
+        Before `.status-fallback` joined the `htmx:afterSwap` condition the
+        button stayed disabled until the user reloaded the page -- a successful
+        scan that looked like a locked-up application. A grep cannot prove the
+        handler fires; this drives a real swap and watches the button.
+        """
+        self._goto(fallback_page, browser_server.url, scheme)
+        fallback_page.evaluate(_DISABLE_SCAN_BUTTON)
+        assert fallback_page.locator("#scan-btn").is_disabled()
+
+        fallback_page.evaluate(_SWAP_STATUS_AREA)
+        fallback_page.wait_for_selector("#scan-btn:not([disabled])")
+        scan_btn = fallback_page.locator("#scan-btn")
+        assert not scan_btn.is_disabled()
+        assert scan_btn.get_attribute("aria-busy") == "false"
+        assert scan_btn.inner_text() == "Scan"
+
+    def test_fallback_swap_refreshes_the_history_table(
+        self, fallback_page: Page, browser_server: _BrowserServer
+    ) -> None:
+        """
+        The hidden reload div in the FALLBACK branch actually fires (T-23-24).
+
+        The status partial is swapped in with a stale history table below it;
+        the reload div carried in the new markup has to repaint that table
+        without a page load.
+        """
+        self._goto(fallback_page, browser_server.url, "light")
+        fallback_page.evaluate(
+            "() => document.querySelectorAll('#history-body td.status-fallback')"
+            ".forEach((cell) => cell.classList.remove('status-fallback'))"
+        )
+        assert fallback_page.locator("#history-body td.status-fallback").count() == 0
+
+        fallback_page.evaluate(_SWAP_STATUS_AREA)
+        fallback_page.wait_for_selector("#history-body td.status-fallback")
+        cell = fallback_page.locator("#history-body td.status-fallback").first
+        assert cell.inner_text().strip() == "Saved to folder"
