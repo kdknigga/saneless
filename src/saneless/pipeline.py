@@ -337,6 +337,42 @@ def _drop_empty_pages(
     return filtered
 
 
+def _consume_dir_warning(destination: Path | None) -> str:
+    """
+    Describe what a consume-directory delivery cost the document.
+
+    OUTC-02 asks a fallback to be recorded "in the FALLBACK state with a
+    warning", and the two halves carry different information: the state says
+    the document took the other route, and the warning says what that route
+    did not do.  ``docs/explanation/consume-directory-fallback.md`` documents
+    the same consequence -- paperless-ngx applies its own matching rules to a
+    file it finds in the consume directory, so the title, tags and
+    correspondent chosen for this scan are not applied to it.
+
+    Nothing was lost and no rescan is needed, so the register is deliberately
+    a warning rather than an error: the web UI renders it amber beside
+    "Saved to folder", not red beside "Failed".
+
+    Args:
+        destination: Where the PDF was written.
+            ``UploadResult.__post_init__`` guarantees this for every delivery
+            that did not reach the API; the ``None`` arm exists only because
+            the field is typed optional, and a warning that reaches the user
+            must never be empty or read "None".
+
+    Returns:
+        The warning text recorded on the job and rendered in the status area.
+
+    """
+    where = f" at {destination}" if destination is not None else ""
+    return (
+        f"Saved to the paperless-ngx consume directory{where} instead of "
+        "uploading through the API, so the title, tags and correspondent "
+        "chosen for this scan were not applied -- paperless-ngx will apply "
+        "its own matching rules to the file instead."
+    )
+
+
 def _is_manual_duplex(source: str) -> bool:
     """Check if the source string indicates manual duplex scanning."""
     return "manual" in source.lower() and "duplex" in source.lower()
@@ -783,14 +819,20 @@ def run_pipeline(
                     timeout=settings.output.paperless_task_timeout,
                 )
                 outcome = ScanOutcome.SUCCESS
+                warning = None
             else:
                 outcome = ScanOutcome.FALLBACK
+                # A state alone would leave the user to work out for
+                # themselves why the title and tags they chose never appeared
+                # in paperless-ngx (OUTC-02).
+                warning = _consume_dir_warning(upload_result.consume_dir_path)
 
         result = ScanResult(
             outcome=outcome,
             pages_scanned=len(images),
             pages_removed=len(images) - len(filtered),
             pages_uploaded=len(filtered),
+            warning=warning,
         )
 
         notify(PipelineEvent.DONE)
