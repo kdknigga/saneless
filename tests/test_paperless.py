@@ -11,6 +11,7 @@ import pytest
 
 from saneless.exceptions import PaperlessError, PaperlessTimeoutError
 from saneless.paperless import PaperlessClient, UploadResult
+from saneless.vocabulary import ConnectionStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -92,6 +93,54 @@ def _poll_client(
         token=_MOCK_AUTH,
         _transport=_make_transport(handler),
     )
+
+
+def _connection_result_for_status(status_code: int) -> ConnectionStatus:
+    """Run test_connection against a server that answers with one status code."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, text="")
+
+    client = _poll_client(handler)
+    try:
+        return client.test_connection()
+    finally:
+        client.close()
+
+
+def _connection_result_for_exception(
+    exc_type: type[httpx.TransportError],
+) -> ConnectionStatus:
+    """Run test_connection against a transport that raises."""
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        msg = "transport failed"
+        raise exc_type(msg)
+
+    client = _poll_client(handler)
+    try:
+        return client.test_connection()
+    finally:
+        client.close()
+
+
+_CONNECTION_STATUS_CASES = [
+    pytest.param(200, ConnectionStatus.CONNECTED, id="200"),
+    pytest.param(204, ConnectionStatus.CONNECTED, id="204"),
+    pytest.param(401, ConnectionStatus.TOKEN_REJECTED, id="401"),
+    pytest.param(403, ConnectionStatus.TOKEN_REJECTED, id="403"),
+    pytest.param(404, ConnectionStatus.NOT_FOUND, id="404"),
+    pytest.param(500, ConnectionStatus.SERVER_ERROR, id="500"),
+    pytest.param(503, ConnectionStatus.SERVER_ERROR, id="503"),
+    pytest.param(302, ConnectionStatus.SERVER_ERROR, id="302"),
+    pytest.param(429, ConnectionStatus.SERVER_ERROR, id="429"),
+]
+
+_CONNECTION_EXCEPTION_CASES = [
+    pytest.param(httpx.ConnectError, id="connect-error"),
+    pytest.param(httpx.ConnectTimeout, id="connect-timeout"),
+    pytest.param(httpx.ReadTimeout, id="read-timeout"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -498,8 +547,57 @@ class TestPollTask:
 class TestConnectionTest:
     """Connection test method tests."""
 
-    def test_test_connection_connected(self) -> None:
-        """Connection test returns 'connected' on 200 from /api/tags/."""
+    @pytest.mark.parametrize(("status_code", "expected"), _CONNECTION_STATUS_CASES)
+    def test_status_code_classification(
+        self, status_code: int, expected: ConnectionStatus
+    ) -> None:
+        """Each HTTP status maps to exactly one ConnectionStatus member."""
+        assert _connection_result_for_status(status_code) is expected
+
+    @pytest.mark.parametrize("exc_type", _CONNECTION_EXCEPTION_CASES)
+    def test_transport_failures_are_unreachable(
+        self, exc_type: type[httpx.TransportError]
+    ) -> None:
+        """
+        Every transport-level failure is UNREACHABLE, not an escaped exception.
+
+        ConnectTimeout and ReadTimeout used to propagate past the narrow
+        `except httpx.ConnectError` and hit routes.py's blanket handler,
+        surfacing as HTTP 502 {"status": "error"} -- which is none of the
+        five outcomes OUTC-08 names.
+        """
+        assert (
+            _connection_result_for_exception(exc_type) is ConnectionStatus.UNREACHABLE
+        )
+
+    @pytest.mark.parametrize("member", list(ConnectionStatus), ids=lambda m: m.name)
+    def test_every_member_is_producible(self, member: ConnectionStatus) -> None:
+        """
+        No ConnectionStatus member is unreachable from a real response.
+
+        Parametrised over `list(ConnectionStatus)` so a sixth member cannot
+        be added without someone deciding what produces it.
+        """
+        produced = {
+            _connection_result_for_status(code) for code in (200, 401, 404, 500)
+        }
+        produced.add(_connection_result_for_exception(httpx.ConnectError))
+        assert member in produced, f"{member.name} is not produced by any input"
+
+    def test_legacy_wire_strings_are_byte_identical(self) -> None:
+        """
+        The three documented JSON strings still compare equal as plain str.
+
+        These assertions are deliberately NOT enum-identity checks: they are
+        the only thing proving the StrEnum *value* is still what
+        web/routes.py serialises and docs/reference/web-api.md documents.
+        """
+        assert _connection_result_for_status(200) == "connected"
+        assert _connection_result_for_status(401) == "token_rejected"
+        assert _connection_result_for_exception(httpx.ConnectError) == "unreachable"
+
+    def test_connection_test_hits_the_tags_endpoint(self) -> None:
+        """The probe is a one-row GET against /api/tags/."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             assert "/api/tags/" in str(request.url)
@@ -512,59 +610,16 @@ class TestConnectionTest:
             token=_MOCK_AUTH,
             _transport=transport,
         )
-        assert client.test_connection() == "connected"
+        assert client.test_connection() is ConnectionStatus.CONNECTED
         client.close()
 
-    def test_test_connection_token_rejected_401(self) -> None:
-        """Connection test returns 'token_rejected' on 401 from /api/tags/."""
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            assert "/api/tags/" in str(request.url)
-            assert "page_size=1" in str(request.url)
-            return httpx.Response(401, text="Unauthorized")
-
-        transport = _make_transport(handler)
-        auth = "badtoken"
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=auth,
-            _transport=transport,
-        )
-        assert client.test_connection() == "token_rejected"
-        client.close()
-
-    def test_test_connection_token_rejected_403(self) -> None:
-        """Connection test returns 'token_rejected' on 403 from /api/tags/."""
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            assert "/api/tags/" in str(request.url)
-            assert "page_size=1" in str(request.url)
-            return httpx.Response(403, text="Forbidden")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            _transport=transport,
-        )
-        assert client.test_connection() == "token_rejected"
-        client.close()
-
-    def test_test_connection_unreachable(self) -> None:
-        """Connection test returns 'unreachable' on ConnectError."""
-
-        def handler(_request: httpx.Request) -> httpx.Response:
-            msg = "connection refused"
-            raise httpx.ConnectError(msg)
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            _transport=transport,
-        )
-        assert client.test_connection() == "unreachable"
-        client.close()
+    def test_unclassified_status_is_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An unclassified non-2xx is diagnosable, not silently bucketed."""
+        with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
+            assert _connection_result_for_status(429) is ConnectionStatus.SERVER_ERROR
+        assert any("429" in message for message in caplog.messages)
 
 
 # ---------------------------------------------------------------------------

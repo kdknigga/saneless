@@ -2,9 +2,9 @@
 Paperless-ngx REST API client with retry, polling, and connection test.
 
 Uploads PDFs with metadata (title, tags, correspondent, created date),
-polls the task endpoint with exponential backoff until terminal state,
-and tests connections distinguishing unreachable, token_rejected, and
-connected states.
+polls the task endpoint with exponential backoff until a terminal state
+and raises when that state is not success, and probes connections,
+reporting one of the five ConnectionStatus outcomes.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 
 from .exceptions import PaperlessError, PaperlessTimeoutError
+from .vocabulary import ConnectionStatus
 
 __all__ = ["PaperlessClient", "UploadResult"]
 
@@ -405,25 +406,50 @@ class PaperlessClient:
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, 30.0)
 
-    def test_connection(self) -> str:
+    def test_connection(self) -> ConnectionStatus:
         """
-        Test paperless-ngx connection.
+        Probe paperless-ngx and report which of five outcomes occurred.
 
-        Distinguishes three states: connected (API reachable and
-        authenticated), token_rejected (API reachable but auth
-        failed), and unreachable (network error).
+        CONNECTED means a 2xx and nothing else.  A 404 says the API is not
+        where the configured URL points -- a different thing to fix than a
+        500, which says paperless-ngx itself is unwell, and both used to be
+        reported as CONNECTED.
+
+        The classification is an ordered chain of integer comparisons rather
+        than a ``match`` with ``assert_never``, for the same reason
+        ``vocabulary.classify_error`` is an ``isinstance`` chain: the input
+        is a range of integers, not a closed set of members, so exhaustive
+        matching does not apply and a trailing fallback is the correct total
+        answer.  ``assert_never`` governs the *message* lookup in
+        ``vocabulary.connection_status_message``, which does dispatch on a
+        closed set.
 
         Returns:
-            One of "connected", "token_rejected", or "unreachable".
+            A ConnectionStatus member.  It is a StrEnum, and its values are
+            the public JSON contract documented in
+            ``docs/reference/web-api.md`` -- ``web/routes.py`` serialises the
+            return value straight into a response body, so the values may
+            not be renamed without breaking existing clients.
 
         """
         try:
             response = self._client.get("/api/tags/", params={"page_size": 1})
-            if response.status_code in (401, 403):
-                return "token_rejected"
-            return "connected"
-        except httpx.ConnectError:
-            return "unreachable"
+        except httpx.TransportError:
+            # The base class of ConnectError, ConnectTimeout and ReadTimeout.
+            # Catching only ConnectError let the timeout siblings escape to
+            # routes.py's blanket handler, which answers HTTP 502
+            # {"status": "error"} -- none of the five outcomes.
+            logger.warning("Paperless is unreachable")
+            return ConnectionStatus.UNREACHABLE
+
+        if response.is_success:
+            return ConnectionStatus.CONNECTED
+        if response.status_code in (401, 403):
+            return ConnectionStatus.TOKEN_REJECTED
+        if response.status_code == 404:
+            return ConnectionStatus.NOT_FOUND
+        logger.warning("Unexpected paperless status %s", response.status_code)
+        return ConnectionStatus.SERVER_ERROR
 
     def get_tags(self) -> list[dict[str, object]]:
         """
