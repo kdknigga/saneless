@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import logging
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +19,7 @@ from saneless.exceptions import (
 )
 from saneless.paperless import UploadResult
 from saneless.pipeline import (
+    FAILED_DIR_WARN_THRESHOLD,
     PipelineEvent,
     PipelineRequest,
     ScanResult,
@@ -34,7 +37,7 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Iterator
 
     from saneless.config import Settings
 
@@ -1425,3 +1428,168 @@ class TestPreservation:
         scratch = tmp_path / "scratch"
         assert [item for item in scratch.iterdir() if item.is_dir()] == []
         assert len(list(failed_dir.glob("*.pdf"))) == 1
+
+
+def _fill_failed_dir(failed_dir: Path, count: int) -> list[str]:
+    """
+    Pre-populate ``failed_dir`` with ``count`` preserved-looking PDFs.
+
+    Args:
+        failed_dir: The directory to fill; created if absent.
+        count: How many files to write.
+
+    Returns:
+        The file names written, so a test can assert every one of them
+        survived a later preservation.
+
+    """
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    names = [f"20260101-000000-old{index:02d}-doc.pdf" for index in range(count)]
+    for name in names:
+        (failed_dir / name).write_bytes(b"%PDF-old" * 64)
+    return names
+
+
+def _preserve_one_scan(settings: Settings, job_id: str) -> PaperlessError:
+    """
+    Drive one failing delivery through the pipeline and return what escaped.
+
+    Args:
+        settings: Settings already pointed at isolated directories.
+        job_id: The job id, which is what makes the preserved name unique.
+
+    Returns:
+        The PaperlessError that escaped run_pipeline.
+
+    """
+    paperless = MagicMock()
+    paperless.upload_document.side_effect = PaperlessError("Upload failed")
+    with pytest.raises(PaperlessError) as excinfo:
+        run_pipeline(
+            scanner=_one_page_scanner(),
+            paperless=paperless,
+            settings=settings,
+            request=PipelineRequest(
+                profile_name="default", title="Growth Check", job_id=job_id
+            ),
+        )
+    return excinfo.value
+
+
+class TestFailedDirWarning:
+    """Warn -- never prune -- when preserved scans accumulate (T-23-29)."""
+
+    def test_failed_dir_warns_when_the_threshold_is_reached(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Preserving into a crowded directory logs one WARNING."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            _preserve_one_scan(default_settings, "job-growth-1")
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and str(failed_dir) in record.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    def test_failed_dir_warning_names_the_count_size_and_path(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The operator needs all three facts to act on the warning."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            _preserve_one_scan(default_settings, "job-growth-2")
+
+        message = next(
+            record.getMessage()
+            for record in caplog.records
+            if str(failed_dir) in record.getMessage()
+        )
+        assert str(FAILED_DIR_WARN_THRESHOLD) in message
+        assert "MiB" in message
+        assert str(failed_dir) in message
+
+    def test_failed_dir_warning_is_silent_below_the_threshold(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One preserved scan is not a problem and must not be announced."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            _preserve_one_scan(default_settings, "job-growth-3")
+
+        assert len(list(failed_dir.glob("*.pdf"))) == 1
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if "MiB" in record.getMessage()
+        ] == []
+
+    def test_failed_dir_warning_deletes_nothing(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        The warning is the whole control: no prune, no sweep, no rotation.
+
+        Deleting a preserved scan would be exactly the data loss the guard
+        exists to prevent, so every pre-existing file must still be there.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        existing = _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            _preserve_one_scan(default_settings, "job-growth-4")
+
+        survivors = {path.name for path in failed_dir.glob("*.pdf")}
+        assert set(existing) <= survivors
+        assert len(survivors) == FAILED_DIR_WARN_THRESHOLD
+
+    def test_failed_dir_warning_failure_cannot_mask_the_delivery_error(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        An unreadable failed/ must not replace the real failure.
+
+        The growth check runs inside the preservation guard's own exception
+        handler, so a raise there would swap the delivery failure -- the
+        message OUTC-04 requires the job to carry -- for a bookkeeping error.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        real_glob = Path.glob
+
+        def exploding_glob(self: Path, pattern: str) -> Iterator[Path]:
+            if self == failed_dir:
+                msg = "failed/ became unreadable"
+                raise OSError(msg)
+            return real_glob(self, pattern)
+
+        monkeypatch.setattr(Path, "glob", exploding_glob)
+
+        escaped = _preserve_one_scan(default_settings, "job-growth-5")
+
+        assert "Upload failed" in str(escaped)
+        assert "preserved at" in str(escaped)
+        # iterdir, not glob: the patch is still in force.
+        assert len([path for path in failed_dir.iterdir() if path.is_file()]) == 1
