@@ -96,7 +96,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
-        output=OutputConfig(tmp_dir=str(tmp_path)),
+        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         profiles={"default": ProfileConfig()},
     )
     app = create_app(settings, _StubScanner())
