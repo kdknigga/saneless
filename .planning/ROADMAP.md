@@ -1,7 +1,7 @@
 # Roadmap: saneless
 
 **Milestone:** v2.0 "Prep for release"
-**Requirements:** `.planning/REQUIREMENTS.md` (118 v2.0 requirements)
+**Requirements:** `.planning/REQUIREMENTS.md` (125 v2.0 requirements)
 **Research:** `.planning/research/SUMMARY.md`
 **Review under remediation:** `.planning/reviews/2026-09-09-code-review.md`
 **Previous milestone:** v1.0, archived at `.planning/milestones/v1.0-ROADMAP.md` (ended at Phase 19)
@@ -35,6 +35,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 21: Vocabulary and Contracts** - One `JobState`, one label map, one `ErrorCategory`, one `classify_source()`, and typed `ScanResult`/`UploadResult`, with zero behaviour change (completed 2026-09-10)
 - [x] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration (completed 2026-09-10)
 - [x] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI (completed 2026-09-11)
+- [ ] **Phase 23.1: Dark Mode and the Commit Gate** (INSERTED) - The dark palette actually engages, every status colour passes AA in both schemes, and a TDD RED commit is possible without suppressing a gate
 - [ ] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane
 - [ ] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass
 - [ ] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets
@@ -176,6 +177,27 @@ Wave order is load-bearing, not cosmetic. **23-04 Task 1 bundles the v9/v10 shap
 Note: the preservation `try/except` must span both `upload_document` and `poll_task`. Wrapping only the upload call means a correct FAILURE raise unwinds the `TemporaryDirectory` and deletes the document this phase exists to protect.
 
 Note (added 2026-09-11 from Phase 23 research): criterion 6 / OUTC-11 was not in the original scope. `poll_task` assumes API v9 while paperless-ngx now serves v10 by default to a client that sends no version header. The bug is masked today because `pipeline.py:521-527` discards the poll result; criteria 1 and 3 remove that mask, at which point every successful scan would record FAILED with a preserved stray PDF. The fix is a prerequisite for criterion 1, not an extension of it.
+
+### Phase 23.1: Dark Mode and the Commit Gate (INSERTED)
+
+**Goal**: Two defects that Phase 23 execution exposed are closed — the web UI actually renders Pico v2's dark palette when the operator's OS asks for it, with every status colour passing WCAG AA in both schemes; and a TDD RED commit is possible without `--no-verify`, `# type: ignore`, or disabling a rule, while type errors still cannot reach master
+**Depends on**: Phase 23
+**Requirements**: DARK-01, DARK-02, DARK-03, GATE-01, GATE-02, GATE-03
+**Success Criteria** (what must be TRUE):
+
+  1. With `prefers-color-scheme: dark`, a Playwright test asserts `body`'s **computed** background is Pico's dark surface rather than the light one, and that test fails if `data-theme="auto"` is restored
+  2. `.status-done`, `.status-error` and `.status-fallback` each measure at least 4.5:1 against the surface in **both** schemes, asserted by computed-colour tests rather than by eye
+  3. A test file referencing a symbol that does not exist yet can be committed with hooks enabled and no suppression of any kind
+  4. A deliberate type error is still rejected before it can reach master — proven at whichever gate now owns that job
+  5. No verification command in `.planning/`, the hooks, or CI uses bare `uv run pyrefly check`
+
+**Plans**: TBD
+
+**Why this is an insertion rather than end-of-milestone work.** GATE-01/02 affect every phase from 24 to 32: all eight Phase 23 executors independently hit the same wall, and each spent real effort rediscovering it. Fixing it once here compounds across the nine phases that follow. DARK-01/02 are not urgent in the same way and are here only because the user asked for one phase covering both.
+
+**Coupling to Phase 26.** DARK-03 settles whether `pico.colors.css` ships. Phase 26's ROBU-09 vendors htmx and PicoCSS for the no-egress CI sandbox, so whatever this phase decides about which Pico files exist must survive that vendoring — and Phase 26 must not silently reintroduce `data-theme="auto"` or drop the dark-scheme overrides. Check this explicitly when planning 26.
+
+**Evidence base.** `.planning/phases/23-honest-outcomes-and-never-lose-a-scan/deferred-items.md` (written by plan 23-05, with the measurement DARK-02 needs) and `.planning/todos/pending/002-dark-mode-never-engages.md`. Both predate this phase and should be read before planning it.
 
 ### Phase 24: Scanner Truthfulness
 
@@ -353,7 +375,7 @@ Safe to skip research: Phase 20 (mechanical), Phase 21 (pure refactor, fully spe
 
 ## Coverage
 
-All 118 v2.0 requirements are mapped to exactly one phase. See the Traceability table in `.planning/REQUIREMENTS.md`.
+All 125 v2.0 requirements are mapped to exactly one phase. See the Traceability table in `.planning/REQUIREMENTS.md`.
 
 ---
 *Roadmap created: 2026-09-09*

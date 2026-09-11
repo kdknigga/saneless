@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: completed
-stopped_at: Phase 23 complete -- verified 6/6
-last_updated: "2026-09-11T17:02:00.169Z"
+stopped_at: Phase 23.1 inserted, not yet planned
+last_updated: "2026-09-11T18:46:57.439Z"
 last_activity: 2026-09-10 -- Phase 22 marked complete
 progress:
-  total_phases: 13
+  total_phases: 14
   completed_phases: 4
   total_plans: 25
   completed_plans: 25
-  percent: 31
+  percent: 29
 ---
 
 # Project State
@@ -217,6 +217,7 @@ Recent decisions affecting current work:
 - Phase 17 added: Fix Paperless upload error: datetime format and title type mismatch in API payload
 - Phase 18 added: Automatic scanned page size detection or user-specified paper size to avoid capturing the full scanner bed
 - Phase 19 added: Write user-facing docs including a full getting started section that walks a new user through setup and first scan using the Diátaxis model
+- Phase 23.1 inserted after Phase 23: Dark Mode and the Commit Gate (URGENT)
 
 ### Pending Todos
 
@@ -238,6 +239,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
-Last session: 2026-09-11T17:02:00.163Z
-Stopped at: Phase 23 complete -- verified 6/6
-Resume file: .planning/phases/23-honest-outcomes-and-never-lose-a-scan/23-VERIFICATION.md
+Last session: 2026-09-11T18:46:57.433Z
+Stopped at: Phase 23.1 inserted, not yet planned
+Resume file: .planning/ROADMAP.md

@@ -47,6 +47,18 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 
   **Why this exists.** `poll_task` (`src/saneless/paperless.py:210-248`) was written against API v9. Current paperless-ngx serves **v10 by default when no version header is sent**, and `PaperlessClient.__init__` sends only `Authorization` — so `isinstance(tasks, list)` is `False`, no terminal status is ever observed, and every poll burns the full timeout. This is invisible today only because `pipeline.py:521-527` discards `poll_task`'s return value and records `SUCCESS` regardless. OUTC-01 and OUTC-07 remove that cover: once timeouts raise and the PDF is preserved on timeout (D-10), **every successful scan would record as FAILED with a stray file in `failed/`** — the exact inversion of this phase's goal. OUTC-01's "records the job FAILED with the Paperless message" also cannot be implemented without resolving which field carries that message.
 
+### Dark Mode and the Commit Gate
+
+Both defects below were discovered *during* Phase 23 execution, not by the 2026-09-09 review, so they carry no `C-`/`M-`/`N-` finding ID. Evidence lives in `.planning/phases/23-honest-outcomes-and-never-lose-a-scan/deferred-items.md` and `.planning/todos/pending/002-dark-mode-never-engages.md`.
+
+- [ ] **DARK-01**: The web UI renders PicoCSS v2's dark palette when the operator's OS requests it. `src/saneless/web/templates/base.html:2` sets `data-theme="auto"`, but Pico v2 scopes its automatic dark rule to `:root:not([data-theme])` — the attribute must be **absent**; `"auto"` was the Pico v1 spelling. The shipped CDN build contains exactly one dark media block, selector `:host(:not([data-theme])), :root:not([data-theme])`. Consequence: every user has seen the light palette regardless of OS preference since Phase 12. Proven by a Playwright test asserting a **computed** background colour under `prefers-color-scheme: dark`, not by reading the attribute out of the HTML [Phase 23 plan 23-05]
+- [ ] **DARK-02**: `.status-done`, `.status-error` and `.status-fallback` each meet WCAG AA (4.5:1) against the surface in **both** colour schemes. `.status-fallback`'s amber-600 (`#a16207`) measures ~3.6:1 on Pico's dark surface today — below the floor — so it needs a lighter amber under dark. This introduces the first dark-scheme-specific override in `app.css`; the convention is recorded in `.planning/UI-SPEC.md`, which currently records its absence [Phase 23 plan 23-05]
+- [ ] **DARK-03**: Whether `pico.colors.css` is linked is decided and recorded. `pico.min.css` ships the semantic tokens only; the `--pico-color-*` palette lives in a separate file `base.html` does not link, so `.status-fallback`'s `var(--pico-color-amber-600, #a16207)` falls through to the literal hex today. Coordinate with ROBU-09 (Phase 26), which vendors the Pico files — which Pico files exist should be settled once, not twice [Phase 23 plan 23-05]
+
+- [ ] **GATE-01**: A TDD RED commit — a test file referencing a symbol that does not exist yet — can be committed without `--no-verify`, without `# type: ignore`, and without disabling any rule. Today `prek` runs `uv run ty check` and `uv run pyrefly check src tests` on **every** commit, and both reject such a file by construction, so RED and GREEN must land together. All eight Phase 23 executors hit this independently and one enumerated every escape it tried and was denied (`--no-verify` forbidden by contract, `# type: ignore` forbidden by CLAUDE.md, `SKIP=ty-checker` denied by the sandbox). `workflow.tdd_mode` is `true` in `.planning/config.json`, so this degrades every remaining phase [Phase 23, all plans]
+- [ ] **GATE-02**: Whatever mechanism satisfies GATE-01, a deliberate type error still cannot reach master. If the type checkers move off `pre-commit`, the gate that replaces them (pre-push, CI, or both) is proven to reject one. CI-01's GitHub Actions gate remains the enforcing boundary [Phase 23, all plans]
+- [ ] **GATE-03**: No verification command in `.planning/`, `.pre-commit-config.yaml`, or CI uses bare `uv run pyrefly check`, and the reason is written down where a future plan author will see it: inside a gitignored directory — such as a `.claude/worktrees/` git worktree — pyrefly's `use-ignore-files` default filters out every source file, and the bare invocation can report success having checked nothing. Phase 23 saw it exit 1 in some worktrees and 0 in others; both are wrong. Always name paths: `uv run pyrefly check src tests` [Phase 23 plans 23-01, 23-03, 23-04]
+
 ### Scanner Truthfulness
 
 - [ ] **SCNR-01**: `sane_backend`, `auto_profiles`, the pipeline, and the worker all route feeder decisions through `classify_source()`; a device whose feeder is named "Automatic Document Feeder" scans a full stack, and auto-profiles never collapses two distinct feeder sources into one slug [C-06, N-09]
@@ -240,6 +252,12 @@ Which phases cover which requirements. Updated during roadmap creation.
 | OUTC-09 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
 | OUTC-10 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
 | OUTC-11 | Phase 23 — Honest Outcomes and Never Lose a Scan | Complete |
+| DARK-01 | Phase 23.1 — Dark Mode and the Commit Gate | Pending |
+| DARK-02 | Phase 23.1 — Dark Mode and the Commit Gate | Pending |
+| DARK-03 | Phase 23.1 — Dark Mode and the Commit Gate | Pending |
+| GATE-01 | Phase 23.1 — Dark Mode and the Commit Gate | Pending |
+| GATE-02 | Phase 23.1 — Dark Mode and the Commit Gate | Pending |
+| GATE-03 | Phase 23.1 — Dark Mode and the Commit Gate | Pending |
 | SCNR-01 | Phase 24 — Scanner Truthfulness | Pending |
 | SCNR-02 | Phase 24 — Scanner Truthfulness | Pending |
 | SCNR-03 | Phase 24 — Scanner Truthfulness | Pending |
