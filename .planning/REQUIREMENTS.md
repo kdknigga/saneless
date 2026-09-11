@@ -41,6 +41,9 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 - [ ] **OUTC-08**: `test_connection` reports "connected" only for a 2xx response; 404 and 5xx are reported as distinct failure modes [N-12]
 - [ ] **OUTC-09**: The job database and the `failed/` directory live under a new `output.data_dir` setting (XDG state by default, `saneless-data` volume in Docker), never under the disposable `tmp_dir` [N-39, U-08]
 - [ ] **OUTC-10**: A parametrised end-to-end test drives the real worker and pipeline with a stub scanner through SUCCESS, Paperless FAILURE, TIMEOUT, consume-dir fallback, and duplex mismatch, asserting the persisted state, outcome, page counts, and file preservation for each [C-03, M-33]
+- [ ] **OUTC-11**: `PaperlessClient` pins the paperless-ngx API version with an explicit `Accept` header and parses both the v9 and v10 `/api/tasks/` response shapes — paginated `{"count","results":[…]}` as well as a bare list, lowercase as well as uppercase status values, and the failure message from `result_data["error_message"]` as well as `result` [Phase 23 research, 2026-09-11]
+
+  **Why this exists.** `poll_task` (`src/saneless/paperless.py:210-248`) was written against API v9. Current paperless-ngx serves **v10 by default when no version header is sent**, and `PaperlessClient.__init__` sends only `Authorization` — so `isinstance(tasks, list)` is `False`, no terminal status is ever observed, and every poll burns the full timeout. This is invisible today only because `pipeline.py:521-527` discards `poll_task`'s return value and records `SUCCESS` regardless. OUTC-01 and OUTC-07 remove that cover: once timeouts raise and the PDF is preserved on timeout (D-10), **every successful scan would record as FAILED with a stray file in `failed/`** — the exact inversion of this phase's goal. OUTC-01's "records the job FAILED with the Paperless message" also cannot be implemented without resolving which field carries that message.
 
 ### Scanner Truthfulness
 
@@ -234,6 +237,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | OUTC-08 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
 | OUTC-09 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
 | OUTC-10 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
+| OUTC-11 | Phase 23 — Honest Outcomes and Never Lose a Scan | Pending |
 | SCNR-01 | Phase 24 — Scanner Truthfulness | Pending |
 | SCNR-02 | Phase 24 — Scanner Truthfulness | Pending |
 | SCNR-03 | Phase 24 — Scanner Truthfulness | Pending |

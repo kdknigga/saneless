@@ -148,7 +148,7 @@ Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the w
 
 **Goal**: A job's recorded state is always the truth and a scanned document is never destroyed by a downstream failure — Paperless failures and timeouts raise, consume-directory delivery is recorded as `FALLBACK`, unrecoverable uploads preserve the PDF under a durable `data_dir/failed/` with a unique name and correct DPI — with every doc sentence that promised the old silent-DONE behaviour rewritten in-phase
 **Depends on**: Phase 22
-**Requirements**: OUTC-01, OUTC-02, OUTC-03, OUTC-04, OUTC-05, OUTC-06, OUTC-07, OUTC-08, OUTC-09, OUTC-10
+**Requirements**: OUTC-01, OUTC-02, OUTC-03, OUTC-04, OUTC-05, OUTC-06, OUTC-07, OUTC-08, OUTC-09, OUTC-10, OUTC-11
 **Success Criteria** (what must be TRUE):
 
   1. A Paperless task ending FAILURE, or a poll that exceeds its monotonic deadline, records the job FAILED with the Paperless message — never DONE — and a PDF still exists on disk whose path is named in the job error
@@ -156,10 +156,13 @@ Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the w
   3. When upload and consume-directory fallback both fail after N pages, the assembled PDF is in `<data_dir>/failed/` under a unique name and no page image or PDF was deleted on that path
   4. An A4 page scanned at 300 DPI produces a PDF with a 595 x 842 pt MediaBox, and two jobs with the same title produce two distinct PDF file names
   5. A parametrised end-to-end test drives the real worker and pipeline with a stub scanner through SUCCESS, Paperless FAILURE, TIMEOUT, consume-dir fallback, and duplex mismatch, asserting persisted state, outcome, page counts, and file preservation for each
+  6. `poll_task` reaches a terminal status against BOTH a v9-shaped (bare list, uppercase status, `result`) and a v10-shaped (paginated `{"count","results"}`, lowercase status, `result_data.error_message`) `/api/tasks/` response, and `PaperlessClient` sends an explicit API-version `Accept` header
 
 **Plans**: TBD
 
 Note: the preservation `try/except` must span both `upload_document` and `poll_task`. Wrapping only the upload call means a correct FAILURE raise unwinds the `TemporaryDirectory` and deletes the document this phase exists to protect.
+
+Note (added 2026-09-11 from Phase 23 research): criterion 6 / OUTC-11 was not in the original scope. `poll_task` assumes API v9 while paperless-ngx now serves v10 by default to a client that sends no version header. The bug is masked today because `pipeline.py:521-527` discards the poll result; criteria 1 and 3 remove that mask, at which point every successful scan would record FAILED with a preserved stray PDF. The fix is a prerequisite for criterion 1, not an extension of it.
 
 ### Phase 24: Scanner Truthfulness
 

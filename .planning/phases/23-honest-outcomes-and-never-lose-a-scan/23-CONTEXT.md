@@ -24,7 +24,10 @@ Concretely, this phase closes five gaps that exist in the code today:
 4. **`pdf.py:55` hardcodes `output.pdf`.** Every document reaches paperless with that original
    filename, and every consume-directory copy (`paperless.py:202-203`) collides with the last one.
    `img2pdf.convert(image_paths)` at `pdf.py:56` passes no layout function, so an A4 page scanned at
-   300 DPI gets a 2480 x 3508 pt MediaBox instead of 595 x 842.
+   300 DPI gets a 1860 x 2631 pt MediaBox instead of 595 x 842.
+   *(Corrected 2026-09-11 from research: `img2pdf.default_dpi` is 96, not 72 — verified against the
+   installed img2pdf 0.6.3. The fixed-DPI result is 595.2 x 841.92 pt, so the OUTC-06 test must
+   round rather than assert the roadmap's exact `595 x 842`.)*
 5. **The job database lives in the disposable temp directory** (`cli.py:227`, `web/app.py:59`), and
    `docker-compose.yml:21` mounts the durable `saneless-data` volume *at* `/tmp/saneless` — the
    deployment the docs recommend has its durable volume and its scratch space as the same directory.
@@ -110,6 +113,15 @@ is called out explicitly (**D-14** is the only one).
     improvement.
   - Also rejected: a broad guard from `assemble_pdf` to the end of the block, which would catch
     failures in code unrelated to delivery and report them in the job error as delivery failures.
+  - **AMENDED 2026-09-11, resolving a tension the researcher flagged.** D-06 says "on any exception"
+    while also rejecting broad guards, which reads as contradictory. The resolution: the guard is
+    **`except Exception`**, narrow in *span* (upload + poll only) and broad in *type*. The two are
+    not in tension — the rejected option was broad in span, covering code that has nothing to do
+    with delivery. Within the delivery window, a bug in our own code is precisely when the scan most
+    needs keeping, and nothing is masked because the guard re-raises the original exception after
+    moving the file. `KeyboardInterrupt` and `SystemExit` still propagate untouched, since they
+    derive from `BaseException` rather than `Exception`. Do **not** narrow this to
+    `except PaperlessError`.
 
 - **D-07: only the PDF is preserved; page images are not.** OUTC-04's phrase "no page images or PDF
   are deleted on that path" is satisfied by the PDF, because img2pdf assembly is lossless and the PDF
@@ -226,6 +238,41 @@ is called out explicitly (**D-14** is the only one).
     existing `tmp_dir` and `consume_dir` ones, so a bad path fails at startup rather than at
     preservation time — the worst possible moment to discover it.
 
+### Added after research (2026-09-11)
+
+- **D-17: OUTC-11 joins this phase's scope — pin and tolerate the paperless-ngx API version.**
+  `PaperlessClient.__init__` (`paperless.py:94-98`) sends only `Authorization`, and current
+  paperless-ngx serves **API v10** to a client that sends no version header. `poll_task`
+  (`:210-248`) was written against v9. In v10 `/api/tasks/` is paginated into
+  `{"count","results":[…]}`, statuses are lowercase, and `result` became
+  `result_data["error_message"]` — so `isinstance(tasks, list)` at `:236` is `False`, no terminal
+  status is ever observed, and every poll burns the full timeout.
+  - **This is a prerequisite for D-01/OUTC-01, not new scope.** It is masked today only because
+    `pipeline.py:521-527` discards the return value. The moment timeouts raise (OUTC-01) and the PDF
+    is preserved on timeout (D-10), every *successful* scan records FAILED with a stray file in
+    `failed/` — the exact inversion of this phase's goal. OUTC-01's "with the Paperless message"
+    also cannot be implemented without naming the field that carries it.
+  - **Fix shape:** send an explicit version `Accept` header **and** parse both response shapes. That
+    is correct regardless of which version any given server speaks, so it does not block on
+    determining the user's server version.
+  - Recorded as **OUTC-11** in `.planning/REQUIREMENTS.md` and as roadmap success criterion 6, on
+    the user's instruction, so the traceability table and the verifier both see it rather than it
+    riding along inside OUTC-01's row.
+
+- **D-18: two numbers previously written down were wrong; the corrected ones bind the OUTC-06 test.**
+  Verified against the installed `img2pdf` 0.6.3: `img2pdf.default_dpi` is **96**, not 72, so an
+  unlayouted A4 at 300 DPI produces **1860 x 2631 pt**, not 2480 x 3508. And the fixed-DPI result is
+  **595.2 x 841.92 pt** — never exactly the `595 x 842` the roadmap criterion states. **The OUTC-06
+  test must `round()` rather than assert equality.** `pikepdf` 10.5.1 is already installed as an
+  `img2pdf` transitive dependency, so asserting a MediaBox needs no new runtime dependency; promote
+  it to an explicit dev dependency (`uv add --dev pikepdf`) rather than relying on a transitive.
+
+- **D-19: `auto_profiles._slugify` must NOT be reused for D-09's PDF filename.** Research found it
+  passes `/` and `..` straight through. D-09 makes a user-supplied title part of a filesystem path
+  for the first time in this codebase, and that path is then joined against `consume_dir` and
+  `<data_dir>/failed/`. The sanitiser for filenames is a separate function with its own tests,
+  including `../` and absolute-path inputs.
+
 ### Claude's Discretion
 
 The following were raised during discussion and explicitly handed to the planner and executor. Make
@@ -239,12 +286,17 @@ the call, and record the reasoning in the plan:
   `_transport` hook (`paperless.py:91`) is the established seam for the paperless side. Phase 32 owns
   the general "no `time.sleep`" sweep (M-34), but this test must be fast *now* — it runs in the Phase
   20 gate on every push.
-- **The img2pdf DPI layout function (OUTC-06).** `img2pdf.get_fixed_dpi_layout_fun` is the documented
-  mechanism. Which DPI is authoritative is the open question: `profile.resolution` is what we asked
-  for, but the device may have delivered something else, and reading DPI back from the device is
-  explicitly Phase 24's (SCNR block). Decide and record whether this phase uses the profile value,
-  the PIL image's own DPI when present, or a documented preference order — and what happens if pages
-  disagree.
+  **Research answered the hard half:** the test can sleep **zero seconds** using only existing
+  constructor parameters — `max_retries=1` (measured 3.00 s -> 0.00 s) plus a deadline-clamped
+  `time.sleep(min(delay, remaining))` in `poll_task`. No new injection seam and no `time.sleep`
+  monkeypatching are needed. What remains discretionary is the test's structure and parametrisation,
+  not how to make it fast.
+- ~~**The img2pdf DPI layout function (OUTC-06).**~~ **ANSWERED by research, no longer discretionary.**
+  `img2pdf.get_fixed_dpi_layout_fun` takes an **`(x, y)` tuple**. The authoritative DPI is
+  **`profile.resolution`** — not a preference order, because PIL carries no DPI on this path at all
+  (`crop_to_paper_size(...).info` was measured as `{}`), `crop_to_paper_size` already treats
+  `profile.resolution` as authoritative, and a PNG round-trip degrades 300 to `299.9994`. See D-18
+  for the corrected MediaBox arithmetic.
 - **The exact `FALLBACK` rendering** in the status partial, the history table, and `saneless jobs`,
   within D-05's decision ("Saved to folder", warning treatment). Includes whether the `warning` text
   is shown inline or on hover/detail, and whether `progress_label` needs a meaningful `FALLBACK` arm
