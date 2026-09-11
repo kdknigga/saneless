@@ -42,6 +42,7 @@ from saneless.scanner.base import (
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    TERMINAL_STATES,
     JobState,
     progress_label,
     state_label,
@@ -131,11 +132,32 @@ def _adopt_as_current_job(client: TestClient, job_id: str) -> None:
     _app(client).state.worker._current_job_id = job_id
 
 
-def _job_in_state(client: TestClient, state: JobState) -> None:
+def _set_warning(job_store: JobStore, job_id: str, warning: str) -> None:
+    """
+    Write the `warning` column directly.
+
+    `JobStore` grows no warning writer until plan 23-07, but the FALLBACK status
+    markup interpolates `job.warning` now, so the escaping contract (T-23-21)
+    needs a value to escape today. A single parameterised UPDATE is narrower
+    than adding a production setter that nothing else would call yet, and it is
+    the same kind of deliberate reach-through as `_adopt_as_current_job` above.
+    """
+    with job_store._conn:
+        job_store._conn.execute(
+            "UPDATE jobs SET warning = ? WHERE id = ?",
+            (warning, job_id),
+        )
+
+
+def _job_in_state(
+    client: TestClient, state: JobState, warning: str | None = None
+) -> None:
     """Create a job, drive it to `state`, and make it the worker's current job."""
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Render Test")
     job_store.update_state(job.id, state, error="disk on fire")
+    if warning is not None:
+        _set_warning(job_store, job.id, warning)
     _adopt_as_current_job(client, job.id)
 
 
@@ -159,11 +181,12 @@ def test_history_cell_shows_the_shared_label(
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_history_cell_css_class(client: TestClient, state: JobState) -> None:
-    """Only DONE and ERROR history cells carry a status CSS class (CTR-01)."""
+    """Only the three terminal history cells carry a status CSS class (CTR-01)."""
     _job_in_state(client, state)
     text = client.get("/api/jobs/history").text
     assert ('<td class="status-done">' in text) is (state is JobState.DONE)
     assert ('<td class="status-error">' in text) is (state is JobState.ERROR)
+    assert ('<td class="status-fallback">' in text) is (state is JobState.FALLBACK)
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -203,10 +226,16 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
             '<p role="alert" class="status-error">&#10007; Error: disk on fire</p>'
             in text
         )
-    # The history-refresh hook belongs to the two terminal states only.
-    assert ('hx-get="/api/jobs/history"' in text) is (
-        state in {JobState.DONE, JobState.ERROR}
-    )
+    if state is JobState.FALLBACK:
+        assert (
+            '<p class="status-fallback">&#8594; Saved to folder: Render Test</p>'
+            in text
+        )
+        # A fallback is a degradation, not a failure: no role="alert" here.
+        assert 'role="alert"' not in text
+    # The history-refresh hook belongs to the terminal states only -- all three
+    # of them, FALLBACK included, or the table goes stale after a fallback.
+    assert ('hx-get="/api/jobs/history"' in text) is (state in TERMINAL_STATES)
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -265,3 +294,65 @@ def test_uploading_renders_its_literal_strings(client: TestClient) -> None:
     assert "Uploading" in client.get("/api/jobs/history").text
     status = client.get("/api/jobs/current/status").text
     assert '<p aria-busy="true">Uploading to paperless-ngx...</p>' in status
+
+
+_HISTORY_RELOAD = (
+    '<div hx-get="/api/jobs/history" hx-target="#history-body" '
+    'hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>'
+)
+
+
+def test_fallback_reloads_the_history_table(client: TestClient) -> None:
+    """
+    FALLBACK carries the hidden history-reload div; a live state does not.
+
+    FALLBACK is terminal, so the history table must refresh the moment the
+    status area swaps to it -- exactly as it does for DONE and ERROR. Without
+    the div the table keeps showing the job as Uploading until the user
+    reloads the page (T-23-24).
+    """
+    _job_in_state(client, JobState.FALLBACK)
+    assert _HISTORY_RELOAD in client.get("/api/jobs/current/status").text
+
+    _job_in_state(client, JobState.SCANNING)
+    assert _HISTORY_RELOAD not in client.get("/api/jobs/current/status").text
+
+
+def test_fallback_warning_renders_inline(client: TestClient) -> None:
+    """
+    The warning is a second visible paragraph, not a tooltip or a hidden detail.
+
+    A user whose title, tags and correspondent were dropped has to be told so
+    without hovering anything (D-05).
+    """
+    _job_in_state(client, JobState.FALLBACK, warning="Metadata was not applied.")
+    text = client.get("/api/jobs/current/status").text
+    assert '<p class="status-fallback">Metadata was not applied.</p>' in text
+
+
+def test_fallback_without_a_warning_renders_no_empty_paragraph(
+    client: TestClient,
+) -> None:
+    """With no warning recorded, the second paragraph is omitted entirely."""
+    _job_in_state(client, JobState.FALLBACK)
+    text = client.get("/api/jobs/current/status").text
+    assert '<p class="status-fallback">None</p>' not in text
+    assert '<p class="status-fallback"></p>' not in text
+    assert text.count('<p class="status-fallback">') == 1
+
+
+def test_fallback_warning_is_escaped_not_injected(client: TestClient) -> None:
+    """
+    A warning carrying markup is escaped, never interpolated as HTML (T-23-21).
+
+    `job.warning` is a new interpolation of a field whose text can originate
+    upstream of saneless -- a paperless-ngx response body reaches it via plan
+    23-04. Jinja2 autoescaping is on by default under `Jinja2Templates`, but
+    "by default" is a setting, and a setting can be changed; this pins the
+    property itself. If this test ever fails the fix is to re-enable
+    autoescaping, never to sanitise at the call site.
+    """
+    _job_in_state(client, JobState.FALLBACK, warning="<script>alert(1)</script>")
+    text = client.get("/api/jobs/current/status").text
+    assert "<script>alert(1)</script>" not in text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
