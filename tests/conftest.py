@@ -1,8 +1,12 @@
-"""Shared test fixtures for all test modules."""
+"""Shared test fixtures and helpers for all test modules."""
+
+from __future__ import annotations
 
 import os
 import tempfile
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import pytest
@@ -18,8 +22,14 @@ from saneless.config import (
 from saneless.paperless import UploadResult
 from saneless.scanner.base import ScannerBackend
 
+if TYPE_CHECKING:
+    from saneless.job import Job, JobStore
+    from saneless.vocabulary import JobState
+
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
 _TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
+
+_POLL_INTERVAL = 0.02
 
 
 @pytest.fixture
@@ -137,5 +147,62 @@ def mock_paperless() -> MagicMock:
     paperless.upload_document.return_value = UploadResult(
         delivered_to_api=True, task_uuid="mock-task-uuid"
     )
-    paperless.poll_task.return_value = {"status": "SUCCESS"}
+    # poll_task's return value is not part of its contract: after OUTC-01 a
+    # successful poll is "it returned" and a failed one is "it raised", so a
+    # stub that hands back a status dict would encode a contract that no longer
+    # exists.  None keeps this fixture honest about what success means.
+    paperless.poll_task.return_value = None
     return paperless
+
+
+def wait_for_state(
+    store: JobStore,
+    job_id: str,
+    state: JobState | frozenset[JobState],
+    timeout: float = 2.0,
+) -> Job:
+    """
+    Block until a job reaches an awaited state, then return it.
+
+    The worker runs on its own thread, so tests that drive it have to wait for
+    a state rather than read one.  Passing a frozenset lets a caller wait on a
+    whole class of states -- ``TERMINAL_STATES`` in particular -- without
+    knowing which member the run will land on.
+
+    The default budget is deliberately far below pytest-timeout's 60 s SIGALRM:
+    a wait that hits this ceiling raises a message naming the job, the awaited
+    state and the state actually observed, which a SIGALRM traceback would not.
+
+    Args:
+        store: The job store to poll.
+        job_id: The id of the job to wait on.
+        state: A single awaited state, or a set of acceptable states.
+        timeout: Seconds to wait before giving up.
+
+    Returns:
+        The job, in one of the awaited states.
+
+    Raises:
+        RuntimeError: If the job does not reach the awaited state in time.
+
+    """
+    wanted = state if isinstance(state, frozenset) else frozenset([state])
+    observed = "<no such job>"
+    found: Job | None = None
+    for _ in range(max(1, int(timeout / _POLL_INTERVAL))):
+        job = store.get_job(job_id)
+        if job is not None:
+            observed = job.state.value
+            if job.state in wanted:
+                found = job
+                break
+        time.sleep(_POLL_INTERVAL)
+    else:
+        names = ", ".join(sorted(s.value for s in wanted))
+        msg = (
+            f"Job {job_id} did not reach {names} within {timeout}s "
+            f"(last observed: {observed})"
+        )
+        raise RuntimeError(msg)
+    assert found is not None
+    return found
