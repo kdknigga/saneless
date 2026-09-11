@@ -167,7 +167,7 @@ buys nothing for an object created a handful of times per scan.
   `tests` tree in this worktree. Every commit was therefore additionally gated on an
   explicit `uv run pyrefly check tests/test_vocabulary.py tests/test_job.py`, which
   reported `0 errors`. In the main repository (not under a dot-directory) the stock
-  `uv run pyrefly check` covers both trees, so the orchestrator's post-merge verification
+  `uv run pyrefly check src tests` covers both trees, so the orchestrator's post-merge verification
   is unaffected.
 - **Commit:** n/a (no tracked file changed)
 

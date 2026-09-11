@@ -135,7 +135,7 @@ uv run pytest -m "not browser" -q && uv run ruff check . && uv run ruff format -
 `.claude/worktrees/` executor checkout: the worktree path is matched by `.gitignore:314`, so
 pyrefly skips every include pattern, reports *"No Python files matched patterns"*, and exits **1**.
 Reproduced here to confirm. The explicit-path form `pyrefly check src tests` is what was run and
-what reports 0 errors. **The authoritative bare `pyrefly check` belongs to the orchestrator's
+what reports 0 errors. **The authoritative `pyrefly check src tests` belongs to the orchestrator's
 post-merge run on the main checkout.** Commits used `SKIP=pyrefly-checker`; every other hook,
 including project-wide `ty`, ran and passed. No commit used `--no-verify`.
 
