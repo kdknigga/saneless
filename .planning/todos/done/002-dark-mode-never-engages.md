@@ -1,6 +1,7 @@
 ---
 title: "data-theme=\"auto\" never engages PicoCSS v2's dark palette — the app renders light for everyone"
-status: pending
+status: done
+resolved: 2026-09-11 (Phase 23.1)
 priority: P2
 source: "discovered during Phase 23 plan 23-05 execution"
 created: 2026-09-11
@@ -48,3 +49,17 @@ make the token resolve with no CSS change.
 
 Candidate home: Phase 26 (Worker and Web Robustness) already vendors htmx and PicoCSS for the
 no-egress CI sandbox (ROBU-09), which is the natural moment to settle which Pico files ship.
+
+## Resolution
+
+Folded into Phase 23.1 and closed there. `data-theme` was removed from `base.html`, so Pico v2's
+`:root:not([data-theme])` dark rule now applies, and the dark palette is proven by computed-colour
+Playwright tests rather than by inspection. The status fallback amber is app-owned: an
+`--saneless-status-fallback` custom property declared in `app.css` with selectors mirroring Pico's,
+which is what carries the contrast fix across both schemes.
+
+One claim in the Context section above is wrong. Linking `pico.colors.css` would **not** have made
+the token resolve with no CSS change: Pico v2.1.1's `--pico-color-amber-600` is `#785800`, a
+noticeably darker amber than the `#a16207` literal the fallback used, so linking the palette would
+have changed the rendered colour and still failed the dark-scheme contrast floor. `pico.colors.css`
+is therefore not shipped. See `23.1-UI-SPEC.md` § Palette File Decision.
