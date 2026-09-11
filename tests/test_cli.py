@@ -32,6 +32,8 @@ if TYPE_CHECKING:
 
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
+# Keeps the suite out of the developer's real ~/.local/state/saneless.
+_TEST_DATA = str(Path(tempfile.gettempdir()) / "saneless-test" / "data")
 _TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
 
 
@@ -46,6 +48,7 @@ def _make_settings(**overrides: object) -> Settings:
         ),
         "output": OutputConfig(
             tmp_dir=_TEST_TMP,
+            data_dir=_TEST_DATA,
             log_file=_TEST_LOG,
         ),
         "profiles": {
@@ -387,6 +390,23 @@ class TestCliFlags:
 class TestJobsCommand:
     """Jobs command tests."""
 
+    @staticmethod
+    def _settings_for(tmp_path: Path) -> Settings:
+        """
+        Build Settings whose data_dir - and therefore db_path - is tmp_path.
+
+        Every test in this class populates the database by hand and then lets
+        the CLI open it. Both sides must resolve to the same file, so the
+        OutputConfig is built in exactly one place.
+        """
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+
     def _populate_store(self, db_path: str, count: int = 2) -> None:
         """Populate a JobStore at db_path with test jobs."""
         store = JobStore(db_path=db_path)
@@ -399,16 +419,10 @@ class TestJobsCommand:
 
     def test_jobs_empty(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs with no jobs in DB shows empty output (exit 0)."""
-        db_path = str(tmp_path / "saneless.db")
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path),
-                log_file=str(tmp_path / "saneless.log"),
-            ),
-        )
+        settings = self._settings_for(tmp_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         # Create empty DB
-        store = JobStore(db_path=db_path)
+        store = JobStore(db_path=str(settings.output.db_path))
         store.close()
 
         result = runner.invoke(cli, ["jobs"])
@@ -418,14 +432,8 @@ class TestJobsCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """Jobs with 2 jobs shows table with Timestamp, Profile, Title, Status columns."""
-        db_path = str(tmp_path / "saneless.db")
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path),
-                log_file=str(tmp_path / "saneless.log"),
-            ),
-        )
-        self._populate_store(db_path, count=2)
+        settings = self._settings_for(tmp_path)
+        self._populate_store(str(settings.output.db_path), count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
@@ -442,14 +450,8 @@ class TestJobsCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """Jobs --json with 2 jobs returns valid JSON array."""
-        db_path = str(tmp_path / "saneless.db")
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path),
-                log_file=str(tmp_path / "saneless.log"),
-            ),
-        )
-        self._populate_store(db_path, count=2)
+        settings = self._settings_for(tmp_path)
+        self._populate_store(str(settings.output.db_path), count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs", "--json"])
@@ -466,14 +468,8 @@ class TestJobsCommand:
 
     def test_jobs_limit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --limit 1 with 2 jobs in DB shows only 1 job."""
-        db_path = str(tmp_path / "saneless.db")
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path),
-                log_file=str(tmp_path / "saneless.log"),
-            ),
-        )
-        self._populate_store(db_path, count=2)
+        settings = self._settings_for(tmp_path)
+        self._populate_store(str(settings.output.db_path), count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs", "--limit", "1"])
@@ -487,20 +483,15 @@ class TestJobsCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """Jobs always exits with code 0."""
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path),
-                log_file=str(tmp_path / "saneless.log"),
-            ),
-        )
+        settings = self._settings_for(tmp_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
 
-    def test_jobs_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_jobs_help(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --help shows --json and --limit options."""
-        runner, _ = _patch_cli(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch, settings=self._settings_for(tmp_path))
 
         result = runner.invoke(cli, ["jobs", "--help"])
         assert result.exit_code == 0
@@ -511,15 +502,9 @@ class TestJobsCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """Jobs --json with no jobs outputs empty JSON array."""
-        db_path = str(tmp_path / "saneless.db")
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path),
-                log_file=str(tmp_path / "saneless.log"),
-            ),
-        )
+        settings = self._settings_for(tmp_path)
         # Create empty DB
-        store = JobStore(db_path=db_path)
+        store = JobStore(db_path=str(settings.output.db_path))
         store.close()
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
@@ -802,14 +787,14 @@ class TestTruncation:
     ) -> None:
         """Jobs table truncates long titles with ellipsis."""
         long_title = "T" * 50
-        db_path = str(tmp_path / "saneless.db")
         settings = _make_settings(
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
                 log_file=str(tmp_path / "saneless.log"),
             ),
         )
-        store = JobStore(db_path=db_path)
+        store = JobStore(db_path=str(settings.output.db_path))
         store.create_job(profile="default", title=long_title)
         store.close()
 
