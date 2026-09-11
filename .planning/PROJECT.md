@@ -84,6 +84,8 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ Getting Started section (Quick Start, First CLI Scan, First Web UI Scan) as top-level nav — Phase 19
 - ✓ auto_source_mode and paper_size woven into how-to guides — Phase 19
 - ✓ Tutorial relocated from tutorials/ to getting-started/, refreshed for Python 3.14 — Phase 19
+- ✓ Web UI honours the operator's OS dark-mode preference, with every status colour at WCAG AA in both schemes — Phase 23.1
+- ✓ A TDD RED commit lands with hooks enabled and no suppression, while type errors are still rejected at merge, push and CI — Phase 23.1
 
 ### Active
 
@@ -133,6 +135,7 @@ v2.0 requirements are defined in `.planning/REQUIREMENTS.md` (derived from the 2
 | PicoCSS classless styling | Minimal CSS, semantic HTML, auto dark mode, no build step | ✓ Good |
 | Two-stage Dockerfile with uv_build | Lean OCI image — build stage creates wheel, runtime has only libsane + curl | ✓ Good |
 | GitHub Actions OIDC trusted publishing | No API tokens for PyPI/GHCR — secure, no secret rotation | ✓ Good |
+| Type checks split by git stage — `src` at commit, `src tests` at merge and push | A RED test file's errors live in `tests/`, so TDD works without suppressions; every worktree is still fully checked as it lands, and CI remains the enforcing boundary for master | ✓ Good — Phase 23.1 |
 
 ## Evolution
 
@@ -152,4 +155,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-09 — started milestone v2.0 Prep for release, driven by the 2026-09-09 comprehensive code review*
+*Last updated: 2026-09-11 — Phase 23.1 complete: the dark palette engages from the OS preference, and the commit gate is re-staged so TDD RED commits land without suppressions (4/4 plans, verification passed 5/5)*
