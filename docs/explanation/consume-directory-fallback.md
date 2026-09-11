@@ -76,4 +76,12 @@ This is a deliberate trade-off: saving the document without metadata is better t
 
 So the job history does mark which documents arrived without metadata. You no longer have to spot them from the paperless-ngx side.
 
-A job also carries a `warning` field, which the status area prints beneath the status line when it is set and `saneless jobs --json` reports as `"warning"`. Only one situation fills it in today: an ADF duplex scan whose front and back page counts did not match. A plain consume-directory fallback leaves `warning` null -- the `FALLBACK` state is itself the signal, and the metadata consequence is the general one described under Limitations above rather than a per-job message.
+A job also carries a `warning` field, which the status area prints beneath the status line when it is set and `saneless jobs --json` reports as `"warning"`. Two situations fill it in.
+
+A consume-directory fallback records where the file went and what that route cost:
+
+> Saved to the paperless-ngx consume directory at `<path>` instead of uploading through the API, so the title, tags and correspondent chosen for this scan were not applied -- paperless-ngx will apply its own matching rules to the file instead.
+
+The `FALLBACK` state says the document took the other route; the warning says what that route cost. The metadata consequence described under Limitations above is therefore also stated per job, on the job itself, rather than only in this document.
+
+The second case is an ADF duplex scan whose front and back page counts did not match, which records the two counts and notes that partial PDFs were saved.
