@@ -123,7 +123,12 @@ def build_pdf_filename(job_id: str, title: str) -> str:
     return "-".join(segments) + ".pdf"
 
 
-def assemble_pdf(images: list[Image.Image], output_dir: Path) -> Path:
+def assemble_pdf(
+    images: list[Image.Image],
+    output_dir: Path,
+    filename: str,
+    dpi: int,
+) -> Path:
     """
     Assemble PIL Images into a single PDF using img2pdf.
 
@@ -131,9 +136,40 @@ def assemble_pdf(images: list[Image.Image], output_dir: Path) -> Path:
     within output_dir, then passed to img2pdf for lossless PDF
     assembly. Temp files are cleaned up automatically.
 
+    ``filename`` is **required**, with no default. Giving it one -- the single
+    hardcoded name this function used to write every PDF to -- would have kept
+    every existing caller compiling while silently preserving the collision
+    this argument exists to remove: every document reaching paperless carried
+    the same original filename, and two preserved scans overwrote each other.
+    So the type level forces each caller to name its own file.
+    Build the name with :func:`build_pdf_filename` rather than composing one.
+
+    ``dpi`` is likewise supplied by the caller, from ``profile.resolution``,
+    and is deliberately **not** read from the images. On this path PIL carries
+    no DPI at all: images arrive from ``dev.snap()`` and go through
+    ``crop_to_paper_size``, whose ``Image.crop()`` returns a fresh image whose
+    ``.info`` is measured as ``{}``. A "prefer the image's own DPI" branch
+    would therefore be unreachable dead code -- and a PNG round-trip degrades
+    300 to 299.9994 anyway, because PNG stores pixels per metre as an integer.
+    ``profile.resolution`` is also what ``crop_to_paper_size`` already uses for
+    its crop arithmetic, so the crop shape and the MediaBox cannot disagree.
+    Phase 24 adds device read-back; the line that changes is the ``dpi``
+    argument at the call sites in ``pipeline.py``, not anything in here.
+
+    A fixed-DPI layout function applies that DPI to **every** page
+    unconditionally, so a page's size in points is determined entirely by its
+    pixel count. That is correct here because one pipeline run scans every page
+    at one ``profile.resolution``: a half-size raster becomes a half-size page
+    rather than being rescaled to match its neighbours.
+
     Args:
         images: List of PIL Image objects to include in the PDF.
         output_dir: Directory where the output PDF will be written.
+        filename: File name for the PDF, including its ``.pdf`` extension.
+            Must be a single path segment; :func:`build_pdf_filename`
+            guarantees that.
+        dpi: Resolution the pages were scanned at, from ``profile.resolution``.
+            Determines the page size the PDF declares.
 
     Returns:
         Path to the generated PDF file.
@@ -149,8 +185,15 @@ def assemble_pdf(images: list[Image.Image], output_dir: Path) -> Path:
             image_paths.append(str(img_path))
             logger.debug("Saved page %d to %s", i, img_path)
 
-        pdf_path = output_dir / "output.pdf"
-        pdf_bytes = img2pdf.convert(image_paths)
+        pdf_path = output_dir / filename
+        # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
+        # default_layout_fun unpacks it, and an int silently yields wrong
+        # geometry.  Without it img2pdf lays pages out at its default_dpi of
+        # 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
+        pdf_bytes = img2pdf.convert(
+            image_paths,
+            layout_fun=img2pdf.get_fixed_dpi_layout_fun((dpi, dpi)),
+        )
         if pdf_bytes is None:
             msg = "img2pdf.convert returned None"
             raise RuntimeError(msg)

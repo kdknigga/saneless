@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, assert_never
 
 from saneless.exceptions import ConfigError, ScanError
 from saneless.pages import filter_empty_pages, generate_thumbnail
-from saneless.pdf import assemble_pdf
+from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.scanner.base import ScanSettings
 from saneless.vocabulary import JobState, ScanOutcome
 
@@ -92,10 +92,24 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PipelineRequest:
-    """Parameters for a scan pipeline run."""
+    """
+    Parameters for a scan pipeline run.
+
+    ``job_id`` names the assembled PDF, via
+    :func:`saneless.pdf.build_pdf_filename`, and is what makes two scans of the
+    same title two distinct files rather than one overwriting the other. The
+    worker always supplies ``job.id``; the empty default exists only so the
+    dozens of tests that construct a request from a profile name and a title
+    need not invent one, and an empty value simply drops the segment.
+
+    It is defaulted rather than required, and sits with the other defaulted
+    fields: moving it into the non-default block above would reorder the
+    dataclass and break positional construction.
+    """
 
     profile_name: str
     title: str
+    job_id: str = ""
     tags: list[int] | None = None
     correspondent: int | None = None
     status_callback: Callable[[PipelineEvent], None] | None = None
@@ -190,7 +204,7 @@ def _handle_duplex_mismatch(
     tmp_path: Path,
     paperless: PaperlessClient,
     request: PipelineRequest,
-    notify: Callable[[PipelineEvent], None],
+    dpi: int,
 ) -> tuple[str, bool]:
     """
     Save and upload partial PDFs when duplex page counts mismatch.
@@ -198,12 +212,21 @@ def _handle_duplex_mismatch(
     Instead of discarding scanned data, assembles fronts and backs into
     separate PDFs and uploads both to paperless-ngx for manual review.
 
+    The two halves get visibly distinct names, both carrying the job id. That
+    matters beyond tidiness: the two partial PDFs are later covered by a single
+    preservation guard, and two files sharing a name would overwrite each other
+    on the way into ``failed/`` -- losing exactly the half this whole recovery
+    path exists to save.
+
     Args:
         passes: Tuple of (front-side images, back-side images).
         tmp_path: Temporary directory for PDF assembly.
         paperless: Paperless-ngx client for upload.
-        request: Pipeline request with title, tags, correspondent.
-        notify: Status callback function.
+        request: Pipeline request with title, tags, correspondent, job id and
+            status callback.
+        dpi: Scan resolution, from ``profile.resolution``. Passed in because
+            this function has no profile in scope, and the PDF's declared page
+            size depends on it.
 
     Returns:
         A (warning, delivered_to_api) pair. The warning describes the mismatch
@@ -213,9 +236,22 @@ def _handle_duplex_mismatch(
 
     """
     fronts, backs = passes
+    # Derived rather than passed: it is exactly what the caller would hand us,
+    # and the caller is already handing us the request it comes from.
+    notify = request.status_callback or _noop_callback
     notify(PipelineEvent.ASSEMBLING)
-    fronts_pdf = assemble_pdf(fronts, tmp_path / "fronts")
-    backs_pdf = assemble_pdf(backs, tmp_path / "backs")
+    fronts_pdf = assemble_pdf(
+        fronts,
+        tmp_path / "fronts",
+        filename=build_pdf_filename(request.job_id, f"{request.title} (fronts)"),
+        dpi=dpi,
+    )
+    backs_pdf = assemble_pdf(
+        backs,
+        tmp_path / "backs",
+        filename=build_pdf_filename(request.job_id, f"{request.title} (backs)"),
+        dpi=dpi,
+    )
     logger.info(
         "Duplex mismatch: assembled %d fronts and %d backs as separate PDFs",
         len(fronts),
@@ -470,7 +506,7 @@ def run_pipeline(
                     tmp_path,
                     paperless,
                     request,
-                    notify,
+                    dpi=profile.resolution,
                 )
                 notify(PipelineEvent.DONE)
                 logger.info(
@@ -501,7 +537,15 @@ def run_pipeline(
 
         # Step 3: Assemble PDF
         notify(PipelineEvent.ASSEMBLING)
-        pdf_path = assemble_pdf(filtered, tmp_path)
+        # profile.resolution is the authoritative DPI: the same value
+        # crop_to_paper_size uses for its crop arithmetic, so the cropped
+        # shape and the declared page size cannot disagree.
+        pdf_path = assemble_pdf(
+            filtered,
+            tmp_path,
+            filename=build_pdf_filename(request.job_id, request.title),
+            dpi=profile.resolution,
+        )
         logger.info("PDF assembled: %s", pdf_path)
 
         # Step 4: Upload
