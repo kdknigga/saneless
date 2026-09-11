@@ -19,8 +19,15 @@ from .auto_profiles import (
     resolve_config_path,
     write_profiles_to_config,
 )
+from .job import JobResult
 from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
-from .vocabulary import ACTIVE_STATES, BUSY_STATES, JobState, classify_error
+from .vocabulary import (
+    ACTIVE_STATES,
+    BUSY_STATES,
+    JobState,
+    classify_error,
+    job_state_for,
+)
 
 if TYPE_CHECKING:
     from .config import Settings
@@ -234,6 +241,10 @@ class ScanWorker:
             request = PipelineRequest(
                 profile_name=job.profile,
                 title=job.title,
+                # The assembled PDF is named from this id, which is what makes
+                # two same-second scans of the same title two files rather than
+                # one overwriting the other.
+                job_id=job.id,
                 tags=job.tags or None,
                 correspondent=job.correspondent,
                 status_callback=_status_cb,
@@ -241,17 +252,34 @@ class ScanWorker:
                 flip_event=self._flip_event,
                 abort_event=self._abort_event,
             )
-            run_pipeline(
+            result = run_pipeline(
                 self._scanner,
                 self._paperless,
                 self._settings,
                 request,
             )
-            self._job_store.update_state(job.id, JobState.DONE)
+            # The terminal state is derived from the outcome the pipeline
+            # returned, never assumed.  The mapping below is a match with
+            # assert_never, so a future third ScanOutcome member fails the type
+            # gate at edit time rather than falling silently into an else.
+            self._job_store.finish_job(
+                job.id,
+                job_state_for(result.outcome),
+                result=JobResult(
+                    outcome=result.outcome,
+                    warning=result.warning,
+                    pages_scanned=result.pages_scanned,
+                    pages_removed=result.pages_removed,
+                    pages_uploaded=result.pages_uploaded,
+                ),
+            )
             self._transition_event.set()
         except Exception as exc:
             category = classify_error(exc)
-            self._job_store.update_state(
+            # No result argument: outcome, warning and all three page counts
+            # stay NULL.  NULL means "never recorded"; 0 would claim a
+            # measurement a job that never reached the scanner did not make.
+            self._job_store.finish_job(
                 job.id,
                 JobState.ERROR,
                 error=str(exc),
