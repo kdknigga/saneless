@@ -1,8 +1,8 @@
 ---
 phase: 23
 slug: honest-outcomes-and-never-lose-a-scan
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-09-11
 ---
@@ -140,11 +140,17 @@ covered by automated parametrised tests. Everything else in this phase has autom
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all ❌ references above
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 60 s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all ❌ references above — two of the three pre-existing breakages are fixed in the same commit as their cause (23-02 Task 2, 23-03 Task 2) rather than in a separate wave; `conftest.mock_paperless` is neutralised pre-emptively in 23-01 Task 1
+- [x] No watch-mode flags
+- [x] Feedback latency < 60 s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** approved 2026-09-11 by gsd-plan-checker (verdict PASS, no blocking concerns)
+
+`wave_0_complete` stays `false` until the Wave 0 items are actually executed — it tracks execution, not planning.
+
+### Discretion item resolved by omission
+
+`23-CONTEXT.md` left open "whether the default `paperless_task_timeout` of 300 s is still right now that a timeout is fatal". **No plan changes it — it stays 300 s**, per RESEARCH Open Question 3: changing the timeout in the same phase that makes timeouts fatal conflates two variables and makes a regression impossible to attribute. Recorded here so the omission is a decision rather than an oversight.

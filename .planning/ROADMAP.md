@@ -171,6 +171,8 @@ Plans:
 - [ ] 23-08-PLAN.md — the parametrised five-outcome end-to-end test (wave 5)
 - [ ] 23-09-PLAN.md — documentation sweep: fallback status, connection statuses, data_dir, upgrade note (wave 5)
 
+Wave order is load-bearing, not cosmetic. **23-04 Task 1 bundles the v9/v10 shape tolerance with the raise semantics in one non-splittable commit** — a commit where timeouts raise against a still-misparsed response would record every successful scan as FAILED with a stray preserved PDF. The preservation guard (23-06) is strictly after it. Do not reorder or split these during execution.
+
 Note: the preservation `try/except` must span both `upload_document` and `poll_task`. Wrapping only the upload call means a correct FAILURE raise unwinds the `TemporaryDirectory` and deletes the document this phase exists to protect.
 
 Note (added 2026-09-11 from Phase 23 research): criterion 6 / OUTC-11 was not in the original scope. `poll_task` assumes API v9 while paperless-ngx now serves v10 by default to a client that sends no version header. The bug is masked today because `pipeline.py:521-527` discards the poll result; criteria 1 and 3 remove that mask, at which point every successful scan would record FAILED with a preserved stray PDF. The fix is a prerequisite for criterion 1, not an extension of it.
