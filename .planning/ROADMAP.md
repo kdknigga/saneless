@@ -35,7 +35,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 21: Vocabulary and Contracts** - One `JobState`, one label map, one `ErrorCategory`, one `classify_source()`, and typed `ScanResult`/`UploadResult`, with zero behaviour change (completed 2026-09-10)
 - [x] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration (completed 2026-09-10)
 - [x] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI (completed 2026-09-11)
-- [ ] **Phase 23.1: Dark Mode and the Commit Gate** (INSERTED) - The dark palette actually engages, every status colour passes AA in both schemes, and a TDD RED commit is possible without suppressing a gate
+- [x] **Phase 23.1: Dark Mode and the Commit Gate** (INSERTED) - The dark palette actually engages, every status colour passes AA in both schemes, and a TDD RED commit is possible without suppressing a gate (completed 2026-09-11)
 - [ ] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane
 - [ ] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass
 - [ ] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets
@@ -197,7 +197,7 @@ Plans:
 - [x] 23.1-01-PLAN.md — dark palette engaged, app-owned fallback amber, T1/T2/T3 computed-colour tests with mutation checks, master UI-SPEC convention (wave 1, TDD)
 - [x] 23.1-02-PLAN.md — type checks split: src-only at commit, full at pre-merge-commit and pre-push; CI pyrefly paths; CONTRIBUTING and CLAUDE.md (wave 1)
 - [x] 23.1-03-PLAN.md — every pathless pyrefly command under .planning/ rewritten to name src tests, residue enumerated and justified (wave 1)
-- [ ] 23.1-04-PLAN.md — three prek shims installed from the main checkout, D-07 RED/commit/merge/push demonstrations, CI and ruleset read-backs, close-out (wave 2)
+- [x] 23.1-04-PLAN.md — three prek shims installed from the main checkout, D-07 RED/commit/merge/push demonstrations, CI and ruleset read-backs, close-out (wave 2)
 
 **Why this is an insertion rather than end-of-milestone work.** GATE-01/02 affect every phase from 24 to 32: all eight Phase 23 executors independently hit the same wall, and each spent real effort rediscovering it. Fixing it once here compounds across the nine phases that follow. DARK-01/02 are not urgent in the same way and are here only because the user asked for one phase covering both.
 
