@@ -18,12 +18,27 @@
 }
 
 /* Consume-directory fallback: a degraded success, so amber -- deliberately
-   neither the ins green nor the del red. PicoCSS v2 ships its colour palette
-   in a separate pico.colors.css that base.html does not link, so
-   --pico-color-amber-600 does not resolve today and the literal amber-600 is
-   what renders; the var() is kept so linking the palette would pick it up. */
+   neither the ins green nor the del red. PicoCSS has no amber among its
+   semantic tokens, so the app owns this one and gives it a light and a dark
+   value; the darker amber is unreadable on a dark surface. The dark selectors
+   mirror PicoCSS v2's own: automatic dark applies only when <html> carries no
+   data-theme attribute, and forced dark uses data-theme="dark". */
+:root {
+    --saneless-status-fallback: #a16207;
+}
+
+@media only screen and (prefers-color-scheme: dark) {
+    :root:not([data-theme]) {
+        --saneless-status-fallback: #ca8a04;
+    }
+}
+
+[data-theme="dark"] {
+    --saneless-status-fallback: #ca8a04;
+}
+
 .status-fallback {
-    color: var(--pico-color-amber-600, #a16207);
+    color: var(--saneless-status-fallback);
 }
 
 /* Thumbnail preview */
