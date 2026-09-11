@@ -16,6 +16,7 @@ from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
     PaperlessError,
+    PaperlessTimeoutError,
     ScanError,
 )
 from saneless.job import ErrorCategory as JobErrorCategory
@@ -30,6 +31,7 @@ from saneless.vocabulary import (
     ScanOutcome,
     classify_error,
     error_message,
+    job_state_for,
     progress_label,
     state_label,
 )
@@ -38,16 +40,16 @@ from saneless.vocabulary import (
 class TestJobStateMembers:
     """JobState membership tests."""
 
-    def test_job_state_has_exactly_seven_members(self) -> None:
+    def test_job_state_has_exactly_eight_members(self) -> None:
         """
-        JobState declares exactly seven lifecycle members (CTR-01).
+        JobState declares exactly eight lifecycle members (CTR-01).
 
         A count guard, not a name list: adding a member should fail the
         parametrised completeness tests below -- which force a label and a
         classification decision -- rather than a hand-written roster that only
         records what the enum happened to contain when it was written.
         """
-        assert len(list(JobState)) == 7
+        assert len(list(JobState)) == 8
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:
@@ -84,10 +86,12 @@ class TestScanOutcomeMembers:
 
     def test_scan_outcome_has_exactly_two_members(self) -> None:
         """
-        ScanOutcome is exactly SUCCESS and FALLBACK (CTR-02).
+        ScanOutcome is exactly SUCCESS and FALLBACK (CTR-02, OUTC-02).
 
-        FAILED is added together with the code path that produces it. This is a
-        membership guard, not an assertion that later work has not happened.
+        There is no FAILED member and there will not be one: a failure raises,
+        so ``outcome`` stays NULL and ``JobState.ERROR`` carries the failure.
+        A returned FAILED would record the same fact in a second column that
+        could disagree with the first about a job with exactly one fate.
         """
         assert {outcome.name for outcome in ScanOutcome} == {"SUCCESS", "FALLBACK"}
 
@@ -129,8 +133,11 @@ class TestStateClassifications:
         )
 
     def test_terminal_states_membership(self) -> None:
-        """TERMINAL_STATES is exactly DONE and ERROR (CTR-01)."""
-        assert frozenset({JobState.DONE, JobState.ERROR}) == TERMINAL_STATES
+        """TERMINAL_STATES is exactly DONE, ERROR and FALLBACK (CTR-01, OUTC-02)."""
+        assert (
+            frozenset({JobState.DONE, JobState.ERROR, JobState.FALLBACK})
+            == TERMINAL_STATES
+        )
 
     def test_busy_states_is_derived_from_active_states(self) -> None:
         """BUSY_STATES is ACTIVE_STATES minus AWAITING_FLIP (CTR-01)."""
@@ -159,6 +166,7 @@ class TestStateLabel:
             (JobState.UPLOADING, "Uploading"),
             (JobState.DONE, "Complete"),
             (JobState.ERROR, "Failed"),
+            (JobState.FALLBACK, "Saved to folder"),
         ],
     )
     def test_state_label_strings(self, state: JobState, expected: str) -> None:
@@ -198,9 +206,10 @@ class TestProgressLabel:
         assert label != state.value
 
     def test_terminal_states_have_progress_prose_for_totality(self) -> None:
-        """DONE and ERROR carry prose purely so the lookup stays total (CTR-01)."""
+        """The three terminal states carry prose purely to stay total (CTR-01)."""
         assert progress_label(JobState.DONE) == "Complete"
         assert progress_label(JobState.ERROR) == "Failed"
+        assert progress_label(JobState.FALLBACK) == "Saved to folder"
 
 
 class TestErrorMessage:
@@ -228,6 +237,43 @@ class TestErrorMessage:
             "The document could not be sent to paperless-ngx."
         )
         assert error_message(ErrorCategory.UNKNOWN) == "Something went wrong."
+
+
+class TestJobStateFor:
+    """job_state_for outcome-to-state mapping tests."""
+
+    @pytest.mark.parametrize("outcome", list(ScanOutcome))
+    def test_job_state_for_is_total(self, outcome: ScanOutcome) -> None:
+        """Every ScanOutcome maps to a state (OUTC-02)."""
+        assert isinstance(job_state_for(outcome), JobState)
+
+    @pytest.mark.parametrize("outcome", list(ScanOutcome))
+    def test_job_state_for_always_lands_in_terminal_states(
+        self,
+        outcome: ScanOutcome,
+    ) -> None:
+        """
+        An outcome always maps to a finished job (OUTC-02).
+
+        A ScanOutcome only exists once the pipeline has resolved, so mapping one
+        onto an ACTIVE_STATES member would mean the worker wrote "still in
+        flight" over a job that is done.
+        """
+        assert job_state_for(outcome) in TERMINAL_STATES
+
+    def test_success_maps_to_done(self) -> None:
+        """SUCCESS is the ordinary finished job (OUTC-02)."""
+        assert job_state_for(ScanOutcome.SUCCESS) is JobState.DONE
+
+    def test_fallback_maps_to_fallback(self) -> None:
+        """FALLBACK gets its own state rather than being folded into DONE (OUTC-02)."""
+        assert job_state_for(ScanOutcome.FALLBACK) is JobState.FALLBACK
+
+    def test_job_state_for_raises_on_unrecognised_value(self) -> None:
+        """job_state_for raises on a value outside ScanOutcome (OUTC-02)."""
+        bad = cast("ScanOutcome", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            job_state_for(bad)
 
 
 class TestUnrecognisedValue:
@@ -288,6 +334,23 @@ class TestClassifyError:
         """An exception outside the saneless hierarchy is UNKNOWN (CTR-05)."""
         assert classify_error(ValueError("who knows")) is ErrorCategory.UNKNOWN
 
+    def test_paperless_timeout_error_subclasses_paperless_error(self) -> None:
+        """PaperlessTimeoutError narrows PaperlessError rather than SanelessError (OUTC-08)."""
+        assert issubclass(PaperlessTimeoutError, PaperlessError)
+
+    def test_paperless_timeout_error_is_upload(self) -> None:
+        """
+        PaperlessTimeoutError classifies as UPLOAD with no new arm (OUTC-08).
+
+        The point of subclassing PaperlessError is that the existing
+        ``isinstance(exc, PaperlessError)`` check already covers it: adding an
+        arm for the subclass would be dead code, and forgetting one would be a
+        silent reclassification to UNKNOWN.
+        """
+        assert (
+            classify_error(PaperlessTimeoutError("timed out")) is ErrorCategory.UPLOAD
+        )
+
     def test_feeder_empty_wins_over_its_scan_error_base(self) -> None:
         """FeederEmptyError is checked before its ScanError base class (CTR-05)."""
         assert issubclass(FeederEmptyError, ScanError)
@@ -329,6 +392,7 @@ class TestJobActivityProperties:
             (JobState.UPLOADING, (True, True)),
             (JobState.DONE, (False, False)),
             (JobState.ERROR, (False, False)),
+            (JobState.FALLBACK, (False, False)),
         ],
     )
     def test_job_reports_activity(
