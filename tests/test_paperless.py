@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
-from saneless.exceptions import PaperlessError
+from saneless.exceptions import PaperlessError, PaperlessTimeoutError
 from saneless.paperless import PaperlessClient, UploadResult
 
 if TYPE_CHECKING:
@@ -31,6 +32,66 @@ def _make_transport(
 ) -> httpx.MockTransport:
     """Create an httpx.MockTransport from a handler function."""
     return httpx.MockTransport(handler)
+
+
+def _v9_payload(status: str, message: str | None) -> object:
+    """
+    Build an API v9 ``/api/tasks/`` body: a bare list, uppercase status.
+
+    The failure text lives in a flat ``result`` string on v9.
+    """
+    task: dict[str, object] = {"task_id": "t1", "status": status.upper()}
+    if message is not None:
+        task["result"] = message
+    return [task]
+
+
+def _v10_payload(status: str, message: str | None) -> object:
+    """
+    Build an API v10 ``/api/tasks/`` body: paginated, lowercase status.
+
+    The failure text moved into ``result_data["error_message"]`` on v10,
+    which is why a single-field extraction cannot serve both versions.
+    """
+    task: dict[str, object] = {"task_id": "t1", "status": status.lower()}
+    if message is not None:
+        task["result_data"] = {
+            "error_type": "ConsumerError",
+            "error_message": message,
+        }
+    return {"count": 1, "next": None, "previous": None, "results": [task]}
+
+
+def _v9_no_task() -> object:
+    """Build the v9 spelling of "200, but the task is not visible yet"."""
+    return []
+
+
+def _v10_no_task() -> object:
+    """Build the v10 spelling of "200, but the task is not visible yet"."""
+    return {"count": 0, "next": None, "previous": None, "results": []}
+
+
+_API_SHAPES = [
+    pytest.param(_v9_payload, id="v9"),
+    pytest.param(_v10_payload, id="v10"),
+]
+
+_API_NO_TASK_SHAPES = [
+    pytest.param(_v9_payload, _v9_no_task, id="v9"),
+    pytest.param(_v10_payload, _v10_no_task, id="v10"),
+]
+
+
+def _poll_client(
+    handler: Callable[[httpx.Request], httpx.Response],
+) -> PaperlessClient:
+    """Build a client wired to the given mock handler."""
+    return PaperlessClient(
+        url="http://paperless:8000",
+        token=_MOCK_AUTH,
+        _transport=_make_transport(handler),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -251,77 +312,182 @@ class TestUploadDocument:
 class TestPollTask:
     """Task polling tests."""
 
-    def test_poll_task_success(self) -> None:
-        """Polling returns SUCCESS when task completes."""
+    @pytest.mark.parametrize("build_payload", _API_SHAPES)
+    def test_success_across_api_versions(
+        self,
+        build_payload: Callable[[str, str | None], object],
+    ) -> None:
+        """A completed task is reached on both the v9 and the v10 wire shape."""
 
         def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=[{"status": "SUCCESS", "task_id": "t1"}])
+            return httpx.Response(200, json=build_payload("SUCCESS", None))
 
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            _transport=transport,
-        )
-        result = client.poll_task("t1", timeout=10)
-        assert result["status"] == "SUCCESS"
-        client.close()
+        client = _poll_client(handler)
+        try:
+            result = client.poll_task("t1", timeout=10)
+            assert str(result["status"]).upper() == "SUCCESS"
+        finally:
+            client.close()
 
-    def test_poll_task_failure(self) -> None:
-        """Polling returns FAILURE when task fails."""
-
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                200, json=[{"status": "FAILURE", "task_id": "t1", "result": "error"}]
-            )
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            _transport=transport,
-        )
-        result = client.poll_task("t1", timeout=10)
-        assert result["status"] == "FAILURE"
-        client.close()
-
-    def test_poll_task_timeout(self) -> None:
-        """Polling returns TIMEOUT when deadline is exceeded."""
+    @pytest.mark.parametrize("build_payload", _API_SHAPES)
+    def test_failure_raises_across_api_versions(
+        self,
+        build_payload: Callable[[str, str | None], object],
+    ) -> None:
+        """A failed task raises, carrying the message Paperless supplied."""
 
         def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+            return httpx.Response(200, json=build_payload("FAILURE", "disk on fire"))
 
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            _transport=transport,
-        )
-        # Very short timeout to trigger timeout quickly
-        result = client.poll_task("t1", timeout=0.1)
-        assert result["status"] == "TIMEOUT"
-        client.close()
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError, match="disk on fire"):
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
 
-    def test_poll_task_not_found_first_retry(self) -> None:
-        """Pitfall #8: task not found on first poll, succeeds on second."""
+    @pytest.mark.parametrize("build_payload", _API_SHAPES)
+    def test_revoked_raises_across_api_versions(
+        self,
+        build_payload: Callable[[str, str | None], object],
+    ) -> None:
+        """
+        REVOKED is terminal, not something to keep polling.
+
+        It is one of paperless-ngx's COMPLETE_STATUSES, so looping on it
+        would turn an administrative cancellation into a misattributed
+        timeout that also blocks the worker for the whole budget.
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=build_payload("REVOKED", "cancelled"))
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError, match="cancelled"):
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize(("build_payload", "build_no_task"), _API_NO_TASK_SHAPES)
+    def test_no_task_yet_is_tolerated_across_api_versions(
+        self,
+        build_payload: Callable[[str, str | None], object],
+        build_no_task: Callable[[], object],
+    ) -> None:
+        """Pitfall #8: a 200 with no task keeps polling rather than raising."""
         call_count = {"n": 0}
 
         def handler(_request: httpx.Request) -> httpx.Response:
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return httpx.Response(200, json=[])
-            return httpx.Response(200, json=[{"status": "SUCCESS", "task_id": "t1"}])
+                return httpx.Response(200, json=build_no_task())
+            return httpx.Response(200, json=build_payload("SUCCESS", None))
 
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            _transport=transport,
-        )
-        result = client.poll_task("t1", timeout=30)
-        assert result["status"] == "SUCCESS"
-        assert call_count["n"] >= 2
-        client.close()
+        client = _poll_client(handler)
+        try:
+            result = client.poll_task("t1", timeout=30)
+            assert str(result["status"]).upper() == "SUCCESS"
+            assert call_count["n"] >= 2
+        finally:
+            client.close()
+
+    def test_failure_without_a_message_still_raises(self) -> None:
+        """A failure carrying neither field raises with a stand-in message."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[{"status": "FAILURE", "task_id": "t1"}])
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError, match="no message"):
+                client.poll_task("t1", timeout=10)
+        finally:
+            client.close()
+
+    def test_non_200_raises_on_the_first_poll(self) -> None:
+        """
+        D-12: any non-200 is a hard failure, reported immediately.
+
+        The counter is the point of the test: a revoked token used to be
+        silently re-polled for the full 300 s and then misreported as a
+        timeout.
+        """
+        call_count = {"n": 0}
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            return httpx.Response(401, text="Invalid token")
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError, match="401"):
+                client.poll_task("t1", timeout=30)
+            assert call_count["n"] == 1
+        finally:
+            client.close()
+
+    def test_non_200_body_is_truncated(self) -> None:
+        """T-23-16: a huge error body cannot flood job.error or the status area."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="x" * 10_000)
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.poll_task("t1", timeout=30)
+            assert len(str(exc_info.value)) < 1000
+            assert "truncated" in str(exc_info.value)
+        finally:
+            client.close()
+
+    def test_timeout_raises_naming_the_task(self) -> None:
+        """A deadline-expired poll raises and names the task id."""
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessTimeoutError, match="t1"):
+                client.poll_task("t1", timeout=0.05)
+        finally:
+            client.close()
+
+    def test_timeout_is_catchable_as_a_paperless_error(self) -> None:
+        """D-11: `except PaperlessError` catches the timeout subclass too."""
+        assert issubclass(PaperlessTimeoutError, PaperlessError)
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError):
+                client.poll_task("t1", timeout=0.05)
+        finally:
+            client.close()
+
+    def test_timeout_does_not_sleep_past_its_own_deadline(self) -> None:
+        """
+        A 0.05 s budget costs 0.05 s, not the 0.5 s first sleep.
+
+        0.5 s is exactly what the unclamped `time.sleep(delay)` cost
+        unconditionally, so that threshold is the regression this asserts.
+        """
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+
+        client = _poll_client(handler)
+        try:
+            start = time.monotonic()
+            with pytest.raises(PaperlessTimeoutError):
+                client.poll_task("t1", timeout=0.05)
+            assert time.monotonic() - start < 0.5
+        finally:
+            client.close()
 
 
 # ---------------------------------------------------------------------------
@@ -508,6 +674,29 @@ class TestAuthHeader:
         )
         client.test_connection()
         assert captured_headers["auth"] == "Token my-secret-token"
+        client.close()
+
+    def test_accept_header_pins_the_api_version(self) -> None:
+        """
+        Every request pins the paperless-ngx API version (OUTC-11 / D-17).
+
+        Without the header the server picks its own default -- today v10,
+        one day v11 -- and the client silently tracks it.
+        """
+        captured_headers: dict[str, str | None] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_headers["accept"] = request.headers.get("accept")
+            return httpx.Response(200, json={"count": 0, "results": []})
+
+        transport = _make_transport(handler)
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            _transport=transport,
+        )
+        client.test_connection()
+        assert captured_headers["accept"] == "application/json; version=9"
         client.close()
 
 
