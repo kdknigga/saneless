@@ -273,6 +273,32 @@ is called out explicitly (**D-14** is the only one).
   `<data_dir>/failed/`. The sanitiser for filenames is a separate function with its own tests,
   including `../` and absolute-path inputs.
 
+- **D-20: the UI design contract for this phase is the project-level `.planning/UI-SPEC.md`. No
+  phase UI-SPEC is generated.** OUTC-02 is a real frontend change (FALLBACK rendered distinctly in
+  the status area and history table), but it extends a contract that is already written down in
+  detail — status classes, glyph prefixes, the `humanize_state` filter, history-table columns — for
+  exactly one new state. Generating a second, phase-scoped spec for one member would duplicate that
+  contract and create two places for it to drift. **The planner MUST read `.planning/UI-SPEC.md`**
+  and extend it in-phase rather than inventing parallel conventions.
+
+  Three concrete obligations follow from that file, all verified against it:
+
+  - **`.planning/UI-SPEC.md:286` is a latent bug for this phase.** `app.js` re-enables the Scan
+    button on `htmx:afterSwap` **only** when the swapped `#status-area` content contains
+    `.status-done` or `.status-error`. A new `.status-fallback` class would leave the Scan button
+    **permanently disabled** after a fallback job until the page is reloaded. Whatever class
+    FALLBACK renders with must be added to that condition.
+  - **`.planning/UI-SPEC.md:281` has the same shape.** The hidden history reload
+    (`GET /api/jobs/history` on `load`) is documented as firing on "Terminal DONE/ERROR". FALLBACK
+    is terminal (D-03), so it must fire there too or the history table will not refresh.
+  - **`UI-SPEC.md:219-220` sets the register for the status line:** `✓ Done: {job.title}` (U+2713)
+    and `✗ Error: {job.error}` (U+2717) — glyphs, not emoji, per `:248`. FALLBACK needs a third
+    glyph and copy in the same register, plus a `.status-fallback` rule using a warning token rather
+    than reusing `--pico-ins-color` or `--pico-del-color` (D-05 requires it be distinct from both).
+
+  `.planning/UI-SPEC.md` is updated in-phase with the new state, in the same way docs are (the phase
+  rule: whatever behaviour you change, you correct its written description in the same phase).
+
 ### Claude's Discretion
 
 The following were raised during discussion and explicitly handed to the planner and executor. Make
