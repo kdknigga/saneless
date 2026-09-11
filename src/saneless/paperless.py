@@ -17,11 +17,127 @@ from pathlib import Path
 
 import httpx
 
-from .exceptions import PaperlessError
+from .exceptions import PaperlessError, PaperlessTimeoutError
 
 __all__ = ["PaperlessClient", "UploadResult"]
 
 logger = logging.getLogger(__name__)
+
+# The API version this client is written against.  paperless-ngx negotiates via
+# ``Accept: application/json; version=N`` and serves its own current default --
+# today 10 -- to a client that sends no header, so pinning turns a hidden
+# assumption into an explicit contract.  Servers old enough to predate task
+# versioning ignore the header.  An *invalid* version string makes paperless-ngx
+# answer 406 Not Acceptable, which poll_task reports immediately as a hard
+# failure, so the string has to be exactly right.
+_API_VERSION_ACCEPT = "application/json; version=9"
+
+# paperless-ngx's COMPLETE_STATUSES, normalised to the v9 uppercase spelling.
+# REVOKED belongs here: it is an administrative cancellation that will never
+# progress, so polling it to the deadline would report a misattributed timeout.
+_TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
+
+# Upper bound on how much of a non-200 response body is interpolated into an
+# error message.  That message is recorded verbatim in the job store and
+# rendered in the web status area (T-23-16), so an upstream returning a
+# multi-megabyte body or an HTML error page must not be able to flood either.
+_MAX_ERROR_BODY_CHARS = 500
+
+_NO_FAILURE_MESSAGE = "Paperless reported a failure but supplied no message"
+
+
+def _extract_task(payload: object) -> dict[str, object] | None:
+    """
+    Return the single task from either paperless-ngx response shape.
+
+    API v9 answers ``GET /api/tasks/`` with a bare list; v10 paginates it
+    into ``{"count", "next", "previous", "results"}``.  This is the same
+    both-shapes tolerance ``get_tags`` and ``get_correspondents`` already
+    apply to their own endpoints.
+
+    Args:
+        payload: The decoded JSON body of a 200 response.
+
+    Returns:
+        The first task dict, or None when the response carried no task.
+        None is **not** an error: a task is not always visible immediately
+        after the upload that created it, so the caller must keep polling
+        inside its deadline rather than raise.
+
+    """
+    if isinstance(payload, dict):
+        payload = payload.get("results")
+    if isinstance(payload, list) and payload:
+        first = payload[0]
+        if isinstance(first, dict):
+            return {str(key): value for key, value in first.items()}
+    return None
+
+
+def _task_status(task: dict[str, object]) -> str:
+    """
+    Return the task status in the v9 uppercase spelling.
+
+    API v10 spells the same statuses in lowercase (``success``, ``failure``,
+    ``revoked``), so every comparison in this module is made against the
+    normalised form.
+
+    Args:
+        task: A task dict from either API version.
+
+    Returns:
+        The uppercase status, or the empty string when absent.
+
+    """
+    return str(task.get("status", "")).upper()
+
+
+def _failure_message(task: dict[str, object]) -> str:
+    """
+    Return the failure text paperless-ngx supplied, from whichever field has it.
+
+    API v9 carries a flat ``result`` string; v10 moved it into
+    ``result_data`` as ``error_message`` (with ``reason`` used for some
+    rejections).  There is no single field that works for both versions.
+
+    Args:
+        task: A task dict whose status is FAILURE or REVOKED.
+
+    Returns:
+        A non-empty string.  This value is recorded as the job's error, so
+        it must never be None or empty -- a failure with neither field still
+        needs something a reader can act on.
+
+    """
+    result = task.get("result")
+    if isinstance(result, str) and result:
+        return result
+    data = task.get("result_data")
+    if isinstance(data, dict):
+        for key in ("error_message", "reason"):
+            message = data.get(key)
+            if isinstance(message, str) and message:
+                return message
+    return _NO_FAILURE_MESSAGE
+
+
+def _truncated_body(text: str) -> str:
+    """
+    Return a length-bounded rendering of an upstream response body.
+
+    Args:
+        text: The raw response body.
+
+    Returns:
+        The body unchanged when short, otherwise its first
+        ``_MAX_ERROR_BODY_CHARS`` characters with an explicit marker naming
+        the full length, so a reader can tell truncation from a short body.
+
+    """
+    if len(text) <= _MAX_ERROR_BODY_CHARS:
+        return text
+    head = text[:_MAX_ERROR_BODY_CHARS]
+    return f"{head}... [truncated, {len(text)} characters total]"
 
 
 @dataclass
@@ -93,7 +209,10 @@ class PaperlessClient:
         """Initialize the paperless-ngx API client."""
         client_kwargs: dict = {
             "base_url": url.rstrip("/"),
-            "headers": {"Authorization": f"Token {token}"},
+            "headers": {
+                "Authorization": f"Token {token}",
+                "Accept": _API_VERSION_ACCEPT,
+            },
             "timeout": 30.0,
         }
         if _transport is not None:
@@ -209,43 +328,82 @@ class PaperlessClient:
 
     def poll_task(self, task_id: str, timeout: int | float = 300) -> dict[str, object]:
         """
-        Poll task endpoint until terminal state with exponential backoff.
+        Poll the task endpoint with exponential backoff until the task succeeds.
 
-        Handles the race condition where a task may not appear
-        immediately after upload (Pitfall #8).
+        Two wire shapes are tolerated. API v9 answers ``GET /api/tasks/``
+        with a bare list of tasks whose ``status`` is uppercase and whose
+        failure text is a flat ``result`` string.  API v10 paginates the
+        list into ``{"count", "next", "previous", "results"}``, spells the
+        status in lowercase, and moved the failure text into
+        ``result_data["error_message"]``.  The client pins v9 in its
+        ``Accept`` header, and reading both shapes anyway means it keeps
+        working if that pin ever stops being honoured.
+
+        A 200 carrying no task is not an error.  A task is not always
+        visible immediately after the upload that created it, so an empty
+        list (or an empty ``results``) means "ask again", and polling
+        continues until the deadline.  A non-200 *is* an error and ends the
+        poll at once: a revoked token or a moved endpoint should be reported
+        as what it is within a second, not as a timeout several minutes
+        later.
 
         Args:
             task_id: Task UUID returned from upload.
-            timeout: Maximum seconds to wait for terminal state.
+            timeout: Maximum seconds to wait, measured on a monotonic clock
+                that includes request time as well as sleep time.
 
         Returns:
-            Task dict with status field. Status is one of
-            SUCCESS, FAILURE, or TIMEOUT.
+            The task dict, only when the task reached SUCCESS.
+
+        Raises:
+            PaperlessError: If the task ends FAILURE or REVOKED, carrying
+                the message paperless-ngx supplied, or if any poll returns a
+                non-200 response, carrying the status code and a
+                length-bounded excerpt of the body.
+            PaperlessTimeoutError: If the deadline passes before the task
+                reaches a terminal status. The message names the task id so
+                the task can be looked up in paperless-ngx directly.
 
         """
+        deadline = time.monotonic() + timeout
         delay = 0.5
-        elapsed = 0.0
 
-        while elapsed < timeout:
+        while True:
             response = self._client.get(
                 "/api/tasks/",
                 params={"task_id": task_id},
             )
-            if response.status_code == 200:
-                tasks = response.json()
-                if isinstance(tasks, list) and tasks:
-                    task = tasks[0]
-                    status = task.get("status")
-                    if status in ("SUCCESS", "FAILURE"):
-                        logger.info("Task %s completed: %s", task_id, status)
-                        return dict(task)
+            if response.status_code != 200:
+                msg = (
+                    f"Paperless task poll failed with HTTP "
+                    f"{response.status_code}: {_truncated_body(response.text)}"
+                )
+                raise PaperlessError(msg)
 
-            time.sleep(delay)
-            elapsed += delay
+            task = _extract_task(response.json())
+            if task is not None:
+                status = _task_status(task)
+                if status == "SUCCESS":
+                    logger.info("Task %s completed: %s", task_id, status)
+                    return task
+                if status in _TERMINAL_STATUSES:
+                    msg = (
+                        f"Paperless task {task_id} ended {status}: "
+                        f"{_failure_message(task)}"
+                    )
+                    raise PaperlessError(msg)
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("Task %s did not finish within %ss", task_id, timeout)
+                msg = f"Paperless task {task_id} did not finish within {timeout}s"
+                raise PaperlessTimeoutError(msg)
+
+            # Clamped so the poll never sleeps past its own deadline -- that
+            # is what makes a sub-second timeout cost what it says it does
+            # rather than the 0.5s first backoff.
+            time.sleep(min(delay, remaining))
             delay = min(delay * 2, 30.0)
-
-        logger.warning("Task %s timed out after %s seconds", task_id, timeout)
-        return {"status": "TIMEOUT", "task_id": task_id}
 
     def test_connection(self) -> str:
         """
