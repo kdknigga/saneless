@@ -17,6 +17,15 @@
     color: var(--pico-del-color, red);
 }
 
+/* Consume-directory fallback: a degraded success, so amber -- deliberately
+   neither the ins green nor the del red. PicoCSS v2 ships its colour palette
+   in a separate pico.colors.css that base.html does not link, so
+   --pico-color-amber-600 does not resolve today and the literal amber-600 is
+   what renders; the var() is kept so linking the palette would pick it up. */
+.status-fallback {
+    color: var(--pico-color-amber-600, #a16207);
+}
+
 /* Thumbnail preview */
 .thumbnail {
     max-width: 200px;
