@@ -1593,3 +1593,249 @@ class TestFailedDirWarning:
         assert "preserved at" in str(escaped)
         # iterdir, not glob: the patch is still in force.
         assert len([path for path in failed_dir.iterdir() if path.is_file()]) == 1
+
+
+def _mismatched_duplex_scanner(fronts: int = 3, backs: int = 2) -> MagicMock:
+    """
+    Return a scanner whose two manual-duplex passes disagree on page count.
+
+    Args:
+        fronts: Pages produced by pass A.
+        backs: Pages produced by pass B.
+
+    Returns:
+        A ScannerBackend mock whose two scan_pages calls yield those pages.
+
+    """
+    scanner = MagicMock(spec=ScannerBackend)
+    scanner.scan_pages.side_effect = [
+        iter([_make_content_image() for _ in range(fronts)]),
+        iter([_make_content_image() for _ in range(backs)]),
+    ]
+    return scanner
+
+
+def _both_halves_delivered() -> MagicMock:
+    """Return a paperless client that accepts both partial uploads."""
+    paperless = MagicMock()
+    paperless.upload_document.side_effect = [
+        UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
+        UploadResult(delivered_to_api=True, task_uuid="backs-task"),
+    ]
+    paperless.poll_task.return_value = None
+    return paperless
+
+
+class TestDuplexMismatchDelivery:
+    """D-08: the duplex-mismatch path gets the same honesty as the simplex one."""
+
+    def test_duplex_mismatch_polls_both_halves(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Leaving either task unpolled is C-03 surviving in a corner."""
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        paperless = _both_halves_delivered()
+
+        result = run_pipeline(
+            scanner=_mismatched_duplex_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Polled Twice", job_id="job-dx-1"
+            ),
+        )
+
+        polled = [call.args[0] for call in paperless.poll_task.call_args_list]
+        assert polled == ["fronts-task", "backs-task"]
+        assert result.outcome is ScanOutcome.SUCCESS
+
+    def test_duplex_mismatch_uses_the_configured_task_timeout(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Both halves honour output.paperless_task_timeout."""
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.output.paperless_task_timeout = 17
+        paperless = _both_halves_delivered()
+
+        run_pipeline(
+            scanner=_mismatched_duplex_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Timeout Wired", job_id="job-dx-2"
+            ),
+        )
+
+        timeouts = [
+            call.kwargs["timeout"] for call in paperless.poll_task.call_args_list
+        ]
+        assert timeouts == [17, 17]
+
+    def test_duplex_mismatch_preserves_both_halves_when_the_fronts_fail(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A failure on one half must not cost the user the other half.
+
+        The two partial PDFs are one document between them, so both go into
+        failed/ even though only the fronts task reported FAILURE.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = PaperlessError("Paperless reported FAILURE")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Fronts Fail", job_id="job-dx-3"
+                ),
+            )
+
+        assert len(list(failed_dir.glob("*.pdf"))) == 2
+
+    def test_duplex_mismatch_preserves_both_halves_when_the_backs_fail(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A clean fronts poll followed by a failing backs poll still raises."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = [
+            None,
+            PaperlessError("Paperless reported FAILURE"),
+        ]
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Backs Fail", job_id="job-dx-4"
+                ),
+            )
+
+        assert paperless.poll_task.call_count == 2
+        assert len(list(failed_dir.glob("*.pdf"))) == 2
+
+    def test_duplex_mismatch_preserved_halves_have_distinct_names(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Two same-named halves would destroy the one this path exists to save."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = PaperlessError("Paperless reported FAILURE")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Distinct Halves", job_id="job-dx-5"
+                ),
+            )
+
+        names = sorted(path.name for path in failed_dir.glob("*.pdf"))
+        assert len(names) == 2
+        assert any("fronts" in name for name in names)
+        assert any("backs" in name for name in names)
+
+    def test_duplex_mismatch_preservation_failure_is_reported_too(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """An unusable failed/ must not silently swallow the duplex failure."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        paperless = _both_halves_delivered()
+        paperless.upload_document.side_effect = PaperlessError("Upload failed")
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Duplex Both Fail", job_id="job-dx-6"
+                ),
+            )
+
+        message = str(excinfo.value)
+        assert "Upload failed" in message
+        assert str(failed_dir) in message
+
+    def test_duplex_mismatch_result_carries_outcome_warning_and_counts(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """OUTC-03: the worker needs an outcome, a warning and three counts."""
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+
+        result = run_pipeline(
+            scanner=_mismatched_duplex_scanner(fronts=4, backs=3),
+            paperless=_both_halves_delivered(),
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Counts And Warning", job_id="job-dx-7"
+            ),
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.warning is not None
+        assert "Page count mismatch: 4 fronts, 3 backs" in result.warning
+        assert result.pages_scanned == 7
+        assert result.pages_removed == 0
+        assert result.pages_uploaded == 7
+
+    def test_duplex_mismatch_is_fallback_not_success_when_a_half_falls_back(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A consume-dir half is not a success, and carries no task to poll."""
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = [
+            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
+            UploadResult(
+                delivered_to_api=False,
+                consume_dir_path=tmp_path / "consume" / "backs.pdf",
+            ),
+        ]
+        paperless.poll_task.return_value = None
+
+        result = run_pipeline(
+            scanner=_mismatched_duplex_scanner(),
+            paperless=paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default", title="Half Fallback", job_id="job-dx-8"
+            ),
+        )
+
+        assert result.outcome is ScanOutcome.FALLBACK
+        assert paperless.poll_task.call_count == 1

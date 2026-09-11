@@ -342,12 +342,38 @@ def _is_manual_duplex(source: str) -> bool:
     return "manual" in source.lower() and "duplex" in source.lower()
 
 
+@dataclass(frozen=True)
+class _DeliveryContext:
+    """
+    The settings-derived values the duplex-mismatch recovery needs.
+
+    Bundled into one record rather than passed as three more parameters
+    because ``_handle_duplex_mismatch`` already sits exactly on ruff's
+    ``PLR0913`` argument limit, and CLAUDE.md forbids both raising the limit
+    and suppressing the rule. A three-field frozen record still names every
+    dependency -- which threading the whole ``Settings`` object in would not --
+    and stays cheap to construct in a test.
+
+    Attributes:
+        dpi: Scan resolution, from ``profile.resolution``. The PDF's declared
+            page size depends on it.
+        failed_dir: Where the preservation guard moves partial PDFs when
+            delivery fails.
+        task_timeout: Seconds to wait for each paperless-ngx consume task.
+
+    """
+
+    dpi: int
+    failed_dir: Path
+    task_timeout: float
+
+
 def _handle_duplex_mismatch(
     passes: tuple[list[Image.Image], list[Image.Image]],
     tmp_path: Path,
     paperless: PaperlessClient,
     request: PipelineRequest,
-    dpi: int,
+    delivery: _DeliveryContext,
 ) -> tuple[str, bool]:
     """
     Save and upload partial PDFs when duplex page counts mismatch.
@@ -367,15 +393,26 @@ def _handle_duplex_mismatch(
         paperless: Paperless-ngx client for upload.
         request: Pipeline request with title, tags, correspondent, job id and
             status callback.
-        dpi: Scan resolution, from ``profile.resolution``. Passed in because
-            this function has no profile in scope, and the PDF's declared page
-            size depends on it.
+        delivery: The DPI, the preservation directory and the task timeout.
+            Bundled because this function has no profile and no settings in
+            scope, and because three more parameters would break PLR0913.
 
     Returns:
         A (warning, delivered_to_api) pair. The warning describes the mismatch
         and recovery action; delivered_to_api is True only when BOTH partial
         PDFs reached the paperless-ngx API. If either fell back to the consume
         directory the caller must report the run as a fallback, not a success.
+
+        Both halves that reach the API are polled, and a paperless-ngx failure
+        on either one raises rather than returning -- a half that failed
+        consumption is not a half that was delivered, and this path is already
+        an anomaly, which makes it the one most likely to be holding a document
+        the user actually needs (D-08).
+
+    Raises:
+        PaperlessError: If either upload or either poll fails. Both partial
+            PDFs are moved to ``delivery.failed_dir`` first, and the message
+            names them.
 
     """
     fronts, backs = passes
@@ -387,13 +424,13 @@ def _handle_duplex_mismatch(
         fronts,
         tmp_path / "fronts",
         filename=build_pdf_filename(request.job_id, f"{request.title} (fronts)"),
-        dpi=dpi,
+        dpi=delivery.dpi,
     )
     backs_pdf = assemble_pdf(
         backs,
         tmp_path / "backs",
         filename=build_pdf_filename(request.job_id, f"{request.title} (backs)"),
-        dpi=dpi,
+        dpi=delivery.dpi,
     )
     logger.info(
         "Duplex mismatch: assembled %d fronts and %d backs as separate PDFs",
@@ -404,20 +441,35 @@ def _handle_duplex_mismatch(
     notify(PipelineEvent.UPLOADING)
     created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     title = request.title
-    fronts_result = paperless.upload_document(
-        fronts_pdf,
-        f"{title} (fronts)",
-        request.tags,
-        request.correspondent,
-        created,
-    )
-    backs_result = paperless.upload_document(
-        backs_pdf,
-        f"{title} (backs)",
-        request.tags,
-        request.correspondent,
-        created,
-    )
+    # One guard over both halves: they are a single document between them, so
+    # a failure on either one has to keep both (D-08).
+    with _preserving([fronts_pdf, backs_pdf], delivery.failed_dir):
+        fronts_result = paperless.upload_document(
+            fronts_pdf,
+            f"{title} (fronts)",
+            request.tags,
+            request.correspondent,
+            created,
+        )
+        backs_result = paperless.upload_document(
+            backs_pdf,
+            f"{title} (backs)",
+            request.tags,
+            request.correspondent,
+            created,
+        )
+
+        # UploadResult.__post_init__ guarantees a task_uuid iff the document
+        # reached the API, so each test is exactly `delivered_to_api` and
+        # additionally narrows the id to str.  A half that only reached the
+        # consume directory has no task to poll.
+        fronts_task = fronts_result.task_uuid
+        if fronts_task is not None:
+            paperless.poll_task(fronts_task, timeout=delivery.task_timeout)
+        backs_task = backs_result.task_uuid
+        if backs_task is not None:
+            paperless.poll_task(backs_task, timeout=delivery.task_timeout)
+
     delivered = fronts_result.delivered_to_api and backs_result.delivered_to_api
 
     warning = (
@@ -656,7 +708,11 @@ def run_pipeline(
                     tmp_path,
                     paperless,
                     request,
-                    dpi=profile.resolution,
+                    _DeliveryContext(
+                        dpi=profile.resolution,
+                        failed_dir=settings.output.failed_dir,
+                        task_timeout=settings.output.paperless_task_timeout,
+                    ),
                 )
                 notify(PipelineEvent.DONE)
                 logger.info(
