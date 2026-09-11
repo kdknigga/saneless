@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: completed
-stopped_at: Phase 23 planned — 9 plans, 5 waves, checker PASS
-last_updated: "2026-09-11T14:26:51.751Z"
+stopped_at: Phase 23 wave 1 complete (23-01, 23-02, 23-03 merged)
+last_updated: "2026-09-11T15:25:53.918Z"
 last_activity: 2026-09-10 -- Phase 22 marked complete
 progress:
   total_phases: 13
   completed_phases: 3
   total_plans: 25
-  completed_plans: 16
+  completed_plans: 19
   percent: 23
 ---
 
@@ -238,6 +238,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-10 - Completed 20-01-PLAN.md (CI workflow, Dependabot, CONTRIBUTING.md, pytest-timeout)
-Last session: 2026-09-11T14:26:51.745Z
-Stopped at: Phase 23 planned — 9 plans, 5 waves, checker PASS
-Resume file: .planning/phases/23-honest-outcomes-and-never-lose-a-scan/23-01-PLAN.md
+Last session: 2026-09-11T15:25:53.912Z
+Stopped at: Phase 23 wave 1 complete (23-01, 23-02, 23-03 merged)
+Resume file: .planning/phases/23-honest-outcomes-and-never-lose-a-scan/23-04-PLAN.md

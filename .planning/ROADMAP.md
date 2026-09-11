@@ -161,9 +161,9 @@ Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the w
 **Plans**: 9 plans in 5 waves
 
 Plans:
-- [ ] 23-01-PLAN.md — Wave 0 test scaffolding, JobState.FALLBACK, job_state_for, PaperlessTimeoutError, ConnectionStatus (wave 1)
-- [ ] 23-02-PLAN.md — output.data_dir, db_path/failed_dir properties, entry points, Dockerfile and compose (wave 1)
-- [ ] 23-03-PLAN.md — filename sanitiser, unique PDF naming, fixed-DPI layout, PipelineRequest.job_id (wave 1)
+- [x] 23-01-PLAN.md — Wave 0 test scaffolding, JobState.FALLBACK, job_state_for, PaperlessTimeoutError, ConnectionStatus (wave 1)
+- [x] 23-02-PLAN.md — output.data_dir, db_path/failed_dir properties, entry points, Dockerfile and compose (wave 1)
+- [x] 23-03-PLAN.md — filename sanitiser, unique PDF naming, fixed-DPI layout, PipelineRequest.job_id (wave 1)
 - [ ] 23-04-PLAN.md — paperless API-version pin, v9/v10 parsing, raising poll_task, ConnectionStatus, atomic consume-dir rename (wave 2)
 - [ ] 23-05-PLAN.md — FALLBACK rendering in status partial, history table, CSS, app.js, CLI, and UI-SPEC (wave 2)
 - [ ] 23-06-PLAN.md — the preservation guard spanning upload_document and poll_task, plus duplex parity (wave 3)
@@ -328,7 +328,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 20. CI Gate | 5/5 | Complete    | 2026-09-10 |
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
-| 23. Honest Outcomes and Never Lose a Scan | 0/? | Not started | - |
+| 23. Honest Outcomes and Never Lose a Scan | 3/9 | In Progress|  |
 | 24. Scanner Truthfulness | 0/? | Not started | - |
 | 25. Manual Duplex | 0/? | Not started | - |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
