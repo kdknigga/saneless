@@ -6,6 +6,7 @@ Covers requirements: CTR-01, CTR-02, CTR-05.
 
 from __future__ import annotations
 
+import json
 from dataclasses import fields
 from typing import cast
 
@@ -26,10 +27,12 @@ from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
     TERMINAL_STATES,
+    ConnectionStatus,
     ErrorCategory,
     JobState,
     ScanOutcome,
     classify_error,
+    connection_status_message,
     error_message,
     job_state_for,
     progress_label,
@@ -237,6 +240,101 @@ class TestErrorMessage:
             "The document could not be sent to paperless-ngx."
         )
         assert error_message(ErrorCategory.UNKNOWN) == "Something went wrong."
+
+
+class TestConnectionStatus:
+    """ConnectionStatus membership, wire-value and message tests."""
+
+    def test_connection_status_has_exactly_five_members(self) -> None:
+        """
+        ConnectionStatus declares exactly five outcomes (OUTC-08).
+
+        A count guard, not a name list: adding a member should fail the
+        parametrised completeness test below -- which forces a user-facing
+        message -- rather than a hand-written roster that only records what the
+        enum happened to contain when it was written.
+        """
+        assert len(list(ConnectionStatus)) == 5
+
+    @pytest.mark.parametrize(
+        ("status", "expected"),
+        [
+            (ConnectionStatus.CONNECTED, "connected"),
+            (ConnectionStatus.TOKEN_REJECTED, "token_rejected"),
+            (ConnectionStatus.NOT_FOUND, "not_found"),
+            (ConnectionStatus.SERVER_ERROR, "server_error"),
+            (ConnectionStatus.UNREACHABLE, "unreachable"),
+        ],
+    )
+    def test_connection_status_wire_values(
+        self,
+        status: ConnectionStatus,
+        expected: str,
+    ) -> None:
+        """
+        Each member serialises to the string the web API documents (OUTC-08).
+
+        Compared against plain str literals, not against other enum members:
+        `GET /api/paperless/test` puts this value straight into a JSON body and
+        `docs/reference/web-api.md` documents the exact spelling, so what this
+        test has to prove is wire compatibility, not enum identity.
+        """
+        assert status == expected
+
+    def test_legacy_wire_values_are_unchanged(self) -> None:
+        """The three pre-existing API strings are byte-identical (OUTC-08)."""
+        assert ConnectionStatus.CONNECTED == "connected"
+        assert ConnectionStatus.TOKEN_REJECTED == "token_rejected"
+        assert ConnectionStatus.UNREACHABLE == "unreachable"
+
+    @pytest.mark.parametrize("status", list(ConnectionStatus))
+    def test_json_round_trip_needs_no_custom_encoder(
+        self,
+        status: ConnectionStatus,
+    ) -> None:
+        """A member serialises as its bare string with the stdlib encoder (OUTC-08)."""
+        assert json.dumps({"status": status}) == json.dumps({"status": status.value})
+
+    def test_connected_serialises_to_the_documented_body(self) -> None:
+        """The success body is exactly what web-api.md shows (OUTC-08)."""
+        assert (
+            json.dumps({"status": ConnectionStatus.CONNECTED})
+            == '{"status": "connected"}'
+        )
+
+    @pytest.mark.parametrize("status", list(ConnectionStatus))
+    def test_connection_status_message_is_complete(
+        self,
+        status: ConnectionStatus,
+    ) -> None:
+        """Every ConnectionStatus has a message that is not its raw value (OUTC-08)."""
+        message = connection_status_message(status)
+        assert message
+        assert message != status.value
+
+    def test_connection_status_message_strings(self) -> None:
+        """connection_status_message returns developer-authored prose (OUTC-08)."""
+        assert connection_status_message(ConnectionStatus.CONNECTED) == (
+            "Connected to paperless-ngx."
+        )
+        assert connection_status_message(ConnectionStatus.TOKEN_REJECTED) == (
+            "Paperless-ngx rejected the API token."
+        )
+        assert connection_status_message(ConnectionStatus.NOT_FOUND) == (
+            "The paperless-ngx API was not found at that URL."
+        )
+        assert connection_status_message(ConnectionStatus.SERVER_ERROR) == (
+            "Paperless-ngx returned a server error."
+        )
+        assert connection_status_message(ConnectionStatus.UNREACHABLE) == (
+            "Could not reach paperless-ngx."
+        )
+
+    def test_connection_status_message_raises_on_unrecognised_value(self) -> None:
+        """connection_status_message raises on a value outside the enum (OUTC-08)."""
+        bad = cast("ConnectionStatus", "teapot")
+        with pytest.raises(AssertionError):
+            connection_status_message(bad)
 
 
 class TestJobStateFor:

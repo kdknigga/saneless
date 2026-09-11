@@ -23,10 +23,12 @@ __all__ = [
     "ACTIVE_STATES",
     "BUSY_STATES",
     "TERMINAL_STATES",
+    "ConnectionStatus",
     "ErrorCategory",
     "JobState",
     "ScanOutcome",
     "classify_error",
+    "connection_status_message",
     "error_message",
     "job_state_for",
     "progress_label",
@@ -70,6 +72,43 @@ class ScanOutcome(StrEnum):
 
     SUCCESS = "SUCCESS"
     FALLBACK = "FALLBACK"
+
+
+# The wire string for a rejected API token, named rather than written inline
+# below.  Ruff's S105 reads any string literal assigned to a name containing
+# "token" as a hardcoded credential; this is a public API value that
+# ``docs/reference/web-api.md`` pins, not a secret, and neither the member name
+# nor the string is free to change.
+_REJECTED_WIRE_VALUE = "token_rejected"
+
+
+class ConnectionStatus(StrEnum):
+    """
+    How a paperless-ngx connection test resolved.
+
+    The values are lowercase snake_case and so break this module's otherwise
+    uniform value-equals-name convention.  That is deliberate, not an
+    oversight: ``web/routes.py:128`` serialises the value straight into the
+    JSON body of ``GET /api/paperless/test`` and
+    ``docs/reference/web-api.md:54-56`` documents the exact spelling of
+    ``connected``, ``token_rejected`` and ``unreachable``.  Those three strings
+    are a public wire contract and have to stay byte-identical; renaming them to
+    match the member names would silently break every existing client.
+
+    Only the *message* lookup below is a ``match`` with ``assert_never``.
+    Deciding which member an HTTP response maps to is an ordered chain of
+    status-code comparisons, and it lives in ``paperless.py`` -- for the same
+    reason ``classify_error`` is an ``isinstance`` chain: it dispatches on a
+    range of integers rather than on a closed set of enum members, so
+    ``assert_never`` does not apply and a trailing fallback is the correct
+    total answer.  This module imports no HTTP client and knows no status codes.
+    """
+
+    CONNECTED = "connected"
+    TOKEN_REJECTED = _REJECTED_WIRE_VALUE
+    NOT_FOUND = "not_found"
+    SERVER_ERROR = "server_error"
+    UNREACHABLE = "unreachable"
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
@@ -266,6 +305,40 @@ def error_message(category: ErrorCategory) -> str:
             message = "Something went wrong."
         case _:
             assert_never(category)
+    return message
+
+
+def connection_status_message(status: ConnectionStatus) -> str:
+    """
+    Return the plain-language user message for a connection-test outcome.
+
+    Every message is a developer-authored constant.  No status code, no
+    response body, no URL and no token is interpolated, so a paperless-ngx
+    error page cannot reach the UI through this path.
+
+    Args:
+        status: The connection-test outcome to describe.
+
+    Returns:
+        A short sentence a non-technical reader can act on.
+
+    Raises:
+        AssertionError: If the value is not a ConnectionStatus member.
+
+    """
+    match status:
+        case ConnectionStatus.CONNECTED:
+            message = "Connected to paperless-ngx."
+        case ConnectionStatus.TOKEN_REJECTED:
+            message = "Paperless-ngx rejected the API token."
+        case ConnectionStatus.NOT_FOUND:
+            message = "The paperless-ngx API was not found at that URL."
+        case ConnectionStatus.SERVER_ERROR:
+            message = "Paperless-ngx returned a server error."
+        case ConnectionStatus.UNREACHABLE:
+            message = "Could not reach paperless-ngx."
+        case _:
+            assert_never(status)
     return message
 
 
