@@ -239,6 +239,11 @@ Every word waves 2-5 import from this root now exists:
 
 No blockers.
 
+## Self-Check: PASSED
+
+All seven claimed files exist on disk. All four claimed commits (`c70ea19`, `ac00a90`, `3d1f469`,
+`fc381f2`) resolve in `git log`. No tracked file was deleted by any commit in this plan.
+
 ---
 *Phase: 23-honest-outcomes-and-never-lose-a-scan*
 *Completed: 2026-09-11*
