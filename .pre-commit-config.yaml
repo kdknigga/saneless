@@ -53,9 +53,14 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # Paths are explicit rather than relying on `project-includes`: pyrefly's
+      # `use-ignore-files` is on by default and is only bypassed when files are
+      # named on the command line.  Without them, a checkout inside a gitignored
+      # directory (a `.claude/worktrees/` git worktree) has every source file
+      # filtered out and the hook fails with "No Python files matched".
       - id: pyrefly-checker
         name: pyrefly type checker
-        entry: uv run pyrefly check
+        entry: uv run pyrefly check src tests
         language: system
         types: [python]
         pass_filenames: false
