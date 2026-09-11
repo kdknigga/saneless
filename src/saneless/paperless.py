@@ -10,6 +10,7 @@ reporting one of the five ConnectionStatus outcomes.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -320,12 +321,66 @@ class PaperlessClient:
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 logger.warning("Created consume directory %s", dest_dir)
             dest = dest_dir / pdf_path.name
-            shutil.copy2(pdf_path, dest)
+            self._deliver_to_consume_dir(pdf_path, dest_dir, dest)
             logger.warning("All retries exhausted. Copied PDF to %s", dest)
             return UploadResult(delivered_to_api=False, consume_dir_path=dest)
 
         msg = f"Upload failed after {self._max_retries} retries"
         raise PaperlessError(msg) from last_error
+
+    @staticmethod
+    def _deliver_to_consume_dir(pdf_path: Path, dest_dir: Path, dest: Path) -> None:
+        """
+        Hand a whole PDF to the consume directory, never a partial one.
+
+        paperless-ngx watches the consume directory with inotify and acts on
+        what appears there, so writing the bytes directly to the final name
+        lets it pick up a half-written PDF.  Instead the bytes go to a hidden
+        staging file, are flushed and fsynced, and only then take their final
+        name in one ``rename(2)``.
+
+        Two details are load-bearing:
+
+        * The staging file is a **dotfile**, which the consumer skips
+          outright.  Relying instead on it merely ignoring an unknown
+          ``.part`` extension would trade log spam for atomicity.
+        * The staging file lives **inside the consume directory**, not in
+          the caller's temporary directory.  ``rename(2)`` is atomic only
+          within one filesystem, and the consume directory is typically a
+          Docker volume or a network share -- a rename across that boundary
+          fails with EXDEV.
+        * The rename is ``Path.replace``, which delegates to ``os.replace``
+          and so is the atomic, unconditionally-overwriting one.
+          ``Path.rename`` is not a substitute: it refuses an existing
+          destination on Windows.  ``os.replace`` is not called directly
+          only because ruff's PTH105 forbids it and this project does not
+          permit per-line suppressions.
+
+        The file is fsynced but the directory is not: the consume directory
+        is a handoff, not a system of record, so paying for file durability
+        is worth it while a directory fsync is not.
+
+        Args:
+            pdf_path: The PDF to hand over.
+            dest_dir: The consume directory, which must already exist.
+            dest: The final path inside dest_dir.
+
+        Raises:
+            OSError: Whatever the copy or the rename raised, re-raised after
+                the staging file is removed so a failed handoff leaves no
+                truncated remnant for a retry or the consumer to find.
+
+        """
+        staged = dest_dir / f".{pdf_path.name}.part"
+        try:
+            with staged.open("wb") as staged_file, pdf_path.open("rb") as source:
+                shutil.copyfileobj(source, staged_file)
+                staged_file.flush()
+                os.fsync(staged_file.fileno())
+            staged.replace(dest)
+        except OSError:
+            staged.unlink(missing_ok=True)
+            raise
 
     def poll_task(self, task_id: str, timeout: int | float = 300) -> dict[str, object]:
         """

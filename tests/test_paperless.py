@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,7 @@ from saneless.vocabulary import ConnectionStatus
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
+    from typing import BinaryIO
 
 _MOCK_AUTH = "testtoken"
 
@@ -141,6 +143,28 @@ _CONNECTION_EXCEPTION_CASES = [
     pytest.param(httpx.ConnectTimeout, id="connect-timeout"),
     pytest.param(httpx.ReadTimeout, id="read-timeout"),
 ]
+
+
+def _assert_no_staging_files(consume_dir: Path) -> None:
+    """Assert no half-written staging file survives in the consume directory."""
+    leftovers = sorted(
+        entry.name
+        for entry in consume_dir.iterdir()
+        if entry.name.startswith(".") or entry.name.endswith(".part")
+    )
+    assert not leftovers, (
+        f"staging files left behind in the consume directory paperless-ngx "
+        f"watches: {leftovers}. The dotfile prefix and the '.part' extension "
+        f"exist only so the inotify consumer skips the file while it is being "
+        f"written; one surviving the upload means the atomic rename did not "
+        f"happen or its cleanup did not run."
+    )
+
+
+def _always_refused(_request: httpx.Request) -> httpx.Response:
+    """Refuse every connection, forcing the consume-directory fallback."""
+    msg = "connection refused"
+    raise httpx.ConnectError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +371,8 @@ class TestUploadDocument:
         copied = list(consume_dir.iterdir())
         assert len(copied) == 1
         assert copied[0].name == "test.pdf"
+        assert copied[0].read_bytes() == sample_pdf.read_bytes()
+        _assert_no_staging_files(consume_dir)
         # The result names the exact file the PDF was copied to -- something
         # the old magic-string sentinel could not carry.
         assert result.consume_dir_path == copied[0]
@@ -683,6 +709,70 @@ class TestConsumeDir:
         assert len(copied) == 1
         assert result.consume_dir_path == consume_dir / "test.pdf"
         client.close()
+
+    def test_delivery_leaves_only_the_final_file(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """
+        The finished consume directory holds the PDF and nothing else.
+
+        paperless-ngx is watching this directory with inotify, so a staging
+        file surviving the handoff is a defect in the other system, not a
+        cosmetic one.
+        """
+        consume_dir = tmp_path / "atomic-consume"
+        consume_dir.mkdir()
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            consume_dir=str(consume_dir),
+            _transport=_make_transport(_always_refused),
+            max_retries=1,
+        )
+        result = client.upload_document(sample_pdf, title="Atomic test")
+        client.close()
+
+        entries = sorted(entry.name for entry in consume_dir.iterdir())
+        assert entries == ["test.pdf"]
+        _assert_no_staging_files(consume_dir)
+        assert result.consume_dir_path == consume_dir / "test.pdf"
+        assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
+
+    def test_a_failed_staged_write_leaves_the_directory_empty(
+        self, sample_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A copy that dies part-way leaves nothing behind and still raises.
+
+        Without the cleanup a retry could later find -- or paperless-ngx
+        could consume -- a truncated remnant.
+        """
+        consume_dir = tmp_path / "doomed-consume"
+        consume_dir.mkdir()
+
+        def half_a_file(fsrc: BinaryIO, fdst: BinaryIO, length: int = 0) -> None:
+            """Write half the bytes, then fail the way a full disk would."""
+            fdst.write(b"%PDF-1.4 trun")
+            msg = "no space left on device"
+            raise OSError(msg)
+
+        monkeypatch.setattr(shutil, "copyfileobj", half_a_file)
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            consume_dir=str(consume_dir),
+            _transport=_make_transport(_always_refused),
+            max_retries=1,
+        )
+        try:
+            with pytest.raises(OSError, match="no space left"):
+                client.upload_document(sample_pdf, title="Doomed")
+        finally:
+            client.close()
+
+        assert sorted(entry.name for entry in consume_dir.iterdir()) == []
 
     def test_consume_dir_logs_warning_on_create(
         self, sample_pdf: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
