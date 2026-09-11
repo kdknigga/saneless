@@ -29,12 +29,18 @@ from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
-from .vocabulary import progress_label
+from .vocabulary import JobState, progress_label, state_label
 from .web.app import create_app
 
 __all__ = ["_truncate", "cli"]
 
 logger = logging.getLogger(__name__)
+
+# Width of the Status column in `saneless jobs`, derived rather than written
+# down: the humanised labels are longer than the raw enum values they replaced,
+# and a ninth JobState member must not be able to overflow an 80-column
+# terminal without anyone noticing.
+_STATUS_COL_WIDTH = max(len(state_label(state)) for state in JobState)
 
 
 def _truncate(value: str, width: int) -> str:
@@ -239,8 +245,13 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                             "id": j.id,
                             "profile": j.profile,
                             "title": j.title,
+                            # Raw enum value, deliberately not humanised: this
+                            # is the machine contract and scripts compare
+                            # against "DONE" / "FALLBACK".
                             "state": j.state.value,
                             "created_at": j.created_at.isoformat(),
+                            "outcome": j.outcome.value if j.outcome else None,
+                            "warning": j.warning,
                         }
                         for j in recent
                     ],
@@ -251,7 +262,8 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
             cols = shutil.get_terminal_size((80, 24)).columns
             ts_w = 22
             profile_w = 15
-            title_w = max(15, cols - 50)
+            # Three single spaces separate the four columns.
+            title_w = max(15, cols - (ts_w + profile_w + _STATUS_COL_WIDTH + 3))
             header = (
                 f"{'Timestamp':<{ts_w}} {'Profile':<{profile_w}} "
                 f"{'Title':<{title_w}} {'Status'}"
@@ -263,7 +275,7 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                     f"{j.created_at.strftime('%Y-%m-%d %H:%M:%S'):<{ts_w}} "
                     f"{_truncate(j.profile, profile_w):<{profile_w}} "
                     f"{_truncate(j.title, title_w):<{title_w}} "
-                    f"{j.state.value}"
+                    f"{state_label(j.state)}"
                 )
     finally:
         store.close()
