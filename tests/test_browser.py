@@ -270,6 +270,121 @@ _SWAP_STATUS_AREA = """
                 {target: "#status-area", swap: "outerHTML"})
 """
 
+# Reads the page surface from the root element. Pico paints its background on
+# :root, so <html> is where the scheme shows up; <body> is transparent in both
+# schemes and would read the same whether dark mode engaged or not, so it is
+# never the thing measured.
+_READ_ROOT_SURFACE = """
+() => {
+    const style = getComputedStyle(document.documentElement);
+    return {background: style.backgroundColor, colorScheme: style.colorScheme};
+}
+"""
+
+# Places one status probe where status text really lives -- a paragraph in the
+# status area or a cell in the history table -- and reads the colour it resolves
+# to plus the background it actually sits on. The background is found by
+# walking up to the first ancestor that paints one, because a history cell has
+# its own surface while a status paragraph shows the page through. Adding,
+# reading and removing all happen in this one call, so no htmx swap can land
+# in between.
+_PROBE_CONTEXT_CONTRAST = """
+({cls, context}) => {
+    const probe = document.createElement(context === "status-area" ? "p" : "td");
+    probe.className = cls;
+    probe.textContent = "probe";
+    let added = probe;
+    if (context === "status-area") {
+        document.getElementById("status-area").appendChild(probe);
+    } else {
+        const row = document.createElement("tr");
+        row.appendChild(probe);
+        document.getElementById("history-body").appendChild(row);
+        added = row;
+    }
+    const colour = getComputedStyle(probe).color;
+    const isTransparent = (value) =>
+        value === "transparent" ||
+        (value.startsWith("rgba(") &&
+            parseFloat(value.slice(value.lastIndexOf(",") + 1)) === 0);
+    let background = null;
+    for (let el = probe; el !== null; el = el.parentElement) {
+        const value = getComputedStyle(el).backgroundColor;
+        if (!isTransparent(value)) {
+            background = value;
+            break;
+        }
+    }
+    if (background === null) {
+        background = getComputedStyle(document.documentElement).backgroundColor;
+    }
+    added.remove();
+    return {colour, background};
+}
+"""
+
+
+def _relative_luminance(css_colour: str) -> float:
+    """Return the WCAG relative luminance of an ``rgb()`` or ``rgba()`` string."""
+    inner = css_colour[css_colour.index("(") + 1 : css_colour.index(")")]
+    channels = [float(part) / 255 for part in inner.split(",")[:3]]
+    linear = [
+        c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels
+    ]
+    return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+
+def _contrast_ratio(foreground: str, background: str) -> float:
+    """Return the WCAG contrast ratio between two computed CSS colours."""
+    first = _relative_luminance(foreground)
+    second = _relative_luminance(background)
+    return (max(first, second) + 0.05) / (min(first, second) + 0.05)
+
+
+class TestContrastHelper:
+    """
+    The contrast helper, pinned to the numbers the UI-SPEC measured.
+
+    The dark-mode contrast tests only mean something if the formula is right.
+    A helper that returned a large number for everything would let every one of
+    them pass without measuring anything, so these checks tie it to known
+    ratios. They need no browser and run in CI.
+    """
+
+    def test_black_on_white_is_the_maximum_ratio(self) -> None:
+        """Black on white is the largest ratio WCAG defines, 21:1."""
+        assert _contrast_ratio("rgb(0, 0, 0)", "rgb(255, 255, 255)") == pytest.approx(
+            21.0
+        )
+
+    def test_ratio_is_symmetric(self) -> None:
+        """Swapping foreground and background does not change the ratio."""
+        amber = "rgb(161, 98, 7)"
+        surface = "rgb(19, 23, 31)"
+        assert _contrast_ratio(amber, surface) == pytest.approx(
+            _contrast_ratio(surface, amber)
+        )
+
+    @pytest.mark.parametrize(
+        ("foreground", "background", "expected"),
+        [
+            ("rgb(161, 98, 7)", "rgb(255, 255, 255)", 4.92),
+            ("rgb(202, 138, 4)", "rgb(19, 23, 31)", 6.11),
+            ("rgb(161, 98, 7)", "rgb(19, 23, 31)", 3.65),
+        ],
+    )
+    def test_reference_ratios_match_the_ui_spec(
+        self, foreground: str, background: str, expected: float
+    ) -> None:
+        """Light amber, dark amber, and the dark-surface failure this phase fixes."""
+        assert _contrast_ratio(foreground, background) == pytest.approx(
+            expected, abs=0.01
+        )
+
+    def test_rgba_strings_parse(self) -> None:
+        """An ``rgba()`` string is read by its colour channels; alpha is ignored."""
+        assert _relative_luminance("rgba(255, 255, 255, 1)") == pytest.approx(1.0)
+
 
 @pytest.mark.browser
 class TestFallbackStatusRendering:
@@ -401,3 +516,89 @@ class TestFallbackStatusRendering:
         fallback_page.wait_for_selector("#history-body td.status-fallback")
         cell = fallback_page.locator("#history-body td.status-fallback").first
         assert cell.inner_text().strip() == "Saved to folder"
+
+
+@pytest.mark.browser
+class TestDarkModeEngagement:
+    """
+    Dark mode engages from the OS preference and keeps status text legible.
+
+    Pico's dark palette is not what is in doubt here; it is a published build.
+    What is in doubt is this app's cascade: whether <html> leaves Pico's
+    automatic-dark selector free to match, whether the app's own amber follows
+    the scheme, and what surface each status line really sits on. None of that
+    is visible in the template or the stylesheet alone, so the proof is the
+    colour a real browser computes.
+    """
+
+    def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
+        """Load the idle page under an emulated OS colour-scheme preference."""
+        page.emulate_media(color_scheme=scheme)
+        page.goto(url)
+        # The idle page renders no status line, so wait for the history table.
+        page.wait_for_selector("#history-body")
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_root_surface_follows_the_os_scheme(
+        self,
+        page: Page,
+        browser_server_url: str,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """The root element paints Pico's surface for the OS scheme (T1)."""
+        expected = {
+            "light": ("rgb(255, 255, 255)", "light"),
+            "dark": ("rgb(19, 23, 31)", "dark"),
+        }
+        self._goto(page, browser_server_url, scheme)
+        surface = page.evaluate(_READ_ROOT_SURFACE)
+        background, color_scheme = expected[scheme]
+        assert surface["background"] == background, surface
+        assert surface["colorScheme"] == color_scheme, surface
+
+    # The probe context is named "placement" here because pytest-playwright
+    # already owns a fixture called "context" (the browser context that "page"
+    # is built from); a parameter of that name would replace it with a string.
+    @pytest.mark.parametrize("placement", ["status-area", "history-cell"])
+    @pytest.mark.parametrize("cls", ["status-done", "status-error", "status-fallback"])
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_status_colour_meets_aa_contrast(
+        self,
+        page: Page,
+        browser_server_url: str,
+        scheme: Literal["light", "dark"],
+        cls: Literal["status-done", "status-error", "status-fallback"],
+        placement: Literal["status-area", "history-cell"],
+    ) -> None:
+        """
+        Every status colour reaches WCAG AA where it is really shown (T2).
+
+        The fallback amber is also checked by value, so a palette drift is
+        reported by name rather than only as a ratio that happens to pass.
+        """
+        self._goto(page, browser_server_url, scheme)
+        probe = page.evaluate(
+            _PROBE_CONTEXT_CONTRAST, {"cls": cls, "context": placement}
+        )
+        colour = probe["colour"]
+        background = probe["background"]
+        ratio = _contrast_ratio(colour, background)
+        assert ratio >= 4.5, (colour, background, ratio)
+        if cls == "status-fallback":
+            amber = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
+            assert colour == amber[scheme], (colour, background, ratio)
+
+    def test_forced_dark_theme_keeps_the_dark_amber(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        A forced dark theme gets the dark amber even under a light OS (T3).
+
+        The automatic-dark tests cannot reach the forced-dark rule, because the
+        OS preference alone never sets data-theme. This sets it directly, the
+        way a future theme toggle would, and checks the amber follows.
+        """
+        self._goto(page, browser_server_url, "light")
+        page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
+        colours = page.evaluate(_PROBE_STATUS_COLOURS)
+        assert colours["status-fallback"] == "rgb(202, 138, 4)", colours
