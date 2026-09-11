@@ -95,6 +95,16 @@ class PipelineEvent(StrEnum):
 
 logger = logging.getLogger(__name__)
 
+FAILED_DIR_WARN_THRESHOLD = 20
+"""
+How many preserved PDFs make ``<data_dir>/failed/`` worth mentioning in the log.
+
+This is an *attention* threshold, not a retention policy. Reaching it changes
+nothing except that a WARNING is emitted: saneless never deletes, moves,
+truncates or rotates a file it preserved, because the whole point of preserving
+one was that it is the only remaining copy of a scanned document.
+"""
+
 
 @dataclass
 class PipelineRequest:
@@ -164,6 +174,50 @@ def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
         raise ScanError(msg)
 
 
+def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
+    """
+    Log one WARNING when preserved scans have piled up in ``failed_dir``.
+
+    Warn only. Nothing in saneless prunes, sweeps, caps, rotates or deletes
+    anything in that directory: every file in it is a document that reached
+    paper and never reached paperless-ngx, and automatically deleting one
+    would be precisely the data loss the preservation guard exists to prevent.
+    The control here is operator visibility, not enforcement (T-23-29). A
+    retention policy would need a config key and a user story that do not
+    exist yet.
+
+    **This function must never raise.** It is called from inside the
+    preservation guard's exception handler, while a delivery exception is
+    already in flight; a raise here would replace the real failure with a
+    bookkeeping error and lose the message OUTC-04 requires the job to carry.
+    Any filesystem trouble -- a permission change, a race, the directory
+    disappearing underneath us -- ends the check silently instead.
+
+    Args:
+        failed_dir: The directory preserved PDFs are moved into. It has just
+            been written to, so the newly preserved file is included in the
+            count.
+
+    """
+    try:
+        preserved = list(failed_dir.glob("*.pdf"))
+        if len(preserved) < FAILED_DIR_WARN_THRESHOLD:
+            return
+        total_bytes = sum(pdf.stat().st_size for pdf in preserved)
+    except OSError:
+        # Deliberately silent, per the docstring: a bookkeeping failure must
+        # not displace the delivery failure the guard is about to re-raise.
+        return
+    logger.warning(
+        "%d preserved scans (%.1f MiB) have accumulated in %s -- saneless "
+        "never deletes these files itself, so draining the directory is yours "
+        "to do once those documents are safely in paperless-ngx",
+        len(preserved),
+        total_bytes / (1024 * 1024),
+        failed_dir,
+    )
+
+
 @contextlib.contextmanager
 def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
     """
@@ -190,7 +244,7 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
     The relocation goes through ``shutil`` rather than a bare rename:
     ``data_dir`` and ``tmp_dir`` are independent settings and may sit on
     different filesystems, where ``Path.rename`` raises ``EXDEV``, while
-    ``shutil`` falls back to copy-then-unlink. The destination is always a full
+    ``shutil`` falls back to a copy plus a drop of the source. The destination is always a full
     explicit path, never the bare directory -- handed a directory, ``shutil``
     raises ``shutil.Error`` on a basename collision, and ``shutil.Error`` does
     **not** inherit from ``OSError``, so it would escape the handler below and
@@ -234,6 +288,7 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
                 destination = failed_dir / pdf_path.name
                 shutil.move(pdf_path, destination)
                 destinations.append(destination)
+                _warn_if_failed_dir_growing(failed_dir)
         except OSError as move_exc:
             msg = f"{exc}. The scan could NOT be preserved to {failed_dir}: {move_exc}"
             raise PaperlessError(msg) from exc
