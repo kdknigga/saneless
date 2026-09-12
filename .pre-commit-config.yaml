@@ -20,20 +20,38 @@ repos:
     hooks:
       - id: check-added-large-files
         stages: [pre-commit]
-      - id: check-ast
       - id: check-executables-have-shebangs
         stages: [pre-commit]
+      # Read-only checks: they report and never rewrite, so nothing here can
+      # abort a merge or a push by modifying a file. They run at all three
+      # stages deliberately -- check-merge-conflict is worth most at
+      # pre-merge-commit, the stage named after the operation it guards, and
+      # detect-private-key and detect-aws-credentials at pre-push, the last
+      # point before content leaves the machine.
+      - id: check-ast
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-json
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-merge-conflict
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-symlinks
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-toml
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-vcs-permalinks
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-xml
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-yaml
         args: ["--allow-multiple-documents"]
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: debug-statements
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: detect-aws-credentials
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: detect-private-key
+        stages: [pre-commit, pre-merge-commit, pre-push]
+      # File-modifying hooks from here down: commit stage only.
       - id: end-of-file-fixer
         stages: [pre-commit]
       - id: fix-byte-order-marker
@@ -101,6 +119,27 @@ repos:
         entry: uv run pyrefly check src tests
         language: system
         types: [python]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      # Lint and format are checked, not applied, at merge and push. The
+      # ruff-pre-commit hooks above rewrite files, so they cannot run at either
+      # stage -- which left the two cheapest checks in the gate deferred to a CI
+      # round trip while the two slowest (the type checkers) ran locally.
+      # `--no-fix` and `--check` report instead of rewriting, so they can.
+      - id: ruff-check-full
+        name: ruff (no fix)
+        entry: uv run ruff check --no-fix .
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      - id: ruff-format-check
+        name: ruff format --check
+        entry: uv run ruff format --check .
+        language: system
         pass_filenames: false
         always_run: true
         stages: [pre-merge-commit, pre-push]
