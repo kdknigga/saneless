@@ -15,8 +15,8 @@ uv run ruff check --fix .  # Lint with auto-fix
 uv run ruff format .       # Format code
 uv run ty check            # Type check (ty)
 uv run pyrefly check src tests  # Type check (pyrefly) -- always name paths
-uv run prek run                   # Run all pre-commit hooks
-uv run prek run --stage pre-push  # Full type check (src + tests)
+uv run prek run --all-files                   # Run all hooks over the whole tree
+uv run prek run --stage pre-push --all-files  # Full type check (src + tests)
 uv sync                    # Sync dependencies from uv.lock
 uv add <package>           # Add a dependency
 uv add --dev <package>     # Add a dev dependency
@@ -74,6 +74,7 @@ Consider the use of the following skills that are available to you:
 - `ty` and `pyrefly` may report different issues for the same code — both must pass clean
 - Ruff's `D` rules require docstrings on all public modules, classes, and functions
 - Ruff ignores `D203`/`D212`: use no-blank-line-before-class and multi-line-summary-second-line style
-- `prek` is a drop-in replacement for `pre-commit` — use `uv run prek run` not `pre-commit run`
+- `prek` is a drop-in replacement for `pre-commit` — use `uv run prek run --all-files` not `pre-commit run`
+- `prek run` defaults to the *staged* set, so with a clean tree it skips almost every hook and reports a pass it never earned — pass `--all-files` for any pre-flight over the tree
 - Inside a gitignored directory such as a `.claude/worktrees/` git worktree, pyrefly's `use-ignore-files` default filters out every source file, and it is only bypassed when files are named on the command line — always run `uv run pyrefly check src tests`
 - The commit-stage hooks type-check `src/` only, so a TDD RED commit is allowed; the full type check (ty, plus pyrefly over `src tests`) runs at pre-merge-commit and pre-push — never pass `--no-verify`, use `SKIP=`, or add a stub to get a RED commit through
