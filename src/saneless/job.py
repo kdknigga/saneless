@@ -142,8 +142,9 @@ consumed by ``_FAIL_ACTIVE`` below.  Its safety argument is ``_SELECT_JOBS``'s.
 _DELETE_JOBS = "DELETE FROM jobs"
 """The ``DELETE`` verb and its target table, held under a name.
 
-Declared for the same reason as ``_UPDATE_JOBS``, and consumed by ``_PRUNE``
-below.  Its safety argument is ``_SELECT_JOBS``'s.
+Declared for the same reason as ``_UPDATE_JOBS``, and consumed by
+``_DELETE_BY_ID`` and ``_PRUNE`` below.  Its safety argument is
+``_SELECT_JOBS``'s.
 """
 
 _SELECT_ALL = f"{_SELECT_JOBS} {_COLUMN_LIST} FROM jobs"
@@ -186,6 +187,13 @@ caller-supplied reason, each active-state value -- is a bound parameter.
 ``json_each(?)`` would make the statement fully static and was verified to work
 here, but JSON1 was a compile-time option before SQLite 3.38, so it would add a
 soft dependency on an extension this module otherwise does not need.
+"""
+
+_DELETE_BY_ID = f"{_DELETE_JOBS} WHERE id = ?"
+"""Delete a single job by its primary key.
+
+One bound parameter, the job id.  Its safety argument is ``_SELECT_JOBS``'s: the
+only interpolated value is the module-level ``_DELETE_JOBS`` literal.
 """
 
 _NEWEST_IDS = f"{_SELECT_JOBS} id FROM jobs ORDER BY created_at DESC LIMIT ?"
@@ -866,6 +874,31 @@ class JobStore:
         if deleted > 0:
             logger.debug("Pruned %d old jobs", deleted)
         return deleted
+
+    @_locked
+    def delete_job(self, job_id: str) -> bool:
+        """
+        Remove one job by id.
+
+        :meth:`prune` deletes by age and by row count, which is the wrong shape
+        for a caller holding a single id.  Without this, removing one named job
+        meant reaching past the store into ``_conn`` and opening a transaction
+        on the shared connection while holding none of the store's lock -- the
+        exact pattern the ``@_locked`` discipline exists to prevent.
+
+        Args:
+            job_id: The UUID string of the job.
+
+        Returns:
+            True if a job was removed, False if no job carried that id.
+
+        """
+        with self._conn:
+            deleted = self._conn.execute(_DELETE_BY_ID, (job_id,)).rowcount
+
+        if deleted > 0:
+            logger.debug("Deleted job %s", job_id)
+        return deleted > 0
 
     @_locked
     def close(self) -> None:
