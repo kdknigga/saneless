@@ -77,18 +77,29 @@ fails on its own with a traceback while the rest of the suite keeps going.
 
 ## Local pre-flight
 
-The repository ships a hook configuration. Run it before you push:
+The repository ships a hook configuration. Run it over the whole tree before you
+push:
 
 ```bash
-uv run prek run
+uv run prek run --all-files
 ```
 
-`prek` is a drop-in replacement for the older hook runner -- always invoke it as
-`uv run prek run`. At its default stage it runs the formatter, the linter and both
-type checkers, but the type checkers only cover `src/` there. For the full type check
-over `src/` and `tests/`, run `uv run prek run --stage pre-push`. prek does not run
-the test suite at any stage, so run `uv run pytest -m "not browser"` too, or just run
-the five commands above.
+`--all-files` is doing real work in that command. prek's default scope is the
+*staged* set, and "before you push" is exactly the state in which nothing is staged:
+your work is already committed. A bare `uv run prek run` in that state skips almost
+every hook -- no ruff lint, no format check, no `debug-statements`, no
+`detect-private-key` -- and prints a wall of `Skipped` that is easy to read as a
+clean tree. Only the two type checkers, which are `always_run`, actually look at
+anything. Use the bare `uv run prek run` only when the staged set is the point, such
+as inspecting what a commit is about to run.
+
+`prek` is a drop-in replacement for the older hook runner -- invoke it as
+`uv run prek run`, never as `pre-commit run`. At its default stage it runs the
+formatter, the linter and both type checkers, but the type checkers only cover `src/`
+there. For the full type check over `src/` and `tests/`, run
+`uv run prek run --stage pre-push --all-files`. prek does not run the test suite at
+any stage, so run `uv run pytest -m "not browser"` too, or just run the five commands
+above.
 
 ## Where the type checkers run
 
