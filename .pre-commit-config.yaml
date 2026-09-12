@@ -2,8 +2,17 @@
 # See https://pre-commit.com/hooks.html for more hooks
 # Git shims installed by `prek install`; worktrees share them via core.hooksPath.
 default_install_hook_types: [pre-commit, pre-merge-commit, pre-push]
-# Hooks with no `stages:` run at commit time only, never at merge or push, where a
-# file-modifying hook would abort the operation.
+# Hooks with no `stages:` of their own run at commit time only, never at merge or
+# push, where a file-modifying hook would abort the operation.
+#
+# It does NOT override a hook whose own manifest declares `stages:` -- a
+# manifest-declared value wins over default_stages. pre-commit-hooks v6.0.0 declares
+# [pre-commit, pre-push, manual] on check-added-large-files,
+# check-executables-have-shebangs, end-of-file-fixer and trailing-whitespace, so each
+# of those carries an explicit `stages: [pre-commit]` below to pin it back. The same
+# manifest declares it on check-shebang-scripts-are-executable and destroyed-symlinks,
+# which this config does not use yet. Read the upstream manifest before adding a hook:
+# if it declares `stages:`, the pin here is what keeps it off merge and push.
 default_stages: [pre-commit]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
