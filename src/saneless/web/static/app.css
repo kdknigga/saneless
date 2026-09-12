@@ -29,11 +29,17 @@
 
 @media only screen and (prefers-color-scheme: dark) {
     :root:not([data-theme]) {
+        /* Paired with the [data-theme="dark"] block below -- same value, and
+           it has to be written out twice. Change one, change the other. */
         --saneless-status-fallback: #ca8a04;
     }
 }
 
 [data-theme="dark"] {
+    /* Same value as the prefers-color-scheme block above. The duplication is
+       structural, not careless: plain CSS cannot merge two selectors onto one
+       declaration, and grouping them would make the forced-dark rule inherit
+       the media query. Change one, change the other. */
     --saneless-status-fallback: #ca8a04;
 }
 
