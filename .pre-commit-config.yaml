@@ -84,11 +84,16 @@ repos:
       # Commit time checks src/ only, so a TDD RED commit (a test naming a symbol
       # that does not exist yet) can land. tests/ is checked in full when the
       # branch is merged with --no-ff or pushed, by the two "(full)" hooks below.
+      #
+      # No `types:` on any hook in this section, deliberately. Each one pairs
+      # `always_run: true` with `pass_filenames: false`, so it runs whatever
+      # changed and is handed no filenames -- a `types:` filter would have
+      # nothing to act on, and would only suggest a scoping that is not there.
+      # The paths these checkers cover are the ones written into `entry`.
       - id: ty-checker
         name: ty type checker (src)
         entry: uv run ty check src
         language: system
-        types: [python]
         pass_filenames: false
         always_run: true
 
@@ -101,7 +106,6 @@ repos:
         name: pyrefly type checker (src)
         entry: uv run pyrefly check src
         language: system
-        types: [python]
         pass_filenames: false
         always_run: true
 
@@ -109,7 +113,6 @@ repos:
         name: ty type checker (full)
         entry: uv run ty check
         language: system
-        types: [python]
         pass_filenames: false
         always_run: true
         stages: [pre-merge-commit, pre-push]
@@ -118,7 +121,6 @@ repos:
         name: pyrefly type checker (full)
         entry: uv run pyrefly check src tests
         language: system
-        types: [python]
         pass_filenames: false
         always_run: true
         stages: [pre-merge-commit, pre-push]
