@@ -50,6 +50,25 @@ from saneless.scanner.base import (
 from saneless.vocabulary import JobState
 from saneless.web.app import create_app
 
+# Every palette value these tests assert against, in one place. All of them are
+# valid only for @picocss/pico@2.1.1, the version pinned in base.html. Pico is
+# loaded from a CDN and .github/dependabot.yml watches "github-actions" only, so
+# that pin sits outside every automated update path and nothing warns when it
+# drifts.
+#
+# Nor is the drift caught on the enforcing boundary yet: CI deselects the
+# `browser` marker, and adding a browser job is held for phase 26, which vendors
+# Pico and htmx locally first so CI need not depend on CDN egress. Until then a
+# Pico bump is a manual edit whose breakage surfaces only when a human runs
+# `pytest -m browser`. Collecting the expectations here does not fix that, but it
+# makes the bump a one-line edit with a named reason instead of four scattered
+# literals that have to be found by grep.
+_PICO_SURFACE = {"light": "rgb(255, 255, 255)", "dark": "rgb(19, 23, 31)"}
+"""Pico's page surface under each colour scheme, as the browser computes it."""
+
+_AMBER = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
+"""The app's fallback amber (#a16207 / #ca8a04, from app.css), as computed."""
+
 
 class _BrowserTestScanner(ScannerBackend):
     """Concrete scanner stub for browser tests."""
@@ -381,8 +400,8 @@ class TestContrastHelper:
 
     def test_ratio_is_symmetric(self) -> None:
         """Swapping foreground and background does not change the ratio."""
-        amber = "rgb(161, 98, 7)"
-        surface = "rgb(19, 23, 31)"
+        amber = _AMBER["light"]
+        surface = _PICO_SURFACE["dark"]
         assert _contrast_ratio(amber, surface) == pytest.approx(
             _contrast_ratio(surface, amber)
         )
@@ -390,9 +409,9 @@ class TestContrastHelper:
     @pytest.mark.parametrize(
         ("foreground", "background", "expected"),
         [
-            ("rgb(161, 98, 7)", "rgb(255, 255, 255)", 4.92),
-            ("rgb(202, 138, 4)", "rgb(19, 23, 31)", 6.11),
-            ("rgb(161, 98, 7)", "rgb(19, 23, 31)", 3.65),
+            (_AMBER["light"], _PICO_SURFACE["light"], 4.92),
+            (_AMBER["dark"], _PICO_SURFACE["dark"], 6.11),
+            (_AMBER["light"], _PICO_SURFACE["dark"], 3.65),
         ],
     )
     def test_reference_ratios_match_the_ui_spec(
@@ -569,8 +588,8 @@ class TestDarkModeEngagement:
     ) -> None:
         """The root element paints Pico's surface for the OS scheme (T1)."""
         expected = {
-            "light": ("rgb(255, 255, 255)", "light"),
-            "dark": ("rgb(19, 23, 31)", "dark"),
+            "light": (_PICO_SURFACE["light"], "light"),
+            "dark": (_PICO_SURFACE["dark"], "dark"),
         }
         self._goto(page, browser_server_url, scheme)
         surface = page.evaluate(_READ_ROOT_SURFACE)
@@ -607,8 +626,7 @@ class TestDarkModeEngagement:
         ratio = _contrast_ratio(colour, background)
         assert ratio >= 4.5, (colour, background, ratio)
         if cls == "status-fallback":
-            amber = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
-            assert colour == amber[scheme], (colour, background, ratio)
+            assert colour == _AMBER[scheme], (colour, background, ratio)
 
     def test_forced_dark_theme_keeps_the_dark_amber(
         self, page: Page, browser_server_url: str
@@ -623,4 +641,4 @@ class TestDarkModeEngagement:
         self._goto(page, browser_server_url, "light")
         page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
         colours = page.evaluate(_PROBE_STATUS_COLOURS)
-        assert colours["status-fallback"] == "rgb(202, 138, 4)", colours
+        assert colours["status-fallback"] == _AMBER["dark"], colours
