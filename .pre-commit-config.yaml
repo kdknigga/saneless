@@ -58,7 +58,11 @@ repos:
       - id: mixed-line-ending
         args: ["--fix=lf"]
       - id: pretty-format-json
-      - id: sort-simple-yaml
+      # No sort-simple-yaml: upstream declares `files: '^$'`, a pattern that
+      # matches nothing, so the hook can only ever run against a `files:` this
+      # config supplies itself. There is no YAML here whose keys we want sorted
+      # -- ordering is meaningful in this file and in the workflows -- so it is
+      # absent rather than configured.
       - id: trailing-whitespace
         stages: [pre-commit]
 
