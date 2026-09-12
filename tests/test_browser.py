@@ -325,11 +325,12 @@ _READ_ROOT_SURFACE = """
 
 # Places one status probe where status text really lives -- a paragraph in the
 # status area or a cell in the history table -- and reads the colour it resolves
-# to plus the background it actually sits on. The background is found by
-# walking up to the first ancestor that paints one, because a history cell has
-# its own surface while a status paragraph shows the page through. Adding,
-# reading and removing all happen in this one call, so no htmx swap can land
-# in between.
+# to plus the layers it actually sits on, because a history cell has its own
+# surface while a status paragraph shows the page through. The walk collects
+# every painted layer out to the first fully opaque one and returns the stack;
+# a translucent layer does not hide what is under it, so compositing is left to
+# _flatten rather than being decided here. Adding, reading and removing all
+# happen in this one call, so no htmx swap can land in between.
 _PROBE_CONTEXT_CONTRAST = """
 ({cls, context}) => {
     const probe = document.createElement(context === "status-area" ? "p" : "td");
@@ -345,31 +346,81 @@ _PROBE_CONTEXT_CONTRAST = """
         added = row;
     }
     const colour = getComputedStyle(probe).color;
-    const isTransparent = (value) =>
-        value === "transparent" ||
-        (value.startsWith("rgba(") &&
-            parseFloat(value.slice(value.lastIndexOf(",") + 1)) === 0);
-    let background = null;
+    const alphaOf = (value) => {
+        if (value === "transparent") return 0;
+        if (!value.startsWith("rgba(")) return 1;
+        return parseFloat(value.slice(value.lastIndexOf(",") + 1));
+    };
+    // Fully transparent layers paint nothing and are skipped; translucent ones
+    // are collected and the walk continues, because what is beneath them still
+    // shows through. Only a fully opaque layer ends the walk.
+    const backgroundStack = [];
     for (let el = probe; el !== null; el = el.parentElement) {
         const value = getComputedStyle(el).backgroundColor;
-        if (!isTransparent(value)) {
-            background = value;
-            break;
-        }
+        const alpha = alphaOf(value);
+        if (alpha === 0) continue;
+        backgroundStack.push(value);
+        if (alpha === 1) break;
     }
-    if (background === null) {
-        background = getComputedStyle(document.documentElement).backgroundColor;
+    const last = backgroundStack[backgroundStack.length - 1];
+    if (backgroundStack.length === 0 || alphaOf(last) < 1) {
+        // Nothing out to <html> painted an opaque layer, so what shows through
+        // is the browser canvas, which is white.
+        backgroundStack.push("rgb(255, 255, 255)");
     }
     added.remove();
-    return {colour, background};
+    return {colour, backgroundStack};
 }
 """
 
 
+def _parse_rgba(css_colour: str) -> tuple[float, float, float, float]:
+    """
+    Split an ``rgb()`` or ``rgba()`` string into its channels and its alpha.
+
+    Asserts rather than letting ``str.index`` raise ``ValueError``: if a browser
+    ever returns ``color(srgb ...)`` or a bare keyword, the failure should name
+    the string it was handed instead of pointing at a slice inside a helper.
+    """
+    assert css_colour.startswith(("rgb(", "rgba(")), (
+        f"expected an rgb()/rgba() colour, got {css_colour!r}"
+    )
+    inner = css_colour[css_colour.index("(") + 1 : css_colour.index(")")]
+    parts = [float(part) for part in inner.split(",")]
+    alpha = parts[3] if len(parts) > 3 else 1.0
+    return parts[0], parts[1], parts[2], alpha
+
+
+def _flatten(background_stack: list[str]) -> str:
+    """
+    Composite a stack of painted layers, nearest first, into one opaque colour.
+
+    The probe walks outward from the status element collecting everything that
+    paints, so the stack can carry translucent layers above the surface that
+    finally stops it. Reading only the channels of the nearest layer -- which is
+    what ignoring alpha does -- measures a background of
+    ``rgba(111, 120, 135, 0.0375)``, which renders as near-white over a white
+    page, as solid ``#6F7887``. That turns a genuinely passing ratio into a
+    reported ~1.1:1: a failure with a number no user would ever experience.
+    """
+    assert background_stack, "the probe returned no background layers"
+    *overlays, base = background_stack
+    red, green, blue, alpha = _parse_rgba(base)
+    assert alpha == 1.0, f"the bottom layer of {background_stack} is not opaque"
+    for layer in reversed(overlays):
+        over_red, over_green, over_blue, over_alpha = _parse_rgba(layer)
+        red = over_red * over_alpha + red * (1 - over_alpha)
+        green = over_green * over_alpha + green * (1 - over_alpha)
+        blue = over_blue * over_alpha + blue * (1 - over_alpha)
+    return f"rgb({red}, {green}, {blue})"
+
+
 def _relative_luminance(css_colour: str) -> float:
     """Return the WCAG relative luminance of an ``rgb()`` or ``rgba()`` string."""
-    inner = css_colour[css_colour.index("(") + 1 : css_colour.index(")")]
-    channels = [float(part) / 255 for part in inner.split(",")[:3]]
+    # Alpha is deliberately ignored here: compositing is _flatten's job, and by
+    # the time a colour reaches this function it is meant to be opaque.
+    red, green, blue, _alpha = _parse_rgba(css_colour)
+    channels = [red / 255, green / 255, blue / 255]
     linear = [
         c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels
     ]
@@ -426,6 +477,30 @@ class TestContrastHelper:
     def test_rgba_strings_parse(self) -> None:
         """An ``rgba()`` string is read by its colour channels; alpha is ignored."""
         assert _relative_luminance("rgba(255, 255, 255, 1)") == pytest.approx(1.0)
+
+    def test_an_opaque_stack_composites_to_itself(self) -> None:
+        """A single opaque layer flattens to the colour it already was."""
+        surface = _PICO_SURFACE["dark"]
+        assert _relative_luminance(_flatten([surface])) == pytest.approx(
+            _relative_luminance(surface)
+        )
+
+    def test_a_translucent_layer_is_blended_rather_than_ignored(self) -> None:
+        """A 3.75%-opacity grey over white reads as near-white, not as the grey."""
+        # This is Pico's striped-row colour. It is unreachable today --
+        # history.html uses role="grid", which Pico 2.1.1 does not stripe -- but
+        # adding class="striped" is a one-attribute change, and reading it as
+        # opaque would report a passing ratio as ~1.1:1.
+        stripe = "rgba(111, 120, 135, 0.0375)"
+        flattened = _flatten([stripe, _PICO_SURFACE["light"]])
+        assert _relative_luminance(flattened) > 0.9
+        # The same colour read as opaque, which is what the bug did.
+        assert _relative_luminance(stripe) < 0.3
+
+    def test_a_colour_the_parser_cannot_read_is_named(self) -> None:
+        """An unreadable colour asserts with the string, not a slice ValueError."""
+        with pytest.raises(AssertionError, match=r"color\(srgb"):
+            _relative_luminance("color(srgb 1 1 1)")
 
 
 @pytest.mark.browser
@@ -649,7 +724,7 @@ class TestDarkModeEngagement:
             _PROBE_CONTEXT_CONTRAST, {"cls": cls, "context": placement}
         )
         colour = probe["colour"]
-        background = probe["background"]
+        background = _flatten(probe["backgroundStack"])
         ratio = _contrast_ratio(colour, background)
         assert ratio >= 4.5, (colour, background, ratio)
         if cls == "status-fallback":
