@@ -135,6 +135,10 @@ def browser_server(
 
     server.should_exit = True
     thread.join(timeout=5)
+    # join() reports nothing on timeout. A uvicorn thread that fails to stop
+    # leaves a bound port and a live app behind for the rest of the session,
+    # so the outcome is asserted rather than discarded.
+    assert not thread.is_alive(), "uvicorn test server did not shut down"
 
 
 @pytest.fixture(scope="session")
