@@ -476,9 +476,16 @@ class TestFallbackStatusRendering:
         try:
             yield page
         finally:
-            # The server is session-scoped, so a job left as "current" would
-            # follow every later test onto the idle page.
+            # The server and its store are both session-scoped, so the teardown
+            # has to undo both halves. Clearing the pointer alone did not:
+            # index() and current_job_status() each fall back to
+            # list_recent(limit=1) when there is no current job, and the most
+            # recent job was the one this fixture had just created. The FALLBACK
+            # page therefore followed every later test onto what was supposed to
+            # be the idle page, and the jobs accumulated across the session.
+            # Deleting the row is what actually restores the idle state.
             app.state.worker._current_job_id = None
+            job_store.delete_job(job.id)
 
     def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
         """Load the page under an emulated OS colour-scheme preference."""
@@ -592,7 +599,11 @@ class TestDarkModeEngagement:
         """Load the idle page under an emulated OS colour-scheme preference."""
         page.emulate_media(color_scheme=scheme)
         page.goto(url)
-        # The idle page renders no status line, so wait for the history table.
+        # The idle page renders "Ready to scan." and no .status-* line, so there
+        # is nothing status-shaped to wait for -- wait for the history table
+        # instead. This is true only because fallback_page deletes its job on
+        # teardown; while that row survived, every test in this class was in
+        # fact looking at a FALLBACK page.
         page.wait_for_selector("#history-body")
 
     @pytest.mark.parametrize("scheme", ["light", "dark"])

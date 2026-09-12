@@ -557,6 +557,35 @@ def test_prune_no_deletions() -> None:
         store.close()
 
 
+def test_delete_job_removes_only_the_named_row() -> None:
+    """delete_job removes the job it names and leaves every other row alone."""
+    store = JobStore()
+    try:
+        doomed = store.create_job(profile="default", title="Doomed")
+        kept = store.create_job(profile="default", title="Kept")
+
+        assert store.delete_job(doomed.id) is True
+
+        assert store.get_job(doomed.id) is None
+        remaining = store.list_recent()
+        assert [job.title for job in remaining] == ["Kept"]
+        assert remaining[0].id == kept.id
+    finally:
+        store.close()
+
+
+def test_delete_job_reports_a_missing_id() -> None:
+    """delete_job returns False for an unknown id rather than raising."""
+    store = JobStore()
+    try:
+        store.create_job(profile="default", title="Untouched")
+
+        assert store.delete_job("no-such-job") is False
+        assert len(store.list_recent()) == 1
+    finally:
+        store.close()
+
+
 class TestErrorCategory:
     """ErrorCategory enum and JobStore integration tests."""
 
