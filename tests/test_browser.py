@@ -41,13 +41,14 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.job import JobResult
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
     ScannerBackend,
     ScanSettings,
 )
-from saneless.vocabulary import JobState
+from saneless.vocabulary import JobState, ScanOutcome
 from saneless.web.app import create_app
 
 # Every palette value these tests assert against, in one place. All of them are
@@ -448,14 +449,29 @@ class TestFallbackStatusRendering:
         app = browser_server.app
         job_store: JobStore = app.state.job_store
         job = job_store.create_job(profile="default", title="Fallback Doc")
-        job_store.update_state(job.id, JobState.FALLBACK)
-        # No warning writer lands until plan 23-07; the column is written
-        # directly so the inline warning paragraph has something to render.
-        with job_store._conn:
-            job_store._conn.execute(
-                "UPDATE jobs SET warning = ? WHERE id = ?",
-                ("Title, tags and correspondent were not applied.", job.id),
-            )
+        # finish_job is the public writer for the warning column, and the worker
+        # already reaches FALLBACK through it. This used to UPDATE the column
+        # through job_store._conn, on a comment saying no warning writer landed
+        # until plan 23-07 -- which it since has.
+        #
+        # The workaround was also unsafe by the store's own rules: every public
+        # writer is wrapped in @_locked because the web and worker threads share
+        # one connection opened with check_same_thread=False, and sqlite3
+        # connection context managers do not nest -- an inner `with conn:`
+        # commits the outer transaction. Opening one from the test thread while
+        # holding no lock could commit another thread's in-flight work. Benign
+        # only because no scan runs during a browser test.
+        job_store.finish_job(
+            job.id,
+            JobState.FALLBACK,
+            result=JobResult(
+                outcome=ScanOutcome.FALLBACK,
+                warning="Title, tags and correspondent were not applied.",
+                pages_scanned=1,
+                pages_removed=0,
+                pages_uploaded=0,
+            ),
+        )
         app.state.worker._current_job_id = job.id
         try:
             yield page
