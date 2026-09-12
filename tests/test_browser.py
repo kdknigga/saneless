@@ -5,6 +5,14 @@ These tests verify that PicoCSS styling, HTMX interactions, and UI
 components render correctly in a real browser. They use a session-scoped
 uvicorn server with a stub scanner for isolation from real hardware.
 
+PicoCSS and htmx are loaded from cdn.jsdelivr.net by ``base.html``, so every
+colour assertion below quietly depends on that CDN being reachable during the
+run. An unreachable CDN does not announce itself: the contrast checks report
+unstyled black-on-white ratios and the amber checks report a colour mismatch,
+both of which read like a palette regression. If a run fails that way in bulk,
+read ``test_pico_css_applied`` first -- it is the load canary, and it is the one
+that says so in plain words.
+
 Requires: pytest-playwright, chromium browser (uv run playwright install chromium)
 """
 
@@ -157,16 +165,26 @@ class TestBrowserRendering:
         assert "saneless" in page.title().lower()
 
     def test_pico_css_applied(self, page: Page, browser_server_url: str) -> None:
-        """PicoCSS styles are loaded and applied to semantic elements."""
+        """PicoCSS is loaded: <main> is capped and centred by Pico's container."""
         page.goto(browser_server_url)
-        # PicoCSS styles <main> with max-width and margin
         main = page.locator("main")
         assert main.count() >= 1
-        # Check that PicoCSS has loaded by verifying computed style
         box = main.first.bounding_box()
         assert box is not None
-        # PicoCSS centers main content -- left margin should be > 0 on wide
-        # viewports (default 1280px, PicoCSS max-width ~1200px)
+        viewport = page.viewport_size
+        assert viewport is not None
+        # bounding_box() returns a box for any rendered element, styled or not,
+        # so its existence proves nothing. Neither does "x > 0": measured with
+        # the CDN blocked, <main> is full-bleed inside <body>'s default 8px
+        # margin -- x=8, width=1264 at a 1280px viewport -- so a bare x > 0
+        # passes unstyled as well. Pico's .container caps the width and centres
+        # what is left (x=40, width=1200), so it is the *cap* that tells the two
+        # states apart. Both numbers were measured against a blocked CDN.
+        assert box["width"] <= viewport["width"] - 64, (
+            f"PicoCSS did not load (main spans {box['width']}px of a "
+            f"{viewport['width']}px viewport; Pico would cap it well below that)"
+        )
+        assert box["x"] >= 16, f"PicoCSS did not load (main at x={box['x']})"
 
     def test_scan_form_elements_present(
         self, page: Page, browser_server_url: str
