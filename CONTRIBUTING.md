@@ -38,6 +38,18 @@ The last command installs three hooks, `pre-commit`, `pre-merge-commit` and
 to install when `core.hooksPath` is set locally, which is the case in a clone that
 shares its hooks with its git worktrees.
 
+**If you installed the hooks before `pre-merge-commit` and `pre-push` were added to
+`default_install_hook_types`, re-run that install command.** `prek install` writes
+the shims that exist when it runs; adding a hook type to the config afterwards does
+not reach back into a clone that already has one. Such a checkout still gets the
+commit-stage `src/` checks, but nothing at merge or push, and nothing tells you the
+other two stages exist. To confirm, list the hook directory -- all three names
+should be there:
+
+```bash
+ls "$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
+```
+
 To add a dependency, use `uv add <package>` (or `uv add --dev <package>`) and commit
 the resulting `uv.lock` change alongside the `pyproject.toml` change.
 
