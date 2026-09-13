@@ -104,6 +104,11 @@ class MockSaneDev:
         """Record that close was called."""
         self._close_called = True
 
+    @property
+    def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The scan area, read-only, as python-sane reports it."""
+        return ((self.tl_x, self.tl_y), (self.br_x, self.br_y))
+
     def get_options(self) -> list[tuple]:
         """
         Return sample SANE option tuples, or _options_impl if set.
@@ -235,6 +240,11 @@ class _FakeSaneDevice:
     def close(self) -> None:
         """Delegate to pluggable close function."""
         self._close_fn()
+
+    @property
+    def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The scan area, read-only, as python-sane reports it."""
+        return ((self.tl_x, self.tl_y), (self.br_x, self.br_y))
 
 
 class MockBackend(ScannerBackend):
@@ -1825,6 +1835,104 @@ class TestGeometryUnit:
         assert pages[0].size == _A4_AT_300_DPI
 
 
+class TestClampedScanArea:
+    """
+    A scan area the device quietly shrank is caught on read-back (D-19).
+
+    Measured against the real ``test`` backend: writing A4's 210 mm to a device
+    whose ``br-x`` range is ``(0.0, 200.0, 1.0)`` yields 200.0, with no error
+    and no ``INFO_INEXACT`` the caller can see.  ``_set_geometry`` could
+    therefore return True having set an area that is not the one requested --
+    the same silent-substitution shape M-16 cures for DPI, and the page comes
+    out quietly wrong.
+    """
+
+    def test_a_clamped_area_falls_through_to_the_crop(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 200 mm device asked for A4 warns with both values and crops."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 200.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        # The warning has to name what was asked for AND what was got, or the
+        # operator cannot tell which of the two is wrong.
+        assert [m for m in _warning_messages(caplog) if "210" in m and "200" in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+    def test_a_comfortable_range_is_not_reported_as_clamped(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A device that honours the area sets it and does not crop as well."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert not [m for m in _warning_messages(caplog) if "clamped" in m.lower()]
+        assert pages[0].size == (3000, 4000)
+
+    def test_a_fixed_point_round_trip_is_within_tolerance(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A near-equal read-back must not trigger the fallback.
+
+        Letter's 215.9 mm is not representable in SANE's 16.16 fixed point, so
+        it reads back inexact on a device that clamped nothing.  Comparing for
+        equality would send this perfectly good scan down the crop path.
+        """
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="letter"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        # The round trip really is inexact -- this is what makes the tolerance
+        # load-bearing rather than decorative.
+        assert dev.br_x != 215.9
+        assert dev.br_x == pytest.approx(215.9, abs=1e-4)
+        assert not [m for m in _warning_messages(caplog) if "clamped" in m.lower()]
+        assert pages[0].size == (3000, 4000)
+
+    def test_the_crop_uses_the_resolution_the_device_chose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A clamped dpi must not yield a crop box computed at the requested dpi.
+
+        The crop arithmetic and the device's actual sampling have to agree, or
+        a clamped resolution produces M-16's cut-off page even when the
+        fallback runs correctly.
+        """
+        dev = _geometry_less_device()
+        # Selecting the source reloads the descriptors and reveals a 75 dpi
+        # ceiling, so the 300 requested is clamped to 75.
+        dev.narrow_resolution_for_source("Flatbed", (1.0, 75.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        pages = list(backend.scan_pages("test:0", settings))
+
+        # A4 at the 75 dpi the device settled on, not at the 300 asked for,
+        # which would have been 2480x3507.
+        assert pages[0].size == (620, 876)
+
+
 # ---------------------------------------------------------------------------
 # D-17: the shared fake and the measured python-sane contract
 # ---------------------------------------------------------------------------
@@ -2029,6 +2137,20 @@ class TestFakeSaneContract:
         dev = FakeSaneDev()
         dev.resolution = requested
         assert dev.resolution == expected
+
+    def test_a_fixed_point_value_cannot_be_stored_exactly(self) -> None:
+        """
+        SANE_Fixed is 16.16, so letter's 215.9 mm is not representable.
+
+        The value comes back differing in the low bits without the device
+        having clamped anything, which is why D-19 uses a tolerance.
+        """
+        dev = FakeSaneDev()
+
+        dev.br_x = 215.9
+
+        assert dev.br_x != 215.9
+        assert dev.br_x == pytest.approx(215.9, abs=1e-4)
 
     def test_area_reflects_the_geometry_clamp(self) -> None:
         """An A4 box against a 200mm device clamps, exactly as measured."""
