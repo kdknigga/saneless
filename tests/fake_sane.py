@@ -70,6 +70,7 @@ _TYPE_GROUP = 5
 
 # SANE units.  There is no UNIT_CM and no UNIT_INCH.
 _UNIT_NONE = 0
+_UNIT_PIXEL = 1
 _UNIT_MM = 3
 _UNIT_DPI = 4
 
@@ -254,6 +255,7 @@ def _build_option_table(
 def build_option_table(
     *,
     geometry_range: tuple[float, float, float] = _DEFAULT_GEOMETRY_RANGE,
+    geometry_unit: int = _UNIT_MM,
     omit: tuple[str, ...] = (),
     geometry_settable: bool = True,
 ) -> list[tuple]:
@@ -271,9 +273,17 @@ def build_option_table(
     only way to reproduce the condition that makes the crop fallback
     reachable.
 
+    ``geometry_unit`` exists for D-10.  The unit lives at index 5 of the option
+    tuple, and a backend is free to report its scan area in something other
+    than millimetres, which the geometry arithmetic has to scale by rather than
+    assume away (N-03).
+
     Args:
         geometry_range: The ``(min, max, step)`` constraint shared by the four
             geometry options.
+        geometry_unit: The SANE unit code the geometry options report at index
+            5.  Defaults to ``UNIT_MM``, which is what real hardware was
+            measured reporting.
         omit: Hyphenated option names to leave out of the table entirely, as a
             device lacking them would report it.
         geometry_settable: When False the geometry options are still reported
@@ -286,7 +296,9 @@ def build_option_table(
     """
     cap = _CAP_SETTABLE if geometry_settable else _CAP_NOT_SETTABLE
     return [
-        (*option[:7], cap, option[8]) if option[1] in _GEOMETRY_NAMES else option
+        (*option[:5], geometry_unit, option[6], cap, option[8])
+        if option[1] in _GEOMETRY_NAMES
+        else option
         for option in _build_option_table(geometry_range=geometry_range)
         if option[1] not in omit
     ]
