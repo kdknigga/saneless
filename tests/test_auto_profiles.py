@@ -82,9 +82,10 @@ class TestSourceToSlug:
         This case used to assert classify_source's branch order *through*
         source_to_slug: the slug was picked from the returned SourceKind, and
         because duplex is tested before flatbed (scanner/base.py) this name
-        slugged "adf-duplex" rather than "flatbed-scan". D-14 severed that
-        coupling -- the slug is now the device's own wording, so this case can
-        no longer witness the precedence. It is re-pointed rather than deleted
+        took the duplex kind's hard-coded name rather than the flatbed kind's.
+        D-14 severed that coupling -- the slug is now the device's own wording,
+        so this case can no longer witness the precedence. It is re-pointed
+        rather than deleted
         so the change of meaning is recorded; the classifier's branch order is
         asserted directly against classify_source in the scanner tests.
         """

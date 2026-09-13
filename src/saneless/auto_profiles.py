@@ -8,13 +8,13 @@ generation logic uses pure functions for easy testing.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, assert_never, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import tomlkit
 
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
-from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
     from saneless.scanner.base import DeviceCapabilities
@@ -30,56 +30,69 @@ __all__ = [
 ]
 
 
-def _slugify(lower: str) -> str:
+# The slug for a name of which _slugify's character set keeps nothing -- a
+# whitespace-only or wholly punctuation source name. "source" is the domain's
+# own word, so it cannot be mistaken for a device's wording, and it leaves the
+# collision tie-break free to turn a second degenerate name into "source-2"
+# rather than dropping it.
+_EMPTY_SLUG_FALLBACK = "source"
+
+
+def _slugify(source: str) -> str:
     """
-    Slugify an already-lowercased source name.
+    Reduce a source name to a strict ``[a-z0-9-]`` slug.
+
+    The character set is the contract: the result holds only lowercase ASCII
+    letters, digits and hyphens, with no leading, trailing or doubled hyphen.
+    The rule, in order -- lowercase the name; replace every run of characters
+    outside ``[a-z0-9]`` with a single hyphen; strip leading and trailing
+    hyphens; fall back to ``_EMPTY_SLUG_FALLBACK`` when nothing survives.
+
+    Lowercasing happens here rather than in the caller so no caller can pass a
+    half-normalised string and get a slug that silently breaks the contract.
+
+    This is deliberately NOT the PDF filename sanitiser, and the two must not
+    be merged: Phase 23's D-19 separated them because this one passed "/" and
+    ".." straight through. D-15 fixes that character-set weakness here; it does
+    not make this function safe to reuse for filesystem paths.
 
     Args:
-        lower: Lowercased SANE source name.
+        source: SANE source name, in whatever case the device reported it.
 
     Returns:
-        The name with spaces and underscores replaced by hyphens.
+        A slug matching ``^[a-z0-9][a-z0-9-]*$``.
 
     """
-    return lower.replace(" ", "-").replace("_", "-")
+    slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    return slug or _EMPTY_SLUG_FALLBACK
 
 
 def source_to_slug(source: str) -> str:
     """
     Convert a SANE source name to a profile slug.
 
-    Dispatches on ``classify_source`` -- the codebase's single
-    source-classification rule -- and turns the resulting SourceKind into a
-    descriptive, URL-safe slug, falling back to a basic slugification for
-    source names that match no rule.
+    Every source is named from the device's own wording (D-14). This function
+    used to map each SourceKind onto one of four hard-coded friendly names,
+    which forced a special case for "ADF Back". The reason is worth keeping:
+    "which scan path do I take?" and "what do I name this profile?" are
+    different questions with different equivalence classes. "ADF Front" and "ADF Back" are both feeders
+    for routing, so naming them from the kind collapsed two distinct sources
+    onto one profile and silently lost one (the N-09 defect). Naming from the
+    source itself removes the naming question's need for a rule at all, so no
+    source can be named after another source's kind.
+
+    Two *different* names can still normalise alike ("ADF-Front" and
+    "ADF Front"). That residue is resolved where profiles are assembled, with a
+    deterministic tie-break -- not here, so this function stays pure.
 
     Args:
         source: SANE source name string (e.g., "Flatbed", "ADF Duplex").
 
     Returns:
-        A lowercase hyphenated slug string.
+        A lowercase slug matching ``^[a-z0-9][a-z0-9-]*$``.
 
     """
-    lower = source.lower()
-    match classify_source(source):
-        case SourceKind.AUTO:
-            slug = "auto-scan"
-        case SourceKind.FLATBED:
-            slug = "flatbed-scan"
-        case SourceKind.FEEDER_DUPLEX:
-            slug = "adf-duplex"
-        case SourceKind.FEEDER:
-            # Not a thin passthrough: "ADF Back" classifies as FEEDER because
-            # it IS a feeder for routing purposes, but it must not slug to
-            # "adf-simplex" or it collides with "ADF Front" (the N-09 defect).
-            # "Which scan path do I take?" and "what do I name this profile?"
-            # are different questions with different equivalence classes.
-            slug = _slugify(lower) if "back" in lower else "adf-simplex"
-        case SourceKind.UNKNOWN:
-            slug = _slugify(lower)
-        case unhandled:
-            assert_never(unhandled)
-    return slug
+    return _slugify(source)
 
 
 def pick_closest_resolution(
