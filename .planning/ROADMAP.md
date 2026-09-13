@@ -36,7 +36,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 22: Job Store Hardening** - `RLock` on every method, `PRAGMA user_version` migration ladder, and every result column added in one migration (completed 2026-09-10)
 - [x] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI (completed 2026-09-11)
 - [x] **Phase 23.1: Dark Mode and the Commit Gate** (INSERTED) - The dark palette actually engages, every status colour passes AA in both schemes, and a TDD RED commit is possible without suppressing a gate (completed 2026-09-11)
-- [ ] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane
+- [x] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane (completed 2026-09-13)
 - [ ] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass
 - [ ] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets
 - [ ] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible
@@ -249,7 +249,7 @@ Plans:
 
 **Wave 7** *(blocked on 24-02 and 24-07)*
 
-- [ ] 24-08-PLAN.md — one `_constraint()` helper, `resolution_range` honoured by auto-profiles and the CLI, the three legacy SANE doubles deleted (D-13, D-17 completion)
+- [x] 24-08-PLAN.md — one `_constraint()` helper, `resolution_range` honoured by auto-profiles and the CLI, the three legacy SANE doubles deleted (D-13, D-17 completion)
 
 Waves: 1 = {24-01, 24-02} · 2 = {24-03} · 3 = {24-04} · 4 = {24-05} · 5 = {24-06} · 6 = {24-07} · 7 = {24-08}
 
@@ -398,7 +398,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
-| 24. Scanner Truthfulness | 7/8 | In Progress|  |
+| 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 0/? | Not started | - |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
