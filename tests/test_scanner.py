@@ -691,26 +691,13 @@ class TestSaneBackendDuplex:
 class TestSaneBackendEmptyFeeder:
     """Empty ADF feeder detection tests."""
 
-    def test_empty_feeder_out_of_documents_error(
-        self, mock_sane_module: MockSaneModule
-    ) -> None:
-        """Multi_scan first iteration error with 'out of documents' raises FeederEmptyError."""
-
-        def _raising_multi_scan() -> Iterator[Image.Image]:
-            msg = "out of documents"
-            raise RuntimeError(msg)
-
-        object.__setattr__(
-            mock_sane_module,
-            "_mock_dev",
-            _FakeSaneDevice(multi_scan=_raising_multi_scan),
-        )
-
-        backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
-
-        with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
-            list(backend.scan_pages("test:device:001", settings))
+    # ``test_empty_feeder_out_of_documents_error`` was deleted here by D-03.
+    # It drove ``multi_scan()`` itself into raising and asserted the result was
+    # FeederEmptyError, but the real method is a one-line
+    # ``return _SaneIterator(self)`` that cannot raise, so it pinned the
+    # behaviour of provably unreachable code.  A fault arriving from the
+    # iterator is now covered honestly by TestAdfPageErrorsAreTruthful, and the
+    # zero-page path it nominally tested is covered below.
 
     def test_empty_feeder_stop_iteration(
         self, mock_sane_module: MockSaneModule
@@ -1083,7 +1070,9 @@ class TestSaneBackendADFCleanup:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
 
-        with pytest.raises(RuntimeError, match="hardware error"):
+        # D-03: a fault after the first page is translated to ScanError
+        # carrying the device's own text, rather than propagating raw.
+        with pytest.raises(ScanError, match="hardware error"):
             list(backend.scan_pages("test:device:001", settings))
 
         assert "cancel" in operations
