@@ -889,11 +889,28 @@ class FakeSaneDev:
 
     @property
     def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
-        """The scan area, reflecting whatever clamping the device applied."""
-        values = self._values
+        """
+        The scan area, reflecting whatever clamping the device applied.
+
+        Composed from attribute reads, exactly as ``sane.py:220`` does, so a
+        device whose option table omits the geometry options raises
+        ``AttributeError("No such attribute: tl_x")``.  Reading ``_values``
+        directly raised ``KeyError`` instead -- an exception the real library
+        never raises here, and precisely the species of quiet divergence this
+        module exists to eliminate.  No production path reaches it today,
+        because ``_set_geometry`` checks presence before reading ``area``, but
+        that ordering is a property of today's code rather than a guarantee.
+
+        Returns:
+            The ``((tl_x, tl_y), (br_x, br_y))`` box.
+
+        Raises:
+            AttributeError: If the device does not report the geometry options.
+
+        """
         return (
-            (float(values["tl_x"]), float(values["tl_y"])),
-            (float(values["br_x"]), float(values["br_y"])),
+            (self.tl_x, self.tl_y),
+            (self.br_x, self.br_y),
         )
 
     @property
