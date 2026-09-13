@@ -125,12 +125,46 @@ class DeviceInfo:
 
 @dataclass
 class DeviceCapabilities:
-    """Available options and constraints reported by a scanner device."""
+    """
+    Available options and constraints reported by a scanner device.
+
+    ``resolutions`` and ``resolution_range`` are two different facts, not two
+    spellings of one. A SANE device constrains its resolution option with
+    *either* a word list *or* a ``(min, max, step)`` range, never both, so at
+    most one of these two fields is ever populated and **neither is derived
+    from the other**. Expanding a range into a list of plausible DPIs would
+    print saneless's own invention rather than the device's answer, and
+    inferring a range from a word list would claim the device accepts every
+    value between the listed ones. Whichever shape the device actually gave is
+    the one that gets filled in; an option it leaves unconstrained fills
+    neither. The two therefore cannot disagree with each other.
+
+    The range keeps the ``float`` members the device reported -- measured
+    against the SANE ``test`` backend, ``(1.0, 1200.0, 1.0)``. Callers wanting
+    whole dpi coerce at the point of use rather than at the point of reading,
+    so nothing here quietly rounds off what the scanner said.
+
+    ``resolution_range`` is defaulted and sits with the other defaulted fields.
+    Moving it above ``raw_options`` would reorder the dataclass and break the
+    positional construction call sites across the suite rely on.
+
+    Attributes:
+        sources: The scan sources the device offers.
+        resolutions: The exact resolutions the device offers, when it
+            constrains the option with a word list. Empty otherwise.
+        modes: The scan modes the device offers.
+        raw_options: The device's option tuples, as ``get_options()`` returns
+            them.
+        resolution_range: The ``(min, max, step)`` the device reports, when it
+            constrains the option with a range. None otherwise.
+
+    """
 
     sources: list[str]
     resolutions: list[int]
     modes: list[str]
     raw_options: list[tuple] = field(default_factory=list)
+    resolution_range: tuple[float, float, float] | None = None
 
 
 @dataclass
