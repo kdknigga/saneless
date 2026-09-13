@@ -100,24 +100,76 @@ def source_to_slug(source: str) -> str:
     return _slugify(source)
 
 
+def _snap_into_range(target: int, resolution_range: tuple[float, float, float]) -> int:
+    """
+    Clamp a target into a reported range and snap it onto the range's step.
+
+    Clamping alone is not enough. A range says the device accepts values from
+    its minimum to its maximum *in increments of its step*, so a value inside
+    the span but off the grid is still one the device never offered, and SANE
+    would silently substitute something else for it.
+
+    A step of zero is not a defect to guard against but a documented SANE
+    meaning -- the range is continuous and any value within it is acceptable --
+    so it clamps without snapping rather than dividing by zero.
+
+    Args:
+        target: The preferred resolution, in dpi.
+        resolution_range: The ``(min, max, step)`` the device reported.
+
+    Returns:
+        A whole-dpi resolution the device could actually accept. The device
+        reports its bounds as floats; the coercion to int happens here, at the
+        point of use, rather than when the constraint was read.
+
+    """
+    low, high, step = resolution_range
+    clamped = min(max(float(target), low), high)
+    if step > 0:
+        # Snap relative to the minimum, which is where the grid starts.
+        clamped = min(max(low + round((clamped - low) / step) * step, low), high)
+    # round() on a float already yields an int, which is the coercion this
+    # function exists to perform.
+    return round(clamped)
+
+
 def pick_closest_resolution(
     resolutions: list[int],
     target: int = DEFAULT_RESOLUTION,
+    resolution_range: tuple[float, float, float] | None = None,
 ) -> int:
     """
-    Pick the resolution closest to target from available options.
+    Pick the resolution closest to target from what the device actually offers.
+
+    A device constrains its resolution option with *either* a word list *or* a
+    ``(min, max, step)`` range, so the two arguments are alternatives rather
+    than two spellings of one fact. A word list is an exhaustive enumeration and
+    wins when present: ``min(..., key=absolute difference)`` is already exactly
+    right for it.
+
+    The range branch is what closes N-01. This function used to return the
+    target unchanged whenever the list was empty -- which is precisely what a
+    range-reporting device produces -- so such a device was asked for 300 dpi
+    regardless of what it supported, and a device whose ceiling sat below 300
+    got a resolution it had never advertised.
 
     Args:
-        resolutions: Available resolution values from scanner.
+        resolutions: The exact resolutions the device offers, when it reported
+            a word list.
         target: Preferred resolution (defaults to DEFAULT_RESOLUTION DPI).
+        resolution_range: The ``(min, max, step)`` the device reported, when it
+            constrained the option with a range instead.
 
     Returns:
-        The closest available resolution, or target if list is empty.
+        A resolution the device could accept, or target if the device
+        constrained the option in neither way.
 
     """
-    if not resolutions:
-        return target
-    return min(resolutions, key=lambda r: abs(r - target))
+    if resolutions:
+        return min(resolutions, key=lambda r: abs(r - target))
+    if resolution_range is not None:
+        return _snap_into_range(target, resolution_range)
+    return target
 
 
 def pick_preferred_mode(
@@ -241,7 +293,9 @@ def generate_profiles(
     """
     profiles: dict[str, ProfileConfig] = {}
     resolution = pick_closest_resolution(
-        capabilities.resolutions, target=DEFAULT_RESOLUTION
+        capabilities.resolutions,
+        target=DEFAULT_RESOLUTION,
+        resolution_range=capabilities.resolution_range,
     )
     mode = pick_preferred_mode(capabilities.modes, preferred="Color")
     has_flatbed = any(

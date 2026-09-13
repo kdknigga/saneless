@@ -13,6 +13,7 @@ import shutil
 import socket
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 import uvicorn
@@ -31,6 +32,9 @@ from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
 from .vocabulary import JobState, progress_label, state_label
 from .web.app import create_app
+
+if TYPE_CHECKING:
+    from .scanner.base import DeviceCapabilities
 
 __all__ = ["_truncate", "cli"]
 
@@ -152,6 +156,43 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         paperless.close()
 
 
+def _echo_capabilities(caps: DeviceCapabilities) -> None:
+    """
+    Print one device's capabilities, naming only what that device reported.
+
+    Extracted from ``devices`` so that rendering the resolution constraint in
+    whichever shape the device gave it does not push that command past ruff's
+    PLR0912 branch limit. The limit is respected rather than raised, and
+    nothing is suppressed.
+
+    Every line is printed only when there is something to put after its label.
+    A label followed by nothing is the symptom the operator actually saw on a
+    range-reporting device (N-01): it reads as "this scanner offers none",
+    when the truth was that saneless had not read what the scanner offered.
+
+    Args:
+        caps: The capabilities to render.
+
+    """
+    if caps.sources:
+        click.echo(f"  Sources: {', '.join(caps.sources)}")
+    if caps.resolutions:
+        click.echo(f"  Resolutions: {', '.join(str(r) for r in caps.resolutions)}")
+    elif caps.resolution_range is not None:
+        # The device gave a span rather than an enumeration, so it is shown as
+        # a span. Expanding it into a list of plausible values would print
+        # saneless's own invention rather than the device's answer.
+        low, high, step = caps.resolution_range
+        click.echo(f"  Resolution range: {low:g} to {high:g} dpi in steps of {step:g}")
+    if caps.modes:
+        click.echo(f"  Modes: {', '.join(caps.modes)}")
+    if caps.raw_options:
+        click.echo("  Raw options:")
+        for opt in caps.raw_options:
+            if len(opt) >= 2:
+                click.echo(f"    {opt[1]}")
+
+
 @cli.command()
 @click.option(
     "--json",
@@ -162,7 +203,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
 @click.option(
     "--capabilities",
     is_flag=True,
-    help="Show raw SANE options.",
+    help="Show sources, modes, resolution support and raw SANE option names.",
 )
 @click.pass_context
 def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
@@ -213,14 +254,7 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
         for d in device_list:
             caps = scanner.get_capabilities(d.name)
             click.echo(f"Capabilities for {d.name}:")
-            click.echo(f"  Sources: {', '.join(caps.sources)}")
-            click.echo(f"  Resolutions: {', '.join(str(r) for r in caps.resolutions)}")
-            click.echo(f"  Modes: {', '.join(caps.modes)}")
-            if caps.raw_options:
-                click.echo("  Raw options:")
-                for opt in caps.raw_options:
-                    if len(opt) >= 2:
-                        click.echo(f"    {opt[1]}")
+            _echo_capabilities(caps)
 
 
 @cli.command()
