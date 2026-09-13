@@ -5,13 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
-import threading
 import time
-from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
-
-if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
 
 import pytest
 from PIL import Image, ImageDraw
@@ -57,196 +51,17 @@ def _make_content_image(
     return img
 
 
-class MockSaneDev:
-    """Mock SANE device returned by sane.open()."""
-
-    def __init__(self) -> None:
-        """Initialize mock device with default settings."""
-        self.mode = "color"
-        self.resolution: float = 300.0
-        self.source = "Flatbed"
-        self.tl_x: float = 0.0
-        self.tl_y: float = 0.0
-        self.br_x: float = 0.0
-        self.br_y: float = 0.0
-        self._cancel_called = False
-        self._close_called = False
-        self._snap_calls: list[dict] = []
-        # Default ADF pages: 3 content images that pass validation
-        self._multi_scan_pages: list[Image.Image] = [
-            _make_content_image(color="red"),
-            _make_content_image(color="green"),
-            _make_content_image(color="blue"),
-        ]
-        self._multi_scan_error: BaseException | None = None
-        self._snap_impl: MagicMock | None = None
-        self._options_impl: list[tuple] | None = None
-
-    def start(self) -> None:
-        """Initiate SANE scan cycle (no-op in mock)."""
-
-    def snap(self) -> Image.Image:
-        """Return a simple test image, or delegate to _snap_impl if set."""
-        if self._snap_impl is not None:
-            return self._snap_impl()
-        self._snap_calls.append({})
-        return Image.new("RGB", (100, 100), "white")
-
-    def multi_scan(self) -> Iterator[Image.Image]:
-        """Return an iterator over ADF pages."""
-        if self._multi_scan_error is not None:
-            raise self._multi_scan_error
-        return iter(self._multi_scan_pages)
-
-    def cancel(self) -> None:
-        """Record that cancel was called."""
-        self._cancel_called = True
-
-    def close(self) -> None:
-        """Record that close was called."""
-        self._close_called = True
-
-    @property
-    def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
-        """The scan area, read-only, as python-sane reports it."""
-        return ((self.tl_x, self.tl_y), (self.br_x, self.br_y))
-
-    def get_options(self) -> list[tuple]:
-        """
-        Return sample SANE option tuples, or _options_impl if set.
-
-        SANE option format:
-        (index, name, title, desc, type, unit, size, cap, constraint)
-        """
-        if self._options_impl is not None:
-            return self._options_impl
-        return [
-            (
-                1,
-                "source",
-                "Scan source",
-                "Source desc",
-                3,
-                0,
-                1,
-                5,
-                ["Flatbed", "ADF", "ADF Duplex"],
-            ),
-            (
-                2,
-                "resolution",
-                "Resolution",
-                "Res desc",
-                1,
-                4,
-                1,
-                5,
-                [75, 150, 300, 600],
-            ),
-            (
-                3,
-                "mode",
-                "Scan mode",
-                "Mode desc",
-                3,
-                0,
-                1,
-                5,
-                ["color", "gray", "lineart"],
-            ),
-            # The four geometry options, hyphenated and reporting UNIT_MM (3),
-            # as a real device does.  D-09 writes geometry only on a device
-            # whose option list mentions them, so a mock that means to exercise
-            # the geometry path has to report them.
-            *(
-                (index, name, title, "Scan area bound", 2, 3, 4, 5, (0.0, 300.0, 1.0))
-                for index, (name, title) in enumerate(
-                    (
-                        ("tl-x", "Top-left x"),
-                        ("tl-y", "Top-left y"),
-                        ("br-x", "Bottom-right x"),
-                        ("br-y", "Bottom-right y"),
-                    ),
-                    start=4,
-                )
-            ),
-        ]
-
-
-class MockSaneModule:
-    """Mock for the ``sane`` module (python-sane)."""
-
-    def __init__(self) -> None:
-        """Initialize mock module with default devices."""
-        self.init_call_count = 0
-        self._devices: list[tuple[str, str, str, str]] = [
-            ("test:device:001", "TestVendor", "TestModel", "scanner"),
-        ]
-        self._mock_dev = MockSaneDev()
-
-    def init(self) -> tuple[int, int, int]:
-        """Simulate sane.init() and track call count."""
-        self.init_call_count += 1
-        return (1, 0, 3)
-
-    def get_devices(self) -> list[tuple[str, str, str, str]]:
-        """Return the list of mock devices."""
-        return self._devices
-
-    def open(self, _device_id: str) -> MockSaneDev:
-        """Return the shared mock device handle."""
-        return self._mock_dev
-
-
-class _FakeSaneDevice:
-    """Fake SANE device for testing scan_pages behavior."""
-
-    def __init__(
-        self,
-        *,
-        multi_scan: Callable[[], Iterator[Image.Image]] | None = None,
-        cancel: Callable[[], None] | None = None,
-        close: Callable[[], None] | None = None,
-    ) -> None:
-        """Initialize fake device with pluggable multi_scan, cancel, close."""
-        self.mode: str = "color"
-        self.resolution: float = 300.0
-        self.source: str = "Flatbed"
-        self.tl_x: float = 0.0
-        self.tl_y: float = 0.0
-        self.br_x: float = 0.0
-        self.br_y: float = 0.0
-        self._multi_scan_fn = multi_scan or (lambda: iter([]))
-        self._cancel_fn = cancel or (lambda: None)
-        self._close_fn = close or (lambda: None)
-
-    def get_options(self) -> list[tuple]:
-        """Return empty options list."""
-        return []
-
-    def start(self) -> None:
-        """Initiate SANE scan cycle (no-op in mock)."""
-
-    def snap(self) -> Image.Image:
-        """Return a test image."""
-        return Image.new("RGB", (100, 100), "white")
-
-    def multi_scan(self) -> Iterator[Image.Image]:
-        """Delegate to pluggable multi_scan function."""
-        return self._multi_scan_fn()
-
-    def cancel(self) -> None:
-        """Delegate to pluggable cancel function."""
-        self._cancel_fn()
-
-    def close(self) -> None:
-        """Delegate to pluggable close function."""
-        self._close_fn()
-
-    @property
-    def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
-        """The scan area, read-only, as python-sane reports it."""
-        return ((self.tl_x, self.tl_y), (self.br_x, self.br_y))
+# D-17 completed: MockSaneDev, MockSaneModule and _FakeSaneDevice used to live
+# here.  All three modelled a python-sane that does not exist -- most sharply
+# the geometry-less one, which RAISED on an unknown option name where the real
+# library stores it silently -- and each disagreement let a shipped defect earn
+# a green test (M-32).  There is now exactly one definition of what python-sane
+# does, in tests/fake_sane.py, and both this module and test_pipeline.py are
+# written against it.
+#
+# MockBackend below is deliberately NOT one of them: it implements the
+# ScannerBackend ABC, which is saneless's own interface, and models no part of
+# the sane module or a device handle.
 
 
 class MockBackend(ScannerBackend):
@@ -308,6 +123,9 @@ class TestScanSettings:
 
     def test_scan_settings_fields(self) -> None:
         """ScanSettings stores source, resolution, and mode."""
+        # Deliberately lowercase: this is a value-object test that reaches no
+        # device, so it is not subject to any device's mode constraint. It
+        # asserts only that the dataclass stores what it was handed.
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
         assert settings.source == "Flatbed"
         assert settings.resolution == 300
@@ -420,7 +238,7 @@ class TestMockBackend:
     def test_mock_backend_scan_pages(self) -> None:
         """MockBackend.scan_pages yields PIL Images."""
         backend = MockBackend()
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         pages = backend.scan_pages("mock:device", settings).pages
         assert len(pages) == 1
         assert isinstance(pages[0], Image.Image)
@@ -431,18 +249,55 @@ class TestMockBackend:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def mock_sane_module(monkeypatch: pytest.MonkeyPatch) -> MockSaneModule:
-    """Patch sane module into sane_backend's namespace."""
-    mock_sane = MockSaneModule()
-    monkeypatch.setattr(sane_backend_mod, "sane", mock_sane)
-    return mock_sane
+_TEST_DEVICE = "test:device:001"
+
+# The call sequence a three-sheet feeder produces, start to finish.
+#
+# The real ADF iterator calls start() then snap() ONCE PER SHEET, so "snap was
+# never called" does not distinguish the feeder path from the flatbed one --
+# that was an artefact of the deleted double, whose multi_scan() handed back
+# iter(list) and touched neither method. What actually distinguishes the feeder
+# is this repeated per-page probe, ending in one final start() that reports the
+# feeder empty. A flatbed scan is exactly ["start", "snap"], so comparing the
+# whole sequence tells the two paths apart without asserting a falsehood about
+# the library.
+_THREE_SHEET_FEEDER_CALLS = ["start", "snap"] * 3 + ["start"]
 
 
 @pytest.fixture
-def sane_backend(mock_sane_module: MockSaneModule) -> SaneBackend:
-    """Create a SaneBackend with mocked sane module."""
-    _ = mock_sane_module  # side-effect: patches the sane module
+def fake_sane_module(monkeypatch: pytest.MonkeyPatch) -> FakeSaneModule:
+    """
+    Patch the one shared fake into sane_backend's module-level ``sane`` name.
+
+    ``_ensure_sane()`` leaves that name None until first use, which is the seam
+    that makes the whole approach work; it is kept exactly as it was.
+
+    The device is asked to report ``"ADF"`` alongside the long feeder name so
+    the tests below can exercise both spellings. Both are real -- plenty of
+    scanners report the short form, and the SANE ``test`` backend reports the
+    long one -- and configuring it through the fake's own knob is what keeps
+    there being one definition of the device rather than two.
+    """
+    device = FakeSaneDev()
+    device.report_sources(["Flatbed", "ADF", "ADF Duplex", "Automatic Document Feeder"])
+    module = FakeSaneModule(
+        device=device,
+        devices=[(_TEST_DEVICE, "TestVendor", "TestModel", "scanner")],
+    )
+    monkeypatch.setattr(sane_backend_mod, "sane", module)
+    return module
+
+
+@pytest.fixture
+def fake_device(fake_sane_module: FakeSaneModule) -> FakeSaneDev:
+    """Return the one device handle the patched module hands out."""
+    return fake_sane_module.open(_TEST_DEVICE)
+
+
+@pytest.fixture
+def sane_backend(fake_sane_module: FakeSaneModule) -> SaneBackend:
+    """Create a SaneBackend over the shared fake."""
+    _ = fake_sane_module  # side-effect: patches the sane module
     return SaneBackend()
 
 
@@ -450,22 +305,22 @@ class TestSaneBackendInit:
     """SaneBackend initialization tests."""
 
     def test_sane_backend_init_calls_sane_init(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """SaneBackend constructor calls sane.init() exactly once."""
-        assert mock_sane_module.init_call_count == 0
+        assert fake_sane_module.init_call_count == 0
         SaneBackend()
-        assert mock_sane_module.init_call_count == 1
+        assert fake_sane_module.init_call_count == 1
 
     def test_sane_backend_init_calls_sane_init_exactly_once(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """A single SaneBackend instance only triggers one init call."""
         SaneBackend()
-        assert mock_sane_module.init_call_count == 1
+        assert fake_sane_module.init_call_count == 1
 
     def test_sane_backend_sets_sane_net_hosts(
-        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """SaneBackend(host='192.168.1.50') sets SANE_NET_HOSTS env var."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
@@ -473,7 +328,7 @@ class TestSaneBackendInit:
         assert os.environ["SANE_NET_HOSTS"] == "192.168.1.50"
 
     def test_sane_backend_does_not_override_existing_env(
-        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """SaneBackend does not override externally-set SANE_NET_HOSTS."""
         monkeypatch.setenv("SANE_NET_HOSTS", "external-host")
@@ -481,7 +336,7 @@ class TestSaneBackendInit:
         assert os.environ["SANE_NET_HOSTS"] == "external-host"
 
     def test_sane_backend_no_host_no_env_change(
-        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """SaneBackend() with no host does not set SANE_NET_HOSTS."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
@@ -489,7 +344,7 @@ class TestSaneBackendInit:
         assert "SANE_NET_HOSTS" not in os.environ
 
     def test_sane_backend_multi_host_colon_delimiter(
-        self, mock_sane_module: MockSaneModule, monkeypatch: pytest.MonkeyPatch
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """SaneBackend with colon-delimited hosts sets multi-host value."""
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
@@ -515,64 +370,61 @@ class TestSaneBackendScanPages:
     """SaneBackend scan page acquisition tests."""
 
     def test_sane_backend_scan_pages_opens_and_closes_device(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """scan_pages opens device, yields image, then closes device."""
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
         assert isinstance(pages[0], Image.Image)
-        mock_dev = mock_sane_module._mock_dev
-        assert mock_dev._close_called
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        assert mock_dev.close_calls
 
     def test_sane_backend_cancel_before_close(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """Device cancel() is called before close() on normal exit."""
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings)
-        mock_dev = mock_sane_module._mock_dev
-        assert mock_dev._cancel_called
-        assert mock_dev._close_called
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        assert mock_dev.cancel_calls
+        assert mock_dev.close_calls
 
     def test_sane_backend_cancel_before_close_on_error(
-        self, mock_sane_module: MockSaneModule
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Device cancel() and close() are called even when snap() raises."""
-        # Make snap raise an error
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(side_effect=RuntimeError("scan failed"))
+        """Device cancel() and close() are called even when the scan raises."""
+        # The fault is armed on the device rather than by swapping out its snap
+        # method: start() is where a flatbed scan first touches the hardware,
+        # and the fake raises from there with the library's own error type.
+        dev = FakeSaneDev(start_error=FakeSaneError("scan failed"))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        backend = SaneBackend()
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
+        with pytest.raises(FakeSaneError, match="scan failed"):
+            backend.scan_pages("test:0", settings)
 
-        with pytest.raises(RuntimeError, match="scan failed"):
-            backend.scan_pages("test:device:001", settings)
-
-        assert mock_dev._cancel_called
-        assert mock_dev._close_called
+        assert dev.cancel_calls
+        assert dev.close_calls
 
     def test_sane_backend_no_progress_callback(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """Verify snap() is called without progress argument (Pitfall #2)."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
 
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings)
 
         # snap() should be called with no arguments (no progress callback)
-        mock_dev._snap_impl.assert_called_once_with()
+        assert mock_dev.calls.count("snap") == 1
 
-    @pytest.mark.usefixtures("mock_sane_module")
+    @pytest.mark.usefixtures("fake_sane_module")
     def test_sane_backend_validates_source_option(self) -> None:
         """Requesting an unsupported source raises ScanError."""
         backend = SaneBackend()
         settings = ScanSettings(
-            source="NonExistentSource", resolution=300, mode="color"
+            source="NonExistentSource", resolution=300, mode="Color"
         )
 
         with pytest.raises(ScanError, match="NonExistentSource"):
@@ -583,16 +435,20 @@ class TestSaneBackendGetCapabilities:
     """SaneBackend capability query tests."""
 
     def test_sane_backend_get_capabilities(self, sane_backend: SaneBackend) -> None:
-        """get_capabilities returns parsed sources, resolutions, and modes."""
+        """get_capabilities reports the sources, modes and resolution support."""
         caps = sane_backend.get_capabilities("test:device:001")
         assert isinstance(caps, DeviceCapabilities)
         assert "Flatbed" in caps.sources
         assert "ADF" in caps.sources
         assert "ADF Duplex" in caps.sources
-        assert 300 in caps.resolutions
-        assert 600 in caps.resolutions
-        assert "color" in caps.modes
-        assert "gray" in caps.modes
+        assert "Color" in caps.modes
+        assert "Gray" in caps.modes
+        # The shared fake constrains resolution with a range, which is what the
+        # real SANE ``test`` backend does and what the deleted double did not.
+        # The word list stays empty because the device reported no word list --
+        # the two are different facts and neither is derived from the other.
+        assert caps.resolution_range == (1.0, 1200.0, 1.0)
+        assert caps.resolutions == []
         assert len(caps.raw_options) > 0
 
 
@@ -605,68 +461,45 @@ class TestSaneBackendADFScan:
     """ADF simplex scan tests."""
 
     def test_adf_scan_yields_all_pages(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """Verify ADF scan via multi_scan yields all 3 pages from the feeder."""
-        _ = mock_sane_module  # fixture provides mock device
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        _ = fake_sane_module  # fixture provides mock device
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 3
         for page in pages:
             assert isinstance(page, Image.Image)
 
     def test_adf_scan_uses_multi_scan_not_snap(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """ADF scan calls multi_scan(), not snap()."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
 
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings)
 
-        mock_dev._snap_impl.assert_not_called()
+        assert mock_dev.calls == _THREE_SHEET_FEEDER_CALLS
 
     def test_flatbed_still_uses_snap(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """Flatbed scan still uses snap(), not multi_scan()."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
 
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 1
-        mock_dev._snap_impl.assert_called_once_with()
+        assert mock_dev.calls.count("snap") == 1
 
 
 class TestSaneBackendAutomaticDocumentFeeder:
     """Routing for feeder names that contain no "adf" token (C-06 / D-11)."""
 
-    @staticmethod
-    def _options_with_feeder_source() -> list[tuple]:
-        """Return SANE options whose source constraint is the test backend's."""
-        return [
-            (
-                1,
-                "source",
-                "Scan source",
-                "Source desc",
-                3,
-                0,
-                1,
-                5,
-                ["Flatbed", "Automatic Document Feeder"],
-            ),
-        ]
-
     def test_automatic_document_feeder_yields_all_pages(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """
         Automatic Document Feeder uses multi_scan and returns every page (CTR-04).
@@ -680,50 +513,44 @@ class TestSaneBackendAutomaticDocumentFeeder:
         called. This is the C-06 fix and the phase's one authorised behaviour
         change (D-11); it could not have passed before Phase 21.
         """
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._options_impl = self._options_with_feeder_source()
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "Automatic Document Feeder"])
 
         settings = ScanSettings(
-            source="Automatic Document Feeder", resolution=300, mode="color"
+            source="Automatic Document Feeder", resolution=300, mode="Color"
         )
         pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 3
         for page in pages:
             assert isinstance(page, Image.Image)
-        mock_dev._snap_impl.assert_not_called()
+        assert mock_dev.calls == _THREE_SHEET_FEEDER_CALLS
 
 
 class TestSaneBackendDuplex:
     """ADF Duplex scan tests."""
 
     def test_duplex_scan_yields_pages(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """Verify ADF Duplex scan yields pages pre-interleaved from hardware."""
-        _ = mock_sane_module  # fixture provides mock device
-        settings = ScanSettings(source="ADF Duplex", resolution=300, mode="color")
+        _ = fake_sane_module  # fixture provides mock device
+        settings = ScanSettings(source="ADF Duplex", resolution=300, mode="Color")
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 3
         for page in pages:
             assert isinstance(page, Image.Image)
 
     def test_duplex_scan_uses_multi_scan(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """ADF Duplex uses multi_scan(), not snap()."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
 
-        settings = ScanSettings(source="ADF Duplex", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF Duplex", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings)
 
-        mock_dev._snap_impl.assert_not_called()
+        assert mock_dev.calls == _THREE_SHEET_FEEDER_CALLS
 
 
 class TestSaneBackendEmptyFeeder:
@@ -738,14 +565,14 @@ class TestSaneBackendEmptyFeeder:
     # zero-page path it nominally tested is covered below.
 
     def test_empty_feeder_stop_iteration(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """Multi_scan that yields zero pages raises FeederEmptyError."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = []
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
 
         with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
             backend.scan_pages("test:device:001", settings)
@@ -929,32 +756,32 @@ class TestSaneBackendPageValidation:
     """Inline page validation tests."""
 
     def test_zero_dimension_page_skipped(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """Page with zero dimensions is skipped with warning."""
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         zero_img = Image.new("RGB", (0, 0))
         normal_img = _make_content_image()
-        mock_dev._multi_scan_pages = [zero_img, normal_img]
+        mock_dev.load_feeder([zero_img, normal_img])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
 
-    def test_min_file_size_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
+    def test_min_file_size_page_skipped(self, fake_sane_module: FakeSaneModule) -> None:
         """Page below MIN_PAGE_BYTES (1x1 pixel) is skipped."""
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         tiny_img = Image.new("RGB", (1, 1), "red")
         normal_img = _make_content_image()
-        mock_dev._multi_scan_pages = [tiny_img, normal_img]
+        mock_dev.load_feeder([tiny_img, normal_img])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
 
-    def test_pure_white_page_survives(self, mock_sane_module: MockSaneModule) -> None:
+    def test_pure_white_page_survives(self, fake_sane_module: FakeSaneModule) -> None:
         """
         A uniformly white page reaches the caller instead of being discarded.
 
@@ -966,19 +793,19 @@ class TestSaneBackendPageValidation:
         ``enable_empty_page_detection`` toggle, where the user can see it and
         turn it off (M-14, D-05).
         """
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         white_img = Image.new("RGB", (200, 300), (255, 255, 255))
         normal_img = _make_content_image()
-        mock_dev._multi_scan_pages = [white_img, normal_img]
+        mock_dev.load_feeder([white_img, normal_img])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 2
         # The blank itself survived, rather than the content page arriving twice.
         assert pages[0].convert("L").getextrema() == (255, 255)
 
-    def test_pure_black_page_survives(self, mock_sane_module: MockSaneModule) -> None:
+    def test_pure_black_page_survives(self, fake_sane_module: FakeSaneModule) -> None:
         """
         A uniformly black page reaches the caller instead of being discarded.
 
@@ -987,51 +814,51 @@ class TestSaneBackendPageValidation:
         was destroyed by the backend before the pipeline ever saw it.  Judging
         content is not the scanner layer's job (M-14, D-05).
         """
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         black_img = Image.new("RGB", (200, 300), (0, 0, 0))
         normal_img = _make_content_image()
-        mock_dev._multi_scan_pages = [black_img, normal_img]
+        mock_dev.load_feeder([black_img, normal_img])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 2
         assert pages[0].convert("L").getextrema() == (0, 0)
 
-    def test_normal_content_page_passes(self, mock_sane_module: MockSaneModule) -> None:
+    def test_normal_content_page_passes(self, fake_sane_module: FakeSaneModule) -> None:
         """Image with mixed content passes all validation checks."""
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         content_img = _make_content_image()
-        mock_dev._multi_scan_pages = [content_img]
+        mock_dev.load_feeder([content_img])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
 
-    def test_exif_stripped(self, mock_sane_module: MockSaneModule) -> None:
+    def test_exif_stripped(self, fake_sane_module: FakeSaneModule) -> None:
         """EXIF data is removed from scanned images before yielding."""
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         img = _make_content_image()
         # Inject fake EXIF data
         img.info["exif"] = b"fake-exif-data"
-        mock_dev._multi_scan_pages = [img]
+        mock_dev.load_feeder([img])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
         assert "exif" not in pages[0].info
 
-    def test_exif_stripped_flatbed(self, mock_sane_module: MockSaneModule) -> None:
+    def test_exif_stripped_flatbed(self, fake_sane_module: FakeSaneModule) -> None:
         """EXIF data is stripped from flatbed scans too."""
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         img = Image.new("RGB", (100, 100), "white")
         img.info["exif"] = b"fake-exif-data"
-        mock_dev._snap_impl = MagicMock(return_value=img)
+        mock_dev.load_feeder([img])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
         assert "exif" not in pages[0].info
@@ -1053,20 +880,22 @@ class TestIntegrityFailuresAreSkippedAndCounted:
     """
 
     def test_a_mid_stack_integrity_failure_costs_exactly_one_page(
-        self, mock_sane_module: MockSaneModule, caplog: pytest.LogCaptureFixture
+        self, fake_sane_module: FakeSaneModule, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A zero-dimension third sheet is skipped and named; four survive."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = [
-            _make_content_image(),
-            _make_content_image(),
-            Image.new("RGB", (0, 0)),
-            _make_content_image(),
-            _make_content_image(),
-        ]
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder(
+            [
+                _make_content_image(),
+                _make_content_image(),
+                Image.new("RGB", (0, 0)),
+                _make_content_image(),
+                _make_content_image(),
+            ]
+        )
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         with caplog.at_level(logging.WARNING):
             pages = backend.scan_pages("test:device:001", settings).pages
 
@@ -1076,14 +905,14 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         assert "Page 3" in skips[0].getMessage()
 
     def test_a_wholly_rejected_batch_raises_rather_than_yielding_nothing(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """Three unreadable sheets raise ScanError naming how many were fed."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = [Image.new("RGB", (0, 0)) for _ in range(3)]
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([Image.new("RGB", (0, 0)) for _ in range(3)])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
 
         with pytest.raises(ScanError) as exc_info:
             backend.scan_pages("test:device:001", settings)
@@ -1094,27 +923,27 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         assert not isinstance(exc_info.value, FeederEmptyError)
 
     def test_a_zero_page_feeder_still_raises_feeder_empty(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """No paper at all stays FeederEmptyError, not the all-rejected error."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = []
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
 
         with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
             backend.scan_pages("test:device:001", settings)
 
     def test_a_clean_stack_logs_no_skip_warning(
-        self, mock_sane_module: MockSaneModule, caplog: pytest.LogCaptureFixture
+        self, fake_sane_module: FakeSaneModule, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Five readable sheets yield five pages and no skip warning at all."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = [_make_content_image() for _ in range(5)]
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([_make_content_image() for _ in range(5)])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         with caplog.at_level(logging.WARNING):
             pages = backend.scan_pages("test:device:001", settings).pages
 
@@ -1126,89 +955,66 @@ class TestAutoSourceRouting:
     """Auto source conditional routing via auto_source_mode."""
 
     def test_auto_source_adf_routes_to_adf_path(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """scan_pages with source='Auto' and auto_source_mode='adf' uses ADF path."""
         # Add "Auto" to available sources
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._options_impl = [
-            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", "Auto"]),
-            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
-            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
-        ]
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "ADF", "Auto"])
         settings = ScanSettings(
-            source="Auto", resolution=300, mode="color", auto_source_mode="adf"
+            source="Auto", resolution=300, mode="Color", auto_source_mode="adf"
         )
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         # ADF path yields 3 pages via multi_scan
         assert len(pages) == 3
 
     def test_auto_source_flatbed_routes_to_flatbed_path(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """scan_pages with source='Auto' and auto_source_mode='flatbed' uses flatbed path."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._options_impl = [
-            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", "Auto"]),
-            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
-            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
-        ]
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "ADF", "Auto"])
         settings = ScanSettings(
-            source="Auto", resolution=300, mode="color", auto_source_mode="flatbed"
+            source="Auto", resolution=300, mode="Color", auto_source_mode="flatbed"
         )
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         # Flatbed path yields 1 page via snap
         assert len(pages) == 1
-        mock_dev._snap_impl.assert_called_once()
+        assert mock_dev.calls.count("snap") == 1
 
     def test_explicit_adf_ignores_auto_source_mode(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """Explicit ADF source ignores auto_source_mode setting."""
         settings = ScanSettings(
-            source="ADF", resolution=300, mode="color", auto_source_mode="flatbed"
+            source="ADF", resolution=300, mode="Color", auto_source_mode="flatbed"
         )
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         # ADF always uses ADF path regardless of auto_source_mode
         assert len(pages) == 3
 
     def test_explicit_flatbed_ignores_auto_source_mode(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """Explicit Flatbed source ignores auto_source_mode setting."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="color", auto_source_mode="adf"
+            source="Flatbed", resolution=300, mode="Color", auto_source_mode="adf"
         )
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         # Flatbed always uses flatbed path regardless of auto_source_mode
         assert len(pages) == 1
-        mock_dev._snap_impl.assert_called_once()
+        assert mock_dev.calls.count("snap") == 1
 
 
 class TestAutoSourceRecognition:
     """The Auto source is recognised by the classifier, not by == (Q8)."""
 
-    @staticmethod
-    def _options_reporting(source: str) -> list[tuple]:
-        """Return an option table whose source constraint offers ``source``."""
-        return [
-            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", source]),
-            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
-            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
-        ]
-
     @pytest.mark.parametrize("reported", ["Auto", "auto", "  AUTO  "])
     def test_auto_is_recognised_whatever_its_spelling(
         self,
         sane_backend: SaneBackend,
-        mock_sane_module: MockSaneModule,
+        fake_sane_module: FakeSaneModule,
         reported: str,
     ) -> None:
         """
@@ -1219,56 +1025,47 @@ class TestAutoSourceRecognition:
         single-page path and skipped the override entirely -- silently ignoring
         ``auto_source_mode = "adf"`` and returning one page from a whole stack.
         """
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._options_impl = self._options_reporting(reported)
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "ADF", reported])
         settings = ScanSettings(
-            source=reported, resolution=300, mode="color", auto_source_mode="adf"
+            source=reported, resolution=300, mode="Color", auto_source_mode="adf"
         )
 
         pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert classify_source(reported) is SourceKind.AUTO
         assert len(pages) == 3
-        mock_dev._snap_impl.assert_not_called()
+        assert mock_dev.calls == _THREE_SHEET_FEEDER_CALLS
 
     @pytest.mark.parametrize("reported", ["Auto", "auto", "  AUTO  "])
     def test_auto_still_honours_flatbed_routing(
         self,
         sane_backend: SaneBackend,
-        mock_sane_module: MockSaneModule,
+        fake_sane_module: FakeSaneModule,
         reported: str,
     ) -> None:
         """The override is consulted, not merely coincidentally agreed with."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._options_impl = self._options_reporting(reported)
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "ADF", reported])
         settings = ScanSettings(
-            source=reported, resolution=300, mode="color", auto_source_mode="flatbed"
+            source=reported, resolution=300, mode="Color", auto_source_mode="flatbed"
         )
 
         pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 1
-        mock_dev._snap_impl.assert_called_once()
+        assert mock_dev.calls.count("snap") == 1
 
     def test_a_long_feeder_name_never_takes_the_auto_override(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """It is a feeder by classification, so auto_source_mode is irrelevant."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._options_impl = self._options_reporting("Automatic Document Feeder")
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "ADF", "Automatic Document Feeder"])
         settings = ScanSettings(
             source="Automatic Document Feeder",
             resolution=300,
-            mode="color",
+            mode="Color",
             auto_source_mode="flatbed",
         )
 
@@ -1276,10 +1073,10 @@ class TestAutoSourceRecognition:
 
         assert classify_source("Automatic Document Feeder") is SourceKind.FEEDER
         assert len(pages) == 3
-        mock_dev._snap_impl.assert_not_called()
+        assert mock_dev.calls == _THREE_SHEET_FEEDER_CALLS
 
     def test_an_unrecognised_source_takes_the_single_page_path(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """
         D-01, asserted so that reversing it flips a test rather than passing quietly.
@@ -1290,15 +1087,12 @@ class TestAutoSourceRecognition:
         precisely to show an unrecognised name does not reach the Auto
         override either.
         """
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._options_impl = self._options_reporting("Mystery Tray")
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (100, 100), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "ADF", "Mystery Tray"])
         settings = ScanSettings(
             source="Mystery Tray",
             resolution=300,
-            mode="color",
+            mode="Color",
             auto_source_mode="adf",
         )
 
@@ -1306,39 +1100,34 @@ class TestAutoSourceRecognition:
 
         assert classify_source("Mystery Tray") is SourceKind.UNKNOWN
         assert len(pages) == 1
-        mock_dev._snap_impl.assert_called_once()
+        assert mock_dev.calls.count("snap") == 1
 
 
 class TestSaneBackendPerPageTimeout:
     """Per-page timeout tests."""
 
     def test_page_timeout_raises_scan_error(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
-        """Page that takes too long raises ScanError with timeout message."""
-        event = threading.Event()
-
-        def _blocking_iterator() -> Iterator[Image.Image]:
-            """Block on first next() call to simulate slow scan."""
-            event.wait(timeout=10)
-            yield _make_content_image()
-
-        fake_dev = _FakeSaneDevice(multi_scan=_blocking_iterator)
+        """A page that takes too long raises ScanError naming the timeout."""
+        # A merely slow scanner is a real condition and the per-page timeout
+        # exists for exactly it, so the delay is armed on the one shared device
+        # rather than by a bespoke blocking iterator -- which was a device
+        # double of its own, and is what D-17 leaves only one of.
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.set_page_delay(2.0)
 
         backend = SaneBackend()
 
         with pytest.raises(ScanError, match="timed out"):
-            backend._scan_adf_pages(fake_dev, timeout_per_page=0.5)
-
-        # Unblock the thread so it can clean up
-        event.set()
+            backend._scan_adf_pages(mock_dev, timeout_per_page=0.1)
 
     def test_pages_within_timeout_succeed(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """Pages acquired within timeout proceed normally."""
-        mock_dev = mock_sane_module._mock_dev
-        assert isinstance(mock_dev, MockSaneDev)
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        assert isinstance(mock_dev, FakeSaneDev)
 
         backend = SaneBackend()
         pages, _ = backend._scan_adf_pages(mock_dev, timeout_per_page=5.0)
@@ -1349,87 +1138,47 @@ class TestSaneBackendADFCleanup:
     """ADF cleanup (cancel/close) tests."""
 
     def test_cancel_called_after_adf_scan(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
-        """dev.cancel() is called after ADF multi_scan completes."""
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        """
+        Both cancel() and close() run after an ADF multi_scan completes.
+
+        ``test_iterator_deleted_before_cancel`` was deleted here by D-17. It
+        built a TrackingIterator with a ``__del__`` probe and a device double to
+        host it, but its own comment conceded the deletion "may or may not
+        appear depending on GC" -- so the only thing it ever actually asserted
+        was that cancel had run, which is asserted here. Nothing was lost but
+        the double, and the ``del iterator`` it nominally guarded is still in
+        the backend's own ``finally``.
+        """
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         sane_backend.scan_pages("test:device:001", settings)
-        mock_dev = mock_sane_module._mock_dev
-        assert mock_dev._cancel_called
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        assert mock_dev.cancel_calls
+        assert mock_dev.close_calls
 
-    def test_cancel_called_on_adf_error(self, mock_sane_module: MockSaneModule) -> None:
-        """dev.cancel() and dev.close() called even when ADF scan errors."""
-        operations: list[str] = []
-
-        def _error_iterator() -> Iterator[Image.Image]:
-            yield _make_content_image()
-            msg = "hardware error"
-            raise RuntimeError(msg)
-
-        fake_dev = _FakeSaneDevice(
-            multi_scan=_error_iterator,
-            cancel=lambda: operations.append("cancel"),
-            close=lambda: operations.append("close"),
+    def test_cancel_called_on_adf_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """dev.cancel() and dev.close() run even when the ADF scan errors."""
+        # The fault lands on the second sheet, so a page has already been
+        # acquired when it arrives -- the same shape the hand-rolled error
+        # iterator modelled, now driven through the one shared fake.
+        dev = FakeSaneDev(
+            pages=5,
+            start_error=FakeSaneError("hardware error"),
+            start_error_page=1,
         )
-        object.__setattr__(mock_sane_module, "_mock_dev", fake_dev)
-
-        backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Automatic Document Feeder", resolution=300, mode="Color"
+        )
 
         # D-03: a fault after the first page is translated to ScanError
         # carrying the device's own text, rather than propagating raw.
         with pytest.raises(ScanError, match="hardware error"):
-            backend.scan_pages("test:device:001", settings)
+            backend.scan_pages("test:0", settings)
 
-        assert "cancel" in operations
-        assert "close" in operations
-
-    def test_iterator_deleted_before_cancel(
-        self, mock_sane_module: MockSaneModule
-    ) -> None:
-        """Multi_scan iterator reference is deleted before dev.cancel()."""
-        mock_dev = mock_sane_module._mock_dev
-
-        # Track operation order
-        operations: list[str] = []
-
-        class TrackingIterator:
-            """Iterator that tracks when it is deleted."""
-
-            def __init__(self, pages: list[Image.Image]) -> None:
-                """Initialize with pages to yield."""
-                self._pages = iter(pages)
-
-            def __next__(self) -> Image.Image:
-                """Yield next page."""
-                return next(self._pages)
-
-            def __iter__(self) -> TrackingIterator:
-                """Return self as iterator."""
-                return self
-
-            def __del__(self) -> None:
-                """Track deletion."""
-                operations.append("iterator_deleted")
-
-        def _tracking_multi_scan() -> TrackingIterator:
-            return TrackingIterator(mock_dev._multi_scan_pages)
-
-        def _tracking_cancel() -> None:
-            operations.append("cancel_called")
-
-        fake_dev = _FakeSaneDevice(
-            multi_scan=_tracking_multi_scan, cancel=_tracking_cancel
-        )
-        object.__setattr__(mock_sane_module, "_mock_dev", fake_dev)
-
-        backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        backend.scan_pages("test:device:001", settings)
-
-        # Note: iterator_deleted may or may not appear depending on GC,
-        # but cancel should always be called
-        assert "cancel_called" in operations
+        assert dev.cancel_calls
+        assert dev.close_calls
 
 
 # ---------------------------------------------------------------------------
@@ -1493,15 +1242,13 @@ class TestPaperSizeGeometry:
     """Paper size geometry option setting tests."""
 
     def test_a4_sets_geometry(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """When paper_size='a4', dev.br_x=210.0 and dev.br_y=297.0."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (2500, 3600), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([Image.new("RGB", (2500, 3600), "white")])
         settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="color", paper_size="a4"
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
         sane_backend.scan_pages("test:device:001", settings)
         assert mock_dev.br_x == 210.0
@@ -1510,39 +1257,43 @@ class TestPaperSizeGeometry:
         assert mock_dev.tl_y == 0.0
 
     def test_full_no_geometry(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
-        """When paper_size='full', no geometry options are set on device."""
-        mock_dev = mock_sane_module._mock_dev
-        # Reset to known values
-        mock_dev.tl_x = -1.0
-        mock_dev.tl_y = -1.0
-        mock_dev.br_x = -1.0
-        mock_dev.br_y = -1.0
+        """When paper_size='full', no geometry option is assigned at all."""
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="color", paper_size="full"
+            source="Flatbed", resolution=300, mode="Color", paper_size="full"
         )
+
         sane_backend.scan_pages("test:device:001", settings)
-        # Geometry should be unchanged (not set by scan_pages)
-        assert mock_dev.tl_x == -1.0
-        assert mock_dev.br_x == -1.0
+
+        # Asserted against the device's own assignment log rather than by
+        # writing a sentinel and reading it back. The deleted double stored any
+        # float verbatim, so a test could write -1.0 and see -1.0; a real device
+        # clamps to the option's range, so that sentinel would have come back
+        # 0.0 and the test would have passed only by coincidence.
+        geometry = [
+            name for name in mock_dev.assignments if name.startswith(("tl_", "br_"))
+        ]
+        assert geometry == []
 
     def test_letter_sets_geometry(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """When paper_size='letter', dev.br_x=215.9 and dev.br_y=279.4."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._snap_impl = MagicMock(
-            return_value=Image.new("RGB", (2600, 3400), "white")
-        )
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([Image.new("RGB", (2600, 3400), "white")])
         settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="color", paper_size="letter"
+            source="Flatbed", resolution=300, mode="Color", paper_size="letter"
         )
         sane_backend.scan_pages("test:device:001", settings)
-        expected_br_x = 215.9
-        expected_br_y = 279.4
-        assert mock_dev.br_x == expected_br_x
-        assert mock_dev.br_y == expected_br_y
+        # SANE_Fixed is a 16.16 fixed-point integer, so letter's 215.9 mm is not
+        # exactly representable and reads back differing in the low bits without
+        # the device having clamped anything. The deleted double stored floats
+        # verbatim and hid that entirely -- which is precisely why D-19 compares
+        # scan areas with a tolerance instead of for equality.
+        assert mock_dev.br_x == pytest.approx(215.9, abs=1e-4)
+        assert mock_dev.br_y == pytest.approx(279.4, abs=1e-4)
 
     def test_geometry_failure_still_completes(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1572,14 +1323,14 @@ class TestPaperSizeCropFallback:
         assert pages[0].size == _A4_AT_300_DPI
 
     def test_full_no_crop(
-        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+        self, sane_backend: SaneBackend, fake_sane_module: FakeSaneModule
     ) -> None:
         """When paper_size='full', image is yielded at original size."""
-        mock_dev = mock_sane_module._mock_dev
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
         original_img = Image.new("RGB", (5000, 6000), "white")
-        mock_dev._snap_impl = MagicMock(return_value=original_img)
+        mock_dev.load_feeder([original_img])
         settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="color", paper_size="full"
+            source="Flatbed", resolution=300, mode="Color", paper_size="full"
         )
         pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
@@ -2300,9 +2051,10 @@ class TestDeviceOptionOrdering:
 
         backend.scan_pages("test:0", settings)
 
-        # ``__getattr__`` is typed ``object``, as the real dynamic option
-        # lookup is; isinstance narrows it without a cast or a suppression,
-        # and doubles as the assertion that the device reports a float.
+        # ``resolution`` is declared on the fake with the type the real device
+        # hands back, so this isinstance is a runtime assertion rather than a
+        # static narrowing: it pins that the device really reports a float,
+        # which is what the Protocol quietly misdeclared for three phases.
         resolution = dev.resolution
         assert isinstance(resolution, float)
         assert 1.0 <= resolution <= 600.0
@@ -2644,21 +2396,21 @@ class TestScanBatch:
         assert not hasattr(batch, "__next__")
 
     def test_a_clean_five_page_stack_rejects_nothing(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """Five readable sheets are five pages and a zero rejection count."""
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = [_make_content_image() for _ in range(5)]
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([_make_content_image() for _ in range(5)])
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         batch = backend.scan_pages("test:device:001", settings)
 
         assert len(batch.pages) == 5
         assert batch.pages_rejected == 0
 
     def test_an_unreadable_sheet_is_counted_rather_than_vanishing(
-        self, mock_sane_module: MockSaneModule
+        self, fake_sane_module: FakeSaneModule
     ) -> None:
         """
         Five sheets with one corrupt page return four pages and a count of one.
@@ -2670,11 +2422,11 @@ class TestScanBatch:
         pages = [_make_content_image() for _ in range(5)]
         # Far below _MIN_PAGE_BYTES: a 10x10 RGB page is 300 bytes.
         pages[2] = Image.new("RGB", (10, 10), "white")
-        mock_dev = mock_sane_module._mock_dev
-        mock_dev._multi_scan_pages = pages
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder(pages)
 
         backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         batch = backend.scan_pages("test:device:001", settings)
 
         assert len(batch.pages) == 4
