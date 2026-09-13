@@ -112,8 +112,14 @@ paper_size = "letter"
 
 Available presets: `full` (default -- entire bed), `a3`, `a4`, `a5`, `letter`, `legal`.
 
-When your scanner supports SANE geometry options, saneless sets the scan area at the hardware
-level. Otherwise, it crops the image after scanning.
+saneless checks the scan-area options your scanner reports, sets them using the unit the
+scanner asks for, and then reads the area back to confirm the scanner kept it.
+
+Three things can prevent the scan area being set at the hardware level: your scanner may not
+report all four scan-area options, it may report them in a unit saneless cannot convert to a
+length, or it may silently shrink the area to something smaller than you asked for. In any of
+those cases saneless crops the image after scanning instead, and logs which of the three
+happened.
 
 See [Configuration reference](../reference/configuration.md) for all profile fields.
 

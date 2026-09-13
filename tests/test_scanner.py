@@ -25,8 +25,13 @@ from saneless.scanner.base import (
     SourceKind,
     classify_source,
 )
-from saneless.scanner.sane_backend import SaneBackend
-from tests.fake_sane import FakeSaneDev, FakeSaneError, FakeSaneModule
+from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
+from tests.fake_sane import (
+    FakeSaneDev,
+    FakeSaneError,
+    FakeSaneModule,
+    build_option_table,
+)
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -99,6 +104,11 @@ class MockSaneDev:
         """Record that close was called."""
         self._close_called = True
 
+    @property
+    def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The scan area, read-only, as python-sane reports it."""
+        return ((self.tl_x, self.tl_y), (self.br_x, self.br_y))
+
     def get_options(self) -> list[tuple]:
         """
         Return sample SANE option tuples, or _options_impl if set.
@@ -141,6 +151,22 @@ class MockSaneDev:
                 1,
                 5,
                 ["color", "gray", "lineart"],
+            ),
+            # The four geometry options, hyphenated and reporting UNIT_MM (3),
+            # as a real device does.  D-09 writes geometry only on a device
+            # whose option list mentions them, so a mock that means to exercise
+            # the geometry path has to report them.
+            *(
+                (index, name, title, "Scan area bound", 2, 3, 4, 5, (0.0, 300.0, 1.0))
+                for index, (name, title) in enumerate(
+                    (
+                        ("tl-x", "Top-left x"),
+                        ("tl-y", "Top-left y"),
+                        ("br-x", "Bottom-right x"),
+                        ("br-y", "Bottom-right y"),
+                    ),
+                    start=4,
+                )
             ),
         ]
 
@@ -214,6 +240,11 @@ class _FakeSaneDevice:
     def close(self) -> None:
         """Delegate to pluggable close function."""
         self._close_fn()
+
+    @property
+    def area(self) -> tuple[tuple[float, float], tuple[float, float]]:
+        """The scan area, read-only, as python-sane reports it."""
+        return ((self.tl_x, self.tl_y), (self.br_x, self.br_y))
 
 
 class MockBackend(ScannerBackend):
@@ -1402,47 +1433,56 @@ class TestSaneBackendADFCleanup:
 # ---------------------------------------------------------------------------
 
 
-class _NoGeometryDevice:
-    """Mock device that raises AttributeError on geometry attribute assignment."""
+# The hyphenated spelling get_options() reports, which D-09's presence check
+# reads.  Assignment uses underscores (dev.tl_x); see fake_sane._GEOMETRY_NAMES.
+_GEOMETRY_OPTION_NAMES = ("tl-x", "tl-y", "br-x", "br-y")
 
-    def __init__(self, pages: list[Image.Image] | None = None) -> None:
-        """Initialize device that rejects geometry options."""
-        self.mode: str = "color"
-        self.resolution: float = 300.0
-        self.source: str = "Flatbed"
-        self._pages = pages or [_make_content_image()]
+# A4 is 210 x 297 mm; at 300 dpi that is 2480 x 3507 px.
+_A4_AT_300_DPI = (2480, 3507)
 
-    def __setattr__(self, name: str, value: object) -> None:
-        """Reject geometry attributes, accept everything else."""
-        if name in {"tl_x", "tl_y", "br_x", "br_y"}:
-            msg = f"Device does not support option '{name}'"
-            raise AttributeError(msg)
-        super().__setattr__(name, value)
 
-    def get_options(self) -> list[tuple]:
-        """Return sample options with source."""
-        return [
-            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF"]),
-            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
-            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
-        ]
+def _warning_messages(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """
+    Return the WARNING messages captured so far.
 
-    def start(self) -> None:
-        """Initiate SANE scan cycle (no-op in mock)."""
+    Args:
+        caplog: The pytest log-capture fixture.
 
-    def snap(self) -> Image.Image:
-        """Return first page image."""
-        return self._pages[0]
+    Returns:
+        One string per captured WARNING record.
 
-    def multi_scan(self) -> Iterator[Image.Image]:
-        """Return iterator over pages."""
-        return iter(self._pages)
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
 
-    def cancel(self) -> None:
-        """Cancel (no-op in mock)."""
 
-    def close(self) -> None:
-        """Close (no-op in mock)."""
+def _geometry_less_device(pages: int = 1) -> FakeSaneDev:
+    """
+    Build a device whose option list does not mention the geometry options.
+
+    This is the condition the old geometry-less double claimed to model and
+    inverted.  The real ``SaneDev.__setattr__`` *stores* an unknown name
+    (``sane.py:188``), so such a device accepts ``dev.br_y`` without complaint
+    -- which is exactly why the presence check, and not an exception, is what
+    makes the crop fallback reachable.
+
+    Args:
+        pages: How many sheets the feeder holds.
+
+    Returns:
+        A device reporting source, mode and resolution but no scan-area options,
+        whose pages are larger than A4 at 300 dpi so a crop is observable.
+
+    """
+    dev = FakeSaneDev(
+        options=build_option_table(omit=_GEOMETRY_OPTION_NAMES),
+        pages=pages,
+    )
+    dev.set_page_size(3000, 4000)
+    return dev
 
 
 class TestPaperSizeGeometry:
@@ -1501,17 +1541,14 @@ class TestPaperSizeGeometry:
         assert mock_dev.br_y == expected_br_y
 
     def test_geometry_failure_still_completes(
-        self, mock_sane_module: MockSaneModule
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When geometry setting raises, scan still completes (fallback to crop)."""
-        no_geom_dev = _NoGeometryDevice()
-        object.__setattr__(mock_sane_module, "_mock_dev", no_geom_dev)
-
-        backend = SaneBackend()
+        """A device without geometry options still completes the scan."""
+        backend = _backend_with(_geometry_less_device(), monkeypatch)
         settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="color", paper_size="a4"
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = list(backend.scan_pages("test:0", settings))
         assert len(pages) == 1
 
 
@@ -1519,22 +1556,16 @@ class TestPaperSizeCropFallback:
     """Pillow crop fallback when geometry options are unavailable."""
 
     def test_crop_fallback_when_geometry_fails(
-        self, mock_sane_module: MockSaneModule
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When geometry fails, scanned image is cropped to paper dimensions."""
-        # Create a large image (larger than A4 at 300 DPI)
-        large_img = _make_content_image(width=3000, height=4000)
-        no_geom_dev = _NoGeometryDevice(pages=[large_img])
-        object.__setattr__(mock_sane_module, "_mock_dev", no_geom_dev)
-
-        backend = SaneBackend()
+        """When geometry is absent, the scanned image is cropped to A4."""
+        backend = _backend_with(_geometry_less_device(), monkeypatch)
         settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="color", paper_size="a4"
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = list(backend.scan_pages("test:0", settings))
         assert len(pages) == 1
-        # A4 at 300 DPI: 210*300/25.4=2480, 297*300/25.4=3507
-        assert pages[0].size == (2480, 3507)
+        assert pages[0].size == _A4_AT_300_DPI
 
     def test_full_no_crop(
         self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
@@ -1550,23 +1581,356 @@ class TestPaperSizeCropFallback:
         assert len(pages) == 1
         assert pages[0].size == (5000, 6000)
 
-    def test_adf_crop_fallback(self, mock_sane_module: MockSaneModule) -> None:
+    def test_adf_crop_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """ADF pages are cropped when geometry options are unavailable."""
-        large_pages = [
-            _make_content_image(width=3000, height=4000),
-            _make_content_image(width=3000, height=4000),
-        ]
-        no_geom_dev = _NoGeometryDevice(pages=large_pages)
-        object.__setattr__(mock_sane_module, "_mock_dev", no_geom_dev)
-
-        backend = SaneBackend()
+        backend = _backend_with(_geometry_less_device(pages=2), monkeypatch)
         settings = ScanSettings(
-            source="ADF", resolution=300, mode="color", paper_size="a4"
+            source="Automatic Document Feeder",
+            resolution=300,
+            mode="Color",
+            paper_size="a4",
         )
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = list(backend.scan_pages("test:0", settings))
         assert len(pages) == 2
         for page in pages:
-            assert page.size == (2480, 3507)
+            assert page.size == _A4_AT_300_DPI
+
+
+class TestGeometryPresenceCheck:
+    """
+    Geometry is written only on a device that reports the options (D-09).
+
+    The real ``SaneDev.__setattr__`` stores an unrecognised option name in
+    ``__dict__`` and returns -- no device call, no validation, no raise
+    (``sane.py:188``).  So assigning ``dev.br_y`` on a device that has no
+    geometry options *succeeds*, ``_set_geometry`` returned True, and the Pillow
+    crop fallback it guarded could never run.  That is M-15, and it shipped
+    green because the double it was tested against raised on exactly the
+    assignment the real library stores.
+
+    Every test here drives a fake that stores silently, as the real library
+    does, so each one fails if the presence check is removed.
+    """
+
+    def test_a_device_without_geometry_options_stores_br_y_silently(self) -> None:
+        """
+        The premise the whole fallback rests on, asserted rather than assumed.
+
+        If this ever raises, the fake has drifted back to modelling a library
+        that does not exist and every test below it proves nothing.
+        """
+        dev = FakeSaneDev(options=build_option_table(omit=_GEOMETRY_OPTION_NAMES))
+
+        dev.br_y = 297.0
+
+        assert dev.br_y == 297.0
+        # Stored with no device call at all, so it is not a device assignment.
+        assert dev.assignments == []
+
+    def test_the_crop_fallback_produces_a_correctly_sized_page(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        SCNR-04's reachability proof: the page comes back at A4's pixel size.
+
+        A return-value assertion alone would not show this -- the fallback has
+        to actually produce a correctly sized page, from a 3000x4000 scan.
+        """
+        backend = _backend_with(_geometry_less_device(), monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        pages = list(backend.scan_pages("test:0", settings))
+
+        assert pages[0].size == _A4_AT_300_DPI
+
+    def test_the_missing_option_is_named_in_the_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One absent option is enough, and the warning says which one."""
+        dev = FakeSaneDev(options=build_option_table(omit=("br-y",)), pages=1)
+        dev.set_page_size(3000, 4000)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert [m for m in _warning_messages(caplog) if "br-y" in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+    def test_a_rejected_geometry_assignment_logs_the_exception(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The bare ``except Exception`` names what it swallowed (M-15's other half).
+
+        Here the options are reported but marked not software-settable, so the
+        assignment raises for a structural reason rather than being stored.
+        """
+        dev = FakeSaneDev(options=build_option_table(geometry_settable=False), pages=1)
+        dev.set_page_size(3000, 4000)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert [m for m in _warning_messages(caplog) if "can't be set by software" in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+
+# The two units saneless can turn into a scan-area box.  Every other SANE unit
+# is declined and the page is cropped by Pillow instead.
+_CONVERTIBLE_UNITS = frozenset({GeometryUnit.UNIT_MM, GeometryUnit.UNIT_PIXEL})
+
+# Wide enough that a pixel-denominated A4 box at 1200 dpi fits without the
+# device clamping it, which would confuse a unit test with a range test.
+_ROOMY_GEOMETRY_RANGE = (0.0, 20000.0, 1.0)
+
+
+def _device_reporting_unit(
+    unit: int,
+    geometry_range: tuple[float, float, float] = _ROOMY_GEOMETRY_RANGE,
+) -> FakeSaneDev:
+    """
+    Build a device whose geometry options report a given SANE unit.
+
+    Args:
+        unit: The unit code to report at index 5 of the geometry options.
+        geometry_range: The ``(min, max, step)`` constraint for those options.
+
+    Returns:
+        A single-sheet device whose pages are larger than A4 at 300 dpi, so a
+        crop is observable.
+
+    """
+    dev = FakeSaneDev(
+        options=build_option_table(geometry_unit=unit, geometry_range=geometry_range),
+        pages=1,
+    )
+    dev.set_page_size(3000, 4000)
+    return dev
+
+
+class TestGeometryUnit:
+    """
+    The scan-area scale factor comes from the descriptor the device sent (D-10).
+
+    ``_set_geometry`` wrote ``br_x = 210.0`` for A4 on every device, assuming
+    millimetres, although the unit lives at index 5 of the option tuple (N-03).
+    A device reporting ``UNIT_PIXEL`` was handed 210 *pixels* -- about 18 mm at
+    300 dpi -- and returned a sliver of the page with no error.
+
+    There is no ``UNIT_CM`` and no ``UNIT_INCH``: the complete set is the seven
+    codes below, confirmed against the ``_sane`` extension itself.
+    """
+
+    def test_every_sane_unit_code_is_a_member(self) -> None:
+        """All seven codes, and only those seven."""
+        assert sorted(unit.value for unit in GeometryUnit) == [0, 1, 2, 3, 4, 5, 6]
+
+    @pytest.mark.parametrize("unit", list(GeometryUnit))
+    def test_every_unit_is_either_converted_or_declined(
+        self, unit: GeometryUnit
+    ) -> None:
+        """
+        Parametrised over the enum itself, so a new member is covered for free.
+
+        This is Phase 21's D-09.  A member added without a matching ``match``
+        arm leaves the scale unbound and fails here at runtime, as well as
+        failing ``assert_never`` under both type checkers at edit time.
+        """
+        scale = sane_backend_mod._units_per_mm(unit, 300)
+
+        if unit in _CONVERTIBLE_UNITS:
+            assert scale is not None
+            assert scale > 0
+        else:
+            assert scale is None
+
+    def test_millimetres_are_written_directly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A device reporting UNIT_MM gets A4's millimetres unchanged."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        pages = list(backend.scan_pages("test:0", settings))
+
+        assert dev.br_x == 210.0
+        assert dev.br_y == 297.0
+        # Geometry was set on the device, so the page is not cropped as well.
+        assert pages[0].size == (3000, 4000)
+
+    def test_pixels_use_the_resolution_read_back_from_the_device(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The pixel conversion follows the dpi the device chose, not the request.
+
+        5000 dpi is clamped by the device to 1200.  Converting with the
+        requested value would reintroduce the very substitution bug D-11 cures,
+        one layer further down.
+        """
+        dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=5000, mode="Color", paper_size="a4"
+        )
+
+        list(backend.scan_pages("test:0", settings))
+
+        assert dev.br_x == pytest.approx(210.0 * 1200 / 25.4)
+        assert dev.br_y == pytest.approx(297.0 * 1200 / 25.4)
+
+    @pytest.mark.parametrize("unit", sorted(set(GeometryUnit) - _CONVERTIBLE_UNITS))
+    def test_an_unconvertible_unit_falls_through_to_the_crop(
+        self,
+        unit: GeometryUnit,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The other five units warn by name and leave the crop to Pillow."""
+        dev = _device_reporting_unit(unit)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert [m for m in _warning_messages(caplog) if unit.name in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+    def test_a_unit_code_outside_sane_does_not_crash_the_scan(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The option tuple is device-supplied, so a bad code must not be fatal.
+
+        A conforming backend cannot report 99, but nothing in the protocol
+        stops a broken one, and a garbage scale factor would silently mis-size
+        the page.  It is treated as unconvertible instead.
+        """
+        dev = _device_reporting_unit(99)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert [m for m in _warning_messages(caplog) if "99" in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+
+class TestClampedScanArea:
+    """
+    A scan area the device quietly shrank is caught on read-back (D-19).
+
+    Measured against the real ``test`` backend: writing A4's 210 mm to a device
+    whose ``br-x`` range is ``(0.0, 200.0, 1.0)`` yields 200.0, with no error
+    and no ``INFO_INEXACT`` the caller can see.  ``_set_geometry`` could
+    therefore return True having set an area that is not the one requested --
+    the same silent-substitution shape M-16 cures for DPI, and the page comes
+    out quietly wrong.
+    """
+
+    def test_a_clamped_area_falls_through_to_the_crop(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A 200 mm device asked for A4 warns with both values and crops."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 200.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        # The warning has to name what was asked for AND what was got, or the
+        # operator cannot tell which of the two is wrong.
+        assert [m for m in _warning_messages(caplog) if "210" in m and "200" in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+    def test_a_comfortable_range_is_not_reported_as_clamped(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A device that honours the area sets it and does not crop as well."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert not [m for m in _warning_messages(caplog) if "clamped" in m.lower()]
+        assert pages[0].size == (3000, 4000)
+
+    def test_a_fixed_point_round_trip_is_within_tolerance(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A near-equal read-back must not trigger the fallback.
+
+        Letter's 215.9 mm is not representable in SANE's 16.16 fixed point, so
+        it reads back inexact on a device that clamped nothing.  Comparing for
+        equality would send this perfectly good scan down the crop path.
+        """
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="letter"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        # The round trip really is inexact -- this is what makes the tolerance
+        # load-bearing rather than decorative.
+        assert dev.br_x != 215.9
+        assert dev.br_x == pytest.approx(215.9, abs=1e-4)
+        assert not [m for m in _warning_messages(caplog) if "clamped" in m.lower()]
+        assert pages[0].size == (3000, 4000)
+
+    def test_the_crop_uses_the_resolution_the_device_chose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A clamped dpi must not yield a crop box computed at the requested dpi.
+
+        The crop arithmetic and the device's actual sampling have to agree, or
+        a clamped resolution produces M-16's cut-off page even when the
+        fallback runs correctly.
+        """
+        dev = _geometry_less_device()
+        # Selecting the source reloads the descriptors and reveals a 75 dpi
+        # ceiling, so the 300 requested is clamped to 75.
+        dev.narrow_resolution_for_source("Flatbed", (1.0, 75.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        pages = list(backend.scan_pages("test:0", settings))
+
+        # A4 at the 75 dpi the device settled on, not at the 300 asked for,
+        # which would have been 2480x3507.
+        assert pages[0].size == (620, 876)
 
 
 # ---------------------------------------------------------------------------
@@ -1581,10 +1945,10 @@ class TestFakeSaneContract:
     The rows asserted here are RESEARCH.md Finding 7's contract table, which
     was executed against the real library rather than inferred.  Each of the
     three hand-written doubles in this module got at least one row wrong, and
-    every wrong row let a shipped defect earn a green test -- most visibly
-    ``_NoGeometryDevice``, which *raises* on an unknown option where the real
+    every wrong row let a shipped defect earn a green test -- most visibly the
+    geometry-less double, which *raised* on an unknown option where the real
     library *stores* it, so the crop fallback it was written to prove could
-    never actually be reached.
+    never actually be reached.  That double is deleted (D-09).
 
     The table is parametrised rather than written out one test per row so that
     a future row cannot be added to the fake without also being asserted here.
@@ -1656,7 +2020,7 @@ class TestFakeSaneContract:
 
     def test_unknown_option_is_stored_silently(self) -> None:
         """
-        Row 1, the inverse of ``_NoGeometryDevice``.
+        Row 1, the inverse of the deleted geometry-less double.
 
         The real ``SaneDev.__setattr__`` stores an unrecognised name straight
         into ``__dict__`` and returns: no device call, no validation, no
@@ -1773,6 +2137,20 @@ class TestFakeSaneContract:
         dev = FakeSaneDev()
         dev.resolution = requested
         assert dev.resolution == expected
+
+    def test_a_fixed_point_value_cannot_be_stored_exactly(self) -> None:
+        """
+        SANE_Fixed is 16.16, so letter's 215.9 mm is not representable.
+
+        The value comes back differing in the low bits without the device
+        having clamped anything, which is why D-19 uses a tolerance.
+        """
+        dev = FakeSaneDev()
+
+        dev.br_x = 215.9
+
+        assert dev.br_x != 215.9
+        assert dev.br_x == pytest.approx(215.9, abs=1e-4)
 
     def test_area_reflects_the_geometry_clamp(self) -> None:
         """An A4 box against a 200mm device clamps, exactly as measured."""

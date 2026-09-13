@@ -12,10 +12,10 @@ docstring.
 The five behaviours a double gets wrong, and which this one gets right:
 
 1. Assigning an **unknown** option name stores it silently in ``__dict__``.
-   There is no device call, no validation and no raise.  ``_NoGeometryDevice``
-   raises here, which is the exact inverse, and it is why ``_set_geometry``
-   could always return True while the crop fallback it guarded was
-   unreachable.
+   There is no device call, no validation and no raise.  The geometry-less
+   double this replaced *raised* here, the exact inverse, and that is why
+   ``_set_geometry`` could always return True while the crop fallback it
+   guarded was unreachable.  That double is deleted (D-09).
 2. Assigning a **bad value** to a known option raises the local error type
    (the real ``_sane.error: Invalid argument``) -- but only for a *list*
    constraint.  A *range* constraint clamps silently and reports success.
@@ -27,6 +27,12 @@ The five behaviours a double gets wrong, and which this one gets right:
    iterator calls ``start()`` then ``snap()`` once per page, and converts
    exactly one message, ``Document feeder out of documents``, to
    ``StopIteration``.
+
+A sixth behaviour, from the SANE specification rather than from an execution:
+``TYPE_FIXED`` values round-trip through SANE's 16.16 fixed-point
+representation, so a length like letter's 215.9 mm does not read back exactly
+as written.  D-19's clamp detection therefore has to compare with a tolerance;
+an equality test would send every such scan down the crop path.
 
 One deliberate, documented divergence: the real ``__load_option_dict`` filters
 ``TYPE_GROUP`` options out of ``opt``, which makes the library's own "Groups
@@ -55,7 +61,12 @@ from PIL import Image, ImageDraw
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-__all__ = ["FakeSaneDev", "FakeSaneError", "FakeSaneModule"]
+__all__ = [
+    "FakeSaneDev",
+    "FakeSaneError",
+    "FakeSaneModule",
+    "build_option_table",
+]
 
 # SANE value types, read from _sane rather than guessed.
 _TYPE_FIXED = 2
@@ -65,6 +76,7 @@ _TYPE_GROUP = 5
 
 # SANE units.  There is no UNIT_CM and no UNIT_INCH.
 _UNIT_NONE = 0
+_UNIT_PIXEL = 1
 _UNIT_MM = 3
 _UNIT_DPI = 4
 
@@ -84,6 +96,10 @@ _READ_ONLY_ATTRIBUTES = frozenset(
 # sane.py:130 -- the single message the ADF iterator converts to StopIteration.
 _FEEDER_EMPTY_MESSAGE = "Document feeder out of documents"
 
+# SANE_Fixed is a 16.16 fixed-point integer, so a TYPE_FIXED option can only
+# represent multiples of 1/65536.
+_SANE_FIXED_SCALE = 65536
+
 _INVALID_ARGUMENT = "Invalid argument"
 _SANE_FIXED_TYPE_ERROR = "SANE_FIXED requires a floating point number"
 
@@ -102,6 +118,15 @@ _GEOMETRY_OPTIONS = (
     ("br-x", "Bottom-right x"),
     ("br-y", "Bottom-right y"),
 )
+
+# The four geometry names alone, in the hyphenated spelling get_options()
+# reports.  Attribute assignment uses underscores (dev.tl_x); both spellings are
+# load-bearing and one set used for both would be wrong on one side.
+_GEOMETRY_NAMES = tuple(name for name, _title in _GEOMETRY_OPTIONS)
+
+# Small enough to keep a multi-page feeder test cheap, and deliberately smaller
+# than any paper size at a realistic dpi -- see set_page_size().
+_DEFAULT_PAGE_SIZE = (200, 300)
 
 
 def _option_is_active(cap: int) -> bool:
@@ -234,6 +259,58 @@ def _build_option_table(
             _CAP_NOT_SETTABLE,
             ["x"],
         ),
+    ]
+
+
+def build_option_table(
+    *,
+    geometry_range: tuple[float, float, float] = _DEFAULT_GEOMETRY_RANGE,
+    geometry_unit: int = _UNIT_MM,
+    omit: tuple[str, ...] = (),
+    geometry_settable: bool = True,
+) -> list[tuple]:
+    """
+    Build the default option table, adjusted for the case a test must model.
+
+    This is the public entry point for the cases a constructor keyword cannot
+    reach: ``FakeSaneDev.__init__`` already carries ruff's maximum of five
+    arguments (``PLR0913``), and this project forbids suppressing the rule.
+
+    ``omit`` exists for D-09.  A device whose option list simply does not
+    mention the geometry options is the case the old geometry-less double
+    claimed to model and got backwards: the real library *stores* ``dev.br_y``
+    on such a device rather than raising, so an omitted option table is the
+    only way to reproduce the condition that makes the crop fallback
+    reachable.
+
+    ``geometry_unit`` exists for D-10.  The unit lives at index 5 of the option
+    tuple, and a backend is free to report its scan area in something other
+    than millimetres, which the geometry arithmetic has to scale by rather than
+    assume away (N-03).
+
+    Args:
+        geometry_range: The ``(min, max, step)`` constraint shared by the four
+            geometry options.
+        geometry_unit: The SANE unit code the geometry options report at index
+            5.  Defaults to ``UNIT_MM``, which is what real hardware was
+            measured reporting.
+        omit: Hyphenated option names to leave out of the table entirely, as a
+            device lacking them would report it.
+        geometry_settable: When False the geometry options are still reported
+            but are marked not software-settable, so assigning one raises the
+            measured ``AttributeError`` instead of storing the value.
+
+    Returns:
+        The option table, ready to hand to :class:`FakeSaneDev`.
+
+    """
+    cap = _CAP_SETTABLE if geometry_settable else _CAP_NOT_SETTABLE
+    return [
+        (*option[:5], geometry_unit, option[6], cap, option[8])
+        if option[1] in _GEOMETRY_NAMES
+        else option
+        for option in _build_option_table(geometry_range=geometry_range)
+        if option[1] not in omit
     ]
 
 
@@ -391,6 +468,25 @@ def _reject_unreadable(option: tuple, key: str) -> None:
         raise AttributeError(msg)
 
 
+def _to_sane_fixed(value: float) -> float:
+    """
+    Round to SANE's 16.16 fixed-point grid, as ``SANE_Fixed`` does.
+
+    A length that is not a multiple of 1/65536 -- letter's 215.9 mm, for
+    instance -- cannot be stored exactly, so it reads back differing in the low
+    bits without the device having clamped anything.  This is the reason D-19
+    compares areas with a tolerance instead of for equality.
+
+    Args:
+        value: The requested value.
+
+    Returns:
+        The nearest value SANE can actually represent.
+
+    """
+    return round(value * _SANE_FIXED_SCALE) / _SANE_FIXED_SCALE
+
+
 def _constrain(option: tuple, key: str, value: object) -> object:
     """
     Apply the option's type and constraint to an assigned value.
@@ -411,10 +507,10 @@ def _constrain(option: tuple, key: str, value: object) -> object:
     if value_type == _TYPE_FIXED:
         number = _as_float(value)
         if isinstance(constraint, tuple):
-            return _clamp(number, constraint)
+            return _to_sane_fixed(_clamp(number, constraint))
         if isinstance(constraint, list) and number not in constraint:
             raise FakeSaneError(_INVALID_ARGUMENT)
-        return number
+        return _to_sane_fixed(number)
     if value_type == _TYPE_STRING:
         text = _as_str(key, value)
         if isinstance(constraint, list) and text not in constraint:
@@ -423,21 +519,23 @@ def _constrain(option: tuple, key: str, value: object) -> object:
     return value
 
 
-def _page_image(index: int) -> Image.Image:
+def _page_image(index: int, size: tuple[int, int] = _DEFAULT_PAGE_SIZE) -> Image.Image:
     """
     Build one page with enough variance to survive page validation.
 
     Args:
         index: Zero-based page number, used to make pages distinguishable.
+        size: The ``(width, height)`` pixel size of the page.
 
     Returns:
-        A 200x300 RGB image well above the backend's 10 KB floor.
+        An RGB image well above the backend's 10 KB floor.
 
     """
-    image = Image.new("RGB", (200, 300), "white")
+    width, height = size
+    image = Image.new("RGB", size, "white")
     draw = ImageDraw.Draw(image)
-    draw.rectangle((10, 10, 190, 290), fill="black")
-    draw.ellipse((30, 30 + index, 170, 170 + index), fill="white")
+    draw.rectangle((10, 10, width - 10, height - 10), fill="black")
+    draw.ellipse((30, 30 + index, width - 30, height - 30 + index), fill="white")
     return image
 
 
@@ -515,6 +613,7 @@ class FakeSaneDev:
     _start_error: BaseException | None
     _start_error_page: int
     _page_index: int
+    _page_size: tuple[int, int]
     _source_resolution_ranges: dict[str, tuple[float, float, float]]
 
     def __init__(
@@ -556,6 +655,7 @@ class FakeSaneDev:
         state["_start_error"] = start_error
         state["_start_error_page"] = start_error_page
         state["_page_index"] = 0
+        state["_page_size"] = _DEFAULT_PAGE_SIZE
         state["_source_resolution_ranges"] = {}
         state["calls"] = []
         state["assignments"] = []
@@ -611,6 +711,27 @@ class FakeSaneDev:
 
         """
         self.__dict__["_source_resolution_ranges"][source] = constraint
+
+    def set_page_size(self, width: int, height: int) -> None:
+        """
+        Set the pixel size of the pages ``snap()`` returns.
+
+        A method rather than a constructor keyword for the same reason
+        ``narrow_resolution_for_source`` is one: ``__init__`` already carries
+        ruff's five-argument maximum.
+
+        The default 200x300 page is smaller than any paper size at a realistic
+        dpi, so ``crop_to_paper_size`` clamps the crop box to the image and
+        returns it unchanged.  A test that means to prove the crop fallback
+        actually *ran* needs a page larger than the crop box, which is what this
+        provides.
+
+        Args:
+            width: Page width in pixels.
+            height: Page height in pixels.
+
+        """
+        self.__dict__["_page_size"] = (width, height)
 
     def _reload_for_source(self, source: str) -> None:
         """
@@ -724,7 +845,7 @@ class FakeSaneDev:
 
         """
         self.calls.append("snap")
-        page = _page_image(self._page_index)
+        page = _page_image(self._page_index, self._page_size)
         self._page_index += 1
         return page
 
