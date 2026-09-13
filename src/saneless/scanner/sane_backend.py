@@ -21,7 +21,7 @@ from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import TYPE_CHECKING, Any, Protocol
 
 import PIL.Image
-from PIL import Image, ImageStat
+from PIL import Image
 
 from saneless.exceptions import FeederEmptyError, ScanError
 from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
@@ -61,8 +61,15 @@ PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
 # At 300 DPI typical scan is ~10-15s, so 120s is very conservative.
 _DEFAULT_PAGE_TIMEOUT_SECONDS: float = 120.0
 
-# Minimum raw image data size in bytes. A valid scanned page at any reasonable
-# resolution will be well above this. Catches corrupt/truncated pages.
+# Minimum raw image data size in bytes. Catches a corrupt or truncated buffer.
+#
+# This is now one of only two surviving checks, so its value is worth
+# justifying rather than asserting. Measured against the SANE `test` backend,
+# the smallest legitimate real page is 69,620 bytes -- Gray at 75 dpi on an
+# 80x100 mm bed, the least data a real device in this project produces. That is
+# nearly 7x this threshold, and a 300 dpi colour page is 3.3 MB. The check
+# therefore demonstrably does not fire on legitimate small pages, which is the
+# only way a size floor can be safe (24-RESEARCH.md Finding 2, Q2).
 _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 
 # Upper bound on the number of pages one scan_pages() call will acquire.
@@ -87,14 +94,6 @@ _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 # reach it. That is assumption A1 in 24-RESEARCH.md, recorded at LOW confidence
 # and cheap to revise precisely because the error names the cap.
 _MAX_ADF_PAGES: int = 500
-
-# Thresholds for pure white/black detection at the scanner level.
-# These are intentionally extreme (tighter than the configurable empty-page
-# thresholds in pages.py) to only catch obviously invalid images.
-_SCANNER_WHITE_MEAN_THRESHOLD: float = 254.0
-_SCANNER_WHITE_STDDEV_THRESHOLD: float = 1.0
-_SCANNER_BLACK_MEAN_THRESHOLD: float = 1.0
-_SCANNER_BLACK_STDDEV_THRESHOLD: float = 1.0
 
 # The one message reported when a feeder produced no pages at all.
 _FEEDER_EMPTY_MESSAGE = "No paper detected in feeder"
@@ -184,13 +183,26 @@ def _maybe_crop(
 
 def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     """
-    Validate a scanned page image inline at the scanner level.
+    Check that a scanned page is a readable image at all.
 
-    Checks nonzero dimensions, minimum file size, and not pure white/black.
-    Returns True if the page is valid, False if it should be skipped.
+    Two integrity checks, and only two: nonzero dimensions, and a raw byte
+    count at or above ``_MIN_PAGE_BYTES``. Both answer "did the device hand
+    back something decodable?". Neither looks at what is printed on the page.
 
-    Per user decision: "Validate each scanned image inline before yielding:
-    check nonzero dimensions, minimum file size, not pure white/black."
+    Blank-page policy deliberately does not live here. The profile exposes
+    ``enable_empty_page_detection`` along with user-visible mean and stddev
+    thresholds, so a page discarded at this level would be discarded behind the
+    user's back and would make that toggle untrue -- which is precisely what
+    M-14 found, and what broke manual-duplex parity. Content is judged in
+    exactly one place, ``pipeline._drop_empty_pages`` (D-05).
+
+    Args:
+        page_image: The acquired page.
+        page_num: One-based page number, used in the warning text.
+
+    Returns:
+        True if the page is readable, False if it should be skipped.
+
     """
     # Check 1: Nonzero dimensions
     if page_image.size[0] == 0 or page_image.size[1] == 0:
@@ -203,36 +215,6 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     raw_size = len(page_image.tobytes())
     if raw_size < _MIN_PAGE_BYTES:
         logger.warning("Page %d: too small (%d bytes), skipping", page_num, raw_size)
-        return False
-
-    # Check 3: Not pure white or pure black (scanner-level, very strict thresholds)
-    gray = page_image.convert("L")
-    stats = ImageStat.Stat(gray)
-    mean_val = stats.mean[0]
-    stddev_val = stats.stddev[0]
-
-    if (
-        mean_val > _SCANNER_WHITE_MEAN_THRESHOLD
-        and stddev_val < _SCANNER_WHITE_STDDEV_THRESHOLD
-    ):
-        logger.warning(
-            "Page %d: pure white (mean=%.1f, stddev=%.1f), skipping",
-            page_num,
-            mean_val,
-            stddev_val,
-        )
-        return False
-
-    if (
-        mean_val < _SCANNER_BLACK_MEAN_THRESHOLD
-        and stddev_val < _SCANNER_BLACK_STDDEV_THRESHOLD
-    ):
-        logger.warning(
-            "Page %d: pure black (mean=%.1f, stddev=%.1f), skipping",
-            page_num,
-            mean_val,
-            stddev_val,
-        )
         return False
 
     return True
@@ -343,7 +325,8 @@ def _acquire_pages(
                 )
                 raise ScanError(cap_msg)
 
-            # Validate: nonzero dimensions, min file size, not pure white/black
+            # Integrity only: nonzero dimensions and minimum raw size. Whether
+            # the page is worth keeping is the pipeline's decision, not ours.
             if not _validate_page_image(page_image, page_num):
                 continue
 
