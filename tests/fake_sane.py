@@ -33,6 +33,17 @@ One deliberate, documented divergence: the real ``__load_option_dict`` filters
 don't have values" branch unreachable.  This fake keeps groups in the table so
 that branch is exercisable.  Either way a group raises ``AttributeError``; only
 the message differs.
+
+``narrow_resolution_for_source`` models the option-reload *hazard* rather than
+a measured device.  ``sane.py:188-213`` reloads every option descriptor when a
+``set_option`` reports ``INFO_RELOAD_OPTIONS``, which a source change does, so a
+resolution accepted against the platen's range can be left standing against a
+feeder's narrower one.  The knob swaps in the narrower range on a source
+assignment and deliberately does **not** re-validate the value already stored,
+which is precisely what makes assignment ordering observable.  Measured caveat
+(assumption A5): the SANE ``test`` backend does **not** behave this way, so this
+hazard cannot be reproduced against real hardware and is modelled here on
+purpose rather than discovered there.
 """
 
 from __future__ import annotations
@@ -495,6 +506,7 @@ class FakeSaneDev:
 
     opt: dict[str, tuple]
     calls: list[str]
+    assignments: list[str]
     cancel_calls: int
     close_calls: int
     _options: list[tuple]
@@ -503,6 +515,7 @@ class FakeSaneDev:
     _start_error: BaseException | None
     _start_error_page: int
     _page_index: int
+    _source_resolution_ranges: dict[str, tuple[float, float, float]]
 
     def __init__(
         self,
@@ -543,7 +556,9 @@ class FakeSaneDev:
         state["_start_error"] = start_error
         state["_start_error_page"] = start_error_page
         state["_page_index"] = 0
+        state["_source_resolution_ranges"] = {}
         state["calls"] = []
+        state["assignments"] = []
         state["cancel_calls"] = 0
         state["close_calls"] = 0
 
@@ -571,6 +586,55 @@ class FakeSaneDev:
             return
         _reject_unsettable(option, key)
         self.__dict__["_values"][key] = _constrain(option, key, value)
+        # Recorded only for names the device actually has: an unrecognised
+        # name is stored with no device call, so logging it would invent one.
+        self.__dict__["assignments"].append(key)
+        if key == "source":
+            self._reload_for_source(str(value))
+
+    def narrow_resolution_for_source(
+        self, source: str, constraint: tuple[float, float, float]
+    ) -> None:
+        """
+        Arm a narrower resolution range that selecting a given source reveals.
+
+        Real feeders commonly cap resolution below the platen's ceiling, and a
+        source change reloads every option descriptor (``sane.py:188-213``).
+
+        This is a method rather than a constructor keyword because ``__init__``
+        already carries ruff's maximum of five arguments (``PLR0913``) and this
+        project forbids suppressing the rule.
+
+        Args:
+            source: The source name whose selection narrows the range.
+            constraint: The ``(min, max, step)`` the device reports afterwards.
+
+        """
+        self.__dict__["_source_resolution_ranges"][source] = constraint
+
+    def _reload_for_source(self, source: str) -> None:
+        """
+        Swap in the source's resolution constraint, as an option reload would.
+
+        The value already stored is deliberately **not** re-validated against
+        the new constraint.  That is the entire hazard: a resolution accepted
+        against the platen's range stands unchanged against the feeder's
+        narrower one, so only assigning the source first keeps it legal.
+
+        Args:
+            source: The source name just assigned.
+
+        """
+        narrowed = self.__dict__["_source_resolution_ranges"].get(source)
+        if narrowed is None:
+            return
+        options = self.__dict__["_options"]
+        for index, option in enumerate(options):
+            if option[1] == "resolution":
+                reloaded = (*option[:8], narrowed)
+                options[index] = reloaded
+                self.__dict__["opt"]["resolution"] = reloaded
+                break
 
     def __getattr__(self, key: str) -> object:
         """
