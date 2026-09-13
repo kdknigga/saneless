@@ -66,3 +66,5 @@ enable_empty_page_detection = false
 ```
 
 This is useful when scanning documents where blank pages are intentional (such as forms with designated blank backs).
+
+Empty page detection is the only place saneless judges what is on a page. The scanner backend never discards a page for its content: with detection disabled, a page that is uniformly white or uniformly black is kept and assembled like any other. The only pages the backend skips are the ones it could not read at all -- an image with zero width or height, or a buffer far too small to be a real page -- and each of those is logged individually with its page number. Those are integrity checks rather than blank-page detection: they ask whether the scanner returned a decodable image, never whether the page was worth keeping.
