@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image, ImageDraw
 
+import saneless.scanner.sane_backend as sane_backend_mod
 from saneless.exceptions import (
     PaperlessError,
     PaperlessTimeoutError,
@@ -29,6 +30,7 @@ from saneless.pipeline import (
     run_pipeline,
 )
 from saneless.scanner.base import ScannerBackend
+from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     ErrorCategory,
     JobState,
@@ -36,6 +38,7 @@ from saneless.vocabulary import (
     classify_error,
 )
 from tests.conftest import scan_batch
+from tests.fake_sane import FakeSaneDev, FakeSaneModule
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -767,6 +770,85 @@ class TestManualDuplex:
                 settings=default_settings,
                 request=request,
             )
+
+
+class TestManualDuplexOverTheSharedFake:
+    """
+    A manual duplex run driven through a real SaneBackend (SCNR-07, M-32).
+
+    Every other pipeline test here hands ``run_pipeline`` a
+    ``MagicMock(spec=ScannerBackend)``, which can only ever return what the test
+    already told it to return.  A SANE-level defect on a duplex path -- a source
+    never assigned to the device, a feeder never rewound, a second pass handing
+    back the first pass's sheets -- cannot surface through a mock like that,
+    which is M-32's actual complaint.  This test drives the pipeline through the
+    real backend over the one shared fake, so such a defect can.
+
+    The two passes share one device handle.  ``scan_pages`` opens and closes the
+    device per pass and drains the feeder to its end, so the stack has to be
+    reloaded between them -- which is precisely the physical act manual duplex
+    asks the operator to perform.  The pipeline announces that moment with
+    ``AWAITING_FLIP`` *before* it waits on the flip event, so the status
+    callback is the honest place to do the reload: no second device, no thread,
+    and the reload happens exactly when the operator's would.
+    """
+
+    def test_both_passes_run_through_the_backend_and_interleave(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Three fronts and three backs become six interleaved pages."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        profile = default_settings.profiles["default"]
+        profile.source = "ADF Manual Duplex"
+        # The fake carries the real device's list constraints, which reject an
+        # unlisted value -- so the mode is the device's own spelling.
+        profile.mode = "Color"
+
+        dev = FakeSaneDev()
+        dev.report_sources(["Flatbed", "ADF Manual Duplex"])
+        fronts = [_make_content_image(c) for c in ["red", "green", "blue"]]
+        backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
+        dev.load_feeder(fronts)
+        monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+
+        flip = threading.Event()
+
+        def _reload_the_stack(event: PipelineEvent) -> None:
+            """Put the flipped stack back when the pipeline asks for it."""
+            if event is PipelineEvent.AWAITING_FLIP:
+                dev.load_feeder(backs)
+                flip.set()
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Duplex over the shared fake",
+            status_callback=_reload_the_stack,
+            flip_event=flip,
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
+                scanner=SaneBackend(),
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+            assembled = mock_assemble.call_args[0][0]
+
+        assert len(assembled) == 6
+        assert result.outcome is ScanOutcome.SUCCESS
+        # The backend really drove the device on both passes: the source was
+        # assigned each time, and twelve feeder calls is six start/snap pairs.
+        assert dev.assignments.count("source") == 2
+        assert dev.calls.count("snap") == 6
 
 
 class TestExifStripped:

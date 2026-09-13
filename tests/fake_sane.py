@@ -54,6 +54,7 @@ purpose rather than discovered there.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 from PIL import Image, ImageDraw
@@ -602,6 +603,26 @@ class FakeSaneDev:
     fourth divergent double.
     """
 
+    # The options the default table serves, declared with the types the real
+    # device hands them back as.
+    #
+    # These are annotations only: no value is assigned, so attribute lookup
+    # still falls through to __getattr__ at runtime and the dynamic behaviour is
+    # completely unchanged.  Declaring them is what lets the fake be passed to
+    # production code that expects the ``SaneDevice`` protocol.  The real
+    # python-sane object serves these through __getattr__ too, so a purely
+    # structural check against it can never succeed -- and the three deleted
+    # doubles satisfied the protocol only by declaring concrete attributes the
+    # real library does not have, which is M-32's "fake kinder than the library"
+    # in miniature.
+    mode: str
+    resolution: float
+    source: str
+    tl_x: float
+    tl_y: float
+    br_x: float
+    br_y: float
+
     opt: dict[str, tuple]
     calls: list[str]
     assignments: list[str]
@@ -614,6 +635,8 @@ class FakeSaneDev:
     _start_error_page: int
     _page_index: int
     _page_size: tuple[int, int]
+    _page_images: list[Image.Image]
+    _page_delay: float
     _source_resolution_ranges: dict[str, tuple[float, float, float]]
 
     def __init__(
@@ -656,6 +679,8 @@ class FakeSaneDev:
         state["_start_error_page"] = start_error_page
         state["_page_index"] = 0
         state["_page_size"] = _DEFAULT_PAGE_SIZE
+        state["_page_images"] = []
+        state["_page_delay"] = 0.0
         state["_source_resolution_ranges"] = {}
         state["calls"] = []
         state["assignments"] = []
@@ -711,6 +736,89 @@ class FakeSaneDev:
 
         """
         self.__dict__["_source_resolution_ranges"][source] = constraint
+
+    def load_feeder(self, pages: list[Image.Image]) -> None:
+        """
+        Load exact page images into the feeder, replacing whatever it held.
+
+        ``snap()`` otherwise returns a generated page carrying enough variance
+        to clear the backend's integrity checks, which is right for a test about
+        routing and useless for a test about the checks themselves.  A test that
+        means to feed a zero-dimension sheet, a sheet below the byte floor, or a
+        uniformly blank one has to supply that exact image.
+
+        Loading also rewinds the feeder, which is the physical act it models: a
+        stack taken out and put back in.  That is what makes a two-pass manual
+        duplex run drivable through a single device handle, since each pass
+        opens the device and drains the feeder to its end.
+
+        A method rather than a constructor keyword for the same reason
+        ``narrow_resolution_for_source`` and ``set_page_size`` are methods:
+        ``__init__`` already carries ruff's maximum of five arguments and this
+        project forbids suppressing the rule.
+
+        Args:
+            pages: The images the feeder should hand back, in order.
+
+        """
+        self.__dict__["_page_images"] = list(pages)
+        self.__dict__["_pages"] = len(pages)
+        self.__dict__["_page_index"] = 0
+
+    def set_page_delay(self, seconds: float) -> None:
+        """
+        Make each page take time to arrive, so a timeout can be exercised.
+
+        A scan that is merely slow is a real condition, and the backend's
+        per-page timeout exists precisely for it, so the delay belongs in the
+        device rather than in a bespoke blocking iterator written per test.  A
+        hand-rolled blocking double is what this replaces, and it modelled a
+        device handle -- exactly what D-17 leaves only one of.
+
+        A method rather than a constructor keyword for the usual reason:
+        ``__init__`` already carries ruff's maximum of five arguments.
+
+        Args:
+            seconds: How long each ``start()`` blocks before its page.
+
+        """
+        self.__dict__["_page_delay"] = seconds
+
+    def report_sources(self, sources: list[str]) -> None:
+        """
+        Replace the list constraint the device reports for ``source``.
+
+        The default table carries three realistic source names.  A test needing
+        one outside them -- this project's "ADF Manual Duplex" pseudo-source, or
+        a name chosen to exercise the classifier -- narrows the constraint here
+        rather than by subclassing the fake, which would reintroduce exactly the
+        per-file drift D-17 exists to prevent.
+
+        Args:
+            sources: The source names the device should report.
+
+        """
+        self._replace_constraint("source", list(sources))
+
+    def _replace_constraint(self, name: str, constraint: object) -> None:
+        """
+        Swap one option's constraint, keeping the lookup table consistent.
+
+        Args:
+            name: The hyphenated option name, as ``get_options()`` reports it.
+            constraint: The constraint the device should report from now on.
+
+        """
+        options = self.__dict__["_options"]
+        key = name.replace("-", "_")
+        for index, option in enumerate(options):
+            if option[1] == name:
+                replaced = (*option[:8], constraint)
+                options[index] = replaced
+                self.__dict__["opt"][key] = replaced
+                if isinstance(constraint, list) and constraint:
+                    self.__dict__["_values"][key] = constraint[0]
+                break
 
     def set_page_size(self, width: int, height: int) -> None:
         """
@@ -824,6 +932,8 @@ class FakeSaneDev:
 
         """
         self.calls.append("start")
+        if self._page_delay:
+            time.sleep(self._page_delay)
         if self._page_index >= self._pages:
             raise FakeSaneError(_FEEDER_EMPTY_MESSAGE)
         if self._start_error is not None and self._page_index == self._start_error_page:
@@ -841,11 +951,19 @@ class FakeSaneDev:
             no_cancel: Accepted for signature compatibility; unused.
 
         Returns:
-            The page image.
+            The page image -- the one ``load_feeder()`` supplied for this
+            position, or a generated page when the feeder was not loaded with
+            exact images.
 
         """
         self.calls.append("snap")
-        page = _page_image(self._page_index, self._page_size)
+        loaded = self._page_images
+        index = self._page_index
+        page = (
+            loaded[index]
+            if index < len(loaded)
+            else _page_image(index, self._page_size)
+        )
         self._page_index += 1
         return page
 
