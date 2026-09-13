@@ -200,6 +200,113 @@ class TestPickClosestResolution:
         )
 
 
+class TestPickClosestResolutionHonoursARange:
+    """
+    A range-reporting device gets a resolution it actually offers (D-13, N-01).
+
+    This function returned the target unchanged whenever the word list was
+    empty -- which is precisely what a range-reporting device produces. So the
+    SANE ``test`` backend got 300 not because it offered 300 but because nothing
+    had been read at all, and a device whose ceiling sat below 300 was asked for
+    a resolution it had never advertised.
+
+    A word list is an exhaustive enumeration, so it still wins when present; a
+    range is a span, and the value chosen from it has to be both inside the span
+    and on the step grid, or it is still a value the device never offered.
+    """
+
+    @staticmethod
+    def _assert_on_the_step_grid(
+        result: int, resolution_range: tuple[float, float, float]
+    ) -> None:
+        """
+        Assert a chosen value is inside the range and reachable by its step.
+
+        Args:
+            result: The resolution chosen.
+            resolution_range: The ``(min, max, step)`` the device reported.
+
+        """
+        low, high, step = resolution_range
+        assert low <= result <= high
+        remainder = (result - low) % step
+        assert min(remainder, step - remainder) == pytest.approx(0.0, abs=1e-6)
+
+    @pytest.mark.parametrize(
+        ("resolution_range", "expected"),
+        [
+            ((1.0, 1200.0, 1.0), 300),
+            ((1.0, 200.0, 1.0), 200),
+            ((400.0, 1200.0, 100.0), 400),
+            ((40.0, 1200.0, 100.0), 340),
+        ],
+        ids=[
+            "target-inside-the-range",
+            "clamped-to-the-maximum",
+            "clamped-to-the-minimum",
+            "snapped-onto-the-step",
+        ],
+    )
+    def test_the_value_returned_is_one_the_device_could_accept(
+        self,
+        resolution_range: tuple[float, float, float],
+        expected: int,
+    ) -> None:
+        """
+        Each case clamps into the range and lands on the step grid.
+
+        The last case is deliberately not a tie: 300 sits 2.6 steps above 40, so
+        the nearest reachable value is unambiguously 340. A tie such as 2.5
+        steps would silently encode Python's banker's rounding as though it were
+        a decision about scanners.
+        """
+        result = pick_closest_resolution(
+            [], target=DEFAULT_RESOLUTION, resolution_range=resolution_range
+        )
+
+        assert result == expected
+        self._assert_on_the_step_grid(result, resolution_range)
+
+    def test_a_word_list_still_wins_over_a_range(self) -> None:
+        """An exhaustive enumeration beats a span; list behaviour is unchanged."""
+        result = pick_closest_resolution(
+            [150, 600],
+            target=DEFAULT_RESOLUTION,
+            resolution_range=(1.0, 1200.0, 1.0),
+        )
+
+        assert result in (150, 600)
+
+    def test_a_device_constraining_nothing_still_leaves_the_target_alone(self) -> None:
+        """Neither shape reported means there is nothing to honour."""
+        assert (
+            pick_closest_resolution(
+                [], target=DEFAULT_RESOLUTION, resolution_range=None
+            )
+            == DEFAULT_RESOLUTION
+        )
+
+    def test_generated_profiles_use_a_resolution_the_range_allows(self) -> None:
+        """
+        End to end: a range-only device no longer gets a silent 300.
+
+        A device whose ceiling is 200 dpi would previously have had every
+        generated profile ask for 300 -- a resolution it cannot deliver, which
+        SANE then silently substitutes.
+        """
+        caps = DeviceCapabilities(
+            sources=["Flatbed"],
+            resolutions=[],
+            modes=["Color"],
+            resolution_range=(1.0, 200.0, 1.0),
+        )
+
+        profiles = generate_profiles(caps)
+
+        assert profiles["flatbed"].resolution == 200
+        assert profiles["default"].resolution == 200
+
+
 class TestPickPreferredMode:
     """Mode selection logic."""
 

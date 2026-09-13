@@ -74,16 +74,29 @@ class TestRealSaneTestBackend:
         assert "test:0" in names
 
     def test_capabilities_report_the_long_feeder_name(self) -> None:
-        """
-        The device reports the full ADF source string, not an abbreviation.
-
-        Nothing is asserted about ``resolutions`` here: the device reports
-        resolution as the range ``(1.0, 1200.0, 1.0)`` and ``get_capabilities``
-        returns an empty list for it today.  Plan 24-08 adds that assertion
-        when D-13 makes it true.
-        """
+        """The device reports the full ADF source string, not an abbreviation."""
         capabilities = SaneBackend().get_capabilities("test:0")
         assert "Automatic Document Feeder" in capabilities.sources
+
+    def test_capabilities_report_the_resolution_range_the_device_gave(self) -> None:
+        """
+        SCNR-06 proven against real libsane rather than against a double.
+
+        ``test:0`` constrains resolution with the measured range
+        ``(1.0, 1200.0, 1.0)``.  ``get_capabilities`` read only the word-list
+        shape, so that answer was discarded and this line would have read
+        ``[] == (1.0, 1200.0, 1.0)`` -- this is the assertion plan 24-01
+        deliberately deferred, and the one that would have caught N-01.
+
+        The word list stays empty on purpose.  The device gave a range and no
+        list, the two are different facts, and neither is synthesised from the
+        other: a list expanded out of this range would be saneless's invention
+        rather than the scanner's answer.
+        """
+        capabilities = SaneBackend().get_capabilities("test:0")
+
+        assert capabilities.resolution_range == (1.0, 1200.0, 1.0)
+        assert capabilities.resolutions == []
 
     def test_ten_pages_come_back_through_the_feeder(self) -> None:
         """
