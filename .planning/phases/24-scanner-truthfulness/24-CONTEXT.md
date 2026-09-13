@@ -356,6 +356,45 @@ discussion — **D-01**, **D-07** and **D-14** — and each is called out where 
   leaves old jobs displaying the name that was true when they ran, which is accurate history.
   **No migration task is needed** — and a planner should not invent one.
 
+### Added after pattern mapping (2026-09-13)
+
+Three corrections to figures written above, plus two documentation findings. Each was obtained by
+execution or by enumeration against the tree, not by estimate. No decision changes; the effort
+sizing and two doc targets do.
+
+- **D-12's blast radius is ~2.5× the estimate, confirming it as the highest-risk item in the phase.**
+  Research put it at "the ABC and ~10 fakes". The measured figure is **89 references across 8 test
+  files plus 3 production call sites** — 23 `MagicMock(spec=ScannerBackend)` sites, 25 stub
+  assignments, 6 concrete `scan_pages` definitions, and ~40 `list(...scan_pages(...))` calls in
+  `tests/test_scanner.py` alone. Size D-12 against 89, not 10; it likely warrants its own plan rather
+  than riding along with another decision.
+  - **The type checkers will not find all of them.** Concrete fakes subclass `ScannerBackend` in two
+    files but **duck-type** in `tests/test_cli.py:234` and `tests/test_web.py:63`. Changing the ABC
+    produces no `ty` or `pyrefly` diagnostic at those two sites — they fail at runtime instead.
+    Enumerate the call sites; do not lean on the checkers to find them.
+
+- **D-14's test churn is 41 slug references, not "roughly eight assertions".** The figure in D-14
+  above was counted during discussion from a truncated grep. The measured count in
+  `tests/test_auto_profiles.py` is **41**. The decision stands unchanged — only its cost was
+  understated.
+
+- **The D-17 shared fake is importable only as `from tests.fake_sane import ...`.** The bare
+  `from fake_sane import ...` raises `ModuleNotFoundError` at collection, verified with probe
+  modules. `tests/__init__.py` existing is what makes the package-qualified form work, and
+  `tests/conftest.py:217-231` already documents the sibling-import failure for `from conftest
+  import`. RESEARCH.md's phrasing ("importable by both") holds only in the qualified form — and the
+  bare form is the natural thing to write. Use the qualified import.
+
+- **`docs/how-to/configure-scan-profiles.md:128` carries a slug claim that has never been true.** It
+  advertises `flatbed-color-300` and `adf-gray-150` as generated profile names; no version of
+  `source_to_slug` has ever produced that shape. It is false today and remains false after D-14, and
+  it is named nowhere in the decisions above. Correct it in-phase with the other doc sentences.
+
+- **`docs/how-to/scanner-host-discovery.md` needs no correction.** The phase goal's wording — "with
+  the scanner-discovery and ADF docs corrected in-phase" — implies work there. The page was read end
+  to end and its claims match `sane_backend.py:250-257`. **The planner must not invent a correction
+  task for it.** The ADF and profile pages are where the real documentation work is.
+
 ### Claude's Discretion
 
 Genuinely open to the planner. Make the call and record the reasoning in the plan:
