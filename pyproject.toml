@@ -137,11 +137,21 @@ docstring-code-line-length = "dynamic"
 [tool.ty.src]
 
 [tool.pyrefly]
+# "src" must come first. Pyrefly infers a single import root from the project
+# layout ("src"), which leaves `tests` unresolvable -- `tests/test_scanner.py`
+# imports the shared fake as `tests.fake_sane`, the only form that works under
+# pytest 9's importlib mode. Adding "." alone is not the fix: it lets
+# `src/saneless` resolve as both `saneless.*` and `src.saneless.*`, and the two
+# identities are not assignable to each other (measured: 14 bad-argument-type
+# errors). Listing "src" first pins each source file to one module name and
+# leaves "." to resolve `tests` only.
+search-path = ["src", "."]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "browser: Playwright browser tests (requires chromium)",
+    "sane_hardware: tests that drive the real SANE test backend (requires libsane-dev)",
 ]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 strict_markers = true

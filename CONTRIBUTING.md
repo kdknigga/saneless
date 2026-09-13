@@ -64,7 +64,7 @@ two parallel jobs in `.github/workflows/ci.yml`:
 | `lint` | `uv run ruff format --check .` |
 | `lint` | `uv run ty check` |
 | `lint` | `uv run pyrefly check src tests` |
-| `test` | `uv run pytest -m "not browser"` |
+| `test` | `uv run pytest -m "not browser and not sane_hardware"` |
 
 You can reproduce the gate exactly, in the same order, with:
 
@@ -73,7 +73,7 @@ uv run ruff check .
 uv run ruff format --check .
 uv run ty check
 uv run pyrefly check src tests
-uv run pytest -m "not browser"
+uv run pytest -m "not browser and not sane_hardware"
 ```
 
 All five must exit 0. Fix what they report -- do not silence them. `# noqa`,
@@ -82,6 +82,12 @@ clean because they do not always report the same issues for the same code.
 
 The `browser` marker deselects the Playwright tests, which need a real Chromium
 install. Run those locally with `uv run pytest -m browser` when you touch the web UI.
+
+The `sane_hardware` marker deselects the tests that drive the real SANE `test`
+backend through a `SANE_CONFIG_DIR` pointed at a temporary `dll.conf`. Run those
+locally with `uv run pytest -m sane_hardware` when you touch the scanner layer. No
+extra apt package is needed: `libsane-dev` depends on `libsane1`, which ships
+`libsane-test.so.1`, and both CI jobs already install it.
 
 A test that hangs is not allowed to hang the run: `pytest-timeout` is configured in
 `pyproject.toml` with `timeout = 60` and `timeout_method = "signal"`, so a stuck test
@@ -110,8 +116,7 @@ as inspecting what a commit is about to run.
 formatter, the linter and both type checkers, but the type checkers only cover `src/`
 there. For the full type check over `src/` and `tests/`, run
 `uv run prek run --stage pre-push --all-files`. prek does not run the test suite at
-any stage, so run `uv run pytest -m "not browser"` too, or just run the five commands
-above.
+any stage, so run the five commands above as well.
 
 ## Where the type checkers run
 
