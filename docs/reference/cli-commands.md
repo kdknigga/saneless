@@ -48,7 +48,7 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--json` | flag | off | Output device list as JSON |
-| `--capabilities` | flag | off | Show raw SANE options for each device |
+| `--capabilities` | flag | off | Show each device's sources, modes and resolution support — either a list of values or a minimum/maximum/step range, whichever the device reports — plus its raw SANE option names |
 
 **Exit codes:**
 
