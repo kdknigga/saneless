@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -36,10 +37,11 @@ def _make_content_image(
     width: int = 200, height: int = 300, color: str = "red"
 ) -> Image.Image:
     """
-    Create a test image with mixed content that passes validation.
+    Create a test image with mixed content, comfortably above _MIN_PAGE_BYTES.
 
-    Uses drawing operations to ensure non-trivial pixel variance,
-    passing the scanner-level pure white/black checks.
+    Uses drawing operations to give the image non-trivial pixel variance, so a
+    test can tell a real page apart from a uniformly blank one.  The backend no
+    longer judges content, so variance is no longer required to survive a scan.
     """
     img = Image.new("RGB", (width, height), color)
     draw = ImageDraw.Draw(img)
@@ -917,8 +919,18 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
 
-    def test_pure_white_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
-        """Pure white image (255,255,255) is skipped at scanner level."""
+    def test_pure_white_page_survives(self, mock_sane_module: MockSaneModule) -> None:
+        """
+        A uniformly white page reaches the caller instead of being discarded.
+
+        python-sane expands 1-bit lineart to 0 and 255 bytes, so a clean blank
+        page is exactly mean 255.0 / stddev 0.0 -- which is precisely what the
+        deleted scanner-level check keyed on.  Those statistics are still how a
+        blank page is recognised; what changed is *where*.  The decision now
+        belongs to ``pipeline._drop_empty_pages``, under the profile's
+        ``enable_empty_page_detection`` toggle, where the user can see it and
+        turn it off (M-14, D-05).
+        """
         mock_dev = mock_sane_module._mock_dev
         white_img = Image.new("RGB", (200, 300), (255, 255, 255))
         normal_img = _make_content_image()
@@ -927,10 +939,19 @@ class TestSaneBackendPageValidation:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         pages = list(backend.scan_pages("test:device:001", settings))
-        assert len(pages) == 1
+        assert len(pages) == 2
+        # The blank itself survived, rather than the content page arriving twice.
+        assert pages[0].convert("L").getextrema() == (255, 255)
 
-    def test_pure_black_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
-        """Pure black image (0,0,0) is skipped at scanner level."""
+    def test_pure_black_page_survives(self, mock_sane_module: MockSaneModule) -> None:
+        """
+        A uniformly black page reaches the caller instead of being discarded.
+
+        This is the defect the real SANE ``test`` backend exposed end to end:
+        its default picture is solid black, so every page of a ten-sheet stack
+        was destroyed by the backend before the pipeline ever saw it.  Judging
+        content is not the scanner layer's job (M-14, D-05).
+        """
         mock_dev = mock_sane_module._mock_dev
         black_img = Image.new("RGB", (200, 300), (0, 0, 0))
         normal_img = _make_content_image()
@@ -939,7 +960,8 @@ class TestSaneBackendPageValidation:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         pages = list(backend.scan_pages("test:device:001", settings))
-        assert len(pages) == 1
+        assert len(pages) == 2
+        assert pages[0].convert("L").getextrema() == (0, 0)
 
     def test_normal_content_page_passes(self, mock_sane_module: MockSaneModule) -> None:
         """Image with mixed content passes all validation checks."""
@@ -978,6 +1000,91 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
         assert "exif" not in pages[0].info
+
+
+class TestIntegrityFailuresAreSkippedAndCounted:
+    """
+    One unreadable page costs one page; a wholly unreadable batch raises.
+
+    Raising on the first integrity failure was rejected in D-06: it would make
+    "every returned page is readable" true by construction, but it fails a
+    fifty-sheet job over one bad sheet, and partial-result recovery belongs to
+    Phase 29's HARD-02.
+
+    A batch in which *every* page was rejected must not return an empty list
+    either.  The pipeline would hand that straight to ``assemble_pdf([])`` and
+    record a job that produced nothing as a success, which is M-14's third
+    consequence and the reason it prescribes a raise.
+    """
+
+    def test_a_mid_stack_integrity_failure_costs_exactly_one_page(
+        self, mock_sane_module: MockSaneModule, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A zero-dimension third sheet is skipped and named; four survive."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = [
+            _make_content_image(),
+            _make_content_image(),
+            Image.new("RGB", (0, 0)),
+            _make_content_image(),
+            _make_content_image(),
+        ]
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        with caplog.at_level(logging.WARNING):
+            pages = list(backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 4
+        skips = [r for r in caplog.records if "skipping" in r.getMessage()]
+        assert len(skips) == 1
+        assert "Page 3" in skips[0].getMessage()
+
+    def test_a_wholly_rejected_batch_raises_rather_than_yielding_nothing(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """Three unreadable sheets raise ScanError naming how many were fed."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = [Image.new("RGB", (0, 0)) for _ in range(3)]
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+
+        with pytest.raises(ScanError) as exc_info:
+            list(backend.scan_pages("test:device:001", settings))
+
+        assert "3" in str(exc_info.value)
+        # Distinct condition from an empty feeder: paper *was* fed, and the
+        # operator needs to be told it was unreadable rather than absent.
+        assert not isinstance(exc_info.value, FeederEmptyError)
+
+    def test_a_zero_page_feeder_still_raises_feeder_empty(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """No paper at all stays FeederEmptyError, not the all-rejected error."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = []
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+
+        with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
+            list(backend.scan_pages("test:device:001", settings))
+
+    def test_a_clean_stack_logs_no_skip_warning(
+        self, mock_sane_module: MockSaneModule, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Five readable sheets yield five pages and no skip warning at all."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = [_make_content_image() for _ in range(5)]
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        with caplog.at_level(logging.WARNING):
+            pages = list(backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 5
+        assert not [r for r in caplog.records if "skipping" in r.getMessage()]
 
 
 class TestAutoSourceRouting:

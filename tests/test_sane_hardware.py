@@ -89,25 +89,40 @@ class TestRealSaneTestBackend:
         """
         Ten sheets in the feeder yield ten pages.
 
-        **This test is expected to fail when it is committed, and that is the
-        point.** The ``test`` backend's default picture is solid black, so
-        today's ``_validate_page_image`` discards every acquired page as
-        "pure black" and ``scan_pages`` returns nothing.  The measured
-        failure is ``assert 0 == 10`` accompanied by ten
-        ``Page N: pure black (mean=0.0, stddev=0.0), skipping`` warnings.
+        This assertion could not have passed before plan 24-04, and that is
+        what makes it worth having.  The ``test`` backend's default picture is
+        solid black, and the scanner backend used to discard any page whose
+        statistics read as pure black -- so all ten sheets were destroyed
+        inside ``scan_pages``, this line read ``assert 0 == 10``, and ten skip
+        warnings named the pages one by one.
 
-        The feeder name and the routing are already correct; it is the
-        content policy that destroys the scan.  Plan 24-04's D-05 removes the
-        pure-black check and turns this green.
-
-        It is deliberately left as a plain failure rather than registered as
-        an expected one.  Strict expected-failure handling is enabled in this
-        project, so registering it would flip the result to an error the
-        moment D-05 landed -- and, worse, it would record a defect as
-        intended behaviour.
+        What it proves now is that the feeder is drained end to end against
+        real libsane: the long ADF source name routes to the multi-page path,
+        ten sheets are taken off it, and nothing is thrown away on the way
+        out.  The assertion is unchanged from the day it was written; only the
+        behaviour underneath it moved (D-05).
         """
         settings = ScanSettings(
             source="Automatic Document Feeder", resolution=75, mode="Gray"
         )
         pages = list(SaneBackend().scan_pages("test:0", settings))
         assert len(pages) == 10
+
+    def test_every_uniformly_black_page_survives_the_scanner_layer(self) -> None:
+        """
+        All ten pages come back, and every one of them is uniformly black.
+
+        SCNR-03 proven against real hardware instead of against a double.  The
+        ``test`` backend hands back solid black at mean 0.0 / stddev 0.0 --
+        exactly the statistics the deleted content policy keyed on -- so this
+        is the strongest evidence available that the scanner layer no longer
+        judges a page by what is printed on it.  Whether a blank page is worth
+        keeping is decided one layer up, under the profile's
+        ``enable_empty_page_detection`` toggle, where the user can see it.
+        """
+        settings = ScanSettings(
+            source="Automatic Document Feeder", resolution=75, mode="Gray"
+        )
+        pages = list(SaneBackend().scan_pages("test:0", settings))
+        assert len(pages) == 10
+        assert all(page.convert("L").getextrema() == (0, 0) for page in pages)
