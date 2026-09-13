@@ -56,7 +56,7 @@ class MockSaneDev:
     def __init__(self) -> None:
         """Initialize mock device with default settings."""
         self.mode = "color"
-        self.resolution = 300
+        self.resolution: float = 300.0
         self.source = "Flatbed"
         self.tl_x: float = 0.0
         self.tl_y: float = 0.0
@@ -182,7 +182,7 @@ class _FakeSaneDevice:
     ) -> None:
         """Initialize fake device with pluggable multi_scan, cancel, close."""
         self.mode: str = "color"
-        self.resolution: int = 300
+        self.resolution: float = 300.0
         self.source: str = "Flatbed"
         self.tl_x: float = 0.0
         self.tl_y: float = 0.0
@@ -1291,7 +1291,7 @@ class _NoGeometryDevice:
     def __init__(self, pages: list[Image.Image] | None = None) -> None:
         """Initialize device that rejects geometry options."""
         self.mode: str = "color"
-        self.resolution: int = 300
+        self.resolution: float = 300.0
         self.source: str = "Flatbed"
         self._pages = pages or [_make_content_image()]
 
@@ -1641,7 +1641,7 @@ class TestFakeSaneContract:
         assert dev.tl_x == 5.0
 
     def test_resolution_reads_back_as_float(self) -> None:
-        """The real device returns float, so the Protocol's ``int`` is a lie."""
+        """The real device returns float, which the Protocol now declares (D-11)."""
         dev = FakeSaneDev()
         dev.resolution = 300
         assert isinstance(dev.resolution, float)
@@ -1801,7 +1801,12 @@ class TestDeviceOptionOrdering:
 
         list(backend.scan_pages("test:0", settings))
 
-        assert 1.0 <= dev.resolution <= 600.0
+        # ``__getattr__`` is typed ``object``, as the real dynamic option
+        # lookup is; isinstance narrows it without a cast or a suppression,
+        # and doubles as the assertion that the device reports a float.
+        resolution = dev.resolution
+        assert isinstance(resolution, float)
+        assert 1.0 <= resolution <= 600.0
 
 
 class TestResolutionReadBack:

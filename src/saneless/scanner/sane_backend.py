@@ -440,9 +440,24 @@ def _configure_device(
     effective_source: str,
     *,
     has_source_option: bool,
-) -> None:
+) -> int:
     """
-    Assign the scan options to the open device.
+    Assign the scan options to the open device, source first (D-11).
+
+    **Order is load-bearing.**  ``sane.py:188-213`` reloads every option
+    descriptor when a ``set_option`` reports ``INFO_RELOAD_OPTIONS``, and a
+    source change does exactly that.  Setting the source last therefore lets a
+    resolution validated against the platen's constraint be stranded under a
+    feeder's narrower one.  Asking the device what it is scanning *from* before
+    telling it *how* removes that whole class of failure.  Geometry is set
+    afterwards, by ``_set_geometry`` in the caller.
+
+    The resolution is then read back, because SANE substitutes silently:
+    measured against the real ``test`` backend, ``5000`` comes back as
+    ``1200.0`` and ``0`` as ``1.0``, with no error and no signal to the caller.
+    Since Phase 23 made the resolution authoritative for the PDF's page
+    geometry, an unnoticed substitution yields both a mis-cropped page and a
+    wrong MediaBox, so the substitution has to be visible (M-16, T-24-15).
 
     Args:
         dev: Open SANE device handle.
@@ -452,18 +467,34 @@ def _configure_device(
             all.  Keyword-only, because a positional boolean is not allowed by
             this project's lint rules.
 
+    Returns:
+        The resolution the device actually reports, as an ``int``.  The device
+        returns a float; callers downstream want whole dpi.
+
     """
-    dev.mode = settings.mode
-    dev.resolution = settings.resolution
     if has_source_option:
         dev.source = effective_source
+    dev.mode = settings.mode
+    dev.resolution = settings.resolution
+
+    actual_resolution = int(dev.resolution)
+    if actual_resolution != settings.resolution:
+        logger.warning(
+            "Scanner substituted resolution: requested %s dpi, device reports %s dpi",
+            settings.resolution,
+            actual_resolution,
+        )
+    return actual_resolution
 
 
 class SaneDevice(Protocol):
     """Protocol describing the SANE device handle interface."""
 
     mode: str
-    resolution: int
+    # The device returns a float -- measured, not assumed: 300 reads back as
+    # 300.0 and 5000 as 1200.0.  This was declared ``int`` for three phases,
+    # which made every read-back a quiet lie to the type checker.
+    resolution: float
     source: str
     tl_x: float
     tl_y: float
