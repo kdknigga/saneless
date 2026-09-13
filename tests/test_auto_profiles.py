@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import TYPE_CHECKING
 
@@ -343,6 +344,135 @@ class TestGenerateProfilesAutoSource:
     def test_flatbed_no_regression(self) -> None:
         """Flatbed source slugs to flatbed (no regression)."""
         assert source_to_slug("Flatbed") == "flatbed"
+
+
+class TestGenerateProfilesUsesClassifier:
+    """generate_profiles asks classify_source, not its own string rules."""
+
+    def test_auto_spelled_with_surrounding_whitespace(self) -> None:
+        """
+        " AUTO " still receives the auto_source_mode treatment (D-02, Q9).
+
+        The rule this replaces was ``source.lower() == "auto"``, which a device
+        reporting stray whitespace defeats: " auto " is not "auto", so the
+        source fell through to the flatbed default and a single-source Auto
+        scanner was told to behave as a flatbed. classify_source strips before
+        comparing, so every spelling reaches the same branch.
+        """
+        caps = DeviceCapabilities(
+            sources=[" AUTO "],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["auto"].auto_source_mode == "adf"
+
+    def test_auto_spelled_lowercase(self) -> None:
+        """
+        A lowercase "auto" receives the auto_source_mode treatment.
+
+        This spelling was already handled by the equality rule -- it is
+        asserted so the swap to classify_source cannot quietly regress it.
+        """
+        caps = DeviceCapabilities(
+            sources=["auto"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["auto"].auto_source_mode == "adf"
+
+    def test_duplex_feeder_is_not_mistaken_for_a_flatbed(self) -> None:
+        """
+        "Flatbed Duplex" is a duplex feeder, so it never backs the default.
+
+        The rule this replaces asked ``"flatbed" in s.lower()``, which is true
+        of "Flatbed Duplex" -- so a duplex feeder became the flatbed-backed
+        default profile, and an Auto source beside it was told to behave as a
+        flatbed. classify_source tests duplex before flatbed, deliberately, and
+        answers FEEDER_DUPLEX.
+        """
+        caps = DeviceCapabilities(
+            sources=["Auto", "Flatbed Duplex"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert "default" not in profiles
+        assert profiles["auto"].auto_source_mode == "adf"
+
+    def test_real_flatbed_still_backs_the_default_profile(self) -> None:
+        """A genuine Flatbed source still becomes the default profile."""
+        caps = DeviceCapabilities(
+            sources=["Flatbed", "ADF"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["default"].source == "Flatbed"
+
+    def test_feeder_only_device_has_no_default_profile(self) -> None:
+        """A device reporting no flatbed source gets no default profile."""
+        caps = DeviceCapabilities(
+            sources=["Automatic Document Feeder"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert "default" not in profiles
+
+
+class TestGenerateProfilesSlugCollision:
+    """Two names that normalise alike both survive, with a tie-break (Q5)."""
+
+    _COLLIDING = ("ADF-Front", "ADF Front")
+
+    def _caps(self) -> DeviceCapabilities:
+        """Capabilities whose two source names normalise to the same slug."""
+        return DeviceCapabilities(
+            sources=list(self._COLLIDING),
+            resolutions=[300],
+            modes=["Color"],
+        )
+
+    def test_both_sources_survive_with_a_suffix(self) -> None:
+        """The first claimant keeps the bare slug; the second gains "-2"."""
+        profiles = generate_profiles(self._caps())
+        assert set(profiles) == {"adf-front", "adf-front-2"}
+        assert profiles["adf-front"].source == "ADF-Front"
+        assert profiles["adf-front-2"].source == "ADF Front"
+
+    def test_no_source_is_silently_lost(self) -> None:
+        """
+        N distinct source strings yield N profiles.
+
+        The assignment was unguarded, so the second collider overwrote the
+        first and the device lost a source -- which is N-09's actual complaint.
+        """
+        profiles = generate_profiles(self._caps())
+        assert len(profiles) == len(self._COLLIDING)
+
+    def test_tie_break_follows_source_order_and_is_deterministic(self) -> None:
+        """Generating twice from the same capabilities yields identical slugs."""
+        assert list(generate_profiles(self._caps())) == list(
+            generate_profiles(self._caps())
+        )
+
+    def test_collision_warning_names_both_sources(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The WARNING names both colliding source strings and the new slug."""
+        with caplog.at_level(logging.WARNING, logger="saneless.auto_profiles"):
+            generate_profiles(self._caps())
+
+        message = "\n".join(
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+        assert "ADF-Front" in message
+        assert "ADF Front" in message
+        assert "adf-front-2" in message
 
 
 class TestAutoGeneratedField:
