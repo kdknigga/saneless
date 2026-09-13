@@ -24,6 +24,7 @@ from saneless.scanner.base import (
     classify_source,
 )
 from saneless.scanner.sane_backend import SaneBackend
+from tests.fake_sane import FakeSaneDev, FakeSaneError, FakeSaneModule
 
 # ---------------------------------------------------------------------------
 # Mock helpers
@@ -1178,3 +1179,246 @@ class TestPaperSizeCropFallback:
         assert len(pages) == 2
         for page in pages:
             assert page.size == (2480, 3507)
+
+
+# ---------------------------------------------------------------------------
+# D-17: the shared fake and the measured python-sane contract
+# ---------------------------------------------------------------------------
+
+
+class TestFakeSaneContract:
+    """
+    The shared fake models python-sane 2.9.2's measured behaviour.
+
+    The rows asserted here are RESEARCH.md Finding 7's contract table, which
+    was executed against the real library rather than inferred.  Each of the
+    three hand-written doubles in this module got at least one row wrong, and
+    every wrong row let a shipped defect earn a green test -- most visibly
+    ``_NoGeometryDevice``, which *raises* on an unknown option where the real
+    library *stores* it, so the crop fallback it was written to prove could
+    never actually be reached.
+
+    The table is parametrised rather than written out one test per row so that
+    a future row cannot be added to the fake without also being asserted here.
+    """
+
+    @pytest.mark.parametrize(
+        ("option", "value", "expected", "fragment"),
+        [
+            # Row 2: a bad value for a known option with a list constraint.
+            ("source", "Nope", FakeSaneError, "Invalid argument"),
+            ("mode", "Sepia", FakeSaneError, "Invalid argument"),
+            # Row 3: the wrong Python type, rejected by the C layer before
+            # SANE ever sees it.  CONTEXT.md does not name this row.
+            (
+                "resolution",
+                "banana",
+                TypeError,
+                "SANE_FIXED requires a floating point number",
+            ),
+            (
+                "tl_x",
+                "banana",
+                TypeError,
+                "SANE_FIXED requires a floating point number",
+            ),
+            # Row 4: read-only attributes, buttons, groups, inactive and
+            # not-software-settable options.
+            ("dev", 1, AttributeError, "Read-only attribute: dev"),
+            (
+                "area",
+                ((0.0, 0.0), (1.0, 1.0)),
+                AttributeError,
+                "Read-only attribute: area",
+            ),
+            ("optlist", [], AttributeError, "Read-only attribute: optlist"),
+            (
+                "scan_button",
+                1,
+                AttributeError,
+                "Buttons don't have values: scan_button",
+            ),
+            (
+                "geometry_group",
+                1,
+                AttributeError,
+                "Groups don't have values: geometry_group",
+            ),
+            ("inactive_opt", "x", AttributeError, "Inactive option: inactive_opt"),
+            (
+                "readonly_opt",
+                "x",
+                AttributeError,
+                "Option can't be set by software: readonly_opt",
+            ),
+        ],
+    )
+    def test_setattr_follows_the_measured_contract(
+        self,
+        option: str,
+        value: object,
+        expected: type[BaseException],
+        fragment: str,
+    ) -> None:
+        """Each assignment row raises its measured exception and message."""
+        dev = FakeSaneDev()
+        with pytest.raises(expected) as exc_info:
+            setattr(dev, option, value)
+        assert fragment in str(exc_info.value)
+
+    def test_unknown_option_is_stored_silently(self) -> None:
+        """
+        Row 1, the inverse of ``_NoGeometryDevice``.
+
+        The real ``SaneDev.__setattr__`` stores an unrecognised name straight
+        into ``__dict__`` and returns: no device call, no validation, no
+        raise.  This is precisely why ``_set_geometry`` always returned True.
+        """
+        dev = FakeSaneDev()
+        dev.no_such_option = 1
+        assert dev.no_such_option == 1
+
+    @pytest.mark.parametrize(
+        ("name", "fragment"),
+        [
+            ("scan_button", "Buttons don't have values: scan_button"),
+            ("geometry_group", "Groups don't have values: geometry_group"),
+            ("inactive_opt", "Inactive option: inactive_opt"),
+            ("definitely_absent", "No such attribute: definitely_absent"),
+        ],
+    )
+    def test_getattr_follows_the_measured_contract(
+        self, name: str, fragment: str
+    ) -> None:
+        """Reading a button, group, inactive or absent name raises."""
+        dev = FakeSaneDev()
+        with pytest.raises(AttributeError) as exc_info:
+            getattr(dev, name)
+        assert fragment in str(exc_info.value)
+
+    def test_multi_scan_returns_an_iterator(self) -> None:
+        """``multi_scan()`` hands back something with ``__next__``."""
+        dev = FakeSaneDev(pages=3)
+        assert hasattr(dev.multi_scan(), "__next__")
+
+    def test_multi_scan_cannot_raise(self) -> None:
+        """
+        ``multi_scan()`` only constructs the iterator, so it never raises.
+
+        The real method is a one-line ``return _SaneIterator(self)``.  A
+        double that raises here makes the backend's ``try``/``except`` around
+        the call look meaningful when it is in fact unreachable.
+        """
+        dev = FakeSaneDev(pages=3, start_error=FakeSaneError("Document feeder jammed"))
+        iterator = dev.multi_scan()
+        with pytest.raises(FakeSaneError) as exc_info:
+            next(iterator)
+        assert "Document feeder jammed" in str(exc_info.value)
+
+    def test_iterator_calls_start_then_snap_once_per_page(self) -> None:
+        """The iterator drives start()/snap() per page, not ``iter(list)``."""
+        dev = FakeSaneDev(pages=2)
+        pages = list(dev.multi_scan())
+        assert len(pages) == 2
+        # The trailing "start" is not an off-by-one: the real iterator learns
+        # the feeder is empty only by calling start() one more time and
+        # catching the message it raises.  A double built on iter(list) hides
+        # that probe, and with it the only place D-03's message handling runs.
+        assert dev.calls == ["start", "snap", "start", "snap", "start"]
+
+    def test_page_budget_is_honoured(self) -> None:
+        """A three-sheet feeder yields exactly three pages."""
+        dev = FakeSaneDev(pages=3)
+        assert len(list(dev.multi_scan())) == 3
+
+    def test_out_of_documents_becomes_stop_iteration(self) -> None:
+        """The one message the iterator converts to StopIteration."""
+        dev = FakeSaneDev(
+            pages=5,
+            start_error=FakeSaneError("Document feeder out of documents"),
+        )
+        assert list(dev.multi_scan()) == []
+
+    def test_an_empty_feeder_stops_immediately(self) -> None:
+        """A zero-sheet feeder stops without yielding."""
+        dev = FakeSaneDev(pages=0)
+        assert list(dev.multi_scan()) == []
+
+    def test_a_jam_propagates_out_of_next(self) -> None:
+        """Any other message propagates rather than ending the scan."""
+        dev = FakeSaneDev(pages=5, start_error=FakeSaneError("Document feeder jammed"))
+        with pytest.raises(FakeSaneError):
+            list(dev.multi_scan())
+
+    def test_get_options_reports_a_realistic_feeder_name(self) -> None:
+        """The default table carries the long real-world feeder name (C-06)."""
+        dev = FakeSaneDev()
+        constraints = {opt[1]: opt[8] for opt in dev.get_options()}
+        assert "Automatic Document Feeder" in constraints["source"]
+
+    def test_get_options_reports_resolution_as_a_range(self) -> None:
+        """Resolution is a ``(min, max, step)`` range, never a list (N-01)."""
+        dev = FakeSaneDev()
+        constraints = {opt[1]: opt[8] for opt in dev.get_options()}
+        assert constraints["resolution"] == (1.0, 1200.0, 1.0)
+
+    def test_option_names_use_hyphens_but_attributes_use_underscores(self) -> None:
+        """D-09's presence check reads ``tl-x``; assignment writes ``tl_x``."""
+        dev = FakeSaneDev()
+        assert "tl-x" in [opt[1] for opt in dev.get_options()]
+        dev.tl_x = 5.0
+        assert dev.tl_x == 5.0
+
+    def test_resolution_reads_back_as_float(self) -> None:
+        """The real device returns float, so the Protocol's ``int`` is a lie."""
+        dev = FakeSaneDev()
+        dev.resolution = 300
+        assert isinstance(dev.resolution, float)
+        assert dev.resolution == 300.0
+
+    @pytest.mark.parametrize(
+        ("requested", "expected"),
+        [(5000, 1200.0), (0, 1.0), (150, 150.0)],
+    )
+    def test_resolution_clamps_silently(self, requested: int, expected: float) -> None:
+        """A range constraint clamps and reports success -- it never raises."""
+        dev = FakeSaneDev()
+        dev.resolution = requested
+        assert dev.resolution == expected
+
+    def test_area_reflects_the_geometry_clamp(self) -> None:
+        """An A4 box against a 200mm device clamps, exactly as measured."""
+        dev = FakeSaneDev(geometry_range=(0.0, 200.0, 1.0))
+        dev.tl_x = 0.0
+        dev.tl_y = 0.0
+        dev.br_x = 210.0
+        dev.br_y = 297.0
+        assert dev.area == ((0.0, 0.0), (200.0, 200.0))
+
+    def test_a_narrowed_constraint_rejects_a_previously_legal_value(self) -> None:
+        """The option table is injectable, so a plan can narrow a constraint."""
+        dev = FakeSaneDev(
+            options=[(1, "mode", "Scan mode", "Mode desc", 3, 0, 1, 5, ["Color"])]
+        )
+        with pytest.raises(FakeSaneError) as exc_info:
+            dev.mode = "Lineart"
+        assert "Invalid argument" in str(exc_info.value)
+
+    def test_error_type_mirrors_the_real_error_mro(self) -> None:
+        """``_sane.error`` subclasses Exception directly, not OSError."""
+        assert issubclass(FakeSaneError, Exception)
+        assert not issubclass(FakeSaneError, OSError)
+
+    def test_module_open_returns_the_shared_device(self) -> None:
+        """``open()`` hands back one device, so a test can configure it."""
+        module = FakeSaneModule()
+        assert module.init() == (1, 0, 3)
+        assert module.init_call_count == 1
+        assert module.open("test:0") is module.open("test:0")
+
+    def test_module_reports_four_element_device_tuples(self) -> None:
+        """``get_devices()`` matches the real ``(name, vendor, model, type)``."""
+        devices = FakeSaneModule().get_devices()
+        assert devices
+        for entry in devices:
+            assert len(entry) == 4
