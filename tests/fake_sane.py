@@ -949,12 +949,20 @@ class FakeSaneDev:
 
         """
         self.calls.append("start")
-        if self._page_delay:
-            time.sleep(self._page_delay)
-        if self._page_index >= self._pages:
-            raise FakeSaneError(_FEEDER_EMPTY_MESSAGE)
+        # The armed error is checked before the page budget so that arming it
+        # at the index one past the last page -- the end-of-feed probe -- is
+        # reachable at all.  With the budget first, ``FakeSaneDev(pages=3,
+        # start_error=..., start_error_page=3)`` never fired: the test quietly
+        # became a clean-feed test rather than failing as a misconfiguration.
         if self._start_error is not None and self._page_index == self._start_error_page:
             raise self._start_error
+        if self._page_index >= self._pages:
+            # No delay on this path: the end-of-feed probe is not a page being
+            # scanned.  Charging it one made the wall-clock arithmetic in the
+            # per-page timeout tests wrong by a whole delay.
+            raise FakeSaneError(_FEEDER_EMPTY_MESSAGE)
+        if self._page_delay:
+            time.sleep(self._page_delay)
 
     def snap(self, *, no_cancel: bool = False) -> Image.Image:
         """
