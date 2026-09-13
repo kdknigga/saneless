@@ -137,7 +137,9 @@ Profile names come from your scanner's own source names, lowercased and reduced 
 saneless auto-profiles --force
 ```
 
-Regenerating can rename profiles, so if you pass `--profile` in a script or a cron entry, check the name still matches. Auto-generated profiles that a new run no longer produces are removed, so a rename does not leave a stale duplicate behind. Profiles you wrote yourself are never touched.
+Regenerating can rename profiles, so if you pass `--profile` in a script or a cron entry, check the name still matches.
+
+`auto-profiles` always writes a `default` profile -- backed by your scanner's flatbed if it has one, and otherwise by the first source the scanner reports -- and regenerating never removes it. saneless requires that profile, and a config without it is one saneless refuses to load. Every other auto-generated profile a new run no longer produces is removed, so a rename does not leave a stale duplicate behind. Profiles you wrote yourself are never touched.
 
 See [CLI Commands](../reference/cli-commands.md) for full `auto-profiles` documentation.
 
