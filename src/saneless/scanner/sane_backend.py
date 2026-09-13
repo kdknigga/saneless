@@ -279,6 +279,22 @@ def _acquire_pages(
     from "it failed on iteration zero" is what made a jam, an open cover and a
     busy device all tell the operator to load paper (M-11, D-03).
 
+    A page that fails its integrity checks is skipped and counted, not fatal:
+    one corrupt sheet must not fail a fifty-sheet job (D-06).  A batch in which
+    *every* fed page was rejected does raise, because returning an empty list
+    would reach ``assemble_pdf([])`` and record a job that produced nothing as
+    a success.
+
+    **D-08, accepted and recorded deliberately.** One skipped front makes
+    ``len(front_pages) != len(back_pages)``, which ``pipeline.py`` routes to
+    ``_handle_duplex_mismatch`` -- two partial PDFs plus a warning instead of
+    one interleaved document.  That is the honest response: a page the device
+    could not read genuinely means the two manual-duplex passes no longer
+    correspond.  SCNR-03's "manual duplex page parity survives" forbids parity
+    broken by *policy* -- the backend silently discarding a clean blank back
+    page -- and not parity broken by a page that could not be read at all.
+    Parity broken that way is reported, never hidden.
+
     Args:
         dev: Open SANE device handle.
         timeout_per_page: Maximum seconds to wait for each page.
@@ -288,13 +304,21 @@ def _acquire_pages(
 
     Raises:
         FeederEmptyError: If the feeder produced no pages at all.
-        ScanError: If a page times out, the device reports a fault, or the
-            page count runs past ``_MAX_ADF_PAGES``.
+        ScanError: If a page times out, the device reports a fault, the page
+            count runs past ``_MAX_ADF_PAGES``, or every fed page failed its
+            integrity checks.
 
     """
     iterator = dev.multi_scan()
 
     page_num = 0
+    # Kept local on purpose. Surfacing this count to the user is D-07, and its
+    # channel is D-12's result object, which plan 24-07 builds. It is
+    # deliberately kept out of the pipeline's blank-page removal count: Phase 23
+    # defined that field as empty-page detection and Phase 30 renders it to
+    # users as "pages removed as blank", so reporting a corrupt page through it
+    # would be a new small lie in a phase about removing them.
+    rejected_pages = 0
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         while True:
@@ -328,6 +352,9 @@ def _acquire_pages(
             # Integrity only: nonzero dimensions and minimum raw size. Whether
             # the page is worth keeping is the pipeline's decision, not ours.
             if not _validate_page_image(page_image, page_num):
+                # Skip and count, never abort. The per-page WARNING naming the
+                # page number and the reason comes from _validate_page_image.
+                rejected_pages += 1
                 continue
 
             # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf)
@@ -341,6 +368,17 @@ def _acquire_pages(
 
     if page_num == 0:
         raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE)
+
+    # Paper was fed but none of it was readable. This is a distinct condition
+    # from an empty feeder and is reported distinctly: the operator needs to
+    # hear "unreadable", not "load paper" (M-14, D-06).
+    if rejected_pages == page_num:
+        all_rejected_msg = (
+            f"All {page_num} page(s) fed were unreadable and were skipped "
+            f"(zero dimensions, or below {_MIN_PAGE_BYTES} bytes of image "
+            f"data); no usable page was produced"
+        )
+        raise ScanError(all_rejected_msg)
 
 
 class SaneDevice(Protocol):
