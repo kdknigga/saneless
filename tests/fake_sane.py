@@ -55,7 +55,12 @@ from PIL import Image, ImageDraw
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-__all__ = ["FakeSaneDev", "FakeSaneError", "FakeSaneModule"]
+__all__ = [
+    "FakeSaneDev",
+    "FakeSaneError",
+    "FakeSaneModule",
+    "build_option_table",
+]
 
 # SANE value types, read from _sane rather than guessed.
 _TYPE_FIXED = 2
@@ -102,6 +107,15 @@ _GEOMETRY_OPTIONS = (
     ("br-x", "Bottom-right x"),
     ("br-y", "Bottom-right y"),
 )
+
+# The four geometry names alone, in the hyphenated spelling get_options()
+# reports.  Attribute assignment uses underscores (dev.tl_x); both spellings are
+# load-bearing and one set used for both would be wrong on one side.
+_GEOMETRY_NAMES = tuple(name for name, _title in _GEOMETRY_OPTIONS)
+
+# Small enough to keep a multi-page feeder test cheap, and deliberately smaller
+# than any paper size at a realistic dpi -- see set_page_size().
+_DEFAULT_PAGE_SIZE = (200, 300)
 
 
 def _option_is_active(cap: int) -> bool:
@@ -234,6 +248,46 @@ def _build_option_table(
             _CAP_NOT_SETTABLE,
             ["x"],
         ),
+    ]
+
+
+def build_option_table(
+    *,
+    geometry_range: tuple[float, float, float] = _DEFAULT_GEOMETRY_RANGE,
+    omit: tuple[str, ...] = (),
+    geometry_settable: bool = True,
+) -> list[tuple]:
+    """
+    Build the default option table, adjusted for the case a test must model.
+
+    This is the public entry point for the cases a constructor keyword cannot
+    reach: ``FakeSaneDev.__init__`` already carries ruff's maximum of five
+    arguments (``PLR0913``), and this project forbids suppressing the rule.
+
+    ``omit`` exists for D-09.  A device whose option list simply does not
+    mention the geometry options is the case ``_NoGeometryDevice`` claimed to
+    model and got backwards: the real library *stores* ``dev.br_y`` on such a
+    device rather than raising, so an omitted option table is the only way to
+    reproduce the condition that makes the crop fallback reachable.
+
+    Args:
+        geometry_range: The ``(min, max, step)`` constraint shared by the four
+            geometry options.
+        omit: Hyphenated option names to leave out of the table entirely, as a
+            device lacking them would report it.
+        geometry_settable: When False the geometry options are still reported
+            but are marked not software-settable, so assigning one raises the
+            measured ``AttributeError`` instead of storing the value.
+
+    Returns:
+        The option table, ready to hand to :class:`FakeSaneDev`.
+
+    """
+    cap = _CAP_SETTABLE if geometry_settable else _CAP_NOT_SETTABLE
+    return [
+        (*option[:7], cap, option[8]) if option[1] in _GEOMETRY_NAMES else option
+        for option in _build_option_table(geometry_range=geometry_range)
+        if option[1] not in omit
     ]
 
 
@@ -423,21 +477,23 @@ def _constrain(option: tuple, key: str, value: object) -> object:
     return value
 
 
-def _page_image(index: int) -> Image.Image:
+def _page_image(index: int, size: tuple[int, int] = _DEFAULT_PAGE_SIZE) -> Image.Image:
     """
     Build one page with enough variance to survive page validation.
 
     Args:
         index: Zero-based page number, used to make pages distinguishable.
+        size: The ``(width, height)`` pixel size of the page.
 
     Returns:
-        A 200x300 RGB image well above the backend's 10 KB floor.
+        An RGB image well above the backend's 10 KB floor.
 
     """
-    image = Image.new("RGB", (200, 300), "white")
+    width, height = size
+    image = Image.new("RGB", size, "white")
     draw = ImageDraw.Draw(image)
-    draw.rectangle((10, 10, 190, 290), fill="black")
-    draw.ellipse((30, 30 + index, 170, 170 + index), fill="white")
+    draw.rectangle((10, 10, width - 10, height - 10), fill="black")
+    draw.ellipse((30, 30 + index, width - 30, height - 30 + index), fill="white")
     return image
 
 
@@ -515,6 +571,7 @@ class FakeSaneDev:
     _start_error: BaseException | None
     _start_error_page: int
     _page_index: int
+    _page_size: tuple[int, int]
     _source_resolution_ranges: dict[str, tuple[float, float, float]]
 
     def __init__(
@@ -556,6 +613,7 @@ class FakeSaneDev:
         state["_start_error"] = start_error
         state["_start_error_page"] = start_error_page
         state["_page_index"] = 0
+        state["_page_size"] = _DEFAULT_PAGE_SIZE
         state["_source_resolution_ranges"] = {}
         state["calls"] = []
         state["assignments"] = []
@@ -611,6 +669,27 @@ class FakeSaneDev:
 
         """
         self.__dict__["_source_resolution_ranges"][source] = constraint
+
+    def set_page_size(self, width: int, height: int) -> None:
+        """
+        Set the pixel size of the pages ``snap()`` returns.
+
+        A method rather than a constructor keyword for the same reason
+        ``narrow_resolution_for_source`` is one: ``__init__`` already carries
+        ruff's five-argument maximum.
+
+        The default 200x300 page is smaller than any paper size at a realistic
+        dpi, so ``crop_to_paper_size`` clamps the crop box to the image and
+        returns it unchanged.  A test that means to prove the crop fallback
+        actually *ran* needs a page larger than the crop box, which is what this
+        provides.
+
+        Args:
+            width: Page width in pixels.
+            height: Page height in pixels.
+
+        """
+        self.__dict__["_page_size"] = (width, height)
 
     def _reload_for_source(self, source: str) -> None:
         """
@@ -724,7 +803,7 @@ class FakeSaneDev:
 
         """
         self.calls.append("snap")
-        page = _page_image(self._page_index)
+        page = _page_image(self._page_index, self._page_size)
         self._page_index += 1
         return page
 
