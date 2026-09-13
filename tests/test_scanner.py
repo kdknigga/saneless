@@ -25,7 +25,7 @@ from saneless.scanner.base import (
     SourceKind,
     classify_source,
 )
-from saneless.scanner.sane_backend import SaneBackend
+from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from tests.fake_sane import (
     FakeSaneDev,
     FakeSaneError,
@@ -1672,6 +1672,156 @@ class TestGeometryPresenceCheck:
             pages = list(backend.scan_pages("test:0", settings))
 
         assert [m for m in _warning_messages(caplog) if "can't be set by software" in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+
+# The two units saneless can turn into a scan-area box.  Every other SANE unit
+# is declined and the page is cropped by Pillow instead.
+_CONVERTIBLE_UNITS = frozenset({GeometryUnit.UNIT_MM, GeometryUnit.UNIT_PIXEL})
+
+# Wide enough that a pixel-denominated A4 box at 1200 dpi fits without the
+# device clamping it, which would confuse a unit test with a range test.
+_ROOMY_GEOMETRY_RANGE = (0.0, 20000.0, 1.0)
+
+
+def _device_reporting_unit(
+    unit: int,
+    geometry_range: tuple[float, float, float] = _ROOMY_GEOMETRY_RANGE,
+) -> FakeSaneDev:
+    """
+    Build a device whose geometry options report a given SANE unit.
+
+    Args:
+        unit: The unit code to report at index 5 of the geometry options.
+        geometry_range: The ``(min, max, step)`` constraint for those options.
+
+    Returns:
+        A single-sheet device whose pages are larger than A4 at 300 dpi, so a
+        crop is observable.
+
+    """
+    dev = FakeSaneDev(
+        options=build_option_table(geometry_unit=unit, geometry_range=geometry_range),
+        pages=1,
+    )
+    dev.set_page_size(3000, 4000)
+    return dev
+
+
+class TestGeometryUnit:
+    """
+    The scan-area scale factor comes from the descriptor the device sent (D-10).
+
+    ``_set_geometry`` wrote ``br_x = 210.0`` for A4 on every device, assuming
+    millimetres, although the unit lives at index 5 of the option tuple (N-03).
+    A device reporting ``UNIT_PIXEL`` was handed 210 *pixels* -- about 18 mm at
+    300 dpi -- and returned a sliver of the page with no error.
+
+    There is no ``UNIT_CM`` and no ``UNIT_INCH``: the complete set is the seven
+    codes below, confirmed against the ``_sane`` extension itself.
+    """
+
+    def test_every_sane_unit_code_is_a_member(self) -> None:
+        """All seven codes, and only those seven."""
+        assert sorted(unit.value for unit in GeometryUnit) == [0, 1, 2, 3, 4, 5, 6]
+
+    @pytest.mark.parametrize("unit", list(GeometryUnit))
+    def test_every_unit_is_either_converted_or_declined(
+        self, unit: GeometryUnit
+    ) -> None:
+        """
+        Parametrised over the enum itself, so a new member is covered for free.
+
+        This is Phase 21's D-09.  A member added without a matching ``match``
+        arm leaves the scale unbound and fails here at runtime, as well as
+        failing ``assert_never`` under both type checkers at edit time.
+        """
+        scale = sane_backend_mod._units_per_mm(unit, 300)
+
+        if unit in _CONVERTIBLE_UNITS:
+            assert scale is not None
+            assert scale > 0
+        else:
+            assert scale is None
+
+    def test_millimetres_are_written_directly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A device reporting UNIT_MM gets A4's millimetres unchanged."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (0.0, 300.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        pages = list(backend.scan_pages("test:0", settings))
+
+        assert dev.br_x == 210.0
+        assert dev.br_y == 297.0
+        # Geometry was set on the device, so the page is not cropped as well.
+        assert pages[0].size == (3000, 4000)
+
+    def test_pixels_use_the_resolution_read_back_from_the_device(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The pixel conversion follows the dpi the device chose, not the request.
+
+        5000 dpi is clamped by the device to 1200.  Converting with the
+        requested value would reintroduce the very substitution bug D-11 cures,
+        one layer further down.
+        """
+        dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=5000, mode="Color", paper_size="a4"
+        )
+
+        list(backend.scan_pages("test:0", settings))
+
+        assert dev.br_x == pytest.approx(210.0 * 1200 / 25.4)
+        assert dev.br_y == pytest.approx(297.0 * 1200 / 25.4)
+
+    @pytest.mark.parametrize("unit", sorted(set(GeometryUnit) - _CONVERTIBLE_UNITS))
+    def test_an_unconvertible_unit_falls_through_to_the_crop(
+        self,
+        unit: GeometryUnit,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The other five units warn by name and leave the crop to Pillow."""
+        dev = _device_reporting_unit(unit)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert [m for m in _warning_messages(caplog) if unit.name in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
+    def test_a_unit_code_outside_sane_does_not_crash_the_scan(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The option tuple is device-supplied, so a bad code must not be fatal.
+
+        A conforming backend cannot report 99, but nothing in the protocol
+        stops a broken one, and a garbage scale factor would silently mis-size
+        the page.  It is treated as unconvertible instead.
+        """
+        dev = _device_reporting_unit(99)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = list(backend.scan_pages("test:0", settings))
+
+        assert [m for m in _warning_messages(caplog) if "99" in m]
         assert pages[0].size == _A4_AT_300_DPI
 
 
