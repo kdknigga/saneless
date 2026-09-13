@@ -73,6 +73,9 @@ _SCANNER_WHITE_STDDEV_THRESHOLD: float = 1.0
 _SCANNER_BLACK_MEAN_THRESHOLD: float = 1.0
 _SCANNER_BLACK_STDDEV_THRESHOLD: float = 1.0
 
+# The one message reported when a feeder produced no pages at all.
+_FEEDER_EMPTY_MESSAGE = "No paper detected in feeder"
+
 __all__ = ["SaneBackend"]
 
 logger = logging.getLogger(__name__)
@@ -212,6 +215,129 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     return True
 
 
+def _next_page_with_timeout(
+    executor: ThreadPoolExecutor,
+    iterator: Iterator[Image.Image],
+    page_num: int,
+    timeout_per_page: float,
+) -> Image.Image:
+    """
+    Acquire one page from the ADF iterator under a wall-clock timeout.
+
+    ``signal.alarm`` is not safe in a non-main thread, so the blocking
+    ``next(iterator)`` call is submitted to a single-worker executor and
+    waited on with a timeout instead.
+
+    Args:
+        executor: Single-worker executor owned by the caller.
+        iterator: The ``multi_scan()`` iterator being drained.
+        page_num: Zero-based index of the page being acquired.
+        timeout_per_page: Maximum seconds to wait for this page.
+
+    Returns:
+        The page image.
+
+    Raises:
+        ScanError: If the page did not arrive within the timeout.
+
+    """
+    future = executor.submit(next, iterator)
+    try:
+        return _as_image(future.result(timeout=timeout_per_page))
+    except FuturesTimeoutError as timeout_exc:
+        logger.error(
+            "Page %d timed out after %.0fs",
+            page_num + 1,
+            timeout_per_page,
+        )
+        timeout_msg = f"Page {page_num + 1} timed out after {timeout_per_page:.0f}s"
+        raise ScanError(timeout_msg) from timeout_exc
+
+
+def _feed_ended(exc: Exception, page_num: int) -> bool:
+    """
+    Decide whether an acquisition failure ends the feed or is a real fault.
+
+    Args:
+        exc: The exception raised while acquiring a page.
+        page_num: Zero-based index of the page being acquired.
+
+    Returns:
+        True if the feed has ended and the loop should stop.
+
+    Raises:
+        FeederEmptyError: If the very first page failed for any reason.
+
+    """
+    if page_num == 0:
+        raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
+    # After the first page, end-of-feed signals.
+    error_str = str(exc).lower()
+    return "out of documents" in error_str or "no docs" in error_str
+
+
+def _acquire_pages(
+    dev: SaneDevice,
+    timeout_per_page: float,
+) -> Iterator[Image.Image]:
+    """
+    Yield validated pages from the ADF, one per feeder sheet.
+
+    Args:
+        dev: Open SANE device handle.
+        timeout_per_page: Maximum seconds to wait for each page.
+
+    Yields:
+        Validated PIL Image for each scanned page.
+
+    Raises:
+        FeederEmptyError: If the ADF feeder is empty.
+        ScanError: If a page times out.
+
+    """
+    try:
+        iterator = dev.multi_scan()
+    except Exception as exc:
+        raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
+
+    page_num = 0
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        while True:
+            try:
+                page_image = _next_page_with_timeout(
+                    executor, iterator, page_num, timeout_per_page
+                )
+            except StopIteration:
+                break
+            except ScanError:
+                # FeederEmptyError subclasses ScanError, so saneless's own
+                # errors -- including the timeout path's -- propagate here.
+                raise
+            except Exception as exc:
+                if not _feed_ended(exc, page_num):
+                    raise
+                break
+
+            page_num += 1
+
+            # Validate: nonzero dimensions, min file size, not pure white/black
+            if not _validate_page_image(page_image, page_num):
+                continue
+
+            # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf)
+            page_image.info.pop("exif", None)
+            yield page_image
+    finally:
+        # Shut down the timeout executor
+        executor.shutdown(wait=False)
+        # Delete iterator before cancel to avoid __del__ issues (Pitfall #1)
+        del iterator
+
+    if page_num == 0:
+        raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE)
+
+
 class SaneDevice(Protocol):
     """Protocol describing the SANE device handle interface."""
 
@@ -347,85 +473,25 @@ class SaneBackend(ScannerBackend):
         timeout_per_page: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
     ) -> Iterator[Image.Image]:
         """
-        Yield validated pages from ADF via multi_scan() with per-page timeout.
+        Return an iterator of validated ADF pages with a per-page timeout.
 
         Per user decision: "Wrap ADF iteration with per-page timeout (not per-job)
         -- cancel if single page takes longer than 2-3x expected duration."
 
-        Uses concurrent.futures.ThreadPoolExecutor to wrap each next(iterator)
-        call with a timeout, since signal.alarm is not safe in non-main threads
+        The work lives in the module-level ``_acquire_pages``, which uses
+        concurrent.futures.ThreadPoolExecutor to wrap each next(iterator) call
+        with a timeout, since signal.alarm is not safe in non-main threads
         (per RESEARCH.md Open Question 1).
 
         Args:
             dev: Open SANE device handle.
             timeout_per_page: Maximum seconds to wait for each page.
 
-        Yields:
-            Validated PIL Image for each scanned page.
-
-        Raises:
-            FeederEmptyError: If the ADF feeder is empty.
-            ScanError: If a page times out.
+        Returns:
+            An iterator of validated PIL Images, one per scanned page.
 
         """
-        feeder_empty_msg = "No paper detected in feeder"
-        try:
-            iterator = dev.multi_scan()
-        except Exception as exc:
-            raise FeederEmptyError(feeder_empty_msg) from exc
-
-        page_num = 0
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            while True:
-                try:
-                    # Per-page timeout: wrap next() in a future
-                    future = executor.submit(next, iterator)
-                    try:
-                        page_image = _as_image(future.result(timeout=timeout_per_page))
-                    except FuturesTimeoutError as timeout_exc:
-                        logger.error(
-                            "Page %d timed out after %.0fs",
-                            page_num + 1,
-                            timeout_per_page,
-                        )
-                        timeout_msg = (
-                            f"Page {page_num + 1} timed out after "
-                            f"{timeout_per_page:.0f}s"
-                        )
-                        raise ScanError(timeout_msg) from timeout_exc
-                except StopIteration:
-                    break
-                except ScanError:
-                    raise
-                except FeederEmptyError:
-                    raise
-                except Exception as exc:
-                    error_str = str(exc).lower()
-                    if page_num == 0:
-                        raise FeederEmptyError(feeder_empty_msg) from exc
-                    # After first page, end-of-feed signals
-                    if "out of documents" in error_str or "no docs" in error_str:
-                        break
-                    raise
-
-                page_num += 1
-
-                # Validate: nonzero dimensions, min file size, not pure white/black
-                if not _validate_page_image(page_image, page_num):
-                    continue
-
-                # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf)
-                page_image.info.pop("exif", None)
-                yield page_image
-        finally:
-            # Shut down the timeout executor
-            executor.shutdown(wait=False)
-            # Delete iterator before cancel to avoid __del__ issues (Pitfall #1)
-            del iterator
-
-        if page_num == 0:
-            raise FeederEmptyError(feeder_empty_msg)
+        return _acquire_pages(dev, timeout_per_page)
 
     def scan_pages(
         self, device_id: str, settings: ScanSettings
