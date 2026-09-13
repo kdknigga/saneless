@@ -105,7 +105,7 @@ class TestRealSaneTestBackend:
         settings = ScanSettings(
             source="Automatic Document Feeder", resolution=75, mode="Gray"
         )
-        pages = list(SaneBackend().scan_pages("test:0", settings))
+        pages = SaneBackend().scan_pages("test:0", settings).pages
         assert len(pages) == 10
 
     def test_every_uniformly_black_page_survives_the_scanner_layer(self) -> None:
@@ -123,6 +123,6 @@ class TestRealSaneTestBackend:
         settings = ScanSettings(
             source="Automatic Document Feeder", resolution=75, mode="Gray"
         )
-        pages = list(SaneBackend().scan_pages("test:0", settings))
+        pages = SaneBackend().scan_pages("test:0", settings).pages
         assert len(pages) == 10
         assert all(page.convert("L").getextrema() == (0, 0) for page in pages)

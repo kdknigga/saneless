@@ -69,6 +69,7 @@ from saneless.paperless import PaperlessClient
 from saneless.scanner.base import ScannerBackend
 from saneless.vocabulary import TERMINAL_STATES, JobState, ScanOutcome
 from saneless.worker import ScanWorker
+from tests.conftest import scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -447,7 +448,9 @@ def _build_scanner(scan_passes: tuple[int, ...]) -> MagicMock:
 
     """
     scanner = MagicMock(spec=ScannerBackend)
-    scanner.scan_pages.side_effect = [iter(_pages(count)) for count in scan_passes]
+    scanner.scan_pages.side_effect = [
+        scan_batch(_pages(count)) for count in scan_passes
+    ]
     return scanner
 
 
