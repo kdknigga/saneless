@@ -30,6 +30,7 @@ from saneless.scanner.base import (
     DeviceInfo,
     ScannerBackend,
     ScanSettings,
+    SourceKind,
     classify_source,
 )
 
@@ -686,10 +687,21 @@ class SaneBackend(ScannerBackend):
             # Set scan area geometry for paper size constraint (D-01)
             geometry_set = _set_geometry(dev, settings.paper_size)
 
-            use_adf = classify_source(effective_source).uses_feeder
+            source_kind = classify_source(effective_source)
+            use_adf = source_kind.uses_feeder
 
-            # D-04: Override for "Auto" source using config-driven routing
-            if effective_source == "Auto":
+            # An Auto source says nothing about what is actually loaded, so the
+            # operator's auto_source_mode decides. That decision stays
+            # config-driven; only the *recognition* of an Auto source moved
+            # here, to the single classifier.
+            #
+            # The previous test compared the source string for equality against
+            # the one exact spelling ``Auto``, so it was case- and
+            # whitespace-sensitive: a device reporting its source as
+            # lowercase ``auto`` classifies as AUTO, so it took the single-page
+            # path and skipped this override entirely. auto_source_mode = "adf"
+            # was then silently ignored and a whole stack came back as one page.
+            if source_kind is SourceKind.AUTO:
                 use_adf = settings.auto_source_mode == "adf"
                 logger.info(
                     "Auto source routing: auto_source_mode='%s', use_adf=%s",
