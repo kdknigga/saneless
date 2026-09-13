@@ -141,5 +141,8 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 |------|---------|
 | 0 | Profiles generated successfully |
 | 1 | No scanners found |
+| 2 | Configuration error — the config file could not be loaded |
 
 Profiles are written to the TOML config file. Without `--force`, existing profiles are preserved and only new ones are added.
+
+A `default` profile is always written, because saneless requires one: your scanner's flatbed backs it when it has one, and otherwise its first reported source does. Regenerating never removes that profile; every other auto-generated profile a new run no longer produces is pruned, while profiles you wrote yourself are left alone.
