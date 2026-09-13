@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import threading
@@ -20,6 +21,7 @@ from saneless.exceptions import FeederEmptyError, ScanError
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
+    ScanBatch,
     ScannerBackend,
     ScanSettings,
     SourceKind,
@@ -2357,3 +2359,127 @@ class TestResolutionReadBack:
             list(backend.scan_pages("test:0", settings))
 
         assert not [m for m in self._warnings(caplog) if "resolution" in m.lower()]
+
+
+class TestScanBatch:
+    """
+    One object carries what the device actually did, out of the backend (D-12).
+
+    ``scan_pages`` used to yield ``Image`` only, so two facts the backend had
+    already measured -- the resolution the device settled on, and how many fed
+    sheets it could not read -- had no way out of it.  A generator's return
+    value is discarded by ``list()``, which is what every pipeline call site
+    does, so carrying them out meant changing the ABC rather than smuggling
+    them past it.
+    """
+
+    def test_the_batch_carries_exactly_three_fields(self) -> None:
+        """
+        Three fields, in order, and no per-page structure.
+
+        The object is deliberately minimal.  Phase 29's HARD-01 owns the
+        ordered per-page record design, and a batch that grew page-level detail
+        here would quietly pre-empt it.
+        """
+        assert [field.name for field in dataclasses.fields(ScanBatch)] == [
+            "pages",
+            "actual_resolution",
+            "pages_rejected",
+        ]
+
+    def test_the_batch_is_not_an_iterator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What comes back is a record, not something to call ``list()`` on."""
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        batch = backend.scan_pages("test:0", settings)
+
+        assert isinstance(batch, ScanBatch)
+        assert not hasattr(batch, "__next__")
+
+    def test_a_clean_five_page_stack_rejects_nothing(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """Five readable sheets are five pages and a zero rejection count."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = [_make_content_image() for _ in range(5)]
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        batch = backend.scan_pages("test:device:001", settings)
+
+        assert len(batch.pages) == 5
+        assert batch.pages_rejected == 0
+
+    def test_an_unreadable_sheet_is_counted_rather_than_vanishing(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """
+        Five sheets with one corrupt page return four pages and a count of one.
+
+        This is the count's whole purpose.  The pipeline's ``pages_scanned`` is
+        ``len(images)``, which already excludes a skipped sheet, so a stack with
+        one unreadable page reports one fewer and nobody learns a page was lost.
+        """
+        pages = [_make_content_image() for _ in range(5)]
+        # Far below _MIN_PAGE_BYTES: a 10x10 RGB page is 300 bytes.
+        pages[2] = Image.new("RGB", (10, 10), "white")
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = pages
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        batch = backend.scan_pages("test:device:001", settings)
+
+        assert len(batch.pages) == 4
+        assert batch.pages_rejected == 1
+
+    def test_the_batch_reports_the_resolution_the_device_chose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A device clamping 5000 to 1200 reports 1200, as a whole number."""
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=5000, mode="Color")
+
+        batch = backend.scan_pages("test:0", settings)
+
+        assert batch.actual_resolution == 1200
+        assert isinstance(batch.actual_resolution, int)
+
+    def test_a_flatbed_scan_carries_both_facts_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The single-page path populates the same two facts as the feeder."""
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        batch = backend.scan_pages("test:0", settings)
+
+        assert len(batch.pages) == 1
+        assert batch.actual_resolution == 300
+        assert batch.pages_rejected == 0
+
+    def test_the_device_is_closed_by_the_time_the_batch_returns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Acquisition is eager, so the handle is released on return.
+
+        This is a consequence, not a goal: the generator held the device open
+        until it was drained or garbage-collected.  Close-while-reading and
+        cancel semantics are Phase 29's HARD-03/HARD-04 and are deliberately
+        not folded in here.
+        """
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        batch = backend.scan_pages("test:0", settings)
+
+        assert dev.close_calls == 1
+        assert len(batch.pages) == 1
