@@ -439,9 +439,17 @@ def _area_matches(
     200.0, with no error and no ``INFO_INEXACT`` the caller can see.  Only what
     the device reports back can tell the two apart.
 
+    What is compared is the **box**, ``br - tl``, and not the far corner alone.
+    Both corners are written and a device clamps either of them just as
+    silently; a device whose ``tl-x``/``tl-y`` range does not start at 0 clamps
+    the ``tl = 0.0`` write while accepting ``br`` verbatim, so a far-corner
+    comparison agrees with itself over an area that is short by the whole
+    minimum.  Measured on a device with a ``(10.0, 300.0, 1.0)`` range: an A4
+    request became a 200 x 287 mm scan reported as success.
+
     Args:
         actual: The ``((tl_x, tl_y), (br_x, br_y))`` the device reports.
-        expected: The ``(br_x, br_y)`` that was requested, in device units.
+        expected: The requested box's ``(width, height)``, in device units.
         tolerance: How far the two may differ, in device units.
 
     Returns:
@@ -449,8 +457,12 @@ def _area_matches(
         the caller should crop the image instead.
 
     """
-    (_tl_x, _tl_y), (actual_x, actual_y) = actual
+    (tl_x, tl_y), (br_x, br_y) = actual
     expected_x, expected_y = expected
+    # The top-left was already being read back here and then discarded, which
+    # is what let a clamped tl through: br matched, so the function returned
+    # True and _maybe_crop never ran.
+    actual_x, actual_y = br_x - tl_x, br_y - tl_y
     within_x = abs(actual_x - expected_x) <= tolerance
     within_y = abs(actual_y - expected_y) <= tolerance
     if within_x and within_y:
