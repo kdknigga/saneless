@@ -511,7 +511,10 @@ class TestGenerateProfilesUsesClassifier:
             modes=["Color"],
         )
         profiles = generate_profiles(caps)
-        assert "default" not in profiles
+        # The default exists (Settings requires it) but is backed by the first
+        # reported source, never by the duplex feeder.
+        assert profiles["default"].source == "Auto"
+        assert profiles["default"].source != "Flatbed Duplex"
         assert profiles["auto"].auto_source_mode == "adf"
 
     def test_real_flatbed_still_backs_the_default_profile(self) -> None:
@@ -524,15 +527,42 @@ class TestGenerateProfilesUsesClassifier:
         profiles = generate_profiles(caps)
         assert profiles["default"].source == "Flatbed"
 
-    def test_feeder_only_device_has_no_default_profile(self) -> None:
-        """A device reporting no flatbed source gets no default profile."""
+    def test_feeder_only_device_still_gets_a_default_profile(self) -> None:
+        """
+        A device reporting no flatbed source falls back to its first source.
+
+        This assertion used to read ``"default" not in profiles``, which pinned
+        a defect rather than a guarantee: Settings requires the key, so the set
+        this function returned for a sheet-fed scanner could be written to disk
+        and then never loaded again.
+        """
         caps = DeviceCapabilities(
             sources=["Automatic Document Feeder"],
             resolutions=[300],
             modes=["Color"],
         )
         profiles = generate_profiles(caps)
-        assert "default" not in profiles
+        assert profiles["default"].source == "Automatic Document Feeder"
+
+    def test_a_feeder_only_config_round_trips_through_load_settings(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The written file loads back, which is the guarantee that matters.
+
+        "default is present" is a proxy; a config saneless can actually load
+        after auto-profiles has run is the user-visible promise.
+        """
+        caps = DeviceCapabilities(
+            sources=["Automatic Document Feeder", "ADF Duplex"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        config_file = tmp_path / "config.toml"
+        write_profiles_to_config(config_file, generate_profiles(caps))
+
+        settings = load_settings(str(config_file))
+        assert settings.profiles["default"].source == "Automatic Document Feeder"
 
 
 class TestGenerateProfilesSlugCollision:
@@ -551,19 +581,27 @@ class TestGenerateProfilesSlugCollision:
     def test_both_sources_survive_with_a_suffix(self) -> None:
         """The first claimant keeps the bare slug; the second gains "-2"."""
         profiles = generate_profiles(self._caps())
-        assert set(profiles) == {"adf-front", "adf-front-2"}
+        # "default" is not a source profile; it is the key Settings requires.
+        assert set(profiles) == {"adf-front", "adf-front-2", "default"}
         assert profiles["adf-front"].source == "ADF-Front"
         assert profiles["adf-front-2"].source == "ADF Front"
 
     def test_no_source_is_silently_lost(self) -> None:
         """
-        N distinct source strings yield N profiles.
+        N distinct source strings yield N source profiles.
 
         The assignment was unguarded, so the second collider overwrote the
         first and the device lost a source -- which is N-09's actual complaint.
+        Counting keys is no longer the way to ask: the required "default" key
+        aliases one of the sources, so the question is put to the source
+        strings the profiles actually carry.
         """
         profiles = generate_profiles(self._caps())
-        assert len(profiles) == len(self._COLLIDING)
+        sources = [
+            profile.source for name, profile in profiles.items() if name != "default"
+        ]
+        assert len(sources) == len(self._COLLIDING)
+        assert set(sources) == set(self._COLLIDING)
 
     def test_tie_break_follows_source_order_and_is_deterministic(self) -> None:
         """Generating twice from the same capabilities yields identical slugs."""
