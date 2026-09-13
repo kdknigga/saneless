@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -999,6 +1000,91 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
         assert "exif" not in pages[0].info
+
+
+class TestIntegrityFailuresAreSkippedAndCounted:
+    """
+    One unreadable page costs one page; a wholly unreadable batch raises.
+
+    Raising on the first integrity failure was rejected in D-06: it would make
+    "every returned page is readable" true by construction, but it fails a
+    fifty-sheet job over one bad sheet, and partial-result recovery belongs to
+    Phase 29's HARD-02.
+
+    A batch in which *every* page was rejected must not return an empty list
+    either.  The pipeline would hand that straight to ``assemble_pdf([])`` and
+    record a job that produced nothing as a success, which is M-14's third
+    consequence and the reason it prescribes a raise.
+    """
+
+    def test_a_mid_stack_integrity_failure_costs_exactly_one_page(
+        self, mock_sane_module: MockSaneModule, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A zero-dimension third sheet is skipped and named; four survive."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = [
+            _make_content_image(),
+            _make_content_image(),
+            Image.new("RGB", (0, 0)),
+            _make_content_image(),
+            _make_content_image(),
+        ]
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        with caplog.at_level(logging.WARNING):
+            pages = list(backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 4
+        skips = [r for r in caplog.records if "skipping" in r.getMessage()]
+        assert len(skips) == 1
+        assert "Page 3" in skips[0].getMessage()
+
+    def test_a_wholly_rejected_batch_raises_rather_than_yielding_nothing(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """Three unreadable sheets raise ScanError naming how many were fed."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = [Image.new("RGB", (0, 0)) for _ in range(3)]
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+
+        with pytest.raises(ScanError) as exc_info:
+            list(backend.scan_pages("test:device:001", settings))
+
+        assert "3" in str(exc_info.value)
+        # Distinct condition from an empty feeder: paper *was* fed, and the
+        # operator needs to be told it was unreadable rather than absent.
+        assert not isinstance(exc_info.value, FeederEmptyError)
+
+    def test_a_zero_page_feeder_still_raises_feeder_empty(
+        self, mock_sane_module: MockSaneModule
+    ) -> None:
+        """No paper at all stays FeederEmptyError, not the all-rejected error."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = []
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+
+        with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
+            list(backend.scan_pages("test:device:001", settings))
+
+    def test_a_clean_stack_logs_no_skip_warning(
+        self, mock_sane_module: MockSaneModule, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Five readable sheets yield five pages and no skip warning at all."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._multi_scan_pages = [_make_content_image() for _ in range(5)]
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=300, mode="color")
+        with caplog.at_level(logging.WARNING):
+            pages = list(backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 5
+        assert not [r for r in caplog.records if "skipping" in r.getMessage()]
 
 
 class TestAutoSourceRouting:
