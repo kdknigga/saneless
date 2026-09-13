@@ -2308,6 +2308,224 @@ class TestDeviceOptionOrdering:
         assert 1.0 <= resolution <= 600.0
 
 
+# The nine-element option tuple, as get_options() reports it:
+# (index, name, title, desc, type, unit, size, cap, constraint).  These are the
+# two value-type codes and the one capability code the tables below vary.
+_STRING_OPTION = 3
+_FIXED_OPTION = 2
+_SETTABLE = 5
+
+
+def _option(index: int, name: str, value_type: int, constraint: object) -> tuple:
+    """
+    Build one nine-element SANE option tuple carrying a given constraint.
+
+    Args:
+        index: The option's position in the device's option list.
+        name: The hyphenated option name, as ``get_options()`` reports it.
+        value_type: The SANE value type code.
+        constraint: What the device reports for the option -- a word list, a
+            ``(min, max, step)`` triple, or None for an unconstrained option.
+
+    Returns:
+        The option tuple.
+
+    """
+    return (
+        index,
+        name,
+        name.title(),
+        f"{name} description",
+        value_type,
+        0,
+        1,
+        _SETTABLE,
+        constraint,
+    )
+
+
+def _capabilities_for(
+    constraint: object, monkeypatch: pytest.MonkeyPatch
+) -> DeviceCapabilities:
+    """
+    Read capabilities from a device reporting a given resolution constraint.
+
+    Args:
+        constraint: What the device reports for its ``resolution`` option.
+        monkeypatch: Fixture used to patch the module-level ``sane`` name.
+
+    Returns:
+        The capabilities parsed from that device.
+
+    """
+    dev = FakeSaneDev(
+        options=[
+            _option(1, "source", _STRING_OPTION, ["Flatbed", "ADF Duplex"]),
+            _option(2, "resolution", _FIXED_OPTION, constraint),
+            _option(3, "mode", _STRING_OPTION, ["Color", "Gray"]),
+        ]
+    )
+    return _backend_with(dev, monkeypatch).get_capabilities("test:0")
+
+
+class TestResolutionConstraintShapes:
+    """
+    All three documented constraint shapes are read, and none is guessed at.
+
+    A SANE device reports its resolution support as *either* a word list *or* a
+    ``(min, max, step)`` range, never both.  So ``resolutions`` and
+    ``resolution_range`` are two different facts rather than two spellings of
+    one, and neither is derived from the other (Q6): expanding a range into a
+    list would print saneless's invention rather than the device's answer, and
+    inferring a range from a list would claim support for values between the
+    listed ones.  At most one of the two is ever populated.
+
+    ``get_capabilities`` used to read only the word-list shape, so the SANE
+    ``test`` backend's measured ``(1.0, 1200.0, 1.0)`` arrived as an empty
+    list: the CLI printed a label with nothing after it and auto-profiles fell
+    back to 300 regardless of what the device actually supported (N-01).
+    """
+
+    @pytest.mark.parametrize(
+        ("constraint", "expected_list", "expected_range"),
+        [
+            ([75, 150, 300, 600], [75, 150, 300, 600], None),
+            ((1.0, 1200.0, 1.0), [], (1.0, 1200.0, 1.0)),
+            (None, [], None),
+        ],
+        ids=["word-list", "range", "unconstrained"],
+    )
+    def test_each_shape_populates_only_the_field_it_describes(
+        self,
+        constraint: object,
+        expected_list: list[int],
+        expected_range: tuple[float, float, float] | None,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A list fills resolutions, a range fills the range, None fills neither."""
+        caps = _capabilities_for(constraint, monkeypatch)
+
+        assert caps.resolutions == expected_list
+        assert caps.resolution_range == expected_range
+        # Whatever the device said, the two cannot both be populated and so
+        # cannot disagree with each other.
+        assert not (caps.resolutions and caps.resolution_range)
+
+    def test_the_range_is_kept_as_the_device_reported_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The members stay floats; coercion belongs at the point of use."""
+        caps = _capabilities_for((1.0, 1200.0, 1.0), monkeypatch)
+
+        assert caps.resolution_range is not None
+        assert all(isinstance(member, float) for member in caps.resolution_range)
+
+    def test_sources_and_modes_still_come_from_their_list_constraints(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reading the range shape did not disturb the two list-shaped options."""
+        caps = _capabilities_for((1.0, 1200.0, 1.0), monkeypatch)
+
+        assert caps.sources == ["Flatbed", "ADF Duplex"]
+        assert caps.modes == ["Color", "Gray"]
+
+    @pytest.mark.parametrize(
+        "constraint",
+        [(1.0, 1200.0), (1.0, 1200.0, 1.0, 1.0), ("low", "high", "step")],
+        ids=["too-short", "too-long", "non-numeric"],
+    )
+    def test_a_tuple_that_is_not_a_sane_range_is_not_guessed_at(
+        self, constraint: object, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A device-supplied tuple of the wrong shape yields neither field (T-24-27).
+
+        The constraint object comes from the device, so nothing guarantees it is
+        one of the three documented shapes.  An unrecognised one must leave both
+        fields alone rather than produce a guessed value, and must not raise out
+        of ``get_capabilities``.
+        """
+        caps = _capabilities_for(constraint, monkeypatch)
+
+        assert caps.resolutions == []
+        assert caps.resolution_range is None
+
+    def test_a_short_option_tuple_is_skipped_without_raising(self) -> None:
+        """An option too short to carry a constraint is ignored, never fatal."""
+        found = sane_backend_mod._constraint([(1, "resolution")], "resolution")
+
+        assert found.present is False
+
+
+class TestSourceOptionPresence:
+    """
+    Whether a device HAS a source option is a different fact from its constraint.
+
+    ``_resolve_source`` records presence independently of whether the constraint
+    can be read as a word list, and the assignment in ``_configure_device``
+    depends on that flag.  Collapsing the two -- reporting only the parsed
+    constraint -- would silently stop saneless setting the source on a device
+    whose constraint it cannot read, which is a behaviour change disguised as a
+    refactor.
+    """
+
+    def test_a_device_with_no_source_option_is_left_alone(self) -> None:
+        """No source option means nothing to assign and nothing to validate."""
+        effective, has_source_option = sane_backend_mod._resolve_source([], "Flatbed")
+
+        assert has_source_option is False
+        assert effective == "Flatbed"
+
+    @pytest.mark.parametrize(
+        "constraint",
+        [None, (0.0, 1.0, 1.0), "Flatbed"],
+        ids=["unconstrained", "range", "bare-string"],
+    )
+    def test_a_non_list_source_constraint_is_still_a_source_option(
+        self, constraint: object
+    ) -> None:
+        """
+        Presence is detected even when the constraint cannot be read as a list.
+
+        This is a regression guard rather than a RED assertion: it already holds,
+        and it is precisely the behaviour most at risk from the dedup.  The raise
+        is what witnesses presence -- a device whose source option went
+        unnoticed would return cleanly here instead, and saneless would scan
+        from whatever source the device happened to be left on.
+        """
+        with pytest.raises(ScanError):
+            sane_backend_mod._resolve_source(
+                [_option(1, "source", _STRING_OPTION, constraint)], "Flatbed"
+            )
+
+
+class TestDeviceCapabilitiesShape:
+    """The value object's field order, which existing call sites depend on."""
+
+    def test_resolution_range_is_defaulted_and_sits_after_the_required_fields(
+        self,
+    ) -> None:
+        """
+        A defaulted field must stay in the defaulted block.
+
+        ``PipelineRequest`` records the same trap in its own docstring: moving a
+        defaulted field up into the non-default block reorders the dataclass and
+        breaks positional construction, which call sites across the suite rely
+        on.
+        """
+        fields = dataclasses.fields(DeviceCapabilities)
+        defaulted = [
+            f.name
+            for f in fields
+            if f.default is not dataclasses.MISSING
+            or f.default_factory is not dataclasses.MISSING
+        ]
+        required = [f.name for f in fields if f.name not in defaulted]
+
+        assert required == ["sources", "resolutions", "modes"]
+        assert defaulted == ["raw_options", "resolution_range"]
+
+
 class TestResolutionReadBack:
     """The resolution the device actually chose is read back (D-11, M-16)."""
 
