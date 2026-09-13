@@ -1238,6 +1238,61 @@ class TestSaneBackendADFCleanup:
         assert dev.close_calls
 
 
+class TestFakeFeederStartOrdering:
+    """
+    ``start()`` checks the armed error before the page budget (WR-07).
+
+    Two ordering faults lived in one method.  The budget check ran first, so
+    an error armed at the index one past the last page -- the end-of-feed
+    probe -- could never fire: the test silently became a clean-feed test
+    rather than failing loudly as a misconfiguration.  And the per-page delay
+    was applied to that probe as well, so a timeout test paid one delay more
+    than its page count implied, making wall-clock reasoning wrong by one unit.
+    """
+
+    def test_an_error_armed_at_the_probe_index_is_reachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A jam on the probe surfaces instead of reading as a clean end of feed.
+
+        With the budget checked first this device returned three pages and no
+        error at all, so the arming was a silent no-op.
+        """
+        dev = FakeSaneDev(
+            pages=3,
+            start_error=FakeSaneError("Document feeder jammed"),
+            start_error_page=3,
+        )
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Automatic Document Feeder", resolution=300, mode="Color"
+        )
+
+        with pytest.raises(ScanError, match="jammed"):
+            backend.scan_pages("test:0", settings)
+
+    def test_the_end_of_feed_probe_is_not_delayed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The delay is charged per page scanned, not per ``start()`` call."""
+        slept: list[float] = []
+        monkeypatch.setattr(time, "sleep", slept.append)
+        dev = FakeSaneDev(pages=2)
+        dev.set_page_delay(0.5)
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Automatic Document Feeder", resolution=300, mode="Color"
+        )
+
+        backend.scan_pages("test:0", settings)
+
+        # Three start() calls -- two sheets and the probe that discovers the
+        # feeder is empty -- but only the two sheets are pages being scanned.
+        assert dev.calls.count("start") == 3
+        assert len(slept) == 2
+
+
 # ---------------------------------------------------------------------------
 # Paper size geometry and crop fallback tests
 # ---------------------------------------------------------------------------
