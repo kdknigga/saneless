@@ -516,7 +516,14 @@ def _set_geometry(
     if dims is None:
         return False
     scale = _geometry_scale(raw_options, resolution)
-    if scale is None:
+    if scale is None or scale <= 0.0:
+        # Guard the value, not just its absence.  ``_units_per_mm`` returns
+        # ``resolution / _MM_PER_INCH`` for UNIT_PIXEL, which is 0.0 for any
+        # device whose read-back resolution truncates to 0 -- and 0.0 passes an
+        # ``is None`` test, makes ``expected`` (0.0, 0.0), stores a zero-size
+        # box on the device, and then lets ``_area_matches`` agree with itself
+        # inside a tolerance that is also 0.  A zero-area scan reported as
+        # success is worse than the crop fallback it bypasses.
         return False
     width_mm, height_mm = dims
     expected = (width_mm * scale, height_mm * scale)
