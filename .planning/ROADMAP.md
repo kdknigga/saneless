@@ -218,7 +218,46 @@ Plans:
   4. Geometry is written only when the device reports `tl_x`/`tl_y`/`br_x`/`br_y` with units read from the option descriptor; a test proves the Pillow crop fallback is reachable and uses the resolution read back after all options are set
   5. The rewritten fakes match real python-sane semantics (unknown option stored silently, bad value for a known option raises `_sane.error`, structurally wrong access raises `AttributeError`), and an opt-in integration test drives the real SANE `test` backend through a `SANE_CONFIG_DIR` scoped to `tmp_path` to pull ten pages from a long feeder name
 
-**Plans**: TBD
+**Plans**: 8 plans in 7 waves
+
+Plans:
+
+**Wave 1** *(no file overlap — 24-01 owns the test doubles and CI config, 24-02 owns auto-profiles)*
+
+- [ ] 24-01-PLAN.md — shared `tests/fake_sane.py` faithful to python-sane 2.9.2, `sane_hardware` marker, session-scoped `SANE_CONFIG_DIR` fixture, SCNR-08's ten-page assertion committed RED (D-17, D-18)
+- [ ] 24-02-PLAN.md — `classify_source` as the only flatbed/Auto rule, every source slugged from its own name over `[a-z0-9-]`, collision tie-break, orphan prune, four doc corrections (D-02, D-14, D-15, D-16)
+
+**Wave 2** *(blocked on 24-01)*
+
+- [ ] 24-03-PLAN.md — `_scan_adf_pages` split for branch headroom, first-page special case and unreachable `multi_scan` guard deleted, `_MAX_ADF_PAGES`, W-01 rationale corrected (D-03, D-04)
+
+**Wave 3** *(blocked on 24-03)*
+
+- [ ] 24-04-PLAN.md — pure-white/black checks deleted, integrity skip-and-count with all-rejected raise, SCNR-08 turns green, CI runs the marker (D-05, D-06, D-08)
+
+**Wave 4** *(blocked on 24-04)*
+
+- [ ] 24-05-PLAN.md — `scan_pages` split, options set source-first, resolution read back, `SaneDevice.resolution` typed `float`, Auto override via `classify_source`, D-01 recorded as settled (D-11, D-01)
+
+**Wave 5** *(blocked on 24-05)*
+
+- [ ] 24-06-PLAN.md — geometry presence check with a reachable crop fallback, `GeometryUnit` total enum over all seven SANE codes, clamped-area read-back (D-09, D-10, D-19)
+
+**Wave 6** *(blocked on 24-06)*
+
+- [ ] 24-07-PLAN.md — `ScanBatch` carries actual DPI and the integrity-skip count out of the backend; the measured 89-reference sweep; both `dpi=profile.resolution` sites redirected (D-12, D-07)
+
+**Wave 7** *(blocked on 24-02 and 24-07)*
+
+- [ ] 24-08-PLAN.md — one `_constraint()` helper, `resolution_range` honoured by auto-profiles and the CLI, the three legacy SANE doubles deleted (D-13, D-17 completion)
+
+Waves: 1 = {24-01, 24-02} · 2 = {24-03} · 3 = {24-04} · 4 = {24-05} · 5 = {24-06} · 6 = {24-07} · 7 = {24-08}
+
+Three measured ordering constraints make waves 2-7 strictly sequential, and none may be collapsed:
+
+1. **SCNR-08 is downstream of D-05.** The SANE `test` backend's default picture is solid black, so today's `_validate_page_image` discards all ten ADF pages and `scan_pages` returns `[]`. The ten-page assertion cannot pass until the pure-black check is removed. It is written RED in 24-01 and turned green by 24-04 — not scheduled in parallel.
+2. **D-04's page cap is downstream of a refactor.** `_scan_adf_pages` already sits at 12 of ruff's 12 `PLR0912` branches, and `scan_pages` at 11. Adding to either breaks the build, and this project forbids suppressing the rule — so 24-03 and 24-05 each split before they add.
+3. **D-12 touches the ABC.** `scan_pages` is a generator and `list()` discards `StopIteration.value`, so the read-back DPI and reject count cannot leave the backend without changing `ScannerBackend` — 89 references across 8 test files plus 3 production sites, two of which duck-type and draw no diagnostic from `ty` or `pyrefly`. 24-07 therefore lands after the facts it carries exist (24-04, 24-05, 24-06).
 
 Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/21-vocabulary-and-contracts/21-SECURITY.md`): **`_scan_adf_pages` has no page cap.** `python-sane`'s `_SaneIterator.__next__` stops only on the exact string `"Document feeder out of documents"`, so on hardware that is not a feeder `start()`/`snap()` keep succeeding and the loop does not terminate. The per-page timeout does not bound it — a succeeding scan satisfies it every iteration — and `pipeline.py` calls `list(scanner.scan_pages(...))`, so unbounded pages means unbounded memory. This is reachable today because Phase 21 routes any `"duplex"`-named source to `multi_scan()` (D-11 AMENDED) and `scan_pages` validates the source against the device only when `has_source_option` is true. Phase 21 accepted the risk with a documentation-only control; this phase should add the iteration guard. Criterion 2 above already covers the other half — the bare `except Exception` that reports every first-page failure as "No paper detected in feeder".
 
@@ -359,7 +398,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
-| 24. Scanner Truthfulness | 0/? | Not started | - |
+| 24. Scanner Truthfulness | 0/8 | Not started | - |
 | 25. Manual Duplex | 0/? | Not started | - |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
