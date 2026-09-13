@@ -30,6 +30,7 @@ from saneless.scanner.base import (
     DeviceInfo,
     ScannerBackend,
     ScanSettings,
+    SourceKind,
     classify_source,
 )
 
@@ -381,11 +382,120 @@ def _acquire_pages(
         raise ScanError(all_rejected_msg)
 
 
+def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool]:
+    """
+    Decide which source name to use, and whether the device has the option.
+
+    The two return values answer genuinely different questions and both are
+    load-bearing.  ``has_source_option`` records the *presence* of a ``source``
+    option, independently of whether its constraint is a list: a device may
+    expose ``source`` with a constraint this code cannot read, and it must
+    still be assigned.  A helper returning only the parsed constraint would
+    collapse the two and silently stop setting the source on such a device.
+
+    Args:
+        raw_options: The device's option tuples, as ``get_options()`` returns
+            them.
+        requested: The source name the caller asked for.
+
+    Returns:
+        A ``(effective_source, has_source_option)`` pair.
+
+    Raises:
+        ScanError: If the device exposes a source list that contains neither
+            the requested name nor ``"Auto"`` to fall back to.
+
+    """
+    available_sources: list[str] = []
+    has_source_option = False
+
+    for opt in raw_options:
+        if len(opt) >= 9 and opt[1] == "source":
+            has_source_option = True
+            constraint = opt[8]
+            if isinstance(constraint, list):
+                available_sources = [str(s) for s in constraint]
+            break
+
+    effective_source = requested
+    if has_source_option and effective_source not in available_sources:
+        if "Auto" in available_sources:
+            logger.info(
+                "Source '%s' not available, falling back to 'Auto'",
+                effective_source,
+            )
+            effective_source = "Auto"
+        else:
+            msg = (
+                f"Device does not support source '{effective_source}'. "
+                f"Available: {available_sources}"
+            )
+            raise ScanError(msg)
+
+    return effective_source, has_source_option
+
+
+def _configure_device(
+    dev: SaneDevice,
+    settings: ScanSettings,
+    effective_source: str,
+    *,
+    has_source_option: bool,
+) -> int:
+    """
+    Assign the scan options to the open device, source first (D-11).
+
+    **Order is load-bearing.**  ``sane.py:188-213`` reloads every option
+    descriptor when a ``set_option`` reports ``INFO_RELOAD_OPTIONS``, and a
+    source change does exactly that.  Setting the source last therefore lets a
+    resolution validated against the platen's constraint be stranded under a
+    feeder's narrower one.  Asking the device what it is scanning *from* before
+    telling it *how* removes that whole class of failure.  Geometry is set
+    afterwards, by ``_set_geometry`` in the caller.
+
+    The resolution is then read back, because SANE substitutes silently:
+    measured against the real ``test`` backend, ``5000`` comes back as
+    ``1200.0`` and ``0`` as ``1.0``, with no error and no signal to the caller.
+    Since Phase 23 made the resolution authoritative for the PDF's page
+    geometry, an unnoticed substitution yields both a mis-cropped page and a
+    wrong MediaBox, so the substitution has to be visible (M-16, T-24-15).
+
+    Args:
+        dev: Open SANE device handle.
+        settings: The requested scan settings.
+        effective_source: The source name resolved by ``_resolve_source``.
+        has_source_option: Whether the device exposes a ``source`` option at
+            all.  Keyword-only, because a positional boolean is not allowed by
+            this project's lint rules.
+
+    Returns:
+        The resolution the device actually reports, as an ``int``.  The device
+        returns a float; callers downstream want whole dpi.
+
+    """
+    if has_source_option:
+        dev.source = effective_source
+    dev.mode = settings.mode
+    dev.resolution = settings.resolution
+
+    actual_resolution = int(dev.resolution)
+    if actual_resolution != settings.resolution:
+        logger.warning(
+            "Scanner substituted resolution: requested %s dpi, device reports %s dpi",
+            settings.resolution,
+            actual_resolution,
+        )
+    return actual_resolution
+
+
 class SaneDevice(Protocol):
     """Protocol describing the SANE device handle interface."""
 
     mode: str
-    resolution: int
+    # The device returns a float -- measured, not assumed: 300 reads back as
+    # 300.0 and 5000 as 1200.0.  This was declared ``int`` for three phases,
+    # which made every read-back a quiet lie to the type checker.
+    resolution: float
     source: str
     tl_x: float
     tl_y: float
@@ -562,46 +672,36 @@ class SaneBackend(ScannerBackend):
         """
         with self._open_device(device_id) as dev:
             # Validate source option against device capabilities
-            raw_options = dev.get_options()
-            available_sources: list[str] = []
-            has_source_option = False
-
-            for opt in raw_options:
-                if len(opt) >= 9 and opt[1] == "source":
-                    has_source_option = True
-                    constraint = opt[8]
-                    if isinstance(constraint, list):
-                        available_sources = [str(s) for s in constraint]
-                    break
-
-            effective_source = settings.source
-            if has_source_option and effective_source not in available_sources:
-                if "Auto" in available_sources:
-                    logger.info(
-                        "Source '%s' not available, falling back to 'Auto'",
-                        effective_source,
-                    )
-                    effective_source = "Auto"
-                else:
-                    msg = (
-                        f"Device does not support source '{effective_source}'. "
-                        f"Available: {available_sources}"
-                    )
-                    raise ScanError(msg)
+            effective_source, has_source_option = _resolve_source(
+                dev.get_options(), settings.source
+            )
 
             # Set device options
-            dev.mode = settings.mode
-            dev.resolution = settings.resolution
-            if has_source_option:
-                dev.source = effective_source
+            _configure_device(
+                dev,
+                settings,
+                effective_source,
+                has_source_option=has_source_option,
+            )
 
             # Set scan area geometry for paper size constraint (D-01)
             geometry_set = _set_geometry(dev, settings.paper_size)
 
-            use_adf = classify_source(effective_source).uses_feeder
+            source_kind = classify_source(effective_source)
+            use_adf = source_kind.uses_feeder
 
-            # D-04: Override for "Auto" source using config-driven routing
-            if effective_source == "Auto":
+            # An Auto source says nothing about what is actually loaded, so the
+            # operator's auto_source_mode decides. That decision stays
+            # config-driven; only the *recognition* of an Auto source moved
+            # here, to the single classifier.
+            #
+            # The previous test compared the source string for equality against
+            # the one exact spelling ``Auto``, so it was case- and
+            # whitespace-sensitive: a device reporting its source as
+            # lowercase ``auto`` classifies as AUTO, so it took the single-page
+            # path and skipped this override entirely. auto_source_mode = "adf"
+            # was then silently ignored and a whole stack came back as one page.
+            if source_kind is SourceKind.AUTO:
                 use_adf = settings.auto_source_mode == "adf"
                 logger.info(
                     "Auto source routing: auto_source_mode='%s', use_adf=%s",

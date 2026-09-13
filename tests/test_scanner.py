@@ -56,7 +56,7 @@ class MockSaneDev:
     def __init__(self) -> None:
         """Initialize mock device with default settings."""
         self.mode = "color"
-        self.resolution = 300
+        self.resolution: float = 300.0
         self.source = "Flatbed"
         self.tl_x: float = 0.0
         self.tl_y: float = 0.0
@@ -182,7 +182,7 @@ class _FakeSaneDevice:
     ) -> None:
         """Initialize fake device with pluggable multi_scan, cancel, close."""
         self.mode: str = "color"
-        self.resolution: int = 300
+        self.resolution: float = 300.0
         self.source: str = "Flatbed"
         self.tl_x: float = 0.0
         self.tl_y: float = 0.0
@@ -1157,6 +1157,123 @@ class TestAutoSourceRouting:
         mock_dev._snap_impl.assert_called_once()
 
 
+class TestAutoSourceRecognition:
+    """The Auto source is recognised by the classifier, not by == (Q8)."""
+
+    @staticmethod
+    def _options_reporting(source: str) -> list[tuple]:
+        """Return an option table whose source constraint offers ``source``."""
+        return [
+            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", source]),
+            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
+            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
+        ]
+
+    @pytest.mark.parametrize("reported", ["Auto", "auto", "  AUTO  "])
+    def test_auto_is_recognised_whatever_its_spelling(
+        self,
+        sane_backend: SaneBackend,
+        mock_sane_module: MockSaneModule,
+        reported: str,
+    ) -> None:
+        """
+        A device spelling its Auto source differently still honours the routing.
+
+        ``effective_source == "Auto"`` was case- and whitespace-sensitive, so a
+        device reporting lowercase ``auto`` classified as AUTO, took the
+        single-page path and skipped the override entirely -- silently ignoring
+        ``auto_source_mode = "adf"`` and returning one page from a whole stack.
+        """
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting(reported)
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source=reported, resolution=300, mode="color", auto_source_mode="adf"
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert classify_source(reported) is SourceKind.AUTO
+        assert len(pages) == 3
+        mock_dev._snap_impl.assert_not_called()
+
+    @pytest.mark.parametrize("reported", ["Auto", "auto", "  AUTO  "])
+    def test_auto_still_honours_flatbed_routing(
+        self,
+        sane_backend: SaneBackend,
+        mock_sane_module: MockSaneModule,
+        reported: str,
+    ) -> None:
+        """The override is consulted, not merely coincidentally agreed with."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting(reported)
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source=reported, resolution=300, mode="color", auto_source_mode="flatbed"
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 1
+        mock_dev._snap_impl.assert_called_once()
+
+    def test_a_long_feeder_name_never_takes_the_auto_override(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """It is a feeder by classification, so auto_source_mode is irrelevant."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting("Automatic Document Feeder")
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source="Automatic Document Feeder",
+            resolution=300,
+            mode="color",
+            auto_source_mode="flatbed",
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert classify_source("Automatic Document Feeder") is SourceKind.FEEDER
+        assert len(pages) == 3
+        mock_dev._snap_impl.assert_not_called()
+
+    def test_an_unrecognised_source_takes_the_single_page_path(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """
+        D-01, asserted so that reversing it flips a test rather than passing quietly.
+
+        UNKNOWN keeps today's single-page routing.  C-06's safer default --
+        treat anything that is not the flatbed entry as multi-page -- was
+        DECLINED, not deferred.  ``auto_source_mode`` is set to ``"adf"`` here
+        precisely to show an unrecognised name does not reach the Auto
+        override either.
+        """
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting("Mystery Tray")
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source="Mystery Tray",
+            resolution=300,
+            mode="color",
+            auto_source_mode="adf",
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert classify_source("Mystery Tray") is SourceKind.UNKNOWN
+        assert len(pages) == 1
+        mock_dev._snap_impl.assert_called_once()
+
+
 class TestSaneBackendPerPageTimeout:
     """Per-page timeout tests."""
 
@@ -1291,7 +1408,7 @@ class _NoGeometryDevice:
     def __init__(self, pages: list[Image.Image] | None = None) -> None:
         """Initialize device that rejects geometry options."""
         self.mode: str = "color"
-        self.resolution: int = 300
+        self.resolution: float = 300.0
         self.source: str = "Flatbed"
         self._pages = pages or [_make_content_image()]
 
@@ -1641,7 +1758,7 @@ class TestFakeSaneContract:
         assert dev.tl_x == 5.0
 
     def test_resolution_reads_back_as_float(self) -> None:
-        """The real device returns float, so the Protocol's ``int`` is a lie."""
+        """The real device returns float, which the Protocol now declares (D-11)."""
         dev = FakeSaneDev()
         dev.resolution = 300
         assert isinstance(dev.resolution, float)
@@ -1693,3 +1810,172 @@ class TestFakeSaneContract:
         assert devices
         for entry in devices:
             assert len(entry) == 4
+
+
+class TestFakeSaneOptionReload:
+    """The fake's assignment log and its source-triggered option reload."""
+
+    def test_assignments_are_recorded_in_order(self) -> None:
+        """Every assignment the device really received, in the order given."""
+        dev = FakeSaneDev()
+        dev.mode = "Gray"
+        dev.resolution = 200
+        dev.source = "Flatbed"
+        assert dev.assignments == ["mode", "resolution", "source"]
+
+    def test_an_unknown_option_is_not_recorded_as_a_device_call(self) -> None:
+        """An unrecognised name is stored silently, so it is not a device call."""
+        dev = FakeSaneDev()
+        dev.not_an_option = 1
+        assert dev.assignments == []
+
+    def test_a_source_change_narrows_the_resolution_constraint(self) -> None:
+        """Selecting the armed source swaps in its narrower range."""
+        dev = FakeSaneDev()
+        dev.narrow_resolution_for_source("ADF Duplex", (1.0, 600.0, 1.0))
+        dev.source = "ADF Duplex"
+
+        constraints = {opt[1]: opt[8] for opt in dev.get_options()}
+        assert constraints["resolution"] == (1.0, 600.0, 1.0)
+
+        dev.resolution = 1000
+        assert dev.resolution == 600.0
+
+    def test_a_value_set_before_the_reload_is_not_re_validated(self) -> None:
+        """The stranded value is the hazard that makes ordering observable."""
+        dev = FakeSaneDev()
+        dev.narrow_resolution_for_source("ADF Duplex", (1.0, 600.0, 1.0))
+        dev.resolution = 1000
+        dev.source = "ADF Duplex"
+        assert dev.resolution == 1000.0
+
+
+# ---------------------------------------------------------------------------
+# D-11: source-first option ordering and the resolution read-back
+# ---------------------------------------------------------------------------
+
+
+class TestDeviceOptionOrdering:
+    """Options are assigned source-first, so a reload cannot strand them."""
+
+    def test_options_are_assigned_source_first(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The order the device observes is source, then mode, then resolution."""
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        list(backend.scan_pages("test:0", settings))
+
+        assert dev.assignments == ["source", "mode", "resolution"]
+
+    def test_a_device_without_a_source_option_is_still_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No source option means no source assignment, but mode and res still land."""
+        dev = FakeSaneDev(
+            options=[
+                (2, "mode", "Scan mode", "Mode desc", 3, 0, 1, 5, ["Color"]),
+                (
+                    3,
+                    "resolution",
+                    "Resolution",
+                    "Res desc",
+                    2,
+                    4,
+                    4,
+                    5,
+                    (1.0, 1200.0, 1.0),
+                ),
+            ],
+            pages=1,
+        )
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        list(backend.scan_pages("test:0", settings))
+
+        assert dev.assignments == ["mode", "resolution"]
+        assert dev.resolution == 300.0
+
+    def test_source_first_keeps_resolution_inside_a_narrowed_ceiling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A feeder ceiling of 600 is respected because the source was set first.
+
+        Under the old mode/resolution/source order the 1000 dpi request was
+        validated against the platen's 1200 dpi range and then stranded there
+        when selecting the feeder reloaded the descriptors, so the device was
+        left holding a value its active constraint no longer permits.
+        """
+        feeder = "Automatic Document Feeder"
+        dev = FakeSaneDev(pages=1)
+        dev.narrow_resolution_for_source(feeder, (1.0, 600.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source=feeder, resolution=1000, mode="Color")
+
+        list(backend.scan_pages("test:0", settings))
+
+        # ``__getattr__`` is typed ``object``, as the real dynamic option
+        # lookup is; isinstance narrows it without a cast or a suppression,
+        # and doubles as the assertion that the device reports a float.
+        resolution = dev.resolution
+        assert isinstance(resolution, float)
+        assert 1.0 <= resolution <= 600.0
+
+
+class TestResolutionReadBack:
+    """The resolution the device actually chose is read back (D-11, M-16)."""
+
+    @staticmethod
+    def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        """Return the WARNING messages captured so far."""
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+
+    def test_a_substituted_resolution_warns_naming_both_values(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Requesting 5000 on a 1200 dpi device names both numbers."""
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=5000, mode="Color")
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            list(backend.scan_pages("test:0", settings))
+
+        assert [m for m in self._warnings(caplog) if "5000" in m and "1200" in m]
+
+    def test_the_read_back_value_is_an_int_not_the_device_float(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The device returns 1200.0; what the backend carries is 1200."""
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=5000, mode="Color")
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            list(backend.scan_pages("test:0", settings))
+
+        warnings = self._warnings(caplog)
+        assert [m for m in warnings if "1200" in m]
+        assert not [m for m in warnings if "1200.0" in m]
+        assert isinstance(dev.resolution, float)
+
+    def test_an_honoured_resolution_logs_no_mismatch_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A resolution the device accepts unchanged is not worth a warning."""
+        dev = FakeSaneDev()
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            list(backend.scan_pages("test:0", settings))
+
+        assert not [m for m in self._warnings(caplog) if "resolution" in m.lower()]

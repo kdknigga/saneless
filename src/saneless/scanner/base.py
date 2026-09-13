@@ -94,10 +94,23 @@ def classify_source(source: str) -> SourceKind:
         return SourceKind.FEEDER
     if "flatbed" in lower:
         return SourceKind.FLATBED
-    # UNKNOWN keeps today's single-page routing (uses_feeder is False). The
-    # safer "anything that is not the flatbed entry is multi-page" default that
-    # the code review floats is a bet about unseen scanners and belongs to
-    # Phase 24, not here (D-11).
+    # ANSWERED, not deferred -- Phase 24, D-01. UNKNOWN keeps single-page
+    # routing, so uses_feeder is False.
+    #
+    # C-06's safer default -- "if the device exposes a source option, treat
+    # anything that is not the flatbed entry as multi-page" -- is DECLINED.
+    # It is a bet about scanners nobody has seen, and it trades a cheap,
+    # visible failure for an expensive one.
+    #
+    # The residual risk is accepted knowingly: a genuinely new feeder name
+    # yields a one-page PDF until someone adds a token to _FEEDER_TOKENS
+    # above. That is visible to the operator and is fixed by one entry in a
+    # tuple. The opposite failure -- treating a flatbed as a feeder and
+    # re-scanning the platen until something stops it -- is the expensive one,
+    # and it is bounded separately by _MAX_ADF_PAGES in sane_backend.py
+    # (plan 24-03).
+    #
+    # This is a settled answer. Do not re-open it as an unmade decision.
     return SourceKind.UNKNOWN
 
 
