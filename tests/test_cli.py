@@ -23,7 +23,13 @@ from saneless.config import (
 from saneless.exceptions import PaperlessError, ScanError
 from saneless.job import JobStore
 from saneless.paperless import UploadResult
-from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
+from saneless.scanner.base import (
+    DeviceCapabilities,
+    DeviceInfo,
+    ScanBatch,
+    ScannerBackend,
+    ScanSettings,
+)
 from saneless.vocabulary import JobState, state_label
 
 if TYPE_CHECKING:
@@ -85,8 +91,15 @@ def _patch_cli(
         monkeypatch.setattr("saneless.cli.SaneBackend", scanner_cls)
     else:
 
-        class MockSaneBackend:
-            """Mock scanner backend for CLI tests."""
+        class MockSaneBackend(ScannerBackend):
+            """
+            Mock scanner backend for CLI tests.
+
+            Subclasses the ABC so the type checkers can see the contract at
+            all. This was one of the two CLI stubs that would *not* have
+            failed when ScanBatch replaced the generator in this phase --
+            every stub that does subclass was caught by the checkers.
+            """
 
             def __init__(self, host: str = "") -> None:
                 """Accept host parameter for API compatibility."""
@@ -100,7 +113,7 @@ def _patch_cli(
                     ),
                 ]
 
-            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
                 """Return fixed test capabilities."""
                 return DeviceCapabilities(
                     sources=["Flatbed", "ADF"],
@@ -121,7 +134,7 @@ def _patch_cli(
                     ],
                 )
 
-            def scan_pages(self, _device_id: str, _settings: object) -> ScanBatch:
+            def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
                 """Return a batch holding a single test image with content."""
                 img = Image.new("RGB", (100, 100), "white")
                 draw = ImageDraw.Draw(img)
@@ -227,13 +240,29 @@ class TestScanCommand:
     def test_scan_scan_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Pipeline raises ScanError -> exit code 1."""
 
-        class FailScanner:
-            """Scanner that always raises ScanError."""
+        class FailScanner(ScannerBackend):
+            """
+            Scanner that always raises ScanError.
+
+            The return type used to be annotated ``-> None`` against an ABC
+            whose scan_pages returns ScanBatch. That annotation was "true"
+            only because the body always raises, and the checkers had nothing
+            to compare it against because the class did not subclass the ABC
+            it was standing in for.
+            """
 
             def __init__(self, host: str = "") -> None:
                 """Accept host parameter for API compatibility."""
 
-            def scan_pages(self, *_args: object, **_kwargs: object) -> None:
+            def get_devices(self) -> list[DeviceInfo]:
+                """Unused here: the pipeline fails before device discovery."""
+                return []
+
+            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+                """Unused here: the pipeline fails before capabilities load."""
+                return DeviceCapabilities(sources=[], resolutions=[], modes=[])
+
+            def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
                 """Raise a scan error."""
                 msg = "Paper jam"
                 raise ScanError(msg)
