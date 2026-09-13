@@ -2336,6 +2336,54 @@ class TestSourceOptionPresence:
             )
 
 
+class TestAutoSourceFallbackIsAudible:
+    """
+    Substituting 'Auto' for a missing source can change the page count (WR-02).
+
+    ``scan_pages`` classifies the *effective* source, so a profile asking for
+    "ADF Duplex" on a device offering only Flatbed and Auto is routed by
+    ``auto_source_mode``, which defaults to "flatbed" -- one page out of a
+    whole stack.  That was announced at INFO, while the comparable resolution
+    substitution has warned since M-16.
+    """
+
+    def _flatbed_and_auto(self) -> list[tuple]:
+        """Build an option table whose source list offers no feeder."""
+        return [_option(1, "source", _STRING_OPTION, ["Flatbed", "Auto"])]
+
+    def test_the_substitution_still_happens(self) -> None:
+        """Raising the level must not change which source is chosen."""
+        effective, has_source_option = sane_backend_mod._resolve_source(
+            self._flatbed_and_auto(), "ADF Duplex"
+        )
+
+        assert effective == "Auto"
+        assert has_source_option is True
+
+    def test_the_substitution_is_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The requested source is named, at a level the operator sees."""
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            sane_backend_mod._resolve_source(self._flatbed_and_auto(), "ADF Duplex")
+
+        assert [m for m in _warning_messages(caplog) if "ADF Duplex" in m]
+
+    def test_the_warning_names_the_routing_consequence(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The page-count risk is the point, not the substitution alone.
+
+        "Falling back to Auto" reads as harmless; "may not be multi-page" is
+        the part that explains a one-page PDF from a twenty-sheet stack.
+        """
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            sane_backend_mod._resolve_source(self._flatbed_and_auto(), "ADF Duplex")
+
+        assert [m for m in _warning_messages(caplog) if "auto_source_mode" in m]
+
+
 class TestDeviceCapabilitiesShape:
     """The value object's field order, which existing call sites depend on."""
 

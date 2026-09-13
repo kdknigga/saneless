@@ -800,6 +800,15 @@ def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool
     still be assigned.  A helper returning only the parsed constraint would
     collapse the two and silently stop setting the source on such a device.
 
+    The ``Auto`` substitution is a WARNING rather than an INFO because it can
+    change how many pages come back.  ``scan_pages`` classifies the *effective*
+    source, so once this returns ``"Auto"`` the routing is decided by the
+    profile's ``auto_source_mode``, which defaults to ``"flatbed"``: a profile
+    asking for ``"ADF Duplex"`` on a device offering only ``Flatbed`` and
+    ``Auto`` quietly returns one page from a whole stack.  The comparable
+    resolution substitution has been visible since M-16, and a substitution
+    that silently drops pages cannot be the quieter of the two.
+
     Args:
         raw_options: The device's option tuples, as ``get_options()`` returns
             them.
@@ -820,8 +829,10 @@ def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool
     effective_source = requested
     if has_source_option and effective_source not in available_sources:
         if "Auto" in available_sources:
-            logger.info(
-                "Source '%s' not available, falling back to 'Auto'",
+            logger.warning(
+                "Source '%s' not available; falling back to 'Auto', whose "
+                "routing is decided by the profile's auto_source_mode and may "
+                "not be multi-page -- a whole stack can come back as one page",
                 effective_source,
             )
             effective_source = "Auto"
