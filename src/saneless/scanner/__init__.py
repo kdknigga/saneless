@@ -6,12 +6,19 @@ wrapping python-sane, along with data types for device information,
 capabilities, and scan settings.
 """
 
-from .base import DeviceCapabilities, DeviceInfo, ScannerBackend, ScanSettings
+from .base import (
+    DeviceCapabilities,
+    DeviceInfo,
+    ScanBatch,
+    ScannerBackend,
+    ScanSettings,
+)
 
 __all__ = [
     "DeviceCapabilities",
     "DeviceInfo",
     "SaneBackend",
+    "ScanBatch",
     "ScanSettings",
     "ScannerBackend",
 ]

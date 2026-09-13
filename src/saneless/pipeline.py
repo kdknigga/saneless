@@ -574,7 +574,7 @@ def _scan_manual_duplex(
 
     """
     # Pass A: scan fronts
-    front_pages = list(scanner.scan_pages(device_id, scan_settings))
+    front_pages = scanner.scan_pages(device_id, scan_settings).pages
     logger.info("Pass A: scanned %d front page(s)", len(front_pages))
 
     # Generate thumbnail from first page
@@ -594,7 +594,7 @@ def _scan_manual_duplex(
 
     # Pass B: scan backs
     notify(PipelineEvent.SCANNING_REVERSE)
-    back_pages = list(scanner.scan_pages(device_id, scan_settings))
+    back_pages = scanner.scan_pages(device_id, scan_settings).pages
     logger.info("Pass B: scanned %d back page(s)", len(back_pages))
 
     # Raw count validation BEFORE empty page detection (SCAN-07)
@@ -625,7 +625,7 @@ def _scan_simplex(
         List of scanned page images.
 
     """
-    images = list(scanner.scan_pages(device_id, scan_settings))
+    images = scanner.scan_pages(device_id, scan_settings).pages
     logger.info("Scanned %d page(s)", len(images))
 
     # Generate thumbnail from first page

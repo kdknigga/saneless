@@ -14,13 +14,12 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from PIL import Image
 
 __all__ = [
     "DeviceCapabilities",
     "DeviceInfo",
+    "ScanBatch",
     "ScanSettings",
     "ScannerBackend",
     "SourceKind",
@@ -145,6 +144,45 @@ class ScanSettings:
     paper_size: str = "full"
 
 
+@dataclass(frozen=True)
+class ScanBatch:
+    """
+    The pages one acquisition produced, and what the device actually did.
+
+    Three fields, and deliberately no per-page structure. Phase 29's HARD-01
+    owns the ordered per-page record design -- which sheet produced which page,
+    in what order, with what per-page fault -- and an object that grew
+    page-level detail here would quietly pre-empt that decision. Do not extend
+    this casually: a fact that is per-page belongs to HARD-01, not here. It
+    deliberately carries no geometry either, because D-19 reuses the existing
+    crop fallback rather than reporting the area back out.
+
+    ``frozen=True`` is a departure from the plain ``@dataclass`` used by
+    ``DeviceInfo``, ``DeviceCapabilities``, ``ScanSettings`` and
+    ``pipeline.ScanResult``. There is no frozen precedent in this codebase, so
+    the choice is stated rather than inherited: this is a report of what a
+    device has already done, and nothing downstream has any business rewriting
+    it afterwards.
+
+    Attributes:
+        pages: The acquired pages, in the order the device produced them.
+        actual_resolution: The resolution the device reported back, in whole
+            dpi. Not the requested one -- SANE substitutes silently -- and it
+            is the value both the crop arithmetic and the PDF's declared page
+            size have to agree on.
+        pages_rejected: How many fed sheets failed their integrity checks and
+            were skipped. This is deliberately NOT the pipeline's blank-page
+            removal count: that one is empty-page detection and is rendered to
+            users as pages removed for being blank, so reporting a sheet the
+            device could not read through it would be a new small lie.
+
+    """
+
+    pages: list[Image.Image]
+    actual_resolution: int
+    pages_rejected: int
+
+
 class ScannerBackend(ABC):
     """
     Abstract base class for scanner backends.
@@ -172,17 +210,22 @@ class ScannerBackend(ABC):
         """
 
     @abstractmethod
-    def scan_pages(
-        self, device_id: str, settings: ScanSettings
-    ) -> Iterator[Image.Image]:
+    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
         """
         Acquire pages from scanner.
+
+        This returns a completed batch rather than yielding pages. A generator
+        can only hand back images, and its return value is discarded by the
+        ``list()`` every caller wrapped it in, so the two facts the backend
+        measures -- the resolution the device settled on, and the sheets it
+        could not read -- had no way out of the backend at all.
 
         Args:
             device_id: SANE device identifier string.
             settings: Scan settings (source, resolution, mode).
 
-        Yields:
-            PIL Image objects for each scanned page.
+        Returns:
+            A ScanBatch carrying the pages, the resolution the device actually
+            used, and how many fed sheets failed their integrity checks.
 
         """

@@ -29,6 +29,7 @@ from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
+    ScanBatch,
     ScannerBackend,
     ScanSettings,
     SourceKind,
@@ -533,9 +534,9 @@ def _next_page_with_timeout(
 def _acquire_pages(
     dev: SaneDevice,
     timeout_per_page: float,
-) -> Iterator[Image.Image]:
+) -> tuple[list[Image.Image], int]:
     """
-    Yield validated pages from the ADF, one per feeder sheet.
+    Return the validated ADF pages, and how many sheets were skipped.
 
     ``multi_scan()`` returns an iterator object and cannot raise, so the call
     is not guarded.  python-sane's ``_SaneIterator.__next__`` converts exactly
@@ -570,8 +571,10 @@ def _acquire_pages(
         dev: Open SANE device handle.
         timeout_per_page: Maximum seconds to wait for each page.
 
-    Yields:
-        Validated PIL Image for each scanned page.
+    Returns:
+        The validated pages, and how many fed sheets were skipped for failing
+        their integrity checks.  The count leaves the backend inside D-12's
+        ``ScanBatch`` and by no other route.
 
     Raises:
         FeederEmptyError: If the feeder produced no pages at all.
@@ -582,13 +585,14 @@ def _acquire_pages(
     """
     iterator = dev.multi_scan()
 
+    pages: list[Image.Image] = []
     page_num = 0
-    # Kept local on purpose. Surfacing this count to the user is D-07, and its
-    # channel is D-12's result object, which plan 24-07 builds. It is
+    # Returned to the caller now rather than kept local: surfacing this count is
+    # D-07, and its channel is D-12's ScanBatch and no second mechanism. It is
     # deliberately kept out of the pipeline's blank-page removal count: Phase 23
     # defined that field as empty-page detection and Phase 30 renders it to
-    # users as "pages removed as blank", so reporting a corrupt page through it
-    # would be a new small lie in a phase about removing them.
+    # users as pages removed for being blank, so reporting a corrupt page
+    # through it would be a new small lie in a phase about removing them.
     rejected_pages = 0
     executor = ThreadPoolExecutor(max_workers=1)
     try:
@@ -630,7 +634,7 @@ def _acquire_pages(
 
             # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf)
             page_image.info.pop("exif", None)
-            yield page_image
+            pages.append(page_image)
     finally:
         # Shut down the timeout executor
         executor.shutdown(wait=False)
@@ -650,6 +654,8 @@ def _acquire_pages(
             f"data); no usable page was produced"
         )
         raise ScanError(all_rejected_msg)
+
+    return pages, rejected_pages
 
 
 def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool]:
@@ -901,9 +907,9 @@ class SaneBackend(ScannerBackend):
         self,
         dev: SaneDevice,
         timeout_per_page: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
-    ) -> Iterator[Image.Image]:
+    ) -> tuple[list[Image.Image], int]:
         """
-        Return an iterator of validated ADF pages with a per-page timeout.
+        Return the validated ADF pages, with a per-page timeout.
 
         Per user decision: "Wrap ADF iteration with per-page timeout (not per-job)
         -- cancel if single page takes longer than 2-3x expected duration."
@@ -918,29 +924,39 @@ class SaneBackend(ScannerBackend):
             timeout_per_page: Maximum seconds to wait for each page.
 
         Returns:
-            An iterator of validated PIL Images, one per scanned page.
+            The validated pages, and the count of fed sheets skipped for
+            failing their integrity checks.
 
         """
         return _acquire_pages(dev, timeout_per_page)
 
-    def scan_pages(
-        self, device_id: str, settings: ScanSettings
-    ) -> Iterator[Image.Image]:
+    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
         """
         Acquire pages from scanner.
 
         Opens the device, validates the requested source against
-        available options, sets scan parameters, and yields scanned
-        images. Uses multi_scan() for ADF sources, snap() for flatbed.
+        available options, sets scan parameters, and returns the finished
+        batch. Uses multi_scan() for ADF sources, snap() for flatbed.
         Does NOT pass a progress callback to snap() to prevent
         segfaults (Pitfall #2).
+
+        Acquisition is eager, and that is what lets the two facts this backend
+        measures leave it at all: a generator hands back images only, and its
+        return value is discarded by the ``list()`` every caller wrapped it in.
+
+        The device being closed by the time this returns is a **consequence**
+        of that, not a goal -- the handle previously stayed open until the
+        generator was drained or garbage-collected. Close-while-reading and
+        cancel semantics are Phase 29's HARD-03/HARD-04 and are deliberately
+        not folded in here.
 
         Args:
             device_id: SANE device identifier string.
             settings: Scan settings (source, resolution, mode).
 
-        Yields:
-            PIL Image for each scanned page.
+        Returns:
+            A ScanBatch carrying the pages, the resolution the device actually
+            used, and how many fed sheets failed their integrity checks.
 
         Raises:
             ScanError: If the device does not support the requested source.
@@ -999,13 +1015,7 @@ class SaneBackend(ScannerBackend):
 
             if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
-                for page in self._scan_adf_pages(dev):
-                    yield _maybe_crop(
-                        page,
-                        settings.paper_size,
-                        actual_resolution,
-                        geometry_set=geometry_set,
-                    )
+                acquired, pages_rejected = self._scan_adf_pages(dev)
             else:
                 # Flatbed: start() initiates the SANE data channel, then
                 # snap() drains it via sane_read() loop.  Without start()
@@ -1014,9 +1024,25 @@ class SaneBackend(ScannerBackend):
                 image = dev.snap()
                 # Strip EXIF from flatbed scans too
                 image.info.pop("exif", None)
-                yield _maybe_crop(
-                    image,
+                acquired = [image]
+                # A flatbed exposes one sheet at a time and the caller sees any
+                # failure as an exception, so there is nothing to skip past.
+                pages_rejected = 0
+
+            pages = [
+                _maybe_crop(
+                    page,
                     settings.paper_size,
                     actual_resolution,
                     geometry_set=geometry_set,
                 )
+                for page in acquired
+            ]
+
+        # Assembled inside the device context but returned outside it, so the
+        # handle is released before the caller ever sees the batch.
+        return ScanBatch(
+            pages=pages,
+            actual_resolution=actual_resolution,
+            pages_rejected=pages_rejected,
+        )
