@@ -27,6 +27,7 @@ from saneless.pipeline import (
     _check_disk_space,
     _interleave_duplex,
     _is_manual_duplex,
+    _preserving,
     run_pipeline,
 )
 from saneless.scanner.base import ScannerBackend
@@ -1563,6 +1564,71 @@ def _preserve_one_scan(settings: Settings, job_id: str) -> PaperlessError:
             ),
         )
     return excinfo.value
+
+
+class TestFailedDirWarningFiresOncePerGuard:
+    """
+    One guard preserving two PDFs warns once, not once per file (WR-09).
+
+    The duplex-mismatch recovery passes both halves under a single
+    ``_preserving`` guard, because they are one document between them (D-08).
+    Running the threshold check inside the per-file loop therefore emitted the
+    same "N preserved scans have accumulated" WARNING twice, with different
+    counts -- log noise on the one path already flagged as an anomaly, and a
+    contradiction of the helper's own "one WARNING" docstring.
+    """
+
+    def _two_scans(self, tmp_path: Path) -> list[Path]:
+        """Write two assembled-looking PDFs for one guard to preserve."""
+        pdfs = [tmp_path / "fronts.pdf", tmp_path / "backs.pdf"]
+        for pdf in pdfs:
+            pdf.write_bytes(b"%PDF-new" * 64)
+        return pdfs
+
+    def _preserve_both(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> Path:
+        """Fail one delivery holding two PDFs, and return the failed dir."""
+        failed_dir = tmp_path / "failed"
+        # One short of the threshold, so the per-file call crossed it on the
+        # first move and again on the second -- two warnings for one failure.
+        _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
+        pdfs = self._two_scans(tmp_path)
+        failure = PaperlessError("Upload failed")
+
+        with (
+            caplog.at_level(logging.WARNING, logger="saneless.pipeline"),
+            pytest.raises(PaperlessError),
+            _preserving(pdfs, failed_dir),
+        ):
+            raise failure
+
+        return failed_dir
+
+    def test_two_preserved_scans_emit_one_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One failure is one anomaly, however many files it preserved."""
+        failed_dir = self._preserve_both(tmp_path, caplog)
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and str(failed_dir) in record.getMessage()
+        ]
+        assert len(warnings) == 1
+
+    def test_the_single_warning_counts_both_preserved_scans(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The count reflects the finished state, not a mid-loop snapshot."""
+        failed_dir = self._preserve_both(tmp_path, caplog)
+
+        message = next(
+            record.getMessage()
+            for record in caplog.records
+            if str(failed_dir) in record.getMessage()
+        )
+        assert str(FAILED_DIR_WARN_THRESHOLD + 1) in message
 
 
 class TestFailedDirWarning:

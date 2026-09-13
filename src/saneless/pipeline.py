@@ -194,9 +194,9 @@ def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     disappearing underneath us -- ends the check silently instead.
 
     Args:
-        failed_dir: The directory preserved PDFs are moved into. It has just
-            been written to, so the newly preserved file is included in the
-            count.
+        failed_dir: The directory preserved PDFs are moved into. Every scan
+            this guard preserved has already been moved in by the time this
+            runs, so all of them are included in the count.
 
     """
     try:
@@ -288,6 +288,13 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
                 destination = failed_dir / pdf_path.name
                 shutil.move(pdf_path, destination)
                 destinations.append(destination)
+            # Once, after the loop, so the count reflects the finished state.
+            # The duplex-mismatch recovery passes two PDFs under a single
+            # guard, so calling this per file emitted the same "N preserved
+            # scans have accumulated" WARNING twice with different counts --
+            # log noise on the one path already flagged as an anomaly, and a
+            # contradiction of this helper's own "one WARNING" docstring.
+            if destinations:
                 _warn_if_failed_dir_growing(failed_dir)
         except OSError as move_exc:
             msg = f"{exc}. The scan could NOT be preserved to {failed_dir}: {move_exc}"
