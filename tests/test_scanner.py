@@ -864,6 +864,63 @@ class TestSaneBackendPageValidation:
         assert "exif" not in pages[0].info
 
 
+class TestFlatbedIntegrityChecks:
+    """
+    The single-sheet path runs the same two checks as the feeder (WR-03).
+
+    The feeder validated every page and counted rejections; the flatbed path
+    did neither.  The reason given -- that the caller sees any failure as an
+    exception -- describes the case these checks are not for: an unreadable
+    image returned *successfully*, which flowed into ``_maybe_crop`` and then
+    into ``assemble_pdf``, where ``img.save()`` on a 0x0 image was the first
+    thing to notice.  The identical page arriving from a feeder was skipped,
+    counted and reported.
+
+    A failure is fatal here rather than counted, because a flatbed exposes one
+    sheet at a time and there is no next page to carry on to.
+    """
+
+    def test_a_zero_dimension_sheet_raises(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """A 0x0 image is not a page, however successfully it was returned."""
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([Image.new("RGB", (0, 0))])
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        with pytest.raises(ScanError, match="unreadable"):
+            backend.scan_pages("test:device:001", settings)
+
+    def test_a_sheet_below_the_byte_floor_raises(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """A 10x10 RGB page is 300 bytes, far below the floor."""
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([Image.new("RGB", (10, 10), "white")])
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        with pytest.raises(ScanError, match="unreadable"):
+            backend.scan_pages("test:device:001", settings)
+
+    def test_a_readable_sheet_still_reports_no_rejections(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """The check must not start counting good flatbed pages as rejects."""
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([_make_content_image()])
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+        batch = backend.scan_pages("test:device:001", settings)
+
+        assert len(batch.pages) == 1
+        assert batch.pages_rejected == 0
+
+
 class TestIntegrityFailuresAreSkippedAndCounted:
     """
     One unreadable page costs one page; a wholly unreadable batch raises.

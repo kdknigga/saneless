@@ -1084,7 +1084,9 @@ class SaneBackend(ScannerBackend):
             used, and how many fed sheets failed their integrity checks.
 
         Raises:
-            ScanError: If the device does not support the requested source.
+            ScanError: If the device does not support the requested source, or
+                if a flatbed scan returns a page that fails its integrity
+                checks -- unlike a fed sheet, there is no next page to skip to.
             FeederEmptyError: If the ADF feeder is empty.
 
         """
@@ -1147,11 +1149,30 @@ class SaneBackend(ScannerBackend):
                 # the read loop has no data source.
                 dev.start()
                 image = dev.snap()
+                # The same two integrity checks the feeder path runs.  The
+                # reason given for omitting them here -- that the caller sees
+                # any failure as an exception -- describes the case they are
+                # not for: a zero-dimension image, or a buffer too small to be
+                # a page, returned *successfully*.  Such an image flowed into
+                # _maybe_crop and then into assemble_pdf, where img.save() on a
+                # 0x0 image was the first thing to notice, while the identical
+                # page arriving from a feeder was skipped, counted and
+                # reported.
+                #
+                # Fatal here rather than skipped: a flatbed exposes one sheet
+                # at a time, so there is no next page to fall back to and
+                # nothing to carry on to.
+                if not _validate_page_image(image, 1):
+                    unreadable_msg = (
+                        "The scanner returned an unreadable page (zero "
+                        f"dimensions, or below {_MIN_PAGE_BYTES} bytes of "
+                        "image data)"
+                    )
+                    raise ScanError(unreadable_msg)
                 # Strip EXIF from flatbed scans too
                 image.info.pop("exif", None)
                 acquired = [image]
-                # A flatbed exposes one sheet at a time and the caller sees any
-                # failure as an exception, so there is nothing to skip past.
+                # Nothing was skipped: an unreadable sheet raised above.
                 pages_rejected = 0
 
             pages = [
