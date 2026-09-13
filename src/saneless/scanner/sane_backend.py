@@ -99,6 +99,19 @@ _MAX_ADF_PAGES: int = 500
 # The one message reported when a feeder produced no pages at all.
 _FEEDER_EMPTY_MESSAGE = "No paper detected in feeder"
 
+# The four scan-area options, spelled as ``get_options()`` REPORTS them, with
+# hyphens.  This set is for the presence lookup only.
+#
+# Attribute ASSIGNMENT uses the underscore spelling instead -- ``dev.tl_x``, not
+# ``dev["tl-x"]`` -- and the two are deliberately not derived from one another.
+# python-sane reports ``tl-x`` from ``get_options()`` while ``__setattr__`` keys
+# on ``tl_x``, so a single set of constants used for both sides would be wrong on
+# one of them, silently.  Measured, not assumed:
+#
+#     OPT (24, 'tl-x', 'Top-left x', ..., type=2, unit=3, (0.0, 200.0, 1.0))
+#     dev.tl_x = 0.0
+_REPORTED_GEOMETRY_OPTIONS: tuple[str, ...] = ("tl-x", "tl-y", "br-x", "br-y")
+
 __all__ = ["SaneBackend"]
 
 logger = logging.getLogger(__name__)
@@ -118,20 +131,44 @@ def _as_image(obj: object) -> Image.Image:
     return obj
 
 
-def _set_geometry(dev: SaneDevice, paper_size: str) -> bool:
+def _missing_geometry_options(raw_options: list[tuple]) -> list[str]:
     """
-    Set SANE geometry options for paper size constraint.
+    Name the scan-area options the device does not report.
 
-    SANE devices expose geometry options (tl_x, tl_y, br_x, br_y) as
-    dynamic attributes.  Not all scanners support them, so assignment
-    failures are caught and cause a fallback to Pillow cropping.
+    Args:
+        raw_options: The device's option tuples, as ``get_options()`` returns
+            them.
+
+    Returns:
+        The absent option names in their hyphenated spelling, empty when the
+        device reports all four.
+
+    """
+    reported = {opt[1] for opt in raw_options if len(opt) >= 9}
+    return [name for name in _REPORTED_GEOMETRY_OPTIONS if name not in reported]
+
+
+def _set_geometry(dev: SaneDevice, paper_size: str, raw_options: list[tuple]) -> bool:
+    """
+    Constrain the scan area to a paper size, if the device really can.
+
+    **The presence check is what makes the crop fallback reachable, and an
+    exception handler is not a substitute for it.**  ``SaneDev.__setattr__``
+    stores an unrecognised option name straight into ``__dict__`` and returns --
+    no device call, no validation, no raise (``sane.py:188``).  So on a scanner
+    with no scan-area options, ``dev.br_y = 297.0`` *succeeds*, this function
+    used to return True, and ``_maybe_crop`` never ran: ``paper_size`` was
+    silently ignored and the user got a full-bed scan (M-15).  Asking the
+    device's own option list first is the only way to tell the two cases apart.
 
     Args:
         dev: Open SANE device handle.
         paper_size: Paper size key (e.g. ``"a4"``).
+        raw_options: The device's option tuples, already fetched by the caller.
 
     Returns:
-        True if geometry was set successfully, False otherwise.
+        True if the scan area was set on the device, False if the caller should
+        crop the image afterwards instead.
 
     """
     if paper_size == "full":
@@ -139,15 +176,26 @@ def _set_geometry(dev: SaneDevice, paper_size: str) -> bool:
     dims = PAPER_SIZES_MM.get(paper_size)
     if dims is None:
         return False
+    missing = _missing_geometry_options(raw_options)
+    if missing:
+        logger.warning(
+            "Scanner does not report scan-area option(s) %s, will crop after scanning",
+            ", ".join(missing),
+        )
+        return False
     width_mm, height_mm = dims
     try:
         dev.tl_x = 0.0
         dev.tl_y = 0.0
         dev.br_x = width_mm
         dev.br_y = height_mm
-    except Exception:
+    except Exception as exc:
+        # Name what was swallowed.  A device that reports the options and then
+        # refuses them is a different fault from one that never had them, and
+        # a bare "does not support geometry" hid which had happened (M-15).
         logger.warning(
-            "Scanner does not support geometry options, will crop after scanning",
+            "Scanner rejected the scan-area options (%s), will crop after scanning",
+            exc,
         )
         return False
     logger.info(
@@ -671,9 +719,15 @@ class SaneBackend(ScannerBackend):
 
         """
         with self._open_device(device_id) as dev:
+            # Fetched once and passed on: _resolve_source reads the source
+            # constraint from it and _set_geometry reads the scan-area options,
+            # and a second get_options() call would be a second device round
+            # trip for a list that cannot have changed in between.
+            raw_options = dev.get_options()
+
             # Validate source option against device capabilities
             effective_source, has_source_option = _resolve_source(
-                dev.get_options(), settings.source
+                raw_options, settings.source
             )
 
             # Set device options
@@ -684,8 +738,9 @@ class SaneBackend(ScannerBackend):
                 has_source_option=has_source_option,
             )
 
-            # Set scan area geometry for paper size constraint (D-01)
-            geometry_set = _set_geometry(dev, settings.paper_size)
+            # Constrain the scan area to the paper size, if the device reports
+            # the options to do it with (D-09).
+            geometry_set = _set_geometry(dev, settings.paper_size, raw_options)
 
             source_kind = classify_source(effective_source)
             use_adf = source_kind.uses_feeder

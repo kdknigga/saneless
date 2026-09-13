@@ -1453,8 +1453,8 @@ def _geometry_less_device(pages: int = 1) -> FakeSaneDev:
     """
     Build a device whose option list does not mention the geometry options.
 
-    This is the condition ``_NoGeometryDevice`` claimed to model and inverted.
-    The real ``SaneDev.__setattr__`` *stores* an unknown option name silently
+    This is the condition the old geometry-less double claimed to model and
+    inverted.  The real ``SaneDev.__setattr__`` *stores* an unknown name
     (``sane.py:188``), so such a device accepts ``dev.br_y`` without complaint
     -- which is exactly why the presence check, and not an exception, is what
     makes the crop fallback reachable.
@@ -1687,10 +1687,10 @@ class TestFakeSaneContract:
     The rows asserted here are RESEARCH.md Finding 7's contract table, which
     was executed against the real library rather than inferred.  Each of the
     three hand-written doubles in this module got at least one row wrong, and
-    every wrong row let a shipped defect earn a green test -- most visibly
-    ``_NoGeometryDevice``, which *raises* on an unknown option where the real
+    every wrong row let a shipped defect earn a green test -- most visibly the
+    geometry-less double, which *raised* on an unknown option where the real
     library *stores* it, so the crop fallback it was written to prove could
-    never actually be reached.
+    never actually be reached.  That double is deleted (D-09).
 
     The table is parametrised rather than written out one test per row so that
     a future row cannot be added to the fake without also being asserted here.
@@ -1762,7 +1762,7 @@ class TestFakeSaneContract:
 
     def test_unknown_option_is_stored_silently(self) -> None:
         """
-        Row 1, the inverse of ``_NoGeometryDevice``.
+        Row 1, the inverse of the deleted geometry-less double.
 
         The real ``SaneDev.__setattr__`` stores an unrecognised name straight
         into ``__dict__`` and returns: no device call, no validation, no
