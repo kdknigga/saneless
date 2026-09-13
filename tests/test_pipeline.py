@@ -35,6 +35,7 @@ from saneless.vocabulary import (
     ScanOutcome,
     classify_error,
 )
+from tests.conftest import scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -302,7 +303,7 @@ class TestPipelineThumbnail:
         """Flatbed scan calls thumbnail_callback with non-empty base64 string."""
         default_settings.output.tmp_dir = str(tmp_path)
         # Use a content image so it doesn't get filtered as empty
-        mock_scanner.scan_pages.return_value = iter([_make_content_image()])
+        mock_scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -331,7 +332,7 @@ class TestPipelineThumbnail:
     ) -> None:
         """Pipeline works without thumbnail_callback."""
         default_settings.output.tmp_dir = str(tmp_path)
-        mock_scanner.scan_pages.return_value = iter([_make_content_image()])
+        mock_scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         request = PipelineRequest(
             profile_name="default",
@@ -369,7 +370,7 @@ class TestPipelineEmptyPageFilter:
         ]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Filter Test")
 
@@ -400,7 +401,7 @@ class TestPipelineEmptyPageFilter:
         default_settings.profiles["default"].empty_page_stddev_threshold = 10.0
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter([_make_content_image()])
+        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         request = PipelineRequest(profile_name="default", title="Threshold Test")
 
@@ -427,7 +428,7 @@ class TestPipelineEmptyPageFilter:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(
+        scanner.scan_pages.return_value = scan_batch(
             [_make_empty_image(), _make_empty_image()]
         )
 
@@ -458,7 +459,7 @@ class TestManualDuplex:
         backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -493,7 +494,7 @@ class TestManualDuplex:
         backs = [_make_content_image() for _ in range(2)]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -545,8 +546,8 @@ class TestManualDuplex:
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = [
-            iter([_make_content_image() for _ in range(3)]),
-            iter([_make_content_image() for _ in range(2)]),
+            scan_batch([_make_content_image() for _ in range(3)]),
+            scan_batch([_make_content_image() for _ in range(2)]),
         ]
 
         result = run_pipeline(
@@ -580,8 +581,8 @@ class TestManualDuplex:
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = [
-            iter([_make_content_image() for _ in range(3)]),
-            iter([_make_content_image() for _ in range(2)]),
+            scan_batch([_make_content_image() for _ in range(3)]),
+            scan_batch([_make_content_image() for _ in range(2)]),
         ]
 
         result = run_pipeline(
@@ -607,7 +608,7 @@ class TestManualDuplex:
         backs = [_make_content_image("green"), _make_content_image("yellow")]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -644,7 +645,7 @@ class TestManualDuplex:
         backs = [_make_empty_image(), _make_content_image("green")]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -680,7 +681,7 @@ class TestManualDuplex:
         backs = [_make_content_image()]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -713,7 +714,7 @@ class TestManualDuplex:
         backs = [_make_content_image()]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         flip_event = threading.Event()
         flip_event.set()  # Pre-set so it doesn't block
@@ -745,7 +746,7 @@ class TestManualDuplex:
         fronts = [_make_content_image()]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(fronts)
+        scanner.scan_pages.return_value = scan_batch(fronts)
 
         flip_event = threading.Event()
         abort_event = threading.Event()
@@ -784,7 +785,7 @@ class TestExifStripped:
         img.info["exif"] = b"fake-exif-data"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter([img])
+        scanner.scan_pages.return_value = scan_batch([img])
 
         request = PipelineRequest(profile_name="default", title="EXIF Test")
 
@@ -823,7 +824,7 @@ class TestEmptyPageDetectionToggle:
         all_pages = [content_page, *empty_pages]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Toggle Test")
 
@@ -856,7 +857,7 @@ class TestFlatbedStillWorks:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter([_make_content_image()])
+        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -966,7 +967,7 @@ class TestScanResultContract:
             _make_content_image("red"),
         ]
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Counts Test")
 
@@ -1000,7 +1001,7 @@ class TestScanResultContract:
 
         all_pages = [_make_content_image(), _make_empty_image(), _make_empty_image()]
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="No Filter Test")
 
@@ -1080,7 +1081,7 @@ def _isolate_dirs(settings: Settings, tmp_path: Path) -> Path:
 def _one_page_scanner() -> MagicMock:
     """Return a scanner backend yielding a single page with content."""
     scanner = MagicMock(spec=ScannerBackend)
-    scanner.scan_pages.return_value = iter([_make_content_image()])
+    scanner.scan_pages.return_value = scan_batch([_make_content_image()])
     return scanner
 
 
@@ -1615,8 +1616,8 @@ def _mismatched_duplex_scanner(fronts: int = 3, backs: int = 2) -> MagicMock:
     """
     scanner = MagicMock(spec=ScannerBackend)
     scanner.scan_pages.side_effect = [
-        iter([_make_content_image() for _ in range(fronts)]),
-        iter([_make_content_image() for _ in range(backs)]),
+        scan_batch([_make_content_image() for _ in range(fronts)]),
+        scan_batch([_make_content_image() for _ in range(backs)]),
     ]
     return scanner
 

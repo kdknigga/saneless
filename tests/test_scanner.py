@@ -272,11 +272,13 @@ class MockBackend(ScannerBackend):
             raw_options=[],
         )
 
-    def scan_pages(
-        self, device_id: str, settings: ScanSettings
-    ) -> Iterator[Image.Image]:
-        """Yield a single white test image."""
-        yield Image.new("RGB", (100, 100), "white")
+    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+        """Return a batch holding a single white test image."""
+        return ScanBatch(
+            pages=[Image.new("RGB", (100, 100), "white")],
+            actual_resolution=settings.resolution,
+            pages_rejected=0,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -419,7 +421,7 @@ class TestMockBackend:
         """MockBackend.scan_pages yields PIL Images."""
         backend = MockBackend()
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
-        pages = list(backend.scan_pages("mock:device", settings))
+        pages = backend.scan_pages("mock:device", settings).pages
         assert len(pages) == 1
         assert isinstance(pages[0], Image.Image)
 
@@ -517,7 +519,7 @@ class TestSaneBackendScanPages:
     ) -> None:
         """scan_pages opens device, yields image, then closes device."""
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
         assert isinstance(pages[0], Image.Image)
         mock_dev = mock_sane_module._mock_dev
@@ -528,7 +530,7 @@ class TestSaneBackendScanPages:
     ) -> None:
         """Device cancel() is called before close() on normal exit."""
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
         mock_dev = mock_sane_module._mock_dev
         assert mock_dev._cancel_called
         assert mock_dev._close_called
@@ -545,7 +547,7 @@ class TestSaneBackendScanPages:
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
 
         with pytest.raises(RuntimeError, match="scan failed"):
-            list(backend.scan_pages("test:device:001", settings))
+            backend.scan_pages("test:device:001", settings)
 
         assert mock_dev._cancel_called
         assert mock_dev._close_called
@@ -560,7 +562,7 @@ class TestSaneBackendScanPages:
         )
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
 
         # snap() should be called with no arguments (no progress callback)
         mock_dev._snap_impl.assert_called_once_with()
@@ -574,7 +576,7 @@ class TestSaneBackendScanPages:
         )
 
         with pytest.raises(ScanError, match="NonExistentSource"):
-            list(backend.scan_pages("test:device:001", settings))
+            backend.scan_pages("test:device:001", settings)
 
 
 class TestSaneBackendGetCapabilities:
@@ -608,7 +610,7 @@ class TestSaneBackendADFScan:
         """Verify ADF scan via multi_scan yields all 3 pages from the feeder."""
         _ = mock_sane_module  # fixture provides mock device
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 3
         for page in pages:
             assert isinstance(page, Image.Image)
@@ -623,7 +625,7 @@ class TestSaneBackendADFScan:
         )
 
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
 
         mock_dev._snap_impl.assert_not_called()
 
@@ -637,7 +639,7 @@ class TestSaneBackendADFScan:
         )
 
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 1
         mock_dev._snap_impl.assert_called_once_with()
@@ -687,7 +689,7 @@ class TestSaneBackendAutomaticDocumentFeeder:
         settings = ScanSettings(
             source="Automatic Document Feeder", resolution=300, mode="color"
         )
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 3
         for page in pages:
@@ -704,7 +706,7 @@ class TestSaneBackendDuplex:
         """Verify ADF Duplex scan yields pages pre-interleaved from hardware."""
         _ = mock_sane_module  # fixture provides mock device
         settings = ScanSettings(source="ADF Duplex", resolution=300, mode="color")
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 3
         for page in pages:
             assert isinstance(page, Image.Image)
@@ -719,7 +721,7 @@ class TestSaneBackendDuplex:
         )
 
         settings = ScanSettings(source="ADF Duplex", resolution=300, mode="color")
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
 
         mock_dev._snap_impl.assert_not_called()
 
@@ -746,7 +748,7 @@ class TestSaneBackendEmptyFeeder:
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
 
         with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
-            list(backend.scan_pages("test:device:001", settings))
+            backend.scan_pages("test:device:001", settings)
 
 
 # The four first-page faults measured against the real SANE ``test`` backend
@@ -818,7 +820,7 @@ class TestAdfPageErrorsAreTruthful:
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(ScanError) as exc_info:
-            list(backend.scan_pages("test:0", _feeder_settings()))
+            backend.scan_pages("test:0", _feeder_settings())
 
         assert message in str(exc_info.value)
         assert "page 1" in str(exc_info.value)
@@ -833,7 +835,7 @@ class TestAdfPageErrorsAreTruthful:
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(ScanError) as exc_info:
-            list(backend.scan_pages("test:0", _feeder_settings()))
+            backend.scan_pages("test:0", _feeder_settings())
 
         assert exc_info.value.__cause__ is original
 
@@ -849,7 +851,7 @@ class TestAdfPageErrorsAreTruthful:
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(ScanError) as exc_info:
-            list(backend.scan_pages("test:0", _feeder_settings()))
+            backend.scan_pages("test:0", _feeder_settings())
 
         assert "Document feeder jammed" in str(exc_info.value)
         assert "page 4" in str(exc_info.value)
@@ -863,7 +865,7 @@ class TestAdfPageErrorsAreTruthful:
         backend = _backend_with(dev, monkeypatch)
 
         with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
-            list(backend.scan_pages("test:0", _feeder_settings()))
+            backend.scan_pages("test:0", _feeder_settings())
 
     def test_a_clean_stack_yields_every_page(
         self, monkeypatch: pytest.MonkeyPatch
@@ -872,7 +874,7 @@ class TestAdfPageErrorsAreTruthful:
         dev = FakeSaneDev(pages=3)
         backend = _backend_with(dev, monkeypatch)
 
-        pages = list(backend.scan_pages("test:0", _feeder_settings()))
+        pages = backend.scan_pages("test:0", _feeder_settings()).pages
 
         assert len(pages) == 3
 
@@ -901,7 +903,7 @@ class TestAdfPageCap:
 
         started = time.monotonic()
         with pytest.raises(ScanError) as exc_info:
-            list(backend.scan_pages("test:0", _feeder_settings()))
+            backend.scan_pages("test:0", _feeder_settings())
         elapsed = time.monotonic() - started
 
         assert str(cap) in str(exc_info.value)
@@ -918,7 +920,7 @@ class TestAdfPageCap:
         dev = FakeSaneDev(pages=cap)
         backend = _backend_with(dev, monkeypatch)
 
-        pages = list(backend.scan_pages("test:0", _feeder_settings()))
+        pages = backend.scan_pages("test:0", _feeder_settings()).pages
 
         assert len(pages) == cap
 
@@ -937,7 +939,7 @@ class TestSaneBackendPageValidation:
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
 
     def test_min_file_size_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
@@ -949,7 +951,7 @@ class TestSaneBackendPageValidation:
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
 
     def test_pure_white_page_survives(self, mock_sane_module: MockSaneModule) -> None:
@@ -971,7 +973,7 @@ class TestSaneBackendPageValidation:
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 2
         # The blank itself survived, rather than the content page arriving twice.
         assert pages[0].convert("L").getextrema() == (255, 255)
@@ -992,7 +994,7 @@ class TestSaneBackendPageValidation:
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 2
         assert pages[0].convert("L").getextrema() == (0, 0)
 
@@ -1004,7 +1006,7 @@ class TestSaneBackendPageValidation:
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
 
     def test_exif_stripped(self, mock_sane_module: MockSaneModule) -> None:
@@ -1017,7 +1019,7 @@ class TestSaneBackendPageValidation:
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
         assert "exif" not in pages[0].info
 
@@ -1030,7 +1032,7 @@ class TestSaneBackendPageValidation:
 
         backend = SaneBackend()
         settings = ScanSettings(source="Flatbed", resolution=300, mode="color")
-        pages = list(backend.scan_pages("test:device:001", settings))
+        pages = backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
         assert "exif" not in pages[0].info
 
@@ -1066,7 +1068,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         with caplog.at_level(logging.WARNING):
-            pages = list(backend.scan_pages("test:device:001", settings))
+            pages = backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 4
         skips = [r for r in caplog.records if "skipping" in r.getMessage()]
@@ -1084,7 +1086,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
 
         with pytest.raises(ScanError) as exc_info:
-            list(backend.scan_pages("test:device:001", settings))
+            backend.scan_pages("test:device:001", settings)
 
         assert "3" in str(exc_info.value)
         # Distinct condition from an empty feeder: paper *was* fed, and the
@@ -1102,7 +1104,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
 
         with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
-            list(backend.scan_pages("test:device:001", settings))
+            backend.scan_pages("test:device:001", settings)
 
     def test_a_clean_stack_logs_no_skip_warning(
         self, mock_sane_module: MockSaneModule, caplog: pytest.LogCaptureFixture
@@ -1114,7 +1116,7 @@ class TestIntegrityFailuresAreSkippedAndCounted:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         with caplog.at_level(logging.WARNING):
-            pages = list(backend.scan_pages("test:device:001", settings))
+            pages = backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 5
         assert not [r for r in caplog.records if "skipping" in r.getMessage()]
@@ -1137,7 +1139,7 @@ class TestAutoSourceRouting:
         settings = ScanSettings(
             source="Auto", resolution=300, mode="color", auto_source_mode="adf"
         )
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         # ADF path yields 3 pages via multi_scan
         assert len(pages) == 3
 
@@ -1157,7 +1159,7 @@ class TestAutoSourceRouting:
         settings = ScanSettings(
             source="Auto", resolution=300, mode="color", auto_source_mode="flatbed"
         )
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         # Flatbed path yields 1 page via snap
         assert len(pages) == 1
         mock_dev._snap_impl.assert_called_once()
@@ -1169,7 +1171,7 @@ class TestAutoSourceRouting:
         settings = ScanSettings(
             source="ADF", resolution=300, mode="color", auto_source_mode="flatbed"
         )
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         # ADF always uses ADF path regardless of auto_source_mode
         assert len(pages) == 3
 
@@ -1184,7 +1186,7 @@ class TestAutoSourceRouting:
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="color", auto_source_mode="adf"
         )
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         # Flatbed always uses flatbed path regardless of auto_source_mode
         assert len(pages) == 1
         mock_dev._snap_impl.assert_called_once()
@@ -1226,7 +1228,7 @@ class TestAutoSourceRecognition:
             source=reported, resolution=300, mode="color", auto_source_mode="adf"
         )
 
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert classify_source(reported) is SourceKind.AUTO
         assert len(pages) == 3
@@ -1249,7 +1251,7 @@ class TestAutoSourceRecognition:
             source=reported, resolution=300, mode="color", auto_source_mode="flatbed"
         )
 
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert len(pages) == 1
         mock_dev._snap_impl.assert_called_once()
@@ -1270,7 +1272,7 @@ class TestAutoSourceRecognition:
             auto_source_mode="flatbed",
         )
 
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert classify_source("Automatic Document Feeder") is SourceKind.FEEDER
         assert len(pages) == 3
@@ -1300,7 +1302,7 @@ class TestAutoSourceRecognition:
             auto_source_mode="adf",
         )
 
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
 
         assert classify_source("Mystery Tray") is SourceKind.UNKNOWN
         assert len(pages) == 1
@@ -1326,7 +1328,7 @@ class TestSaneBackendPerPageTimeout:
         backend = SaneBackend()
 
         with pytest.raises(ScanError, match="timed out"):
-            list(backend._scan_adf_pages(fake_dev, timeout_per_page=0.5))
+            backend._scan_adf_pages(fake_dev, timeout_per_page=0.5)
 
         # Unblock the thread so it can clean up
         event.set()
@@ -1339,7 +1341,7 @@ class TestSaneBackendPerPageTimeout:
         assert isinstance(mock_dev, MockSaneDev)
 
         backend = SaneBackend()
-        pages = list(backend._scan_adf_pages(mock_dev, timeout_per_page=5.0))
+        pages, _ = backend._scan_adf_pages(mock_dev, timeout_per_page=5.0)
         assert len(pages) == 3
 
 
@@ -1351,7 +1353,7 @@ class TestSaneBackendADFCleanup:
     ) -> None:
         """dev.cancel() is called after ADF multi_scan completes."""
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
         mock_dev = mock_sane_module._mock_dev
         assert mock_dev._cancel_called
 
@@ -1377,7 +1379,7 @@ class TestSaneBackendADFCleanup:
         # D-03: a fault after the first page is translated to ScanError
         # carrying the device's own text, rather than propagating raw.
         with pytest.raises(ScanError, match="hardware error"):
-            list(backend.scan_pages("test:device:001", settings))
+            backend.scan_pages("test:device:001", settings)
 
         assert "cancel" in operations
         assert "close" in operations
@@ -1423,7 +1425,7 @@ class TestSaneBackendADFCleanup:
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
-        list(backend.scan_pages("test:device:001", settings))
+        backend.scan_pages("test:device:001", settings)
 
         # Note: iterator_deleted may or may not appear depending on GC,
         # but cancel should always be called
@@ -1501,7 +1503,7 @@ class TestPaperSizeGeometry:
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="color", paper_size="a4"
         )
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
         assert mock_dev.br_x == 210.0
         assert mock_dev.br_y == 297.0
         assert mock_dev.tl_x == 0.0
@@ -1520,7 +1522,7 @@ class TestPaperSizeGeometry:
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="color", paper_size="full"
         )
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
         # Geometry should be unchanged (not set by scan_pages)
         assert mock_dev.tl_x == -1.0
         assert mock_dev.br_x == -1.0
@@ -1536,7 +1538,7 @@ class TestPaperSizeGeometry:
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="color", paper_size="letter"
         )
-        list(sane_backend.scan_pages("test:device:001", settings))
+        sane_backend.scan_pages("test:device:001", settings)
         expected_br_x = 215.9
         expected_br_y = 279.4
         assert mock_dev.br_x == expected_br_x
@@ -1550,7 +1552,7 @@ class TestPaperSizeGeometry:
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
-        pages = list(backend.scan_pages("test:0", settings))
+        pages = backend.scan_pages("test:0", settings).pages
         assert len(pages) == 1
 
 
@@ -1565,7 +1567,7 @@ class TestPaperSizeCropFallback:
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
-        pages = list(backend.scan_pages("test:0", settings))
+        pages = backend.scan_pages("test:0", settings).pages
         assert len(pages) == 1
         assert pages[0].size == _A4_AT_300_DPI
 
@@ -1579,7 +1581,7 @@ class TestPaperSizeCropFallback:
         settings = ScanSettings(
             source="Flatbed", resolution=300, mode="color", paper_size="full"
         )
-        pages = list(sane_backend.scan_pages("test:device:001", settings))
+        pages = sane_backend.scan_pages("test:device:001", settings).pages
         assert len(pages) == 1
         assert pages[0].size == (5000, 6000)
 
@@ -1592,7 +1594,7 @@ class TestPaperSizeCropFallback:
             mode="Color",
             paper_size="a4",
         )
-        pages = list(backend.scan_pages("test:0", settings))
+        pages = backend.scan_pages("test:0", settings).pages
         assert len(pages) == 2
         for page in pages:
             assert page.size == _A4_AT_300_DPI
@@ -1643,7 +1645,7 @@ class TestGeometryPresenceCheck:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        pages = list(backend.scan_pages("test:0", settings))
+        pages = backend.scan_pages("test:0", settings).pages
 
         assert pages[0].size == _A4_AT_300_DPI
 
@@ -1659,7 +1661,7 @@ class TestGeometryPresenceCheck:
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            pages = list(backend.scan_pages("test:0", settings))
+            pages = backend.scan_pages("test:0", settings).pages
 
         assert [m for m in _warning_messages(caplog) if "br-y" in m]
         assert pages[0].size == _A4_AT_300_DPI
@@ -1681,7 +1683,7 @@ class TestGeometryPresenceCheck:
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            pages = list(backend.scan_pages("test:0", settings))
+            pages = backend.scan_pages("test:0", settings).pages
 
         assert [m for m in _warning_messages(caplog) if "can't be set by software" in m]
         assert pages[0].size == _A4_AT_300_DPI
@@ -1766,7 +1768,7 @@ class TestGeometryUnit:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        pages = list(backend.scan_pages("test:0", settings))
+        pages = backend.scan_pages("test:0", settings).pages
 
         assert dev.br_x == 210.0
         assert dev.br_y == 297.0
@@ -1789,7 +1791,7 @@ class TestGeometryUnit:
             source="Flatbed", resolution=5000, mode="Color", paper_size="a4"
         )
 
-        list(backend.scan_pages("test:0", settings))
+        backend.scan_pages("test:0", settings)
 
         assert dev.br_x == pytest.approx(210.0 * 1200 / 25.4)
         assert dev.br_y == pytest.approx(297.0 * 1200 / 25.4)
@@ -1809,7 +1811,7 @@ class TestGeometryUnit:
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            pages = list(backend.scan_pages("test:0", settings))
+            pages = backend.scan_pages("test:0", settings).pages
 
         assert [m for m in _warning_messages(caplog) if unit.name in m]
         assert pages[0].size == _A4_AT_300_DPI
@@ -1831,7 +1833,7 @@ class TestGeometryUnit:
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            pages = list(backend.scan_pages("test:0", settings))
+            pages = backend.scan_pages("test:0", settings).pages
 
         assert [m for m in _warning_messages(caplog) if "99" in m]
         assert pages[0].size == _A4_AT_300_DPI
@@ -1860,7 +1862,7 @@ class TestClampedScanArea:
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            pages = list(backend.scan_pages("test:0", settings))
+            pages = backend.scan_pages("test:0", settings).pages
 
         # The warning has to name what was asked for AND what was got, or the
         # operator cannot tell which of the two is wrong.
@@ -1878,7 +1880,7 @@ class TestClampedScanArea:
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            pages = list(backend.scan_pages("test:0", settings))
+            pages = backend.scan_pages("test:0", settings).pages
 
         assert not [m for m in _warning_messages(caplog) if "clamped" in m.lower()]
         assert pages[0].size == (3000, 4000)
@@ -1900,7 +1902,7 @@ class TestClampedScanArea:
         )
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            pages = list(backend.scan_pages("test:0", settings))
+            pages = backend.scan_pages("test:0", settings).pages
 
         # The round trip really is inexact -- this is what makes the tolerance
         # load-bearing rather than decorative.
@@ -1928,7 +1930,7 @@ class TestClampedScanArea:
             source="Flatbed", resolution=300, mode="Color", paper_size="a4"
         )
 
-        pages = list(backend.scan_pages("test:0", settings))
+        pages = backend.scan_pages("test:0", settings).pages
 
         # A4 at the 75 dpi the device settled on, not at the 300 asked for,
         # which would have been 2480x3507.
@@ -2246,7 +2248,7 @@ class TestDeviceOptionOrdering:
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        list(backend.scan_pages("test:0", settings))
+        backend.scan_pages("test:0", settings)
 
         assert dev.assignments == ["source", "mode", "resolution"]
 
@@ -2274,7 +2276,7 @@ class TestDeviceOptionOrdering:
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        list(backend.scan_pages("test:0", settings))
+        backend.scan_pages("test:0", settings)
 
         assert dev.assignments == ["mode", "resolution"]
         assert dev.resolution == 300.0
@@ -2296,7 +2298,7 @@ class TestDeviceOptionOrdering:
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source=feeder, resolution=1000, mode="Color")
 
-        list(backend.scan_pages("test:0", settings))
+        backend.scan_pages("test:0", settings)
 
         # ``__getattr__`` is typed ``object``, as the real dynamic option
         # lookup is; isinstance narrows it without a cast or a suppression,
@@ -2327,7 +2329,7 @@ class TestResolutionReadBack:
         settings = ScanSettings(source="Flatbed", resolution=5000, mode="Color")
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            list(backend.scan_pages("test:0", settings))
+            backend.scan_pages("test:0", settings)
 
         assert [m for m in self._warnings(caplog) if "5000" in m and "1200" in m]
 
@@ -2340,7 +2342,7 @@ class TestResolutionReadBack:
         settings = ScanSettings(source="Flatbed", resolution=5000, mode="Color")
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            list(backend.scan_pages("test:0", settings))
+            backend.scan_pages("test:0", settings)
 
         warnings = self._warnings(caplog)
         assert [m for m in warnings if "1200" in m]
@@ -2356,7 +2358,7 @@ class TestResolutionReadBack:
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
         with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
-            list(backend.scan_pages("test:0", settings))
+            backend.scan_pages("test:0", settings)
 
         assert not [m for m in self._warnings(caplog) if "resolution" in m.lower()]
 
