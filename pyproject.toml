@@ -151,6 +151,7 @@ search-path = ["src", "."]
 testpaths = ["tests"]
 markers = [
     "browser: Playwright browser tests (requires chromium)",
+    "sane_hardware: tests that drive the real SANE test backend (requires libsane-dev)",
 ]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 strict_markers = true
