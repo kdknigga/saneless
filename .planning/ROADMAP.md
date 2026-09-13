@@ -229,7 +229,7 @@ Plans:
 
 **Wave 2** *(blocked on 24-01)*
 
-- [ ] 24-03-PLAN.md — `_scan_adf_pages` split for branch headroom, first-page special case and unreachable `multi_scan` guard deleted, `_MAX_ADF_PAGES`, W-01 rationale corrected (D-03, D-04)
+- [x] 24-03-PLAN.md — `_scan_adf_pages` split for branch headroom, first-page special case and unreachable `multi_scan` guard deleted, `_MAX_ADF_PAGES`, W-01 rationale corrected (D-03, D-04)
 
 **Wave 3** *(blocked on 24-03)*
 
@@ -398,7 +398,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
-| 24. Scanner Truthfulness | 2/8 | In Progress|  |
+| 24. Scanner Truthfulness | 3/8 | In Progress|  |
 | 25. Manual Duplex | 0/? | Not started | - |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
