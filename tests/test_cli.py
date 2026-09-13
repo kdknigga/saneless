@@ -320,6 +320,63 @@ class TestDevicesCommand:
         assert "Flatbed" in result.output
         assert "ADF" in result.output
 
+    def test_devices_capabilities_prints_a_reported_word_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A list-reporting device prints its exact values, as it always did."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["devices", "--capabilities"])
+
+        assert result.exit_code == 0
+        assert "Resolutions: 150, 300, 600" in result.output
+        # The device gave a list, so no range is invented to go with it.
+        assert "Resolution range" not in result.output
+
+    def test_devices_capabilities_prints_a_reported_range(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A range-reporting device's minimum, maximum and step all reach the operator.
+
+        This is the N-01 symptom the user actually sees. The SANE ``test``
+        backend constrains resolution with ``(1.0, 1200.0, 1.0)``, which used to
+        arrive as an empty list and print a label with nothing after it.
+        """
+
+        class _RangeScanner:
+            """A scanner whose device constrains resolution with a range."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept host parameter for API compatibility."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Return one device, named as the SANE test backend names it."""
+                return [DeviceInfo("test:0", "TestVendor", "TestModel", "scanner")]
+
+            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+                """Report resolution as a range and give no word list at all."""
+                return DeviceCapabilities(
+                    sources=["Flatbed", "Automatic Document Feeder"],
+                    resolutions=[],
+                    modes=["Color", "Gray"],
+                    resolution_range=(1.0, 1200.0, 1.0),
+                )
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_RangeScanner)
+
+        result = runner.invoke(cli, ["devices", "--capabilities"])
+
+        assert result.exit_code == 0
+        assert "Resolution range: 1 to 1200 dpi in steps of 1" in result.output
+        # No word list was reported, so none is printed and none is invented.
+        assert "Resolutions:" not in result.output
+        # The symptom itself: a label with its value missing. Such a line ends
+        # at the separator with nothing following it.
+        assert [
+            line for line in result.output.splitlines() if line.endswith(": ")
+        ] == []
+
 
 class TestCliFlags:
     """CLI flag tests."""
