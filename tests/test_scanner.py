@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -691,26 +692,13 @@ class TestSaneBackendDuplex:
 class TestSaneBackendEmptyFeeder:
     """Empty ADF feeder detection tests."""
 
-    def test_empty_feeder_out_of_documents_error(
-        self, mock_sane_module: MockSaneModule
-    ) -> None:
-        """Multi_scan first iteration error with 'out of documents' raises FeederEmptyError."""
-
-        def _raising_multi_scan() -> Iterator[Image.Image]:
-            msg = "out of documents"
-            raise RuntimeError(msg)
-
-        object.__setattr__(
-            mock_sane_module,
-            "_mock_dev",
-            _FakeSaneDevice(multi_scan=_raising_multi_scan),
-        )
-
-        backend = SaneBackend()
-        settings = ScanSettings(source="ADF", resolution=300, mode="color")
-
-        with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
-            list(backend.scan_pages("test:device:001", settings))
+    # ``test_empty_feeder_out_of_documents_error`` was deleted here by D-03.
+    # It drove ``multi_scan()`` itself into raising and asserted the result was
+    # FeederEmptyError, but the real method is a one-line
+    # ``return _SaneIterator(self)`` that cannot raise, so it pinned the
+    # behaviour of provably unreachable code.  A fault arriving from the
+    # iterator is now covered honestly by TestAdfPageErrorsAreTruthful, and the
+    # zero-page path it nominally tested is covered below.
 
     def test_empty_feeder_stop_iteration(
         self, mock_sane_module: MockSaneModule
@@ -724,6 +712,180 @@ class TestSaneBackendEmptyFeeder:
 
         with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
             list(backend.scan_pages("test:device:001", settings))
+
+
+# The four first-page faults measured against the real SANE ``test`` backend
+# with ``read_return_value`` set to the matching status (RESEARCH Finding 3).
+# Every one of them reached the operator as "No paper detected in feeder"
+# before D-03.
+_MEASURED_SANE_FAULTS = [
+    "Error during device I/O",
+    "Document feeder jammed",
+    "Scanner cover is open",
+    "Device busy",
+]
+
+# The one message python-sane converts to StopIteration (sane.py:130).
+_OUT_OF_DOCUMENTS = "Document feeder out of documents"
+
+
+def _feeder_settings() -> ScanSettings:
+    """
+    Build settings that route to the ADF through the shared fake's options.
+
+    The mode is ``"Color"`` and not ``"color"`` because the fake carries the
+    real device's list constraint, which rejects an unlisted value.
+
+    Returns:
+        Settings whose source classifies as a feeder.
+
+    """
+    return ScanSettings(
+        source="Automatic Document Feeder", resolution=300, mode="Color"
+    )
+
+
+def _backend_with(dev: FakeSaneDev, monkeypatch: pytest.MonkeyPatch) -> SaneBackend:
+    """
+    Wire a configured fake device into SaneBackend via the sane module seam.
+
+    Args:
+        dev: The device the backend should open.
+        monkeypatch: Fixture used to patch the module-level ``sane`` name.
+
+    Returns:
+        A backend whose ``open()`` returns ``dev``.
+
+    """
+    monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
+    return SaneBackend()
+
+
+class TestAdfPageErrorsAreTruthful:
+    """
+    A real SANE fault is reported as itself, never as an empty feeder (D-03).
+
+    ``sane_backend`` used to convert *every* exception raised while acquiring
+    page 0 into ``FeederEmptyError("No paper detected in feeder")``, so a jam,
+    an open cover, a busy device and an I/O error all told the operator to
+    load paper (M-11).  The genuine empty-feeder signal never reached that
+    branch anyway: python-sane converts exactly one message to
+    ``StopIteration``, and a zero-page feeder is the only honest source of
+    "No paper detected in feeder".
+    """
+
+    @pytest.mark.parametrize("message", _MEASURED_SANE_FAULTS)
+    def test_first_page_fault_surfaces_as_scan_error(
+        self, message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Each measured page-0 fault raises ScanError carrying the SANE text."""
+        dev = FakeSaneDev(pages=5, start_error=FakeSaneError(message))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            list(backend.scan_pages("test:0", _feeder_settings()))
+
+        assert message in str(exc_info.value)
+        assert "page 1" in str(exc_info.value)
+        assert not isinstance(exc_info.value, FeederEmptyError)
+
+    def test_first_page_fault_keeps_the_original_as_cause(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The translated ScanError chains the exception SANE actually raised."""
+        original = FakeSaneError("Document feeder jammed")
+        dev = FakeSaneDev(pages=5, start_error=original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            list(backend.scan_pages("test:0", _feeder_settings()))
+
+        assert exc_info.value.__cause__ is original
+
+    def test_mid_stack_jam_names_the_one_based_page(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A jam on the fourth sheet names page 4, not page 0."""
+        dev = FakeSaneDev(
+            pages=10,
+            start_error=FakeSaneError("Document feeder jammed"),
+            start_error_page=3,
+        )
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            list(backend.scan_pages("test:0", _feeder_settings()))
+
+        assert "Document feeder jammed" in str(exc_info.value)
+        assert "page 4" in str(exc_info.value)
+        assert not isinstance(exc_info.value, FeederEmptyError)
+
+    def test_out_of_documents_still_means_an_empty_feeder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one converted message is the only path to the feeder message."""
+        dev = FakeSaneDev(pages=5, start_error=FakeSaneError(_OUT_OF_DOCUMENTS))
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(FeederEmptyError, match="No paper detected in feeder"):
+            list(backend.scan_pages("test:0", _feeder_settings()))
+
+    def test_a_clean_stack_yields_every_page(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A three-sheet feeder yields three pages and raises nothing."""
+        dev = FakeSaneDev(pages=3)
+        backend = _backend_with(dev, monkeypatch)
+
+        pages = list(backend.scan_pages("test:0", _feeder_settings()))
+
+        assert len(pages) == 3
+
+
+class TestAdfPageCap:
+    """
+    The ADF loop is bounded, so non-feeder hardware cannot spin forever (D-04).
+
+    python-sane's ``_SaneIterator.__next__`` stops only on one exact message,
+    so on hardware that is not a feeder ``start()``/``snap()`` keep succeeding
+    and the loop never terminates -- reproduced live during research with a
+    Flatbed source that yielded page after page and would not stop.  The
+    per-page timeout is no help: a scan that succeeds satisfies it every
+    single iteration.  This is Phase 21's W-01, discharged here.
+    """
+
+    def test_an_endless_feeder_is_cut_off_at_the_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A device that never reports end-of-feed raises ScanError at the cap."""
+        cap = sane_backend_mod._MAX_ADF_PAGES
+        # Far more sheets than the cap, so the fake never reports end-of-feed
+        # and the loop has to be stopped by the cap rather than by the device.
+        dev = FakeSaneDev(pages=cap * 100)
+        backend = _backend_with(dev, monkeypatch)
+
+        started = time.monotonic()
+        with pytest.raises(ScanError) as exc_info:
+            list(backend.scan_pages("test:0", _feeder_settings()))
+        elapsed = time.monotonic() - started
+
+        assert str(cap) in str(exc_info.value)
+        assert not isinstance(exc_info.value, FeederEmptyError)
+        # The fake's pages are tiny, so the cap must be reached quickly -- a
+        # slow run here would mean the bound is not what stopped the loop.
+        assert elapsed < 10.0
+
+    def test_a_maximal_stack_is_not_off_by_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exactly _MAX_ADF_PAGES sheets complete normally and yield in full."""
+        cap = sane_backend_mod._MAX_ADF_PAGES
+        dev = FakeSaneDev(pages=cap)
+        backend = _backend_with(dev, monkeypatch)
+
+        pages = list(backend.scan_pages("test:0", _feeder_settings()))
+
+        assert len(pages) == cap
 
 
 class TestSaneBackendPageValidation:
@@ -955,7 +1117,9 @@ class TestSaneBackendADFCleanup:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
 
-        with pytest.raises(RuntimeError, match="hardware error"):
+        # D-03: a fault after the first page is translated to ScanError
+        # carrying the device's own text, rather than propagating raw.
+        with pytest.raises(ScanError, match="hardware error"):
             list(backend.scan_pages("test:device:001", settings))
 
         assert "cancel" in operations
