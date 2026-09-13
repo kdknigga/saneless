@@ -18,7 +18,7 @@
   "model_profile": "quality",
   "parallelization": true,
   "workflow": {
-    "_auto_chain_active": false,
+    "_auto_chain_active": true,
     "ai_integration_phase": true,
     "auto_advance": true,
     "code_review": true,

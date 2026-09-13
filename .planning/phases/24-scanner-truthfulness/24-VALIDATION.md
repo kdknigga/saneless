@@ -1,10 +1,11 @@
 ---
 phase: 24
 slug: scanner-truthfulness
-status: draft
-nyquist_compliant: false
+status: approved
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-09-13
+approved: 2026-09-13
 ---
 
 # Phase 24 — Validation Strategy
@@ -119,11 +120,24 @@ automated through the SANE `test` backend — which is the entire point of SCNR-
 
 ## Validation Sign-Off
 
-- [ ] All tasks have an `<automated>` verify or a Wave 0 dependency
-- [ ] Sampling continuity: no 3 consecutive tasks without an automated verify
-- [ ] Wave 0 covers every ❌ W0 row above
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 30s
-- [ ] `nyquist_compliant: true` set in frontmatter
+Signed off 2026-09-13, after `gsd-plan-checker` verified the eight plans: **0 blockers, 4 warnings**.
 
-**Approval:** pending
+- [x] All tasks have an `<automated>` verify or a Wave 0 dependency
+- [x] Sampling continuity: no 3 consecutive tasks without an automated verify
+- [x] Wave 0 covers every ❌ W0 row above — built by 24-01 (shared fake, marker registration,
+      session-scoped fixture) and completed across 24-02..24-08
+- [x] No watch-mode flags
+- [ ] **Feedback latency < 30s — one deliberate, recorded exception.** 24-07 Task 2 runs
+      `uv run pytest -m browser -q` (22 chromium tests) as a per-task verify, because
+      `_BrowserTestScanner` is one of the six concrete `ScannerBackend` implementers the D-12 ABC
+      change touches, and no type checker can catch that site. Accepted knowingly: it is a genuine
+      correctness check and it applies to exactly one task out of 24. Every other task stays inside
+      the ~30s envelope. Narrowing it to the specific browser tests that exercise
+      `_BrowserTestScanner` is a valid alternative if the latency proves annoying in practice.
+- [x] `nyquist_compliant: true` set in frontmatter
+
+**Approval:** approved 2026-09-13 — with the latency exception above **recorded, not waived**.
+
+**`wave_0_complete` deliberately stays `false`.** Wave 0's artifacts — `tests/fake_sane.py`,
+`tests/test_sane_hardware.py`, and the `sane_hardware` marker registration — do not exist until
+execution builds them. Flip that flag during execution, not at planning time.
