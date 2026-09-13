@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
@@ -839,6 +840,52 @@ class TestAdfPageErrorsAreTruthful:
         pages = list(backend.scan_pages("test:0", _feeder_settings()))
 
         assert len(pages) == 3
+
+
+class TestAdfPageCap:
+    """
+    The ADF loop is bounded, so non-feeder hardware cannot spin forever (D-04).
+
+    python-sane's ``_SaneIterator.__next__`` stops only on one exact message,
+    so on hardware that is not a feeder ``start()``/``snap()`` keep succeeding
+    and the loop never terminates -- reproduced live during research with a
+    Flatbed source that yielded page after page and would not stop.  The
+    per-page timeout is no help: a scan that succeeds satisfies it every
+    single iteration.  This is Phase 21's W-01, discharged here.
+    """
+
+    def test_an_endless_feeder_is_cut_off_at_the_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A device that never reports end-of-feed raises ScanError at the cap."""
+        cap = sane_backend_mod._MAX_ADF_PAGES
+        # Far more sheets than the cap, so the fake never reports end-of-feed
+        # and the loop has to be stopped by the cap rather than by the device.
+        dev = FakeSaneDev(pages=cap * 100)
+        backend = _backend_with(dev, monkeypatch)
+
+        started = time.monotonic()
+        with pytest.raises(ScanError) as exc_info:
+            list(backend.scan_pages("test:0", _feeder_settings()))
+        elapsed = time.monotonic() - started
+
+        assert str(cap) in str(exc_info.value)
+        assert not isinstance(exc_info.value, FeederEmptyError)
+        # The fake's pages are tiny, so the cap must be reached quickly -- a
+        # slow run here would mean the bound is not what stopped the loop.
+        assert elapsed < 10.0
+
+    def test_a_maximal_stack_is_not_off_by_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exactly _MAX_ADF_PAGES sheets complete normally and yield in full."""
+        cap = sane_backend_mod._MAX_ADF_PAGES
+        dev = FakeSaneDev(pages=cap)
+        backend = _backend_with(dev, monkeypatch)
+
+        pages = list(backend.scan_pages("test:0", _feeder_settings()))
+
+        assert len(pages) == cap
 
 
 class TestSaneBackendPageValidation:
