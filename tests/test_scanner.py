@@ -1408,6 +1408,41 @@ class TestPaperSizeCropFallback:
             assert page.size == _A4_AT_300_DPI
 
 
+class TestFakeDeviceAreaMatchesTheLibrary:
+    """
+    ``area`` raises what python-sane raises on a geometry-less device (WR-06).
+
+    The fake read ``_values`` directly, so a device whose option table omits
+    the geometry options -- the exact table ``build_option_table(omit=...)``
+    exists to produce -- raised ``KeyError``.  The real library composes
+    ``area`` from attribute reads (``sane.py:220``) and raises
+    ``AttributeError("No such attribute: tl_x")``.
+
+    No production path reaches this today, because ``_set_geometry`` checks
+    presence before reading ``area``.  But that ordering is a property of
+    today's code, and the fake's whole premise is that it cannot quietly
+    diverge from the library it stands in for.
+    """
+
+    def test_a_geometry_less_device_raises_attribute_error(self) -> None:
+        """Not KeyError, which the real library never raises here."""
+        dev = FakeSaneDev(options=build_option_table(omit=_GEOMETRY_OPTION_NAMES))
+
+        with pytest.raises(AttributeError, match="No such attribute"):
+            _ = dev.area
+
+    def test_a_device_reporting_the_options_still_returns_its_box(self) -> None:
+        """Composing from attribute reads must not change the happy path."""
+        dev = FakeSaneDev()
+        dev.tl_x = 5.0
+        dev.br_x = 100.0
+
+        (tl_x, _tl_y), (br_x, _br_y) = dev.area
+
+        assert tl_x == pytest.approx(5.0)
+        assert br_x == pytest.approx(100.0)
+
+
 class TestGeometryPresenceCheck:
     """
     Geometry is written only on a device that reports the options (D-09).
