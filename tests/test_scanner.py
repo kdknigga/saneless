@@ -1590,6 +1590,38 @@ class TestGeometryUnit:
         assert pages[0].size == _A4_AT_300_DPI
 
 
+class TestNonPositiveGeometryScale:
+    """
+    A scale of zero is declined, not written as a zero-size box (WR-01).
+
+    ``_units_per_mm`` returns ``resolution / 25.4`` for UNIT_PIXEL, so a device
+    whose read-back resolution truncates to 0 yields ``0.0``.  That value is
+    not ``None``, so it passed the only guard ``_set_geometry`` had: the
+    expected box became ``(0.0, 0.0)``, the device stored it, and the clamp
+    check agreed with itself inside a tolerance that was also 0.  A zero-area
+    scan reported as success is worse than the crop it bypassed.
+    """
+
+    def test_a_sub_one_dpi_read_back_yields_a_zero_scale(self) -> None:
+        """The arithmetic really does produce 0.0 -- the premise, measured."""
+        assert sane_backend_mod._units_per_mm(GeometryUnit.UNIT_PIXEL, 0) == 0.0
+
+    def test_a_zero_scale_falls_back_to_the_crop(self) -> None:
+        """``_set_geometry`` declines, which is what makes the crop run."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
+
+        assert sane_backend_mod._set_geometry(dev, "a4", dev.get_options(), 0) is False
+
+    def test_no_zero_size_box_reaches_the_device(self) -> None:
+        """Declining happens before any corner is assigned."""
+        dev = _device_reporting_unit(GeometryUnit.UNIT_PIXEL)
+
+        sane_backend_mod._set_geometry(dev, "a4", dev.get_options(), 0)
+
+        assert "br_x" not in dev.assignments
+        assert "br_y" not in dev.assignments
+
+
 class TestClampedScanArea:
     """
     A scan area the device quietly shrank is caught on read-back (D-19).
