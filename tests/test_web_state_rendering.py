@@ -36,6 +36,7 @@ from saneless.config import (
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
+    ScanBatch,
     ScannerBackend,
     ScanSettings,
 )
@@ -76,11 +77,13 @@ class _StubScanner(ScannerBackend):
             sources=["Flatbed"], resolutions=[300], modes=["color"]
         )
 
-    def scan_pages(
-        self, device_id: str, settings: ScanSettings
-    ) -> Iterator[Image.Image]:
-        """Yield a single white test image."""
-        yield Image.new("RGB", (100, 100), "white")
+    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+        """Return a batch holding a single white test image."""
+        return ScanBatch(
+            pages=[Image.new("RGB", (100, 100), "white")],
+            actual_resolution=settings.resolution,
+            pages_rejected=0,
+        )
 
 
 # The scan button, captured whole so attribute and text assertions cannot be
