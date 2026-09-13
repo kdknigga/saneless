@@ -23,12 +23,10 @@ from saneless.config import (
 from saneless.exceptions import PaperlessError, ScanError
 from saneless.job import JobStore
 from saneless.paperless import UploadResult
-from saneless.scanner.base import DeviceCapabilities, DeviceInfo
+from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.vocabulary import JobState, state_label
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     import pytest
 
 
@@ -123,14 +121,12 @@ def _patch_cli(
                     ],
                 )
 
-            def scan_pages(
-                self, _device_id: str, _settings: object
-            ) -> Iterator[Image.Image]:
-                """Return a single test image with content."""
+            def scan_pages(self, _device_id: str, _settings: object) -> ScanBatch:
+                """Return a batch holding a single test image with content."""
                 img = Image.new("RGB", (100, 100), "white")
                 draw = ImageDraw.Draw(img)
                 draw.rectangle([10, 10, 90, 90], fill="black")
-                return iter([img])
+                return ScanBatch(pages=[img], actual_resolution=300, pages_rejected=0)
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
 

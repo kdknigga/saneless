@@ -25,7 +25,7 @@ from saneless.exceptions import (
 )
 from saneless.pages import filter_empty_pages, generate_thumbnail
 from saneless.pdf import assemble_pdf, build_pdf_filename
-from saneless.scanner.base import ScanSettings
+from saneless.scanner.base import ScanBatch, ScanSettings
 from saneless.vocabulary import JobState, ScanOutcome
 
 if TYPE_CHECKING:
@@ -404,6 +404,116 @@ class _DeliveryContext:
     task_timeout: float
 
 
+@dataclass(frozen=True)
+class _DuplexMismatch:
+    """
+    The two passes of a manual duplex run whose page counts disagreed.
+
+    A named record rather than the bare ``(fronts, backs)`` tuple this used to
+    be. The recovery path now also needs the resolution the device actually
+    used and the sheets it could not read, and a four-element tuple would make
+    every call site remember an order.
+
+    Attributes:
+        fronts: Pages produced by pass A.
+        backs: Pages produced by pass B.
+        dpi: The resolution the device reported actually using.
+        pages_rejected: Sheets skipped across both passes for failing their
+            integrity checks.
+
+    """
+
+    fronts: list[Image.Image]
+    backs: list[Image.Image]
+    dpi: int
+    pages_rejected: int
+
+
+def _duplex_resolution(front: ScanBatch, back: ScanBatch) -> int:
+    """
+    Reconcile the resolution the two manual-duplex passes reported.
+
+    Both passes run with identical settings against one device, so the two
+    values should be identical in practice. If they are not, the device changed
+    its mind mid-job, and that is a fact worth saying out loud rather than
+    resolving silently.
+
+    Pass A's value wins. The choice is arbitrary between two equally plausible
+    numbers, which is exactly why it is logged; failing the run instead would
+    throw away a scan that completed, over a disagreement the crop fallback
+    already tolerates.
+
+    Args:
+        front: The batch pass A produced.
+        back: The batch pass B produced.
+
+    Returns:
+        The resolution to assemble the document at.
+
+    """
+    if front.actual_resolution != back.actual_resolution:
+        logger.warning(
+            "Manual duplex passes disagree on resolution: pass A reports %s dpi, "
+            "pass B reports %s dpi; assembling at %s dpi",
+            front.actual_resolution,
+            back.actual_resolution,
+            front.actual_resolution,
+        )
+    return front.actual_resolution
+
+
+def _rejected_pages_warning(count: int) -> str | None:
+    """
+    Describe sheets the scanner could not read, and log them, if there were any.
+
+    Worded so it cannot be mistaken for blank-page removal. The pipeline's blank
+    count is empty-page detection, which Phase 30 renders to users as pages
+    removed for being blank; a sheet that failed its integrity checks is a
+    different event with a different remedy, and the two must not be conflated.
+
+    This is the only channel the count has. ``pages_scanned`` is the length of
+    the pages that arrived, which already excludes a skipped sheet, so a
+    ten-sheet stack with one unreadable page reports nine and nobody learns a
+    page was lost. It logs as it builds, following ``_handle_duplex_mismatch``,
+    which likewise logs the warning it returns.
+
+    Args:
+        count: How many sheets the backend skipped.
+
+    Returns:
+        The warning text, or None when nothing was rejected.
+
+    """
+    if count <= 0:
+        return None
+    warning = (
+        f"{count} page(s) could not be read by the scanner and were skipped. "
+        f"They were not removed for being blank; rescan those sheets."
+    )
+    logger.warning(warning)
+    return warning
+
+
+def _join_warnings(*parts: str | None) -> str | None:
+    """
+    Combine into the single field that carries them everything a run has to say.
+
+    ``ScanResult`` has one warning field and a run can have more than one thing
+    to report: a consume-directory fallback and an unreadable sheet are
+    independent events that can both happen. Letting either overwrite the other
+    would be the kind of small silence this phase exists to remove.
+
+    Args:
+        parts: The candidate warnings, any of which may be None.
+
+    Returns:
+        The non-empty warnings joined by a space, or None if there were none.
+
+    """
+    present = [part for part in parts if part]
+    return " ".join(present) if present else None
+
+
 def _handle_duplex_mismatch(
     passes: tuple[list[Image.Image], list[Image.Image]],
     tmp_path: Path,
@@ -554,7 +664,7 @@ def _scan_manual_duplex(
     scan_settings: ScanSettings,
     request: PipelineRequest,
     notify: Callable[[PipelineEvent], None],
-) -> list[Image.Image] | tuple[list[Image.Image], list[Image.Image]]:
+) -> ScanBatch | _DuplexMismatch:
     """
     Perform a two-pass manual duplex scan with flip coordination.
 
@@ -566,15 +676,17 @@ def _scan_manual_duplex(
         notify: Status callback function.
 
     Returns:
-        Interleaved list of images on matching page counts, or a tuple
-        of (fronts, backs) when counts mismatch for recovery handling.
+        A ScanBatch of interleaved pages when the two passes agree on count,
+        carrying the device's resolution and the rejections from both passes;
+        or a _DuplexMismatch holding both passes when the counts disagree.
 
     Raises:
         ScanError: If scan is aborted by user.
 
     """
     # Pass A: scan fronts
-    front_pages = list(scanner.scan_pages(device_id, scan_settings))
+    front_batch = scanner.scan_pages(device_id, scan_settings)
+    front_pages = front_batch.pages
     logger.info("Pass A: scanned %d front page(s)", len(front_pages))
 
     # Generate thumbnail from first page
@@ -594,16 +706,26 @@ def _scan_manual_duplex(
 
     # Pass B: scan backs
     notify(PipelineEvent.SCANNING_REVERSE)
-    back_pages = list(scanner.scan_pages(device_id, scan_settings))
+    back_batch = scanner.scan_pages(device_id, scan_settings)
+    back_pages = back_batch.pages
     logger.info("Pass B: scanned %d back page(s)", len(back_pages))
+
+    dpi = _duplex_resolution(front_batch, back_batch)
+    # Summed, not picked: a sheet lost on either pass is a sheet lost.
+    rejected = front_batch.pages_rejected + back_batch.pages_rejected
 
     # Raw count validation BEFORE empty page detection (SCAN-07)
     if len(front_pages) != len(back_pages):
-        return (front_pages, back_pages)
+        return _DuplexMismatch(
+            fronts=front_pages,
+            backs=back_pages,
+            dpi=dpi,
+            pages_rejected=rejected,
+        )
 
     images = _interleave_duplex(front_pages, back_pages)
     logger.info("Interleaved %d total pages", len(images))
-    return images
+    return ScanBatch(pages=images, actual_resolution=dpi, pages_rejected=rejected)
 
 
 def _scan_simplex(
@@ -611,7 +733,7 @@ def _scan_simplex(
     device_id: str,
     scan_settings: ScanSettings,
     request: PipelineRequest,
-) -> list[Image.Image]:
+) -> ScanBatch:
     """
     Perform a simplex / hardware duplex / flatbed scan.
 
@@ -622,18 +744,19 @@ def _scan_simplex(
         request: Pipeline request with optional thumbnail callback.
 
     Returns:
-        List of scanned page images.
+        The batch the device produced: its pages, the resolution it actually
+        used, and how many fed sheets it could not read.
 
     """
-    images = list(scanner.scan_pages(device_id, scan_settings))
-    logger.info("Scanned %d page(s)", len(images))
+    batch = scanner.scan_pages(device_id, scan_settings)
+    logger.info("Scanned %d page(s)", len(batch.pages))
 
     # Generate thumbnail from first page
-    if images and request.thumbnail_callback:
-        thumb = generate_thumbnail(images[0])
+    if batch.pages and request.thumbnail_callback:
+        thumb = generate_thumbnail(batch.pages[0])
         request.thumbnail_callback(thumb)
 
-    return images
+    return batch
 
 
 def _resolve_device(scanner: ScannerBackend, settings: Settings) -> str:
@@ -738,14 +861,14 @@ def run_pipeline(
                 request,
                 notify,
             )
-            if isinstance(duplex_result, tuple):
+            if isinstance(duplex_result, _DuplexMismatch):
                 warning, delivered = _handle_duplex_mismatch(
-                    duplex_result,
+                    (duplex_result.fronts, duplex_result.backs),
                     tmp_path,
                     paperless,
                     request,
                     _DeliveryContext(
-                        dpi=profile.resolution,
+                        dpi=duplex_result.dpi,
                         failed_dir=settings.output.failed_dir,
                         task_timeout=settings.output.paperless_task_timeout,
                     ),
@@ -755,8 +878,7 @@ def run_pipeline(
                     "Pipeline complete for '%s' (duplex mismatch recovery)",
                     request.title,
                 )
-                fronts, backs = duplex_result
-                mismatch_pages = len(fronts) + len(backs)
+                mismatch_pages = len(duplex_result.fronts) + len(duplex_result.backs)
                 return ScanResult(
                     outcome=(
                         ScanOutcome.SUCCESS if delivered else ScanOutcome.FALLBACK
@@ -764,11 +886,18 @@ def run_pipeline(
                     pages_scanned=mismatch_pages,
                     pages_removed=0,
                     pages_uploaded=mismatch_pages,
-                    warning=warning,
+                    warning=_join_warnings(
+                        warning,
+                        _rejected_pages_warning(duplex_result.pages_rejected),
+                    ),
                 )
-            images = duplex_result
+            batch = duplex_result
         else:
-            images = _scan_simplex(scanner, device_id, scan_settings, request)
+            batch = _scan_simplex(scanner, device_id, scan_settings, request)
+
+        images = batch.pages
+        actual_dpi = batch.actual_resolution
+        rejected_warning = _rejected_pages_warning(batch.pages_rejected)
 
         # Step 1.5: Strip EXIF from all images (Pitfall #5)
         for img in images:
@@ -779,14 +908,18 @@ def run_pipeline(
 
         # Step 3: Assemble PDF
         notify(PipelineEvent.ASSEMBLING)
-        # profile.resolution is the authoritative DPI: the same value
-        # crop_to_paper_size uses for its crop arithmetic, so the cropped
-        # shape and the declared page size cannot disagree.
+        # The resolution the device read back is the authoritative DPI, not the
+        # one the profile asked for. SANE substitutes silently -- measured, a
+        # request for 5000 comes back as 1200 -- and the read-back value is the
+        # same one the backend's crop arithmetic used, so the cropped shape and
+        # the declared page size cannot disagree. A device that substitutes
+        # would otherwise produce both a mis-cropped page and a MediaBox at odds
+        # with its own content, re-opening part of OUTC-06.
         pdf_path = assemble_pdf(
             filtered,
             tmp_path,
             filename=build_pdf_filename(request.job_id, request.title),
-            dpi=profile.resolution,
+            dpi=actual_dpi,
         )
         logger.info("PDF assembled: %s", pdf_path)
 
@@ -830,9 +963,12 @@ def run_pipeline(
         result = ScanResult(
             outcome=outcome,
             pages_scanned=len(images),
+            # Blank-page detection only. A sheet the scanner could not read is
+            # reported through the warning instead, because Phase 30 renders
+            # this number to users as pages removed for being blank.
             pages_removed=len(images) - len(filtered),
             pages_uploaded=len(filtered),
-            warning=warning,
+            warning=_join_warnings(warning, rejected_warning),
         )
 
         notify(PipelineEvent.DONE)

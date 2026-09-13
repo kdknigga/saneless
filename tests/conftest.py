@@ -20,7 +20,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.paperless import UploadResult
-from saneless.scanner.base import ScannerBackend
+from saneless.scanner.base import ScanBatch, ScannerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -113,14 +113,44 @@ def default_settings() -> Settings:
     )
 
 
+def scan_batch(
+    pages: list[Image.Image],
+    *,
+    resolution: int = 300,
+    rejected: int = 0,
+) -> ScanBatch:
+    """
+    Build a ScanBatch for a stubbed scanner.
+
+    ``scan_pages`` returns a record rather than yielding, so a stub handing back
+    ``iter([...])`` no longer models the backend at all -- and because a
+    ``MagicMock`` will return whatever it is given, that mismatch surfaces as a
+    confusing failure deep in the pipeline rather than at the stub.
+
+    The two extra facts default to "nothing surprising happened": the device
+    honoured the resolution it was asked for and rejected no sheets. A test that
+    cares about either passes it explicitly.
+
+    Args:
+        pages: The pages the stubbed scan produced.
+        resolution: The resolution the device reports having actually used.
+        rejected: How many fed sheets failed their integrity checks.
+
+    Returns:
+        A ScanBatch carrying those pages and both facts.
+
+    """
+    return ScanBatch(pages=pages, actual_resolution=resolution, pages_rejected=rejected)
+
+
 @pytest.fixture
 def mock_scanner() -> MagicMock:
-    """Return a mock ScannerBackend that yields a single image with content."""
+    """Return a mock ScannerBackend returning a single image with content."""
     scanner = MagicMock(spec=ScannerBackend)
     img = Image.new("RGB", (100, 100), "white")
     draw = ImageDraw.Draw(img)
     draw.rectangle([10, 10, 90, 90], fill="black")
-    scanner.scan_pages.return_value = iter([img])
+    scanner.scan_pages.return_value = scan_batch([img])
     return scanner
 
 

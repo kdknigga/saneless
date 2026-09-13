@@ -35,6 +35,7 @@ from saneless.vocabulary import (
     ScanOutcome,
     classify_error,
 )
+from tests.conftest import scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -302,7 +303,7 @@ class TestPipelineThumbnail:
         """Flatbed scan calls thumbnail_callback with non-empty base64 string."""
         default_settings.output.tmp_dir = str(tmp_path)
         # Use a content image so it doesn't get filtered as empty
-        mock_scanner.scan_pages.return_value = iter([_make_content_image()])
+        mock_scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -331,7 +332,7 @@ class TestPipelineThumbnail:
     ) -> None:
         """Pipeline works without thumbnail_callback."""
         default_settings.output.tmp_dir = str(tmp_path)
-        mock_scanner.scan_pages.return_value = iter([_make_content_image()])
+        mock_scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         request = PipelineRequest(
             profile_name="default",
@@ -369,7 +370,7 @@ class TestPipelineEmptyPageFilter:
         ]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Filter Test")
 
@@ -400,7 +401,7 @@ class TestPipelineEmptyPageFilter:
         default_settings.profiles["default"].empty_page_stddev_threshold = 10.0
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter([_make_content_image()])
+        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         request = PipelineRequest(profile_name="default", title="Threshold Test")
 
@@ -427,7 +428,7 @@ class TestPipelineEmptyPageFilter:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(
+        scanner.scan_pages.return_value = scan_batch(
             [_make_empty_image(), _make_empty_image()]
         )
 
@@ -458,7 +459,7 @@ class TestManualDuplex:
         backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -493,7 +494,7 @@ class TestManualDuplex:
         backs = [_make_content_image() for _ in range(2)]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -545,8 +546,8 @@ class TestManualDuplex:
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = [
-            iter([_make_content_image() for _ in range(3)]),
-            iter([_make_content_image() for _ in range(2)]),
+            scan_batch([_make_content_image() for _ in range(3)]),
+            scan_batch([_make_content_image() for _ in range(2)]),
         ]
 
         result = run_pipeline(
@@ -580,8 +581,8 @@ class TestManualDuplex:
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = [
-            iter([_make_content_image() for _ in range(3)]),
-            iter([_make_content_image() for _ in range(2)]),
+            scan_batch([_make_content_image() for _ in range(3)]),
+            scan_batch([_make_content_image() for _ in range(2)]),
         ]
 
         result = run_pipeline(
@@ -607,7 +608,7 @@ class TestManualDuplex:
         backs = [_make_content_image("green"), _make_content_image("yellow")]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -644,7 +645,7 @@ class TestManualDuplex:
         backs = [_make_empty_image(), _make_content_image("green")]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         request = PipelineRequest(
             profile_name="default",
@@ -680,7 +681,7 @@ class TestManualDuplex:
         backs = [_make_content_image()]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -713,7 +714,7 @@ class TestManualDuplex:
         backs = [_make_content_image()]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [iter(fronts), iter(backs)]
+        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
 
         flip_event = threading.Event()
         flip_event.set()  # Pre-set so it doesn't block
@@ -745,7 +746,7 @@ class TestManualDuplex:
         fronts = [_make_content_image()]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(fronts)
+        scanner.scan_pages.return_value = scan_batch(fronts)
 
         flip_event = threading.Event()
         abort_event = threading.Event()
@@ -784,7 +785,7 @@ class TestExifStripped:
         img.info["exif"] = b"fake-exif-data"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter([img])
+        scanner.scan_pages.return_value = scan_batch([img])
 
         request = PipelineRequest(profile_name="default", title="EXIF Test")
 
@@ -823,7 +824,7 @@ class TestEmptyPageDetectionToggle:
         all_pages = [content_page, *empty_pages]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Toggle Test")
 
@@ -856,7 +857,7 @@ class TestFlatbedStillWorks:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter([_make_content_image()])
+        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -966,7 +967,7 @@ class TestScanResultContract:
             _make_content_image("red"),
         ]
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Counts Test")
 
@@ -1000,7 +1001,7 @@ class TestScanResultContract:
 
         all_pages = [_make_content_image(), _make_empty_image(), _make_empty_image()]
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = iter(all_pages)
+        scanner.scan_pages.return_value = scan_batch(all_pages)
 
         request = PipelineRequest(profile_name="default", title="No Filter Test")
 
@@ -1080,7 +1081,7 @@ def _isolate_dirs(settings: Settings, tmp_path: Path) -> Path:
 def _one_page_scanner() -> MagicMock:
     """Return a scanner backend yielding a single page with content."""
     scanner = MagicMock(spec=ScannerBackend)
-    scanner.scan_pages.return_value = iter([_make_content_image()])
+    scanner.scan_pages.return_value = scan_batch([_make_content_image()])
     return scanner
 
 
@@ -1615,8 +1616,8 @@ def _mismatched_duplex_scanner(fronts: int = 3, backs: int = 2) -> MagicMock:
     """
     scanner = MagicMock(spec=ScannerBackend)
     scanner.scan_pages.side_effect = [
-        iter([_make_content_image() for _ in range(fronts)]),
-        iter([_make_content_image() for _ in range(backs)]),
+        scan_batch([_make_content_image() for _ in range(fronts)]),
+        scan_batch([_make_content_image() for _ in range(backs)]),
     ]
     return scanner
 
@@ -1845,3 +1846,193 @@ class TestDuplexMismatchDelivery:
 
         assert result.outcome is ScanOutcome.FALLBACK
         assert paperless.poll_task.call_count == 1
+
+
+class TestTheDpiTheDeviceActuallyChose:
+    """
+    The PDF declares the resolution the scanner used, not the one asked for.
+
+    Phase 23 made the profile's requested resolution authoritative for
+    ``img2pdf.get_fixed_dpi_layout_fun``. SANE substitutes silently -- measured,
+    5000 comes back as 1200 -- so a device that substitutes produced both a
+    mis-cropped page and a MediaBox disagreeing with its own content, which
+    re-opened part of OUTC-06 (T-24-22).
+    """
+
+    def test_the_pdf_is_assembled_at_the_resolution_the_device_chose(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A profile asking 600 on a device that gives 300 assembles at 300."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].resolution = 600
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch(
+            [_make_content_image()], resolution=300
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Clamped"),
+            )
+
+        assert mock_assemble.call_args.kwargs["dpi"] == 300
+
+    def test_the_duplex_mismatch_recovery_also_uses_the_actual_dpi(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The recovery path builds its two partial PDFs at the device's dpi."""
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].resolution = 600
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [
+            scan_batch([_make_content_image() for _ in range(3)], resolution=150),
+            scan_batch([_make_content_image() for _ in range(2)], resolution=150),
+        ]
+
+        fronts_pdf = tmp_path / "fronts.pdf"
+        backs_pdf = tmp_path / "backs.pdf"
+        fronts_pdf.write_bytes(b"%PDF-fake")
+        backs_pdf.write_bytes(b"%PDF-fake")
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.side_effect = [fronts_pdf, backs_pdf]
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=_both_halves_delivered(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Mismatch Dpi", job_id="job-dpi-1"
+                ),
+            )
+
+        dpis = [call.kwargs["dpi"] for call in mock_assemble.call_args_list]
+        assert dpis == [150, 150]
+
+    def test_two_passes_disagreeing_on_resolution_say_so(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        Manual duplex must not silently pick one of two different resolutions.
+
+        The two passes use identical settings on one device, so a disagreement
+        means the device changed its mind mid-job. Pass A's value is used and
+        the difference is logged rather than swallowed.
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [
+            scan_batch([_make_content_image() for _ in range(2)], resolution=300),
+            scan_batch([_make_content_image() for _ in range(2)], resolution=150),
+        ]
+
+        with (
+            patch("saneless.pipeline.assemble_pdf") as mock_assemble,
+            caplog.at_level(logging.WARNING, logger="saneless.pipeline"),
+        ):
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Two Dpis"),
+            )
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert [m for m in messages if "300" in m and "150" in m]
+        assert mock_assemble.call_args.kwargs["dpi"] == 300
+
+
+class TestRejectedPagesAreNotBlankPages:
+    """
+    D-07: a sheet the scanner could not read is counted, and counted apart.
+
+    ``pages_scanned`` is ``len(images)``, which already excludes a skipped
+    sheet, so a ten-sheet stack with one unreadable page reported nine and
+    nobody learned a page was lost (T-24-23). The count must not be folded into
+    the blank-page total, which Phase 30 renders as pages removed for being
+    blank (T-24-24).
+    """
+
+    def test_rejected_pages_are_reported_without_touching_the_blank_count(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Two integrity rejections and no blank pages: 0 removed, 2 reported."""
+        default_settings.output.tmp_dir = str(tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch(
+            [_make_content_image() for _ in range(3)], rejected=2
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Two Rejected"),
+            )
+
+        assert result.pages_removed == 0
+        assert result.warning is not None
+        assert "2" in result.warning
+
+    def test_a_clean_scan_reports_zero_for_both_counts(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """No rejections and no blank removals leaves nothing to warn about."""
+        default_settings.output.tmp_dir = str(tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch(
+            [_make_content_image() for _ in range(3)]
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="All Clean"),
+            )
+
+        assert result.pages_removed == 0
+        assert result.warning is None

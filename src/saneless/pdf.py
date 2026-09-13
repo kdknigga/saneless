@@ -144,23 +144,22 @@ def assemble_pdf(
     So the type level forces each caller to name its own file.
     Build the name with :func:`build_pdf_filename` rather than composing one.
 
-    ``dpi`` is likewise supplied by the caller, from ``profile.resolution``,
-    and is deliberately **not** read from the images. On this path PIL carries
-    no DPI at all: images arrive from ``dev.snap()`` and go through
-    ``crop_to_paper_size``, whose ``Image.crop()`` returns a fresh image whose
-    ``.info`` is measured as ``{}``. A "prefer the image's own DPI" branch
-    would therefore be unreachable dead code -- and a PNG round-trip degrades
-    300 to 299.9994 anyway, because PNG stores pixels per metre as an integer.
-    ``profile.resolution`` is also what ``crop_to_paper_size`` already uses for
+    ``dpi`` is likewise supplied by the caller -- as the resolution the scanner
+    reported actually using, read back from the device rather than the one the
+    profile requested -- and is deliberately **not** read from the images. On
+    this path PIL carries no DPI at all: images arrive from ``dev.snap()`` and
+    go through ``crop_to_paper_size``, whose ``Image.crop()`` returns a fresh
+    image whose ``.info`` is measured as ``{}``. A "prefer the image's own DPI"
+    branch would therefore be unreachable dead code -- and a PNG round-trip
+    degrades 300 to 299.9994 anyway, because PNG stores pixels per metre as an
+    integer. That same read-back value is what ``crop_to_paper_size`` uses for
     its crop arithmetic, so the crop shape and the MediaBox cannot disagree.
-    Phase 24 adds device read-back; the line that changes is the ``dpi``
-    argument at the call sites in ``pipeline.py``, not anything in here.
 
     A fixed-DPI layout function applies that DPI to **every** page
     unconditionally, so a page's size in points is determined entirely by its
     pixel count. That is correct here because one pipeline run scans every page
-    at one ``profile.resolution``: a half-size raster becomes a half-size page
-    rather than being rescaled to match its neighbours.
+    at one resolution: a half-size raster becomes a half-size page rather than
+    being rescaled to match its neighbours.
 
     Args:
         images: List of PIL Image objects to include in the PDF.
@@ -168,8 +167,8 @@ def assemble_pdf(
         filename: File name for the PDF, including its ``.pdf`` extension.
             Must be a single path segment; :func:`build_pdf_filename`
             guarantees that.
-        dpi: Resolution the pages were scanned at, from ``profile.resolution``.
-            Determines the page size the PDF declares.
+        dpi: Resolution the pages were actually scanned at, as read back from
+            the device. Determines the page size the PDF declares.
 
     Returns:
         Path to the generated PDF file.
