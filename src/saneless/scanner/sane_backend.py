@@ -18,7 +18,8 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
-from typing import TYPE_CHECKING, Any, Protocol
+from enum import IntEnum
+from typing import TYPE_CHECKING, Any, Protocol, assert_never
 
 import PIL.Image
 from PIL import Image
@@ -112,7 +113,11 @@ _FEEDER_EMPTY_MESSAGE = "No paper detected in feeder"
 #     dev.tl_x = 0.0
 _REPORTED_GEOMETRY_OPTIONS: tuple[str, ...] = ("tl-x", "tl-y", "br-x", "br-y")
 
-__all__ = ["SaneBackend"]
+# Millimetres per inch, for converting a paper size into pixel-denominated
+# scan-area units.  The same factor crop_to_paper_size() uses.
+_MM_PER_INCH = 25.4
+
+__all__ = ["GeometryUnit", "SaneBackend"]
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +134,116 @@ def _as_image(obj: object) -> Image.Image:
         msg = f"Expected Image, got {type(obj)}"
         raise TypeError(msg)
     return obj
+
+
+class GeometryUnit(IntEnum):
+    """
+    The unit a SANE device reports for its scan-area options.
+
+    These seven are the complete set of SANE unit codes, confirmed against the
+    ``_sane`` extension itself rather than against ``sane.UNIT_STR``, which is
+    a display dict for ``Option.__repr__``.  **A backend cannot report
+    centimetres or inches** -- SANE defines no such code -- so no such member
+    exists here and no such arm exists below.  Offering the operator a scan
+    area in those terms is a separate, deferred idea; nothing here implements
+    it, and a dead branch for a unit no device can send would be a lie about
+    what was measured.
+
+    Dispatch on this is a ``match`` with ``assert_never``, and never a mapping
+    keyed on the enum, on purpose.  A mapping missing a member draws no
+    diagnostic from either ``ty`` or ``pyrefly``; the same enum in a match is
+    caught by both, at edit time, before an unhandled unit can silently
+    mis-scale a page.
+    """
+
+    UNIT_NONE = 0
+    UNIT_PIXEL = 1
+    UNIT_BIT = 2
+    UNIT_MM = 3
+    UNIT_DPI = 4
+    UNIT_PERCENT = 5
+    UNIT_MICROSECOND = 6
+
+
+def _units_per_mm(unit: GeometryUnit, resolution: int) -> float | None:
+    """
+    Return how many device units one millimetre is, or None if unconvertible.
+
+    One factor serves both jobs the geometry path has: scaling a paper size
+    into the device's own units, and expressing the read-back tolerance in
+    those same units.
+
+    Args:
+        unit: The unit the device reports for its scan-area options.
+        resolution: The resolution the device actually reported, in dpi.  Read
+            back from the device, never the requested value -- converting with
+            a resolution the device silently refused would reintroduce M-16's
+            substitution one layer further down.
+
+    Returns:
+        The number of device units in one millimetre, or None when saneless
+        cannot convert the unit and the caller should crop instead.
+
+    """
+    match unit:
+        case GeometryUnit.UNIT_MM:
+            scale = 1.0
+        case GeometryUnit.UNIT_PIXEL:
+            scale = resolution / _MM_PER_INCH
+        case (
+            GeometryUnit.UNIT_NONE
+            | GeometryUnit.UNIT_BIT
+            | GeometryUnit.UNIT_DPI
+            | GeometryUnit.UNIT_PERCENT
+            | GeometryUnit.UNIT_MICROSECOND
+        ):
+            logger.warning(
+                "Scanner reports its scan area in %s, which saneless cannot "
+                "convert to a paper size, will crop after scanning",
+                unit.name,
+            )
+            scale = None
+        case _:
+            assert_never(unit)
+    return scale
+
+
+def _geometry_unit(raw_options: list[tuple]) -> GeometryUnit | None:
+    """
+    Read the unit the device reports for its scan-area options.
+
+    The unit lives at index 5 of the option tuple, which the geometry
+    arithmetic used to ignore entirely, assuming millimetres (N-03).
+
+    ``br-x`` is the option read: the four scan-area options describe one box,
+    and a device reports one unit for all of them.
+
+    The conversion is defensive because the tuple is device-supplied.  A
+    conforming backend cannot report a code outside the seven, but nothing in
+    the protocol stops a broken one, and scaling by a garbage factor would
+    silently mis-size the page.
+
+    Args:
+        raw_options: The device's option tuples.
+
+    Returns:
+        The reported unit, or None if the device reported something that is not
+        a SANE unit at all.
+
+    """
+    reported = next(
+        (opt[5] for opt in raw_options if len(opt) >= 9 and opt[1] == "br-x"),
+        None,
+    )
+    try:
+        return GeometryUnit(reported)
+    except ValueError:
+        logger.warning(
+            "Scanner reports scan-area unit code %s, which is not a SANE unit, "
+            "will crop after scanning",
+            reported,
+        )
+        return None
 
 
 def _missing_geometry_options(raw_options: list[tuple]) -> list[str]:
@@ -148,7 +263,45 @@ def _missing_geometry_options(raw_options: list[tuple]) -> list[str]:
     return [name for name in _REPORTED_GEOMETRY_OPTIONS if name not in reported]
 
 
-def _set_geometry(dev: SaneDevice, paper_size: str, raw_options: list[tuple]) -> bool:
+def _geometry_scale(raw_options: list[tuple], resolution: int) -> float | None:
+    """
+    Decide whether this device's scan area can be set, and on what scale.
+
+    Three separate ways a device can rule geometry out -- an option it does not
+    report at all, a unit code that is not a SANE unit, and a unit saneless
+    cannot convert into a length -- collapse here into one answer, so the
+    caller has a single decision to make.  Each cause logs its own WARNING
+    naming what was wrong before returning None, so the three stay
+    distinguishable in the log even though they share a return value.
+
+    Args:
+        raw_options: The device's option tuples.
+        resolution: The resolution the device actually reported, in dpi.
+
+    Returns:
+        The number of device units in one millimetre, or None if the caller
+        should crop the image after scanning instead.
+
+    """
+    missing = _missing_geometry_options(raw_options)
+    if missing:
+        logger.warning(
+            "Scanner does not report scan-area option(s) %s, will crop after scanning",
+            ", ".join(missing),
+        )
+        return None
+    unit = _geometry_unit(raw_options)
+    if unit is None:
+        return None
+    return _units_per_mm(unit, resolution)
+
+
+def _set_geometry(
+    dev: SaneDevice,
+    paper_size: str,
+    raw_options: list[tuple],
+    resolution: int,
+) -> bool:
     """
     Constrain the scan area to a paper size, if the device really can.
 
@@ -165,30 +318,30 @@ def _set_geometry(dev: SaneDevice, paper_size: str, raw_options: list[tuple]) ->
         dev: Open SANE device handle.
         paper_size: Paper size key (e.g. ``"a4"``).
         raw_options: The device's option tuples, already fetched by the caller.
+        resolution: The resolution the device actually reported, in dpi, used
+            to convert the paper size when the device denominates its scan area
+            in pixels.
 
     Returns:
         True if the scan area was set on the device, False if the caller should
         crop the image afterwards instead.
 
     """
-    if paper_size == "full":
-        return False
+    # "full" means no constraint at all and is deliberately absent from
+    # PAPER_SIZES_MM, so this one lookup answers both "is a constraint wanted?"
+    # and "is it a size we know?".
     dims = PAPER_SIZES_MM.get(paper_size)
     if dims is None:
         return False
-    missing = _missing_geometry_options(raw_options)
-    if missing:
-        logger.warning(
-            "Scanner does not report scan-area option(s) %s, will crop after scanning",
-            ", ".join(missing),
-        )
+    scale = _geometry_scale(raw_options, resolution)
+    if scale is None:
         return False
     width_mm, height_mm = dims
     try:
         dev.tl_x = 0.0
         dev.tl_y = 0.0
-        dev.br_x = width_mm
-        dev.br_y = height_mm
+        dev.br_x = width_mm * scale
+        dev.br_y = height_mm * scale
     except Exception as exc:
         # Name what was swallowed.  A device that reports the options and then
         # refuses them is a different fault from one that never had them, and
@@ -730,8 +883,9 @@ class SaneBackend(ScannerBackend):
                 raw_options, settings.source
             )
 
-            # Set device options
-            _configure_device(
+            # Set device options.  The return value is the resolution the
+            # device actually chose, which may not be the one requested.
+            actual_resolution = _configure_device(
                 dev,
                 settings,
                 effective_source,
@@ -739,8 +893,11 @@ class SaneBackend(ScannerBackend):
             )
 
             # Constrain the scan area to the paper size, if the device reports
-            # the options to do it with (D-09).
-            geometry_set = _set_geometry(dev, settings.paper_size, raw_options)
+            # the options to do it with (D-09), scaling by the unit it reports
+            # (D-10) at the resolution it actually chose (D-11).
+            geometry_set = _set_geometry(
+                dev, settings.paper_size, raw_options, actual_resolution
+            )
 
             source_kind = classify_source(effective_source)
             use_adf = source_kind.uses_feeder
