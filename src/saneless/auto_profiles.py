@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
@@ -302,6 +303,27 @@ def resolve_config_path(config_path: str | None = None) -> Path:
     return Path("./saneless.toml")
 
 
+def _is_auto_generated(table: object) -> bool:
+    """
+    Report whether a parsed profile table carries a truthy auto_generated flag.
+
+    The parsed profiles section holds values typed ``object``, so the flag is
+    read behind an isinstance narrowing rather than an annotation the type
+    checkers cannot verify. Anything that is not a mapping -- a stray scalar
+    under ``[profiles]`` -- answers False and is therefore never pruned.
+
+    Args:
+        table: A value from the parsed ``[profiles]`` section.
+
+    Returns:
+        True only for a mapping whose ``auto_generated`` value is truthy.
+
+    """
+    if not isinstance(table, Mapping):
+        return False
+    return bool(table.get("auto_generated", False))
+
+
 def write_profiles_to_config(
     config_path: Path,
     profiles: dict[str, ProfileConfig],
@@ -314,13 +336,23 @@ def write_profiles_to_config(
     Uses tomlkit for comment-preserving TOML round-tripping. Profiles that
     already exist in the config are skipped unless force=True.
 
+    Auto-generated profiles that the freshly generated set no longer names are
+    pruned first, so renaming does not strand the profiles it replaced. The
+    prune runs whether or not ``force`` is passed, and that is deliberate:
+    ``force`` governs overwriting keys that are *present* in the generated set,
+    while an orphan is by definition absent from it, so ``force`` has nothing
+    to say about it. A profile without a truthy ``auto_generated`` flag is
+    never touched -- CFG-07's literal wording, which keeps this from
+    pre-empting the general merge semantics owned by a later phase.
+
     Args:
         config_path: Path to the TOML config file.
         profiles: Dictionary of profile name to ProfileConfig.
         force: If True, overwrite existing profiles.
 
     Returns:
-        List of profile names that were actually written.
+        List of profile names that were actually written. Pruned profiles are
+        not named here -- they were removed, not written.
 
     """
     if config_path.exists():
@@ -332,6 +364,19 @@ def write_profiles_to_config(
         doc.add("profiles", tomlkit.table(is_super_table=True))
 
     profiles_section = cast("dict[str, object]", doc["profiles"])
+
+    orphans = [
+        name
+        for name, table in profiles_section.items()
+        if name not in profiles and _is_auto_generated(table)
+    ]
+    for name in orphans:
+        logger.info(
+            "Removing auto-generated profile %r: the scanner's sources no "
+            "longer produce that name.",
+            name,
+        )
+        del profiles_section[name]
 
     written: list[str] = []
     for name, profile in profiles.items():
