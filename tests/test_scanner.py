@@ -1620,6 +1620,36 @@ class TestClampedScanArea:
         assert [m for m in _warning_messages(caplog) if "210" in m and "200" in m]
         assert pages[0].size == _A4_AT_300_DPI
 
+    def test_a_clamped_top_left_falls_through_to_the_crop(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A device whose geometry range starts above 0 clamps ``tl``, not ``br``.
+
+        ``dev.tl_x = 0.0`` is clamped up to the range minimum while ``br`` is
+        accepted verbatim, so comparing the far corner alone reports success
+        over an area short by the whole minimum on each axis.  The read-back
+        already had the measured top-left in hand and threw it away: an A4
+        request silently yielded a 200 x 287 mm page, with no warning, no crop,
+        and a PDF MediaBox disagreeing with its own content.
+        """
+        dev = _device_reporting_unit(GeometryUnit.UNIT_MM, (10.0, 300.0, 1.0))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
+        )
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            pages = backend.scan_pages("test:0", settings).pages
+
+        # br really was honoured -- only tl moved, which is what makes the far
+        # corner alone an insufficient test rather than a redundant one.
+        assert dev.tl_x == pytest.approx(10.0)
+        assert dev.br_x == pytest.approx(210.0)
+        # 210 requested, 200 of box actually obtained.
+        assert [m for m in _warning_messages(caplog) if "210" in m and "200" in m]
+        assert pages[0].size == _A4_AT_300_DPI
+
     def test_a_comfortable_range_is_not_reported_as_clamped(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
