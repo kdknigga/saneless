@@ -28,6 +28,12 @@ The five behaviours a double gets wrong, and which this one gets right:
    exactly one message, ``Document feeder out of documents``, to
    ``StopIteration``.
 
+A sixth behaviour, from the SANE specification rather than from an execution:
+``TYPE_FIXED`` values round-trip through SANE's 16.16 fixed-point
+representation, so a length like letter's 215.9 mm does not read back exactly
+as written.  D-19's clamp detection therefore has to compare with a tolerance;
+an equality test would send every such scan down the crop path.
+
 One deliberate, documented divergence: the real ``__load_option_dict`` filters
 ``TYPE_GROUP`` options out of ``opt``, which makes the library's own "Groups
 don't have values" branch unreachable.  This fake keeps groups in the table so
@@ -89,6 +95,10 @@ _READ_ONLY_ATTRIBUTES = frozenset(
 
 # sane.py:130 -- the single message the ADF iterator converts to StopIteration.
 _FEEDER_EMPTY_MESSAGE = "Document feeder out of documents"
+
+# SANE_Fixed is a 16.16 fixed-point integer, so a TYPE_FIXED option can only
+# represent multiples of 1/65536.
+_SANE_FIXED_SCALE = 65536
 
 _INVALID_ARGUMENT = "Invalid argument"
 _SANE_FIXED_TYPE_ERROR = "SANE_FIXED requires a floating point number"
@@ -458,6 +468,25 @@ def _reject_unreadable(option: tuple, key: str) -> None:
         raise AttributeError(msg)
 
 
+def _to_sane_fixed(value: float) -> float:
+    """
+    Round to SANE's 16.16 fixed-point grid, as ``SANE_Fixed`` does.
+
+    A length that is not a multiple of 1/65536 -- letter's 215.9 mm, for
+    instance -- cannot be stored exactly, so it reads back differing in the low
+    bits without the device having clamped anything.  This is the reason D-19
+    compares areas with a tolerance instead of for equality.
+
+    Args:
+        value: The requested value.
+
+    Returns:
+        The nearest value SANE can actually represent.
+
+    """
+    return round(value * _SANE_FIXED_SCALE) / _SANE_FIXED_SCALE
+
+
 def _constrain(option: tuple, key: str, value: object) -> object:
     """
     Apply the option's type and constraint to an assigned value.
@@ -478,10 +507,10 @@ def _constrain(option: tuple, key: str, value: object) -> object:
     if value_type == _TYPE_FIXED:
         number = _as_float(value)
         if isinstance(constraint, tuple):
-            return _clamp(number, constraint)
+            return _to_sane_fixed(_clamp(number, constraint))
         if isinstance(constraint, list) and number not in constraint:
             raise FakeSaneError(_INVALID_ARGUMENT)
-        return number
+        return _to_sane_fixed(number)
     if value_type == _TYPE_STRING:
         text = _as_str(key, value)
         if isinstance(constraint, list) and text not in constraint:
