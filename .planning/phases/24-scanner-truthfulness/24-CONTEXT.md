@@ -244,10 +244,20 @@ discussion — **D-01**, **D-07** and **D-14** — and each is called out where 
     references in `tests/test_cli.py` and `tests/test_worker.py`.
 
 - **D-15: `_slugify` is hardened to a strict `[a-z0-9-]` character set.** Today it only replaces
-  spaces and underscores (`auto_profiles.py:33-44`), so Canon's `"ADF (left aligned)"` would
-  emit `adf-(left-aligned)` — not a legal TOML bare key, and awkward as a `--profile` value and
-  a URL fragment. The rule drops or replaces anything outside the set, collapses hyphen runs,
-  strips leading and trailing hyphens, and guards the empty result.
+  spaces and underscores (`auto_profiles.py:33-44`), so Canon's `"ADF (left aligned)"` emits
+  `adf-(left-aligned)`, which is awkward as a `--profile` value and as a URL fragment. The rule
+  drops or replaces anything outside the set, collapses hyphen runs, strips leading and trailing
+  hyphens, and guards the empty result.
+  - **CORRECTED 2026-09-13 by research, verified by execution.** The original wording above claimed
+    `adf-(left-aligned)` is "not a legal TOML bare key". **That is false.** tomlkit quotes such a key
+    automatically and `tomllib` round-trips it cleanly — measured both ways. **Do not write a test
+    asserting the un-hardened slug breaks the config file**; it does not, and such a test would
+    encode a false belief as a regression guard.
+  - **The decision still stands, on stronger and now-measured grounds.** `_slugify` passes `/`
+    straight through — `"Flachbett/Einzug"` → `flachbett/einzug`, measured — which is one careless
+    reuse away from a filesystem path, and a punctuation-heavy or whitespace-only source name
+    degenerates to `--` or to the empty string. The hardening is an input-validation control over a
+    device-supplied string (ASVS V5/V12), not a TOML-syntax fix.
   - **This is the same weakness Phase 23's D-19 identified** when it forbade reusing `_slugify`
     for PDF filenames because it passes `/` and `..` through. The two sanitisers stay separate
     per D-19; only the character-set weakness is fixed in both places' spirit.
@@ -311,6 +321,40 @@ discussion — **D-01**, **D-07** and **D-14** — and each is called out where 
     test stays developer-machine-only, exactly as the DARK browser tests did until Phase 26.
   - Locally verified during discussion: python-sane **2.9.2** imports, and
     `/usr/lib64/sane/libsane-test.so` and `/etc/sane.d/test.conf` are both present.
+
+### Added after research (2026-09-13)
+
+- **D-19: a clamped geometry area is detected on read-back and falls through to the crop.**
+  Research (its Q7) measured that writing A4's 210 mm to a device whose `br_x` range is
+  `(0.0, 200.0, 1.0)` clamps to 200.0 with **no error and no exception**, so `_set_geometry` can
+  return `True` having set an area that is not the one requested. This is the same
+  silent-substitution shape as M-16's DPI clamping, but it is named by none of D-01..D-18, so the
+  user was asked rather than it being decided unilaterally.
+  - **Resolution:** after assigning the four geometry values, read them back. If the effective area
+    differs materially from the requested paper size, log at WARNING naming both requested and
+    actual, and return `False` so D-09's existing Pillow crop fallback runs. The crop then produces
+    a correctly sized page even though the device refused the area.
+  - **Why this shape:** it reuses a code path this phase is already building (D-09's `return False`
+    into `_maybe_crop`), adds no new vocabulary, and does **not** grow D-12's result object — which
+    research warns is already bigger than scoped, because `scan_pages` is a generator and `list()`
+    discards `StopIteration.value`.
+  - Rejected: carrying the actual geometry out alongside `actual_resolution` in D-12's object (more
+    consistent with D-12, but grows the object that was deliberately kept minimal); and deferring it
+    (no later phase owns it, so it would need a backlog entry, and SCNR-04 would be satisfied while
+    the scan area could still be silently wrong — the failure shape this phase exists to remove).
+  - **"Materially" needs a tolerance, not exact equality.** SANE geometry options are `TYPE_FIXED`,
+    so a round-tripped value can differ in the low bits without the device having clamped anything.
+    The tolerance is Claude's discretion; do not assert equality.
+
+- **A2 CONFIRMED — historic `job.profile` needs no migration after D-14's rename.** Research flagged
+  this as a LOW-confidence assumption requiring one confirming grep before "no migration" could be
+  accepted, rather than inherited. Confirmed 2026-09-13: the stored slug reaches exactly three
+  display-only sites — `cli.py:246` (JSON field), `cli.py:276` (truncated table column), and
+  `web/templates/partials/history.html:5` — there is no retry, rerun, or resubmit path anywhere in
+  the codebase, and the profile dropdown iterates live `settings.profiles` keys rather than historic
+  rows. No stored slug is ever fed back into `settings.profiles[...]`, so a renamed profile simply
+  leaves old jobs displaying the name that was true when they ran, which is accurate history.
+  **No migration task is needed** — and a planner should not invent one.
 
 ### Claude's Discretion
 
