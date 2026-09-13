@@ -18,6 +18,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
+from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Protocol, assert_never
 
@@ -152,6 +153,117 @@ def _as_image(obj: object) -> Image.Image:
         msg = f"Expected Image, got {type(obj)}"
         raise TypeError(msg)
     return obj
+
+
+@dataclass(frozen=True)
+class _OptionConstraint:
+    """
+    What a device reports for one option, in whichever shape it used.
+
+    ``present`` answers a genuinely different question from the other two, and
+    is not implied by either: a device may expose an option whose constraint
+    saneless cannot read, and it must still be recognised as *having* that
+    option. A record reporting only the parsed constraint would collapse the
+    two questions into one and silently stop saneless assigning the source on
+    such a device.
+
+    Attributes:
+        present: Whether the device reports the option at all.
+        values: The word list the device gave, or None if it gave another shape.
+        span: The ``(min, max, step)`` the device gave, or None if it gave
+            another shape.
+
+    """
+
+    present: bool
+    values: list | None
+    span: tuple[float, float, float] | None
+
+
+def _is_number(value: object) -> bool:
+    """
+    Report whether a constraint member is a real number.
+
+    ``bool`` is excluded deliberately: it is a subclass of ``int``, so a
+    device reporting ``True`` would otherwise convert to ``1.0`` and be
+    accepted as a legitimate bound.
+
+    Args:
+        value: One member of a device-supplied constraint.
+
+    Returns:
+        True if the value is an int or float that is not a bool.
+
+    """
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _as_span(constraint: object) -> tuple[float, float, float] | None:
+    """
+    Read a ``(min, max, step)`` range, or None if that is not what this is.
+
+    The constraint comes from the device, so nothing guarantees it is one of
+    the three shapes SANE defines. A tuple of the wrong arity, or one whose
+    members are not numbers, yields None rather than a guessed value, and this
+    never raises: a malformed constraint must not take down a capability query
+    (T-24-27).
+
+    Args:
+        constraint: The constraint object the device reported.
+
+    Returns:
+        The range as floats, or None if the constraint is not a SANE range.
+
+    """
+    if not isinstance(constraint, tuple):
+        # None is the third documented shape -- an unconstrained option -- and
+        # is not worth a warning. Anything else simply is not a range.
+        return None
+    if len(constraint) != 3 or not all(_is_number(member) for member in constraint):
+        logger.warning(
+            "Scanner reports %r for a range-constrained option, which is not a "
+            "(minimum, maximum, step) triple; ignoring it rather than guessing",
+            constraint,
+        )
+        return None
+    low, high, step = constraint
+    return (float(low), float(high), float(step))
+
+
+def _constraint(raw_options: list[tuple], name: str) -> _OptionConstraint:
+    """
+    Read what a device reports for one option, in whichever shape it used.
+
+    This is the single place any option constraint is parsed. Two call sites
+    used to carry their own copy of the word-list case and neither handled the
+    other two shapes, so a range-reporting device's answer was discarded twice
+    over -- the whole of N-01. A third copy would be that defect's third life.
+
+    Presence and constraint are reported separately because they are different
+    facts; see :class:`_OptionConstraint`.
+
+    Args:
+        raw_options: The device's option tuples, as ``get_options()`` returns
+            them.
+        name: The option name to look for, in the hyphenated spelling
+            ``get_options()`` uses.
+
+    Returns:
+        What the device reports for that option. An option tuple too short to
+        carry a constraint is skipped rather than being an error.
+
+    """
+    for opt in raw_options:
+        # SANE option tuple:
+        # (index, name, title, desc, type, unit, size, cap, constraint)
+        if len(opt) >= 9 and opt[1] == name:
+            constraint = opt[8]
+            if isinstance(constraint, list):
+                return _OptionConstraint(present=True, values=constraint, span=None)
+            return _OptionConstraint(
+                present=True, values=None, span=_as_span(constraint)
+            )
+    return _OptionConstraint(present=False, values=None, span=None)
 
 
 class GeometryUnit(IntEnum):
@@ -682,16 +794,9 @@ def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool
             the requested name nor ``"Auto"`` to fall back to.
 
     """
-    available_sources: list[str] = []
-    has_source_option = False
-
-    for opt in raw_options:
-        if len(opt) >= 9 and opt[1] == "source":
-            has_source_option = True
-            constraint = opt[8]
-            if isinstance(constraint, list):
-                available_sources = [str(s) for s in constraint]
-            break
+    reported = _constraint(raw_options, "source")
+    has_source_option = reported.present
+    available_sources = [str(s) for s in reported.values or []]
 
     effective_source = requested
     if has_source_option and effective_source not in available_sources:
@@ -866,41 +971,31 @@ class SaneBackend(ScannerBackend):
         """
         Query device capabilities and available options.
 
-        Opens the device, reads its option list, and extracts
-        available sources, resolutions, and modes.
+        Opens the device, reads its option list, and records what the device
+        reports for its source, resolution and mode options.
 
         Args:
             device_id: SANE device identifier string.
 
         Returns:
-            DeviceCapabilities with parsed option information.
+            DeviceCapabilities with parsed option information. Resolution
+            support is reported in whichever shape the device used -- a word
+            list or a range -- with at most one of the two populated and
+            neither derived from the other.
 
         """
         with self._open_device(device_id) as dev:
             raw_options = dev.get_options()
-            sources: list[str] = []
-            resolutions: list[int] = []
-            modes: list[str] = []
-
-            for opt in raw_options:
-                # SANE option tuple:
-                # (index, name, title, desc, type, unit, size, cap, constraint)
-                if len(opt) < 9:
-                    continue
-                name = opt[1]
-                constraint = opt[8]
-                if name == "source" and isinstance(constraint, list):
-                    sources = [str(s) for s in constraint]
-                elif name == "resolution" and isinstance(constraint, list):
-                    resolutions = [int(r) for r in constraint]
-                elif name == "mode" and isinstance(constraint, list):
-                    modes = [str(m) for m in constraint]
+            sources = _constraint(raw_options, "source").values or []
+            modes = _constraint(raw_options, "mode").values or []
+            resolution = _constraint(raw_options, "resolution")
 
             return DeviceCapabilities(
-                sources=sources,
-                resolutions=resolutions,
-                modes=modes,
+                sources=[str(s) for s in sources],
+                resolutions=[int(r) for r in resolution.values or []],
+                modes=[str(m) for m in modes],
                 raw_options=raw_options,
+                resolution_range=resolution.span,
             )
 
     def _scan_adf_pages(
