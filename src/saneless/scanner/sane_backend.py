@@ -117,6 +117,23 @@ _REPORTED_GEOMETRY_OPTIONS: tuple[str, ...] = ("tl-x", "tl-y", "br-x", "br-y")
 # scan-area units.  The same factor crop_to_paper_size() uses.
 _MM_PER_INCH = 25.4
 
+# How far the area a device reports may differ from the one requested before it
+# counts as having been clamped, in millimetres.
+#
+# This is a tolerance and NOT an equality test, on purpose.  SANE geometry
+# options are TYPE_FIXED -- a 16.16 fixed-point integer -- so a length that is
+# not a multiple of 1/65536 cannot be represented exactly and reads back
+# differing in the low bits although the device clamped nothing at all.
+# Letter's 215.9 mm is exactly such a length.  Comparing for equality would
+# send every letter-sized scan down the crop path for no reason.
+#
+# One millimetre is the chosen value because the smallest thing being compared
+# is a paper size, where a millimetre is far below what anyone could notice,
+# while the clamping this has to catch is measured in tens of millimetres
+# (210 -> 200, measured).  Three orders of magnitude separate the two, so the
+# exact figure is not delicate.
+_AREA_TOLERANCE_MM = 1.0
+
 __all__ = ["GeometryUnit", "SaneBackend"]
 
 logger = logging.getLogger(__name__)
@@ -296,6 +313,46 @@ def _geometry_scale(raw_options: list[tuple], resolution: int) -> float | None:
     return _units_per_mm(unit, resolution)
 
 
+def _area_matches(
+    actual: tuple[tuple[float, float], tuple[float, float]],
+    expected: tuple[float, float],
+    tolerance: float,
+) -> bool:
+    """
+    Check that the device kept the scan area it was given (D-19).
+
+    Accepting an assignment is not the same as honouring it.  Measured: writing
+    A4's 210 mm to a device whose ``br-x`` range is ``(0.0, 200.0, 1.0)`` stores
+    200.0, with no error and no ``INFO_INEXACT`` the caller can see.  Only what
+    the device reports back can tell the two apart.
+
+    Args:
+        actual: The ``((tl_x, tl_y), (br_x, br_y))`` the device reports.
+        expected: The ``(br_x, br_y)`` that was requested, in device units.
+        tolerance: How far the two may differ, in device units.
+
+    Returns:
+        True if the device kept the requested area, False if it clamped it and
+        the caller should crop the image instead.
+
+    """
+    (_tl_x, _tl_y), (actual_x, actual_y) = actual
+    expected_x, expected_y = expected
+    within_x = abs(actual_x - expected_x) <= tolerance
+    within_y = abs(actual_y - expected_y) <= tolerance
+    if within_x and within_y:
+        return True
+    logger.warning(
+        "Scanner clamped the scan area: requested %.1f x %.1f, device reports "
+        "%.1f x %.1f in its own units, will crop after scanning",
+        expected_x,
+        expected_y,
+        actual_x,
+        actual_y,
+    )
+    return False
+
+
 def _set_geometry(
     dev: SaneDevice,
     paper_size: str,
@@ -337,11 +394,13 @@ def _set_geometry(
     if scale is None:
         return False
     width_mm, height_mm = dims
+    expected = (width_mm * scale, height_mm * scale)
     try:
         dev.tl_x = 0.0
         dev.tl_y = 0.0
-        dev.br_x = width_mm * scale
-        dev.br_y = height_mm * scale
+        dev.br_x = expected[0]
+        dev.br_y = expected[1]
+        actual = dev.area
     except Exception as exc:
         # Name what was swallowed.  A device that reports the options and then
         # refuses them is a different fault from one that never had them, and
@@ -350,6 +409,10 @@ def _set_geometry(
             "Scanner rejected the scan-area options (%s), will crop after scanning",
             exc,
         )
+        return False
+    # A device can accept all four assignments and still quietly shrink the
+    # area, so what it reports back is what decides (D-19).
+    if not _area_matches(actual, expected, _AREA_TOLERANCE_MM * scale):
         return False
     logger.info(
         "Scan area set to %s: %.1f x %.1f mm",
@@ -362,24 +425,30 @@ def _set_geometry(
 
 def _maybe_crop(
     image: Image.Image,
-    settings: ScanSettings,
+    paper_size: str,
+    resolution: int,
     *,
     geometry_set: bool,
 ) -> Image.Image:
     """
-    Apply Pillow crop fallback when geometry options were not set.
+    Crop to the paper size when the area could not be set on the device.
 
     Args:
         image: Scanned page image.
-        settings: Scan settings with paper_size and resolution.
-        geometry_set: Whether SANE geometry was already applied.
+        paper_size: Paper size key (e.g. ``"a4"``).
+        resolution: The resolution the device actually reported, in dpi.
+            Deliberately not the requested one: the crop arithmetic and the
+            device's real sampling rate have to agree, or a silently clamped
+            resolution yields a cut-off page even when this fallback runs
+            exactly as intended (M-16).
+        geometry_set: Whether the scan area was already set on the device.
 
     Returns:
-        Cropped image, or original if no crop needed.
+        The cropped image, or the original if no crop is needed.
 
     """
-    if settings.paper_size != "full" and not geometry_set:
-        return crop_to_paper_size(image, settings.paper_size, settings.resolution)
+    if paper_size != "full" and not geometry_set:
+        return crop_to_paper_size(image, paper_size, resolution)
     return image
 
 
@@ -703,6 +772,13 @@ class SaneDevice(Protocol):
     br_x: float
     br_y: float
 
+    # Read-only in python-sane: __setattr__ rejects this name outright.
+    # Declaring it a property is what makes that read-only-ness true for the
+    # type checkers as well, rather than only at runtime.  D-19 reads it back
+    # to catch an area the device silently clamped.
+    @property
+    def area(self) -> tuple[tuple[float, float], tuple[float, float]]: ...
+
     def get_options(self) -> list: ...
     def start(self) -> None: ...
     def snap(self) -> Image.Image: ...
@@ -924,7 +1000,12 @@ class SaneBackend(ScannerBackend):
             if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
                 for page in self._scan_adf_pages(dev):
-                    yield _maybe_crop(page, settings, geometry_set=geometry_set)
+                    yield _maybe_crop(
+                        page,
+                        settings.paper_size,
+                        actual_resolution,
+                        geometry_set=geometry_set,
+                    )
             else:
                 # Flatbed: start() initiates the SANE data channel, then
                 # snap() drains it via sane_read() loop.  Without start()
@@ -933,4 +1014,9 @@ class SaneBackend(ScannerBackend):
                 image = dev.snap()
                 # Strip EXIF from flatbed scans too
                 image.info.pop("exif", None)
-                yield _maybe_crop(image, settings, geometry_set=geometry_set)
+                yield _maybe_crop(
+                    image,
+                    settings.paper_size,
+                    actual_resolution,
+                    geometry_set=geometry_set,
+                )
