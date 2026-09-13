@@ -1846,3 +1846,193 @@ class TestDuplexMismatchDelivery:
 
         assert result.outcome is ScanOutcome.FALLBACK
         assert paperless.poll_task.call_count == 1
+
+
+class TestTheDpiTheDeviceActuallyChose:
+    """
+    The PDF declares the resolution the scanner used, not the one asked for.
+
+    Phase 23 made the profile's requested resolution authoritative for
+    ``img2pdf.get_fixed_dpi_layout_fun``. SANE substitutes silently -- measured,
+    5000 comes back as 1200 -- so a device that substitutes produced both a
+    mis-cropped page and a MediaBox disagreeing with its own content, which
+    re-opened part of OUTC-06 (T-24-22).
+    """
+
+    def test_the_pdf_is_assembled_at_the_resolution_the_device_chose(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A profile asking 600 on a device that gives 300 assembles at 300."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].resolution = 600
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch(
+            [_make_content_image()], resolution=300
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Clamped"),
+            )
+
+        assert mock_assemble.call_args.kwargs["dpi"] == 300
+
+    def test_the_duplex_mismatch_recovery_also_uses_the_actual_dpi(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The recovery path builds its two partial PDFs at the device's dpi."""
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].resolution = 600
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [
+            scan_batch([_make_content_image() for _ in range(3)], resolution=150),
+            scan_batch([_make_content_image() for _ in range(2)], resolution=150),
+        ]
+
+        fronts_pdf = tmp_path / "fronts.pdf"
+        backs_pdf = tmp_path / "backs.pdf"
+        fronts_pdf.write_bytes(b"%PDF-fake")
+        backs_pdf.write_bytes(b"%PDF-fake")
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.side_effect = [fronts_pdf, backs_pdf]
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=_both_halves_delivered(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Mismatch Dpi", job_id="job-dpi-1"
+                ),
+            )
+
+        dpis = [call.kwargs["dpi"] for call in mock_assemble.call_args_list]
+        assert dpis == [150, 150]
+
+    def test_two_passes_disagreeing_on_resolution_say_so(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        Manual duplex must not silently pick one of two different resolutions.
+
+        The two passes use identical settings on one device, so a disagreement
+        means the device changed its mind mid-job. Pass A's value is used and
+        the difference is logged rather than swallowed.
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [
+            scan_batch([_make_content_image() for _ in range(2)], resolution=300),
+            scan_batch([_make_content_image() for _ in range(2)], resolution=150),
+        ]
+
+        with (
+            patch("saneless.pipeline.assemble_pdf") as mock_assemble,
+            caplog.at_level(logging.WARNING, logger="saneless.pipeline"),
+        ):
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Two Dpis"),
+            )
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert [m for m in messages if "300" in m and "150" in m]
+        assert mock_assemble.call_args.kwargs["dpi"] == 300
+
+
+class TestRejectedPagesAreNotBlankPages:
+    """
+    D-07: a sheet the scanner could not read is counted, and counted apart.
+
+    ``pages_scanned`` is ``len(images)``, which already excludes a skipped
+    sheet, so a ten-sheet stack with one unreadable page reported nine and
+    nobody learned a page was lost (T-24-23). The count must not be folded into
+    the blank-page total, which Phase 30 renders as pages removed for being
+    blank (T-24-24).
+    """
+
+    def test_rejected_pages_are_reported_without_touching_the_blank_count(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Two integrity rejections and no blank pages: 0 removed, 2 reported."""
+        default_settings.output.tmp_dir = str(tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch(
+            [_make_content_image() for _ in range(3)], rejected=2
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Two Rejected"),
+            )
+
+        assert result.pages_removed == 0
+        assert result.warning is not None
+        assert "2" in result.warning
+
+    def test_a_clean_scan_reports_zero_for_both_counts(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """No rejections and no blank removals leaves nothing to warn about."""
+        default_settings.output.tmp_dir = str(tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch(
+            [_make_content_image() for _ in range(3)]
+        )
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.return_value = tmp_path / "output.pdf"
+            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+
+            result = run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="All Clean"),
+            )
+
+        assert result.pages_removed == 0
+        assert result.warning is None
