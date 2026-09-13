@@ -254,34 +254,25 @@ def _next_page_with_timeout(
         raise ScanError(timeout_msg) from timeout_exc
 
 
-def _feed_ended(exc: Exception, page_num: int) -> bool:
-    """
-    Decide whether an acquisition failure ends the feed or is a real fault.
-
-    Args:
-        exc: The exception raised while acquiring a page.
-        page_num: Zero-based index of the page being acquired.
-
-    Returns:
-        True if the feed has ended and the loop should stop.
-
-    Raises:
-        FeederEmptyError: If the very first page failed for any reason.
-
-    """
-    if page_num == 0:
-        raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
-    # After the first page, end-of-feed signals.
-    error_str = str(exc).lower()
-    return "out of documents" in error_str or "no docs" in error_str
-
-
 def _acquire_pages(
     dev: SaneDevice,
     timeout_per_page: float,
 ) -> Iterator[Image.Image]:
     """
     Yield validated pages from the ADF, one per feeder sheet.
+
+    ``multi_scan()`` returns an iterator object and cannot raise, so the call
+    is not guarded.  python-sane's ``_SaneIterator.__next__`` converts exactly
+    one message into ``StopIteration``, and that is the only feeder-empty
+    signal there is.  Every other exception is a real fault -- a jam, an open
+    cover, a busy device, an I/O error -- and is reported as itself.
+
+    The zero-page ``FeederEmptyError`` at the end is therefore the **only**
+    path to "No paper detected in feeder", and it is the correct one: a feeder
+    that produced no pages at all genuinely has no paper in it.  Do not
+    re-introduce a first-page special case; inferring "the feeder is empty"
+    from "it failed on iteration zero" is what made a jam, an open cover and a
+    busy device all tell the operator to load paper (M-11, D-03).
 
     Args:
         dev: Open SANE device handle.
@@ -291,14 +282,11 @@ def _acquire_pages(
         Validated PIL Image for each scanned page.
 
     Raises:
-        FeederEmptyError: If the ADF feeder is empty.
-        ScanError: If a page times out.
+        FeederEmptyError: If the feeder produced no pages at all.
+        ScanError: If a page times out or the device reports a fault.
 
     """
-    try:
-        iterator = dev.multi_scan()
-    except Exception as exc:
-        raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
+    iterator = dev.multi_scan()
 
     page_num = 0
     executor = ThreadPoolExecutor(max_workers=1)
@@ -315,9 +303,8 @@ def _acquire_pages(
                 # errors -- including the timeout path's -- propagate here.
                 raise
             except Exception as exc:
-                if not _feed_ended(exc, page_num):
-                    raise
-                break
+                scan_error_msg = f"Scanner error on page {page_num + 1}: {exc}"
+                raise ScanError(scan_error_msg) from exc
 
             page_num += 1
 
