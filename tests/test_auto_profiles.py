@@ -18,7 +18,12 @@ from saneless.auto_profiles import (
     source_to_slug,
     write_profiles_to_config,
 )
-from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
+from saneless.config import (
+    DEFAULT_RESOLUTION,
+    ProfileConfig,
+    Settings,
+    load_settings,
+)
 from saneless.scanner.base import DeviceCapabilities
 
 if TYPE_CHECKING:
@@ -691,6 +696,76 @@ auto_generated = false
         config_file.write_text(self._EXISTING)
         written = write_profiles_to_config(config_file, self._generated())
         assert set(written) == {"adf", "flatbed"}
+
+
+class TestDefaultProfileSurvivesThePrune:
+    """
+    The prune must never remove ``default``, because Settings requires it.
+
+    ``write_profiles_to_config`` stamps ``auto_generated = true`` on every
+    profile it writes, ``default`` included, so a ``default`` that a previous
+    ``auto-profiles`` run produced is indistinguishable from any other orphan
+    the moment the user points saneless at a scanner with no flatbed. Pruning
+    it leaves a config that fails ``Settings`` validation, and ``cli()`` loads
+    settings before dispatch, so not even ``auto-profiles`` can regenerate it.
+    """
+
+    # Exactly what a previous auto-profiles run against a flatbed+ADF scanner
+    # leaves behind: every profile carries the flag the writer always stamps.
+    _PREVIOUS_RUN = """\
+[profiles.default]
+source = "Flatbed"
+resolution = 300
+mode = "Color"
+auto_generated = true
+
+[profiles.flatbed]
+source = "Flatbed"
+resolution = 300
+mode = "Color"
+auto_generated = true
+"""
+
+    def _feeder_only(self) -> dict[str, ProfileConfig]:
+        """Build a generated set from a sheet-fed scanner, naming no flatbed."""
+        return {
+            "adf-duplex": ProfileConfig(
+                source="ADF Duplex",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+            ),
+        }
+
+    def _rerun(self, tmp_path: Path) -> Path:
+        """Re-run the writer against a feeder-only device and return the path."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(self._PREVIOUS_RUN)
+        write_profiles_to_config(config_file, self._feeder_only())
+        return config_file
+
+    def test_an_auto_generated_default_survives(self, tmp_path: Path) -> None:
+        """``default`` stays even though the new set does not name it."""
+        parsed = tomllib.loads(self._rerun(tmp_path).read_text())
+        assert "default" in parsed["profiles"]
+
+    def test_other_orphans_are_still_pruned(self, tmp_path: Path) -> None:
+        """The guard is one name wide, not a disabling of the prune."""
+        parsed = tomllib.loads(self._rerun(tmp_path).read_text())
+        assert "flatbed" not in parsed["profiles"]
+        assert "adf-duplex" in parsed["profiles"]
+
+    def test_the_written_config_still_loads(self, tmp_path: Path) -> None:
+        """
+        The file the writer leaves behind round-trips through load_settings.
+
+        This is the assertion that matters: "default is present" is a proxy,
+        while loading the config is the thing the user actually needs to work
+        after running auto-profiles.
+        """
+        settings = load_settings(str(self._rerun(tmp_path)))
+        assert "default" in settings.profiles
+        assert "adf-duplex" in settings.profiles
 
 
 class TestTomlWriting:

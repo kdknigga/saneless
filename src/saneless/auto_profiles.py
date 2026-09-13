@@ -378,6 +378,19 @@ def _is_auto_generated(table: object) -> bool:
     return bool(table.get("auto_generated", False))
 
 
+# Profile names the orphan prune must never remove, however they are flagged.
+#
+# ``default`` is required by ``Settings.validate_default_profile``, so pruning
+# it leaves behind a config saneless itself refuses to load. There is no way
+# back from that inside the tool: ``cli()`` loads settings before dispatching to
+# any subcommand, so not even ``auto-profiles`` could regenerate the key it just
+# deleted, and the user has to hand-edit TOML. A previous run stamps every
+# profile it writes with ``auto_generated = true``, ``default`` included, so
+# without this guard a single run against a scanner with no flatbed -- an
+# ordinary sheet-fed document scanner -- destroys a working installation.
+_UNPRUNABLE = frozenset({"default"})
+
+
 def write_profiles_to_config(
     config_path: Path,
     profiles: dict[str, ProfileConfig],
@@ -398,6 +411,10 @@ def write_profiles_to_config(
     to say about it. A profile without a truthy ``auto_generated`` flag is
     never touched -- CFG-07's literal wording, which keeps this from
     pre-empting the general merge semantics owned by a later phase.
+
+    ``default`` is never pruned either, whatever it is flagged with: it is not
+    an ordinary profile but a schema requirement (``_UNPRUNABLE``), and a
+    config missing it is one saneless refuses to load.
 
     Args:
         config_path: Path to the TOML config file.
@@ -422,7 +439,9 @@ def write_profiles_to_config(
     orphans = [
         name
         for name, table in profiles_section.items()
-        if name not in profiles and _is_auto_generated(table)
+        if name not in profiles
+        and name not in _UNPRUNABLE
+        and _is_auto_generated(table)
     ]
     for name in orphans:
         logger.info(
