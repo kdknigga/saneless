@@ -8,6 +8,7 @@ generation logic uses pure functions for easy testing.
 
 from __future__ import annotations
 
+import logging
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import tomlkit
 
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
+from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
     from saneless.scanner.base import DeviceCapabilities
@@ -28,6 +30,8 @@ __all__ = [
     "source_to_slug",
     "write_profiles_to_config",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 # The slug for a name of which _slugify's character set keeps nothing -- a
@@ -164,6 +168,50 @@ def is_bare_default(settings: Settings) -> bool:
     )
 
 
+def _claim_slug(source: str, claimed: dict[str, str]) -> str:
+    """
+    Resolve a source's slug against the slugs already claimed.
+
+    Slugging is not injective -- "ADF-Front" and "ADF Front" are different
+    source names that normalise to the same slug -- so the assignment needs a
+    tie-break. The first source to claim a slug keeps it bare; each later
+    collider gains a "-2", "-3", ... suffix. "Last wins" is rejected: it
+    silently drops a source the device reported, which is N-09's actual
+    complaint.
+
+    The walk follows ``capabilities.sources`` order, so the result is
+    deterministic given the device's own stable ordering of its sources.
+
+    Args:
+        source: The SANE source name claiming a slug.
+        claimed: Slugs already taken, mapped to the source that took each.
+            Mutated to record the returned slug.
+
+    Returns:
+        The slug this source may use.
+
+    """
+    slug = source_to_slug(source)
+    candidate = slug
+    suffix = 1
+    while candidate in claimed:
+        suffix += 1
+        candidate = f"{slug}-{suffix}"
+
+    if candidate != slug:
+        logger.warning(
+            "Scanner sources %r and %r both normalise to the profile slug %r; "
+            "naming the second %r so neither source is lost.",
+            claimed[slug],
+            source,
+            slug,
+            candidate,
+        )
+
+    claimed[candidate] = source
+    return candidate
+
+
 def generate_profiles(
     capabilities: DeviceCapabilities,
 ) -> dict[str, ProfileConfig]:
@@ -173,6 +221,14 @@ def generate_profiles(
     Creates one profile per scanner source, plus a "default" profile
     mapped to the flatbed source if available. All generated profiles
     have auto_generated=True.
+
+    Every question this function asks about a source name is answered by
+    ``classify_source`` (D-02, Q9). It previously carried three rules of its
+    own -- an equality test for "auto" and two ``"flatbed" in s.lower()``
+    substring tests -- which disagreed with the classifier at the edges: stray
+    whitespace defeated the equality test, and the substring test called
+    "Flatbed Duplex" a flatbed, making a duplex feeder back the default
+    profile.
 
     Args:
         capabilities: Scanner device capabilities with sources,
@@ -187,13 +243,16 @@ def generate_profiles(
         capabilities.resolutions, target=DEFAULT_RESOLUTION
     )
     mode = pick_preferred_mode(capabilities.modes, preferred="Color")
+    has_flatbed = any(
+        classify_source(s) is SourceKind.FLATBED for s in capabilities.sources
+    )
+    claimed: dict[str, str] = {}
 
     for source in capabilities.sources:
-        slug = source_to_slug(source)
+        slug = _claim_slug(source, claimed)
         auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
-        if source.lower() == "auto":
-            has_flatbed = any("flatbed" in s.lower() for s in capabilities.sources)
-            auto_source_mode = "adf" if not has_flatbed else "flatbed"
+        if classify_source(source) is SourceKind.AUTO and not has_flatbed:
+            auto_source_mode = "adf"
         profiles[slug] = ProfileConfig(
             source=source,
             resolution=resolution,
@@ -203,7 +262,9 @@ def generate_profiles(
         )
 
     # Set default to flatbed if available
-    flatbed_sources = [s for s in capabilities.sources if "flatbed" in s.lower()]
+    flatbed_sources = [
+        s for s in capabilities.sources if classify_source(s) is SourceKind.FLATBED
+    ]
     if flatbed_sources:
         profiles["default"] = ProfileConfig(
             source=flatbed_sources[0],
