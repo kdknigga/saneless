@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Literal, cast
 import tomlkit
 
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
+from saneless.exceptions import ConfigError
 from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
@@ -484,7 +485,17 @@ def write_profiles_to_config(
     if "profiles" not in doc:
         doc.add("profiles", tomlkit.table(is_super_table=True))
 
-    profiles_section = cast("dict[str, object]", doc["profiles"])
+    # ``cast`` is a promise to the type checker, not a check. A config whose
+    # ``profiles`` key is a scalar -- ``profiles = "oops"`` -- reaches
+    # ``.items()`` on a tomlkit String, and the user gets a raw AttributeError
+    # traceback out of ``auto-profiles`` instead of a configuration error.
+    # ``_is_auto_generated`` already guards exactly this risk one level down,
+    # for each entry; the container itself was not given the same treatment.
+    section = doc["profiles"]
+    if not isinstance(section, Mapping):
+        msg = f"[profiles] in {config_path} is not a table; refusing to overwrite it"
+        raise ConfigError(msg)
+    profiles_section = cast("dict[str, object]", section)
 
     orphans = [
         name
