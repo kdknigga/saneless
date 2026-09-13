@@ -265,15 +265,47 @@ def _claim_slug(source: str, claimed: dict[str, str]) -> str:
     return candidate
 
 
+def _auto_source_mode(source: str, *, has_flatbed: bool) -> Literal["flatbed", "adf"]:
+    """
+    Decide how an ``Auto`` source should be routed on this device.
+
+    A source that is not ``Auto`` routes on its own name and never consults
+    this. An ``Auto`` source says nothing about what is loaded, so the only
+    evidence available is whether the device has a platen at all: one that does
+    not is a sheet-fed machine, where treating ``Auto`` as single-page returns
+    one page from a whole stack.
+
+    Args:
+        source: The SANE source name the profile will carry.
+        has_flatbed: Whether the device reports any flatbed source. Keyword-only,
+            because a positional boolean is not allowed by this project's lint
+            rules.
+
+    Returns:
+        The ``auto_source_mode`` the profile should carry.
+
+    """
+    if classify_source(source) is SourceKind.AUTO and not has_flatbed:
+        return "adf"
+    return "flatbed"
+
+
 def generate_profiles(
     capabilities: DeviceCapabilities,
 ) -> dict[str, ProfileConfig]:
     """
     Generate scan profiles from scanner capabilities.
 
-    Creates one profile per scanner source, plus a "default" profile
-    mapped to the flatbed source if available. All generated profiles
-    have auto_generated=True.
+    Creates one profile per scanner source, plus a "default" profile. All
+    generated profiles have auto_generated=True.
+
+    The "default" profile is emitted whenever the device reports any source at
+    all, and that is not a preference: ``Settings.validate_default_profile``
+    makes the key mandatory, so a generated set without it is written to disk
+    and then refused by saneless on the next load, with ``auto-profiles``
+    reporting success and exiting 0 over an unusable installation. A flatbed
+    backs it when the device has one; on a sheet-fed scanner the device's own
+    first reported source does, which is the only honest candidate available.
 
     Every question this function asks about a source name is answered by
     ``classify_source`` (D-02, Q9). It previously carried three rules of its
@@ -305,27 +337,34 @@ def generate_profiles(
 
     for source in capabilities.sources:
         slug = _claim_slug(source, claimed)
-        auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
-        if classify_source(source) is SourceKind.AUTO and not has_flatbed:
-            auto_source_mode = "adf"
         profiles[slug] = ProfileConfig(
             source=source,
             resolution=resolution,
             mode=mode,
             auto_generated=True,
-            auto_source_mode=auto_source_mode,
+            auto_source_mode=_auto_source_mode(source, has_flatbed=has_flatbed),
         )
 
-    # Set default to flatbed if available
+    # A flatbed backs the default when the device has one; otherwise its first
+    # reported source does. The fallback is what keeps a sheet-fed scanner from
+    # producing a config that Settings refuses to load (see the docstring).
     flatbed_sources = [
         s for s in capabilities.sources if classify_source(s) is SourceKind.FLATBED
     ]
-    if flatbed_sources:
+    default_source = next(iter(flatbed_sources), None) or next(
+        iter(capabilities.sources), None
+    )
+    if default_source is not None:
         profiles["default"] = ProfileConfig(
-            source=flatbed_sources[0],
+            source=default_source,
             resolution=resolution,
             mode=mode,
             auto_generated=True,
+            # Mirrors the loop rather than defaulting to "flatbed": a default
+            # backed by an Auto source on a platen-less device would otherwise
+            # route a whole stack as a single page, disagreeing with the very
+            # profile it was copied from.
+            auto_source_mode=_auto_source_mode(default_source, has_flatbed=has_flatbed),
         )
 
     return profiles
