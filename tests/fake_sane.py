@@ -12,10 +12,10 @@ docstring.
 The five behaviours a double gets wrong, and which this one gets right:
 
 1. Assigning an **unknown** option name stores it silently in ``__dict__``.
-   There is no device call, no validation and no raise.  ``_NoGeometryDevice``
-   raises here, which is the exact inverse, and it is why ``_set_geometry``
-   could always return True while the crop fallback it guarded was
-   unreachable.
+   There is no device call, no validation and no raise.  The geometry-less
+   double this replaced *raised* here, the exact inverse, and that is why
+   ``_set_geometry`` could always return True while the crop fallback it
+   guarded was unreachable.  That double is deleted (D-09).
 2. Assigning a **bad value** to a known option raises the local error type
    (the real ``_sane.error: Invalid argument``) -- but only for a *list*
    constraint.  A *range* constraint clamps silently and reports success.
@@ -265,10 +265,11 @@ def build_option_table(
     arguments (``PLR0913``), and this project forbids suppressing the rule.
 
     ``omit`` exists for D-09.  A device whose option list simply does not
-    mention the geometry options is the case ``_NoGeometryDevice`` claimed to
-    model and got backwards: the real library *stores* ``dev.br_y`` on such a
-    device rather than raising, so an omitted option table is the only way to
-    reproduce the condition that makes the crop fallback reachable.
+    mention the geometry options is the case the old geometry-less double
+    claimed to model and got backwards: the real library *stores* ``dev.br_y``
+    on such a device rather than raising, so an omitted option table is the
+    only way to reproduce the condition that makes the crop fallback
+    reachable.
 
     Args:
         geometry_range: The ``(min, max, step)`` constraint shared by the four
