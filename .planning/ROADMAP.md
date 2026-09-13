@@ -237,7 +237,7 @@ Plans:
 
 **Wave 4** *(blocked on 24-04)*
 
-- [ ] 24-05-PLAN.md — `scan_pages` split, options set source-first, resolution read back, `SaneDevice.resolution` typed `float`, Auto override via `classify_source`, D-01 recorded as settled (D-11, D-01)
+- [x] 24-05-PLAN.md — `scan_pages` split, options set source-first, resolution read back, `SaneDevice.resolution` typed `float`, Auto override via `classify_source`, D-01 recorded as settled (D-11, D-01)
 
 **Wave 5** *(blocked on 24-05)*
 
@@ -398,7 +398,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
-| 24. Scanner Truthfulness | 4/8 | In Progress|  |
+| 24. Scanner Truthfulness | 5/8 | In Progress|  |
 | 25. Manual Duplex | 0/? | Not started | - |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
