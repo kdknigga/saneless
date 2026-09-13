@@ -36,10 +36,11 @@ def _make_content_image(
     width: int = 200, height: int = 300, color: str = "red"
 ) -> Image.Image:
     """
-    Create a test image with mixed content that passes validation.
+    Create a test image with mixed content, comfortably above _MIN_PAGE_BYTES.
 
-    Uses drawing operations to ensure non-trivial pixel variance,
-    passing the scanner-level pure white/black checks.
+    Uses drawing operations to give the image non-trivial pixel variance, so a
+    test can tell a real page apart from a uniformly blank one.  The backend no
+    longer judges content, so variance is no longer required to survive a scan.
     """
     img = Image.new("RGB", (width, height), color)
     draw = ImageDraw.Draw(img)
@@ -917,8 +918,18 @@ class TestSaneBackendPageValidation:
         pages = list(backend.scan_pages("test:device:001", settings))
         assert len(pages) == 1
 
-    def test_pure_white_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
-        """Pure white image (255,255,255) is skipped at scanner level."""
+    def test_pure_white_page_survives(self, mock_sane_module: MockSaneModule) -> None:
+        """
+        A uniformly white page reaches the caller instead of being discarded.
+
+        python-sane expands 1-bit lineart to 0 and 255 bytes, so a clean blank
+        page is exactly mean 255.0 / stddev 0.0 -- which is precisely what the
+        deleted scanner-level check keyed on.  Those statistics are still how a
+        blank page is recognised; what changed is *where*.  The decision now
+        belongs to ``pipeline._drop_empty_pages``, under the profile's
+        ``enable_empty_page_detection`` toggle, where the user can see it and
+        turn it off (M-14, D-05).
+        """
         mock_dev = mock_sane_module._mock_dev
         white_img = Image.new("RGB", (200, 300), (255, 255, 255))
         normal_img = _make_content_image()
@@ -927,10 +938,19 @@ class TestSaneBackendPageValidation:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         pages = list(backend.scan_pages("test:device:001", settings))
-        assert len(pages) == 1
+        assert len(pages) == 2
+        # The blank itself survived, rather than the content page arriving twice.
+        assert pages[0].convert("L").getextrema() == (255, 255)
 
-    def test_pure_black_page_skipped(self, mock_sane_module: MockSaneModule) -> None:
-        """Pure black image (0,0,0) is skipped at scanner level."""
+    def test_pure_black_page_survives(self, mock_sane_module: MockSaneModule) -> None:
+        """
+        A uniformly black page reaches the caller instead of being discarded.
+
+        This is the defect the real SANE ``test`` backend exposed end to end:
+        its default picture is solid black, so every page of a ten-sheet stack
+        was destroyed by the backend before the pipeline ever saw it.  Judging
+        content is not the scanner layer's job (M-14, D-05).
+        """
         mock_dev = mock_sane_module._mock_dev
         black_img = Image.new("RGB", (200, 300), (0, 0, 0))
         normal_img = _make_content_image()
@@ -939,7 +959,8 @@ class TestSaneBackendPageValidation:
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="color")
         pages = list(backend.scan_pages("test:device:001", settings))
-        assert len(pages) == 1
+        assert len(pages) == 2
+        assert pages[0].convert("L").getextrema() == (0, 0)
 
     def test_normal_content_page_passes(self, mock_sane_module: MockSaneModule) -> None:
         """Image with mixed content passes all validation checks."""
