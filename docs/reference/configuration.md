@@ -124,7 +124,7 @@ mode = "Color"
 default_tags = [1]
 title = "Letter"
 
-[profiles.auto-scan]
+[profiles.auto]
 source = "Auto"
 auto_source_mode = "adf"
 resolution = 300

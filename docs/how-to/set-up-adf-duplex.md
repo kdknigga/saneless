@@ -9,6 +9,8 @@ Scan both sides of multi-page documents using your scanner's Automatic Document 
 
 ## The three ADF modes
 
+The profile names below are hand-written, but they match what `saneless auto-profiles` generates, because every profile is named after the scanner's own source name -- a device reporting `ADF` gets a profile called `adf`.
+
 ### ADF Simplex
 
 Scans one side of each page. Load a stack face-up and saneless feeds each page through the ADF, scanning the front only.

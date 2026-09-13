@@ -911,7 +911,7 @@ class TestLazyAutoGenerate:
 
             # Profiles should now include generated ones
             assert len(default_settings.profiles) > 1
-            assert "flatbed-scan" in default_settings.profiles
+            assert "flatbed" in default_settings.profiles
         finally:
             store.close()
 

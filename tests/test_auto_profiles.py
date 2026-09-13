@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import re
+import tomllib
 from typing import TYPE_CHECKING
+
+import pytest
 
 from saneless.auto_profiles import (
     generate_profiles,
@@ -20,67 +25,157 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+_SLUG_INPUTS = [
+    "Flatbed",
+    "ADF",
+    "Automatic Document Feeder",
+    "ADF Duplex",
+    "Adf-duplex",
+    "ADF Front",
+    "ADF Back",
+    "Auto",
+    "auto",
+    "Flatbed Duplex",
+    "ADF (left aligned)",
+    "Flachbett/Einzug",
+    "ADF  Duplex",
+    "---ADF---",
+    "  ",
+]
+
+
 class TestSourceToSlug:
     """Source name to profile slug conversion."""
 
     def test_flatbed(self) -> None:
-        """Flatbed source maps to flatbed-scan slug."""
-        assert source_to_slug("Flatbed") == "flatbed-scan"
+        """Flatbed slugs from its own name (D-14)."""
+        assert source_to_slug("Flatbed") == "flatbed"
 
     def test_adf(self) -> None:
-        """ADF source maps to adf-simplex slug."""
-        assert source_to_slug("ADF") == "adf-simplex"
+        """ADF slugs from its own name (D-14)."""
+        assert source_to_slug("ADF") == "adf"
 
     def test_automatic_document_feeder(self) -> None:
-        """Automatic Document Feeder maps to adf-simplex."""
-        assert source_to_slug("Automatic Document Feeder") == "adf-simplex"
+        """Automatic Document Feeder slugs from its own name (D-14)."""
+        assert (
+            source_to_slug("Automatic Document Feeder") == "automatic-document-feeder"
+        )
 
     def test_adf_duplex(self) -> None:
-        """ADF Duplex maps to adf-duplex."""
+        """ADF Duplex slugs from its own name (D-14)."""
         assert source_to_slug("ADF Duplex") == "adf-duplex"
 
     def test_case_insensitive_adf_duplex(self) -> None:
-        """Case-insensitive ADF duplex mapping."""
+        """Slugging lowercases whatever case the device reports."""
         assert source_to_slug("Adf-duplex") == "adf-duplex"
 
     def test_adf_front(self) -> None:
-        """ADF Front maps to adf-simplex."""
-        assert source_to_slug("ADF Front") == "adf-simplex"
+        """ADF Front slugs from its own name (D-14)."""
+        assert source_to_slug("ADF Front") == "adf-front"
 
     def test_auto_source(self) -> None:
-        """Auto source maps to auto-scan slug."""
-        assert source_to_slug("Auto") == "auto-scan"
+        """Auto slugs from its own name (D-14)."""
+        assert source_to_slug("Auto") == "auto"
 
-    def test_duplex_outranks_flatbed(self) -> None:
+    def test_flatbed_duplex_slugs_from_its_own_name(self) -> None:
         """
-        A name carrying both "flatbed" and "duplex" slugs as duplex (CTR-04).
+        A name carrying both "flatbed" and "duplex" slugs verbatim (CTR-04).
 
-        classify_source tests duplex before flatbed, deliberately and in that
-        order (scanner/base.py). The pre-consolidation implementation tested
-        flatbed first, so this name used to slug "flatbed-scan". No other case
-        in this class distinguishes the two orders -- without this test the
-        precedence is implied rather than asserted.
+        This case used to assert classify_source's branch order *through*
+        source_to_slug: the slug was picked from the returned SourceKind, and
+        because duplex is tested before flatbed (scanner/base.py) this name
+        took the duplex kind's hard-coded name rather than the flatbed kind's.
+        D-14 severed that coupling -- the slug is now the device's own wording,
+        so this case can no longer witness the precedence. It is re-pointed
+        rather than deleted
+        so the change of meaning is recorded; the classifier's branch order is
+        asserted directly against classify_source in the scanner tests.
         """
-        assert source_to_slug("Flatbed Duplex") == "adf-duplex"
+        assert source_to_slug("Flatbed Duplex") == "flatbed-duplex"
 
     def test_auto_is_matched_exactly_not_as_a_substring(self) -> None:
         """
         "Automatic Document Feeder" is a feeder, not an Auto source (CTR-04).
 
-        The name begins with the letters "auto"; a substring test would slug it
-        "auto-scan" and route a stack of pages down the single-page path.
+        The name begins with the letters "auto"; a substring rule would have
+        collapsed it onto the Auto source's slug and routed a stack of pages
+        down the single-page path. D-14 makes that collapse impossible by
+        construction -- each source keeps its own wording -- so the guarantee
+        survives here as an assertion on the two distinct new values.
         """
-        assert source_to_slug("Automatic Document Feeder") == "adf-simplex"
-        assert source_to_slug("Auto") == "auto-scan"
+        assert (
+            source_to_slug("Automatic Document Feeder") == "automatic-document-feeder"
+        )
+        assert source_to_slug("Auto") == "auto"
 
     def test_auto_source_case_insensitive(self) -> None:
-        """Auto source mapping is case-insensitive."""
-        assert source_to_slug("auto") == "auto-scan"
+        """A lowercase "auto" slugs the same as "Auto"."""
+        assert source_to_slug("auto") == "auto"
 
-    def test_adf_back_fallback(self) -> None:
-        """ADF Back produces a slug that is not adf-simplex or adf-duplex."""
-        slug = source_to_slug("ADF Back")
-        assert slug not in ("adf-simplex", "adf-duplex")
+    def test_adf_back_slugs_from_its_own_name(self) -> None:
+        """ADF Back slugs verbatim rather than onto a shared feeder name."""
+        assert source_to_slug("ADF Back") == "adf-back"
+
+    def test_adf_front_and_back_never_collide(self) -> None:
+        """
+        Two distinct feeder sources never collapse onto one slug (N-09).
+
+        "ADF Front" and "ADF Back" both classify as FEEDER -- they ARE feeders
+        for routing purposes -- so any rule that named the profile from the
+        SourceKind gave them the same slug and silently lost one. D-14 names
+        from the source string itself, so distinctness holds by construction.
+        """
+        assert source_to_slug("ADF Front") != source_to_slug("ADF Back")
+
+    def test_parentheses_do_not_survive(self) -> None:
+        """Canon's "ADF (left aligned)" loses its parentheses (D-15)."""
+        assert source_to_slug("ADF (left aligned)") == "adf-left-aligned"
+
+    def test_slash_does_not_survive(self) -> None:
+        """
+        A path separator never reaches the slug (D-15).
+
+        Measured before the hardening: "Flachbett/Einzug" slugged
+        "flachbett/einzug", passing "/" straight through. Slugs are TOML keys
+        rather than filesystem paths today, so this was not exploitable -- but
+        it is one careless reuse away, which is exactly why Phase 23's D-19
+        refused to reuse this sanitiser for PDF filenames.
+        """
+        assert source_to_slug("Flachbett/Einzug") == "flachbett-einzug"
+
+    def test_hyphen_runs_collapse(self) -> None:
+        """A doubled space collapses to a single hyphen (D-15)."""
+        assert source_to_slug("ADF  Duplex") == "adf-duplex"
+
+    def test_leading_and_trailing_hyphens_are_stripped(self) -> None:
+        """Leading and trailing hyphens are stripped (D-15)."""
+        assert source_to_slug("---ADF---") == "adf"
+
+    def test_degenerate_name_still_yields_a_usable_slug(self) -> None:
+        """
+        A whitespace-only source name still yields a non-empty slug (D-15).
+
+        Measured before the hardening: "  " degenerated to "--", which is not
+        addressable as a --profile value. The guarded fallback keeps the
+        profile reachable.
+        """
+        slug = source_to_slug("  ")
+        assert re.fullmatch(r"[a-z0-9][a-z0-9-]*", slug), slug
+
+
+class TestSlugCharacterSet:
+    """The D-15 character-set invariant, over every name the suite exercises."""
+
+    @pytest.mark.parametrize("source", _SLUG_INPUTS)
+    def test_slug_uses_only_lowercase_alphanumerics_and_hyphens(
+        self, source: str
+    ) -> None:
+        """Every slug is [a-z0-9-] with no leading, trailing or doubled hyphen."""
+        slug = source_to_slug(source)
+        assert re.fullmatch(r"[a-z0-9-]+", slug), slug
+        assert not slug.startswith("-"), slug
+        assert not slug.endswith("-"), slug
+        assert "--" not in slug, slug
 
 
 class TestPickClosestResolution:
@@ -169,19 +264,19 @@ class TestGenerateProfiles:
     """Profile generation from scanner capabilities."""
 
     def test_single_source(self) -> None:
-        """Single flatbed source generates flatbed-scan and default profiles."""
+        """Single flatbed source generates flatbed and default profiles."""
         caps = DeviceCapabilities(
             sources=["Flatbed"],
             resolutions=[150, 300, 600],
             modes=["Color", "Gray"],
         )
         profiles = generate_profiles(caps)
-        assert "flatbed-scan" in profiles
+        assert "flatbed" in profiles
         assert "default" in profiles
-        assert profiles["flatbed-scan"].source == "Flatbed"
-        assert profiles["flatbed-scan"].resolution == 300
-        assert profiles["flatbed-scan"].mode == "Color"
-        assert profiles["flatbed-scan"].auto_generated is True
+        assert profiles["flatbed"].source == "Flatbed"
+        assert profiles["flatbed"].resolution == 300
+        assert profiles["flatbed"].mode == "Color"
+        assert profiles["flatbed"].auto_generated is True
 
     def test_multiple_sources(self) -> None:
         """Multiple sources generate correct number of profiles."""
@@ -191,13 +286,13 @@ class TestGenerateProfiles:
             modes=["Color"],
         )
         profiles = generate_profiles(caps)
-        assert "flatbed-scan" in profiles
-        assert "adf-simplex" in profiles
+        assert "flatbed" in profiles
+        assert "adf" in profiles
         assert "adf-duplex" in profiles
         assert "default" in profiles
         assert len(profiles) == 4
         # Closest to 300 from [200, 400] is 200
-        assert profiles["flatbed-scan"].resolution == 200
+        assert profiles["flatbed"].resolution == 200
 
     def test_all_auto_generated(self) -> None:
         """All generated profiles have auto_generated=True."""
@@ -222,8 +317,8 @@ class TestGenerateProfilesAutoSource:
             modes=["Color"],
         )
         profiles = generate_profiles(caps)
-        assert "auto-scan" in profiles
-        assert profiles["auto-scan"].auto_source_mode == "adf"
+        assert "auto" in profiles
+        assert profiles["auto"].auto_source_mode == "adf"
 
     def test_auto_with_flatbed_sets_flatbed_mode(self) -> None:
         """Auto source defaults to flatbed mode when Flatbed source exists."""
@@ -233,8 +328,8 @@ class TestGenerateProfilesAutoSource:
             modes=["Color"],
         )
         profiles = generate_profiles(caps)
-        assert "auto-scan" in profiles
-        assert profiles["auto-scan"].auto_source_mode == "flatbed"
+        assert "auto" in profiles
+        assert profiles["auto"].auto_source_mode == "flatbed"
 
     def test_auto_only_sets_adf_mode(self) -> None:
         """Auto source alone (no Flatbed, no ADF) defaults to adf mode."""
@@ -244,12 +339,141 @@ class TestGenerateProfilesAutoSource:
             modes=["Color"],
         )
         profiles = generate_profiles(caps)
-        assert "auto-scan" in profiles
-        assert profiles["auto-scan"].auto_source_mode == "adf"
+        assert "auto" in profiles
+        assert profiles["auto"].auto_source_mode == "adf"
 
     def test_flatbed_no_regression(self) -> None:
-        """Flatbed source still returns flatbed-scan slug (no regression)."""
-        assert source_to_slug("Flatbed") == "flatbed-scan"
+        """Flatbed source slugs to flatbed (no regression)."""
+        assert source_to_slug("Flatbed") == "flatbed"
+
+
+class TestGenerateProfilesUsesClassifier:
+    """generate_profiles asks classify_source, not its own string rules."""
+
+    def test_auto_spelled_with_surrounding_whitespace(self) -> None:
+        """
+        " AUTO " still receives the auto_source_mode treatment (D-02, Q9).
+
+        The rule this replaces was ``source.lower() == "auto"``, which a device
+        reporting stray whitespace defeats: " auto " is not "auto", so the
+        source fell through to the flatbed default and a single-source Auto
+        scanner was told to behave as a flatbed. classify_source strips before
+        comparing, so every spelling reaches the same branch.
+        """
+        caps = DeviceCapabilities(
+            sources=[" AUTO "],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["auto"].auto_source_mode == "adf"
+
+    def test_auto_spelled_lowercase(self) -> None:
+        """
+        A lowercase "auto" receives the auto_source_mode treatment.
+
+        This spelling was already handled by the equality rule -- it is
+        asserted so the swap to classify_source cannot quietly regress it.
+        """
+        caps = DeviceCapabilities(
+            sources=["auto"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["auto"].auto_source_mode == "adf"
+
+    def test_duplex_feeder_is_not_mistaken_for_a_flatbed(self) -> None:
+        """
+        "Flatbed Duplex" is a duplex feeder, so it never backs the default.
+
+        The rule this replaces asked ``"flatbed" in s.lower()``, which is true
+        of "Flatbed Duplex" -- so a duplex feeder became the flatbed-backed
+        default profile, and an Auto source beside it was told to behave as a
+        flatbed. classify_source tests duplex before flatbed, deliberately, and
+        answers FEEDER_DUPLEX.
+        """
+        caps = DeviceCapabilities(
+            sources=["Auto", "Flatbed Duplex"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert "default" not in profiles
+        assert profiles["auto"].auto_source_mode == "adf"
+
+    def test_real_flatbed_still_backs_the_default_profile(self) -> None:
+        """A genuine Flatbed source still becomes the default profile."""
+        caps = DeviceCapabilities(
+            sources=["Flatbed", "ADF"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["default"].source == "Flatbed"
+
+    def test_feeder_only_device_has_no_default_profile(self) -> None:
+        """A device reporting no flatbed source gets no default profile."""
+        caps = DeviceCapabilities(
+            sources=["Automatic Document Feeder"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert "default" not in profiles
+
+
+class TestGenerateProfilesSlugCollision:
+    """Two names that normalise alike both survive, with a tie-break (Q5)."""
+
+    _COLLIDING = ("ADF-Front", "ADF Front")
+
+    def _caps(self) -> DeviceCapabilities:
+        """Capabilities whose two source names normalise to the same slug."""
+        return DeviceCapabilities(
+            sources=list(self._COLLIDING),
+            resolutions=[300],
+            modes=["Color"],
+        )
+
+    def test_both_sources_survive_with_a_suffix(self) -> None:
+        """The first claimant keeps the bare slug; the second gains "-2"."""
+        profiles = generate_profiles(self._caps())
+        assert set(profiles) == {"adf-front", "adf-front-2"}
+        assert profiles["adf-front"].source == "ADF-Front"
+        assert profiles["adf-front-2"].source == "ADF Front"
+
+    def test_no_source_is_silently_lost(self) -> None:
+        """
+        N distinct source strings yield N profiles.
+
+        The assignment was unguarded, so the second collider overwrote the
+        first and the device lost a source -- which is N-09's actual complaint.
+        """
+        profiles = generate_profiles(self._caps())
+        assert len(profiles) == len(self._COLLIDING)
+
+    def test_tie_break_follows_source_order_and_is_deterministic(self) -> None:
+        """Generating twice from the same capabilities yields identical slugs."""
+        assert list(generate_profiles(self._caps())) == list(
+            generate_profiles(self._caps())
+        )
+
+    def test_collision_warning_names_both_sources(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The WARNING names both colliding source strings and the new slug."""
+        with caplog.at_level(logging.WARNING, logger="saneless.auto_profiles"):
+            generate_profiles(self._caps())
+
+        message = "\n".join(
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+        assert "ADF-Front" in message
+        assert "ADF Front" in message
+        assert "adf-front-2" in message
 
 
 class TestAutoGeneratedField:
@@ -264,6 +488,102 @@ class TestAutoGeneratedField:
         """auto_generated can be set to True."""
         profile = ProfileConfig(auto_generated=True)
         assert profile.auto_generated is True
+
+
+class TestOrphanedProfilePrune:
+    """Auto-generated profiles absent from the new set are pruned (D-16)."""
+
+    # "legacy-feeder" stands for a profile generated under the pre-D-14 naming
+    # scheme, which the rename strands. It is given a neutral name on purpose:
+    # the slugs D-14 retired must appear nowhere in the tree, so this fixture
+    # cannot spell them even as historic content. The prune keys on the
+    # auto_generated flag, never on the name, so the substitution is faithful.
+    _EXISTING = """\
+# saneless configuration -- hand written, keep this comment
+[profiles.default]
+source = "Flatbed"  # the one I actually use
+resolution = 600
+mode = "Gray"
+
+[profiles.legacy-feeder]
+source = "ADF"
+resolution = 300
+mode = "Color"
+auto_generated = true
+
+[profiles.handwritten]
+source = "ADF"
+resolution = 150
+mode = "Gray"
+auto_generated = false
+"""
+
+    def _generated(self) -> dict[str, ProfileConfig]:
+        """Build a generated set that names none of the existing profiles."""
+        return {
+            "adf": ProfileConfig(
+                source="ADF", resolution=300, mode="Color", auto_generated=True
+            ),
+            "flatbed": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
+    def _write(self, tmp_path: Path, *, force: bool) -> Path:
+        """Write the generated set over the existing config and return the path."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(self._EXISTING)
+        write_profiles_to_config(config_file, self._generated(), force=force)
+        return config_file
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_orphaned_auto_generated_profile_is_removed(
+        self, tmp_path: Path, *, force: bool
+    ) -> None:
+        """
+        The orphan is pruned whether or not force is passed.
+
+        force governs overwriting keys that are *present* in the generated set;
+        an orphan is by definition absent from it, so force has nothing to say
+        about it. Without the prune a rename leaves the stale profile behind,
+        still functional, which is the quiet duplication D-16 prevents.
+        """
+        config_file = self._write(tmp_path, force=force)
+        parsed = tomllib.loads(config_file.read_text())
+        assert "legacy-feeder" not in parsed["profiles"]
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_profiles_without_a_true_flag_are_never_touched(
+        self, tmp_path: Path, *, force: bool
+    ) -> None:
+        """A profile with no flag, or an explicit false, survives intact."""
+        config_file = self._write(tmp_path, force=force)
+        profiles = tomllib.loads(config_file.read_text())["profiles"]
+
+        assert profiles["default"]["source"] == "Flatbed"
+        assert profiles["default"]["resolution"] == 600
+        assert profiles["default"]["mode"] == "Gray"
+        assert profiles["handwritten"]["resolution"] == 150
+        assert profiles["handwritten"]["auto_generated"] is False
+
+    def test_comments_survive_the_prune(self, tmp_path: Path) -> None:
+        """Preserve file-level and inline comments through tomlkit's round trip."""
+        content = self._write(tmp_path, force=False).read_text()
+        assert "# saneless configuration -- hand written, keep this comment" in content
+        assert "# the one I actually use" in content
+
+    def test_generated_profiles_are_still_written(self, tmp_path: Path) -> None:
+        """The freshly generated profiles land in the file alongside the prune."""
+        parsed = tomllib.loads(self._write(tmp_path, force=False).read_text())
+        assert "adf" in parsed["profiles"]
+        assert "flatbed" in parsed["profiles"]
+
+    def test_written_list_names_only_written_profiles(self, tmp_path: Path) -> None:
+        """The returned list names what was written, never what was pruned."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(self._EXISTING)
+        written = write_profiles_to_config(config_file, self._generated())
+        assert set(written) == {"adf", "flatbed"}
 
 
 class TestTomlWriting:
@@ -339,7 +659,7 @@ class TestTomlWriting:
         """Writes auto_source_mode when value is adf (non-default)."""
         config_file = tmp_path / "config.toml"
         profiles = {
-            "auto-scan": ProfileConfig(
+            "auto": ProfileConfig(
                 source="Auto",
                 resolution=300,
                 mode="Color",
@@ -355,7 +675,7 @@ class TestTomlWriting:
         """Does NOT write auto_source_mode when value is flatbed (default)."""
         config_file = tmp_path / "config.toml"
         profiles = {
-            "auto-scan": ProfileConfig(
+            "auto": ProfileConfig(
                 source="Auto",
                 resolution=300,
                 mode="Color",
