@@ -381,6 +381,84 @@ def _acquire_pages(
         raise ScanError(all_rejected_msg)
 
 
+def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool]:
+    """
+    Decide which source name to use, and whether the device has the option.
+
+    The two return values answer genuinely different questions and both are
+    load-bearing.  ``has_source_option`` records the *presence* of a ``source``
+    option, independently of whether its constraint is a list: a device may
+    expose ``source`` with a constraint this code cannot read, and it must
+    still be assigned.  A helper returning only the parsed constraint would
+    collapse the two and silently stop setting the source on such a device.
+
+    Args:
+        raw_options: The device's option tuples, as ``get_options()`` returns
+            them.
+        requested: The source name the caller asked for.
+
+    Returns:
+        A ``(effective_source, has_source_option)`` pair.
+
+    Raises:
+        ScanError: If the device exposes a source list that contains neither
+            the requested name nor ``"Auto"`` to fall back to.
+
+    """
+    available_sources: list[str] = []
+    has_source_option = False
+
+    for opt in raw_options:
+        if len(opt) >= 9 and opt[1] == "source":
+            has_source_option = True
+            constraint = opt[8]
+            if isinstance(constraint, list):
+                available_sources = [str(s) for s in constraint]
+            break
+
+    effective_source = requested
+    if has_source_option and effective_source not in available_sources:
+        if "Auto" in available_sources:
+            logger.info(
+                "Source '%s' not available, falling back to 'Auto'",
+                effective_source,
+            )
+            effective_source = "Auto"
+        else:
+            msg = (
+                f"Device does not support source '{effective_source}'. "
+                f"Available: {available_sources}"
+            )
+            raise ScanError(msg)
+
+    return effective_source, has_source_option
+
+
+def _configure_device(
+    dev: SaneDevice,
+    settings: ScanSettings,
+    effective_source: str,
+    *,
+    has_source_option: bool,
+) -> None:
+    """
+    Assign the scan options to the open device.
+
+    Args:
+        dev: Open SANE device handle.
+        settings: The requested scan settings.
+        effective_source: The source name resolved by ``_resolve_source``.
+        has_source_option: Whether the device exposes a ``source`` option at
+            all.  Keyword-only, because a positional boolean is not allowed by
+            this project's lint rules.
+
+    """
+    dev.mode = settings.mode
+    dev.resolution = settings.resolution
+    if has_source_option:
+        dev.source = effective_source
+
+
 class SaneDevice(Protocol):
     """Protocol describing the SANE device handle interface."""
 
@@ -562,38 +640,17 @@ class SaneBackend(ScannerBackend):
         """
         with self._open_device(device_id) as dev:
             # Validate source option against device capabilities
-            raw_options = dev.get_options()
-            available_sources: list[str] = []
-            has_source_option = False
-
-            for opt in raw_options:
-                if len(opt) >= 9 and opt[1] == "source":
-                    has_source_option = True
-                    constraint = opt[8]
-                    if isinstance(constraint, list):
-                        available_sources = [str(s) for s in constraint]
-                    break
-
-            effective_source = settings.source
-            if has_source_option and effective_source not in available_sources:
-                if "Auto" in available_sources:
-                    logger.info(
-                        "Source '%s' not available, falling back to 'Auto'",
-                        effective_source,
-                    )
-                    effective_source = "Auto"
-                else:
-                    msg = (
-                        f"Device does not support source '{effective_source}'. "
-                        f"Available: {available_sources}"
-                    )
-                    raise ScanError(msg)
+            effective_source, has_source_option = _resolve_source(
+                dev.get_options(), settings.source
+            )
 
             # Set device options
-            dev.mode = settings.mode
-            dev.resolution = settings.resolution
-            if has_source_option:
-                dev.source = effective_source
+            _configure_device(
+                dev,
+                settings,
+                effective_source,
+                has_source_option=has_source_option,
+            )
 
             # Set scan area geometry for paper size constraint (D-01)
             geometry_set = _set_geometry(dev, settings.paper_size)
