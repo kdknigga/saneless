@@ -1157,6 +1157,123 @@ class TestAutoSourceRouting:
         mock_dev._snap_impl.assert_called_once()
 
 
+class TestAutoSourceRecognition:
+    """The Auto source is recognised by the classifier, not by == (Q8)."""
+
+    @staticmethod
+    def _options_reporting(source: str) -> list[tuple]:
+        """Return an option table whose source constraint offers ``source``."""
+        return [
+            (1, "source", "Source", "", 3, 0, 1, 5, ["Flatbed", "ADF", source]),
+            (2, "resolution", "Res", "", 1, 4, 1, 5, [300]),
+            (3, "mode", "Mode", "", 3, 0, 1, 5, ["color"]),
+        ]
+
+    @pytest.mark.parametrize("reported", ["Auto", "auto", "  AUTO  "])
+    def test_auto_is_recognised_whatever_its_spelling(
+        self,
+        sane_backend: SaneBackend,
+        mock_sane_module: MockSaneModule,
+        reported: str,
+    ) -> None:
+        """
+        A device spelling its Auto source differently still honours the routing.
+
+        ``effective_source == "Auto"`` was case- and whitespace-sensitive, so a
+        device reporting lowercase ``auto`` classified as AUTO, took the
+        single-page path and skipped the override entirely -- silently ignoring
+        ``auto_source_mode = "adf"`` and returning one page from a whole stack.
+        """
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting(reported)
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source=reported, resolution=300, mode="color", auto_source_mode="adf"
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert classify_source(reported) is SourceKind.AUTO
+        assert len(pages) == 3
+        mock_dev._snap_impl.assert_not_called()
+
+    @pytest.mark.parametrize("reported", ["Auto", "auto", "  AUTO  "])
+    def test_auto_still_honours_flatbed_routing(
+        self,
+        sane_backend: SaneBackend,
+        mock_sane_module: MockSaneModule,
+        reported: str,
+    ) -> None:
+        """The override is consulted, not merely coincidentally agreed with."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting(reported)
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source=reported, resolution=300, mode="color", auto_source_mode="flatbed"
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert len(pages) == 1
+        mock_dev._snap_impl.assert_called_once()
+
+    def test_a_long_feeder_name_never_takes_the_auto_override(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """It is a feeder by classification, so auto_source_mode is irrelevant."""
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting("Automatic Document Feeder")
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source="Automatic Document Feeder",
+            resolution=300,
+            mode="color",
+            auto_source_mode="flatbed",
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert classify_source("Automatic Document Feeder") is SourceKind.FEEDER
+        assert len(pages) == 3
+        mock_dev._snap_impl.assert_not_called()
+
+    def test_an_unrecognised_source_takes_the_single_page_path(
+        self, sane_backend: SaneBackend, mock_sane_module: MockSaneModule
+    ) -> None:
+        """
+        D-01, asserted so that reversing it flips a test rather than passing quietly.
+
+        UNKNOWN keeps today's single-page routing.  C-06's safer default --
+        treat anything that is not the flatbed entry as multi-page -- was
+        DECLINED, not deferred.  ``auto_source_mode`` is set to ``"adf"`` here
+        precisely to show an unrecognised name does not reach the Auto
+        override either.
+        """
+        mock_dev = mock_sane_module._mock_dev
+        mock_dev._options_impl = self._options_reporting("Mystery Tray")
+        mock_dev._snap_impl = MagicMock(
+            return_value=Image.new("RGB", (100, 100), "white")
+        )
+        settings = ScanSettings(
+            source="Mystery Tray",
+            resolution=300,
+            mode="color",
+            auto_source_mode="adf",
+        )
+
+        pages = list(sane_backend.scan_pages("test:device:001", settings))
+
+        assert classify_source("Mystery Tray") is SourceKind.UNKNOWN
+        assert len(pages) == 1
+        mock_dev._snap_impl.assert_called_once()
+
+
 class TestSaneBackendPerPageTimeout:
     """Per-page timeout tests."""
 
