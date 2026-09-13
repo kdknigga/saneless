@@ -2431,10 +2431,10 @@ class TestResolutionConstraintShapes:
 
     @pytest.mark.parametrize(
         "constraint",
-        [(1.0, 1200.0), (1.0, 1200.0, 1.0, 1.0), ("low", "high", "step")],
-        ids=["too-short", "too-long", "non-numeric"],
+        [(1.0, 1200.0), (1.0, 1200.0, 1.0, 1.0)],
+        ids=["too-short", "too-long"],
     )
-    def test_a_tuple_that_is_not_a_sane_range_is_not_guessed_at(
+    def test_a_tuple_of_the_wrong_arity_is_not_guessed_at(
         self, constraint: object, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
@@ -2449,6 +2449,29 @@ class TestResolutionConstraintShapes:
 
         assert caps.resolutions == []
         assert caps.resolution_range is None
+
+    def test_a_range_whose_members_are_not_numbers_is_not_guessed_at(self) -> None:
+        """
+        The same guard for non-numeric members, asserted where it protects.
+
+        This case is driven straight through ``_constraint`` rather than through
+        a device, and deliberately so: the shared fake coerces a range's members
+        with ``float()`` when it builds a device's starting values, so it cannot
+        hold this table at all.  That refusal is correct -- no real SANE backend
+        can report a range of strings -- and widening the fake to accept one
+        would make it model a library that does not exist, which is the very
+        drift D-17 exists to stop.  The guard is defensive hardening against a
+        malformed device, so the honest place to assert it is the function that
+        does the hardening.
+        """
+        found = sane_backend_mod._constraint(
+            [_option(2, "resolution", _FIXED_OPTION, ("low", "high", "step"))],
+            "resolution",
+        )
+
+        assert found.present is True
+        assert found.values is None
+        assert found.span is None
 
     def test_a_short_option_tuple_is_skipped_without_raising(self) -> None:
         """An option too short to carry a constraint is ignored, never fatal."""
