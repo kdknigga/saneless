@@ -65,6 +65,29 @@ _DEFAULT_PAGE_TIMEOUT_SECONDS: float = 120.0
 # resolution will be well above this. Catches corrupt/truncated pages.
 _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 
+# Upper bound on the number of pages one scan_pages() call will acquire.
+#
+# WHAT IT BOUNDS: python-sane's _SaneIterator.__next__ stops only on the exact
+# string "Document feeder out of documents". On hardware that is not a feeder,
+# start()/snap() keep succeeding, so the iterator re-scans the platen and the
+# loop never terminates on its own -- reproduced live against a Flatbed source.
+# The per-page timeout is no defence: a scan that succeeds satisfies it every
+# iteration. This cap is what stops that loop (Phase 21 security finding W-01).
+#
+# WHAT IT DOES NOT BOUND: memory. At A4 300 dpi colour a page is roughly 26 MB,
+# so 500 pages is roughly 13 GB, and pipeline.py materialises pages with list().
+# This cap must not be described as a memory bound, because it is not one.
+# Bounding memory is Phase 29's HARD-01/HARD-02.
+#
+# SCOPE: the cap is per scan_pages() call. Phase 25's two manual-duplex passes
+# each call scan_pages() separately, so this is a per-pass cap, not a per-job
+# one.
+#
+# The value matches the largest production ADF hoppers, so no real stack should
+# reach it. That is assumption A1 in 24-RESEARCH.md, recorded at LOW confidence
+# and cheap to revise precisely because the error names the cap.
+_MAX_ADF_PAGES: int = 500
+
 # Thresholds for pure white/black detection at the scanner level.
 # These are intentionally extreme (tighter than the configurable empty-page
 # thresholds in pages.py) to only catch obviously invalid images.
@@ -283,7 +306,8 @@ def _acquire_pages(
 
     Raises:
         FeederEmptyError: If the feeder produced no pages at all.
-        ScanError: If a page times out or the device reports a fault.
+        ScanError: If a page times out, the device reports a fault, or the
+            page count runs past ``_MAX_ADF_PAGES``.
 
     """
     iterator = dev.multi_scan()
@@ -307,6 +331,17 @@ def _acquire_pages(
                 raise ScanError(scan_error_msg) from exc
 
             page_num += 1
+
+            # The overrun is detected on the page *past* the cap, not on the
+            # cap itself: a legitimate maximal stack only learns it is finished
+            # when the next probe raises, so stopping at equality would reject
+            # a full hopper.
+            if page_num > _MAX_ADF_PAGES:
+                cap_msg = (
+                    f"ADF page cap exceeded: stopped after {page_num} pages "
+                    f"(limit {_MAX_ADF_PAGES})"
+                )
+                raise ScanError(cap_msg)
 
             # Validate: nonzero dimensions, min file size, not pure white/black
             if not _validate_page_image(page_image, page_num):

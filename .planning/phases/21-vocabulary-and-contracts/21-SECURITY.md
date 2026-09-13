@@ -39,7 +39,7 @@ Suite state at audit time: `uv run pytest -q` → **515 passed**.
 | 2 | 21-01/T-21-02 | Info disclosure | mitigate | CLOSED | `src/saneless/vocabulary.py:206-219` — five developer-authored constants, zero interpolation. D-12 unwired confirmed: only references to `error_message` in `src/` are its own `def` and `__all__` entry |
 | 3 | 21-01/T-21-03 | Tampering (XSS) | accept | CLOSED | `grep -rn '\| safe' src/saneless/web/templates/` → 0 matches. Autoescape confirmed at the library, not assumed: starlette 0.52.1 `Jinja2Templates._create_env` does `env_options.setdefault("autoescape", True)`; `web/app.py:87` passes no `env_options` |
 | 4 | 21-02/T-21-03 | Tampering | mitigate | CLOSED | `src/saneless/scanner/base.py:88-101` — `.strip().lower()`, substring tests only, no shell/path/SQL/HTML sink; returns closed `SourceKind`; `UNKNOWN` default has `uses_feeder is False` (`base.py:46-47`) |
-| 5 | 21-02/T-21-04 | DoS | accept | **CLOSED — rationale corrected (WARNING)** | See § Finding W-01. Risk remains accepted by explicit user decision (D-11 AMENDED, `e6de95e`), but the register's stated bound is false as written |
+| 5 | 21-02/T-21-04 | DoS | accept | **CLOSED — rationale corrected; bound now shipped** | See § Finding W-01. Unbounded on non-feeder hardware; **bounded from Phase 24 by `_MAX_ADF_PAGES`** (`sane_backend.py`, plan 24-03). The risk itself remains accepted by explicit user decision (D-11 AMENDED, `e6de95e`); the register's original one-page bound was false as written and is withdrawn |
 | 6 | 21-03/T-21-02 | Tampering (XSS) | mitigate | CLOSED | `partials/history.html:8` `{{ job.state \| state_label }}`, `partials/status.html:9` `{{ job.state \| progress_label }}`; filters bound to the vocabulary functions at `web/app.py:92-93`; grep gate returns 0 |
 | 7 | 21-03/T-21-05 | DoS | mitigate | CLOSED | Store-boundary guard not weakened: `JobState(row[3])` still the only path into `Job.state` from SQLite — `job.py:176` (`get_job`), `job.py:251` (`list_recent`); the only other `Job(...)` construction is `create_job` (`job.py:124`) from in-process values, no row |
 | 8 | 21-03/T-21-06 | Info disclosure | accept | CLOSED | `{{ job.error }}` unchanged, verified by diff: `git diff 51daabc..HEAD -- partials/status.html` leaves that line untouched. Rendered autoescaped, no `\| safe`. Net change: zero |
@@ -79,8 +79,8 @@ library, and the library evidence contradicts it.
    ```
 
    On a device that is not a feeder, `dev.start()` + `dev.snap()` succeed, so the
-   iterator re-scans the platen instead of stopping. Neither "yields one page" nor
-   "yields at all" is guaranteed.
+   iterator re-scans the platen instead of stopping. Neither a single page nor
+   any page at all is guaranteed.
 
 2. saneless imposes **no page cap**. The only bound in `_scan_adf_pages` is
    `_DEFAULT_PAGE_TIMEOUT_SECONDS = 120.0` per page (`sane_backend.py:62`), which a
@@ -118,9 +118,11 @@ tests and was not verified against hardware." The compensating control shipped i
 the same commit is documentation only: `docs/how-to/set-up-adf-duplex.md` now says
 manual duplex requires a feeder.
 
-**Required action (not blocking this phase):**
-- Rewrite the T-21-04 rationale in the register. The correct statement is *"unbounded on non-feeder hardware; accepted by explicit user decision, no code control, documentation-only compensating control."* Do not carry the "yields one page" wording forward.
-- Phase 24, which already owns `UNKNOWN` routing and the `auto_source_mode` override, should carry a page cap or an iteration guard for `_scan_adf_pages`, and should stop mapping every `multi_scan()` failure to "No paper detected in feeder."
+**Required action — DISCHARGED 2026-09-13 by Phase 24, plan 24-03:**
+- ~~Rewrite the T-21-04 rationale in the register.~~ **Done.** The register row and the Accepted Risks Log row now both read to the effect of *"unbounded on non-feeder hardware; bounded from Phase 24 by `_MAX_ADF_PAGES`."* The withdrawn wording survives in exactly one place — the verbatim quotation of the original register text at the top of this finding — which is retained deliberately, because the history of the false rationale is the point.
+- ~~Phase 24 … should carry a page cap or an iteration guard for `_scan_adf_pages`, and should stop mapping every `multi_scan()` failure to "No paper detected in feeder."~~ **Done.** `_MAX_ADF_PAGES = 500` bounds the loop in `_acquire_pages` and names both itself and the page count in the `ScanError` it raises (D-04). Separately, the first-page special case and the unreachable guard around `multi_scan()` are deleted, so a jam, an open cover, a busy device and an I/O error each surface as `ScanError` carrying the SANE text, and a feeder that produced zero pages is now the only remaining source of that message (D-03).
+
+**What the cap does not do.** It bounds the *iteration*, not memory: at A4/300 dpi colour 500 pages is roughly 13 GB, and `pipeline.py` still materialises pages with `list()`. Memory bounding is Phase 29's HARD-01/HARD-02 and is explicitly not claimed here. The cap is also **per `scan_pages()` call**, so Phase 25's two manual-duplex passes get one cap each — per-pass, not per-job.
 
 ---
 
@@ -150,7 +152,7 @@ mistaken for undeclared behaviour later:
 | ID | Risk | Accepted because | Owner / revisit |
 |---|---|---|---|
 | 21-01/T-21-03 | XSS via a label string reaching a template | Labels are developer-authored constants; Jinja2 autoescape verified in force at starlette 0.52.1. **Standing control: no `\| safe` filter on any label, anywhere under `src/saneless/web/templates/`.** Currently 0 occurrences | Standing — re-grep every phase that touches templates |
-| 21-02/T-21-04 | A non-feeder source routed to `multi_scan()` | Explicit user decision recorded in 21-CONTEXT.md D-11 (AMENDED) and `e6de95e`. Documentation-only compensating control. **The original "bounded to one page" rationale is withdrawn — see W-01** | Phase 24 (page cap, honest feeder errors, `UNKNOWN` routing) |
+| 21-02/T-21-04 | A non-feeder source routed to `multi_scan()` | Explicit user decision recorded in 21-CONTEXT.md D-11 (AMENDED) and `e6de95e`. No longer documentation-only: **unbounded on non-feeder hardware; bounded from Phase 24 by `_MAX_ADF_PAGES`** (plan 24-03), which also made the feeder error messages truthful. The original "bounded to one page" rationale is withdrawn — see W-01. Residual: the cap bounds iteration, not memory | Phase 29 (HARD-01/HARD-02) for the memory bound |
 | 21-03/T-21-06 | Raw exception text shown via `{{ job.error }}` | Pre-existing, deliberately unchanged; net change this phase is zero. Substituting a generic message before Phase 24 makes the underlying messages truthful would be a regression, not a fix | Phase 30 (U-05), depends on Phase 24 |
 | 21-04/T-21-02 | `error_message()` replacing specific error text | Deliberately not wired (D-12); `job.error` and the log line are byte-unchanged | Phase 30 (U-05) |
 | 21-05/T-21-10 | `consume_dir_path` carrying a filesystem path | No new disclosure — the same path was already logged pre-phase; it is a locally-configured directory, not user input, and has zero consumers outside `paperless.py` | Revisit if the value is ever surfaced in the UI |
