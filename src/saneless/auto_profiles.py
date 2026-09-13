@@ -333,7 +333,27 @@ def generate_profiles(
     has_flatbed = any(
         classify_source(s) is SourceKind.FLATBED for s in capabilities.sources
     )
+    # A flatbed backs the default when the device has one; otherwise its first
+    # reported source does. The fallback is what keeps a sheet-fed scanner from
+    # producing a config that Settings refuses to load (see the docstring).
+    # Decided before the loop so that the slug it occupies can be reserved.
+    flatbed_sources = [
+        s for s in capabilities.sources if classify_source(s) is SourceKind.FLATBED
+    ]
+    default_source = next(iter(flatbed_sources), None) or next(
+        iter(capabilities.sources), None
+    )
+
+    # "default" is claimed up front because the default profile is assigned
+    # after the loop with a bare ``profiles["default"] = ...``: a source whose
+    # name slugs to "default" would otherwise claim the slug, be written, and
+    # then be silently overwritten by that assignment -- N sources in, N-1
+    # represented, which is the exact loss _claim_slug exists to prevent.
+    # Reserving it sends such a source to "default-2" and makes the collision
+    # WARNING name both.
     claimed: dict[str, str] = {}
+    if default_source is not None:
+        claimed["default"] = default_source
 
     for source in capabilities.sources:
         slug = _claim_slug(source, claimed)
@@ -345,15 +365,6 @@ def generate_profiles(
             auto_source_mode=_auto_source_mode(source, has_flatbed=has_flatbed),
         )
 
-    # A flatbed backs the default when the device has one; otherwise its first
-    # reported source does. The fallback is what keeps a sheet-fed scanner from
-    # producing a config that Settings refuses to load (see the docstring).
-    flatbed_sources = [
-        s for s in capabilities.sources if classify_source(s) is SourceKind.FLATBED
-    ]
-    default_source = next(iter(flatbed_sources), None) or next(
-        iter(capabilities.sources), None
-    )
     if default_source is not None:
         profiles["default"] = ProfileConfig(
             source=default_source,
