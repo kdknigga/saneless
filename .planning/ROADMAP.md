@@ -241,7 +241,7 @@ Plans:
 
 **Wave 5** *(blocked on 24-05)*
 
-- [ ] 24-06-PLAN.md — geometry presence check with a reachable crop fallback, `GeometryUnit` total enum over all seven SANE codes, clamped-area read-back (D-09, D-10, D-19)
+- [x] 24-06-PLAN.md — geometry presence check with a reachable crop fallback, `GeometryUnit` total enum over all seven SANE codes, clamped-area read-back (D-09, D-10, D-19)
 
 **Wave 6** *(blocked on 24-06)*
 
@@ -398,7 +398,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 21. Vocabulary and Contracts | 5/5 | Complete   | 2026-09-10 |
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
-| 24. Scanner Truthfulness | 5/8 | In Progress|  |
+| 24. Scanner Truthfulness | 6/8 | In Progress|  |
 | 25. Manual Duplex | 0/? | Not started | - |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
