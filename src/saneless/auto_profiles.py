@@ -8,8 +8,11 @@ generation logic uses pure functions for easy testing.
 
 from __future__ import annotations
 
+import logging
+import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, assert_never, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import tomlkit
 
@@ -29,57 +32,72 @@ __all__ = [
     "write_profiles_to_config",
 ]
 
+logger = logging.getLogger(__name__)
 
-def _slugify(lower: str) -> str:
+
+# The slug for a name of which _slugify's character set keeps nothing -- a
+# whitespace-only or wholly punctuation source name. "source" is the domain's
+# own word, so it cannot be mistaken for a device's wording, and it leaves the
+# collision tie-break free to turn a second degenerate name into "source-2"
+# rather than dropping it.
+_EMPTY_SLUG_FALLBACK = "source"
+
+
+def _slugify(source: str) -> str:
     """
-    Slugify an already-lowercased source name.
+    Reduce a source name to a strict ``[a-z0-9-]`` slug.
+
+    The character set is the contract: the result holds only lowercase ASCII
+    letters, digits and hyphens, with no leading, trailing or doubled hyphen.
+    The rule, in order -- lowercase the name; replace every run of characters
+    outside ``[a-z0-9]`` with a single hyphen; strip leading and trailing
+    hyphens; fall back to ``_EMPTY_SLUG_FALLBACK`` when nothing survives.
+
+    Lowercasing happens here rather than in the caller so no caller can pass a
+    half-normalised string and get a slug that silently breaks the contract.
+
+    This is deliberately NOT the PDF filename sanitiser, and the two must not
+    be merged: Phase 23's D-19 separated them because this one passed "/" and
+    ".." straight through. D-15 fixes that character-set weakness here; it does
+    not make this function safe to reuse for filesystem paths.
 
     Args:
-        lower: Lowercased SANE source name.
+        source: SANE source name, in whatever case the device reported it.
 
     Returns:
-        The name with spaces and underscores replaced by hyphens.
+        A slug matching ``^[a-z0-9][a-z0-9-]*$``.
 
     """
-    return lower.replace(" ", "-").replace("_", "-")
+    slug = re.sub(r"[^a-z0-9]+", "-", source.lower()).strip("-")
+    return slug or _EMPTY_SLUG_FALLBACK
 
 
 def source_to_slug(source: str) -> str:
     """
     Convert a SANE source name to a profile slug.
 
-    Dispatches on ``classify_source`` -- the codebase's single
-    source-classification rule -- and turns the resulting SourceKind into a
-    descriptive, URL-safe slug, falling back to a basic slugification for
-    source names that match no rule.
+    Every source is named from the device's own wording (D-14). This function
+    used to map each SourceKind onto one of four hard-coded friendly names,
+    which forced a special case for "ADF Back". The reason is worth keeping:
+    "which scan path do I take?" and "what do I name this profile?" are
+    different questions with different equivalence classes. "ADF Front" and "ADF Back" are both feeders
+    for routing, so naming them from the kind collapsed two distinct sources
+    onto one profile and silently lost one (the N-09 defect). Naming from the
+    source itself removes the naming question's need for a rule at all, so no
+    source can be named after another source's kind.
+
+    Two *different* names can still normalise alike ("ADF-Front" and
+    "ADF Front"). That residue is resolved where profiles are assembled, with a
+    deterministic tie-break -- not here, so this function stays pure.
 
     Args:
         source: SANE source name string (e.g., "Flatbed", "ADF Duplex").
 
     Returns:
-        A lowercase hyphenated slug string.
+        A lowercase slug matching ``^[a-z0-9][a-z0-9-]*$``.
 
     """
-    lower = source.lower()
-    match classify_source(source):
-        case SourceKind.AUTO:
-            slug = "auto-scan"
-        case SourceKind.FLATBED:
-            slug = "flatbed-scan"
-        case SourceKind.FEEDER_DUPLEX:
-            slug = "adf-duplex"
-        case SourceKind.FEEDER:
-            # Not a thin passthrough: "ADF Back" classifies as FEEDER because
-            # it IS a feeder for routing purposes, but it must not slug to
-            # "adf-simplex" or it collides with "ADF Front" (the N-09 defect).
-            # "Which scan path do I take?" and "what do I name this profile?"
-            # are different questions with different equivalence classes.
-            slug = _slugify(lower) if "back" in lower else "adf-simplex"
-        case SourceKind.UNKNOWN:
-            slug = _slugify(lower)
-        case unhandled:
-            assert_never(unhandled)
-    return slug
+    return _slugify(source)
 
 
 def pick_closest_resolution(
@@ -151,6 +169,50 @@ def is_bare_default(settings: Settings) -> bool:
     )
 
 
+def _claim_slug(source: str, claimed: dict[str, str]) -> str:
+    """
+    Resolve a source's slug against the slugs already claimed.
+
+    Slugging is not injective -- "ADF-Front" and "ADF Front" are different
+    source names that normalise to the same slug -- so the assignment needs a
+    tie-break. The first source to claim a slug keeps it bare; each later
+    collider gains a "-2", "-3", ... suffix. "Last wins" is rejected: it
+    silently drops a source the device reported, which is N-09's actual
+    complaint.
+
+    The walk follows ``capabilities.sources`` order, so the result is
+    deterministic given the device's own stable ordering of its sources.
+
+    Args:
+        source: The SANE source name claiming a slug.
+        claimed: Slugs already taken, mapped to the source that took each.
+            Mutated to record the returned slug.
+
+    Returns:
+        The slug this source may use.
+
+    """
+    slug = source_to_slug(source)
+    candidate = slug
+    suffix = 1
+    while candidate in claimed:
+        suffix += 1
+        candidate = f"{slug}-{suffix}"
+
+    if candidate != slug:
+        logger.warning(
+            "Scanner sources %r and %r both normalise to the profile slug %r; "
+            "naming the second %r so neither source is lost.",
+            claimed[slug],
+            source,
+            slug,
+            candidate,
+        )
+
+    claimed[candidate] = source
+    return candidate
+
+
 def generate_profiles(
     capabilities: DeviceCapabilities,
 ) -> dict[str, ProfileConfig]:
@@ -160,6 +222,14 @@ def generate_profiles(
     Creates one profile per scanner source, plus a "default" profile
     mapped to the flatbed source if available. All generated profiles
     have auto_generated=True.
+
+    Every question this function asks about a source name is answered by
+    ``classify_source`` (D-02, Q9). It previously carried three rules of its
+    own -- an equality test for "auto" and two ``"flatbed" in s.lower()``
+    substring tests -- which disagreed with the classifier at the edges: stray
+    whitespace defeated the equality test, and the substring test called
+    "Flatbed Duplex" a flatbed, making a duplex feeder back the default
+    profile.
 
     Args:
         capabilities: Scanner device capabilities with sources,
@@ -174,13 +244,16 @@ def generate_profiles(
         capabilities.resolutions, target=DEFAULT_RESOLUTION
     )
     mode = pick_preferred_mode(capabilities.modes, preferred="Color")
+    has_flatbed = any(
+        classify_source(s) is SourceKind.FLATBED for s in capabilities.sources
+    )
+    claimed: dict[str, str] = {}
 
     for source in capabilities.sources:
-        slug = source_to_slug(source)
+        slug = _claim_slug(source, claimed)
         auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
-        if source.lower() == "auto":
-            has_flatbed = any("flatbed" in s.lower() for s in capabilities.sources)
-            auto_source_mode = "adf" if not has_flatbed else "flatbed"
+        if classify_source(source) is SourceKind.AUTO and not has_flatbed:
+            auto_source_mode = "adf"
         profiles[slug] = ProfileConfig(
             source=source,
             resolution=resolution,
@@ -190,7 +263,9 @@ def generate_profiles(
         )
 
     # Set default to flatbed if available
-    flatbed_sources = [s for s in capabilities.sources if "flatbed" in s.lower()]
+    flatbed_sources = [
+        s for s in capabilities.sources if classify_source(s) is SourceKind.FLATBED
+    ]
     if flatbed_sources:
         profiles["default"] = ProfileConfig(
             source=flatbed_sources[0],
@@ -228,6 +303,27 @@ def resolve_config_path(config_path: str | None = None) -> Path:
     return Path("./saneless.toml")
 
 
+def _is_auto_generated(table: object) -> bool:
+    """
+    Report whether a parsed profile table carries a truthy auto_generated flag.
+
+    The parsed profiles section holds values typed ``object``, so the flag is
+    read behind an isinstance narrowing rather than an annotation the type
+    checkers cannot verify. Anything that is not a mapping -- a stray scalar
+    under ``[profiles]`` -- answers False and is therefore never pruned.
+
+    Args:
+        table: A value from the parsed ``[profiles]`` section.
+
+    Returns:
+        True only for a mapping whose ``auto_generated`` value is truthy.
+
+    """
+    if not isinstance(table, Mapping):
+        return False
+    return bool(table.get("auto_generated", False))
+
+
 def write_profiles_to_config(
     config_path: Path,
     profiles: dict[str, ProfileConfig],
@@ -240,13 +336,23 @@ def write_profiles_to_config(
     Uses tomlkit for comment-preserving TOML round-tripping. Profiles that
     already exist in the config are skipped unless force=True.
 
+    Auto-generated profiles that the freshly generated set no longer names are
+    pruned first, so renaming does not strand the profiles it replaced. The
+    prune runs whether or not ``force`` is passed, and that is deliberate:
+    ``force`` governs overwriting keys that are *present* in the generated set,
+    while an orphan is by definition absent from it, so ``force`` has nothing
+    to say about it. A profile without a truthy ``auto_generated`` flag is
+    never touched -- CFG-07's literal wording, which keeps this from
+    pre-empting the general merge semantics owned by a later phase.
+
     Args:
         config_path: Path to the TOML config file.
         profiles: Dictionary of profile name to ProfileConfig.
         force: If True, overwrite existing profiles.
 
     Returns:
-        List of profile names that were actually written.
+        List of profile names that were actually written. Pruned profiles are
+        not named here -- they were removed, not written.
 
     """
     if config_path.exists():
@@ -258,6 +364,19 @@ def write_profiles_to_config(
         doc.add("profiles", tomlkit.table(is_super_table=True))
 
     profiles_section = cast("dict[str, object]", doc["profiles"])
+
+    orphans = [
+        name
+        for name, table in profiles_section.items()
+        if name not in profiles and _is_auto_generated(table)
+    ]
+    for name in orphans:
+        logger.info(
+            "Removing auto-generated profile %r: the scanner's sources no "
+            "longer produce that name.",
+            name,
+        )
+        del profiles_section[name]
 
     written: list[str] = []
     for name, profile in profiles.items():

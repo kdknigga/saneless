@@ -752,8 +752,11 @@ class TestAutoProfiles:
         result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
         assert result.exit_code == 0
         assert "Generated" in result.output
-        assert "flatbed-scan" in result.output
-        assert "adf-simplex" in result.output
+        # Match the whole printed "  <name>: source=..." line, not a bare
+        # substring: "flatbed" alone is a substring of the pre-D-14 name too,
+        # so a looser assertion would pass before and after the rename.
+        assert "  flatbed: source=Flatbed" in result.output
+        assert "  adf: source=ADF" in result.output
 
     def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """auto-profiles with no scanners exits with code 1."""
@@ -769,14 +772,14 @@ class TestAutoProfiles:
     ) -> None:
         """auto-profiles --force overwrites existing profiles."""
         config_file = tmp_path / "saneless.toml"
-        # Pre-populate config with an existing flatbed-scan profile
+        # Pre-populate config with an existing flatbed profile
         doc = tomlkit.document()
         profiles_table = tomlkit.table(is_super_table=True)
         existing = tomlkit.table()
         existing.add("source", "Old Source")
         existing.add("resolution", 150)
         existing.add("mode", "Gray")
-        profiles_table["flatbed-scan"] = existing
+        profiles_table["flatbed"] = existing
         doc.add("profiles", profiles_table)
         config_file.write_text(tomlkit.dumps(doc))
 
@@ -788,7 +791,7 @@ class TestAutoProfiles:
         )
         assert result.exit_code == 0
         assert "Generated" in result.output
-        assert "flatbed-scan" in result.output
+        assert "  flatbed: source=Flatbed" in result.output
 
     def test_auto_profiles_no_force_skips_existing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -798,7 +801,7 @@ class TestAutoProfiles:
         # Pre-populate config with ALL profiles that would be generated
         doc = tomlkit.document()
         profiles_table = tomlkit.table(is_super_table=True)
-        for name in ("default", "flatbed-scan", "adf-simplex"):
+        for name in ("default", "flatbed", "adf"):
             entry = tomlkit.table()
             entry.add("source", "Existing")
             entry.add("resolution", 150)

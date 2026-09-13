@@ -88,7 +88,7 @@ flatbed scan or a multi-page ADF scan. The `auto_source_mode` field controls thi
 | `"adf"` | Multi-page feeder, like ADF |
 
 ```toml
-[profiles.auto-scan]
+[profiles.auto]
 source = "Auto"
 auto_source_mode = "adf"
 resolution = 300
@@ -125,11 +125,13 @@ If you are unsure what sources and modes your scanner supports, saneless can gen
 saneless auto-profiles
 ```
 
-This creates profiles like `flatbed-color-300`, `adf-gray-150`, etc. based on what your scanner hardware actually supports. Use `--force` to overwrite existing auto-generated profiles:
+Profile names come from your scanner's own source names, lowercased and reduced to letters, digits and hyphens. A scanner reporting `Flatbed` and `Automatic Document Feeder` gets profiles named `flatbed` and `automatic-document-feeder`. Use `--force` to overwrite existing auto-generated profiles:
 
 ```bash
 saneless auto-profiles --force
 ```
+
+Regenerating can rename profiles, so if you pass `--profile` in a script or a cron entry, check the name still matches. Auto-generated profiles that a new run no longer produces are removed, so a rename does not leave a stale duplicate behind. Profiles you wrote yourself are never touched.
 
 See [CLI Commands](../reference/cli-commands.md) for full `auto-profiles` documentation.
 
