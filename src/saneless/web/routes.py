@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import JSONResponse
 
-from saneless.vocabulary import FlipOutcome, JobState
+from saneless.vocabulary import (
+    FlipOutcome,
+    JobState,
+    WorkerHealth,
+    worker_health_detail,
+)
 
 if TYPE_CHECKING:
     from starlette.responses import Response
@@ -23,6 +28,12 @@ __all__ = ["router"]
 
 logger = logging.getLogger(__name__)
 
+# Every handler below is a plain ``def`` on purpose.  Each one calls blocking
+# code -- sync httpx to Paperless, sqlite through the job store, the worker --
+# and FastAPI runs ``def`` handlers on its threadpool, so a slow Paperless call
+# cannot stall ``/health`` or the status poll (ROBU-05, M-01).  The shared state
+# they touch is locked: the JobStore's RLock, the worker's profile lock and the
+# metadata cache's per-key locks.
 router = APIRouter()
 
 _TAGS_FORM_DEFAULT = Form(default=[])
@@ -36,8 +47,10 @@ def _get_cached_or_fetch(
     """
     Retrieve metadata from cache or fetch from paperless-ngx.
 
-    Falls back to an empty list if the paperless API is unreachable,
-    ensuring the UI always loads even when paperless-ngx is down.
+    The fetch goes through the cache's single-flight ``get_or_fetch``, so
+    concurrent requests for the same resource make one Paperless call
+    (ROBU-05).  Falls back to an empty list if the paperless API is
+    unreachable, ensuring the UI always loads even when paperless-ngx is down.
 
     Args:
         cache: Metadata cache instance.
@@ -48,15 +61,9 @@ def _get_cached_or_fetch(
         List of metadata dicts, or empty list on error.
 
     """
-    data = cache.get(resource)
-    if data is not None:
-        return data
+    fetch = paperless.get_tags if resource == "tags" else paperless.get_correspondents
     try:
-        if resource == "tags":
-            data = paperless.get_tags()
-        else:
-            data = paperless.get_correspondents()
-        cache.set(resource, data)
+        data = cache.get_or_fetch(resource, fetch)
     except Exception:
         logger.warning(
             "Failed to fetch %s from paperless-ngx, using empty list",
@@ -139,7 +146,7 @@ def _status_context(
 
 
 @router.get("/")
-async def index(request: Request) -> Response:
+def index(request: Request) -> Response:
     """
     Render the main page with scan form, status, and job history.
 
@@ -172,23 +179,27 @@ async def index(request: Request) -> Response:
 
 
 @router.get("/health", response_model=None)
-async def health(request: Request) -> dict[str, str] | JSONResponse:
+def health(request: Request) -> dict[str, str] | JSONResponse:
     """
     Health check endpoint for container orchestration.
 
-    Returns 200 with ``{"status": "ok"}`` when the worker thread is
-    alive, or 503 with error detail when the worker is down.
+    Returns 200 with ``{"status": "ok"}`` when the worker is healthy.
+    Otherwise 503, whose detail distinguishes a failing job store ("job store
+    failing") from a dead worker thread ("worker thread is down") (D-10).
+    Docker's HEALTHCHECK marks the container unhealthy on a 503 but does not
+    restart it (documented in 26-14).
     """
-    if request.app.state.worker.is_alive:
+    worker_health = request.app.state.worker.health
+    if worker_health is WorkerHealth.HEALTHY:
         return {"status": "ok"}
     return JSONResponse(
         status_code=503,
-        content={"status": "error", "detail": "worker thread is down"},
+        content={"status": "error", "detail": worker_health_detail(worker_health)},
     )
 
 
 @router.get("/api/paperless/test", response_model=None)
-async def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
+def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
     """
     Test paperless-ngx connection status.
 
@@ -207,7 +218,7 @@ async def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
 
 
 @router.post("/api/scan")
-async def start_scan(
+def start_scan(
     request: Request,
     profile: str = Form(...),
     title: str = Form(default=""),
@@ -249,7 +260,7 @@ async def start_scan(
 
 
 @router.get("/api/jobs/current/status")
-async def current_job_status(request: Request) -> Response:
+def current_job_status(request: Request) -> Response:
     """
     Poll the current or most recent job status.
 
@@ -266,7 +277,7 @@ async def current_job_status(request: Request) -> Response:
 
 
 @router.get("/api/tags")
-async def get_tags(request: Request) -> Response:
+def get_tags(request: Request) -> Response:
     """
     Fetch tag options for the dropdown selector.
 
@@ -283,7 +294,7 @@ async def get_tags(request: Request) -> Response:
 
 
 @router.get("/api/correspondents")
-async def get_correspondents(request: Request) -> Response:
+def get_correspondents(request: Request) -> Response:
     """
     Fetch correspondent options for the dropdown selector.
 
@@ -302,7 +313,7 @@ async def get_correspondents(request: Request) -> Response:
 
 
 @router.post("/api/cache/invalidate")
-async def invalidate_cache(request: Request, resource: str) -> Response:
+def invalidate_cache(request: Request, resource: str) -> Response:
     """
     Invalidate a specific cache entry and return fresh data.
 
@@ -336,7 +347,7 @@ async def invalidate_cache(request: Request, resource: str) -> Response:
 
 
 @router.get("/api/jobs/history")
-async def job_history(request: Request) -> Response:
+def job_history(request: Request) -> Response:
     """
     Fetch the job history table body.
 
@@ -353,7 +364,7 @@ async def job_history(request: Request) -> Response:
 
 
 @router.post("/api/flip/continue")
-async def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
+def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
     Answer the named job's flip prompt with Continue, starting its pass B.
 
@@ -383,7 +394,7 @@ async def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
 
 
 @router.post("/api/flip/abort")
-async def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
+def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
     Answer the named job's flip prompt with Abort, failing it before pass B.
 

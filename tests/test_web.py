@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import inspect
 import json
+import logging
 import re
 import threading
 import time
@@ -157,14 +158,15 @@ def test_health_endpoint_no_auth(client: TestClient) -> None:
     assert response.status_code == 200
 
 
-def test_no_route_handler_is_a_coroutine(app: FastAPI) -> None:
+def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
     """
     Every route handler is a plain ``def`` (ROBU-05, M-01).
 
     Each handler calls blocking code, and FastAPI only moves ``def`` handlers
-    onto its threadpool; an ``async def`` one would block the event loop.
+    onto its threadpool; an ``async def`` one would block the event loop.  The
+    client fixture is used so the lifespan closes the job store afterwards.
     """
-    routes = [route for route in app.routes if isinstance(route, APIRoute)]
+    routes = [route for route in _app(client).routes if isinstance(route, APIRoute)]
     assert routes
     for route in routes:
         assert not inspect.iscoroutinefunction(route.endpoint), route.path
@@ -193,6 +195,30 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
     finally:
         gate.set()
         slow.join(5)
+
+
+def test_metadata_fetch_failure_falls_back_to_an_empty_list(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Paperless failure still renders empty options and logs a WARNING (ROBU-05)."""
+    app = _app(client)
+
+    def failing_get_tags() -> list[dict[str, object]]:
+        msg = "paperless unreachable"
+        raise ConnectionError(msg)
+
+    app.state.paperless.get_tags = failing_get_tags
+    app.state.cache.invalidate("tags")
+    with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
+        response = client.get("/api/tags")
+
+    assert response.status_code == 200
+    assert "receipt" not in response.text
+    assert app.state.cache.get("tags") is None
+    assert any(
+        r.levelno == logging.WARNING and "using empty list" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_health_reports_degraded_worker(client: TestClient) -> None:
