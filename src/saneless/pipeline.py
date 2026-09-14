@@ -11,6 +11,7 @@ import contextlib
 import logging
 import shutil
 import tempfile
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -26,10 +27,9 @@ from saneless.exceptions import (
 from saneless.pages import filter_empty_pages, generate_thumbnail
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.scanner.base import ScanBatch, ScanSettings
-from saneless.vocabulary import JobState, ScanOutcome
+from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable, Iterator, Sequence
 
     from PIL import Image
@@ -38,7 +38,13 @@ if TYPE_CHECKING:
     from saneless.paperless import PaperlessClient
     from saneless.scanner.base import ScannerBackend
 
-__all__ = ["PipelineEvent", "PipelineRequest", "ScanResult", "run_pipeline"]
+__all__ = [
+    "FlipCoordinator",
+    "PipelineEvent",
+    "PipelineRequest",
+    "ScanResult",
+    "run_pipeline",
+]
 
 
 class PipelineEvent(StrEnum):
@@ -105,6 +111,71 @@ one was that it is the only remaining copy of a scanned document.
 """
 
 
+class FlipCoordinator(ABC):
+    """
+    The one way a manual-duplex run waits for the operator to flip the stack.
+
+    Pass A has fed the fronts; before pass B the pipeline asks this seam a
+    single question -- has the stack been turned? -- and gets back a single,
+    total ``FlipOutcome``.  The web worker answers it from the Continue and
+    Abort routes, and the CLI answers it from a terminal prompt.
+
+    This is an ``ABC`` and not a ``typing.Protocol`` on purpose, and the rule is
+    observable in the tree: ``Protocol`` describes shapes this project does not
+    own (``SaneDevice`` for python-sane's handle, ``_SettingsFactory`` for
+    pydantic's constructor), while ``ABC`` defines seams the project implements
+    itself (``ScannerBackend``).  DPLX-04's lowercase "protocol" means
+    "contract", not ``typing.Protocol``.
+    """
+
+    @abstractmethod
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Block until the flip wait resolves, for at most ``timeout`` seconds.
+
+        An implementation answers once, and its answer is final: whichever of
+        Continue, Abort or the clock resolves the wait first is what this
+        returns, and a signal arriving after that is dropped (D-16).
+
+        Args:
+            timeout: The longest the wait may hold the calling thread, in
+                seconds.  ``0`` is a valid bound and returns at once.
+
+        Returns:
+            ``CONTINUED`` when the operator flipped the stack, ``ABORTED`` when
+            they gave up at the prompt, or ``TIMED_OUT`` when neither happened
+            within ``timeout``.
+
+        """
+
+
+@dataclass(frozen=True)
+class _FlipContext:
+    """
+    What ``_scan_manual_duplex`` needs to wait for a flip.
+
+    Bundled into one record rather than passed as two parameters because
+    ``_scan_manual_duplex`` already sits exactly on ruff's ``PLR0913``
+    argument limit, and CLAUDE.md forbids both raising the limit and
+    suppressing the rule -- the same reason ``_DeliveryContext`` exists.
+
+    It also carries the coordinator as non-Optional.
+    ``PipelineRequest.flip_coordinator`` is ``FlipCoordinator | None`` because a
+    simplex run legitimately has none, so the narrowing to "there is one"
+    happens exactly once, where this record is built, and the callee never
+    needs an ``assert`` (which ``S101`` bans in ``src/``) to prove it.
+
+    Attributes:
+        coordinator: The seam that answers the flip wait.
+        timeout: Seconds the wait may hold the pipeline, from
+            ``output.flip_timeout_seconds``.
+
+    """
+
+    coordinator: FlipCoordinator
+    timeout: float
+
+
 @dataclass
 class PipelineRequest:
     """
@@ -129,8 +200,10 @@ class PipelineRequest:
     correspondent: int | None = None
     status_callback: Callable[[PipelineEvent], None] | None = None
     thumbnail_callback: Callable[[str], None] | None = None
-    flip_event: threading.Event | None = None
-    abort_event: threading.Event | None = None
+    # One field, one atomic answer.  This replaced a flip event and an abort
+    # event, where an Abort set both so the waiter woke and then had to inspect
+    # the second to learn why -- the two-step M-02's dead Abort lived in.
+    flip_coordinator: FlipCoordinator | None = None
 
 
 @dataclass
@@ -669,17 +742,21 @@ def _scan_manual_duplex(
     device_id: str,
     scan_settings: ScanSettings,
     request: PipelineRequest,
-    notify: Callable[[PipelineEvent], None],
+    flip: _FlipContext,
 ) -> ScanBatch | _DuplexMismatch:
     """
     Perform a two-pass manual duplex scan with flip coordination.
+
+    Between the passes the run waits on ``flip.coordinator``, bounded by
+    ``flip.timeout``, so a forgotten flip prompt fails this job instead of
+    parking the single worker thread forever (M-07).
 
     Args:
         scanner: Scanner backend instance.
         device_id: SANE device identifier string.
         scan_settings: Scan settings for the scanner.
-        request: Pipeline request with flip/abort events.
-        notify: Status callback function.
+        request: Pipeline request with the thumbnail and status callbacks.
+        flip: The flip coordinator and the timeout bounding its wait.
 
     Returns:
         A ScanBatch of interleaved pages when the two passes agree on count,
@@ -687,9 +764,16 @@ def _scan_manual_duplex(
         or a _DuplexMismatch holding both passes when the counts disagree.
 
     Raises:
-        ScanError: If scan is aborted by user.
+        ScanError: If the operator aborts at the flip prompt, or if the flip
+            wait times out.  Both raise before pass B starts.
+        AssertionError: If the coordinator returns a value that is not a
+            FlipOutcome member.
 
     """
+    # Derived rather than passed: it is exactly what the caller would hand us,
+    # and the caller is already handing us the request it comes from.
+    notify = request.status_callback or _noop_callback
+
     # Pass A: scan fronts
     front_batch = scanner.scan_pages(device_id, scan_settings)
     front_pages = front_batch.pages
@@ -700,15 +784,26 @@ def _scan_manual_duplex(
         thumb = generate_thumbnail(front_pages[0])
         request.thumbnail_callback(thumb)
 
-    # Signal awaiting flip
-    if request.flip_event is not None:
-        notify(PipelineEvent.AWAITING_FLIP)
-        request.flip_event.wait()
-
-        # Check if aborted
-        if request.abort_event is not None and request.abort_event.is_set():
-            msg = "Manual duplex scan cancelled by user"
+    notify(PipelineEvent.AWAITING_FLIP)
+    outcome = flip.coordinator.wait_for_flip(flip.timeout)
+    # A match with assert_never rather than an if-chain: a fourth FlipOutcome
+    # member then fails ty and pyrefly at edit time instead of falling through
+    # into pass B.  These are plain ScanErrors on purpose (D-15) -- classifying
+    # an abort as a cancellation rather than a failure is Phase 28's EXC-04.
+    match outcome:
+        case FlipOutcome.CONTINUED:
+            pass
+        case FlipOutcome.ABORTED:
+            msg = "Manual duplex scan aborted at the flip prompt"
             raise ScanError(msg)
+        case FlipOutcome.TIMED_OUT:
+            msg = (
+                f"Manual duplex flip wait timed out after {flip.timeout:g} "
+                "seconds: nobody confirmed the stack was flipped"
+            )
+            raise ScanError(msg)
+        case _:
+            assert_never(outcome)
 
     # Pass B: scan backs
     notify(PipelineEvent.SCANNING_REVERSE)
@@ -732,6 +827,39 @@ def _scan_manual_duplex(
     images = _interleave_duplex(front_pages, back_pages)
     logger.info("Interleaved %d total pages", len(images))
     return ScanBatch(pages=images, actual_resolution=dpi, pages_rejected=rejected)
+
+
+def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
+    """
+    Build the flip context for a manual-duplex run, refusing one with no coordinator.
+
+    Args:
+        request: The pipeline request, which must carry a flip coordinator.
+        settings: Application settings, for ``output.flip_timeout_seconds``.
+
+    Returns:
+        The coordinator, narrowed to non-Optional, with the configured timeout.
+
+    Raises:
+        ConfigError: If the request carries no flip coordinator.
+
+    """
+    coordinator = request.flip_coordinator
+    if coordinator is None:
+        # Placeholder until plan 25-04 moves this refusal up front, ahead of
+        # _resolve_device and any other scanner contact -- today it fires just
+        # before pass A.  Refusing is the only safe answer: with no coordinator
+        # pass B would start the instant pass A ends, re-feeding an empty tray
+        # (C-02).
+        msg = (
+            f"Profile '{request.profile_name}' is manual duplex, which needs a "
+            "flip coordinator, and none was supplied"
+        )
+        raise ConfigError(msg)
+    return _FlipContext(
+        coordinator=coordinator,
+        timeout=settings.output.flip_timeout_seconds,
+    )
 
 
 def _scan_simplex(
@@ -820,8 +948,10 @@ def run_pipeline(
         scanned, dropped as empty, and uploaded.
 
     Raises:
-        ConfigError: If the profile or device is not configured.
-        ScanError: If scanning fails.
+        ConfigError: If the profile or device is not configured, or a manual
+            duplex profile is run with no flip coordinator.
+        ScanError: If scanning fails, or a manual duplex flip wait is aborted
+            or times out.
         PaperlessError: If upload or polling fails. The message names where
             the assembled PDF was preserved, or -- if preservation failed
             too -- reports both failures.
@@ -865,7 +995,7 @@ def run_pipeline(
                 device_id,
                 scan_settings,
                 request,
-                notify,
+                _flip_context(request, settings),
             )
             if isinstance(duplex_result, _DuplexMismatch):
                 warning, delivered = _handle_duplex_mismatch(
