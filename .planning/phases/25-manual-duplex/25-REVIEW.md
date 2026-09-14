@@ -1,20 +1,28 @@
 ---
 phase: 25-manual-duplex
-reviewed: 2026-09-14T15:09:53Z
+reviewed: 2026-09-14T17:41:29Z
 depth: deep
-files_reviewed: 28
+files_reviewed: 27
 files_reviewed_list:
+  - docs/explanation/architecture.md
+  - docs/getting-started/first-web-ui-scan.md
+  - docs/how-to/set-up-adf-duplex.md
+  - docs/reference/cli-commands.md
+  - docs/reference/configuration.md
+  - docs/reference/web-api.md
   - src/saneless/auto_profiles.py
   - src/saneless/cli.py
   - src/saneless/config.py
   - src/saneless/pipeline.py
-  - src/saneless/scanner/base.py
   - src/saneless/scanner/sane_backend.py
   - src/saneless/vocabulary.py
+  - src/saneless/web/app.py
   - src/saneless/web/routes.py
+  - src/saneless/web/templates/partials/flip.html
+  - src/saneless/web/templates/partials/status.html
   - src/saneless/worker.py
-  - tests/conftest.py
   - tests/test_auto_profiles.py
+  - tests/test_browser.py
   - tests/test_cli.py
   - tests/test_config.py
   - tests/test_outcomes_e2e.py
@@ -23,360 +31,270 @@ files_reviewed_list:
   - tests/test_vocabulary.py
   - tests/test_web.py
   - tests/test_worker.py
-  - docs/explanation/architecture.md
-  - docs/getting-started/first-web-ui-scan.md
-  - docs/how-to/cli-scripting.md
-  - docs/how-to/configure-scan-profiles.md
-  - docs/how-to/set-up-adf-duplex.md
-  - docs/reference/cli-commands.md
-  - docs/reference/configuration.md
-  - docs/reference/environment-variables.md
-  - docs/reference/web-api.md
 findings:
-  critical: 1
-  warning: 8
-  info: 4
-  total: 13
+  critical: 0
+  warning: 3
+  info: 5
+  total: 8
 status: issues_found
 ---
 
-# Phase 25: Code Review Report
+# Phase 25: Code Review Report (re-review after gap closure 25-10..25-15)
 
-**Reviewed:** 2026-09-14T15:09:53Z
+**Reviewed:** 2026-09-14T17:41:29Z
 **Depth:** deep
-**Files Reviewed:** 28
+**Files Reviewed:** 27
 **Status:** issues_found
 
 ## Narrative Findings (AI reviewer)
 
 ## Summary
 
-I reviewed the whole `42cb5ef..HEAD` diff and used the full files to follow calls across
-modules: config → pipeline → worker/routes → scanner backend, plus the CLI coordinator. The
-gates pass on HEAD: `ruff check .` is clean, `ty check` is clean, and 723 tests pass across
-the nine phase test modules. The main structure is sound. There is one decision point in
-`run_pipeline`, the `match`/`assert_never` dispatch is total, the no-coordinator refusal
-comes before any SANE contact, and the `Auto` substitution cannot be reached from the feeder
-branch.
+This is a re-review of the gap-closure diff `07054af..HEAD`. I read the full files to follow
+the cross-module paths: the routes and `_status_context`, then `ScanWorker` and
+`WorkerFlipCoordinator`, then `FlipAnswerSlot`, then `_scan_manual_duplex`. I also followed
+config into `cli()` and `configure_logging`, and the profile into `_resolve_source` and
+`_resolve_feeder_source`.
 
-I did not flag the deliberate choices in 25-CONTEXT.md: D-08 (mismatch pages kept), D-15
-(abort is a plain `ScanError`), D-16 (first answer wins within one job), D-18 (legacy form
-removed from the docs) and D-19 (the orphaned prompt thread keeps stdin after a timeout).
+The gates pass on HEAD:
+- `ruff check .` is clean.
+- `ty check` is clean.
+- `pyrefly check src tests` reports 0 errors.
+- 782 tests pass across the nine phase test modules.
 
-**Deferred item (early flip signal): CONFIRMED, and rated BLOCKER, not a minor API quirk.**
-The deferred note says only direct API callers can reach it. That is wrong. A normal browser
-double-click, or a retry, reaches it, because the flip routes re-render the stale
-`AWAITING_FLIP` prompt, buttons included. I reproduced this against the real `ScanWorker`
-and `run_pipeline`. An Abort click meant for job 1 ended job 2, which was queued, with
-`ERROR: Manual duplex scan aborted at the flip prompt`. Nobody ever saw job 2's flip prompt.
-See CR-01.
+**All 13 prior findings are closed in code.** The disposition table follows. I traced the CR-01
+fix against the concurrency questions in the brief. It holds:
 
-Other problems:
-- `flip_timeout_seconds` has no bounds.
-- Feeder resolution treats a hardware-duplex source the same as a simplex feeder.
-- A device with no `source` option regressed: it can no longer do manual duplex.
-- `is_bare_default` ignores the new `duplex` field.
-- The legacy-source warning is emitted before logging is configured.
-- `docs/reference/cli-commands.md` has a broken exit-code table.
+- **Arm before persist.** `_status_cb` arms before it writes `AWAITING_FLIP`
+  (`worker.py:421-431`). Any observer that reads that row therefore finds the coordinator
+  armed. Arming happens only after `scan_pages` for pass A has returned
+  (`pipeline.py:938-948`), so a click during pass A is still dropped.
+  - A window remains where the coordinator is armed but the row is not yet written. A click
+    can only land in it by naming job X's id, and nothing has rendered a button for X at that
+    point, so the UI cannot reach it.
+- **Timeout vs. signal.** Both paths go through the slot lock. `offer` returns `False` once
+  anything has claimed the answer. `settle` hands back whatever answer is in effect, so a
+  Continue that lands between the wait expiring and `settle` is honoured.
+- **Job-id snapshot.** `_signal_flip` reads `self._flip_coordinator` once and compares the
+  posted id with that coordinator's own `job_id`. Every job gets its own coordinator. A
+  snapshot taken just before `finally` clears the pointer can therefore only signal a dead
+  coordinator, never the next job's.
+- **Tests.** The regression tests are real, not vacuous.
+  `test_the_coordinator_is_armed_before_awaiting_flip_is_persisted` wraps `update_state`. Its
+  mock pipeline announces `AWAITING_FLIP` *before* it calls `wait_for_flip`, so the
+  backstop arming inside `wait_for_flip` cannot mask a regression.
 
-## Critical Issues
+The new defects are at the edges of the fix, not in its core:
 
-### CR-01: The flip coordinator accepts answers from the moment the job starts, so a stale or early Continue/Abort lands on the wrong pass or the wrong job
+- A worker shut down while parked at the flip prompt leaves the job in `AWAITING_FLIP` for
+  good, and the prompt's buttons do nothing (WR-01).
+- The WR-05 fix sends the legacy-source warning to the log file, but it no longer reaches
+  stderr. The warning is now invisible to CLI users and to the documented Docker deployment
+  (WR-02).
+- The flip endpoints now require a `job_id` that no documented API surface exposes (WR-03).
 
-**File:** `src/saneless/worker.py:171-183, 256`; `src/saneless/web/routes.py:309-345`; `src/saneless/pipeline.py:856-857`
+I did not flag the approved amendments to D-02 and D-03, or PEP 758 syntax.
 
-**Issue:** `_process_job` creates a `WorkerFlipCoordinator` before pass A (`worker.py:256`).
-`continue_flip`/`abort_flip` signal it whenever it exists, and `_resolve` keeps the first
-answer permanently. Nothing ties a signal to the job's `AWAITING_FLIP` window or to a
-particular job. There are three ways to reach this:
+## Prior findings disposition
 
-1. **Browser double-click or retry after Abort, with a queued manual-duplex job.**
-   `abort_flip` signals, then renders `_current_or_recent_job` straight away. The worker
-   thread has not yet woken and written `ERROR`, so the response is job 1 still in
-   `AWAITING_FLIP`. The Continue and Abort buttons are rendered again, and the click looks
-   like it did nothing. Job 2 starts within milliseconds and gets a fresh coordinator. A
-   second Abort click during job 2's pass A is kept, and job 2 fails as soon as its fronts
-   finish. Reproduction (scratch script against the real worker and pipeline, job 2's pass A
-   held open by the fake scanner):
-   ```
-   route renders after 1st abort: one AWAITING_FLIP
-   job2 state before 2nd click: SCANNING
-   job1: ERROR Manual duplex scan aborted at the flip prompt
-   job2: ERROR Manual duplex scan aborted at the flip prompt scan calls: 2
-   ```
-   Without the gate, job 2 reached `AWAITING_FLIP` within 100 ms and was aborted there by
-   the click meant for job 1.
-2. **Continue during pass A (API, or the same stale re-render when job 1 ends quickly).**
-   `wait_for_flip` returns `CONTINUED` the moment pass A ends, and pass B starts on an
-   unflipped stack. If the tray is empty, pass B raises `FeederEmptyError` and the fronts
-   are thrown away with the `TemporaryDirectory`. If the operator has already reloaded the
-   stack but not flipped it, the fronts are scanned again as "backs". The counts match, the
-   pages are interleaved, and the job shows a green `DONE` for a wrong document. This is
-   C-02, the failure this phase exists to close.
-3. Any late POST retried by a proxy or by htmx lands on whichever manual-duplex job is
-   current.
-
-**Fix:** Arm the coordinator only when the pipeline announces the wait, and make the routes
-name the job they are answering.
-```python
-# worker.py
-class WorkerFlipCoordinator(FlipCoordinator):
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._event = threading.Event()
-        self._armed = False
-        self._outcome: FlipOutcome | None = None
-
-    def arm(self) -> None:
-        with self._lock:
-            self._armed = True
-
-    def _signal(self, outcome: FlipOutcome) -> bool:
-        with self._lock:
-            if not self._armed or self._outcome is not None:
-                return False          # early or late: dropped
-            self._outcome = outcome
-        self._event.set()
-        return True
-
-# in _status_cb, after persisting the state:
-if state is JobState.AWAITING_FLIP and self._flip_coordinator is not None:
-    self._flip_coordinator.arm()
-
-# ScanWorker.continue_flip(job_id: str) / abort_flip(job_id: str):
-if job_id != self._current_job_id: return
-```
-Put the job id in the flip partial (`hx-vals='{"job_id": "{{ job.id }}"}'`) and read it in
-both routes. Add a worker test that sends an Abort during pass A and during the next job's
-pass A, and asserts that both are dropped. Then remove the deferred-items entry and the
-"call them only while AWAITING_FLIP" caveat in `web-api.md`.
+| ID | Prior finding | Status | Evidence |
+|----|---------------|--------|----------|
+| CR-01 | Coordinator accepted signals before `AWAITING_FLIP`, with no job scoping | **Closed** | `WorkerFlipCoordinator(job_id)` with a one-way `_armed` latch (`worker.py:79-170`). It is armed in `_status_cb` before persisting (`worker.py:421-430`). `continue_flip`/`abort_flip` take `job_id` and compare it with the coordinator snapshot (`worker.py:275-321`). The routes require the `job_id` form field (`routes.py:356, 386`), and `flip.html:42-43` sends it through `hx-vals` with `tojson`, which escapes it for the attribute. Once answered, the partial shows an acknowledgment instead of the buttons (`status.html:13-17`, `routes.py:98-138`). Tests: `test_signals_during_pass_a_are_dropped`, `test_a_double_clicked_abort_cannot_abort_the_next_job`, `test_foreign_job_id_leaves_the_prompt_open`, and the browser test `test_flip_continue_click_answers_the_waiting_job`. |
+| WR-01 | `flip_timeout_seconds` unbounded | **Closed** | `Field(default=600, ge=1, le=86_400)` (`config.py:172`). 86 400 is far below `threading.TIMEOUT_MAX`. The e2e tests moved to a 1 s budget with a matching margin. |
+| WR-02 | Feeder resolution accepted `FEEDER_DUPLEX` like a simplex feeder | **Closed** | `_resolve_feeder_source` prefers `SourceKind.FEEDER`. It warns when it overrides a named `FEEDER_DUPLEX` source, and refuses when every feeder is duplex (`sane_backend.py:837-866`). This matches the approved D-02 amendment. |
+| WR-03 | Manual duplex regressed on devices with no `source` option | **Closed** | `sane_backend.py:922-931` trusts `classify_source(requested).uses_feeder` when no source option exists. A legacy `"Manual Duplex"` classifies `FEEDER_DUPLEX`, which counts as a feeder, so it still runs. |
+| WR-04 | `is_bare_default` ignored `duplex` | **Closed** | `settings.profiles["default"] == ProfileConfig()` (`auto_profiles.py:223`). I checked this against pydantic 2.12.5. Equality compares field values, not `model_fields_set`, so a TOML file that spells out the default values still counts as bare. |
+| WR-05 | Legacy warning emitted before logging was configured | **Closed, with a new side effect (see WR-02 below)** | `warn_on_legacy_duplex_sources(settings)` is called after `configure_logging` (`cli.py:195-196`). I measured that the record now reaches `log_file`. |
+| WR-06 | Exit-code table split by a paragraph | **Closed** | `cli-commands.md:31-38`: row 3 now follows row 2, and the paragraph comes after the table. |
+| WR-07 | `web-api.md` promised safety properties the code lacked | **Closed** | The "cannot do this" and "buttons are gone" bullets are replaced by accurate job-scoping and acknowledgment bullets (`web-api.md:160-165`). The new text has one gap of its own; see WR-03. |
+| WR-08 | Prompt-thread exception hung the CLI for the full timeout | **Closed** | `except Exception` logs the traceback and settles `ABORTED` right away (`cli.py:143-152`). The test asserts `elapsed < 5` against a 600 s bound. |
+| IN-01 | Stale "non-None" docstring | **Closed** | `pipeline.py:74`. |
+| IN-02 | Claim-once logic copied in two coordinators | **Closed** | Both coordinators now use `FlipAnswerSlot` (`pipeline.py:154-240`). Arming stays in the web coordinator. |
+| IN-03 | "signal sent" logged even when the signal was dropped | **Closed** | `_signal_flip` logs "claimed", "dropped: not yet at the flip prompt", "dropped: already answered", or "dropped: not the job waiting" (`worker.py:292-321`). |
+| IN-04 | Legacy source with non-manual `duplex` gave no warning | **Closed** | A second branch in `warn_on_legacy_duplex_sources` (`config.py:299-311`) covers it. |
 
 ## Warnings
 
-### WR-01: `flip_timeout_seconds` is unbounded; 0 or a negative value fails every manual duplex job after pass A, and a very large value crashes
+### WR-01: A worker shut down while parked at the flip prompt leaves the job in `AWAITING_FLIP` for good, and its buttons do nothing
 
-**File:** `src/saneless/config.py:167`
+**File:** `src/saneless/worker.py:208-212`; `src/saneless/web/app.py:80-83`; `src/saneless/web/routes.py:131-138`
 
-**Issue:** `flip_timeout_seconds: int = 600` accepts any int. I measured both edges.
-`OutputConfig(flip_timeout_seconds=-5)` validates, and `Event.wait(-5)` returns at once.
-Zero is a common way to write "no timeout", and with 0 or a negative value every manual
-duplex job scans the whole stack, then fails with "timed out after 0 seconds" and throws
-the fronts away. In the CLI it also leaves a prompt printed that nobody can answer. At the
-other end, a large value meant as "effectively forever" (above `threading.TIMEOUT_MAX`,
-about 9.2e9) makes `Event.wait` raise
-`OverflowError: timestamp too large to convert to C PyTime_t`. That happens after pass A.
-The web job ends `ERROR` with that text, and `saneless scan` shows a raw traceback, because
-`OverflowError` is neither `ScanError` nor `PaperlessError`.
+**Issue:** `ScanWorker.stop()` puts the sentinel on the queue and joins for 5 s. A worker
+thread parked in `WorkerFlipCoordinator.wait_for_flip` never reads the queue, and that wait
+can now last up to 86 400 s. I reproduced it with a scratch script against the real worker
+and store:
 
-**Fix:**
-```python
-flip_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
 ```
-`test_unanswered_prompt_times_out_before_pass_b` depends on `0`. Switch it to building a
-`ClickFlipCoordinator` directly and calling `wait_for_flip(0)`, which is the coordinator's
-own contract, as the Ctrl-C test already does.
-
-### WR-02: Feeder resolution treats a hardware-duplex source the same as a simplex feeder
-
-**File:** `src/saneless/scanner/sane_backend.py:824-828`
-
-**Issue:** `_resolve_feeder_source` accepts any source where `uses_feeder` is true, and
-that includes `FEEDER_DUPLEX`. Two cases go wrong:
-
-- When the operator's `source` is `"ADF Duplex"` (for example, an auto-generated duplex
-  profile hand-edited to `duplex = "manual"`), it is used as-is.
-  `test_a_reported_feeder_the_operator_named_is_honoured` pins exactly this.
-- When `source` is not reported, the first feeder in device order wins, even if it is a
-  duplex source listed before the simplex one.
-
-On a duplex source, each pass feeds both sides of every sheet, so each pass returns 2N
-pages. The counts agree, `_interleave_duplex` pairs a front+back sequence with a reversed
-back+front sequence, and the job reports `DONE` with 4N pages in scrambled order. No
-warning is raised. D-02 says to pick a FEEDER or FEEDER_DUPLEX source. It does not say the
-two are equally good. Manual duplex on a source that already duplexes is never what the
-operator wants.
-
-**Fix:** Prefer `SourceKind.FEEDER`, and use `FEEDER_DUPLEX` only as a last resort with a
-WARNING, or refuse it:
-```python
-kinds = {s: classify_source(s) for s in available_sources}
-if kinds.get(requested) is SourceKind.FEEDER:
-    return requested
-for source, kind in kinds.items():
-    if kind is SourceKind.FEEDER:
-        return source
-duplex_feeders = [s for s, k in kinds.items() if k is SourceKind.FEEDER_DUPLEX]
-if duplex_feeders:
-    msg = (f"Manual duplex needs a single-sided feeder; this device's feeders "
-           f"all scan both sides ({duplex_feeders}). Use duplex = \"hardware\".")
-    raise ScanError(msg)
+stop took 5.0 alive True
+row state after stop: AWAITING_FLIP
 ```
 
-### WR-03: Manual duplex regressed on devices that expose no `source` option
+The lifespan then runs `job_store.close()` while the worker thread is still alive. In a
+process that keeps running after the lifespan (tests, reload), the thread eventually wakes
+and calls `finish_job` on a closed connection. That raises `sqlite3.ProgrammingError` from
+inside the `except` handler, and the thread dies with a traceback.
 
-**File:** `src/saneless/scanner/sane_backend.py:879-886`
+In production the process exits and the row stays `AWAITING_FLIP`. `fail_active_jobs` has no
+production caller (ROBU-06 belongs to Phase 26). After a restart, `_current_or_recent_job`
+returns that row and `_status_context` finds no coordinator, so `flip_answer` is `None`. The
+idle page then renders the Continue and Abort buttons with a 1 s poll. Every click is dropped
+as "not the job waiting at the flip prompt", and the same buttons render again. This is the
+same "click does nothing" symptom CR-01's acknowledgment work set out to remove, and it stays
+until another job is created.
 
-**Issue:** The feeder branch refuses whenever `available_sources` is empty, and that
-includes devices with no `source` option at all (`has_source_option is False`). The comment
-says such a device "cannot be told to feed". But a sheet-fed scanner with a single source
-feeds without being told. On that same device a simplex `source = "ADF"` profile still
-works: `effective_source` stays `"ADF"`, `classify_source` returns FEEDER, and
-`multi_scan()` runs. Before this phase, `"Manual Duplex"` classified as FEEDER_DUPLEX and
-also ran through `multi_scan()`. So manual duplex now fails on hardware where it used to
-work, and where simplex feeding on the same device still works. The "no feeder" error is
-also wrong for this case: the device reports no source *list*, not "no feeder".
+The Phase 26 fix will not cover this by itself. A stop flag does not wake an
+`Event.wait` on the answer slot.
 
-**Fix:** When the device has no source option, trust the classifier on the configured name,
-as the simplex path does:
+**Fix:** Resolve the live flip wait during shutdown, so the job ends through the normal
+`ERROR` path before the join. Do it through `settle`, which ignores arming:
+
 ```python
-if resolve_feeder:
-    if not has_source_option:
-        if classify_source(requested).uses_feeder:
-            return requested, False
-        msg = ("Manual duplex needs a feeder source, and this device exposes no "
-               f"source option to choose one; set source to its feeder (got {requested!r})")
-        raise ScanError(msg)
-    return _resolve_feeder_source(available_sources, requested), True
-```
-Update `test_a_device_with_no_source_option_is_refused` to match.
+# worker.py
+class WorkerFlipCoordinator(FlipCoordinator):
+    def cancel(self) -> None:
+        """Resolve the wait as ABORTED regardless of arming (worker shutdown)."""
+        self._slot.settle(FlipOutcome.ABORTED)
 
-### WR-04: `is_bare_default` ignores `duplex`, so a manual-duplex `default` profile is replaced in memory by a generated flatbed profile
-
-**File:** `src/saneless/auto_profiles.py:197-222` (used at `src/saneless/worker.py:209-224`)
-
-**Issue:** Feeder resolution means `source` no longer has to name a feeder. So a config with
-only `[profiles.default]` and `duplex = "manual"` is now valid and useful. But
-`is_bare_default` compares only `source`, `resolution`, `mode` and `auto_generated`, so it
-treats that profile as uncustomized. On the first web job, `_maybe_auto_generate` runs
-before the worker looks up the profile. It overwrites `self._settings.profiles["default"]`
-with a generated profile (`duplex = "none"`, flatbed source). The operator's first scan
-then silently takes a single flatbed snapshot and reports `DONE`, with no flip prompt. The
-TOML is not rewritten, because `default` is skipped without `--force`, so the in-memory and
-on-disk configs disagree until restart.
-
-**Fix:** Compare the profile as a whole rather than a hand-picked subset, so that no field
-added later can repeat this:
-```python
-return default == ProfileConfig()
-```
-(or at least add `and default.duplex == bare.duplex`). Add a test with a `duplex = "manual"`
-default.
-
-### WR-05: The legacy-source deprecation warning is emitted before logging is configured, so it never reaches `log_file`
-
-**File:** `src/saneless/config.py:258-292`; `src/saneless/cli.py:187-200`
-
-**Issue:** `warn_on_legacy_duplex_source` runs inside `load_settings`. `cli()` calls that
-before `configure_logging`, and no other code path configures logging first. At that point
-no handlers are attached, so the record goes to Python's `lastResort` handler: bare
-message, stderr only. It never reaches the configured rotating `log_file`. D-18 makes this
-warning the operator's only migration instruction. An operator who reads the log file, as
-the appliance setup expects, never sees it.
-
-**Fix:** Configure logging from raw settings first and then re-emit, or collect the
-legacy-profile names during validation and log them after `configure_logging`:
-```python
-# config.py: expose the detection instead of logging inside the validator
-def legacy_manual_duplex_profiles(settings: Settings) -> list[str]: ...
-# cli.py, after configure_logging(...):
-for name in legacy_manual_duplex_profiles(settings):
-    logger.warning(...)
+class ScanWorker:
+    def stop(self) -> None:
+        coordinator = self._flip_coordinator
+        if coordinator is not None:
+            coordinator.cancel()
+        self._queue.put(None)
+        self._thread.join(timeout=5)
 ```
 
-### WR-06: The `scan` exit-code table in `cli-commands.md` is broken by a paragraph inserted mid-table
+Add a worker test that parks a manual-duplex job at `AWAITING_FLIP`, calls `stop()`, and
+asserts that the thread has exited and the row is `ERROR`.
 
-**File:** `docs/reference/cli-commands.md:34-38`
+Also make the status partial stop offering buttons for an `AWAITING_FLIP` row that has no
+live coordinator. For example, `_status_context` could pass `flip_live = worker.flip_armed(job.id)`,
+and `status.html` could render the flip prompt only when that is true.
 
-**Issue:** The new manual-duplex paragraph sits between the row for code 2 and the row for
-code 3. Markdown ends the table at the blank line, so code 3 ("Paperless-ngx upload error")
-renders as a stray `| 3 | ... |` line under the paragraph. The paragraph also reads as if
-it belongs to exit codes.
+### WR-02: The WR-05 fix made the legacy-source warning invisible to CLI users and to Docker deployments
 
-**Fix:** Move the `| 3 | Paperless-ngx upload error ... |` row up to directly after row 2,
-and put the paragraph after the table.
+**File:** `src/saneless/cli.py:188-196`; `src/saneless/logging_config.py:41-66`
 
-### WR-07: `web-api.md` says the web UI cannot send an early answer, and that the buttons are gone before a second click; both are false
+**Issue:** `configure_logging` attaches only a `RotatingFileHandler`. It adds a stderr handler
+only with `-v`, or when the log file cannot be opened. Before the fix, the warning reached
+stderr through `logging.lastResort`. It now goes to the log file and nowhere else. I measured
+this with `saneless --config legacy.toml jobs`: nothing on stderr, and one record in
+`log_file`.
 
-**File:** `docs/reference/web-api.md:149-150`
+Two groups lose the warning:
 
-**Issue:** "The web UI cannot do this" and "the buttons are gone before a second click can
-land on them" are both contradicted by the CR-01 reproduction. The flip routes return
-whatever the store holds straight after signalling, which is still `AWAITING_FLIP`, and
-`partials/status.html` renders the Continue and Abort buttons again for that state. The
-docs promise a safety property the code does not have.
+- **An interactive `saneless scan` user.** This is the person best placed to act on the
+  message. They no longer see it.
+- **The documented Docker deployment.** The `Dockerfile` runs `ENTRYPOINT ["saneless"]` /
+  `CMD ["serve"]` without `-v`. It sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless`, but
+  `log_file` keeps its `$HOME/.local/state/...` default, which is outside the only declared
+  `VOLUME`. `docker logs` used to show the warning. Now it lives only in a file inside the
+  container.
 
-**Fix:** Fixing CR-01 makes the "call them only while AWAITING_FLIP" caveat unnecessary;
-then rewrite both bullets. If CR-01 is deferred, the bullets must at least say that a
-repeated click can land on the next manual-duplex job.
+D-18 makes this message the operator's only migration instruction. The fix traded one
+audience for another instead of reaching both.
 
-### WR-08: An unexpected exception on the CLI prompt thread hangs `saneless scan` for the whole timeout and reports "nobody confirmed"
+**Fix:** Also write the warning to stderr, independent of `-v`, while still logging it to
+the file:
 
-**File:** `src/saneless/cli.py:126-136`
-
-**Issue:** `_prompt` handles only `click.Abort`. Anything else raised by `click.confirm` or
-the read is not handled. For example, `UnicodeDecodeError` on non-UTF-8 terminal input, or
-`OSError`/`EIO` on a lost terminal. The thread dies, `threading.excepthook` prints a
-traceback, and the main thread keeps waiting for the full `flip_timeout_seconds` (10
-minutes by default). It then fails with "nobody confirmed the stack was flipped", which is
-false: the operator may have answered, and the prompt broke. The comment calls TIMED_OUT
-"the right fallback", but a ten-minute hang followed by a wrong cause is not a good one.
-
-**Fix:** Resolve at once, with a truthful outcome and a log line:
 ```python
-try:
-    flipped = click.confirm(_FLIP_PROMPT, default=True)
-except click.Abort:
-    self._resolve(FlipOutcome.ABORTED)
-    return
-except Exception:
-    logger.exception("Flip prompt failed; treating it as an abort")
-    self._resolve(FlipOutcome.ABORTED)
-    return
+# config.py
+def legacy_duplex_source_warnings(settings: Settings) -> list[str]:
+    """Build one message per legacy-looking profile (pure; no logging)."""
+    ...
+
+# cli.py, after configure_logging(...)
+for message in legacy_duplex_source_warnings(settings):
+    logger.warning("%s", message)
+    click.echo(f"Warning: {message}", err=True)
 ```
-(`BLE001` may need the concrete types, such as `OSError` and `UnicodeError`, instead of a
-bare `Exception`.)
+
+Add a `CliRunner` test that asserts the message appears in `result.stderr` without `-v`.
+
+### WR-03: The flip endpoints require a `job_id` that no documented API surface exposes
+
+**File:** `docs/reference/web-api.md:136-156, 163`; `src/saneless/web/routes.py:355-410`
+
+**Issue:** Both flip routes now reject a request without `job_id` (422). `web-api.md` tells a
+direct API caller to "poll `/api/jobs/current/status` for `AWAITING_FLIP` before answering".
+That endpoint, `POST /api/scan` and `/api/jobs/history` all return HTML, and none of them
+shows a job id. The only place the id appears is inside the `hx-vals` attribute of the
+flip partial's buttons. A script following the reference docs cannot build a valid request
+without scraping that attribute, which is undocumented markup. The prior contract took no
+fields, so this is a breaking API change with no documented way to migrate.
+
+**Fix:** Pick one of these:
+
+- Document where the id comes from. For example: "the `hx-vals` attribute of the Continue
+  button in the `AWAITING_FLIP` partial". Weak, because it makes markup part of the contract.
+- Expose the id in a stable way, for example `data-job-id="{{ job.id }}"` on
+  `#status-area`, and document it.
+- Return the id from `POST /api/scan` in an `HX-Trigger` or `X-Job-Id` response header, and
+  document that.
+
+Whichever you choose, add it to the `POST /api/scan` and `GET /api/jobs/current/status`
+sections, and fix the "poll ... before answering" sentence so it says how to get the id.
 
 ## Info
 
-### IN-01: Stale "non-None" wording in `PipelineEvent.job_state`
+### IN-01: "A call arriving just after the job ended reports that job" is false when another job is queued, including CR-01's own scenario
 
-**File:** `src/saneless/pipeline.py:72`
-**Issue:** The return type is now `JobState`, never `None`, but the docstring still says
-"Note that a non-``None`` result is not an instruction to write that state".
-**Fix:** Change it to "Note that the returned state is not an instruction to write it".
+**File:** `docs/reference/web-api.md:141`; `src/saneless/web/routes.py:89-95`
+**Issue:** `_current_or_recent_job` falls back to `list_recent(limit=1)`, which orders by
+`created_at DESC`. When job 1 is aborted and job 2 is already queued, the response and the
+following polls show job 2 as `PENDING`, not job 1's `ERROR`. That is exactly the
+double-click scenario CR-01 describes. Job 1's abort result is never shown in the status
+area, only in the history table. The behaviour is older than this phase, but the rewritten
+paragraph keeps the claim.
+**Fix:** Qualify the sentence ("...reports that job, unless a newer job has been queued").
+Alternatively, have `_status_context` prefer the job named by `claimed[0]` when it rendered a
+different job.
 
-### IN-02: The claim-once logic is copied in two coordinators
+### IN-02: A broken CLI prompt is reported at the terminal as an operator abort
 
-**File:** `src/saneless/cli.py:93-159`; `src/saneless/worker.py:57-116`
-**Issue:** `__init__` (lock, event, outcome) and `_resolve` are the same concurrency code in
-both places, with the same comments. A fix to one, such as CR-01's arming, will not reach
-the other.
-**Fix:** Move the single-answer slot into one private helper, for example a
-`_OneShotAnswer` in `pipeline.py` next to `FlipCoordinator`, and have both coordinators use
-it.
+**File:** `src/saneless/cli.py:143-152`; `src/saneless/pipeline.py:956-958`
+**Issue:** After WR-08 the operator sees `Scan error: Manual duplex scan aborted at the flip
+prompt`, but they did not abort. Without `-v` the traceback that explains why goes only to
+`log_file`, and the terminal gives no hint to look there. D-09 rules out a fourth outcome, so
+the message cannot change through `FlipOutcome`.
+**Fix:** In the `except Exception` arm, also
+`click.echo("Flip prompt failed; see the log for details", err=True)` before settling.
 
-### IN-03: `continue_flip`/`abort_flip` log "signal sent" even when the answer is dropped
+### IN-03: The status poll reads the store and the coordinator separately, so a job that ends between the two reads briefly shows its buttons again
 
-**File:** `src/saneless/worker.py:176, 183`
-**Issue:** `_resolve`'s result is ignored, so a late Continue or Abort that was dropped (D-16)
-still logs "Manual duplex: continue signal sent". During an incident the log then claims an
-action that had no effect.
-**Fix:** Have `signal_*` return whether it claimed the answer, and log "dropped (already
-answered: X)" when it did not.
+**File:** `src/saneless/web/routes.py:131-138`
+**Issue:** The poll reads `AWAITING_FLIP` from the store. The worker then settles `ABORTED`
+or `TIMED_OUT`, writes `ERROR`, and clears `_flip_coordinator` in `finally`. After that,
+`worker.flip_answer(job.id)` returns `None`, and the partial renders Continue and Abort for
+a job that has already ended. The `claimed` parameter covers this race for the route that
+made the claim, but not for `current_job_status` or `index`. It is harmless: a click is
+dropped and the next poll fixes the view. It is the last place where CR-01's "buttons that
+do nothing" can still appear.
+**Fix:** Read the coordinator first, or re-read the job after `flip_answer` returns `None`
+and render from that second read.
 
-### IN-04: A legacy source with an explicit non-manual `duplex` goes to SANE unchanged, with no warning
+### IN-04: Plan IDs in code docstrings will go stale
 
-**File:** `src/saneless/config.py:280-282`
-**Issue:** `source = "Manual Duplex"` together with `duplex = "none"` (or `"hardware"`) is
-not translated, which is correct because explicit configuration wins. But it is also not
-warned about, because the warning requires `duplex == "manual"`. The string then reaches
-`_resolve_source`. There it either raises, or on a device offering `Auto` it is swapped for
-`Auto` and takes a flatbed snapshot, which is C-01's path.
-**Fix:** Warn for every legacy-looking source whatever `duplex` says, and tailor the
-message when `duplex` is not `"manual"`.
+**File:** `src/saneless/worker.py:259-260`
+**Issue:** "25-11's status rendering reads this..." names a planning artifact, not a code
+path. Once `.planning/` is archived, the reference means nothing to a reader.
+**Fix:** Name the caller instead: "`routes._status_context` reads this...".
+
+### IN-05: A full queue blocks the event loop, so Continue and Abort cannot be served while the worker is parked at the flip prompt
+
+**File:** `src/saneless/web/routes.py:241`; `src/saneless/worker.py:197, 222`
+**Issue:** `start_scan` is `async def` and calls `worker.submit`, which is
+`queue.Queue(maxsize=10).put`, a blocking call. While the worker waits at a flip prompt, ten
+queued jobs plus one more submit block the event loop. The `/api/flip/*` routes then cannot
+run, the prompt cannot be answered, and everything stays stuck until `flip_timeout_seconds`
+(up to a day) expires. This belongs to Phase 26 (ROBU-02 429 backpressure, ROBU-05 blocking
+routes). It is recorded here because the flip wait is what turns a slow submit into a
+deadlock.
+**Fix:** Make sure Phase 26's ROBU-02 test covers a worker parked at `AWAITING_FLIP`. Use
+`put_nowait` and return 429 on `queue.Full`.
 
 ---
 
-_Reviewed: 2026-09-14T15:09:53Z_
+_Reviewed: 2026-09-14T17:41:29Z_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: deep_
