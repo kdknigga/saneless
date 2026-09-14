@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 import threading
 from pathlib import Path
@@ -574,18 +575,46 @@ class TestManualDuplexPrompt:
 
         assert outcome is FlipOutcome.ABORTED
 
+    def test_the_coordinator_times_out_at_a_zero_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``wait_for_flip(0)`` with nobody answering resolves ``TIMED_OUT``.
+
+        The coordinator's own contract, independent of the config bounds that
+        keep zero out of ``flip_timeout_seconds`` (WR-01): its ``timeout``
+        argument is the zero-cost seam, so no wall clock is spent here.
+        """
+        release = threading.Event()
+
+        def never_answered(*_args: object, **_kwargs: object) -> bool:
+            """Block until the test lets go, then decline."""
+            release.wait()
+            return False
+
+        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        coordinator = ClickFlipCoordinator()
+
+        try:
+            outcome = coordinator.wait_for_flip(0)
+        finally:
+            release.set()
+
+        assert outcome is FlipOutcome.TIMED_OUT
+
     def test_unanswered_prompt_times_out_before_pass_b(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
         An answer that never arrives fails the job on the flip wait (D-19).
 
-        The timeout is ``0``, not a small float and not a wall-clock wait.
-        ``flip_timeout_seconds`` is typed ``int``, so pydantic rejects ``0.05``
-        outright (a float with a fractional part is not a lax-mode int), and
-        widening a production field for a test is not worth it.  Zero costs no
-        wall clock and proves the same property: the bounded wait expires at
-        once and ``TIMED_OUT`` is claimed before pass B.
+        The timeout is one second, the smallest value config accepts: zero is
+        no longer a legal ``flip_timeout_seconds`` (WR-01), and the field is
+        typed ``int``, so a fractional float is rejected too.  One second of
+        wall clock buys the whole ``scan`` command end to end -- the bounded
+        wait expires and ``TIMED_OUT`` is claimed before pass B.  The
+        zero-cost version of the coordinator's own contract is
+        ``test_the_coordinator_times_out_at_a_zero_timeout``.
         """
         # The only test in this class that stubs click.confirm instead of
         # driving the real one, and it has to.  CliRunner's empty input stream
@@ -605,7 +634,7 @@ class TestManualDuplexPrompt:
         uploads: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_duplex_settings(tmp_path, flip_timeout_seconds=0),
+            settings=_duplex_settings(tmp_path, flip_timeout_seconds=1),
             scanner_cls=_counting_scanner(calls),
             paperless_cls=_recording_paperless(uploads),
         )
@@ -819,6 +848,56 @@ class TestCliFlags:
         result = runner.invoke(cli, ["--config", "/path/to/config.toml", "devices"])
         assert result.exit_code == 0
         assert captured["config_path"] == "/path/to/config.toml"
+
+
+class TestLegacyDuplexWarningReachesLogFile:
+    """The legacy manual-duplex warning lands in the configured log file (WR-05)."""
+
+    def test_warning_is_written_to_log_file(self, tmp_path: Path) -> None:
+        """
+        A real config load through ``cli()`` writes the warning to ``log_file``.
+
+        Deliberately not ``_patch_cli``: the subject is the order of loading
+        settings against configuring logging, so both run for real.  The
+        warning is only useful to an operator if it reaches the log file the
+        appliance keeps, and it can only reach it once that handler exists.
+        """
+        log_file = tmp_path / "logs" / "saneless.log"
+        doc = tomlkit.document()
+        output = tomlkit.table()
+        output.add("tmp_dir", str(tmp_path / "tmp"))
+        output.add("data_dir", str(tmp_path / "data"))
+        output.add("log_file", str(log_file))
+        doc.add("output", output)
+        profiles_table = tomlkit.table(is_super_table=True)
+        profiles_table.add("default", tomlkit.table())
+        legacy = tomlkit.table()
+        legacy.add("source", "Manual Duplex")
+        profiles_table.add("legacy", legacy)
+        doc.add("profiles", profiles_table)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(tomlkit.dumps(doc))
+
+        root_logger = logging.getLogger()
+        handlers_before = list(root_logger.handlers)
+        level_before = root_logger.level
+        try:
+            result = CliRunner().invoke(
+                cli, ["--config", str(config_file), "jobs", "--limit", "1"]
+            )
+        finally:
+            # configure_logging adds to the ROOT logger; remove what this
+            # invocation added so later tests do not write into tmp_path.
+            for handler in list(root_logger.handlers):
+                if handler not in handlers_before:
+                    root_logger.removeHandler(handler)
+                    handler.close()
+            root_logger.setLevel(level_before)
+
+        assert result.exit_code == 0, result.output
+        content = log_file.read_text()
+        assert "'legacy'" in content
+        assert 'duplex = "manual"' in content
 
 
 class TestJobsCommand:
