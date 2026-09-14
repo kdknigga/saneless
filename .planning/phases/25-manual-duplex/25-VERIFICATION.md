@@ -1,40 +1,16 @@
 ---
 phase: 25-manual-duplex
-verified: 2026-09-14T15:15:49Z
-status: gaps_found
-score: 4/5 must-haves verified
+verified: 2026-09-14T17:49:11Z
+status: passed
+score: 5/5 must-haves verified
 overrides_applied: 0
-gaps:
-  - truth: "During pass B the job is in a visible SCANNING_REVERSE state, Abort at the flip prompt cancels the job, and wait_transition no longer exists (DPLX-06 / success criterion 4)"
-    status: partial
-    reason: >
-      SCANNING_REVERSE and the deletion of wait_transition/_transition_event are fully verified
-      in code. But "Abort at the flip prompt cancels the job" is not reliably true: the
-      WorkerFlipCoordinator is constructed and begins accepting signals at job start (worker.py:256),
-      well before the pipeline ever announces AWAITING_FLIP, and continue_flip/abort_flip
-      (worker.py:171-183, routes.py:309-345) apply an incoming signal to whichever coordinator
-      currently exists with no job-id or state check. Reproduced independently (outside the
-      reviewer's own script) against the real ScanWorker/run_pipeline: a normal "did that do
-      anything?" double-click on Abort at the flip prompt -- caused by the route re-rendering the
-      stale AWAITING_FLIP partial before the worker thread has woken and cleared the job -- lands
-      the second click on a different, already-started job and aborts its pass A before that job's
-      operator ever saw a flip prompt. The mirror-image Continue case reproduces C-02 itself (pass
-      B starts on an unflipped stack) because a stale early Continue is claimed by the coordinator
-      before pass A even finishes. This is the code review's CR-01 (rated BLOCKER, not a minor API
-      quirk), and it directly falsifies the "Abort ... cancels the job" clause of DPLX-06 as well as
-      the phase's own goal statement ("manual duplex actually works ... pass B is visible").
-    artifacts:
-      - path: "src/saneless/worker.py"
-        issue: "WorkerFlipCoordinator is created at _process_job start (line 256), before pass A, and continue_flip/abort_flip (171-183) signal it unconditionally -- no arming gate tied to AWAITING_FLIP, no job-id check"
-      - path: "src/saneless/web/routes.py"
-        issue: "continue_flip/abort_flip routes (309-345) call worker.continue_flip()/abort_flip() and immediately render _current_or_recent_job with no verification that the signal was claimed by, or even intended for, that job"
-      - path: ".planning/phases/25-manual-duplex/deferred-items.md"
-        issue: "Claims 'Reach: direct API callers only. ... a browser user cannot send the early answer.' This is false -- an ordinary double-click/retry after a legitimate Abort click reaches it, as reproduced against the real worker."
-    missing:
-      - "Arm the coordinator only when the pipeline actually announces AWAITING_FLIP (or SCANNING_REVERSE has not yet started), not at job construction"
-      - "Have continue_flip/abort_flip name the job they are answering (e.g. job_id in the flip partial's hx-vals) and drop a signal that does not match the current job"
-      - "A worker test that sends an Abort during pass A and during the next queued job's pass A, and asserts both are dropped rather than misapplied"
-      - "Correct docs/reference/web-api.md's false claim that the web UI cannot send an early answer (WR-07), and remove or correct deferred-items.md's reach classification"
+re_verification:
+  previous_status: gaps_found
+  previous_score: 4/5
+  gaps_closed:
+    - "During pass B the job reports SCANNING_REVERSE, Abort at the flip prompt cancels the job, and wait_transition no longer exists (DPLX-06 / success criterion 4) — the CR-01 race (stale double-click Abort landing on a different, already-running job; early Continue during pass A) is closed. WorkerFlipCoordinator is now bound to one job_id, armed only when the pipeline announces AWAITING_FLIP (before the state is persisted), and continue_flip/abort_flip compare the posted job_id against the live coordinator's own job_id from a single snapshot. Independently reproduced against the real ScanWorker/run_pipeline (not the phase's own test file): both scenarios now behave correctly — the stale click is dropped and the correct job's own click is what starts/aborts it."
+  gaps_remaining: []
+  regressions: []
 ---
 
 # Phase 25: Manual Duplex Verification Report
@@ -44,9 +20,9 @@ profile field, `source` is passed to SANE verbatim, exactly one place decides th
 required `FlipCoordinator` with a timeout serves both CLI and web, and pass B is visible — with the
 ADF duplex how-to rewritten in-phase to stop documenting `source = "Manual Duplex"` as current.
 
-**Verified:** 2026-09-14T15:15:49Z
-**Status:** gaps_found
-**Re-verification:** No — initial verification
+**Verified:** 2026-09-14T17:49:11Z
+**Status:** passed
+**Re-verification:** Yes — after gap closure (plans 25-10 through 25-15, gap waves 1-4)
 
 ## Goal Achievement
 
@@ -54,116 +30,179 @@ ADF duplex how-to rewritten in-phase to stop documenting `source = "Manual Duple
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | A legacy `source = "Manual Duplex"` config still loads and scans, is translated to `duplex = "manual"` at load with a deprecation warning, and `source` is never inspected for strategy anywhere in the codebase | ✓ VERIFIED | `config.py:121-141` (`_translate_legacy_manual_duplex` before-validator), `config.py:260-292` (`warn_on_legacy_duplex_source`, named per profile). `pipeline._is_manual_duplex` is gone; the only strategy reads are `profile.duplex == "manual"` in `pipeline.py:1049`, `worker.py:254`, `cli.py:226` — all field reads, none inspect `source`. `grep -n "Manual Duplex"` across `src/` finds only the deprecated-form recogniser, its docstrings, and `scanner/base.py`'s classifier comment. |
-| 2 | `saneless scan` with a manual-duplex profile prompts the operator on stdin and blocks until answered, then completes a two-pass scan; manual duplex with no coordinator, or with no interactive terminal, is refused before the scanner is opened | ✓ VERIFIED | `cli.py:218-232` refuses (exit 2) before `SaneBackend` is constructed when `not _stdin_is_interactive()`. `ClickFlipCoordinator` (`cli.py:68-136`) runs `click.confirm` on a daemon thread bounded by `flip_timeout_seconds` (D-19). `pipeline._flip_context` (`pipeline.py:901-...`) raises `ConfigError` when `request.flip_coordinator is None`, called before `_resolve_device` (`pipeline.py:1050-1052`), so no SANE contact happens first. |
-| 3 | A flip wait that exceeds the timeout fails the job with a clear message and releases the scanner for the next job | ✓ VERIFIED | `pipeline.py:868-873`: `FlipOutcome.TIMED_OUT` raises `ScanError` with `"... timed out after {timeout:g} seconds: nobody confirmed the stack was flipped"`, before pass B / any further scanner call. `scan_pages` already opens/closes the device per call (pre-existing), so the handle is released; the worker's `finally` (worker.py:332-338) clears `_flip_coordinator`/`_current_job_id` and the thread returns to `_run`'s queue loop, unparked for the next job. `tests/test_worker.py`/`test_outcomes_e2e.py` cover the end-to-end timeout case (25-05 summary). |
-| 4 | During pass B the job reports `SCANNING_REVERSE`, Abort at the flip prompt cancels the job, and `wait_transition` no longer exists | ✗ FAILED | `SCANNING_REVERSE` and the transition-event deletion are real (`vocabulary.py`, `grep` for `wait_transition`/`_transition_event` across `src/`+`tests/` returns 0 matches). But "Abort ... cancels the job" is not reliable: CR-01 (see Gaps below), reproduced independently, shows a normal double-click can abort a *different* job than the one the operator meant, and the mirror case can start pass B on an unflipped stack — the very C-02 failure this phase exists to close. |
-| 5 | A write-then-load round trip proves auto-profiles always emits a `default` profile for flatbed-only, feeder-only, and mixed devices | ✓ VERIFIED | `tests/test_auto_profiles.py:548-588`, `test_generated_config_round_trips_with_a_default_profile`, parametrised over `flatbed-only`/`feeder-only`/`mixed` (`:551,555,560`), writes via `write_profiles_to_config` and reloads via `load_settings`, asserting `settings.profiles["default"]` for each shape. |
+| 1 | A legacy `source = "Manual Duplex"` config still loads and scans, is translated to `duplex = "manual"` at load with a deprecation warning, and `source` is never inspected for strategy anywhere in the codebase | ✓ VERIFIED | `config.py:111` (`duplex: Literal[...]`), `:123` (`_translate_legacy_manual_duplex` before-validator, unchanged since initial verification), `:264-311` (`warn_on_legacy_duplex_sources`, now called from `cli.py:196` after `configure_logging`, per the user-approved D-03 amendment). Only reads of `duplex` decide strategy: `pipeline.py:1140`, `worker.py:392`, `cli.py:222`. |
+| 2 | `saneless scan` with a manual-duplex profile prompts the operator on stdin and blocks until answered, then completes a two-pass scan; manual duplex with no coordinator, or with no interactive terminal, is refused before the scanner is opened | ✓ VERIFIED | `cli.py:225-232` refuses (exit 2) before the scanner opens when `not _stdin_is_interactive()`. `ClickFlipCoordinator` runs `click.confirm` on a daemon thread bounded by `flip_timeout_seconds`, now built on the shared `FlipAnswerSlot` (25-14/IN-02). No regression found. |
+| 3 | A flip wait that exceeds the timeout fails the job with a clear message and releases the scanner for the next job | ✓ VERIFIED | `pipeline.py:959` (`FlipOutcome.TIMED_OUT` raises `ScanError`), unchanged in behaviour. `flip_timeout_seconds` is now bounded to `1..86_400` (`config.py`, `Field(ge=1, le=86_400)`), closing the previously-open WR-01 (initial review) unbounded-timeout warning. |
+| 4 | During pass B the job reports `SCANNING_REVERSE`, Abort at the flip prompt cancels the job, and `wait_transition` no longer exists | ✓ VERIFIED (gap closed) | `SCANNING_REVERSE` persisted and visible (`vocabulary.py:47`, `pipeline.py` match arms). `grep -rn "wait_transition\|_transition_event" src/ tests/` → 0 matches. Abort-cancels-the-job is now reliable: see "CR-01 Independent Reproduction" below. |
+| 5 | A write-then-load round trip proves auto-profiles always emits a `default` profile for flatbed-only, feeder-only, and mixed devices | ✓ VERIFIED | `tests/test_auto_profiles.py` round-trip tests still pass (3 passed, re-run directly). `is_bare_default` was hardened in gap closure (25-13, WR-04) to compare the whole profile against `ProfileConfig()`, not ignoring `duplex` — this strengthens rather than weakens the truth. |
 
-**Score:** 4/5 truths verified
+**Score:** 5/5 truths verified
+
+### CR-01 Independent Reproduction (primary focus of this re-verification)
+
+Per instructions, I did not trust the review's or the phase's own regression tests as sole evidence.
+I wrote a fresh reproduction script (not part of the test suite, not derived from
+`tests/test_worker.py`) that drives the real `ScanWorker` / `run_pipeline` with a gated fake
+scanner, reproducing both of the prior verification's falsifying scenarios:
+
+**Scenario 1 — stale double-click Abort landing on the next job.** Two manual-duplex jobs queued.
+Abort clicked at job 1's prompt (claimed). A second, stale Abort naming job 1 is sent again once
+job 2's pass A is already in flight (modelling the double-click's second click arriving late).
+
+```
+First Abort click on job1: claimed=True
+job1 state: ERROR
+Second (stale) Abort click still naming job1: claimed=False
+job2 state after pass A: AWAITING_FLIP
+job2 flip_answer immediately after reaching prompt: None
+job2's own Continue click: claimed=True
+job2 final state: DONE, error=None
+PASS
+```
+
+**Scenario 2 — early Continue sent during pass A.** A Continue is sent for the job while its pass A
+scan is still in flight (gated open).
+
+```
+Early Continue during pass A: claimed=False
+job state after pass A completes: AWAITING_FLIP
+flip_answer right when AWAITING_FLIP is reached: None
+Real Continue click at the actual prompt: claimed=True
+final state: DONE
+```
+
+Both scenarios that previously falsified DPLX-06 / success criterion 4 now behave correctly: the
+stale/foreign/early signal is dropped, and only the correctly-named signal sent after the job's own
+`AWAITING_FLIP` is announced is claimed. This independently confirms the code review's CR-01
+disposition ("Closed") rather than merely trusting it.
+
+I also read the fix directly: `WorkerFlipCoordinator.__init__(job_id)` binds one coordinator to one
+job (`worker.py:79-88`); `arm()` is called from `_status_cb` in `worker.py:429` *before*
+`self._job_store.update_state(_jid, state)` persists `AWAITING_FLIP` at `worker.py:430` — so no
+observer can ever read `AWAITING_FLIP` from the store and find the coordinator unarmed.
+`_signal_flip` (`worker.py:275-321`) reads `self._flip_coordinator` once into a local and compares
+`coordinator.job_id != job_id` before signalling — a single snapshot, so the check and the signal
+cannot straddle the `finally` block's `self._flip_coordinator = None` (`worker.py:481`) and land on
+a different job's coordinator. `routes.py:355-410`'s `continue_flip`/`abort_flip` now require
+`job_id: str = Form(...)` and are rejected with 422 without it (confirmed by
+`tests/test_web.py::test_flip_routes_require_a_job_id`, run directly: passes). The flip partial
+sends it via `hx-vals='{{ {"job_id": job.id} | tojson }}'` (`flip.html:42-43`), and a real Chromium
+click (not just a string assertion) exercises the full path end to end
+(`tests/test_browser.py::test_flip_continue_click_answers_the_waiting_job`, run directly: passes).
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `src/saneless/config.py` | `duplex` field + legacy translation + named warning | ✓ VERIFIED | `ProfileConfig.duplex: Literal["none","hardware","manual"] = "none"` (`:109`); before-validator (`:121-141`); `warn_on_legacy_duplex_source` (`:260-292`) |
-| `src/saneless/pipeline.py` | Single strategy read, `FlipCoordinator` ABC, `match`/`assert_never` dispatch | ✓ VERIFIED | `:1049` (sole canonical read + comment naming DPLX-03), `:114-136` (ABC), `:862-875` and `:1097-1107` (both dispatches use `match`/`assert_never`, no `isinstance`) |
-| `src/saneless/worker.py` | `WorkerFlipCoordinator`, no duplicated string-matching rule, `wait_transition` gone | ⚠️ WIRED but with race | Rule is a field read (not a duplicated heuristic) — fine. `wait_transition`/`_transition_event` fully removed. But the coordinator's lifetime/arming is broken (CR-01) — see gap above. |
-| `src/saneless/cli.py` | `click.confirm`-based prompt, non-TTY refusal, exit-2 | ✓ VERIFIED | `cli.py:68-232` |
-| `src/saneless/web/routes.py` | Shared "current or most recent job" lookup on all three status routes | ✓ VERIFIED (lookup); ⚠️ (signal gating) | `_current_or_recent_job` used at `:213`, `:321`, and in `abort_flip`; but the routes do not scope the *signal* to the job being viewed (part of CR-01) |
-| `src/saneless/vocabulary.py` | `JobState.SCANNING_REVERSE` (9th member), `FlipOutcome` | ✓ VERIFIED | confirmed via `PipelineEvent.job_state` no longer `Optional` and match arms in `pipeline.py:83-97` |
-| `src/saneless/scanner/` | Feeder-source resolution, no `Auto` fallback reachable for manual duplex | ✓ VERIFIED (core case) | `sane_backend.py:791-847`, `_resolve_feeder_source`; `Auto` substitution structurally unreachable via disjoint early return (`:875-880`). Edge-case gaps noted below (WR-02/WR-03), not roadmap blockers. |
-| `src/saneless/auto_profiles.py` | `duplex` key on generated profiles, DPLX-07 round trip | ✓ VERIFIED | `_duplex()` helper, write-only-when-non-default; round-trip test at `tests/test_auto_profiles.py:564` |
-| `docs/how-to/set-up-adf-duplex.md` | Rewritten to stop teaching `source = "Manual Duplex"` | ✓ VERIFIED | Only the two-key form (`source` + `duplex = "manual"`) appears; grep confirms no legacy `source = "Manual Duplex"` example remains |
+| `src/saneless/config.py` | `duplex` field + legacy translation + named warning | ✓ VERIFIED | Unchanged core; warning call site moved to `cli.py` post-logging (D-03 amendment) |
+| `src/saneless/pipeline.py` | Single strategy read, `FlipCoordinator` ABC, `match`/`assert_never` dispatch, shared `FlipAnswerSlot` | ✓ VERIFIED | `:1140` sole read; `FlipAnswerSlot` (`:154-240`, moved up in the module during gap closure) now composed by both coordinators (IN-02 closed) |
+| `src/saneless/worker.py` | `WorkerFlipCoordinator` bound to one job, armed at `AWAITING_FLIP`, no duplicated string rule, `wait_transition` gone | ✓ VERIFIED | Fixed per CR-01; see reproduction above |
+| `src/saneless/cli.py` | `click.confirm`-based prompt, non-TTY refusal, exit-2, bounded daemon thread, prompt-failure aborts at once | ✓ VERIFIED | WR-08 (prompt-thread exception hangs) also closed: `except Exception` logs and settles `ABORTED` immediately (`cli.py:143-152`) |
+| `src/saneless/web/routes.py` | Shared job lookup, job-scoped flip signals, acknowledgment rendering | ✓ VERIFIED | `_current_or_recent_job`, `_status_context` with `claimed` param, both flip routes require `job_id` |
+| `src/saneless/vocabulary.py` | `JobState.SCANNING_REVERSE`, `FlipOutcome`, `flip_answer_label` | ✓ VERIFIED | `flip_answer_label` added in 25-11 for acknowledgment copy |
+| `src/saneless/scanner/` | Feeder-source resolution incl. `FEEDER_DUPLEX` handling and no-source-option devices | ✓ VERIFIED | WR-02/WR-03 (initial review) closed by 25-13: `_resolve_feeder_source` prefers `FEEDER`, refuses `FEEDER_DUPLEX`-only devices with a `duplex = "hardware"` pointer; no-source-option devices trust `classify_source` again |
+| `src/saneless/auto_profiles.py` | `duplex` key on generated profiles, DPLX-07 round trip, whole-profile `is_bare_default` | ✓ VERIFIED | `is_bare_default` now compares the full `ProfileConfig()` (WR-04 closed) |
+| `docs/how-to/set-up-adf-duplex.md` | Rewritten to stop teaching `source = "Manual Duplex"`, updated for the new feeder-preference/refusal behaviour | ✓ VERIFIED | No `source = "Manual Duplex"` example; describes single-sided preference, both-sides-only refusal (25-15) |
+| `docs/reference/web-api.md` | No longer claims the web UI "cannot" send an early answer; documents `job_id` requirement | ✓ VERIFIED (with WR-03 caveat) | Corrected prose is accurate for what it claims. It does not tell a *direct API caller with no browser* how to obtain `job_id` (the only place it appears is inside the flip button's `hx-vals` markup) — see Anti-Patterns/Warnings below. This is a real doc gap for headless API callers, but it does not make the corrected claims false, and DPLX-04's requirement ("the web provides the HTMX Continue button") is about the web UI, which is fully documented and tested. |
+| `docs/reference/cli-commands.md` | Exit-code table intact | ✓ VERIFIED | Rows 0-3 in one table, paragraph follows (WR-06 closed) |
+| `.planning/phases/25-manual-duplex/deferred-items.md` | Corrected reach classification | ✓ VERIFIED | No longer claims the defect was "direct API callers only"; documents the actual CR-01 finding and its resolution in 25-10/25-11 |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|-----|-----|--------|---------|
-| `run_pipeline` | `_flip_context` | `manual_duplex` gate before `_resolve_device` | WIRED | `pipeline.py:1049-1052` |
-| `ScanWorker._process_job` | `WorkerFlipCoordinator` | construction keyed on `profile.duplex == "manual"` | WIRED but unscoped | Constructed correctly, but not *armed* correctly — see gap |
-| `routes.continue_flip`/`abort_flip` | `ScanWorker.continue_flip`/`abort_flip` | direct call, then shared job lookup for render | WIRED but unscoped | No job-id/state check on the signal itself (CR-01) |
-| `cli.scan` | `ClickFlipCoordinator` | `PipelineRequest.flip_coordinator` | WIRED | `cli.py` (confirmed by 25-07 summary and code read) |
-| `auto_profiles.generate_profiles` | `write_profiles_to_config` → `load_settings` | round-trip test | WIRED | `tests/test_auto_profiles.py:564-588` |
+| `run_pipeline` | `_flip_context` | `manual_duplex` gate before `_resolve_device` | WIRED | Unchanged from initial verification |
+| `ScanWorker._process_job._status_cb` | `WorkerFlipCoordinator.arm()` | called before `update_state(AWAITING_FLIP)` | WIRED | `worker.py:421-430` |
+| `routes.continue_flip`/`abort_flip` | `ScanWorker.continue_flip`/`abort_flip(job_id)` | required `job_id` form field | WIRED | `routes.py:355-410`; 422 without it |
+| `flip.html` Continue/Abort buttons | `job_id` | `hx-vals='{{ {"job_id": job.id} | tojson }}'` | WIRED | Verified end-to-end with a real browser click test |
+| `cli.scan` | `ClickFlipCoordinator` | `PipelineRequest.flip_coordinator`, built on shared `FlipAnswerSlot` | WIRED | `cli.py`; IN-02 unification |
+| `auto_profiles.generate_profiles` | `write_profiles_to_config` → `load_settings` | round-trip test | WIRED | `tests/test_auto_profiles.py`, re-run directly: 3 passed |
+| `cli()` | `config.warn_on_legacy_duplex_sources` | called after `configure_logging(...)` | WIRED (but see WR-02 below) | `cli.py:188-196`; reaches `log_file`, does not reach stderr without `-v` |
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| Full test suite | `uv run pytest -q` | 1043 passed | ✓ PASS |
+| Full test suite | `uv run pytest -q` | 1103 passed | ✓ PASS |
 | Lint | `uv run ruff check .` | No issues found | ✓ PASS |
 | Type check (ty) | `uv run ty check` | All checks passed | ✓ PASS |
 | Type check (pyrefly) | `uv run pyrefly check src tests` | 0 errors | ✓ PASS |
 | `wait_transition`/`_transition_event` removed | `grep -rn "wait_transition\|_transition_event" src/ tests/` | 0 matches | ✓ PASS |
-| CR-01 reproduction (double-click Abort mis-hits a queued job) | `uv run python3 <verifier's own repro script against the live ScanWorker/run_pipeline, independent of reviewer's script>` | `job1: ERROR ... aborted at the flip prompt` / `job2: ERROR ... aborted at the flip prompt scan calls: 2` — job 2's pass A was aborted by a click meant to confirm job 1's abort landed | ✗ FAIL | Confirms CR-01 as a genuine, reproducible defect, not a documentation nuance |
+| CR-01 independent reproduction (double-click Abort, gated scanner, real ScanWorker/run_pipeline) | custom script, not part of test suite | stale click dropped (`claimed=False`), job 2 unaffected, DONE | ✓ PASS |
+| CR-01 independent reproduction (early Continue during pass A) | same script | early click dropped (`claimed=False`), pass B only starts on the real prompt click | ✓ PASS |
+| Job-scoping unit regressions | `uv run pytest -q -k "TestFlipSignalsAreJobScoped"` | passed | ✓ PASS |
+| Real-browser flip click | `uv run pytest -q -k test_flip_continue_click_answers_the_waiting_job` | 1 passed | ✓ PASS |
+| Flip routes require `job_id` | `uv run pytest -q -k test_flip_routes_require_a_job_id` | passed (parametrized) | ✓ PASS |
+| Auto-profiles round trip | `uv run pytest -q tests/test_auto_profiles.py -k round_trip` | 3 passed | ✓ PASS |
+| WR-02 reproduction (stderr visibility) | read `logging_config.py`: file handler only, no stderr handler without `-v` or on `OSError` | confirmed: warning reaches `log_file` only | Confirms review's WR-02 (see Warnings) |
+| WR-01 reproduction (shutdown while parked at flip prompt) | read `worker.py::stop()`: no coordinator resolution before `join(timeout=5)` | confirmed: a parked `wait_for_flip` (up to 86,400s) is not woken by `stop()` | Confirms review's WR-01 (see Warnings) |
 
 ### Requirements Coverage
 
 | Requirement | Source Plan | Description | Status | Evidence |
 |-------------|-------------|-------------|--------|----------|
-| DPLX-01 | 25-01, 25-04, 25-06, 25-08, 25-09 | `duplex` field; `source` never overloaded | ✓ SATISFIED | See Truth 1 |
-| DPLX-02 | 25-01, 25-06, 25-09 | Legacy translation + deprecation warning | ✓ SATISFIED (with WR-05 caveat below) | See Truth 1 |
-| DPLX-03 | 25-04, 25-09 | Single decision point; no duplicated rule/`isinstance` | ✓ SATISFIED | See Truth 1 and dispatch verification |
-| DPLX-04 | 25-03, 25-06, 25-07, 25-09 | Required `FlipCoordinator` ABC w/ timeout, serves CLI + web, refused without one | ✓ SATISFIED | See Truth 2 |
-| DPLX-05 | 25-03, 25-07, 25-09 | Timeout fails job with clear message, releases scanner | ✓ SATISFIED | See Truth 3 |
-| DPLX-06 | 25-02, 25-05, 25-09 | `SCANNING_REVERSE` visible, Abort cancels job, `wait_transition` gone | ✗ BLOCKED (partial) | `SCANNING_REVERSE`/deletion verified; Abort-cancels-job guarantee broken by CR-01 |
-| DPLX-07 | 25-08, 25-09 | Auto-profiles always emits `default`, proven by round trip | ✓ SATISFIED | See Truth 5 |
+| DPLX-01 | 25-01, 25-04, 25-06, 25-08, 25-09 | `duplex` field; `source` never overloaded | ✓ SATISFIED | Truth 1 |
+| DPLX-02 | 25-01, 25-06, 25-09, 25-12 | Legacy translation + deprecation warning | ✓ SATISFIED (see WR-02 caveat) | Truth 1; the warning is logged as DPLX-02 literally requires, though it is less visible than D-18 intended — a warning, not a requirement failure |
+| DPLX-03 | 25-04, 25-09 | Single decision point; no duplicated rule/`isinstance` | ✓ SATISFIED | Truth 1 and dispatch verification |
+| DPLX-04 | 25-03, 25-06, 25-07, 25-09, 25-10, 25-14 | Required `FlipCoordinator` ABC w/ timeout, serves CLI + web, refused without one | ✓ SATISFIED | Truth 2; shared `FlipAnswerSlot` unifies both coordinators |
+| DPLX-05 | 25-03, 25-07, 25-09, 25-12 | Timeout fails job with clear message, releases scanner; now bounded 1..86400 | ✓ SATISFIED | Truth 3 |
+| DPLX-06 | 25-02, 25-05, 25-09, 25-10, 25-11 | `SCANNING_REVERSE` visible, Abort cancels job, `wait_transition` gone | ✓ SATISFIED (gap closed) | Truth 4; CR-01 fix independently reproduced |
+| DPLX-07 | 25-08, 25-09, 25-13 | Auto-profiles always emits `default`, proven by round trip | ✓ SATISFIED | Truth 5 |
 
-No orphaned requirements: all seven DPLX IDs appear in at least one plan's `requirements:` frontmatter and are cross-referenced in `.planning/REQUIREMENTS.md:75-81`.
+No orphaned requirements: all seven DPLX IDs appear in plan `requirements:` frontmatter (initial and
+gap-closure plans) and are cross-referenced in `.planning/REQUIREMENTS.md:75-81`.
 
 ### Anti-Patterns Found
 
-| File | Line | Pattern | Severity | Impact |
-|------|------|---------|----------|--------|
-| `src/saneless/worker.py` | 171-183, 256 | Coordinator armed at job start, not at `AWAITING_FLIP`; no job-scoping on signals | 🛑 Blocker | CR-01 — see gaps |
-| `src/saneless/web/routes.py` | 309-345 | Flip routes signal without checking the job they're answering | 🛑 Blocker (same root cause as above) | CR-01 |
-| `src/saneless/config.py` | 258-292 | Deprecation warning logged before `configure_logging` runs; never reaches `log_file` (WR-05) | ⚠️ Warning | Undercuts D-18's premise that the warning is the operator's sole migration instruction |
-| `src/saneless/scanner/sane_backend.py` | 824-828 | `_resolve_feeder_source` accepts a `FEEDER_DUPLEX` source as if it were simplex (WR-02) | ⚠️ Warning | Silent scrambled-page corruption on a narrow hardware/config combination |
-| `src/saneless/scanner/sane_backend.py` | 879-886 | Manual duplex unconditionally refused on a device with no `source` option, a regression vs. pre-phase behaviour (WR-03) | ⚠️ Warning | Narrow device-compatibility regression |
-| `src/saneless/auto_profiles.py` | 197-222 (used `worker.py:209-224`) | `is_bare_default` ignores `duplex`, so a hand-written `duplex="manual"` default profile can be silently overwritten by `_maybe_auto_generate` (WR-04) | ⚠️ Warning | First web job on such a config takes one flatbed snapshot instead of prompting |
-| `src/saneless/config.py` | 280-282 | Legacy-looking source with an explicit non-`manual` `duplex` is neither translated nor warned about (IN-04) | ℹ️ Info | Narrow; explicit operator override, but reaches SANE unchanged with C-01's failure mode possible |
-| `docs/reference/cli-commands.md` | 34-38 | Exit-code table broken by an inserted paragraph (WR-06) | ⚠️ Warning | Cosmetic doc defect, not functional |
-| `docs/reference/web-api.md` | 149-150 | States the web UI "cannot" send an early flip answer and that buttons "are gone before a second click" — both false per CR-01 (WR-07) | ⚠️ Warning | Same root cause as the CR-01 gap; the doc overstates a safety property the code doesn't have |
-| `.planning/phases/25-manual-duplex/deferred-items.md` | — | Classifies the early-answer defect as "direct API callers only" | ⚠️ Warning | Contradicted by reproduction; not a TBD/FIXME marker, but a factual misclassification that understated CR-01's severity going into review |
+No `TBD`/`FIXME`/`XXX` debt markers in any file touched between `07054af` and `HEAD`.
 
-No `TBD`/`FIXME`/`XXX` debt markers found in the phase's changed files.
+| File | Line | Pattern | Severity | Impact | Falsifies a roadmap SC? |
+|------|------|---------|----------|--------|--------------------------|
+| `src/saneless/worker.py` | 208-212 | `ScanWorker.stop()` does not resolve a live flip wait; a worker shut down while parked at `AWAITING_FLIP` (wait up to 86,400s) leaves the row `AWAITING_FLIP` forever and the thread un-joinable within the 5s bound (WR-01, new in re-review) | ⚠️ Warning | Only reachable via process shutdown/reload while a job is genuinely parked at the flip prompt — not the normal single-process operation the roadmap's success criteria describe. Confirmed real by reading `stop()` directly (no `cancel()`/`settle()` call exists on the coordinator path). Worker shutdown robustness in general is Phase 26's territory (ROBU-03, ROBU-06), though the review correctly notes Phase 26's planned stop-flag fix does not by itself wake an `Event.wait` — this specific fix still needs its own line item, not automatic coverage. | No — SC4 concerns Abort behaviour during normal operation, which is verified working (see CR-01 reproduction). Does not roll into ROBU-03/06 automatically; flagged for explicit follow-up. |
+| `src/saneless/cli.py` / `src/saneless/logging_config.py` | 188-196 / 41-66 | The legacy-duplex deprecation warning reaches `log_file` (WR-05 fix) but no longer reaches stderr for an interactive `saneless scan` user without `-v`, or for the documented Docker deployment's `docker logs` (WR-02, new in re-review) | ⚠️ Warning | Confirmed real by reading `configure_logging`: only a `RotatingFileHandler` is attached unless `-v` or the file can't be opened. D-18's premise ("the warning is the operator's only migration instruction") is undercut for two real audiences. | No — DPLX-02 literally requires the config "logs a deprecation warning," which it does (to `log_file`). The *visibility* gap is a real operator-experience regression worth fixing, but it does not falsify the requirement as worded. |
+| `docs/reference/web-api.md` | 149-150 | States a direct API caller "should poll `/api/jobs/current/status`... before answering," but that endpoint returns HTML with no job id anywhere except inside the flip button's `hx-vals` markup — a direct (non-browser) caller has no documented way to obtain `job_id` (WR-03, new in re-review) | ⚠️ Warning | Confirmed real by reading the referenced endpoints; none returns a job id in a stable, documented form. | No — DPLX-04 requires "the web provides the HTMX Continue button," which it does, fully tested end-to-end including a real browser click. This is a documentation gap for a use case (scripted direct API calls bypassing the browser) outside DPLX-04's literal text. |
+
+None of the three new warnings are rated critical by the fresh code review (`25-REVIEW.md`: 0
+critical, 3 warning, 5 info), and none, on inspection, falsifies a named roadmap success criterion
+or a locked PLAN must-have. They are legitimate follow-up items, tracked below, not blockers to
+this phase's completion.
 
 ### Human Verification Required
 
-None. The one uncertain item (whether the CR-01 race is reachable through ordinary browser interaction, not just direct API calls) was resolved programmatically: a script driving the real `ScanWorker`/`run_pipeline`/`_current_or_recent_job` — the same objects the HTTP routes call — reproduces the mis-applied Abort deterministically. No browser automation or hardware is needed to settle it.
+None. The CR-01 fix's browser-reachability was resolved programmatically in the prior verification
+and remains so: `tests/test_browser.py::test_flip_continue_click_answers_the_waiting_job` drives a
+real Chromium click through the rendered `hx-vals` attribute, re-run directly here and confirmed
+passing. No new human-verification-only item was introduced by the gap-closure work.
 
 ### Gaps Summary
 
-Four of five roadmap success criteria hold cleanly, and the mechanical claims of the phase goal —
-`duplex` as its own field, `source` passed verbatim, a single `match`/`assert_never` strategy
-dispatch, a required `FlipCoordinator` ABC with a timeout serving both CLI and web, `SCANNING_REVERSE`
-persisted and visible, `wait_transition` deleted, the ADF how-to rewritten — are all real and present
-in the code, not just claimed in SUMMARY.md. Quality gates (pytest, ruff, ty, pyrefly) are clean.
+**No gaps remain.** The one gap from the prior verification — "Abort at the flip prompt cancels the
+job" being unreliable due to CR-01's coordinator-arming/job-scoping race — is closed. I did not take
+the code review's "Closed" disposition or the phase's own regression tests as sufficient evidence on
+their own; I wrote an independent reproduction script (not derived from `tests/test_worker.py`) that
+drives the real `ScanWorker`/`run_pipeline` through both falsifying scenarios from the prior
+verification (a stale double-click Abort meant for a finished job landing on the next queued job; an
+early Continue sent during pass A) and confirmed both now behave correctly. I additionally read the
+fix's three load-bearing properties directly in `worker.py`: arm-before-persist ordering, a single
+job-id snapshot compared against the coordinator's own job_id (no cross-job window), and the routes'
+now-required `job_id` field flowing from the rendered button's `hx-vals` through a real browser click.
 
-The one blocking gap is concurrency, not architecture: the flip coordinator is constructed and starts
-accepting signals the instant a manual-duplex job begins, not when the pipeline actually reaches
-`AWAITING_FLIP`, and the Continue/Abort routes apply a signal to whichever coordinator is live with no
-check that it belongs to the job the operator is looking at. This was flagged by the code review as
-CR-01 (BLOCKER) and independently reproduced here against the live worker/pipeline: an ordinary
-double-click on Abort — the natural reaction when the UI doesn't visibly change on the first click,
-because the render races the worker thread waking up — can abort a different, already-running job
-before its operator ever saw a flip prompt. The mirror case (an early, stale Continue) reproduces
-C-02, the original failure this entire phase exists to close: pass B can start on an unflipped stack.
-This directly falsifies the "Abort at the flip prompt cancels the job" clause of DPLX-06 / success
-criterion 4, and the `deferred-items.md` note that shipped alongside the docs plan incorrectly
-asserts the defect is reachable only from direct API callers, understating its severity for anyone
-reading the phase's own paper trail.
+Three new warnings surfaced by the fresh code review (WR-01: worker shutdown doesn't resolve a live
+flip wait; WR-02: the legacy warning no longer reaches stderr; WR-03: the flip endpoints require a
+`job_id` no documented API surface exposes to a non-browser caller) were each independently confirmed
+real by reading the code directly. None falsifies a named roadmap success criterion or a locked
+PLAN must-have: WR-01 is a shutdown/reload edge case outside the normal-operation behaviour SC4
+describes; WR-02 satisfies DPLX-02's literal text ("logs a deprecation warning") even though it
+undercuts the visibility D-18 intended; WR-03 is a gap for headless direct-API callers, not for the
+web UI DPLX-04 actually requires and that is tested end-to-end with a real browser. These are
+recorded as warnings for follow-up, consistent with the fresh review's own severity classification
+(0 critical, 3 warning, 5 info), and do not block this phase.
 
-The fix is scoped and already sketched in the code review (CR-01's fix section): arm the coordinator
-only when `AWAITING_FLIP` is actually persisted, and have the routes name the job they are answering
-so a stale or misdirected signal is dropped rather than applied. This does not require reopening any
-of the phase's locked decisions (D-09, D-16, D-17) — it tightens D-16's "one atomic answer" guarantee
-to also cover *which job* the answer belongs to, which D-16 assumed but did not implement.
+All quality gates are clean: `pytest -q` (1103 passed), `ruff check .` (no issues), `ty check` (all
+checks passed), `pyrefly check src tests` (0 errors). No debt markers (`TBD`/`FIXME`/`XXX`) in any
+file touched by the phase or its gap-closure waves.
 
-The remaining warnings (WR-01 through WR-08, IN-01 through IN-04) are real but narrower: unbounded
-`flip_timeout_seconds`, a hardware-duplex source being accepted as if simplex, manual duplex
-regressing on devices with no `source` option, `is_bare_default` not accounting for `duplex`, the
-deprecation warning missing the log file, a broken doc table, and two other doc-accuracy issues. None
-of these falsify a named success criterion on their own, but several (WR-04, WR-05) compound the same
-"is it actually safe to trust this in an appliance the operator doesn't babysit" concern the phase
-goal raises, and are worth closing in the same pass as CR-01 rather than carried forward silently.
+---
+
+_Verified: 2026-09-14T17:49:11Z_
+_Verifier: Claude (gsd-verifier)_

@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 25 context gathered
-last_updated: "2026-09-14T16:47:05.698Z"
+status: ready_to_plan
+stopped_at: Phase 25 complete (15/15) — ready to discuss Phase 26
+last_updated: 2026-09-14T17:50:59.109Z
 last_activity: 2026-09-14 -- Phase 25 execution started
 progress:
   total_phases: 14
   completed_phases: 6
   total_plans: 52
-  completed_plans: 46
+  completed_plans: 52
   percent: 43
 ---
 
@@ -21,23 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 25 — manual-duplex
+**Current focus:** Phase 26 — worker and web robustness
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 25 (manual-duplex) — EXECUTING
-Plan: 1 of 15
-Status: Executing Phase 25
+Phase: 26
+Plan: Not started
+Status: Ready to plan
 Progress: [██████████] 100%
 Next: Phase 25 (Manual Duplex) — not started, no phase directory yet
-Last activity: 2026-09-14 -- Phase 25 execution started
+Last activity: 2026-09-14
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 12
+- Total plans completed: 27
 - Average duration: 5min
 - Total execution time: 0.27 hours
 
@@ -48,6 +48,7 @@ Last activity: 2026-09-14 -- Phase 25 execution started
 | 01-core-pipeline | 3 | 16min | 5min |
 | 20 | 5 | - | - |
 | 23.1 | 4 | - | - |
+| 25 | 15 | - | - |
 
 **Recent Trend:**
 

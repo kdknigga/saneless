@@ -72,13 +72,13 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 ### Manual Duplex
 
-- [ ] **DPLX-01**: `ProfileConfig` has a `duplex` field (`none`, `hardware`, `manual`); `source` is passed to SANE verbatim and is never overloaded to mean a scanning strategy [C-01, doc row 2]
-- [ ] **DPLX-02**: A legacy config with `source = "Manual Duplex"` still loads, is translated to `duplex = "manual"` at config load, and logs a deprecation warning [C-01]
-- [ ] **DPLX-03**: The manual-duplex decision is read in exactly one place; the duplicated detection rule in the worker and the `isinstance` dispatch on the two-outcome result are gone [N-07]
-- [ ] **DPLX-04**: A `FlipCoordinator` protocol with a timeout is the only way the pipeline waits for a flip; the CLI provides a stdin prompt ("Flip the stack and press Enter"), the web provides the HTMX Continue button, and running manual duplex without a coordinator is refused up front [C-02, M-07, doc row 1]
-- [ ] **DPLX-05**: A flip wait that exceeds the timeout fails the job with a clear message and releases the scanner [M-07]
-- [ ] **DPLX-06**: During pass B the job is in a visible `SCANNING_REVERSE` state, Abort at the flip prompt cancels the job, and `wait_transition` is deleted [M-02, doc row 22]
-- [ ] **DPLX-07**: Auto-profiles always writes a `default` profile, for flatbed-only, feeder-only, and mixed devices, proven by a write-then-load round-trip test [C-08]
+- [x] **DPLX-01**: `ProfileConfig` has a `duplex` field (`none`, `hardware`, `manual`); `source` is passed to SANE verbatim and is never overloaded to mean a scanning strategy [C-01, doc row 2]
+- [x] **DPLX-02**: A legacy config with `source = "Manual Duplex"` still loads, is translated to `duplex = "manual"` at config load, and logs a deprecation warning [C-01]
+- [x] **DPLX-03**: The manual-duplex decision is read in exactly one place; the duplicated detection rule in the worker and the `isinstance` dispatch on the two-outcome result are gone [N-07]
+- [x] **DPLX-04**: A `FlipCoordinator` protocol with a timeout is the only way the pipeline waits for a flip; the CLI provides a stdin prompt ("Flip the stack and press Enter"), the web provides the HTMX Continue button, and running manual duplex without a coordinator is refused up front [C-02, M-07, doc row 1]
+- [x] **DPLX-05**: A flip wait that exceeds the timeout fails the job with a clear message and releases the scanner [M-07]
+- [x] **DPLX-06**: During pass B the job is in a visible `SCANNING_REVERSE` state, Abort at the flip prompt cancels the job, and `wait_transition` is deleted [M-02, doc row 22]
+- [x] **DPLX-07**: Auto-profiles always writes a `default` profile, for flatbed-only, feeder-only, and mixed devices, proven by a write-then-load round-trip test [C-08]
 
 ### Worker and Web Robustness
 
@@ -266,13 +266,13 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SCNR-06 | Phase 24 — Scanner Truthfulness | Complete |
 | SCNR-07 | Phase 24 — Scanner Truthfulness | Complete |
 | SCNR-08 | Phase 24 — Scanner Truthfulness | Complete |
-| DPLX-01 | Phase 25 — Manual Duplex | Pending |
-| DPLX-02 | Phase 25 — Manual Duplex | Pending |
-| DPLX-03 | Phase 25 — Manual Duplex | Pending |
-| DPLX-04 | Phase 25 — Manual Duplex | Pending |
-| DPLX-05 | Phase 25 — Manual Duplex | Pending |
-| DPLX-06 | Phase 25 — Manual Duplex | Pending |
-| DPLX-07 | Phase 25 — Manual Duplex | Pending |
+| DPLX-01 | Phase 25 — Manual Duplex | Complete |
+| DPLX-02 | Phase 25 — Manual Duplex | Complete |
+| DPLX-03 | Phase 25 — Manual Duplex | Complete |
+| DPLX-04 | Phase 25 — Manual Duplex | Complete |
+| DPLX-05 | Phase 25 — Manual Duplex | Complete |
+| DPLX-06 | Phase 25 — Manual Duplex | Complete |
+| DPLX-07 | Phase 25 — Manual Duplex | Complete |
 | ROBU-01 | Phase 26 — Worker and Web Robustness | Pending |
 | ROBU-02 | Phase 26 — Worker and Web Robustness | Pending |
 | ROBU-03 | Phase 26 — Worker and Web Robustness | Pending |
