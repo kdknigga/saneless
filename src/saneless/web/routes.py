@@ -193,6 +193,8 @@ def index(request: Request) -> Response:
             "correspondents": correspondents,
             **status,
             "jobs": jobs,
+            # The title input's maxlength; templates own no vocabulary (ROBU-08).
+            "title_max_length": TITLE_MAX_LENGTH,
         },
     )
 
