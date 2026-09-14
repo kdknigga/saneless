@@ -62,13 +62,13 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 ### Scanner Truthfulness
 
 - [ ] **SCNR-01**: `sane_backend`, `auto_profiles`, the pipeline, and the worker all route feeder decisions through `classify_source()`; a device whose feeder is named "Automatic Document Feeder" scans a full stack, and auto-profiles never collapses two distinct feeder sources into one slug [C-06, N-09]
-- [ ] **SCNR-02**: A first-page SANE error other than the exact "Document feeder out of documents" message is raised as a `ScanError` carrying the SANE message, never reported as "No paper detected" [M-11]
-- [ ] **SCNR-03**: The scanner backend never drops blank pages on its own; empty-page detection happens only in the pipeline, only when the profile enables it, and manual-duplex page parity is preserved [M-14, doc row 12]
-- [ ] **SCNR-04**: Geometry is set only when the device reports `tl_x`/`tl_y`/`br_x`/`br_y` options; otherwise the Pillow crop fallback runs and is proven reachable by a test; geometry units are read from the option descriptor rather than assumed to be millimetres [M-15, N-03, doc row 9]
-- [ ] **SCNR-05**: The crop fallback and page-size maths use the resolution read back from the device after all options are set, and options are set source-first so the source cannot clamp resolution afterwards [M-16]
-- [ ] **SCNR-06**: `get_capabilities` honours range constraints (min/max/step) on resolution and reports them in `devices --capabilities` [N-01]
-- [ ] **SCNR-07**: The SANE test doubles mirror python-sane 2.9.2: unknown option names are stored silently, a bad value for a known option raises `_sane.error`, structurally wrong access raises `AttributeError`, and `multi_scan()` cannot raise [M-32]
-- [ ] **SCNR-08**: An opt-in integration test module drives the real SANE `test` backend through a `SANE_CONFIG_DIR` scoped to `tmp_path` and proves a ten-page stack comes through a long feeder name [M-32]
+- [x] **SCNR-02**: A first-page SANE error other than the exact "Document feeder out of documents" message is raised as a `ScanError` carrying the SANE message, never reported as "No paper detected" [M-11]
+- [x] **SCNR-03**: The scanner backend never drops blank pages on its own; empty-page detection happens only in the pipeline, only when the profile enables it, and manual-duplex page parity is preserved [M-14, doc row 12]
+- [x] **SCNR-04**: Geometry is set only when the device reports `tl_x`/`tl_y`/`br_x`/`br_y` options; otherwise the Pillow crop fallback runs and is proven reachable by a test; geometry units are read from the option descriptor rather than assumed to be millimetres [M-15, N-03, doc row 9]
+- [x] **SCNR-05**: The crop fallback and page-size maths use the resolution read back from the device after all options are set, and options are set source-first so the source cannot clamp resolution afterwards [M-16]
+- [x] **SCNR-06**: `get_capabilities` honours range constraints (min/max/step) on resolution and reports them in `devices --capabilities` [N-01]
+- [x] **SCNR-07**: The SANE test doubles mirror python-sane 2.9.2: unknown option names are stored silently, a bad value for a known option raises `_sane.error`, structurally wrong access raises `AttributeError`, and `multi_scan()` cannot raise [M-32]
+- [x] **SCNR-08**: An opt-in integration test module drives the real SANE `test` backend through a `SANE_CONFIG_DIR` scoped to `tmp_path` and proves a ten-page stack comes through a long feeder name [M-32]
 
 ### Manual Duplex
 
@@ -258,14 +258,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | GATE-01 | Phase 23.1 — Dark Mode and the Commit Gate | Complete |
 | GATE-02 | Phase 23.1 — Dark Mode and the Commit Gate | Complete |
 | GATE-03 | Phase 23.1 — Dark Mode and the Commit Gate | Complete |
-| SCNR-01 | Phase 24 — Scanner Truthfulness | Pending |
-| SCNR-02 | Phase 24 — Scanner Truthfulness | Pending |
-| SCNR-03 | Phase 24 — Scanner Truthfulness | Pending |
-| SCNR-04 | Phase 24 — Scanner Truthfulness | Pending |
-| SCNR-05 | Phase 24 — Scanner Truthfulness | Pending |
-| SCNR-06 | Phase 24 — Scanner Truthfulness | Pending |
-| SCNR-07 | Phase 24 — Scanner Truthfulness | Pending |
-| SCNR-08 | Phase 24 — Scanner Truthfulness | Pending |
+| SCNR-01 | Phase 24 — Scanner Truthfulness | Partial — feeder routing done; strategy reads deferred to Phase 25 (DPLX-03) |
+| SCNR-02 | Phase 24 — Scanner Truthfulness | Complete |
+| SCNR-03 | Phase 24 — Scanner Truthfulness | Complete |
+| SCNR-04 | Phase 24 — Scanner Truthfulness | Complete |
+| SCNR-05 | Phase 24 — Scanner Truthfulness | Complete |
+| SCNR-06 | Phase 24 — Scanner Truthfulness | Complete |
+| SCNR-07 | Phase 24 — Scanner Truthfulness | Complete |
+| SCNR-08 | Phase 24 — Scanner Truthfulness | Complete |
 | DPLX-01 | Phase 25 — Manual Duplex | Pending |
 | DPLX-02 | Phase 25 — Manual Duplex | Pending |
 | DPLX-03 | Phase 25 — Manual Duplex | Pending |
