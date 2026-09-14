@@ -20,7 +20,9 @@ from saneless.config import (
     Settings,
 )
 from saneless.paperless import UploadResult
+from saneless.pipeline import FlipCoordinator
 from saneless.scanner.base import ScanBatch, ScannerBackend
+from saneless.vocabulary import FlipOutcome
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -141,6 +143,38 @@ def scan_batch(
 
     """
     return ScanBatch(pages=pages, actual_resolution=resolution, pages_rejected=rejected)
+
+
+class AlwaysContinueFlipCoordinator(FlipCoordinator):
+    """
+    A flip coordinator whose operator flips the stack the instant it is asked.
+
+    For pipeline tests that exercise a manual-duplex run but are not about the
+    flip wait itself.  A manual-duplex request has to carry a coordinator, and
+    this one answers ``CONTINUED`` at once, so pass B starts straight away.
+
+    Subclasses the ABC rather than duck-typing it, for the reason Phase 24's
+    WR-08 measured and ``tests/test_cli.py``'s ``MockSaneBackend`` records:
+    every stub that subclassed was caught by the type checkers when its
+    contract changed, and the ones that did not were missed.
+
+    Import it as ``from tests.conftest import AlwaysContinueFlipCoordinator``;
+    the bare ``conftest`` form raises ``ModuleNotFoundError`` under pytest 9's
+    importlib mode.
+    """
+
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Report the stack flipped, without waiting.
+
+        Args:
+            timeout: Ignored; the answer is immediate.
+
+        Returns:
+            Always ``FlipOutcome.CONTINUED``.
+
+        """
+        return FlipOutcome.CONTINUED
 
 
 @pytest.fixture
