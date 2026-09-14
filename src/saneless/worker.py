@@ -38,7 +38,9 @@ from .vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from .config import Settings
+    from collections.abc import Mapping
+
+    from .config import ProfileConfig, Settings
     from .job import Job, JobStore
     from .paperless import PaperlessClient
     from .scanner.base import ScannerBackend
@@ -215,6 +217,8 @@ class ScanWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         # Set once by stop(); read by the loop, submit() and the flip callback.
         self._stopping = threading.Event()
+        # Guards every read and every rebind of self._settings.profiles (D-19).
+        self._profiles_lock = threading.Lock()
         self._flip_coordinator: WorkerFlipCoordinator | None = None
         self._current_job_id: str | None = None
         self._auto_generated = False
@@ -400,6 +404,71 @@ class ScanWorker:
         """ID of the currently processing job, or None."""
         return self._current_job_id
 
+    def profile_names(self) -> list[str]:
+        """
+        List the configured profile names, in configuration order.
+
+        Request threads (the index dropdown) and the worker share one lock for
+        every profile read (D-19); once the routes are ``def`` handlers on the
+        threadpool (ROBU-05) that concurrency is real.
+
+        Returns:
+            A new list, so the caller can keep or change it freely.
+
+        """
+        with self._profiles_lock:
+            return list(self._settings.profiles)
+
+    def has_profile(self, name: str) -> bool:
+        """
+        Report whether a profile is configured, under the profile lock (D-19).
+
+        ROBU-08's unknown-profile check on a request thread reads through here.
+
+        Args:
+            name: The profile name to look for.
+
+        Returns:
+            Whether ``name`` is a configured profile.
+
+        """
+        with self._profiles_lock:
+            return name in self._settings.profiles
+
+    def get_profile(self, name: str) -> ProfileConfig | None:
+        """
+        Look up a profile under the profile lock (D-19).
+
+        The worker's own lookup for a job goes through here, sharing the lock
+        with request threads.
+
+        Args:
+            name: The profile name to look up.
+
+        Returns:
+            The profile, or ``None`` when no profile has that name.
+
+        """
+        with self._profiles_lock:
+            return self._settings.profiles.get(name)
+
+    def _set_profiles(self, profiles: Mapping[str, ProfileConfig]) -> None:
+        """
+        Replace the configured profiles with a new dict, under the lock (D-19).
+
+        The mapping is rebound, never mutated in place.  A reader that took the
+        old dict without the lock -- ``run_pipeline`` on the worker thread, for
+        example -- keeps a consistent view of it, and no locked reader can
+        observe a dict part-way through an update.
+
+        Args:
+            profiles: The complete new set of profiles.
+
+        """
+        replacement = dict(profiles)
+        with self._profiles_lock:
+            self._settings.profiles = replacement
+
     def _run(self) -> None:
         """
         Worker loop: process jobs until stop() sets the stop flag.
@@ -440,9 +509,11 @@ class ScanWorker:
             profiles = generate_profiles(caps)
             config_path = resolve_config_path()
             written = write_profiles_to_config(config_path, profiles)
-            # Update in-memory settings
-            for name, profile in profiles.items():
-                self._settings.profiles[name] = profile
+            # Update in-memory settings by rebinding a merged dict under the
+            # profile lock, never by mutating the live one (D-19).
+            with self._profiles_lock:
+                current = dict(self._settings.profiles)
+            self._set_profiles({**current, **profiles})
             if written:
                 logger.info(
                     "Auto-generated %d profile(s): %s",
@@ -471,7 +542,7 @@ class ScanWorker:
         # run_pipeline reads to choose the strategy.  source is a pure SANE
         # value and is never consulted: a second copy of the detection rule
         # here could drift from the pipeline's and skip the flip wait (C-02).
-        profile = self._settings.profiles.get(job.profile)
+        profile = self.get_profile(job.profile)
         is_manual_duplex = profile is not None and profile.duplex == "manual"
 
         coordinator = WorkerFlipCoordinator(job.id) if is_manual_duplex else None
