@@ -169,6 +169,31 @@ Like ``_PRUNE``'s, the ``ORDER BY`` is lexicographic over ``created_at``'s
 ISO-8601 strings and is correct only because every writer stamps UTC.
 """
 
+_SELECT_LATEST_RUN = (
+    f"{_SELECT_ALL} WHERE error_category IS NOT ? ORDER BY created_at DESC LIMIT 1"
+)
+"""Read the newest job that was not rejected at submit.
+
+One bound parameter, ``ErrorCategory.REJECTED.value`` at the only call site.
+``IS NOT`` rather than ``!=`` because it is NULL-safe in SQLite: ``NULL != 'X'``
+is NULL and would drop the row, while ``NULL IS NOT 'X'`` is true.  Every job
+that has not failed, and every job ``fail_active_jobs`` failed on restart, has
+no category, so ``!=`` would silently hide exactly the jobs this query exists to
+return.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated value
+is the module-level ``_SELECT_ALL``, and the category is bound.
+
+Like ``_SELECT_RECENT``'s, the ``ORDER BY`` is lexicographic over
+``created_at``'s ISO-8601 strings and is correct only because every writer
+stamps UTC.
+"""
+
+_COUNT_JOBS = f"{_SELECT_JOBS} COUNT(*) FROM jobs"
+"""Count every job -- the read half of ``JobStore.probe``.
+
+No parameters.  Its safety argument is ``_SELECT_JOBS``'s: the only interpolated
+value is that module-level literal.
+"""
+
 _INSERT = f"{_INSERT_JOBS} ({_COLUMN_LIST}) VALUES ({_PLACEHOLDERS})"
 """Write one job, naming every column so physical column order never matters."""
 
@@ -788,6 +813,61 @@ class JobStore:
                 _LIST_PENDING, (JobState.PENDING.value,)
             ).fetchall()
         return [self._row_to_job(row) for row in rows]
+
+    @_locked
+    def latest_run_job(self) -> Job | None:
+        """
+        Fetch the newest job that was not rejected at submit.
+
+        This is what the status area falls back to once no job is active, to
+        report the job that just ended (D-17).  ``list_recent(1)`` is the wrong
+        answer there: a submit refused while a job runs -- queue full, worker
+        down or degraded -- still writes a row marked
+        ``ErrorCategory.REJECTED``, and that row is newer than the running job.
+        Reading the newest row would let the rejection replace the job in the
+        status area the moment the job ends (D-06).  History keeps using
+        ``list_recent``, so the rejected row is still listed there.
+
+        Returns:
+            The newest job whose error category is not REJECTED, or None when
+            the store holds no such job.
+
+        """
+        with self._conn:
+            row = self._conn.execute(
+                _SELECT_LATEST_RUN, (ErrorCategory.REJECTED.value,)
+            ).fetchone()
+        return None if row is None else self._row_to_job(row)
+
+    @_locked
+    def probe(self) -> None:
+        """
+        Prove the database can be read and written, in one transaction.
+
+        A count of the jobs table, then a same-value ``user_version`` write.
+        The write is what makes this a real probe: a read-only transaction can
+        succeed against a store whose disk is full or whose file has gone
+        read-only, but setting ``user_version`` -- even to the value it already
+        holds -- appends a WAL frame and so exercises the write path (D-12).
+        Nothing observable changes on a healthy store.
+
+        The worker's idle loop calls this while it is degraded; a clean return
+        is what clears degraded health, and a raise means "still degraded".
+
+        Raises:
+            sqlite3.Error: Whatever sqlite raises when the store cannot be read
+                or written, including ``sqlite3.ProgrammingError`` once the
+                store is closed.
+
+        """
+        with self._conn:
+            self._conn.execute(_COUNT_JOBS).fetchone()
+            version: int = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            # A PRAGMA argument cannot be bound -- "PRAGMA user_version = ?" is
+            # a syntax error.  version is an int read back from this database
+            # in this same transaction, never request input, so no
+            # caller-supplied value reaches this string.
+            self._conn.execute(f"PRAGMA user_version = {version}")
 
     @_locked
     def fail_active_jobs(self, reason: str = "Interrupted by restart") -> int:
