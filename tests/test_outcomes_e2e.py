@@ -88,12 +88,14 @@ _TITLE = "Quarterly Report"
 
 # The scans run under a profile that is deliberately NOT the one named
 # "default".  auto_profiles.is_bare_default matches a profile set of exactly
-# one untouched profile called "default", and on that match the worker tries to
-# generate profiles from the stub scanner and write them to whatever
-# saneless.toml resolve_config_path() finds on the machine running the suite.
+# one untouched profile called "default", and on that match the worker's startup
+# generation (D-14) would build profiles from the stub scanner and swap them in
+# while these runs read them.  It writes only to settings.config_path (D-16),
+# which is None for these directly-built settings, so nothing would reach the
+# disk (D-17) -- but the swap alone would change the profile set under test.
 # Settings requires a "default" profile to exist, so it is defined alongside
 # this one: two entries make is_bare_default return on its length check and
-# _maybe_auto_generate return on its first line.
+# startup generation skip before it asks the scanner anything.
 _PROFILE = "e2e"
 
 _SIMPLEX_SOURCE = "Flatbed"
