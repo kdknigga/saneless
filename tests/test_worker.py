@@ -51,6 +51,22 @@ if TYPE_CHECKING:
     from saneless.scanner.base import ScanSettings
 
 
+@pytest.fixture(autouse=True)
+def _mock_scanner_reports_no_devices(mock_scanner: MagicMock) -> None:
+    """
+    Answer the shared mock scanner's ``get_devices`` with a deliberate ``[]``.
+
+    Every worker started over ``default_settings`` -- a bare default profile
+    set -- runs startup profile generation first (D-14).  Left to itself the
+    ``MagicMock`` hands back a truthy mock and generation fails somewhere inside
+    ``generate_profiles``, so whether profiles were swapped under a test would
+    hang on how that function treats a mock.  "No scanners found" is a real
+    answer instead: generation logs its WARNING and keeps the bare default.
+    ``TestStartupProfileGeneration`` overrides this per test.
+    """
+    mock_scanner.get_devices.return_value = []
+
+
 def _get(store: JobStore, job_id: str) -> Job:
     """Retrieve a job, asserting it exists (narrows Job | None to Job)."""
     fetched = store.get_job(job_id)
@@ -1081,7 +1097,7 @@ class _PassBGatedScanner(ScannerBackend):
         self.scan_calls = 0
 
     def get_devices(self) -> list[DeviceInfo]:
-        """Report no devices; the worker never asks when a device is configured."""
+        """Report no devices, so startup profile generation keeps the settings."""
         return []
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
@@ -1282,7 +1298,7 @@ class _GatedScanner(ScannerBackend):
             gate.set()
 
     def get_devices(self) -> list[DeviceInfo]:
-        """Report no devices; the worker never asks when a device is configured."""
+        """Report no devices, so startup profile generation keeps the settings."""
         return []
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
@@ -2895,7 +2911,7 @@ class TestStartupProfileGeneration:
         """
         D-15 / T-26-34: the WARNING names the real exception, not a guessed cause.
 
-        The old message called every failure "scanner unreachable", which sent
+        The old message called every failure an unreachable scanner, which sent
         operators hunting network faults for what was often a parsing error.
         """
         mock_scanner.get_devices.side_effect = ScanError("boom")
@@ -2917,7 +2933,8 @@ class TestStartupProfileGeneration:
         assert warned
         assert alive
         assert names == ["default"]
-        assert "scanner unreachable" not in caplog.text
+        # Broader than the retired wording: no guess about reachability at all.
+        assert "unreachable" not in caplog.text
 
     def test_startup_generation_no_scanners_keeps_the_bare_default(
         self,

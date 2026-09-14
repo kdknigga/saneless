@@ -101,7 +101,14 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
-        profiles={"default": ProfileConfig()},
+        # Two profiles, so the set is not the bare default.  With only
+        # ``default``, the worker's startup generation (D-14) would build
+        # profiles from _StubScanner's device and swap them in while these
+        # requests read the dropdown -- generation these tests do not intend.
+        profiles={
+            "default": ProfileConfig(),
+            "duplex": ProfileConfig(source="ADF Duplex"),
+        },
     )
     app = create_app(settings, _StubScanner())
     app.state.paperless.get_tags = list
