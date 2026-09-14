@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .auto_profiles import (
     generate_profiles,
@@ -248,19 +248,103 @@ class ScanWorker:
         self._queue.put(job)
         logger.info("Job %s submitted to worker queue", job.id)
 
-    def continue_flip(self) -> None:
-        """Signal the worker to continue with pass B of manual duplex."""
-        coordinator = self._flip_coordinator
-        if coordinator is not None:
-            coordinator.signal_continue()
-            logger.info("Manual duplex: continue signal sent")
+    def continue_flip(self, job_id: str) -> bool:
+        """
+        Answer ``job_id``'s flip prompt with Continue, starting its pass B.
 
-    def abort_flip(self) -> None:
-        """Signal the worker to abort manual duplex scan."""
+        Args:
+            job_id: The job the operator is answering.
+
+        Returns:
+            Whether the answer was claimed.  ``False`` means it was dropped:
+            ``job_id`` is not the job waiting at the flip prompt, that job has
+            not reached the prompt yet, or the prompt was already answered.
+
+        """
+        return self._signal_flip(job_id, "continue")
+
+    def abort_flip(self, job_id: str) -> bool:
+        """
+        Answer ``job_id``'s flip prompt with Abort, failing it before pass B.
+
+        Args:
+            job_id: The job the operator is answering.
+
+        Returns:
+            Whether the answer was claimed.  ``False`` means it was dropped:
+            ``job_id`` is not the job waiting at the flip prompt, that job has
+            not reached the prompt yet, or the prompt was already answered.
+
+        """
+        return self._signal_flip(job_id, "abort")
+
+    def flip_answer(self, job_id: str) -> FlipOutcome | None:
+        """
+        Report the claimed flip answer for ``job_id``, if it is the live job.
+
+        25-11's status rendering reads this to tell an answered prompt from an
+        open one.
+
+        Args:
+            job_id: The job whose answer is wanted.
+
+        Returns:
+            The claimed answer when ``job_id`` is the job with the live flip
+            coordinator, otherwise ``None`` -- including while it is unanswered.
+
+        """
         coordinator = self._flip_coordinator
-        if coordinator is not None:
-            coordinator.signal_abort()
-            logger.info("Manual duplex: abort signal sent")
+        if coordinator is None or coordinator.job_id != job_id:
+            return None
+        return coordinator.answer
+
+    def _signal_flip(self, job_id: str, action: Literal["continue", "abort"]) -> bool:
+        """
+        Deliver one flip signal to ``job_id``'s coordinator and log the result.
+
+        The coordinator is read once, and ``job_id`` is compared with that
+        coordinator's own job id rather than with ``_current_job_id``: one
+        snapshot, so the check and the signal cannot straddle a job boundary
+        and deliver a click meant for one job to the next (CR-01).
+
+        Args:
+            job_id: The job the operator is answering.
+            action: Which answer the operator gave.
+
+        Returns:
+            Whether the signal claimed the answer.
+
+        """
+        coordinator = self._flip_coordinator
+        if coordinator is None or coordinator.job_id != job_id:
+            logger.info(
+                "Manual duplex: %s for job %s dropped: "
+                "not the job waiting at the flip prompt",
+                action,
+                job_id,
+            )
+            return False
+        claimed = (
+            coordinator.signal_continue()
+            if action == "continue"
+            else coordinator.signal_abort()
+        )
+        if claimed:
+            logger.info("Manual duplex: %s for job %s claimed", action, job_id)
+        elif not coordinator.armed:
+            logger.info(
+                "Manual duplex: %s for job %s dropped: not yet at the flip prompt",
+                action,
+                job_id,
+            )
+        else:
+            logger.info(
+                "Manual duplex: %s for job %s dropped: already answered: %s",
+                action,
+                job_id,
+                coordinator.answer,
+            )
+        return claimed
 
     @property
     def is_alive(self) -> bool:

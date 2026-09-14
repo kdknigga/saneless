@@ -395,7 +395,7 @@ class TestScanWorkerManualDuplex:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """abort_flip() answers the coordinator ABORTED, so the pipeline raises."""
+        """abort_flip(job.id) answers the coordinator ABORTED; the pipeline raises."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
