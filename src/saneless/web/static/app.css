@@ -8,6 +8,14 @@
     border-radius: var(--pico-border-radius);
 }
 
+/* A request error sits just above the status area. Inset its text by the
+   status area's own left border and padding so the two lines start at the
+   same x. The border is transparent: the error colour stays text-only. */
+#status-message > p {
+    padding-left: 1rem;
+    border-left: var(--pico-border-width) solid transparent;
+}
+
 /* Status indicators */
 .status-done {
     color: var(--pico-ins-color, green);
