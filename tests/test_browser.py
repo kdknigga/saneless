@@ -5,13 +5,20 @@ These tests verify that PicoCSS styling, HTMX interactions, and UI
 components render correctly in a real browser. They use a session-scoped
 uvicorn server with a stub scanner for isolation from real hardware.
 
-PicoCSS and htmx are loaded from cdn.jsdelivr.net by ``base.html``, so every
-colour assertion below quietly depends on that CDN being reachable during the
-run. An unreachable CDN does not announce itself: the contrast checks report
-unstyled black-on-white ratios and the amber checks report a colour mismatch,
-both of which read like a palette regression. If a run fails that way in bulk,
-read ``test_pico_css_applied`` first -- it is the load canary, and it is the one
-that says so in plain words.
+PicoCSS and htmx are vendored under ``/static/vendor/`` and ``base.html`` loads
+them with an SRI ``integrity`` pin; ``tests/test_vendor_assets.py`` pins those
+bytes to the hashes. Every browser test here runs behind an egress gate (the
+overridden ``context`` fixture) that aborts and records any request not
+addressed to the test server and fails the test if anything was recorded, so
+the UI is proven to work with no internet, and the CI ``browser`` job runs this
+whole module offline.
+
+A stylesheet whose bytes no longer match its ``integrity`` is refused by the
+browser without announcing itself: the contrast checks then report unstyled
+black-on-white ratios and the amber checks report a colour mismatch, both of
+which read like a palette regression. If a run fails that way in bulk, read
+``test_pico_css_applied`` first -- it is the load canary, and it is the one that
+says so in plain words.
 
 Requires: pytest-playwright, chromium browser (uv run playwright install chromium)
 """
@@ -26,7 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from fastapi import FastAPI
-    from playwright.sync_api import Page
+    from playwright.sync_api import BrowserContext, Page, Route
 
     from saneless.job import JobStore
 
@@ -55,18 +62,16 @@ from saneless.web.app import create_app
 from saneless.worker import WorkerFlipCoordinator
 
 # Every palette value these tests assert against, in one place. All of them are
-# valid only for @picocss/pico@2.1.1, the version pinned in base.html. Pico is
-# loaded from a CDN and .github/dependabot.yml watches "github-actions" only, so
-# that pin sits outside every automated update path and nothing warns when it
-# drifts.
+# valid only for Pico 2.1.1, the version vendored as
+# static/vendor/pico-2.1.1.min.css. .github/dependabot.yml watches
+# "github-actions" only, so that file sits outside every automated update path.
 #
-# Nor is the drift caught on the enforcing boundary yet: CI deselects the
-# `browser` marker, and adding a browser job is held for phase 26, which vendors
-# Pico and htmx locally first so CI need not depend on CDN egress. Until then a
-# Pico bump is a manual edit whose breakage surfaces only when a human runs
-# `pytest -m browser`. Collecting the expectations here does not fix that, but it
-# makes the bump a one-line edit with a named reason instead of four scattered
-# literals that have to be found by grep.
+# The drift is caught on the enforcing boundary: the CI `browser` job runs this
+# module, offline behind the egress gate. A Pico bump is therefore a vendoring
+# change -- new file, new `integrity` in base.html, new hash in
+# tests/test_vendor_assets.py -- plus these literals. Collecting the expectations
+# here makes that last part a one-line edit with a named reason instead of four
+# scattered literals that have to be found by grep.
 _PICO_SURFACE = {"light": "rgb(255, 255, 255)", "dark": "rgb(19, 23, 31)"}
 """Pico's page surface under each colour scheme, as the browser computes it."""
 
@@ -180,6 +185,53 @@ def browser_server_url(browser_server: _BrowserServer) -> str:
     return browser_server.url
 
 
+@pytest.fixture
+def egress_allowlist(browser_server: _BrowserServer) -> list[str]:
+    """
+    Return the base URLs a browser test may reach: the test server, and nothing else.
+
+    It is a list rather than a single URL so a test that deliberately serves the
+    page from a second origin can append that base; the gate reads the list when
+    each request arrives, so an append made inside the test still counts.
+    """
+    return [browser_server.url]
+
+
+def _is_allowed(url: str, allowlist: list[str]) -> bool:
+    """Say whether ``url`` is addressed to one of the allowlisted base URLs."""
+    return any(url == base or url.startswith(base + "/") for base in allowlist)
+
+
+@pytest.fixture
+def context(
+    context: BrowserContext, egress_allowlist: list[str]
+) -> Iterator[BrowserContext]:
+    """
+    Route every request the page makes through a no-egress gate.
+
+    This overrides pytest-playwright's ``context`` fixture, so every ``page`` in
+    this module -- the DARK-01/DARK-02 tests included -- is built from a context
+    that continues requests addressed to the test server and aborts and records
+    everything else. The test then fails if anything was recorded. That proves
+    the UI needs no internet (ROBU-09) rather than assuming it from the network
+    the run happens to have, and it is what lets every browser test run offline
+    in the CI ``browser`` job (ROBU-11).
+    """
+    blocked: list[str] = []
+
+    def _gate(route: Route) -> None:
+        url = route.request.url
+        if _is_allowed(url, egress_allowlist):
+            route.continue_()
+        else:
+            blocked.append(url)
+            route.abort()
+
+    context.route("**/*", _gate)
+    yield context
+    assert blocked == [], f"the page tried to reach the network: {blocked}"
+
+
 @pytest.mark.browser
 class TestBrowserRendering:
     """PicoCSS and semantic HTML rendering tests."""
@@ -255,6 +307,106 @@ class TestHTMXPolling:
         # Check htmx is available in the global scope
         htmx_loaded = page.evaluate("typeof htmx !== 'undefined'")
         assert htmx_loaded is True
+
+
+@pytest.mark.browser
+class TestOfflinePage:
+    """
+    The page structure phase 26 promises, read from the live DOM.
+
+    Each of these is a property of what the browser actually loaded and built:
+    which htmx ran and with which config, whether a deleted script is still
+    fetched, and how an empty alert region lays out. A template string test sees
+    the markup, not the result.
+    """
+
+    def test_vendored_htmx_is_the_pinned_version_with_error_swapping(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        The vendored htmx 2.0.8 runs with all three response rules (B2, ROBU-09).
+
+        htmx merges the meta config shallowly, so a config holding only the
+        ``[45]..`` entry would replace the whole array and stop every 2xx swap;
+        the count of three and the error entry's ``swap`` are both asserted. No
+        ``data-theme`` and no ``pico.colors`` stylesheet keep the 23.1 dark-mode
+        coupling intact.
+        """
+        page.goto(browser_server_url)
+        assert page.evaluate("htmx.version") == "2.0.8"
+        assert page.evaluate("htmx.config.responseHandling.length") == 3
+        error_rule_swaps = page.evaluate(
+            "htmx.config.responseHandling.find((rule) => rule.code === '[45]..').swap"
+        )
+        assert error_rule_swaps is True
+        assert (
+            page.evaluate("document.documentElement.hasAttribute('data-theme')")
+            is False
+        )
+        assert (
+            page.evaluate(
+                "document.querySelectorAll(\"link[href*='pico.colors']\").length"
+            )
+            == 0
+        )
+
+    def test_app_js_is_gone(self, page: Page, browser_server: _BrowserServer) -> None:
+        """
+        The deleted app script is neither referenced nor served (B3, ROBU-04).
+
+        A stale ``<script>`` tag pointing at a 404 would still load nothing, and
+        a stale file still served would let a cached page run the old button
+        logic, so both halves are checked.
+        """
+        page.goto(browser_server.url)
+        assert page.locator("script[src*='app.js']").count() == 0
+        response = page.request.get(browser_server.url + "/static/app.js")
+        assert response.status == 404
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_status_message_slot_is_empty_and_zero_height(
+        self,
+        page: Page,
+        browser_server_url: str,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        The request-error slot is one empty alert region taking no space (B4, D-03).
+
+        It must be present and empty in the initial HTML so a later insertion is
+        announced, and it must not push the status area down while empty.
+        """
+        page.emulate_media(color_scheme=scheme)
+        page.goto(browser_server_url)
+        slot = page.locator("#status-message")
+        assert slot.count() == 1
+        assert slot.get_attribute("role") == "alert"
+        assert slot.evaluate("(el) => el.childNodes.length") == 0
+        assert slot.evaluate("(el) => el.getBoundingClientRect().height") == 0
+        assert (
+            page.evaluate("document.querySelectorAll('[id=\"status-message\"]').length")
+            == 1
+        )
+        slot_precedes_status_area = page.evaluate(
+            "() => Boolean("
+            "document.getElementById('status-message').compareDocumentPosition("
+            "document.getElementById('status-area')) "
+            "& Node.DOCUMENT_POSITION_FOLLOWING)"
+        )
+        assert slot_precedes_status_area is True
+
+    def test_title_input_caps_at_256(self, page: Page, browser_server_url: str) -> None:
+        """
+        The title input stops at the server's 256-character cap (B14, ROBU-08).
+
+        The server's 422 stays authoritative; this is what keeps a browser user
+        from ever meeting it.
+        """
+        page.goto(browser_server_url)
+        title_input = page.locator("#title-input")
+        assert title_input.get_attribute("maxlength") == "256"
+        title_input.fill("x" * 300)
+        assert len(title_input.input_value()) == 256
 
 
 @pytest.mark.browser
