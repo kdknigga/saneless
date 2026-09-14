@@ -32,6 +32,7 @@ from .pipeline import (
 from .vocabulary import (
     ACTIVE_STATES,
     RESTART_REASON,
+    ErrorCategory,
     FlipOutcome,
     JobState,
     SubmitResult,
@@ -47,7 +48,6 @@ if TYPE_CHECKING:
     from .job import Job, JobStore
     from .paperless import PaperlessClient
     from .scanner.base import ScannerBackend
-    from .vocabulary import ErrorCategory
 
 __all__ = ["STOP_JOIN_SECONDS", "ScanWorker", "WorkerFlipCoordinator"]
 
@@ -242,10 +242,13 @@ class ScanWorker:
         # When the idle loop last pruned.  Starts now: the startup prune is the
         # lifespan's (26-09), so the first idle prune is an interval away.
         self._last_prune = time.monotonic()
-        # Jobs whose failure could not be written even by the loop guard, by
-        # id, with the error text and category the guard tried to record.
-        # Every idle tick retries them (CR-01).  Touched only by the worker
-        # thread.
+        # Job-row writes owed by id, with the error text and category to record:
+        # failures even the loop guard could not write, and rejected submits
+        # whose REJECTED write failed in the request (WR-01).  Every idle tick
+        # retries them (CR-01).  Shared by the worker thread (the guard and the
+        # idle flush) and request threads (owe_rejection), so every read and
+        # write goes through _unrecorded_lock.
+        self._unrecorded_lock = threading.Lock()
         self._unrecorded_failures: dict[str, tuple[str, ErrorCategory | None]] = {}
         # Set and cleared by the worker thread (and by mark_recovery_pending,
         # before the thread exists); read by request threads through health and
@@ -273,6 +276,30 @@ class ScanWorker:
         """
         self._restart_recovery_pending = True
         self._degraded.set()
+
+    def owe_rejection(self, job_id: str, error: str) -> None:
+        """
+        Take over a refused submit's REJECTED write that the request could not make.
+
+        The scan route calls this when finishing a refused submit's row as
+        ``ERROR`` with ``ErrorCategory.REJECTED`` raised, so the row is not
+        left PENDING with no marker and the Scan button disabled (WR-01).  The
+        id was refused by :meth:`submit` and never enqueued, so no job can be
+        running under it.
+
+        The worker writes it on its next idle tick, or through the recovery
+        path while degraded, sharing the flush of the loop guard's owed
+        failures (CR-01, D-12).  If the worker thread is not running (DOWN) no
+        tick comes: ``/health`` reports 503 meanwhile, and the next startup's
+        ``fail_active_jobs(RESTART_REASON)`` ends the row (D-13).
+
+        Args:
+            job_id: The refused submit's job row.
+            error: The job-row error text for the rejection.
+
+        """
+        with self._unrecorded_lock:
+            self._unrecorded_failures[job_id] = (error, ErrorCategory.REJECTED)
 
     @property
     def health(self) -> WorkerHealth:
@@ -755,7 +782,8 @@ class ScanWorker:
                 job.id,
                 exc_info=True,
             )
-            self._unrecorded_failures[job.id] = (error, category)
+            with self._unrecorded_lock:
+                self._unrecorded_failures[job.id] = (error, category)
 
     def _idle_housekeeping(self) -> None:
         """
@@ -801,17 +829,28 @@ class ScanWorker:
         job the loop already abandoned: none can be the job in flight.  With
         nothing owed it returns without touching the store.
 
+        The owed entries are snapshotted under ``_unrecorded_lock``, and every
+        store write runs outside it, so a request thread calling
+        :meth:`owe_rejection` never waits on the store.  An entry is dropped
+        only if it is unchanged since the snapshot; one owed after the
+        snapshot waits for the next tick.
+
         Raises:
             Exception: Whatever the store raises.  Rows already written stay
                 written and are no longer owed; the rest wait for the next
                 tick.
 
         """
-        for job_id, (error, category) in list(self._unrecorded_failures.items()):
+        with self._unrecorded_lock:
+            owed_writes = list(self._unrecorded_failures.items())
+        for job_id, owed in owed_writes:
+            error, category = owed
             self._job_store.finish_job(
                 job_id, JobState.ERROR, error=error, error_category=category
             )
-            del self._unrecorded_failures[job_id]
+            with self._unrecorded_lock:
+                if self._unrecorded_failures.get(job_id) == owed:
+                    del self._unrecorded_failures[job_id]
             logger.info(
                 "Recorded job %s as failed now that the job store accepts writes",
                 job_id,
