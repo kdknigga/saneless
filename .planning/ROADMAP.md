@@ -38,7 +38,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 23.1: Dark Mode and the Commit Gate** (INSERTED) - The dark palette actually engages, every status colour passes AA in both schemes, and a TDD RED commit is possible without suppressing a gate (completed 2026-09-11)
 - [x] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane (completed 2026-09-13)
 - [x] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass (completed 2026-09-14)
-- [ ] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets
+- [x] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets (completed 2026-09-14)
 - [ ] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible
 - [ ] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback
 - [ ] **Phase 29: Geometry, Memory, and Timeouts** - Pages spooled to disk in explicit order, safe cancel, shared flatbed/ADF timeout, guarded `sane.init()`
@@ -377,7 +377,7 @@ Plans:
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 26-13-PLAN.md — Request error slot browser proof (ROBU-02 visibility) and plain-HTTP LAN origin (wave 7)
+- [x] 26-13-PLAN.md — Request error slot browser proof (ROBU-02 visibility) and plain-HTTP LAN origin (wave 7)
 
 Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 must be paired with an explicit `htmx-config` override or it is invisible — reintroducing the exact C-10 symptom this phase fixes. Worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper here, not in Phase 32.
 
@@ -488,7 +488,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
-| 26. Worker and Web Robustness | 13/14 | In Progress|  |
+| 26. Worker and Web Robustness | 14/14 | Complete   | 2026-09-14 |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
