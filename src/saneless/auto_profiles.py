@@ -11,21 +11,17 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Mapping
-from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 import tomlkit
 
-from saneless.config import (
-    DEFAULT_RESOLUTION,
-    ProfileConfig,
-    Settings,
-    config_search_paths,
-)
+from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
 from saneless.exceptions import ConfigError
 from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from saneless.scanner.base import DeviceCapabilities
 
 __all__ = [
@@ -33,7 +29,6 @@ __all__ = [
     "is_bare_default",
     "pick_closest_resolution",
     "pick_preferred_mode",
-    "resolve_config_path",
     "source_to_slug",
     "write_profiles_to_config",
 ]
@@ -425,30 +420,6 @@ def generate_profiles(
         )
 
     return profiles
-
-
-def resolve_config_path(config_path: str | None = None) -> Path:
-    """
-    Resolve the TOML config file path for writing.
-
-    Searches ``config_search_paths()`` when no explicit path is given. Its
-    last production caller is the worker's lazy generation, which re-derives
-    a path that ignores ``--config``; plan 26-08 removes both in favour of
-    ``Settings.config_path`` (D-16).
-
-    Args:
-        config_path: Explicit path string, or None to search defaults.
-
-    Returns:
-        Resolved Path to the config file.
-
-    """
-    if config_path:
-        return Path(config_path)
-    for path in config_search_paths():
-        if path.exists():
-            return path
-    return Path("./saneless.toml")
 
 
 def _is_auto_generated(table: object) -> bool:
