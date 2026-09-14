@@ -1736,7 +1736,7 @@ class TestWorkerStopAndSubmit:
         """
         scanner = _GatedScanner(frozenset({1}))
         settings = _manual_duplex_settings(default_settings)
-        assert settings.flip_timeout_seconds > _STATE_BUDGET * 10
+        assert settings.output.flip_timeout_seconds > _STATE_BUDGET * 10
         states_seen: list[JobState] = []
         store = JobStore()
         original_update = store.update_state
