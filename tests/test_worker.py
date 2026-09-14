@@ -551,6 +551,7 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker tracks current_job_id during processing."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -578,33 +579,101 @@ class TestScanWorkerManualDuplex:
 
             assert worker.current_job_id == job.id
 
+            # Continue counts only at the flip prompt (CR-01), so reach it first.
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
             worker.continue_flip()
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
             worker.stop()
 
             assert worker.current_job_id is None
         finally:
             store.close()
 
+    def test_the_coordinator_is_armed_before_awaiting_flip_is_persisted(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        CR-01: whoever reads AWAITING_FLIP from the store finds the prompt armed.
+
+        The status poll renders Continue and Abort from the persisted row, so
+        the coordinator must already accept an answer by the time that row is
+        written.  The store's ``update_state`` is wrapped to record, at the
+        moment AWAITING_FLIP is written, whether the worker's coordinator is
+        armed.
+        """
+        default_settings.profiles["duplex"] = ProfileConfig(
+            source="ADF", duplex="manual"
+        )
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _mock_manual_duplex_pipeline,
+        )
+
+        armed_at_persist: list[bool] = []
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        original_update = store.update_state
+
+        def recording_update(
+            job_id: str,
+            state: JobState,
+            error: str | None = None,
+            error_category: ErrorCategory | None = None,
+        ) -> None:
+            """Record the coordinator's arming as AWAITING_FLIP is written."""
+            if state is JobState.AWAITING_FLIP:
+                coordinator = worker._flip_coordinator
+                armed_at_persist.append(coordinator is not None and coordinator.armed)
+            original_update(job_id, state, error=error, error_category=error_category)
+
+        monkeypatch.setattr(store, "update_state", recording_update)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Armed Before Persist")
+            worker.submit(job)
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.continue_flip()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert armed_at_persist == [True]
+        assert finished.state is JobState.DONE
+
 
 class TestWorkerFlipCoordinator:
     """
     The web flip coordinator answers once, and its answer is final (D-16).
 
+    It is also bound to one job and accepts an answer only once armed, which
+    the worker does when the job announces ``AWAITING_FLIP`` (CR-01).
+
     Every wait here is bounded by ``0``: ``threading.Event().wait(0)`` returns
     in microseconds, so nothing in this class waits on a wall clock.
     """
 
-    def test_continue_before_the_wait_resolves_continued(self) -> None:
-        """A Continue that arrives first is the answer the wait returns."""
-        coordinator = WorkerFlipCoordinator()
-        coordinator.signal_continue()
+    def test_the_coordinator_is_bound_to_one_job(self) -> None:
+        """A coordinator carries the id of the job whose flip it answers."""
+        assert WorkerFlipCoordinator("job-1").job_id == "job-1"
+
+    def test_continue_at_the_flip_prompt_resolves_continued(self) -> None:
+        """A Continue that arrives first at the prompt is the answer returned."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_continue() is True
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
-    def test_abort_before_the_wait_resolves_aborted(self) -> None:
-        """An Abort that arrives first is the answer the wait returns."""
-        coordinator = WorkerFlipCoordinator()
-        coordinator.signal_abort()
+    def test_abort_at_the_flip_prompt_resolves_aborted(self) -> None:
+        """An Abort that arrives first at the prompt is the answer returned."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_abort() is True
         assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
 
     def test_a_later_abort_after_continue_is_dropped(self) -> None:
@@ -614,21 +683,82 @@ class TestWorkerFlipCoordinator:
         Pass B has genuinely started by then, and stopping it mid-pass is
         Phase 29's HARD-02, so the honest answer is the first one.
         """
-        coordinator = WorkerFlipCoordinator()
-        coordinator.signal_continue()
-        coordinator.signal_abort()
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_continue() is True
+        assert coordinator.signal_abort() is False
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
-    def test_an_unanswered_wait_times_out(self) -> None:
+    def test_an_unarmed_signal_is_dropped(self) -> None:
+        """
+        CR-01: a signal before the flip prompt exists claims nothing.
+
+        Both signals report that they were dropped and leave the answer slot
+        empty, so a click meant for an earlier prompt cannot pre-answer this one.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        assert coordinator.armed is False
+        assert coordinator.signal_continue() is False
+        assert coordinator.signal_abort() is False
+        assert coordinator.answer is None
+
+    def test_an_early_signal_is_dropped_not_queued(self) -> None:
+        """
+        CR-01: an Abort sent during pass A is not held back for the prompt.
+
+        Once the prompt is armed, the operator's real Continue is the answer.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        assert coordinator.signal_abort() is False
+        coordinator.arm()
+        assert coordinator.signal_continue() is True
+        assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
+
+    def test_the_first_armed_answer_wins_and_later_ones_are_dropped(self) -> None:
+        """D-16 with CR-01: the first armed signal claims; every later one is False."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_abort() is True
+        assert coordinator.signal_abort() is False
+        assert coordinator.signal_continue() is False
+        assert coordinator.answer is FlipOutcome.ABORTED
+        assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
+
+    def test_arming_is_idempotent(self) -> None:
+        """Arming twice is the same as arming once."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        coordinator.arm()
+        assert coordinator.armed is True
+        assert coordinator.signal_continue() is True
+
+    def test_an_unanswered_armed_wait_times_out(self) -> None:
         """Nothing signalled within the bound resolves TIMED_OUT (DPLX-05)."""
-        coordinator = WorkerFlipCoordinator()
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
+
+    def test_an_unanswered_unarmed_wait_times_out(self) -> None:
+        """A wait on a never-armed coordinator still times out (DPLX-05)."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
+
+    def test_waiting_arms_the_coordinator(self) -> None:
+        """
+        ``wait_for_flip`` arms the coordinator itself, as a backstop.
+
+        A caller that never announces ``AWAITING_FLIP`` still gets a
+        coordinator its operator can answer.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.wait_for_flip(0)
+        assert coordinator.armed is True
 
     def test_a_continue_after_a_timeout_does_not_revive_the_wait(self) -> None:
         """The timeout is an answer too; a Continue arriving after it is dropped."""
-        coordinator = WorkerFlipCoordinator()
+        coordinator = WorkerFlipCoordinator("job-1")
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
-        coordinator.signal_continue()
+        assert coordinator.signal_continue() is False
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
 
     def test_a_continue_racing_the_timeout_is_honoured(
@@ -642,7 +772,8 @@ class TestWorkerFlipCoordinator:
         the interleaving a real race produces.  The coordinator must return the
         answer already claimed, not overwrite it with ``TIMED_OUT``.
         """
-        coordinator = WorkerFlipCoordinator()
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
 
         def _continue_then_expire(timeout: float | None = None) -> bool:
             """Deliver Continue, then report the wait as expired."""
