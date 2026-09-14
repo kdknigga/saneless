@@ -8,8 +8,12 @@ HLTH-01, HLTH-02, LOG-03.
 from __future__ import annotations
 
 import html
+import inspect
 import json
+import logging
 import re
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -37,9 +42,17 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.vocabulary import FlipOutcome
+from saneless.vocabulary import (
+    QUEUE_FULL_JOB_ERROR,
+    ErrorCategory,
+    FlipOutcome,
+    RequestRejection,
+    SubmitResult,
+    WorkerHealth,
+    rejection_message,
+)
 from saneless.web.app import create_app
-from saneless.worker import WorkerFlipCoordinator
+from saneless.worker import ScanWorker, WorkerFlipCoordinator
 
 
 def _app(client: TestClient) -> FastAPI:
@@ -153,6 +166,94 @@ def test_health_endpoint_no_auth(client: TestClient) -> None:
     assert response.status_code == 200
 
 
+def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
+    """
+    Every route handler is a plain ``def`` (ROBU-05, M-01).
+
+    Each handler calls blocking code, and FastAPI only moves ``def`` handlers
+    onto its threadpool; an ``async def`` one would block the event loop.  The
+    client fixture is used so the lifespan closes the job store afterwards.
+    """
+    routes = [route for route in _app(client).routes if isinstance(route, APIRoute)]
+    assert routes
+    for route in routes:
+        assert not inspect.iscoroutinefunction(route.endpoint), route.path
+
+
+def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
+    """/health answers promptly while another request is blocked in I/O (ROBU-05)."""
+    gate = threading.Event()
+    app = _app(client)
+
+    def blocking_get_tags() -> list[dict[str, object]]:
+        gate.wait(5)
+        return []
+
+    app.state.paperless.get_tags = blocking_get_tags
+    app.state.cache.invalidate("tags")
+    slow = threading.Thread(target=lambda: client.get("/api/tags"))
+    slow.start()
+    try:
+        time.sleep(0.2)
+        started = time.monotonic()
+        response = client.get("/health")
+        elapsed = time.monotonic() - started
+        assert response.status_code == 200
+        assert elapsed < 1.0
+    finally:
+        gate.set()
+        slow.join(5)
+
+
+def test_metadata_fetch_failure_falls_back_to_an_empty_list(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Paperless failure still renders empty options and logs a WARNING (ROBU-05)."""
+    app = _app(client)
+
+    def failing_get_tags() -> list[dict[str, object]]:
+        msg = "paperless unreachable"
+        raise ConnectionError(msg)
+
+    app.state.paperless.get_tags = failing_get_tags
+    app.state.cache.invalidate("tags")
+    with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
+        response = client.get("/api/tags")
+
+    assert response.status_code == 200
+    assert "receipt" not in response.text
+    assert app.state.cache.get("tags") is None
+    assert any(
+        r.levelno == logging.WARNING and "using empty list" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_health_reports_degraded_worker(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A degraded worker makes /health a 503 naming the store (ROBU-05, D-10).
+
+    The property is patched rather than the degraded Event set, so the worker
+    thread's idle recovery probe cannot clear it mid-request.
+    """
+    monkeypatch.setattr(
+        ScanWorker, "health", property(lambda _self: WorkerHealth.DEGRADED)
+    )
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json() == {"status": "error", "detail": "job store failing"}
+
+
+def test_health_reports_down_worker(client: TestClient) -> None:
+    """A stopped worker makes /health a 503 naming the thread (ROBU-05, D-10)."""
+    assert _app(client).state.worker.stop()
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json() == {"status": "error", "detail": "worker thread is down"}
+
+
 def test_profile_dropdown(client: TestClient, test_settings: Settings) -> None:
     """Profile names from settings appear in dropdown (PROF-03)."""
     response = client.get("/")
@@ -259,6 +360,97 @@ def test_cache_invalidate(client: TestClient) -> None:
     """POST /api/cache/invalidate refreshes resource (UI-08)."""
     response = client.post("/api/cache/invalidate?resource=tags")
     assert response.status_code == 200
+
+
+def test_cache_invalidate_rejects_an_unknown_resource(client: TestClient) -> None:
+    """Only tags and correspondents can be invalidated; nothing else is (N-20, D-19)."""
+    cache = _app(client).state.cache
+    cache.set("tags", [{"id": 1, "name": "receipt"}])
+
+    response = client.post("/api/cache/invalidate?resource=bogus")
+
+    assert response.status_code == 422
+    assert response.json() == {
+        "status": "error",
+        "detail": rejection_message(RequestRejection.INVALID_REQUEST),
+    }
+    assert cache.get("tags") == [{"id": 1, "name": "receipt"}]
+
+
+def _status_area(page: str) -> str:
+    """Cut the status area out of the full page, leaving history behind."""
+    start = page.index('id="status-area"')
+    return page[start : page.index("history-table-wrap", start)]
+
+
+def test_rejected_submit_does_not_replace_the_job_that_ran(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A rejection during a run never becomes the status area's job (D-06, T8).
+
+    The rejected row is newer than the running job, so once that job ends the
+    status area must still report it -- not the queue-full rejection.
+    """
+    app = _app(client)
+    job_store: JobStore = app.state.job_store
+    worker = app.state.worker
+    job = job_store.create_job(profile="default", title="Running Job")
+    job_store.update_state(job.id, JobState.SCANNING)
+    worker._current_job_id = job.id
+    monkeypatch.setattr(worker, "submit", lambda _job: SubmitResult.QUEUE_FULL)
+
+    rejected = client.post(
+        "/api/scan", data={"profile": "default", "title": "Refused Scan"}
+    )
+    assert rejected.status_code == 429
+    newest = job_store.list_recent(limit=1)[0]
+    assert newest.title == "Refused Scan"
+    assert newest.error_category is ErrorCategory.REJECTED
+
+    job_store.finish_job(job.id, JobState.DONE)
+    worker._current_job_id = None
+
+    status = client.get("/api/jobs/current/status")
+    assert "Done: Running Job" in status.text
+    assert QUEUE_FULL_JOB_ERROR not in status.text
+
+    page = client.get("/").text
+    assert "Done: Running Job" in _status_area(page)
+    assert QUEUE_FULL_JOB_ERROR not in _status_area(page)
+    # History still lists the rejected attempt (D-05).
+    assert "Refused Scan" in page
+
+
+def test_rejected_rows_alone_leave_the_status_area_ready(client: TestClient) -> None:
+    """With only rejected rows and no current job, nothing has run (D-06)."""
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title="Never Ran")
+    job_store.finish_job(
+        job.id,
+        JobState.ERROR,
+        error=QUEUE_FULL_JOB_ERROR,
+        error_category=ErrorCategory.REJECTED,
+    )
+
+    response = client.get("/api/jobs/current/status")
+
+    assert response.status_code == 200
+    assert "Ready to scan." in response.text
+    assert QUEUE_FULL_JOB_ERROR not in response.text
+
+
+def test_index_lists_the_worker_profiles(client: TestClient) -> None:
+    """The profile dropdown reads the worker's locked profile set (D-19)."""
+    _app(client).state.worker._set_profiles(
+        {"default": ProfileConfig(), "zz-new-profile": ProfileConfig()}
+    )
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert "zz-new-profile" in response.text
+    assert ">duplex<" not in response.text
 
 
 def test_flip_continue(client: TestClient) -> None:
