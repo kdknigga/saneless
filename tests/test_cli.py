@@ -522,9 +522,10 @@ class TestManualDuplexPrompt:
                 ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Abort"],
                 input=answer,
             )
-            error_line = next(
-                line for line in result.output.splitlines() if "Scan error" in line
-            )
+            # Sliced from the message rather than taken by line: at EOF the
+            # prompt gets no newline, so the error shares the prompt's line.
+            error_line = result.output[result.output.index("Scan error") :]
+            error_line = error_line.splitlines()[0]
             outcomes.append((result.exit_code, error_line, len(calls), len(uploads)))
 
         answered_no, interrupted = outcomes
