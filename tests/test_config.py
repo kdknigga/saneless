@@ -300,20 +300,45 @@ class TestMinFreeSpaceMb:
 
 
 class TestFlipTimeoutSeconds:
-    """OutputConfig flip_timeout_seconds field (DPLX-05, D-10)."""
+    """
+    OutputConfig flip_timeout_seconds field (DPLX-05, D-10, WR-01).
+
+    The wait is bounded to one second through one day.  Zero or a negative
+    value makes the flip wait expire at once, failing every manual-duplex job
+    right after pass A; a value above ``threading.TIMEOUT_MAX`` makes
+    ``Event.wait`` raise ``OverflowError`` at the same point.  Both are
+    rejected at load, where the CLI reports a configuration error.
+    """
 
     def test_flip_timeout_seconds_default(self) -> None:
         """Settings default the manual-duplex flip wait to ten minutes."""
         assert Settings().output.flip_timeout_seconds == 600
 
-    def test_flip_timeout_seconds_accepts_zero(self) -> None:
-        """
-        Zero is a valid timeout.
+    @pytest.mark.parametrize("value", [0, -5, 86_401])
+    def test_flip_timeout_seconds_out_of_bounds_rejected(self, value: int) -> None:
+        """Zero, a negative value and anything above a day fail validation."""
+        with pytest.raises(ValidationError, match="flip_timeout_seconds"):
+            OutputConfig(flip_timeout_seconds=value)
 
-        It is the zero-cost seam later plans use to make a flip timeout
-        observable without waiting for one.
-        """
-        assert OutputConfig(flip_timeout_seconds=0).flip_timeout_seconds == 0
+    @pytest.mark.parametrize("value", [1, 86_400])
+    def test_flip_timeout_seconds_bounds_accepted(self, value: int) -> None:
+        """One second and exactly one day are the inclusive bounds."""
+        assert OutputConfig(flip_timeout_seconds=value).flip_timeout_seconds == value
+
+    def test_flip_timeout_seconds_zero_in_toml_rejected(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A TOML ``flip_timeout_seconds = 0`` fails at load, not after pass A."""
+        toml_content = """\
+[output]
+flip_timeout_seconds = 0
+
+[profiles.default]
+"""
+        config_file = tmp_config_dir / "flip_timeout_zero.toml"
+        config_file.write_text(toml_content)
+        with pytest.raises(ValidationError, match="flip_timeout_seconds"):
+            load_settings(config_path=str(config_file))
 
     def test_flip_timeout_seconds_from_toml(self, tmp_config_dir: Path) -> None:
         """The timeout is read from the [output] section."""
