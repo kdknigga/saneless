@@ -677,11 +677,12 @@ class TestFiveOutcomesEndToEnd:
             job = store.create_job(_PROFILE, _TITLE)
             worker.submit(job)
             if case.awaits_flip and case.operator_flips:
-                # Observing the persisted AWAITING_FLIP first removes the race
-                # against the worker creating its flip event: continue_flip()
-                # is a no-op if it arrives before _process_job has made one.
+                # The persisted AWAITING_FLIP is observed first because the
+                # coordinator only accepts an answer once armed, and the worker
+                # arms it as it announces AWAITING_FLIP: a Continue sent any
+                # earlier is dropped, not queued (CR-01).
                 wait_for_state(store, job.id, JobState.AWAITING_FLIP, 2.0)
-                worker.continue_flip()
+                worker.continue_flip(job.id)
             # A 2 s budget, far below pytest-timeout's 60 s SIGALRM.  The
             # signal method delivers to the MAIN thread whichever thread is
             # stuck, so letting this run to the global ceiling would print a
