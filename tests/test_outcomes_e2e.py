@@ -26,16 +26,18 @@ SQLite job store, and a real background thread.  Every assertion reads the
 because a row in the database is the thing a user's web page and ``saneless
 jobs`` actually render (T-23-38).
 
-**On speed.**  All five cases together sleep for well under a second, using
+**On speed.**  All the cases together sleep for well under a second, using
 only seams that already exist:
 
 * ``max_retries=1`` makes both exponential-backoff pauses in
   ``upload_document`` unreachable (measured 3.00 s at 3 retries, 1.00 s at 2,
   0.00 s at 1).  The consume-directory case is the one that needs it.
-* ``paperless_task_timeout`` is 0 for the timeout case, so ``poll_task``'s
+* ``paperless_task_timeout`` is 0 for the poll-timeout case, so ``poll_task``'s
   monotonic deadline has already passed when the first poll comes back without
   a terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
-* The other four cases reach a terminal status, or fall back, on the first
+* ``flip_timeout_seconds`` is 0 for the flip-timeout case, so the flip wait
+  resolves in microseconds.  See ``_FLIP_TIMEOUT_BUDGET``.
+* The other cases reach a terminal status, or fall back, on the first
   request, before any sleep, and cost nothing.
 
 The sleep primitive itself is **not** patched anywhere here, and no flat
@@ -50,7 +52,7 @@ tests, for a problem two existing constructor parameters already solve.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from unittest.mock import MagicMock
 
 import httpx
@@ -94,9 +96,14 @@ _TITLE = "Quarterly Report"
 _PROFILE = "e2e"
 
 _SIMPLEX_SOURCE = "Flatbed"
-_DUPLEX_SOURCE = "Manual Duplex"
+# A manual-duplex profile names a real feeder source and says ``duplex =
+# "manual"``: source is a pure SANE value and no longer selects the strategy.
+_DUPLEX_SOURCE = "ADF"
+# The deprecated one-key form, kept as its own case so DPLX-02's "still loads
+# AND scans" is proven through the real pipeline, not only at config load.
+_LEGACY_DUPLEX_SOURCE = "ADF Manual Duplex"
 
-# The shipped default, used by the four cases that do not time out: their first
+# The shipped default, used by every case that does not time out a poll: their first
 # poll is terminal, so the value never actually elapses and production's own
 # number is the honest thing to run with.
 _PRODUCTION_TIMEOUT = 300
@@ -113,6 +120,19 @@ _PRODUCTION_TIMEOUT = 300
 # ``min(delay, remaining)`` backoff clamp itself is proven by
 # ``tests/test_paperless.py``'s dedicated wall-clock test at the unit level.
 _TIMEOUT_BUDGET = 0
+
+# The shipped flip wait, for every case whose operator answers the prompt: the
+# answer arrives first, so the bound never elapses.
+_PRODUCTION_FLIP_TIMEOUT = 600
+
+# Zero, for the same reasons as _TIMEOUT_BUDGET.  flip_timeout_seconds is typed
+# ``int``, so pydantic rejects a fractional float like 0.05 outright, and
+# assigning one afterwards would be a type lie that ty and pyrefly are right to
+# reject.  Zero costs no wall clock -- ``threading.Event().wait(0)`` was
+# measured at 4 microseconds -- and proves the same property end to end:
+# nothing answered within the bound, so the coordinator resolves TIMED_OUT and
+# the pipeline raises before pass B.
+_FLIP_TIMEOUT_BUDGET = 0
 
 _FAILURE_TASK = "e2e-task-failure"
 _PENDING_TASK = "e2e-task-never-finishes"
@@ -298,7 +318,7 @@ class _Case:
     """
     One end-to-end outcome: how the world is built, and how it must end.
 
-    A record rather than a tuple because five heterogeneous cases with a dozen
+    A record rather than a tuple because heterogeneous cases with a dozen
     fields each are unreadable positionally, and because ``label`` doubles as
     the pytest test id.
 
@@ -313,14 +333,20 @@ class _Case:
         expected_pages: (scanned, removed, uploaded), all None on a failure.
         expected_failed_pdfs: How many PDFs must survive in <data_dir>/failed/.
         expected_consume_pdfs: How many files must sit in the consume directory.
-        source: The profile's scan source; "Manual Duplex" takes the two-pass
-            path.
+        source: The profile's scan source, handed to the device verbatim.
+        duplex: The profile's ``duplex`` key; ``"manual"`` takes the two-pass
+            path.  None omits the key entirely, which is what lets the legacy
+            ``source`` form be translated at load -- an explicit value, even
+            ``"none"``, is never overwritten by that inference.
         scan_passes: Page count per scan_pages call.  Two entries means two
             passes, and two different numbers means a duplex mismatch.
         task_timeout: settings.output.paperless_task_timeout for this case.
+        flip_timeout: settings.output.flip_timeout_seconds for this case.
         with_consume_dir: Whether the client is given a consume directory.
-        awaits_flip: Whether the run parks in AWAITING_FLIP and needs the
-            operator's continue signal.
+        awaits_flip: Whether the run parks in AWAITING_FLIP at all.
+        operator_flips: Whether the test answers the flip prompt with
+            Continue.  False leaves the wait to run out, which is the whole
+            point of the flip-timeout case.
         warning_contains: A fragment the persisted warning must contain; None
             means the warning column must be NULL.
         error_contains: Fragments the persisted error must contain; empty means
@@ -336,10 +362,13 @@ class _Case:
     expected_failed_pdfs: int
     expected_consume_pdfs: int
     source: str = _SIMPLEX_SOURCE
+    duplex: Literal["none", "hardware", "manual"] | None = None
     scan_passes: tuple[int, ...] = (2,)
     task_timeout: int = _PRODUCTION_TIMEOUT
+    flip_timeout: int = _PRODUCTION_FLIP_TIMEOUT
     with_consume_dir: bool = False
     awaits_flip: bool = False
+    operator_flips: bool = True
     warning_contains: str | None = None
     error_contains: tuple[str, ...] = ()
 
@@ -395,9 +424,40 @@ _CASES = [
         expected_failed_pdfs=0,
         expected_consume_pdfs=0,
         source=_DUPLEX_SOURCE,
+        duplex="manual",
         scan_passes=(3, 2),
         awaits_flip=True,
         warning_contains="Page count mismatch: 3 fronts, 2 backs",
+    ),
+    _Case(
+        label="legacy-duplex-source",
+        handler_factory=_accepting_handler,
+        expected_state=JobState.DONE,
+        expected_outcome=ScanOutcome.SUCCESS,
+        expected_pages=(4, 0, 4),
+        expected_failed_pdfs=0,
+        expected_consume_pdfs=0,
+        source=_LEGACY_DUPLEX_SOURCE,
+        scan_passes=(2, 2),
+        awaits_flip=True,
+    ),
+    _Case(
+        label="flip-timeout",
+        handler_factory=_accepting_handler,
+        expected_state=JobState.ERROR,
+        expected_outcome=None,
+        expected_pages=(None, None, None),
+        # The timeout raises before pass B and before assembly, so there is no
+        # PDF to preserve: Phase 23's guard spans upload and poll only.
+        expected_failed_pdfs=0,
+        expected_consume_pdfs=0,
+        source=_DUPLEX_SOURCE,
+        duplex="manual",
+        scan_passes=(3, 3),
+        flip_timeout=_FLIP_TIMEOUT_BUDGET,
+        awaits_flip=True,
+        operator_flips=False,
+        error_contains=("flip wait timed out", "nobody confirmed"),
     ),
 ]
 
@@ -437,8 +497,9 @@ def _build_scanner(scan_passes: tuple[int, ...]) -> MagicMock:
     raise StopIteration rather than silently rescanning.
 
     The flip coordination is not the scanner's job -- ``_scan_manual_duplex``
-    owns ``flip_event``, and the test releases it from the main thread once the
-    job is observed parked in AWAITING_FLIP.
+    waits on the worker's flip coordinator, and the test answers it from the
+    main thread once the job is observed parked in AWAITING_FLIP (or, for the
+    flip-timeout case, deliberately never answers it).
 
     Args:
         scan_passes: Page count for each successive scan_pages call.
@@ -466,7 +527,7 @@ def _build_settings(tmp_path: Path, case: _Case) -> Settings:
 
     Args:
         tmp_path: pytest's per-test directory.
-        case: The case being built, for its source and timeout.
+        case: The case being built, for its source, duplex mode and timeouts.
 
     Returns:
         Settings pointing at scratch, durable state and consume directories
@@ -489,15 +550,36 @@ def _build_settings(tmp_path: Path, case: _Case) -> Settings:
             data_dir=str(data_dir),
             log_file=str(tmp_path / "logs" / "saneless.log"),
             paperless_task_timeout=case.task_timeout,
+            flip_timeout_seconds=case.flip_timeout,
         ),
         profiles={
-            # Settings' field validator requires this one; nothing runs under
-            # it, and its presence alongside _PROFILE is what keeps
-            # is_bare_default False.
+            # Settings' field validator requires this one.  Only the worker
+            # release test runs a job under it; its presence alongside _PROFILE
+            # is what keeps is_bare_default False.
             "default": ProfileConfig(),
-            _PROFILE: ProfileConfig(source=case.source),
+            _PROFILE: _build_profile(case),
         },
     )
+
+
+def _build_profile(case: _Case) -> ProfileConfig:
+    """
+    Build the case's profile, writing ``duplex`` only when the case sets it.
+
+    Omitting the key is not the same as ``duplex = "none"``: the legacy
+    ``source`` translation runs only when the key is absent, so the legacy case
+    must leave it out to exercise that path at all.
+
+    Args:
+        case: The case whose source and duplex mode to use.
+
+    Returns:
+        The profile the case scans under.
+
+    """
+    if case.duplex is None:
+        return ProfileConfig(source=case.source)
+    return ProfileConfig(source=case.source, duplex=case.duplex)
 
 
 def _assert_persisted_row(case: _Case, job: Job) -> None:
@@ -559,7 +641,7 @@ def _assert_files(case: _Case, job: Job, failed_dir: Path, consume_dir: Path) ->
 
 
 class TestFiveOutcomesEndToEnd:
-    """The real worker and the real pipeline, through all five outcomes."""
+    """The real worker and the real pipeline, through every outcome case."""
 
     @pytest.mark.parametrize("case", _CASES, ids=[case.label for case in _CASES])
     def test_outcome_is_persisted(
@@ -594,7 +676,7 @@ class TestFiveOutcomesEndToEnd:
             worker.start()
             job = store.create_job(_PROFILE, _TITLE)
             worker.submit(job)
-            if case.awaits_flip:
+            if case.awaits_flip and case.operator_flips:
                 # Observing the persisted AWAITING_FLIP first removes the race
                 # against the worker creating its flip event: continue_flip()
                 # is a no-op if it arrives before _process_job has made one.
@@ -612,3 +694,62 @@ class TestFiveOutcomesEndToEnd:
 
         _assert_persisted_row(case, finished)
         _assert_files(case, finished, settings.output.failed_dir, consume_dir)
+
+
+class TestFlipTimeoutReleasesTheWorker:
+    """A flip wait that runs out fails its job and frees the worker (DPLX-05)."""
+
+    def test_the_next_job_runs_after_a_flip_timeout(
+        self,
+        tmp_path: Path,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        After a timed-out flip, a second submitted job still reaches terminal.
+
+        This is roadmap criterion 3's "releases the scanner for the next job",
+        and what that phrase does and does not mean matters.  ``scan_pages``
+        opens and closes the device on every call, so the device *handle* is
+        already released between pass A and pass B whether or not anyone ever
+        flips.  What an unbounded wait actually held was the single worker
+        thread, queueing every later job behind a forgotten prompt -- M-07's
+        real complaint.  So the proof is a second job getting through, not a
+        handle being closed.
+        """
+        case = next(case for case in _CASES if case.label == "flip-timeout")
+        settings = _build_settings(tmp_path, case)
+        store = JobStore(db_path=str(settings.output.db_path))
+        paperless = PaperlessClient(
+            url=settings.paperless.url,
+            token=settings.paperless.token,
+            consume_dir=settings.paperless.consume_dir,
+            max_retries=1,
+            _transport=httpx.MockTransport(_accepting_handler()),
+        )
+        # Pass A of the timed-out job, then the single pass of the simplex job
+        # that follows it.  No third batch: the timed-out job must never reach
+        # pass B, and if it did the simplex job would find the stub exhausted.
+        worker = ScanWorker(_build_scanner((3, 2)), paperless, settings, store)
+        try:
+            worker.start()
+            parked = store.create_job(_PROFILE, "Forgotten Flip")
+            worker.submit(parked)
+            # Nothing signals the flip.  The 2 s budget is far below
+            # pytest-timeout's 60 s SIGALRM, which lands on the main thread.
+            timed_out = wait_for_state(store, parked.id, TERMINAL_STATES, 2.0)
+
+            # The simplex "default" profile, so the follow-up job needs no flip
+            # of its own and can only be held up by the worker being stuck.
+            follow_up = store.create_job("default", "Next In Line")
+            worker.submit(follow_up)
+            finished = wait_for_state(store, follow_up.id, TERMINAL_STATES, 2.0)
+        finally:
+            worker.stop()
+            paperless.close()
+            store.close()
+
+        assert timed_out.state is JobState.ERROR
+        assert timed_out.error is not None
+        assert "flip wait timed out" in timed_out.error
+        assert finished.state is JobState.DONE
+        assert finished.pages_scanned == 2
