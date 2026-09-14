@@ -378,7 +378,7 @@ class TestScanWorkerManualDuplex:
             assert fetched.state == JobState.AWAITING_FLIP
 
             # Continue the flip
-            worker.continue_flip()
+            worker.continue_flip(job.id)
 
             time.sleep(0.5)
             worker.stop()
@@ -395,7 +395,7 @@ class TestScanWorkerManualDuplex:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """abort_flip() answers the coordinator ABORTED, so the pipeline raises."""
+        """abort_flip(job.id) answers the coordinator ABORTED; the pipeline raises."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -418,7 +418,7 @@ class TestScanWorkerManualDuplex:
                 if fetched.state == JobState.AWAITING_FLIP:
                     break
 
-            worker.abort_flip()
+            worker.abort_flip(job.id)
 
             time.sleep(0.5)
             worker.stop()
@@ -463,7 +463,7 @@ class TestScanWorkerManualDuplex:
             fetched = _get(store, job.id)
             assert fetched.thumbnail == "dGh1bWI="
 
-            worker.continue_flip()
+            worker.continue_flip(job.id)
             time.sleep(0.5)
             worker.stop()
         finally:
@@ -551,6 +551,7 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker tracks current_job_id during processing."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -578,33 +579,101 @@ class TestScanWorkerManualDuplex:
 
             assert worker.current_job_id == job.id
 
-            worker.continue_flip()
-            time.sleep(0.5)
+            # Continue counts only at the flip prompt (CR-01), so reach it first.
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.continue_flip(job.id)
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
             worker.stop()
 
             assert worker.current_job_id is None
         finally:
             store.close()
 
+    def test_the_coordinator_is_armed_before_awaiting_flip_is_persisted(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        CR-01: whoever reads AWAITING_FLIP from the store finds the prompt armed.
+
+        The status poll renders Continue and Abort from the persisted row, so
+        the coordinator must already accept an answer by the time that row is
+        written.  The store's ``update_state`` is wrapped to record, at the
+        moment AWAITING_FLIP is written, whether the worker's coordinator is
+        armed.
+        """
+        default_settings.profiles["duplex"] = ProfileConfig(
+            source="ADF", duplex="manual"
+        )
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _mock_manual_duplex_pipeline,
+        )
+
+        armed_at_persist: list[bool] = []
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        original_update = store.update_state
+
+        def recording_update(
+            job_id: str,
+            state: JobState,
+            error: str | None = None,
+            error_category: ErrorCategory | None = None,
+        ) -> None:
+            """Record the coordinator's arming as AWAITING_FLIP is written."""
+            if state is JobState.AWAITING_FLIP:
+                coordinator = worker._flip_coordinator
+                armed_at_persist.append(coordinator is not None and coordinator.armed)
+            original_update(job_id, state, error=error, error_category=error_category)
+
+        monkeypatch.setattr(store, "update_state", recording_update)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Armed Before Persist")
+            worker.submit(job)
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.continue_flip(job.id)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert armed_at_persist == [True]
+        assert finished.state is JobState.DONE
+
 
 class TestWorkerFlipCoordinator:
     """
     The web flip coordinator answers once, and its answer is final (D-16).
 
+    It is also bound to one job and accepts an answer only once armed, which
+    the worker does when the job announces ``AWAITING_FLIP`` (CR-01).
+
     Every wait here is bounded by ``0``: ``threading.Event().wait(0)`` returns
     in microseconds, so nothing in this class waits on a wall clock.
     """
 
-    def test_continue_before_the_wait_resolves_continued(self) -> None:
-        """A Continue that arrives first is the answer the wait returns."""
-        coordinator = WorkerFlipCoordinator()
-        coordinator.signal_continue()
+    def test_the_coordinator_is_bound_to_one_job(self) -> None:
+        """A coordinator carries the id of the job whose flip it answers."""
+        assert WorkerFlipCoordinator("job-1").job_id == "job-1"
+
+    def test_continue_at_the_flip_prompt_resolves_continued(self) -> None:
+        """A Continue that arrives first at the prompt is the answer returned."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_continue() is True
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
-    def test_abort_before_the_wait_resolves_aborted(self) -> None:
-        """An Abort that arrives first is the answer the wait returns."""
-        coordinator = WorkerFlipCoordinator()
-        coordinator.signal_abort()
+    def test_abort_at_the_flip_prompt_resolves_aborted(self) -> None:
+        """An Abort that arrives first at the prompt is the answer returned."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_abort() is True
         assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
 
     def test_a_later_abort_after_continue_is_dropped(self) -> None:
@@ -614,21 +683,82 @@ class TestWorkerFlipCoordinator:
         Pass B has genuinely started by then, and stopping it mid-pass is
         Phase 29's HARD-02, so the honest answer is the first one.
         """
-        coordinator = WorkerFlipCoordinator()
-        coordinator.signal_continue()
-        coordinator.signal_abort()
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_continue() is True
+        assert coordinator.signal_abort() is False
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
-    def test_an_unanswered_wait_times_out(self) -> None:
+    def test_an_unarmed_signal_is_dropped(self) -> None:
+        """
+        CR-01: a signal before the flip prompt exists claims nothing.
+
+        Both signals report that they were dropped and leave the answer slot
+        empty, so a click meant for an earlier prompt cannot pre-answer this one.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        assert coordinator.armed is False
+        assert coordinator.signal_continue() is False
+        assert coordinator.signal_abort() is False
+        assert coordinator.answer is None
+
+    def test_an_early_signal_is_dropped_not_queued(self) -> None:
+        """
+        CR-01: an Abort sent during pass A is not held back for the prompt.
+
+        Once the prompt is armed, the operator's real Continue is the answer.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        assert coordinator.signal_abort() is False
+        coordinator.arm()
+        assert coordinator.signal_continue() is True
+        assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
+
+    def test_the_first_armed_answer_wins_and_later_ones_are_dropped(self) -> None:
+        """D-16 with CR-01: the first armed signal claims; every later one is False."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        assert coordinator.signal_abort() is True
+        assert coordinator.signal_abort() is False
+        assert coordinator.signal_continue() is False
+        assert coordinator.answer is FlipOutcome.ABORTED
+        assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
+
+    def test_arming_is_idempotent(self) -> None:
+        """Arming twice is the same as arming once."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
+        coordinator.arm()
+        assert coordinator.armed is True
+        assert coordinator.signal_continue() is True
+
+    def test_an_unanswered_armed_wait_times_out(self) -> None:
         """Nothing signalled within the bound resolves TIMED_OUT (DPLX-05)."""
-        coordinator = WorkerFlipCoordinator()
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
+
+    def test_an_unanswered_unarmed_wait_times_out(self) -> None:
+        """A wait on a never-armed coordinator still times out (DPLX-05)."""
+        coordinator = WorkerFlipCoordinator("job-1")
+        assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
+
+    def test_waiting_arms_the_coordinator(self) -> None:
+        """
+        ``wait_for_flip`` arms the coordinator itself, as a backstop.
+
+        A caller that never announces ``AWAITING_FLIP`` still gets a
+        coordinator its operator can answer.
+        """
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.wait_for_flip(0)
+        assert coordinator.armed is True
 
     def test_a_continue_after_a_timeout_does_not_revive_the_wait(self) -> None:
         """The timeout is an answer too; a Continue arriving after it is dropped."""
-        coordinator = WorkerFlipCoordinator()
+        coordinator = WorkerFlipCoordinator("job-1")
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
-        coordinator.signal_continue()
+        assert coordinator.signal_continue() is False
         assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
 
     def test_a_continue_racing_the_timeout_is_honoured(
@@ -642,7 +772,8 @@ class TestWorkerFlipCoordinator:
         the interleaving a real race produces.  The coordinator must return the
         answer already claimed, not overwrite it with ``TIMED_OUT``.
         """
-        coordinator = WorkerFlipCoordinator()
+        coordinator = WorkerFlipCoordinator("job-1")
+        coordinator.arm()
 
         def _continue_then_expire(timeout: float | None = None) -> bool:
             """Deliver Continue, then report the wait as expired."""
@@ -1018,7 +1149,7 @@ class TestWorkerPassB:
             worker.submit(job)
 
             wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
-            worker.continue_flip()
+            worker.continue_flip(job.id)
 
             # Held open by the gate, so this is a state, not a blink.
             during = wait_for_state(
@@ -1053,7 +1184,7 @@ class TestWorkerPassB:
             worker.submit(job)
 
             wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
-            worker.abort_flip()
+            worker.abort_flip(job.id)
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
             scanner.release_pass_b.set()
@@ -1088,10 +1219,10 @@ class TestWorkerPassB:
             worker.submit(job)
 
             wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
-            worker.continue_flip()
+            worker.continue_flip(job.id)
             wait_for_state(store, job.id, JobState.SCANNING_REVERSE, _STATE_BUDGET)
 
-            worker.abort_flip()
+            worker.abort_flip(job.id)
             scanner.release_pass_b.set()
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
@@ -1102,6 +1233,264 @@ class TestWorkerPassB:
         assert finished.state is JobState.DONE
         assert finished.error is None
         assert scanner.scan_calls == 2
+
+
+class _GatedScanner(ScannerBackend):
+    """
+    A scanner that holds chosen ``scan_pages`` calls until the test releases them.
+
+    Call numbers count every pass of every job the worker runs, starting at 1.
+    For each held call there is a ``gate`` the test sets to let it return and
+    an ``entered`` event the scanner sets on arrival, so the test knows the
+    pass is genuinely in flight before it sends a signal.  That is what makes
+    "a click during pass A" a staged state rather than a timing guess.
+
+    A concrete class rather than a ``MagicMock``, like ``_PassBGatedScanner``.
+
+    Attributes:
+        gates: Per held call number, set by the test to let that call return.
+        entered: Per held call number, set by the scanner when the call begins.
+        scan_calls: How many times ``scan_pages`` has been entered.
+
+    """
+
+    def __init__(self, held_calls: frozenset[int]) -> None:
+        """
+        Hold the given call numbers until released.
+
+        Args:
+            held_calls: The 1-based ``scan_pages`` call numbers to hold.
+
+        """
+        self.gates = {call: threading.Event() for call in held_calls}
+        self.entered = {call: threading.Event() for call in held_calls}
+        self.scan_calls = 0
+
+    def release_all(self) -> None:
+        """Release every held call, for ``finally`` blocks."""
+        for gate in self.gates.values():
+            gate.set()
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """Report no devices; the worker never asks when a device is configured."""
+        return []
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Report a feeder-only device.
+
+        Args:
+            device_id: Ignored.
+
+        Returns:
+            Capabilities naming a single feeder source.
+
+        """
+        return DeviceCapabilities(sources=["ADF"], resolutions=[300], modes=["color"])
+
+    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+        """
+        Return one inked page, holding the configured calls on their gates.
+
+        Args:
+            device_id: Ignored.
+            settings: Ignored.
+
+        Returns:
+            A batch of one non-blank page.
+
+        """
+        self.scan_calls += 1
+        call = self.scan_calls
+        if call in self.gates:
+            self.entered[call].set()
+            self.gates[call].wait(_PASS_B_GATE_CEILING)
+        return scan_batch([_inked_page()])
+
+
+class TestFlipSignalsAreJobScoped:
+    """
+    A flip answer belongs to one job, and counts only at that job's prompt (CR-01).
+
+    These run the real ``run_pipeline``: the flip wait is the subject.  Only
+    the scanner and the paperless client are fakes.  "Not answered early" is
+    asserted as ``flip_answer(job.id) is None`` at AWAITING_FLIP, which reads
+    the coordinator's slot directly rather than inferring it from timing.
+    """
+
+    def test_signals_during_pass_a_are_dropped(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A Continue or Abort sent while pass A runs is dropped, not queued.
+
+        This is the C-02 mirror of CR-01: a kept early Continue would start
+        pass B on a stack nobody had flipped.
+        """
+        scanner = _GatedScanner(frozenset({1}))
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Early Signals")
+            worker.submit(job)
+
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+            assert worker.continue_flip(job.id) is False
+            assert worker.abort_flip(job.id) is False
+
+            scanner.gates[1].set()
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            assert worker.flip_answer(job.id) is None
+
+            assert worker.continue_flip(job.id) is True
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        assert finished.state is JobState.DONE
+        assert scanner.scan_calls == 2
+
+    def test_a_double_clicked_abort_cannot_abort_the_next_job(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The verifier's scenario (CR-01, 25-VERIFICATION.md) ends with job 2 DONE.
+
+        Two manual-duplex jobs are queued.  Abort is clicked twice at job 1's
+        prompt: the first click aborts job 1, the second is dropped.  Clicks
+        meant for job 1 then land while job 2's pass A is held open, and again
+        at job 2's own prompt.  None of them may answer job 2's flip; only
+        job 2's own Continue does.
+        """
+        # Job 1 aborts at its prompt, so it makes one scan call; call 2 is
+        # job 2's pass A, and call 3 (job 2's pass B) runs freely.
+        scanner = _GatedScanner(frozenset({2}))
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job1 = store.create_job("duplex", "Job One")
+            job2 = store.create_job("duplex", "Job Two")
+            worker.submit(job1)
+            worker.submit(job2)
+
+            wait_for_state(store, job1.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            assert worker.abort_flip(job1.id) is True
+            assert worker.abort_flip(job1.id) is False
+            first = wait_for_state(store, job1.id, TERMINAL_STATES, _STATE_BUDGET)
+
+            # Job 2's pass A is in flight.
+            assert scanner.entered[2].wait(_PASS_B_GATE_CEILING)
+            assert worker.abort_flip(job1.id) is False
+            assert worker.abort_flip(job2.id) is False
+            assert worker.continue_flip(job2.id) is False
+
+            scanner.gates[2].set()
+            wait_for_state(store, job2.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            assert worker.flip_answer(job2.id) is None
+            # A stale click for job 1 at job 2's own prompt is still dropped.
+            assert worker.abort_flip(job1.id) is False
+            assert worker.flip_answer(job2.id) is None
+
+            assert worker.continue_flip(job2.id) is True
+            second = wait_for_state(store, job2.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        assert first.state is JobState.ERROR
+        assert first.error is not None
+        assert "flip prompt" in first.error
+        assert second.state is JobState.DONE
+        assert second.error is None
+        assert scanner.scan_calls == 3
+
+    def test_with_no_job_waiting_every_signal_is_dropped(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """With no job at a flip prompt, no job has an answer and none is taken."""
+        store = JobStore()
+        try:
+            worker = ScanWorker(
+                _GatedScanner(frozenset()), mock_paperless, default_settings, store
+            )
+            assert worker.flip_answer("no-such-job") is None
+            assert worker.continue_flip("no-such-job") is False
+            assert worker.abort_flip("no-such-job") is False
+        finally:
+            store.close()
+
+    def test_the_log_says_whether_a_signal_was_claimed_or_dropped(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        IN-03: a dropped signal is logged as dropped, with the reason.
+
+        Pass A and pass B are both held, so each signal meets a coordinator in
+        a known state: unarmed, armed and open, and already answered.
+        """
+        scanner = _GatedScanner(frozenset({1, 2}))
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Logged Signals")
+            worker.submit(job)
+
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+            worker.continue_flip(job.id)
+            worker.abort_flip("some-other-job")
+
+            scanner.gates[1].set()
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.continue_flip(job.id)
+
+            assert scanner.entered[2].wait(_PASS_B_GATE_CEILING)
+            worker.abort_flip(job.id)
+
+            scanner.gates[2].set()
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.worker"
+            and record.levelno == logging.INFO
+            and record.getMessage().startswith("Manual duplex: ")
+        ]
+        assert messages == [
+            f"Manual duplex: continue for job {job.id} dropped: "
+            "not yet at the flip prompt",
+            "Manual duplex: abort for job some-other-job dropped: "
+            "not the job waiting at the flip prompt",
+            f"Manual duplex: continue for job {job.id} claimed",
+            f"Manual duplex: abort for job {job.id} dropped: already answered: "
+            "CONTINUED",
+        ]
 
 
 class TestScanWorkerQueuing:

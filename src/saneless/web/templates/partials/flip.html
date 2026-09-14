@@ -39,7 +39,7 @@
   </div>
 
   <div role="group">
-    <button hx-post="/api/flip/continue" hx-target="#status-area" hx-swap="outerHTML">Continue</button>
-    <button hx-post="/api/flip/abort" hx-target="#status-area" hx-swap="outerHTML" class="secondary">Abort scan</button>
+    <button hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
+    <button hx-post="/api/flip/abort" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML" class="secondary">Abort scan</button>
   </div>
 </div>

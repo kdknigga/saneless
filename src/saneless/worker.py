@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from .auto_profiles import (
     generate_profiles,
@@ -42,40 +42,95 @@ logger = logging.getLogger(__name__)
 
 class WorkerFlipCoordinator(FlipCoordinator):
     """
-    The web flip coordinator: one answer, claimed once, and final (D-16).
+    The web flip coordinator: one answer, for one job, claimed once, and final.
 
     The Continue and Abort routes signal it from request threads while the
     worker thread waits on it.  Whichever of Continue, Abort or the timeout
-    claims the answer first is the answer; anything arriving later is dropped.
+    claims the answer first is the answer; anything arriving later is dropped
+    (D-16).
+
+    It is also bound to one job and accepts a signal only once armed.  The
+    worker arms it when the job announces ``AWAITING_FLIP``, which is after
+    pass A has finished.  Until then a signal is dropped, not queued: a stale
+    Abort double-clicked at the previous job's prompt, or a Continue sent
+    during pass A, would otherwise pre-answer a prompt nobody has seen yet and
+    abort the wrong job or start pass B on an unflipped stack (CR-01).
+    ``FlipCoordinator`` itself is unchanged (D-09): arming is this class's
+    detail, not part of the contract the pipeline waits on.
 
     The answer is written under a lock *before* the event is set, so a waiter
     that wakes always finds an answer to read -- there is no window in which
     the event says "resolved" and the slot still says nothing.  That ordering
     is what makes it race-free by construction rather than by timing.
+
+    Args:
+        job_id: The id of the job whose flip this coordinator answers.
+
     """
 
-    def __init__(self) -> None:
-        """Start unanswered."""
+    def __init__(self, job_id: str) -> None:
+        """Start unarmed and unanswered, bound to ``job_id``."""
+        self._job_id = job_id
         self._lock = threading.Lock()
         self._event = threading.Event()
+        self._armed = False
         self._outcome: FlipOutcome | None = None
 
-    def signal_continue(self) -> None:
-        """Answer the wait: the operator flipped the stack."""
-        self._resolve(FlipOutcome.CONTINUED)
+    @property
+    def job_id(self) -> str:
+        """The id of the job whose flip this coordinator answers."""
+        return self._job_id
 
-    def signal_abort(self) -> None:
-        """Answer the wait: the operator gave up at the flip prompt."""
-        self._resolve(FlipOutcome.ABORTED)
+    @property
+    def armed(self) -> bool:
+        """Whether the flip prompt exists, so a signal can claim the answer."""
+        with self._lock:
+            return self._armed
+
+    @property
+    def answer(self) -> FlipOutcome | None:
+        """The claimed answer, or ``None`` while the wait is unanswered."""
+        with self._lock:
+            return self._outcome
+
+    def arm(self) -> None:
+        """Open the flip prompt to signals.  Idempotent."""
+        with self._lock:
+            self._armed = True
+
+    def signal_continue(self) -> bool:
+        """
+        Answer the wait: the operator flipped the stack.
+
+        Returns:
+            Whether this signal claimed the answer.  ``False`` means it was
+            dropped: sent before the prompt was armed, or after an answer.
+
+        """
+        return self._signal(FlipOutcome.CONTINUED)
+
+    def signal_abort(self) -> bool:
+        """
+        Answer the wait: the operator gave up at the flip prompt.
+
+        Returns:
+            Whether this signal claimed the answer.  ``False`` means it was
+            dropped: sent before the prompt was armed, or after an answer.
+
+        """
+        return self._signal(FlipOutcome.ABORTED)
 
     def wait_for_flip(self, timeout: float) -> FlipOutcome:
         """
         Block until answered, or claim ``TIMED_OUT`` when ``timeout`` elapses.
 
-        On expiry the timeout is claimed through the same single-answer path
-        as the two signals, and what comes back is whatever answer is actually
-        in effect -- so a Continue that landed between the wait expiring and
-        this claim is honoured rather than overwritten.
+        The wait arms the coordinator first, as a backstop: a caller that never
+        announces ``AWAITING_FLIP`` still gets a prompt its operator can answer.
+
+        On expiry the timeout is claimed through the single-answer slot, and
+        what comes back is whatever answer is actually in effect -- so a
+        Continue that landed between the wait expiring and this claim is
+        honoured rather than overwritten.
 
         Args:
             timeout: The longest to wait, in seconds.
@@ -84,6 +139,7 @@ class WorkerFlipCoordinator(FlipCoordinator):
             The one answer this coordinator resolved to.
 
         """
+        self.arm()
         # One path for both endings.  If a signal set the event, _resolve finds
         # that answer already claimed and hands it back; if the wait expired,
         # TIMED_OUT is offered and wins unless a signal claimed first after
@@ -91,9 +147,33 @@ class WorkerFlipCoordinator(FlipCoordinator):
         self._event.wait(timeout)
         return self._resolve(FlipOutcome.TIMED_OUT)
 
+    def _signal(self, outcome: FlipOutcome) -> bool:
+        """
+        Claim the answer for an operator signal, if the prompt is armed and open.
+
+        Unlike ``_resolve``, this honours ``armed``: a signal before the prompt
+        exists, or after an answer, leaves the slot and the event untouched.
+
+        Args:
+            outcome: The answer the operator is offering.
+
+        Returns:
+            Whether ``outcome`` became the answer.
+
+        """
+        with self._lock:
+            if not self._armed or self._outcome is not None:
+                return False
+            self._outcome = outcome
+        self._event.set()
+        return True
+
     def _resolve(self, outcome: FlipOutcome) -> FlipOutcome:
         """
-        Claim the single answer, unless one is already claimed.
+        Claim the single answer unconditionally, unless one is already claimed.
+
+        Only the timeout uses this path; it ignores ``armed``, which is why the
+        operator signals go through ``_signal`` instead.
 
         Returning the answer in effect, rather than asserting one exists, is
         what lets ``wait_for_flip`` narrow ``FlipOutcome | None`` to
@@ -168,19 +248,103 @@ class ScanWorker:
         self._queue.put(job)
         logger.info("Job %s submitted to worker queue", job.id)
 
-    def continue_flip(self) -> None:
-        """Signal the worker to continue with pass B of manual duplex."""
-        coordinator = self._flip_coordinator
-        if coordinator is not None:
-            coordinator.signal_continue()
-            logger.info("Manual duplex: continue signal sent")
+    def continue_flip(self, job_id: str) -> bool:
+        """
+        Answer ``job_id``'s flip prompt with Continue, starting its pass B.
 
-    def abort_flip(self) -> None:
-        """Signal the worker to abort manual duplex scan."""
+        Args:
+            job_id: The job the operator is answering.
+
+        Returns:
+            Whether the answer was claimed.  ``False`` means it was dropped:
+            ``job_id`` is not the job waiting at the flip prompt, that job has
+            not reached the prompt yet, or the prompt was already answered.
+
+        """
+        return self._signal_flip(job_id, "continue")
+
+    def abort_flip(self, job_id: str) -> bool:
+        """
+        Answer ``job_id``'s flip prompt with Abort, failing it before pass B.
+
+        Args:
+            job_id: The job the operator is answering.
+
+        Returns:
+            Whether the answer was claimed.  ``False`` means it was dropped:
+            ``job_id`` is not the job waiting at the flip prompt, that job has
+            not reached the prompt yet, or the prompt was already answered.
+
+        """
+        return self._signal_flip(job_id, "abort")
+
+    def flip_answer(self, job_id: str) -> FlipOutcome | None:
+        """
+        Report the claimed flip answer for ``job_id``, if it is the live job.
+
+        25-11's status rendering reads this to tell an answered prompt from an
+        open one.
+
+        Args:
+            job_id: The job whose answer is wanted.
+
+        Returns:
+            The claimed answer when ``job_id`` is the job with the live flip
+            coordinator, otherwise ``None`` -- including while it is unanswered.
+
+        """
         coordinator = self._flip_coordinator
-        if coordinator is not None:
-            coordinator.signal_abort()
-            logger.info("Manual duplex: abort signal sent")
+        if coordinator is None or coordinator.job_id != job_id:
+            return None
+        return coordinator.answer
+
+    def _signal_flip(self, job_id: str, action: Literal["continue", "abort"]) -> bool:
+        """
+        Deliver one flip signal to ``job_id``'s coordinator and log the result.
+
+        The coordinator is read once, and ``job_id`` is compared with that
+        coordinator's own job id rather than with ``_current_job_id``: one
+        snapshot, so the check and the signal cannot straddle a job boundary
+        and deliver a click meant for one job to the next (CR-01).
+
+        Args:
+            job_id: The job the operator is answering.
+            action: Which answer the operator gave.
+
+        Returns:
+            Whether the signal claimed the answer.
+
+        """
+        coordinator = self._flip_coordinator
+        if coordinator is None or coordinator.job_id != job_id:
+            logger.info(
+                "Manual duplex: %s for job %s dropped: "
+                "not the job waiting at the flip prompt",
+                action,
+                job_id,
+            )
+            return False
+        claimed = (
+            coordinator.signal_continue()
+            if action == "continue"
+            else coordinator.signal_abort()
+        )
+        if claimed:
+            logger.info("Manual duplex: %s for job %s claimed", action, job_id)
+        elif not coordinator.armed:
+            logger.info(
+                "Manual duplex: %s for job %s dropped: not yet at the flip prompt",
+                action,
+                job_id,
+            )
+        else:
+            logger.info(
+                "Manual duplex: %s for job %s dropped: already answered: %s",
+                action,
+                job_id,
+                coordinator.answer,
+            )
+        return claimed
 
     @property
     def is_alive(self) -> bool:
@@ -253,7 +417,8 @@ class ScanWorker:
         profile = self._settings.profiles.get(job.profile)
         is_manual_duplex = profile is not None and profile.duplex == "manual"
 
-        self._flip_coordinator = WorkerFlipCoordinator() if is_manual_duplex else None
+        coordinator = WorkerFlipCoordinator(job.id) if is_manual_duplex else None
+        self._flip_coordinator = coordinator
 
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
             self._job_store.update_thumbnail(_jid, thumb)
@@ -279,6 +444,15 @@ class ScanWorker:
             # Every active state, AWAITING_FLIP and SCANNING_REVERSE included,
             # is simply persisted.  The row is the only thing observers read:
             # the web UI re-reads it each poll, so nothing here needs signalling.
+            if state is JobState.AWAITING_FLIP and coordinator is not None:
+                # Arm BEFORE persisting.  Any observer that reads AWAITING_FLIP
+                # from the store -- the status poll, which renders Continue and
+                # Abort -- must find the coordinator already armed; arming
+                # after the write would open a window in which a click on a
+                # freshly rendered Continue is dropped.  Pass A has already
+                # finished when AWAITING_FLIP is announced, so arming here
+                # cannot accept a click sent during pass A (CR-01).
+                coordinator.arm()
             self._job_store.update_state(_jid, state)
             persisted_state = state
 
@@ -294,7 +468,7 @@ class ScanWorker:
                 correspondent=job.correspondent,
                 status_callback=_status_cb,
                 thumbnail_callback=_thumbnail_cb,
-                flip_coordinator=self._flip_coordinator,
+                flip_coordinator=coordinator,
             )
             result = run_pipeline(
                 self._scanner,

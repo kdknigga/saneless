@@ -307,17 +307,19 @@ async def job_history(request: Request) -> Response:
 
 
 @router.post("/api/flip/continue")
-async def continue_flip(request: Request) -> Response:
+async def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
-    Signal the worker to continue with pass B of manual duplex.
+    Answer the named job's flip prompt with Continue, starting its pass B.
 
-    Returns the updated status partial.  Nothing is waited for: the flip
-    coordinator's first answer is final (D-16), so the route renders whatever
-    the store has recorded and the one-second poll picks up pass B from there.
-    A Continue that arrives after the wait already resolved is simply dropped.
+    The posted ``job_id`` scopes the answer (CR-01).  A Continue for any other
+    job, one sent before that job reached the flip prompt, or one arriving
+    after the prompt was already answered is dropped -- and the route still
+    returns the current status rather than an error (D-16).  Nothing is
+    waited for: the route renders whatever the store has recorded and the
+    one-second poll picks up pass B from there.
     """
     state = request.app.state
-    state.worker.continue_flip()
+    state.worker.continue_flip(job_id)
     job = _current_or_recent_job(state.worker, state.job_store)
     return state.templates.TemplateResponse(
         request,
@@ -327,16 +329,18 @@ async def continue_flip(request: Request) -> Response:
 
 
 @router.post("/api/flip/abort")
-async def abort_flip(request: Request) -> Response:
+async def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
-    Signal the worker to abort the current manual duplex scan.
+    Answer the named job's flip prompt with Abort, failing it before pass B.
 
-    Returns the updated status partial.  A late Abort, arriving after Continue
-    already answered the flip wait, is dropped rather than reported as an error
-    (D-16): the route returns the job's current status either way.
+    The posted ``job_id`` scopes the answer (CR-01): a double-clicked Abort
+    cannot land on the next queued job.  An Abort for any other job, one sent
+    before that job reached the flip prompt, or one arriving after Continue
+    already answered is dropped rather than reported as an error (D-16): the
+    route returns the current status either way.
     """
     state = request.app.state
-    state.worker.abort_flip()
+    state.worker.abort_flip(job_id)
     job = _current_or_recent_job(state.worker, state.job_store)
     return state.templates.TemplateResponse(
         request,
