@@ -37,7 +37,9 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
+from saneless.vocabulary import FlipOutcome
 from saneless.web.app import create_app
+from saneless.worker import WorkerFlipCoordinator
 
 
 def _app(client: TestClient) -> FastAPI:
@@ -301,6 +303,176 @@ def test_flip_abort(client: TestClient) -> None:
     assert response.status_code == 200
     assert "Manual duplex flip wait timed out after 600 seconds" in response.text
     assert "Ready to scan." not in response.text
+
+
+_FLIP_BUTTONS = ('hx-post="/api/flip/continue"', 'hx-post="/api/flip/abort"')
+
+
+@pytest.fixture
+def waiting_flip(client: TestClient) -> Iterator[tuple[str, WorkerFlipCoordinator]]:
+    """
+    Stage a job waiting at an armed flip prompt as the worker's current job.
+
+    This reaches into the served worker the same deliberate way
+    ``test_flip_prompt`` does, and adds the armed coordinator the worker would
+    hold while the job is ``AWAITING_FLIP``.  Both attributes are reset on
+    teardown so the lifespan's worker thread is not left pointing at a fake.
+    """
+    worker = _app(client).state.worker
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="duplex", title="Flip Waiting")
+    job_store.update_state(job.id, JobState.AWAITING_FLIP)
+    coordinator = WorkerFlipCoordinator(job.id)
+    coordinator.arm()
+    worker._current_job_id = job.id
+    worker._flip_coordinator = coordinator
+    try:
+        yield job.id, coordinator
+    finally:
+        worker._flip_coordinator = None
+        worker._current_job_id = None
+
+
+def _assert_acknowledged(text: str, label: str) -> None:
+    """Assert the status area acknowledges ``label`` and shows no flip buttons."""
+    assert f'<p aria-busy="true">{label}</p>' in text
+    for button in _FLIP_BUTTONS:
+        assert button not in text
+    assert "flip the stack over the long edge" not in text.lower()
+
+
+def test_claimed_abort_acknowledges_instead_of_the_prompt(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """
+    A claimed Abort renders "Aborting scan..." without the buttons (CR-01).
+
+    The worker has not persisted ERROR yet, so the row still reads
+    AWAITING_FLIP.  Re-rendering the prompt there would look as though the
+    click did nothing and invite a second one.
+    """
+    job_id, coordinator = waiting_flip
+
+    response = client.post("/api/flip/abort", data={"job_id": job_id})
+
+    assert response.status_code == 200
+    _assert_acknowledged(response.text, "Aborting scan...")
+    assert coordinator.answer is FlipOutcome.ABORTED
+    # AWAITING_FLIP is still active, so the status area keeps polling.
+    assert 'hx-trigger="every 1s"' in response.text
+
+
+def test_claimed_continue_acknowledges_instead_of_the_prompt(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """A claimed Continue renders the flip-confirmed copy without buttons (CR-01)."""
+    job_id, coordinator = waiting_flip
+
+    response = client.post("/api/flip/continue", data={"job_id": job_id})
+
+    assert response.status_code == 200
+    _assert_acknowledged(
+        response.text, "Flip confirmed. Scanning reverse sides next..."
+    )
+    assert coordinator.answer is FlipOutcome.CONTINUED
+
+
+def test_double_clicked_abort_still_acknowledges(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """
+    A repeat click on an answered job renders the same acknowledgment (CR-01).
+
+    The second Abort is dropped by the coordinator, so the route has no claim
+    of its own; the acknowledgment must come from the answer the worker holds.
+    """
+    job_id, coordinator = waiting_flip
+
+    first = client.post("/api/flip/abort", data={"job_id": job_id})
+    second = client.post("/api/flip/abort", data={"job_id": job_id})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    _assert_acknowledged(second.text, "Aborting scan...")
+    assert coordinator.answer is FlipOutcome.ABORTED
+
+
+def test_continue_after_abort_reports_the_abort(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """A late Continue on an aborted job acknowledges the Abort that won (D-16)."""
+    job_id, coordinator = waiting_flip
+
+    client.post("/api/flip/abort", data={"job_id": job_id})
+    response = client.post("/api/flip/continue", data={"job_id": job_id})
+
+    assert response.status_code == 200
+    _assert_acknowledged(response.text, "Aborting scan...")
+    assert coordinator.answer is FlipOutcome.ABORTED
+
+
+def test_foreign_job_id_leaves_the_prompt_open(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """
+    An Abort naming another job does not acknowledge the waiting job (T-25-49).
+
+    The route's claim is only authoritative for the job it names; the rendered
+    job is still unanswered, so its prompt and both buttons stay.
+    """
+    _, coordinator = waiting_flip
+
+    response = client.post("/api/flip/abort", data={"job_id": "some-other-job"})
+
+    assert response.status_code == 200
+    for button in _FLIP_BUTTONS:
+        assert button in response.text
+    assert "Aborting scan..." not in response.text
+    assert coordinator.answer is None
+
+
+def test_poll_acknowledges_an_answer_the_store_has_not_recorded_yet(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """The status poll keeps the buttons away once the job is answered (CR-01)."""
+    job_id, _ = waiting_flip
+    client.post("/api/flip/continue", data={"job_id": job_id})
+
+    response = client.get("/api/jobs/current/status")
+
+    assert response.status_code == 200
+    _assert_acknowledged(
+        response.text, "Flip confirmed. Scanning reverse sides next..."
+    )
+    assert 'hx-trigger="every 1s"' in response.text
+
+
+def test_poll_renders_the_prompt_for_an_unanswered_flip(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """An armed, unanswered flip wait still renders the full prompt (UI-03)."""
+    _ = waiting_flip
+
+    response = client.get("/api/jobs/current/status")
+
+    assert response.status_code == 200
+    assert "flip the stack over the long edge" in response.text.lower()
+    for button in _FLIP_BUTTONS:
+        assert button in response.text
+    assert 'aria-busy="true"' not in response.text
+
+
+def test_index_acknowledges_an_answered_flip(
+    client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+) -> None:
+    """A page reload after the answer shows the acknowledgment too (CR-01, D-17)."""
+    job_id, _ = waiting_flip
+    client.post("/api/flip/abort", data={"job_id": job_id})
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    _assert_acknowledged(response.text, "Aborting scan...")
 
 
 @pytest.mark.parametrize("route", ["/api/flip/continue", "/api/flip/abort"])

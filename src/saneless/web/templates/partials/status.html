@@ -8,7 +8,13 @@
     {% if job.is_busy %}
       <p aria-busy="true">{{ job.state | progress_label }}</p>
     {% elif job.state == JobState.AWAITING_FLIP %}
+      {# CR-01: once this job's flip wait is answered, acknowledge the answer
+         instead of re-rendering buttons that look as though the click did nothing. #}
+      {% if flip_answer %}
+      <p aria-busy="true">{{ flip_answer | flip_answer_label }}</p>
+      {% else %}
       {% include "partials/flip.html" %}
+      {% endif %}
     {% elif job.state == JobState.DONE %}
       <p class="status-done">&#10003; Done: {{ job.title }}</p>
       <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
