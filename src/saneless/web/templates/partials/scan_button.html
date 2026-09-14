@@ -1,0 +1,11 @@
+{# The ONLY copy of the Scan button markup (ROBU-04, C-10).  index.html includes
+   it inline; partials/status_response.html includes it with oob = true so every
+   status response re-renders it from server state.  Keep type="submit"
+   id="scan-btn" as the first two attributes, in that order: the _SCAN_BUTTON
+   regex in tests/test_web_state_rendering.py depends on it.  Never include this
+   inside partials/status.html -- the page includes that partial too, so the
+   page would carry a duplicate id="scan-btn". #}
+<button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
+        {% if job and job.is_active %}disabled{% if job.is_busy %} aria-busy="true"{% endif %}{% endif %}>
+    {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
+</button>
