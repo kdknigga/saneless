@@ -131,7 +131,15 @@ Returns the job history table body (most recent 50 jobs).
 
 Tells a manual duplex job waiting in `AWAITING_FLIP` that the stack has been flipped, so the worker starts pass B (back sides) and the job moves to `SCANNING_REVERSE`.
 
-**Response:** HTML partial (the status indicator for HTMX swap), for the job the call acted on: the current job, else the most recent one. A call arriving just after the job ended reports that job, not the idle "Ready to scan." state. The endpoint does not wait for pass B to start, so the partial shows whatever state the job has recorded at that moment; the one-second status poll picks up pass B from there.
+**Request fields (form-encoded):**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `job_id` | string | yes | The id of the job the answer is for. The web UI's Continue button sends it automatically. A request without it is rejected with `422`. |
+
+**Response:** HTML partial (the status indicator for HTMX swap), for the current job, else the most recent one. A call arriving just after the job ended reports that job, not the idle "Ready to scan." state. The endpoint does not wait for pass B to start, so the partial shows whatever state the job has recorded at that moment; the one-second status poll picks up pass B from there.
+
+While that job is still recorded `AWAITING_FLIP` and its flip wait has been answered -- by this call or by an earlier one -- the partial shows an acknowledgment instead of the Continue and Abort scan buttons: `Flip confirmed. Scanning reverse sides next...` after a Continue, `Aborting scan...` after an Abort.
 
 ---
 
@@ -139,15 +147,22 @@ Tells a manual duplex job waiting in `AWAITING_FLIP` that the stack has been fli
 
 Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt. Pass B never starts, nothing is uploaded, and the job ends `ERROR` with `Manual duplex scan aborted at the flip prompt`.
 
-**Response:** HTML partial (the status indicator for HTMX swap), for the job the call acted on: the current job, else the most recent one, exactly as for `/api/flip/continue`.
+**Request fields (form-encoded):**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `job_id` | string | yes | The id of the job the answer is for. The web UI's Abort scan button sends it automatically. A request without it is rejected with `422`. |
+
+**Response:** HTML partial (the status indicator for HTMX swap), for the current job, else the most recent one, with the same acknowledgment as `/api/flip/continue` while an answered job is still recorded `AWAITING_FLIP`.
 
 ---
 
 #### How the two flip endpoints interact
 
 - **The first answer is final.** A job waiting at the flip prompt accepts exactly one answer -- Continue, Abort, or the `flip_timeout_seconds` timeout, whichever comes first -- and ignores everything after it. An Abort that arrives after a Continue is dropped: pass B carries on, and the endpoint returns the job's current status rather than an error. The same applies to a Continue after an Abort, and to either call after the wait has timed out.
-- **Call them only while the job is `AWAITING_FLIP`.** When no manual duplex job is running, both endpoints change nothing and still return the status partial. A manual duplex job accepts its answer from the moment it starts, though, so a Continue or Abort sent during pass A is kept and used as soon as the fronts finish -- a Continue sent that early starts pass B without waiting for the stack to be flipped. The web UI cannot do this, because it only shows the buttons during `AWAITING_FLIP`; a direct API caller should poll `/api/jobs/current/status` for that state first.
-- **The controls disappear on their own.** The web UI renders the Continue and Abort scan buttons only while the job is `AWAITING_FLIP`. Once pass B starts the status indicator shows `Scanning reverse sides...` instead, so the buttons are gone before a second click can land on them.
+- **An answer counts only for the named job, once it is waiting.** The worker accepts an answer only for the job named by `job_id`, and only once that job has reached `AWAITING_FLIP`. An answer sent during pass A, one naming a different job from the one at the flip prompt, or one arriving after the job ended is dropped: it changes nothing, and the endpoint still returns the current status rather than an error. A direct API caller should poll `/api/jobs/current/status` for `AWAITING_FLIP` before answering.
+- **A repeated click cannot reach the next job.** Because every answer names its job, a double-clicked or retried Continue or Abort is dropped once the job it names has moved on, even when another manual duplex job is already queued behind it.
+- **The prompt is acknowledged, then replaced.** After an accepted answer the partial shows the acknowledgment until the job leaves `AWAITING_FLIP`. Once pass B starts the status indicator shows `Scanning reverse sides...`.
 
 ---
 
