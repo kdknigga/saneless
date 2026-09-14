@@ -18,6 +18,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     ValidationError,
     field_validator,
     model_validator,
@@ -41,6 +42,7 @@ __all__ = [
     "ProfileConfig",
     "ScannerConfig",
     "Settings",
+    "config_search_paths",
     "load_settings",
     "validate_settings_dirs",
     "warn_on_legacy_duplex_sources",
@@ -219,6 +221,26 @@ class Settings(BaseSettings):
     paperless: PaperlessConfig = PaperlessConfig()
     output: OutputConfig = OutputConfig()
     profiles: dict[str, ProfileConfig] = {"default": ProfileConfig()}
+
+    # A PrivateAttr, not a field: a field would be settable from
+    # SANELESS_CONFIG_PATH and from a top-level TOML key, letting either
+    # redirect profile writes (D-16, research Pattern 8).
+    _config_path: Path | None = PrivateAttr(default=None)
+
+    @property
+    def config_path(self) -> Path | None:
+        """
+        The TOML file these settings were loaded from.
+
+        Only ``load_settings`` records it; nothing in the environment or a
+        config file can set it.
+
+        Returns:
+            The loaded config file, or None when only defaults and environment
+            variables were used.
+
+        """
+        return self._config_path
 
     @classmethod
     def settings_customise_sources(
@@ -405,34 +427,51 @@ def validate_settings_dirs(settings: Settings) -> None:
                 raise ConfigError(msg)
 
 
+def config_search_paths() -> tuple[Path, ...]:
+    """
+    List the config file locations searched when no explicit path is given.
+
+    The single search list for both loading and the CLI's write target
+    (D-16). A function rather than a module constant so ``Path.home()`` is
+    read when called, not at import.
+
+    Returns:
+        The candidate paths, in search order.
+
+    """
+    return (
+        Path("./saneless.toml"),
+        Path.home() / ".config" / "saneless" / "config.toml",
+        Path("/etc/saneless/config.toml"),
+    )
+
+
 def load_settings(config_path: str | None = None) -> Settings:
     """
     Load settings from TOML file with env var overrides.
 
     Args:
         config_path: Explicit path to a TOML config file. If provided,
-            loads from that path directly. Otherwise searches standard
-            locations.
+            loads from that path directly. Otherwise searches
+            ``config_search_paths()``.
 
     Returns:
-        Fully validated Settings instance.
+        Fully validated Settings instance carrying ``config_path``: the
+        explicit path as given, else the first search path that exists, else
+        None when no file was found.
 
     Raises:
         ConfigError: If the TOML file has unrecognized top-level sections.
 
     """
-    if config_path:
-        return _build_settings(toml_file=Path(config_path))
-
-    search_paths = [
-        Path("./saneless.toml"),
-        Path.home() / ".config" / "saneless" / "config.toml",
-        Path("/etc/saneless/config.toml"),
-    ]
-
-    for path in search_paths:
-        if path.exists():
-            return _build_settings(toml_file=path)
-
-    # No config file found -- use defaults + env vars only
-    return _build_settings()
+    path = (
+        Path(config_path)
+        if config_path
+        else next((p for p in config_search_paths() if p.exists()), None)
+    )
+    # With no path, only defaults + env vars are used.
+    settings = _build_settings(toml_file=path)
+    # An explicit path is recorded even if missing; CFG-02 (Phase 27) owns
+    # making that an error.
+    settings._config_path = path
+    return settings

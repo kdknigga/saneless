@@ -16,7 +16,12 @@ from typing import TYPE_CHECKING, Literal, cast
 
 import tomlkit
 
-from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
+from saneless.config import (
+    DEFAULT_RESOLUTION,
+    ProfileConfig,
+    Settings,
+    config_search_paths,
+)
 from saneless.exceptions import ConfigError
 from saneless.scanner.base import SourceKind, classify_source
 
@@ -426,7 +431,10 @@ def resolve_config_path(config_path: str | None = None) -> Path:
     """
     Resolve the TOML config file path for writing.
 
-    Searches standard config locations when no explicit path is given.
+    Searches ``config_search_paths()`` when no explicit path is given. Its
+    last production caller is the worker's lazy generation, which re-derives
+    a path that ignores ``--config``; plan 26-08 removes both in favour of
+    ``Settings.config_path`` (D-16).
 
     Args:
         config_path: Explicit path string, or None to search defaults.
@@ -437,12 +445,7 @@ def resolve_config_path(config_path: str | None = None) -> Path:
     """
     if config_path:
         return Path(config_path)
-    search_paths = [
-        Path("./saneless.toml"),
-        Path.home() / ".config" / "saneless" / "config.toml",
-        Path("/etc/saneless/config.toml"),
-    ]
-    for path in search_paths:
+    for path in config_search_paths():
         if path.exists():
             return path
     return Path("./saneless.toml")

@@ -21,7 +21,6 @@ import uvicorn
 
 from .auto_profiles import (
     generate_profiles,
-    resolve_config_path,
     write_profiles_to_config,
 )
 from .config import (
@@ -472,9 +471,6 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     """Generate scan profiles from scanner capabilities."""
     settings = ctx.obj["settings"]
-    config_path_str: str | None = (
-        ctx.parent.params.get("config_path") if ctx.parent else None
-    )
 
     scanner = SaneBackend(host=settings.scanner.host)
     device_list = scanner.get_devices()
@@ -487,7 +483,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     caps = scanner.get_capabilities(device_id)
     profiles = generate_profiles(caps)
 
-    config_path = resolve_config_path(config_path_str)
+    # The file that was loaded (including an explicit --config), else the
+    # documented ./saneless.toml default. XDG placement is CFG-03 (Phase 27).
+    config_path = settings.config_path or Path("./saneless.toml")
     written = write_profiles_to_config(config_path, profiles, force=force)
 
     if not written:
