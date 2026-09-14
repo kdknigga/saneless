@@ -23,7 +23,6 @@ from .job import JobResult
 from .pipeline import FlipCoordinator, PipelineEvent, PipelineRequest, run_pipeline
 from .vocabulary import (
     ACTIVE_STATES,
-    BUSY_STATES,
     FlipOutcome,
     JobState,
     classify_error,
@@ -144,7 +143,6 @@ class ScanWorker:
         self._queue: queue.Queue[Job | None] = queue.Queue(maxsize=10)
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._flip_coordinator: WorkerFlipCoordinator | None = None
-        self._transition_event = threading.Event()
         self._current_job_id: str | None = None
         self._auto_generated = False
 
@@ -183,21 +181,6 @@ class ScanWorker:
         if coordinator is not None:
             coordinator.signal_abort()
             logger.info("Manual duplex: abort signal sent")
-
-    def wait_transition(self, timeout: float = 2.0) -> bool:
-        """
-        Wait for worker to transition state after flip continue.
-
-        Args:
-            timeout: Maximum seconds to wait.
-
-        Returns:
-            True if transition occurred, False on timeout.
-
-        """
-        result = self._transition_event.wait(timeout=timeout)
-        self._transition_event.clear()
-        return result
 
     @property
     def is_alive(self) -> bool:
@@ -262,7 +245,6 @@ class ScanWorker:
         self._current_job_id = job.id
         self._maybe_auto_generate()
         self._job_store.update_state(job.id, JobState.SCANNING)
-        self._transition_event.set()
 
         # Flip machinery follows profile.duplex alone, the same field
         # run_pipeline reads to choose the strategy.  source is a pure SANE
@@ -279,7 +261,7 @@ class ScanWorker:
         # The worker persisted SCANNING just above, before starting the
         # pipeline.  run_pipeline re-announces it as its first event; rewriting
         # the state we just wrote would blank error/error_category a second
-        # time and signal a transition that did not happen.
+        # time for no change of state.
         persisted_state = JobState.SCANNING
 
         def _status_cb(event: PipelineEvent, _jid: str = job.id) -> None:
@@ -287,22 +269,17 @@ class ScanWorker:
             logger.info("Pipeline event: %s", event.value)
             state = event.job_state
             if state not in ACTIVE_STATES:
-                # DONE is terminal.  The worker writes it, and signals the
-                # transition, only once run_pipeline has returned and its
-                # temporary directory is gone -- never from in here.
+                # DONE is terminal.  The worker writes it only once
+                # run_pipeline has returned and its temporary directory is
+                # gone -- never from in here.
                 return
             if state is persisted_state:
                 # Already persisted; not a transition.
                 return
-            if state in BUSY_STATES:
-                self._job_store.update_state(_jid, state)
-                self._transition_event.set()
-            else:
-                # AWAITING_FLIP: clear before the write so the UI, which polls
-                # once a second, never shows "busy" while a human is being
-                # waited on.
-                self._transition_event.clear()
-                self._job_store.update_state(_jid, state)
+            # Every active state, AWAITING_FLIP and SCANNING_REVERSE included,
+            # is simply persisted.  The row is the only thing observers read:
+            # the web UI re-reads it each poll, so nothing here needs signalling.
+            self._job_store.update_state(_jid, state)
             persisted_state = state
 
         try:
@@ -340,7 +317,6 @@ class ScanWorker:
                     pages_uploaded=result.pages_uploaded,
                 ),
             )
-            self._transition_event.set()
         except Exception as exc:
             category = classify_error(exc)
             # No result argument: outcome, warning and all three page counts

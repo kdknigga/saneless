@@ -12,8 +12,10 @@ from fastapi.responses import JSONResponse
 if TYPE_CHECKING:
     from starlette.responses import Response
 
+    from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
     from saneless.web.cache import MetadataCache
+    from saneless.worker import ScanWorker
 
 __all__ = ["router"]
 
@@ -62,6 +64,35 @@ def _get_cached_or_fetch(
     return data
 
 
+def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | None:
+    """
+    Find the job the status area should report: the current one, else the latest.
+
+    The worker clears its current job id in ``_process_job``'s ``finally``, so a
+    request landing as a job ends -- a flip Continue or Abort in particular --
+    finds no current job.  Falling back to the most recent job makes that
+    request report the job that just ended instead of the idle "Ready to scan."
+    copy, which would claim nothing happened (M-02).  Every route that renders
+    the status area uses this one lookup, so none of them can drift (D-17).
+
+    Args:
+        worker: The scan worker, for the id of the job in flight.
+        job_store: The job store to read the job from.
+
+    Returns:
+        The current job, else the most recent job, else None when there has
+        never been one.
+
+    """
+    job = None
+    if worker.current_job_id:
+        job = job_store.get_job(worker.current_job_id)
+    if job is None:
+        recent = job_store.list_recent(limit=1)
+        job = recent[0] if recent else None
+    return job
+
+
 @router.get("/")
 async def index(request: Request) -> Response:
     """
@@ -78,12 +109,7 @@ async def index(request: Request) -> Response:
         state.cache, state.paperless, "correspondents"
     )
 
-    current_job = None
-    if state.worker.current_job_id:
-        current_job = state.job_store.get_job(state.worker.current_job_id)
-    if current_job is None:
-        recent = state.job_store.list_recent(limit=1)
-        current_job = recent[0] if recent else None
+    current_job = _current_or_recent_job(state.worker, state.job_store)
 
     jobs = state.job_store.list_recent(limit=50)
 
@@ -184,12 +210,7 @@ async def current_job_status(request: Request) -> Response:
     Returns the status partial template for HTMX polling swap.
     """
     state = request.app.state
-    job = None
-    if state.worker.current_job_id:
-        job = state.job_store.get_job(state.worker.current_job_id)
-    if job is None:
-        recent = state.job_store.list_recent(limit=1)
-        job = recent[0] if recent else None
+    job = _current_or_recent_job(state.worker, state.job_store)
 
     return state.templates.TemplateResponse(
         request,
@@ -290,14 +311,14 @@ async def continue_flip(request: Request) -> Response:
     """
     Signal the worker to continue with pass B of manual duplex.
 
-    Returns the updated status partial.
+    Returns the updated status partial.  Nothing is waited for: the flip
+    coordinator's first answer is final (D-16), so the route renders whatever
+    the store has recorded and the one-second poll picks up pass B from there.
+    A Continue that arrives after the wait already resolved is simply dropped.
     """
     state = request.app.state
     state.worker.continue_flip()
-    state.worker.wait_transition(timeout=2.0)
-    job = None
-    if state.worker.current_job_id:
-        job = state.job_store.get_job(state.worker.current_job_id)
+    job = _current_or_recent_job(state.worker, state.job_store)
     return state.templates.TemplateResponse(
         request,
         "partials/status.html",
@@ -310,13 +331,13 @@ async def abort_flip(request: Request) -> Response:
     """
     Signal the worker to abort the current manual duplex scan.
 
-    Returns the updated status partial.
+    Returns the updated status partial.  A late Abort, arriving after Continue
+    already answered the flip wait, is dropped rather than reported as an error
+    (D-16): the route returns the job's current status either way.
     """
     state = request.app.state
     state.worker.abort_flip()
-    job = None
-    if state.worker.current_job_id:
-        job = state.job_store.get_job(state.worker.current_job_id)
+    job = _current_or_recent_job(state.worker, state.job_store)
     return state.templates.TemplateResponse(
         request,
         "partials/status.html",
