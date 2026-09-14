@@ -162,6 +162,7 @@ Note: every plan touches `src/saneless/job.py` and `tests/test_job.py`, so the w
 **Plans**: 9 plans in 5 waves
 
 Plans:
+
 - [x] 23-01-PLAN.md — Wave 0 test scaffolding, JobState.FALLBACK, job_state_for, PaperlessTimeoutError, ConnectionStatus (wave 1)
 - [x] 23-02-PLAN.md — output.data_dir, db_path/failed_dir properties, entry points, Dockerfile and compose (wave 1)
 - [x] 23-03-PLAN.md — filename sanitiser, unique PDF naming, fixed-DPI layout, PipelineRequest.job_id (wave 1)
@@ -194,6 +195,7 @@ Note (added 2026-09-11 from Phase 23 research): criterion 6 / OUTC-11 was not in
 **Plans**: 4 plans in 2 waves
 
 Plans:
+
 - [x] 23.1-01-PLAN.md — dark palette engaged, app-owned fallback amber, T1/T2/T3 computed-colour tests with mutation checks, master UI-SPEC convention (wave 1, TDD)
 - [x] 23.1-02-PLAN.md — type checks split: src-only at commit, full at pre-merge-commit and pre-push; CI pyrefly paths; CONTRIBUTING and CLAUDE.md (wave 1)
 - [x] 23.1-03-PLAN.md — every pathless pyrefly command under .planning/ rewritten to name src tests, residue enumerated and justified (wave 1)
@@ -277,14 +279,34 @@ Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/
 **Plans**: 9 plans in 7 waves
 
 Plans:
+**Wave 1**
+
 - [ ] 25-01-PLAN.md — Config: the `duplex` field, the legacy translation, the flip timeout (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 25-02-PLAN.md — Vocabulary: the ninth `JobState` and the filled projection seam (wave 2)
 - [ ] 25-08-PLAN.md — auto-profiles: `duplex` emission and the DPLX-07 round trip (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 25-03-PLAN.md — The `FlipCoordinator` contract and the bounded flip wait (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 25-04-PLAN.md — One strategy reader, the refusal guard, the total dispatch (wave 4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 25-05-PLAN.md — Worker and web: delete the transition-event protocol, shared job lookup (wave 5)
 - [ ] 25-06-PLAN.md — Scanner: feeder resolution and the no-feeder refusal (wave 5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 25-07-PLAN.md — CLI: the flip prompt and the non-TTY refusal (wave 6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
 - [ ] 25-09-PLAN.md — Documentation and UI-SPEC (wave 7)
 
 ### Phase 26: Worker and Web Robustness
