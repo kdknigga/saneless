@@ -53,7 +53,7 @@ Settings are resolved in this order (highest to lowest priority):
 | `SANELESS_OUTPUT__PAPERLESS_CACHE_TTL_SECONDS` | `output.paperless_cache_ttl_seconds` | int | `60` |
 | `SANELESS_OUTPUT__FLIP_TIMEOUT_SECONDS` | `output.flip_timeout_seconds` | int | `600` |
 | `SANELESS_OUTPUT__MIN_FREE_SPACE_MB` | `output.min_free_space_mb` | int | `500` |
-| `SANELESS_OUTPUT__WEB_HOST` | `output.web_host` | string | `0.0.0.0` |
+| `SANELESS_OUTPUT__WEB_HOST` | `output.web_host` | string | `0.0.0.0` (the default: all network interfaces) |
 | `SANELESS_OUTPUT__WEB_PORT` | `output.web_port` | int | `8080` |
 
 ## Notes

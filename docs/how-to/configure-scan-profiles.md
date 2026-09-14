@@ -154,6 +154,18 @@ Regenerating can rename profiles, so if you pass `--profile` in a script or a cr
 
 See [CLI Commands](../reference/cli-commands.md) for full `auto-profiles` documentation.
 
+### Generation at server startup
+
+`saneless serve` also generates profiles, once at startup, when the config holds only the untouched `default` profile -- a single profile named `default` with every field at its default value. Any profile you have written or changed turns this off. Generation runs in the background after the server starts, so a page loaded in the first moments may list only `default` until you reload it.
+
+Where the generated profiles go depends on the config file saneless loaded:
+
+- **A config file was loaded** (the `--config` path, or the first file found in the [search path](../reference/configuration.md#config-file-search-path)): the profiles are added to that file, as `saneless auto-profiles` would add them, and used straight away.
+- **No config file was loaded:** the profiles are used for this run only and nothing is written. The log names the locations where a config file would be picked up.
+- **The config file cannot be written** -- for example, because it is mounted read-only, as in the Docker Compose examples: the profiles are used for this run only, and a warning is logged.
+
+Generation is tried once per start. If the scanner was not reachable, saneless keeps the bare `default` profile and logs why; connect the scanner, then restart saneless or run `saneless auto-profiles` to try again.
+
 ## Setting default metadata
 
 Profiles can include default paperless-ngx metadata so you do not need to specify it on every scan:
