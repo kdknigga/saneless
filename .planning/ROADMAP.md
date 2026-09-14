@@ -313,8 +313,8 @@ Plans:
 
 **Gap Wave 1**
 
-- [ ] 25-10-PLAN.md — CR-01: flip coordinator armed at AWAITING_FLIP, signals scoped by job_id, race regressions (gap wave 1)
-- [ ] 25-13-PLAN.md — WR-02/WR-03/WR-04: single-sided feeder preference, no-source-option devices, whole-profile is_bare_default (gap wave 1)
+- [x] 25-10-PLAN.md — CR-01: flip coordinator armed at AWAITING_FLIP, signals scoped by job_id, race regressions (gap wave 1)
+- [x] 25-13-PLAN.md — WR-02/WR-03/WR-04: single-sided feeder preference, no-source-option devices, whole-profile is_bare_default (gap wave 1)
 
 **Gap Wave 2** *(blocked on Gap Wave 1 completion)*
 
@@ -452,7 +452,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
-| 25. Manual Duplex | 9/9 | Complete   | 2026-09-14 |
+| 25. Manual Duplex | 11/15 | In Progress|  |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
