@@ -342,7 +342,42 @@ Plans:
   4. Jobs left non-terminal by a crash are FAILED with a "server restarted" reason before the worker starts, and profiles are generated at startup from the config path that was actually loaded
   5. A browser test in CI with no CDN egress clicks Scan, waits for the terminal status, and asserts `#scan-btn` is enabled again with no duplicate `id="scan-btn"` in the DOM and `app.js` deleted
 
-**Plans**: TBD
+**Plans**: 14 plans
+
+**Wave 1**
+
+- [ ] 26-01-PLAN.md — Vocabulary contracts (S3 copy, WorkerHealth, SubmitResult, RequestRejection, ErrorCategory.REJECTED) and JobStore.latest_run_job / probe (wave 1)
+- [ ] 26-02-PLAN.md — Settings.config_path, one config search list, is_bare_default shapes (wave 1)
+- [ ] 26-03-PLAN.md — Vendored htmx 2.0.8 / Pico 2.1.1 with SRI, hook exclusion, pinning test (wave 1)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 26-04-PLAN.md — Worker stop flag, bounded join, non-blocking submit, converted tests, profile lock (wave 2)
+- [ ] 26-05-PLAN.md — One error renderer, exception handlers, htmx-config meta, #status-message slot (wave 2)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 26-06-PLAN.md — Guarded worker loop, degraded health, idle store probe, prune out of the job path (wave 3)
+- [ ] 26-07-PLAN.md — Cross-origin guard middleware (Sec-Fetch-Site + Origin fallback) (wave 3)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 26-08-PLAN.md — Startup profile generation from the loaded config path (wave 4)
+- [ ] 26-09-PLAN.md — Lifespan crash recovery before the worker, guarded close (wave 4)
+- [ ] 26-10-PLAN.md — def routes, honest /health, single-flight cache, 422/429/503 and the D-06 lookup (wave 4)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 26-11-PLAN.md — Server-owned Scan button via OOB swap, app.js deleted, title cap (wave 5)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 26-12-PLAN.md — Offline browser gate, Scan button browser proof (ROBU-11), CI browser job (wave 6)
+- [ ] 26-14-PLAN.md — Docs and master UI-SPEC corrected for Phase 26 (wave 6)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
+- [ ] 26-13-PLAN.md — Request error slot browser proof (ROBU-02 visibility) and plain-HTTP LAN origin (wave 7)
 
 Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 must be paired with an explicit `htmx-config` override or it is invisible — reintroducing the exact C-10 symptom this phase fixes. Worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper here, not in Phase 32.
 
