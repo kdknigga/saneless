@@ -1194,15 +1194,74 @@ class TestResolveSourceForManualDuplex:
         assert effective == "Automatic Document Feeder"
         assert has_source_option is True
 
-    def test_a_reported_feeder_the_operator_named_is_honoured(self) -> None:
+    def test_a_single_sided_feeder_the_operator_named_is_honoured(self) -> None:
         """An operator who picked one of two feeders gets that one (T-25-28)."""
-        raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
+        raw = _options_reporting(["Flatbed", "ADF Front", "Automatic Document Feeder"])
 
         effective, _ = sane_backend_mod._resolve_source(
-            raw, "ADF Duplex", resolve_feeder=True
+            raw, "Automatic Document Feeder", resolve_feeder=True
         )
 
-        assert effective == "ADF Duplex"
+        assert effective == "Automatic Document Feeder"
+
+    def test_a_named_both_sides_feeder_is_overridden_loudly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        A named ``"ADF Duplex"`` gives way to the single-sided feeder (WR-02).
+
+        A both-sides source returns 2N pages per pass, the two passes' counts
+        agree, and interleaving them scrambles 4N pages into a green DONE. The
+        operator's choice is therefore overridden -- with a WARNING naming both
+        sources, so the override is never silent.
+        """
+        raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            effective, _ = sane_backend_mod._resolve_source(
+                raw, "ADF Duplex", resolve_feeder=True
+            )
+
+        assert effective == "Automatic Document Feeder"
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.scanner.sane_backend"
+            and record.levelno == logging.WARNING
+        ]
+        assert any(
+            "'ADF Duplex'" in message and "'Automatic Document Feeder'" in message
+            for message in warnings
+        )
+
+    def test_a_single_sided_feeder_wins_over_an_earlier_both_sides_one(
+        self,
+    ) -> None:
+        """The first *single-sided* feeder is chosen, not the first feeder (WR-02)."""
+        raw = _options_reporting(["Flatbed", "ADF Duplex", "Automatic Document Feeder"])
+
+        effective, _ = sane_backend_mod._resolve_source(
+            raw, "Flatbed", resolve_feeder=True
+        )
+
+        assert effective == "Automatic Document Feeder"
+
+    def test_a_device_whose_only_feeder_scans_both_sides_is_refused(self) -> None:
+        """
+        Only a both-sides feeder means refusal before any page (WR-02).
+
+        Using it with a WARNING would still end in a scrambled document beside
+        a green DONE on an unattended appliance, so the operator is pointed at
+        hardware duplex instead.
+        """
+        raw = _options_reporting(["Flatbed", "ADF Duplex"])
+
+        with pytest.raises(ScanError, match="scans both sides") as excinfo:
+            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+
+        message = str(excinfo.value)
+        assert 'duplex = "hardware"' in message
+        assert "['Flatbed', 'ADF Duplex']" in message
 
     def test_an_unreported_source_falls_back_to_a_reported_feeder(self) -> None:
         """``source = "ADF"`` on a device that says "Automatic Document Feeder"."""
@@ -1235,12 +1294,37 @@ class TestResolveSourceForManualDuplex:
 
         assert "['Flatbed', 'Auto']" in str(excinfo.value)
 
-    def test_a_device_with_no_source_option_is_refused(self) -> None:
-        """A device exposing no ``source`` option at all cannot be told to feed."""
+    def test_no_source_option_trusts_a_configured_feeder_name(self) -> None:
+        """
+        A sheet-fed device with no ``source`` option feeds without being told (WR-03).
+
+        The simplex path already trusts the classifier on the configured name
+        for such a device, so manual duplex does the same and nothing is
+        assigned.
+        """
         raw = build_option_table(omit=("source",))
 
-        with pytest.raises(ScanError, match="feeder"):
-            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+        assert sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True) == (
+            "ADF",
+            False,
+        )
+
+    def test_no_source_option_accepts_the_legacy_manual_duplex_name(self) -> None:
+        """The pre-phase ``source = "Manual Duplex"`` profile runs again (WR-03)."""
+        raw = build_option_table(omit=("source",))
+
+        assert sane_backend_mod._resolve_source(
+            raw, "Manual Duplex", resolve_feeder=True
+        ) == ("Manual Duplex", False)
+
+    def test_no_source_option_refuses_a_non_feeder_name(self) -> None:
+        """A configured flatbed on a device with no source option is refused (WR-03)."""
+        raw = build_option_table(omit=("source",))
+
+        with pytest.raises(ScanError, match="exposes no source option") as excinfo:
+            sane_backend_mod._resolve_source(raw, "Flatbed", resolve_feeder=True)
+
+        assert "'Flatbed'" in str(excinfo.value)
 
     def test_without_the_flag_auto_is_still_substituted(self) -> None:
         """The simplex path's validate-or-substitute behaviour is unchanged."""
@@ -1290,6 +1374,25 @@ class TestResolveSourceForManualDuplex:
         assert mock_dev.source == "Automatic Document Feeder"
         assert len(pages) == 3
         assert mock_dev.calls == _THREE_SHEET_FEEDER_CALLS
+
+    def test_scan_pages_feeds_a_device_with_no_source_option(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Manual duplex on a no-source-option device feeds the stack (WR-03)."""
+        dev = FakeSaneDev(options=build_option_table(omit=("source",)))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="ADF",
+            resolution=300,
+            mode="Color",
+            resolve_feeder_source=True,
+        )
+
+        pages = backend.scan_pages(_TEST_DEVICE, settings).pages
+
+        assert len(pages) == 3
+        assert dev.calls == _THREE_SHEET_FEEDER_CALLS
+        assert "source" not in dev.assignments
 
     def test_scan_pages_refuses_before_touching_the_platen(
         self, fake_sane_module: FakeSaneModule
