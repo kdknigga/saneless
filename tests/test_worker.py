@@ -1776,6 +1776,177 @@ class TestWorkerStopAndSubmit:
         assert scanner.scan_calls == 1
 
 
+# Rounds each thread runs in the profile lock stress test.
+_PROFILE_LOCK_ROUNDS = 200
+
+
+class TestWorkerProfileLock:
+    """
+    Every read and update of the worker's profiles goes through one lock (D-19).
+
+    Request threads (the index dropdown, ROBU-08's unknown-profile check) and
+    the worker's own lookup read the profiles while the worker may be replacing
+    them.  Once routes run on the threadpool (ROBU-05) that is real
+    concurrency, so reads are locked and updates rebind a new dict rather than
+    mutating the one a reader may hold.
+    """
+
+    def test_profile_lock_names_are_a_copy_in_insertion_order(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """D-19: profile_names() is a snapshot the caller cannot use to mutate."""
+        default_settings.profiles["flatbed"] = ProfileConfig(source="Flatbed")
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            names = worker.profile_names()
+            names.append("intruder")
+            again = worker.profile_names()
+        finally:
+            store.close()
+
+        assert again == ["default", "flatbed"]
+        assert list(default_settings.profiles) == ["default", "flatbed"]
+
+    def test_profile_lock_has_profile(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """D-19 / ROBU-08: has_profile answers from the locked profiles."""
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            known = worker.has_profile("default")
+            unknown = worker.has_profile("nope")
+        finally:
+            store.close()
+
+        assert known is True
+        assert unknown is False
+
+    def test_profile_lock_get_profile(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """D-19: get_profile returns the configured profile, or None."""
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            found = worker.get_profile("default")
+            missing = worker.get_profile("nope")
+        finally:
+            store.close()
+
+        assert found is default_settings.profiles["default"]
+        assert missing is None
+
+    def test_profile_lock_set_profiles_rebinds_a_new_dict(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """
+        D-19: an update replaces the mapping; the old dict is left untouched.
+
+        A reader holding the old dict without the lock -- ``run_pipeline`` on
+        the worker thread -- therefore keeps a consistent view.
+        """
+        old = default_settings.profiles
+        old_snapshot = dict(old)
+        replacement = {
+            "default": ProfileConfig(),
+            "flatbed": ProfileConfig(source="Flatbed"),
+        }
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker._set_profiles(replacement)
+            names = worker.profile_names()
+        finally:
+            store.close()
+
+        assert names == ["default", "flatbed"]
+        assert default_settings.profiles is not old
+        assert default_settings.profiles is not replacement
+        assert old == old_snapshot
+
+    def test_profile_lock_readers_never_see_a_dict_mid_update(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """
+        D-19 / ROBU-05: concurrent readers and a writer never collide.
+
+        Four readers iterate the names and look each one up while a writer
+        swaps between two profile sets.  No thread may raise, and every name
+        list a reader sees must be exactly one of the two sets.
+        """
+        first = {
+            "default": ProfileConfig(),
+            "flatbed": ProfileConfig(source="Flatbed"),
+        }
+        second = {
+            "default": ProfileConfig(),
+            "adf": ProfileConfig(source="ADF"),
+            "duplex": ProfileConfig(source="ADF", duplex="manual"),
+        }
+        allowed = (list(first), list(second))
+        errors: list[Exception] = []
+        unexpected: list[list[str]] = []
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        barrier = threading.Barrier(5)
+
+        def reader() -> None:
+            """Read names, look each up, and check membership, many times."""
+            try:
+                barrier.wait(_STATE_BUDGET)
+                for _ in range(_PROFILE_LOCK_ROUNDS):
+                    names = worker.profile_names()
+                    if names not in allowed:
+                        unexpected.append(names)
+                    for name in names:
+                        worker.get_profile(name)
+                    worker.has_profile("default")
+            except Exception as exc:  # recorded and asserted on below
+                errors.append(exc)
+
+        def writer() -> None:
+            """Alternate the profile set between the two known shapes."""
+            try:
+                barrier.wait(_STATE_BUDGET)
+                for round_number in range(_PROFILE_LOCK_ROUNDS):
+                    worker._set_profiles(second if round_number % 2 else first)
+            except Exception as exc:  # recorded and asserted on below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=reader) for _ in range(4)]
+        threads.append(threading.Thread(target=writer))
+        try:
+            worker._set_profiles(first)
+            for thread in threads:
+                thread.start()
+        finally:
+            for thread in threads:
+                if thread.ident is not None:
+                    thread.join(_STATE_BUDGET * 5)
+            store.close()
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        assert unexpected == []
+
+
 class TestScanWorkerQueuing:
     """Worker sequential queuing tests."""
 
