@@ -1041,16 +1041,16 @@ def health(request: Request) -> dict[str, str] | JSONResponse:
 | A6 | Chromium sends an `Origin` equal to the page origin on same-origin htmx XHR POSTs over plain HTTP to a LAN IP | Pattern 10 | Every scan on the documented deployment would 403. Mitigation: optional LAN-IP browser test (Open Question 3) |
 | A7 | `ErrorCategory.REJECTED` (rather than a column) is acceptable as the D-06 marker | Pattern 2 | User may prefer a migration column; the planner can surface it in plan review |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **Startup recovery failure (disk full at boot).**
+1. **Startup recovery failure (disk full at boot).** RESOLVED: 26-06 / 26-09 (worker starts degraded; first successful probe runs recovery).
    - What we know: D-13 orders recovery before `worker.start()`; `fail_active_jobs` can raise.
    - What's unclear: abort startup (container restart loop, `/health` unreachable) or start degraded.
    - Recommendation: start with the worker pre-degraded and let the first successful probe run `fail_active_jobs` then clear degraded (Pitfall 6). It unifies both cases, keeps `/health` answering with a truthful 503, and needs no new decision beyond D-10..D-12. Confirm in plan review.
-2. **Error text for a flip job aborted by shutdown.** `stop()`'s Abort makes the pipeline raise "aborted at the flip prompt", which the worker records, and that is untrue (the operator didn't abort). Recommendation: when `_stopping` is set, the worker's pipeline-failure path writes the restart reason instead. This is the worker thread's own final write, so it doesn't break D-07's "no shutdown-time state write" (which is about lifespan). Low stakes.
-3. **Real-browser proof of branch 2 (plain HTTP).** A `TestClient` test covers the rule (required by CONTEXT specifics). A stronger, optional proof: a second uvicorn fixture bound to `0.0.0.0`, reached through the runner's non-loopback IP (discovered with a UDP `connect` + `getsockname`), where Chromium sends no `Sec-Fetch-Site`. Click Scan and expect success. Skip when no non-loopback address exists. It proves A6 on the documented deployment shape.
-4. **CLI `auto-profiles` with no config file** keeps writing `./saneless.toml` (today's documented behaviour). Recommendation: keep it; Phase 27 CFG-03 (XDG) is the place to move it.
-5. **Uncommitted `.python-version` change** (a `3.13` line appended, in git status). It is unrelated to this phase and `uv` still resolves 3.14.2. Do not include it in phase commits.
+2. **Error text for a flip job aborted by shutdown.** RESOLVED: 26-04 (restart reason recorded on stopping). `stop()`'s Abort makes the pipeline raise "aborted at the flip prompt", which the worker records, and that is untrue (the operator didn't abort). Recommendation: when `_stopping` is set, the worker's pipeline-failure path writes the restart reason instead. This is the worker thread's own final write, so it doesn't break D-07's "no shutdown-time state write" (which is about lifespan). Low stakes.
+3. **Real-browser proof of branch 2 (plain HTTP).** RESOLVED: 26-13 Task 3. A `TestClient` test covers the rule (required by CONTEXT specifics). A stronger, optional proof: a second uvicorn fixture bound to `0.0.0.0`, reached through the runner's non-loopback IP (discovered with a UDP `connect` + `getsockname`), where Chromium sends no `Sec-Fetch-Site`. Click Scan and expect success. Skip when no non-loopback address exists. It proves A6 on the documented deployment shape.
+4. RESOLVED: 26-02 keeps the `./saneless.toml` fallback. **CLI `auto-profiles` with no config file** keeps writing `./saneless.toml` (today's documented behaviour). Recommendation: keep it; Phase 27 CFG-03 (XDG) is the place to move it.
+5. RESOLVED: excluded from every plan's files_modified. **Uncommitted `.python-version` change** (a `3.13` line appended, in git status). It is unrelated to this phase and `uv` still resolves 3.14.2. Do not include it in phase commits.
 
 ## Environment Availability
 
