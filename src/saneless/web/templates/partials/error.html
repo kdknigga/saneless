@@ -1,0 +1,2 @@
+<p class="status-error">&#10007; {{ message }}</p>
+{% if refresh_history %}<div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>{% endif %}
