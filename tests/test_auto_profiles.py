@@ -545,17 +545,39 @@ class TestGenerateProfilesUsesClassifier:
         profiles = generate_profiles(caps)
         assert profiles["default"].source == "Automatic Document Feeder"
 
-    def test_a_feeder_only_config_round_trips_through_load_settings(
-        self, tmp_path: Path
+    @pytest.mark.parametrize(
+        ("sources", "expected_default_source"),
+        [
+            pytest.param(["Flatbed"], "Flatbed", id="flatbed-only"),
+            pytest.param(
+                ["Automatic Document Feeder", "ADF Duplex"],
+                "Automatic Document Feeder",
+                id="feeder-only",
+            ),
+            pytest.param(
+                ["Flatbed", "Automatic Document Feeder", "ADF Duplex"],
+                "Flatbed",
+                id="mixed",
+            ),
+        ],
+    )
+    def test_generated_config_round_trips_with_a_default_profile(
+        self,
+        tmp_path: Path,
+        sources: list[str],
+        expected_default_source: str,
     ) -> None:
         """
         The written file loads back, which is the guarantee that matters.
 
         "default is present" is a proxy; a config saneless can actually load
-        after auto-profiles has run is the user-visible promise.
+        after auto-profiles has run is the user-visible promise. The generated
+        set is therefore written to disk and read back through load_settings,
+        whose ``validate_default_profile`` refuses any config without the key,
+        for each of the three device shapes a scanner can have (DPLX-07).
         """
         caps = DeviceCapabilities(
-            sources=["Automatic Document Feeder", "ADF Duplex"],
+            sources=sources,
             resolutions=[300],
             modes=["Color"],
         )
@@ -563,7 +585,149 @@ class TestGenerateProfilesUsesClassifier:
         write_profiles_to_config(config_file, generate_profiles(caps))
 
         settings = load_settings(str(config_file))
-        assert settings.profiles["default"].source == "Automatic Document Feeder"
+        assert settings.profiles["default"].source == expected_default_source
+
+
+class TestGenerateProfilesDuplex:
+    """Generated profiles carry duplex from the source classifier (D-06)."""
+
+    @staticmethod
+    def _written_profiles(config_file: Path) -> dict[str, dict[str, object]]:
+        """Parse the written config file and return its profile tables."""
+        data = tomllib.loads(config_file.read_text())
+        return data["profiles"]
+
+    def test_hardware_duplex_source_is_generated_with_duplex_hardware(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A FEEDER_DUPLEX source yields duplex = "hardware", in memory and on disk.
+
+        D-06 is a statement about what is written to disk, so the file is
+        asserted as well as the model: an in-memory assertion alone would not
+        catch a writer that drops the key.
+        """
+        caps = DeviceCapabilities(
+            sources=["Flatbed", "ADF Duplex"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["adf-duplex"].duplex == "hardware"
+
+        config_file = tmp_path / "config.toml"
+        write_profiles_to_config(config_file, profiles)
+        assert self._written_profiles(config_file)["adf-duplex"]["duplex"] == (
+            "hardware"
+        )
+
+    def test_default_backed_by_a_duplex_feeder_mirrors_its_source(self) -> None:
+        """
+        The default profile's duplex agrees with the source it was copied from.
+
+        On a device whose first reported source is a duplex feeder, the default
+        is that feeder; it must not claim a different duplex strategy from the
+        profile it duplicates.
+        """
+        caps = DeviceCapabilities(
+            sources=["ADF Duplex", "ADF"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["default"].source == "ADF Duplex"
+        assert profiles["default"].duplex == "hardware"
+
+    @pytest.mark.parametrize(
+        "source",
+        ["Flatbed", "ADF", "Automatic Document Feeder", "Auto"],
+    )
+    def test_other_source_kinds_are_generated_with_duplex_none(
+        self, source: str
+    ) -> None:
+        """Flatbed, plain feeder and Auto sources all carry the default "none"."""
+        caps = DeviceCapabilities(
+            sources=[source],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert {profile.duplex for profile in profiles.values()} == {"none"}
+
+    def test_non_duplex_profiles_are_written_without_a_duplex_key(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A duplex of "none" is never written, keeping the config clean.
+
+        Follows the auto_source_mode precedent: only non-default values reach
+        the file. The mixed device proves the omission is per profile, not a
+        blanket rule -- its duplex feeder still gets the key.
+        """
+        caps = DeviceCapabilities(
+            sources=["Flatbed", "Automatic Document Feeder", "Auto", "ADF Duplex"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        config_file = tmp_path / "config.toml"
+        write_profiles_to_config(config_file, generate_profiles(caps))
+
+        written = self._written_profiles(config_file)
+        for name in ("flatbed", "automatic-document-feeder", "auto", "default"):
+            assert "duplex" not in written[name], name
+        assert "duplex" in written["adf-duplex"]
+
+    def test_flatbed_only_config_file_has_no_duplex_key_anywhere(
+        self, tmp_path: Path
+    ) -> None:
+        """The text written for a flatbed-only device never mentions duplex."""
+        caps = DeviceCapabilities(
+            sources=["Flatbed"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        config_file = tmp_path / "config.toml"
+        write_profiles_to_config(config_file, generate_profiles(caps))
+
+        assert "duplex" not in config_file.read_text()
+
+    @pytest.mark.parametrize(
+        "sources",
+        [
+            pytest.param(["Flatbed"], id="flatbed-only"),
+            pytest.param(["ADF", "ADF Duplex"], id="feeder-only"),
+            pytest.param(["Flatbed", "ADF", "ADF Duplex", "Auto"], id="mixed"),
+            pytest.param(["Manual Duplex", "ADF Manual Duplex"], id="legacy-names"),
+        ],
+    )
+    def test_auto_profiles_never_emits_manual_duplex(
+        self, tmp_path: Path, sources: list[str]
+    ) -> None:
+        """
+        No generated profile is ever manual duplex, before or after a reload.
+
+        Manual duplex is not a device source at all -- those profiles are always
+        hand-written -- so auto-profiles has no evidence for it. Pinning this
+        stops a later change from inventing a heuristic.
+
+        The legacy-names case is the sharp edge: a source name containing both
+        "manual" and "duplex" is read as ``duplex = "manual"`` by the config
+        loader when no duplex is given. A generated profile must therefore
+        state its duplex explicitly, so that neither construction nor the
+        reload of the written file translates it.
+        """
+        caps = DeviceCapabilities(
+            sources=sources,
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert all(profile.duplex != "manual" for profile in profiles.values())
+
+        config_file = tmp_path / "config.toml"
+        write_profiles_to_config(config_file, profiles)
+        settings = load_settings(str(config_file))
+        assert all(profile.duplex != "manual" for profile in settings.profiles.values())
 
 
 class TestGenerateProfilesSlugCollision:
