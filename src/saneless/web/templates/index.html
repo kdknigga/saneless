@@ -54,10 +54,7 @@
             {% endfor %}
         </select>
 
-        <button type="submit" id="scan-btn"
-                {% if job and job.is_active %}disabled{% if job.is_busy %} aria-busy="true"{% endif %}{% endif %}>
-            {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
-        </button>
+        {% include "partials/scan_button.html" %}
     </form>
 </article>
 
