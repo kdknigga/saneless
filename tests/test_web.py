@@ -7,6 +7,9 @@ HLTH-01, HLTH-02, LOG-03.
 
 from __future__ import annotations
 
+import html
+import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -198,6 +201,21 @@ def test_flip_prompt(client: TestClient) -> None:
     assert 'hx-post="/api/flip/continue"' in response.text
     assert 'hx-post="/api/flip/abort"' in response.text
 
+    # Both buttons name the job they were rendered for, so an answer can only
+    # ever land on that job (CR-01).
+    buttons = re.findall(
+        r"<button[^>]*hx-post=\"/api/flip/(continue|abort)\"[^>]*>", response.text
+    )
+    assert sorted(buttons) == ["abort", "continue"]
+    hx_vals = re.findall(
+        r"<button[^>]*hx-post=\"/api/flip/(?:continue|abort)\"[^>]*"
+        r"hx-vals='([^']*)'[^>]*>",
+        response.text,
+    )
+    assert len(hx_vals) == 2
+    for raw in hx_vals:
+        assert json.loads(html.unescape(raw)) == {"job_id": job.id}
+
 
 def test_thumbnail_display(client: TestClient) -> None:
     """Job with thumbnail shows base64 img tag (UI-04)."""
@@ -255,7 +273,7 @@ def test_flip_continue(client: TestClient) -> None:
     job_store.finish_job(job.id, JobState.DONE)
     assert _app(client).state.worker.current_job_id is None
 
-    response = client.post("/api/flip/continue")
+    response = client.post("/api/flip/continue", data={"job_id": job.id})
 
     assert response.status_code == 200
     assert "Done: Flip Just Finished" in response.text
@@ -278,11 +296,24 @@ def test_flip_abort(client: TestClient) -> None:
     )
     assert _app(client).state.worker.current_job_id is None
 
-    response = client.post("/api/flip/abort")
+    response = client.post("/api/flip/abort", data={"job_id": job.id})
 
     assert response.status_code == 200
     assert "Manual duplex flip wait timed out after 600 seconds" in response.text
     assert "Ready to scan." not in response.text
+
+
+@pytest.mark.parametrize("route", ["/api/flip/continue", "/api/flip/abort"])
+def test_flip_routes_require_a_job_id(client: TestClient, route: str) -> None:
+    """
+    A flip answer that names no job is rejected before reaching the worker.
+
+    The job id is what scopes the answer to one job (CR-01), so a request
+    without it cannot be interpreted and is refused with 422.
+    """
+    response = client.post(route)
+
+    assert response.status_code == 422
 
 
 def test_paperless_test_connected(client: TestClient) -> None:
