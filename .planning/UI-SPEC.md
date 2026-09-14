@@ -194,7 +194,7 @@ Inventory of every interactive/presentational component currently shipped.
 | Correspondent refresh button | Mirror of tag refresh | `index.html` | |
 | Primary scan button | `<button type="submit" id="scan-btn">` | `index.html` | Disabled + `aria-busy="true"` during active job; label swaps to `Scanning...` / `Scanning\u2026` |
 | Status area | `<div id="status-area">` polling itself `hx-get="/api/jobs/current/status" hx-trigger="every 1s"` when active | `partials/status.html` | Only polls when state is PENDING/SCANNING/AWAITING_FLIP/SCANNING_REVERSE/ASSEMBLING/UPLOADING |
-| Status states | Ten presentations, one per row of the Status area table below: Idle/Starting/Scanning/AwaitingFlip/ScanningReverse/Assembling/Uploading/Done/Error/Fallback | `partials/status.html` | Each uses `aria-busy="true"` on the `<p>` during non-terminal in-progress states. Fallback renders two `.status-fallback` paragraphs — the outcome line and the inline `{job.warning}` — and, unlike Error, carries no `role="alert"`: a fallback is a degradation, not a failure |
+| Status states | Eleven presentations, one per row of the Status area table below: Idle/Starting/Scanning/AwaitingFlip/AwaitingFlipAnswered/ScanningReverse/Assembling/Uploading/Done/Error/Fallback | `partials/status.html` | Each uses `aria-busy="true"` on the `<p>` during non-terminal in-progress states. Fallback renders two `.status-fallback` paragraphs — the outcome line and the inline `{job.warning}` — and, unlike Error, carries no `role="alert"`: a fallback is a degradation, not a failure |
 | Thumbnail preview | `<img class="thumbnail">` with base64 data URI | `partials/status.html` | alt text "First page preview" |
 | Duplex flip prompt | `.flip-prompt` with two-paragraph instructions, `.flip-illustration` SVG pair, and `<div role="group">` with Continue + Abort buttons | `partials/flip.html` | Abort uses Pico `.secondary` |
 | Flip SVGs | Inline SVGs with `aria-label`; "Long edge (correct)" shows curved arrow + checkmark, "Short edge (incorrect)" shows X mark | `partials/flip.html` | `currentColor` strokes follow theme |
@@ -240,7 +240,8 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | Idle | `Ready to scan.` | plain `<p>` |
 | PENDING | `Starting scan...` | `<p aria-busy="true">` |
 | SCANNING | `Scanning...` | `<p aria-busy="true">` |
-| AWAITING_FLIP | The duplex flip prompt (`partials/flip.html`, copy below) in place of a status line | no `aria-busy`; the Continue and Abort scan controls exist only in this branch |
+| AWAITING_FLIP (unanswered) | The duplex flip prompt (`partials/flip.html`, copy below) in place of a status line | no `aria-busy`; the Continue and Abort scan controls exist only in this branch |
+| AWAITING_FLIP (answered) | `Flip confirmed. Scanning reverse sides next...` after Continue / `Aborting scan...` after Abort (copy from `vocabulary.flip_answer_label`), shown while the store still records `AWAITING_FLIP` but the job's flip wait has been answered | `<p aria-busy="true">`; no Continue or Abort scan controls |
 | SCANNING_REVERSE | `Scanning reverse sides...` | `<p aria-busy="true">` |
 | ASSEMBLING | `Assembling PDF...` | `<p aria-busy="true">` |
 | UPLOADING | `Uploading to paperless-ngx...` | `<p aria-busy="true">` |
@@ -248,7 +249,7 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | ERROR | `✗ Error: {job.error}` (U+2717) | `role="alert"` + `.status-error` |
 | FALLBACK | `→ Saved to folder: {job.title}` (U+2192), then `{job.warning}` on its own line when a warning is recorded | `.status-fallback` on both paragraphs; no `role="alert"` |
 
-**SCANNING_REVERSE has no distinct presentation, deliberately.** It is counted above because its copy differs, but pass B (the back sides of a manual duplex scan) renders through the same busy branch as every other in-progress state — its progress prose under `aria-busy="true"` — and `status.html` has no `SCANNING_REVERSE` branch. That is the mechanism, not an omission: the flip controls live only in the `AWAITING_FLIP` branch, so the moment the job moves to `SCANNING_REVERSE` the next poll swaps them out and a late Continue or Abort click has nothing to land on. Giving pass B its own branch would break Phase 25's D-16 (the flip answer is given once and is final) by severing that link. Do not add one.
+**SCANNING_REVERSE has no distinct presentation, deliberately.** It is counted above because its copy differs, but pass B (the back sides of a manual duplex scan) renders through the same busy branch as every other in-progress state — its progress prose under `aria-busy="true"` — and `status.html` has no `SCANNING_REVERSE` branch. That is the mechanism, not an omission: the flip controls live only in the unanswered `AWAITING_FLIP` branch, so the moment the job moves to `SCANNING_REVERSE` the next poll swaps them out and a late Continue or Abort click has nothing to land on -- and a click that does reach the server for any job other than the one waiting at the flip prompt is dropped by its `job_id`. Giving pass B its own branch would break Phase 25's D-16 (the flip answer is given once and is final) by severing that link. Do not add one.
 
 ### Duplex flip prompt (`partials/flip.html`)
 
@@ -311,7 +312,7 @@ The following patterns would flag on generic copywriting heuristics but are **in
 | Flip abort | `POST /api/flip/abort` | `#status-area` | `outerHTML` |
 | Terminal DONE/ERROR/FALLBACK hidden history reload | `GET /api/jobs/history` on `load` | `#history-body` | `outerHTML` |
 
-**Flip routes (Phase 25).** Both flip buttons still target `#status-area` with an `outerHTML` swap, and both routes answer immediately — neither waits for pass B to start. The status partial they return reports the job resolved as "current job, else most recent", the same lookup the status poll and the index page use, so a click that lands just as the job ends shows that job rather than `Ready to scan.`. The flip controls are rendered only while the job is `AWAITING_FLIP`; the first answer (Continue, Abort, or the flip timeout) is final, and a later click is dropped and simply re-renders the job's current status.
+**Flip routes (Phase 25).** Both flip buttons still target `#status-area` with an `outerHTML` swap, and both routes answer immediately — neither waits for pass B to start. The status partial they return reports the job resolved as "current job, else most recent", the same lookup the status poll and the index page use, so a click that lands just as the job ends shows that job rather than `Ready to scan.`. The flip controls are rendered only while the job is `AWAITING_FLIP` and unanswered. Both buttons send the job's id as a `job_id` form field via `hx-vals`, and the routes drop an answer that names any other job or arrives before that job reached `AWAITING_FLIP` (CR-01). The first answer (Continue, Abort, or the flip timeout) is final; a later click is dropped and the route returns the job's current status. An accepted answer renders the acknowledgment row (`Flip confirmed. Scanning reverse sides next...` / `Aborting scan...`) rather than re-rendering the prompt, and the status poll keeps showing it until the job leaves `AWAITING_FLIP`.
 
 ### Button lifecycle (app.js)
 
