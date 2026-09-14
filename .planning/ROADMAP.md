@@ -37,7 +37,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 23: Honest Outcomes and Never Lose a Scan** - Typed outcomes end to end, `FALLBACK` state, PDFs preserved under a durable `data_dir`, unique names, correct DPI (completed 2026-09-11)
 - [x] **Phase 23.1: Dark Mode and the Commit Gate** (INSERTED) - The dark palette actually engages, every status colour passes AA in both schemes, and a TDD RED commit is possible without suppressing a gate (completed 2026-09-11)
 - [x] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane (completed 2026-09-13)
-- [ ] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass
+- [x] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass (completed 2026-09-14)
 - [ ] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets
 - [ ] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible
 - [ ] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback
@@ -307,7 +307,7 @@ Plans:
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 25-09-PLAN.md — Documentation and UI-SPEC (wave 7)
+- [x] 25-09-PLAN.md — Documentation and UI-SPEC (wave 7)
 
 ### Phase 26: Worker and Web Robustness
 
@@ -432,7 +432,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
-| 25. Manual Duplex | 8/9 | In Progress|  |
+| 25. Manual Duplex | 9/9 | Complete   | 2026-09-14 |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
