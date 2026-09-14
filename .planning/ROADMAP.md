@@ -269,7 +269,7 @@ Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/
 **Success Criteria** (what must be TRUE):
 
   1. A legacy config with `source = "Manual Duplex"` still loads and scans, is translated to `duplex = "manual"` at config load with a deprecation warning, and `source` is never inspected for strategy anywhere in the codebase
-  2. `saneless scan` with a manual-duplex profile prompts "Flip the stack and press Enter" on stdin and completes a two-pass scan; starting manual duplex with no coordinator is refused before the scanner is opened
+  2. `saneless scan` with a manual-duplex profile prompts the operator on stdin and blocks until answered, then completes a two-pass scan; manual duplex with no coordinator, or with no interactive terminal, is refused before the scanner is opened
   3. A flip wait that exceeds the timeout fails the job with a clear message and releases the scanner for the next job
   4. During pass B the job reports `SCANNING_REVERSE`, Abort at the flip prompt cancels the job, and `wait_transition` no longer exists
   5. A write-then-load round trip proves auto-profiles always emits a `default` profile for flatbed-only, feeder-only, and mixed devices

@@ -296,6 +296,35 @@ discussion — **D-18** — and it is called out where it appears.
     deprecation. A warning pointing at documentation that no longer exists is the dead end this
     milestone's appliance goal exists to remove.
 
+### Added after research and plan verification (2026-09-14)
+
+- **D-19: the CLI coordinator honours the timeout via a daemon thread. `TIMED_OUT` is reachable
+  from `saneless scan`, and DPLX-05 is NOT narrowed.** Research raised, and the plan-checker
+  escalated as a BLOCKER, that `click.confirm` has no timeout facility — so the planned
+  `ClickFlipCoordinator` ignored its `_timeout` and could only ever return `CONTINUED` or
+  `ABORTED`. That contradicted both DPLX-05 (which carries no CLI/web carve-out) and the phase
+  goal's own wording, "a required `FlipCoordinator` with a timeout serves both CLI **and web**".
+  No locked decision covered it, because the conflict surfaced after this document was sealed.
+  - **Resolution:** run `click.confirm` on a **daemon thread**; the main thread waits on a
+    `threading.Event` with `flip_timeout_seconds` and returns `FlipOutcome.TIMED_OUT` when it
+    elapses. D-11's locked `click.confirm` is preserved, so C-02's prescribed `CliRunner`
+    prompt-echo assertion still works verbatim.
+  - **Measured before choosing, not assumed:** a daemon thread blocked on a stdin read does **not**
+    delay interpreter shutdown. Timing the interpreter alone against a never-EOF FIFO gave
+    `elapsed_in_python=0.200s` / `real 0m0.223s` with the reader thread still alive at exit. An
+    earlier measurement that appeared to show a 5 s hang was invalid — it timed a shell pipeline
+    whose `sleep 5` dominated the wall clock, not the interpreter.
+  - **Accepted cost:** after a timeout the orphaned thread still holds stdin until the process
+    exits, and a stray prompt may remain on the terminal. Bounded, because the job has failed and
+    the CLI is exiting anyway.
+  - **Consequences for the plan of record:** no DPLX-05 amendment and no criterion-3 amendment are
+    needed — both become literally true on both paths. Roadmap criterion 2 is still amended, for
+    the unrelated `click.pause` reason already recorded below.
+  - Rejected: accepting the narrowing and amending DPLX-05 to a web-only guarantee (weakens a
+    requirement to match an implementation). Rejected: `select.select` on stdin (reopens D-11,
+    loses `click.confirm`'s y/n parsing and its `Abort`-on-interrupt behaviour, and forces C-02's
+    prescribed test assertion to be rewritten).
+
 ### Claude's Discretion
 
 Genuinely open to the planner. Make the call and record the reasoning in the plan:

@@ -1322,21 +1322,32 @@ that today lets one forgotten browser tab hang the appliance until it is restart
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **The CLI cannot honour `wait_for_flip`'s timeout.**
+1. **The CLI cannot honour `wait_for_flip`'s timeout.** — **RESOLVED 2026-09-14 by the developer.
+   See CONTEXT.md D-19. The recommendation below was NOT adopted.**
    - *What we know:* D-09 fixes the signature as `wait_for_flip(timeout: float) -> FlipOutcome`.
      `click.confirm` blocks on stdin with no timeout facility, and implementing one needs `select`
      on stdin or a thread.
    - *What's unclear:* whether DPLX-05's "a flip wait that exceeds the timeout fails the job"
      is meant to bind the CLI at all. M-07's actual complaint is the *web* worker thread being
      parked behind a queue; the CLI has no queue behind it and the operator can press Ctrl-C.
-   - *Recommendation:* the CLI coordinator **accepts and documents-away** the timeout, naming the
-     parameter `_timeout` (ruff's `ARG002` honours `dummy-variable-rgx`, whose configured pattern
-     `^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$` matches it; in-tree precedent: `_noop_callback`).
-     Criterion 3 is then satisfied through the worker coordinator. **Flag this to the user** — it
-     is a narrowing of DPLX-05's plain reading, and the roadmap criterion may want amending
-     alongside criterion 2, which the CONTEXT already flags for amendment.
+   - *Original recommendation (SUPERSEDED):* the CLI coordinator accepts and documents-away the
+     timeout, naming the parameter `_timeout`, with criterion 3 satisfied through the worker
+     coordinator only. The plan-checker escalated this as a BLOCKER: it contradicts DPLX-05, which
+     carries no CLI/web carve-out, and the phase goal's own "serves both CLI **and web**".
+   - **RESOLUTION — the CLI honours the timeout via a daemon thread.** `click.confirm` runs on a
+     daemon thread; the main thread waits on a `threading.Event` with `flip_timeout_seconds` and
+     returns `FlipOutcome.TIMED_OUT` when it elapses. D-11's locked `click.confirm` is preserved,
+     so C-02's prescribed `CliRunner` prompt-echo assertion still works verbatim.
+     **Measured before choosing:** a daemon thread blocked on a stdin read does not delay
+     interpreter shutdown — `elapsed_in_python=0.200s`, `real 0m0.223s`, reader still alive at
+     exit, timed against a never-EOF FIFO so the interpreter alone was measured.
+     **Consequence: DPLX-05 is not narrowed, and neither it nor criterion 3 needs amending.**
+     Accepted cost: the orphaned thread holds stdin until the process exits.
+
+   *Questions 2-5 below were answered by the planner and their reasoning is recorded in the plans;
+   only Question 1 required a developer decision.*
 
 2. **Does `source` still matter when `duplex == "manual"`?** (A1)
    - *What we know:* D-01 says `source` is passed verbatim; D-02 says the device source is resolved
