@@ -1,7 +1,7 @@
 """
 Per-state rendering contract for the web templates.
 
-Covers requirements: UI-03, UI-07, CTR-01, ROBU-04, ROBU-08.
+Covers requirements: UI-03, UI-07, CTR-01, ROBU-01, ROBU-04, ROBU-08.
 
 The templates are the one surface neither ``ty`` nor ``pyrefly`` can see. Once
 the hand-written state lists moved behind ``Job.is_active`` / ``Job.is_busy``
@@ -19,6 +19,9 @@ functions themselves.
 from __future__ import annotations
 
 import re
+import sqlite3
+import threading
+import time
 from typing import TYPE_CHECKING
 
 import pytest
@@ -54,7 +57,7 @@ from saneless.vocabulary import (
 from saneless.web.app import create_app
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from saneless.job import JobStore
@@ -97,9 +100,14 @@ _SCAN_BUTTON = re.compile(
 )
 
 
-@pytest.fixture
-def client(tmp_path: Path) -> Iterator[TestClient]:
-    """TestClient over a real app with a stub scanner and no network calls."""
+def _make_app(tmp_path: Path) -> FastAPI:
+    """
+    Build a real app with a stub scanner and no network calls, not yet started.
+
+    Returns:
+        The app, whose lifespan (and so its worker) starts with its TestClient.
+
+    """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
@@ -116,7 +124,13 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     app = create_app(settings, _StubScanner())
     app.state.paperless.get_tags = list
     app.state.paperless.get_correspondents = list
-    with TestClient(app) as tc:
+    return app
+
+
+@pytest.fixture
+def client(tmp_path: Path) -> Iterator[TestClient]:
+    """TestClient over a real app with a stub scanner and no network calls."""
+    with TestClient(_make_app(tmp_path)) as tc:
         yield tc
 
 
@@ -557,3 +571,114 @@ def test_fallback_warning_is_escaped_not_injected(client: TestClient) -> None:
     text = client.get("/api/jobs/current/status").text
     assert "<script>alert(1)</script>" not in text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+
+
+# How long the owed-write test waits for the worker to act.  Idle ticks run at
+# 20 ms there, so this is many ticks' worth of slack.
+_OWED_WRITE_BUDGET = 2.0
+
+# The error every simulated job store failure in the owed-write test raises.
+_DISK_ERROR = "disk I/O error"
+
+
+def _poll_until(predicate: Callable[[], bool], budget: float) -> bool:
+    """
+    Poll ``predicate`` until it holds or ``budget`` seconds pass.
+
+    Returns:
+        Whether the predicate held before the budget ran out.
+
+    """
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class _BreakableWrite:
+    """
+    A job store write that raises ``sqlite3.OperationalError`` while broken.
+
+    Every call is counted; while ``broken`` is set the call raises, otherwise
+    it delegates to the real method, so the row the worker writes is the row
+    the status poll reads back.
+
+    Args:
+        original: The bound store method being replaced.
+        broken: Set while the store should refuse writes.
+
+    """
+
+    def __init__(
+        self, original: Callable[..., object], broken: threading.Event
+    ) -> None:
+        """Wrap ``original``, failing while ``broken`` is set."""
+        self._original = original
+        self._broken = broken
+        self._lock = threading.Lock()
+        self._calls = 0
+
+    @property
+    def calls(self) -> int:
+        """How many times the write has been called so far."""
+        with self._lock:
+            return self._calls
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        """Count the call, then raise or delegate."""
+        with self._lock:
+            self._calls += 1
+        if self._broken.is_set():
+            raise sqlite3.OperationalError(_DISK_ERROR)
+        return self._original(*args, **kwargs)
+
+
+def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A job the guard could not end stops disabling Scan once the store heals.
+
+    ROBU-01 success criterion 1, CR-01, D-12: one loop-level failure whose
+    best-effort ERROR write also failed leaves the row active and the button
+    disabled while ``/health`` stays 200.  The worker never degrades, so no
+    probe runs; the owed write must still land on an idle tick, and the next
+    status poll must render ``#scan-btn`` enabled with no restart and no scan.
+    """
+    # Before the lifespan starts the worker: patched later, it would sit in a
+    # five-second queue wait before the first fast tick.
+    monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 0.02)
+    app = _make_app(tmp_path)
+    broken = threading.Event()
+    broken.set()
+
+    with TestClient(app) as tc:
+        job_store: JobStore = app.state.job_store
+        updates = _BreakableWrite(job_store.update_state, broken)
+        finishes = _BreakableWrite(job_store.finish_job, broken)
+        monkeypatch.setattr(job_store, "update_state", updates)
+        monkeypatch.setattr(job_store, "finish_job", finishes)
+
+        response = tc.post("/api/scan", data={"profile": "default"})
+        assert response.status_code == 200
+        job_id = job_store.list_recent(limit=1)[0].id
+
+        # The guard's write, then at least one idle-tick retry.
+        assert _poll_until(lambda: finishes.calls >= 2, _OWED_WRITE_BUDGET)
+        stuck = _only_scan_button(tc.get("/api/jobs/current/status").text)
+        assert "disabled" in stuck.group("attrs")
+        assert tc.get("/health").status_code == 200
+
+        broken.clear()
+
+        def button_enabled() -> bool:
+            text = tc.get("/api/jobs/current/status").text
+            return "disabled" not in _only_scan_button(text).group("attrs")
+
+        assert _poll_until(button_enabled, _OWED_WRITE_BUDGET)
+        finished = job_store.get_job(job_id)
+        assert finished is not None
+        assert finished.state is JobState.ERROR
+        assert tc.get("/health").status_code == 200
