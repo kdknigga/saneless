@@ -142,6 +142,107 @@ source = "Flatbed"
         assert "default" in settings.profiles
 
 
+class TestLoadedConfigPath:
+    """
+    Settings record the config file that was actually loaded (D-16, M-04).
+
+    The worker used to re-derive a write target that ignored ``--config``; the
+    loaded path now travels with ``Settings`` so every consumer writes to the
+    file the operator's settings came from.
+    """
+
+    @pytest.fixture
+    def empty_cwd_and_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        """
+        Run in an empty CWD with HOME redirected into tmp_path.
+
+        A developer's real ``~/.config/saneless/config.toml`` must not leak in.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        return tmp_path
+
+    def test_explicit_path_is_recorded(self, tmp_path: Path) -> None:
+        """An explicit config path that exists is recorded as given (D-16)."""
+        config_file = tmp_path / "x.toml"
+        config_file.write_text("[profiles.default]\n")
+        settings = load_settings(str(config_file))
+        assert settings.config_path == config_file
+
+    def test_missing_explicit_path_is_recorded(self, tmp_path: Path) -> None:
+        """
+        An explicit path that does not exist is still recorded as given (D-16).
+
+        Making a missing explicit path an error is CFG-02 (Phase 27).
+        """
+        missing = str(tmp_path / "absent.toml")
+        settings = load_settings(missing)
+        assert settings.config_path == Path(missing)
+
+    def test_found_search_path_is_recorded(self, empty_cwd_and_home: Path) -> None:
+        """The relative search entry that was found is recorded (D-16, M-04)."""
+        (empty_cwd_and_home / "saneless.toml").write_text("[profiles.default]\n")
+        settings = load_settings()
+        assert settings.config_path == Path("saneless.toml")
+
+    def test_home_search_path_is_recorded(self, empty_cwd_and_home: Path) -> None:
+        """A config found under the redirected HOME is recorded (D-16)."""
+        home_config = empty_cwd_and_home / "home" / ".config" / "saneless"
+        home_config.mkdir(parents=True)
+        (home_config / "config.toml").write_text("[profiles.default]\n")
+        settings = load_settings()
+        assert settings.config_path == home_config / "config.toml"
+
+    def test_no_file_found_records_none(self, empty_cwd_and_home: Path) -> None:
+        """With no config file anywhere, config_path is None (D-16)."""
+        settings = load_settings()
+        assert settings.config_path is None
+
+    def test_env_var_cannot_set_config_path(
+        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        SANELESS_CONFIG_PATH cannot forge the loaded path (D-16, T-26-05).
+
+        A public field would be populated from this variable and redirect
+        profile writes; the private attribute is not.
+        """
+        evil = empty_cwd_and_home / "evil.toml"
+        evil.write_text("[profiles.default]\n")
+        monkeypatch.setenv("SANELESS_CONFIG_PATH", str(evil))
+        settings = load_settings()
+        assert settings.config_path is None
+
+    def test_toml_config_path_key_is_rejected(self, tmp_path: Path) -> None:
+        """A top-level TOML ``config_path`` key is an unknown section (D-16)."""
+        config_file = tmp_path / "forged.toml"
+        config_file.write_text('config_path = "x"\n\n[profiles.default]\n')
+        with pytest.raises(ConfigError, match="config_path"):
+            load_settings(str(config_file))
+
+    def test_directly_constructed_settings_have_no_config_path(self) -> None:
+        """``Settings()`` built directly was loaded from no file (D-16)."""
+        assert Settings().config_path is None
+
+    def test_config_search_paths_order(self) -> None:
+        """The single search list holds the three locations in order (D-16)."""
+        assert config_mod.config_search_paths() == (
+            Path("./saneless.toml"),
+            Path.home() / ".config" / "saneless" / "config.toml",
+            Path("/etc/saneless/config.toml"),
+        )
+
+    def test_config_search_paths_reads_home_at_call_time(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A HOME change after import is honoured by the search list (D-16)."""
+        monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
+        expected = tmp_path / "elsewhere" / ".config" / "saneless" / "config.toml"
+        assert config_mod.config_search_paths()[1] == expected
+
+
 class TestInvalidToml:
     """Invalid TOML handling."""
 
