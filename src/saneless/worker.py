@@ -213,11 +213,6 @@ class ScanWorker:
             nonlocal persisted_state
             logger.info("Pipeline event: %s", event.value)
             state = event.job_state
-            if state is None:
-                # SCANNING_REVERSE carries no persisted state, but the pass
-                # boundary is a transition a flip waiter must observe.
-                self._transition_event.set()
-                return
             if state not in ACTIVE_STATES:
                 # DONE is terminal.  The worker writes it, and signals the
                 # transition, only once run_pipeline has returned and its
