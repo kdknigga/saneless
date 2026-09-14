@@ -276,7 +276,7 @@ Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/
   4. During pass B the job reports `SCANNING_REVERSE`, Abort at the flip prompt cancels the job, and `wait_transition` no longer exists
   5. A write-then-load round trip proves auto-profiles always emits a `default` profile for flatbed-only, feeder-only, and mixed devices
 
-**Plans**: 9 plans in 7 waves
+**Plans**: 15 plans (9 executed in 7 waves, plus 6 gap-closure plans in 4 waves)
 
 Plans:
 **Wave 1**
@@ -308,6 +308,26 @@ Plans:
 **Wave 7** *(blocked on Wave 6 completion)*
 
 - [x] 25-09-PLAN.md — Documentation and UI-SPEC (wave 7)
+
+**Gap closure** (from 25-VERIFICATION.md and 25-REVIEW.md: CR-01, WR-01..WR-08, IN-01..IN-04)
+
+**Gap Wave 1**
+
+- [ ] 25-10-PLAN.md — CR-01: flip coordinator armed at AWAITING_FLIP, signals scoped by job_id, race regressions (gap wave 1)
+- [ ] 25-13-PLAN.md — WR-02/WR-03/WR-04: single-sided feeder preference, no-source-option devices, whole-profile is_bare_default (gap wave 1)
+
+**Gap Wave 2** *(blocked on Gap Wave 1 completion)*
+
+- [ ] 25-11-PLAN.md — CR-01: flip routes acknowledge a claimed answer instead of re-rendering the prompt, Playwright check (gap wave 2)
+- [ ] 25-12-PLAN.md — WR-01/WR-05/IN-04: bounded flip timeout, deprecation warning after logging setup (gap wave 2)
+
+**Gap Wave 3** *(blocked on Gap Wave 2 completion)*
+
+- [ ] 25-14-PLAN.md — IN-02/WR-08/IN-01: one claim-once FlipAnswerSlot, CLI prompt failure aborts at once (gap wave 3)
+
+**Gap Wave 4** *(blocked on Gap Wave 3 completion)*
+
+- [ ] 25-15-PLAN.md — WR-06/WR-07 and deferred-items correction: docs and UI-SPEC match the fixes (gap wave 4)
 
 ### Phase 26: Worker and Web Robustness
 
