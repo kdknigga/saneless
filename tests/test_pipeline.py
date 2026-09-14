@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import logging
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -11,6 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from PIL import Image, ImageDraw
 
+import saneless.pipeline as pipeline_module
 import saneless.scanner.sane_backend as sane_backend_mod
 from saneless.config import ProfileConfig
 from saneless.exceptions import (
@@ -22,6 +25,7 @@ from saneless.exceptions import (
 from saneless.paperless import UploadResult
 from saneless.pipeline import (
     FAILED_DIR_WARN_THRESHOLD,
+    FlipAnswerSlot,
     FlipCoordinator,
     PipelineEvent,
     PipelineRequest,
@@ -421,6 +425,106 @@ class TestPipelineEmptyPageFilter:
                 settings=default_settings,
                 request=request,
             )
+
+
+class TestFlipAnswerSlot:
+    """
+    The one claim-once answer both flip coordinators compose (IN-02).
+
+    Every wait here is bounded, and none sleeps: a wait on an answered slot
+    returns because its event is already set, and a wait on an unanswered one
+    is given ``0``.
+    """
+
+    def test_a_new_slot_is_unanswered(self) -> None:
+        """Nothing has claimed a freshly built slot."""
+        assert FlipAnswerSlot().answer is None
+
+    def test_the_first_offer_claims_and_a_later_one_is_dropped(self) -> None:
+        """D-16: the first offer is the answer, and a later offer changes nothing."""
+        slot = FlipAnswerSlot()
+        assert slot.offer(FlipOutcome.CONTINUED) is True
+        assert slot.answer is FlipOutcome.CONTINUED
+        assert slot.offer(FlipOutcome.ABORTED) is False
+        assert slot.answer is FlipOutcome.CONTINUED
+
+    def test_settle_claims_an_unanswered_slot(self) -> None:
+        """Settling an unanswered slot makes the offered outcome the answer."""
+        slot = FlipAnswerSlot()
+        assert slot.settle(FlipOutcome.TIMED_OUT) is FlipOutcome.TIMED_OUT
+        assert slot.answer is FlipOutcome.TIMED_OUT
+
+    def test_settle_returns_the_answer_already_in_effect(self) -> None:
+        """A settle that loses the race hands back the answer that beat it."""
+        slot = FlipAnswerSlot()
+        slot.offer(FlipOutcome.CONTINUED)
+        assert slot.settle(FlipOutcome.TIMED_OUT) is FlipOutcome.CONTINUED
+        assert slot.answer is FlipOutcome.CONTINUED
+
+    def test_settle_wakes_a_waiter(self) -> None:
+        """A settled slot's wait returns at once: settle sets the event too."""
+        slot = FlipAnswerSlot()
+        slot.settle(FlipOutcome.ABORTED)
+        started = time.monotonic()
+        slot.wait(5)
+        assert time.monotonic() - started < 1
+
+    def test_a_zero_wait_on_an_unanswered_slot_returns_promptly(self) -> None:
+        """``wait(0)`` is a valid bound and returns without an answer."""
+        slot = FlipAnswerSlot()
+        started = time.monotonic()
+        slot.wait(0)
+        assert time.monotonic() - started < 1
+        assert slot.answer is None
+
+    def test_an_offer_wakes_a_waiter(self) -> None:
+        """After a claiming offer, a long wait returns at once."""
+        slot = FlipAnswerSlot()
+        slot.offer(FlipOutcome.CONTINUED)
+        started = time.monotonic()
+        slot.wait(5)
+        assert time.monotonic() - started < 1
+
+    def test_racing_offers_claim_exactly_once(self) -> None:
+        """
+        Twenty threads offering at once yield exactly one claim.
+
+        A barrier releases every thread together, so the offers genuinely
+        contend for the lock; the answer left behind is the winner's outcome.
+        """
+        slot = FlipAnswerSlot()
+        contenders = 20
+        barrier = threading.Barrier(contenders, timeout=5)
+        results: list[tuple[FlipOutcome, bool]] = []
+        results_lock = threading.Lock()
+
+        def _offer(outcome: FlipOutcome) -> None:
+            """Wait for the others, then offer ``outcome`` and record the result."""
+            barrier.wait()
+            claimed = slot.offer(outcome)
+            with results_lock:
+                results.append((outcome, claimed))
+
+        threads = [
+            threading.Thread(
+                target=_offer,
+                args=(FlipOutcome.CONTINUED if i % 2 else FlipOutcome.ABORTED,),
+            )
+            for i in range(contenders)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert len(results) == contenders
+        winners = [outcome for outcome, claimed in results if claimed]
+        assert len(winners) == 1
+        assert slot.answer is winners[0]
+
+    def test_the_slot_is_public_api(self) -> None:
+        """``FlipAnswerSlot`` is exported next to the coordinator contract."""
+        assert "FlipAnswerSlot" in pipeline_module.__all__
 
 
 class _FixedFlipCoordinator(FlipCoordinator):
