@@ -274,7 +274,18 @@ Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/
   4. During pass B the job reports `SCANNING_REVERSE`, Abort at the flip prompt cancels the job, and `wait_transition` no longer exists
   5. A write-then-load round trip proves auto-profiles always emits a `default` profile for flatbed-only, feeder-only, and mixed devices
 
-**Plans**: TBD
+**Plans**: 9 plans in 7 waves
+
+Plans:
+- [ ] 25-01-PLAN.md — Config: the `duplex` field, the legacy translation, the flip timeout (wave 1)
+- [ ] 25-02-PLAN.md — Vocabulary: the ninth `JobState` and the filled projection seam (wave 2)
+- [ ] 25-08-PLAN.md — auto-profiles: `duplex` emission and the DPLX-07 round trip (wave 2)
+- [ ] 25-03-PLAN.md — The `FlipCoordinator` contract and the bounded flip wait (wave 3)
+- [ ] 25-04-PLAN.md — One strategy reader, the refusal guard, the total dispatch (wave 4)
+- [ ] 25-05-PLAN.md — Worker and web: delete the transition-event protocol, shared job lookup (wave 5)
+- [ ] 25-06-PLAN.md — Scanner: feeder resolution and the no-feeder refusal (wave 5)
+- [ ] 25-07-PLAN.md — CLI: the flip prompt and the non-TTY refusal (wave 6)
+- [ ] 25-09-PLAN.md — Documentation and UI-SPEC (wave 7)
 
 ### Phase 26: Worker and Web Robustness
 
