@@ -767,20 +767,20 @@ class TestWorkerFlipCoordinator:
         """
         A Continue landing between the wait expiring and the timeout's claim wins.
 
-        The race is staged rather than timed: the event's ``wait`` is replaced
-        by one that delivers Continue and then reports expiry, which is exactly
-        the interleaving a real race produces.  The coordinator must return the
-        answer already claimed, not overwrite it with ``TIMED_OUT``.
+        The race is staged rather than timed: the answer slot's ``wait`` is
+        replaced by one that delivers Continue and then returns as an expired
+        wait would, which is exactly the interleaving a real race produces.  The
+        coordinator must return the answer already claimed, not overwrite it
+        with ``TIMED_OUT``.
         """
         coordinator = WorkerFlipCoordinator("job-1")
         coordinator.arm()
 
-        def _continue_then_expire(timeout: float | None = None) -> bool:
-            """Deliver Continue, then report the wait as expired."""
+        def _continue_then_expire(timeout: float) -> None:
+            """Deliver Continue, then return as an expired wait does."""
             coordinator.signal_continue()
-            return False
 
-        monkeypatch.setattr(coordinator._event, "wait", _continue_then_expire)
+        monkeypatch.setattr(coordinator._slot, "wait", _continue_then_expire)
         assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
 
