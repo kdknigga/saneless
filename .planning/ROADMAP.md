@@ -346,9 +346,9 @@ Plans:
 
 **Wave 1**
 
-- [ ] 26-01-PLAN.md — Vocabulary contracts (S3 copy, WorkerHealth, SubmitResult, RequestRejection, ErrorCategory.REJECTED) and JobStore.latest_run_job / probe (wave 1)
-- [ ] 26-02-PLAN.md — Settings.config_path, one config search list, is_bare_default shapes (wave 1)
-- [ ] 26-03-PLAN.md — Vendored htmx 2.0.8 / Pico 2.1.1 with SRI, hook exclusion, pinning test (wave 1)
+- [x] 26-01-PLAN.md — Vocabulary contracts (S3 copy, WorkerHealth, SubmitResult, RequestRejection, ErrorCategory.REJECTED) and JobStore.latest_run_job / probe (wave 1)
+- [x] 26-02-PLAN.md — Settings.config_path, one config search list, is_bare_default shapes (wave 1)
+- [x] 26-03-PLAN.md — Vendored htmx 2.0.8 / Pico 2.1.1 with SRI, hook exclusion, pinning test (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -488,7 +488,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
-| 26. Worker and Web Robustness | 0/? | Not started | - |
+| 26. Worker and Web Robustness | 3/14 | In Progress|  |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
