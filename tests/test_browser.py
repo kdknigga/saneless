@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from fastapi import FastAPI
-    from playwright.sync_api import BrowserContext, Page, Route
+    from playwright.sync_api import BrowserContext, Page, Response, Route
 
     from saneless.job import Job, JobStore
 
@@ -1474,3 +1474,66 @@ class TestRequestErrorSlot:
             " return [main.scrollWidth, main.clientWidth]; }"
         )
         assert overflow[0] <= overflow[1], overflow
+
+    def test_error_survives_status_polling(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        An error shown mid-scan outlives at least two status polls (B10, D-03).
+
+        The poll re-renders ``#status-area`` every second while a job is active.
+        If a poll response carried the slot clear that a successful scan
+        carries, the message would vanish within a second -- before a user
+        could read it. The submitted profile is also checked not to be echoed.
+        """
+        server = scan_harness.server
+        polls: list[str] = []
+
+        def _record_poll(response: Response) -> None:
+            if response.url.endswith(_POLL_PATH):
+                polls.append(response.url)
+
+        page.on("response", _record_poll)
+        server.scanner.gate.clear()
+        page.goto(server.url)
+        page.locator("#scan-btn").click()
+        expect(page.locator('#status-area p[aria-busy="true"]')).to_be_visible()
+
+        page.evaluate(_SUBMIT_UNKNOWN_PROFILE)
+
+        slot = page.locator("#status-message")
+        expect(slot).to_contain_text(_UNKNOWN_PROFILE_TEXT)
+        assert "zz-nonexistent-profile" not in slot.inner_text()
+        polls_before = len(polls)
+        page.wait_for_timeout(2500)
+        polls_during = len(polls) - polls_before
+        assert polls_during >= 2, f"only {polls_during} polls arrived in 2.5 s"
+        # Read once, without retrying: the claim is that the message is there
+        # now, after the polls, not that it can be found again within a timeout.
+        assert _UNKNOWN_PROFILE_TEXT in slot.inner_text(), "a poll erased the error"
+        assert page.locator("#status-area").count() == 1
+
+    def test_successful_scan_clears_the_error(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        A successful scan empties the slot back to zero height (B11, D-03).
+
+        The slot must also stay the same ``role="alert"`` element: the clear
+        replaces its contents, not the element, so the next error is still
+        announced.
+        """
+        server = scan_harness.server
+        page.goto(server.url)
+        page.evaluate(_SUBMIT_UNKNOWN_PROFILE)
+        slot = page.locator("#status-message")
+        expect(slot).to_contain_text(_UNKNOWN_PROFILE_TEXT)
+
+        page.locator("#scan-btn").click()
+
+        page.wait_for_function(
+            "document.getElementById('status-message').childNodes.length === 0"
+        )
+        assert slot.evaluate("(el) => el.getBoundingClientRect().height") == 0
+        assert slot.get_attribute("role") == "alert"
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
