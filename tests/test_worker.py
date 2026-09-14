@@ -2170,15 +2170,24 @@ class TestWorkerGuard:
         assert finished.state is JobState.ERROR
         assert finished.error == _DISK_ERROR
 
-    def test_a_failed_best_effort_write_is_only_logged(
+    def test_a_failed_best_effort_write_is_retried_until_it_lands(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """ROBU-01: when the guard's own write raises too, the worker still goes on."""
+        """
+        ROBU-01, CR-01, D-12: a row the guard could not end still ends on its own.
+
+        The job's SCANNING write and the guard's ERROR write both fail once.
+        That is one loop-level failure, well below degraded, so no probe ever
+        runs; the owed write must still land on a later idle tick, with no
+        restart and no scan.  Only once that row is terminal is a second job
+        submitted, so a newer row cannot hide a stranded one.
+        """
         caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
             lambda *_args, **_kwargs: _success_result(),
@@ -2192,24 +2201,96 @@ class TestWorkerGuard:
         try:
             worker.start()
             first = store.create_job("default", "Twice Unrecordable")
-            second = store.create_job("default", "After Both Failures")
             worker.submit(first)
+            failed = wait_for_state(store, first.id, TERMINAL_STATES, _STATE_BUDGET)
+            second = store.create_job("default", "After Both Failures")
             worker.submit(second)
             finished = wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
             alive = worker.is_alive
-            stranded = _get(store, first.id)
+            health = worker.health
         finally:
             worker.stop()
             store.close()
 
+        assert failed.state is JobState.ERROR
+        assert failed.error == _DISK_ERROR
+        assert failed.error_category == classify_error(
+            sqlite3.OperationalError(_DISK_ERROR)
+        )
         assert finished.state is JobState.DONE
         assert alive
-        assert len(finishes.calls) == 2
-        # Still active: only the recovery probe (D-12) reconciles this row.
-        assert stranded.is_active
+        assert health is WorkerHealth.HEALTHY
         records = _worker_records(caplog, logging.WARNING, first.id)
         assert records
         assert records[0].exc_info is not None
+
+    @pytest.mark.parametrize("stranded", [1, 2])
+    def test_owed_failures_below_the_degraded_threshold_are_written_once_the_store_heals(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+        stranded: int,
+    ) -> None:
+        """
+        CR-01, D-10, D-12: owed writes are retried on every idle tick, not probed.
+
+        ``stranded`` loop-level failures stay below ``_DEGRADED_AFTER``, and the
+        guard's ERROR write for each fails too.  Failed retries are not counted,
+        so the worker stays HEALTHY and never probes; once the store accepts
+        writes, every stranded row reaches ERROR with the guard's own text.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        updates = _StoreFault(store.update_state, frozenset(range(1, stranded + 1)))
+        finishes = _StoreFault(store.finish_job, None)
+        probes = _StoreFault(store.probe, frozenset())
+        monkeypatch.setattr(store, "update_state", updates)
+        monkeypatch.setattr(store, "finish_job", finishes)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            jobs = _submit_jobs(worker, store, stranded)
+            # The guard's write per job, then at least two idle-tick retries.
+            retried = _wait_until(
+                lambda: len(finishes.calls) >= stranded + 2, _STATE_BUDGET
+            )
+            still_active = [_get(store, job.id).is_active for job in jobs]
+            health_before = worker.health
+            failures_before = worker._consecutive_loop_failures
+            probes_before = probes.calls
+            finishes.heal()
+            failed = [
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+                for job in jobs
+            ]
+            latest = store.latest_run_job()
+            owed_after = dict(worker._unrecorded_failures)
+            health_after = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert retried
+        assert still_active == [True] * stranded
+        assert health_before is WorkerHealth.HEALTHY
+        assert failures_before == stranded
+        assert probes_before == []
+        expected_category = classify_error(sqlite3.OperationalError(_DISK_ERROR))
+        for row in failed:
+            assert row.state is JobState.ERROR
+            assert row.error == _DISK_ERROR
+            assert row.error_category == expected_category
+        assert latest is not None
+        assert not latest.is_active
+        assert owed_after == {}
+        assert probes.calls == []
+        assert health_after is WorkerHealth.HEALTHY
 
 
 # Loop-level failures in a row that make a worker degraded (D-10).
