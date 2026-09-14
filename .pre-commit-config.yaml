@@ -2,6 +2,13 @@
 # See https://pre-commit.com/hooks.html for more hooks
 # Git shims installed by `prek install`; worktrees share them via core.hooksPath.
 default_install_hook_types: [pre-commit, pre-merge-commit, pre-push]
+# The vendored htmx and Pico files under static/vendor/ are pinned by SHA-384
+# `integrity` attributes in base.html, so their bytes must stay exactly as the npm
+# registry shipped them. The byte-rewriting hooks below (end-of-file-fixer,
+# mixed-line-ending, trailing-whitespace) would append a newline or rewrite line
+# endings, the hash would stop matching, and browsers would refuse to load the
+# assets. No hook sees the directory; tests/test_vendor_assets.py is the backstop.
+exclude: ^src/saneless/web/static/vendor/
 # Hooks with no `stages:` of their own run at commit time only, never at merge or
 # push, where a file-modifying hook would abort the operation.
 #
