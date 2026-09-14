@@ -19,8 +19,12 @@ Evidence paths (all absolute):
 - `/home/kris/git/saneless/src/saneless/web/templates/partials/tags.html`
 - `/home/kris/git/saneless/src/saneless/web/templates/partials/correspondents.html`
 - `/home/kris/git/saneless/src/saneless/web/templates/partials/flip.html`
+- `/home/kris/git/saneless/src/saneless/web/templates/partials/scan_button.html`
+- `/home/kris/git/saneless/src/saneless/web/templates/partials/status_response.html`
+- `/home/kris/git/saneless/src/saneless/web/templates/partials/error.html`
 - `/home/kris/git/saneless/src/saneless/web/static/app.css`
-- `/home/kris/git/saneless/src/saneless/web/static/app.js`
+- `/home/kris/git/saneless/src/saneless/web/static/vendor/` (`pico-2.1.1.min.css`, `htmx-2.0.8.min.js`, `LICENSE-pico.md`, `LICENSE-htmx.txt`)
+- `/home/kris/git/saneless/src/saneless/web/errors.py` (renders every error response; `vocabulary.py` owns the copy)
 - `/home/kris/git/saneless/src/saneless/web/app.py` (registers the `state_label` and `progress_label` Jinja filters and the `JobState` template global; the labels themselves live in `src/saneless/vocabulary.py`)
 
 ---
@@ -31,8 +35,9 @@ Evidence paths (all absolute):
 |----------|-------|
 | Tool | none (no shadcn, no Tailwind, no build step) |
 | Preset | not applicable |
-| Component library | PicoCSS v2 (`@picocss/pico@2.1.1`, classless) via jsDelivr CDN; `pico.colors.css` not shipped (DARK-03) |
-| Interaction library | htmx v2.0.8 via jsDelivr CDN |
+| Component library | PicoCSS 2.1.1 (classless), served from the package at `/static/vendor/pico-2.1.1.min.css` with a SHA-384 `integrity` attribute (vendored in Phase 26); `pico.colors.css` not shipped (DARK-03) |
+| Interaction library | htmx 2.0.8, served from the package at `/static/vendor/htmx-2.0.8.min.js` with a SHA-384 `integrity` attribute (vendored in Phase 26) |
+| App JavaScript | none. The app script and its `<script>` tag were deleted in Phase 26; the page runs only vendored htmx |
 | Templating | Jinja2 served by FastAPI |
 | Icon library | none — Unicode glyphs only (`U+21BB` refresh, `U+2713` checkmark, `U+2717` cross, `U+2192` rightwards arrow) plus two inline SVG illustrations in `flip.html` |
 | Font | PicoCSS default system stack (`--pico-font-family`): `system-ui, -apple-system, "Segoe UI", Roboto, ...` |
@@ -42,7 +47,7 @@ Evidence paths (all absolute):
 ### Design philosophy
 
 - Classless semantic HTML — styling is driven almost entirely by element type (`<article>`, `<form>`, `<label>`, `<select>`, `<button>`, `<table role="grid">`) rather than utility classes.
-- Zero build step — stylesheets and scripts are CDN-hosted; `/static/app.css` and `/static/app.js` contain only thin app-specific overrides (128 lines CSS, 43 lines JS).
+- Zero build step — vendored, integrity-pinned assets; no app JavaScript. `/static/app.css` contains only thin app-specific overrides (142 lines). Loading the UI fetches nothing from a third-party origin.
 - Server-rendered HTML partials; htmx orchestrates async swaps. No SPA, no client-side router, no reactive framework.
 
 ### Project-specific classes (exhaustive)
@@ -56,7 +61,7 @@ The only non-Pico classes defined in `app.css`:
 | `.flip-prompt` | Wrapping container for the duplex-flip partial | `flip.html` (no styles; semantic hook only) |
 | `.refresh-btn` | Inline, transparent circular-arrow button beside tag/correspondent labels | `index.html` |
 | `.status-done` | Success color (uses `--pico-ins-color`) for status text and history cell | `status.html`, `history.html` |
-| `.status-error` | Error color (uses `--pico-del-color`) for error text and history cell | `status.html`, `history.html` |
+| `.status-error` | Error color (uses `--pico-del-color`) for error text and history cell | `status.html`, `history.html`, `error.html` |
 | `.status-fallback` | Warning color (amber) for a consume-directory fallback — a degraded success, so deliberately neither the ins green nor the del red. Uses `var(--saneless-status-fallback)`: `#a16207` in light (4.92:1) and `#ca8a04` in dark (6.11:1) | `status.html`, `history.html` |
 | `.history-table-wrap` | Horizontal scroll wrapper for job history table on narrow viewports | `index.html` |
 | `.sr-only` | Screen-reader-only text for icon-only button labels | `index.html` (refresh buttons) |
@@ -73,10 +78,12 @@ All spacing resolves against PicoCSS v2 tokens (`--pico-spacing`, `--pico-border
 |-------|-------------|-----------------------|-------------------|
 | 0.25rem | 0.25rem | 4px | `.refresh-btn` top/bottom padding |
 | 0.5rem | 0.5rem | 8px | `.refresh-btn` horizontal padding + left margin; `.thumbnail` top margin |
-| 1rem | 1rem | 16px | `#status-area` outer margin + padding; `.flip-illustration` vertical margin; mobile flip gap |
+| 1rem | 1rem | 16px | `#status-area` outer margin + padding; `#status-message > p` left padding (Phase 26: insets the request error text to the status line's x); `.flip-illustration` vertical margin; mobile flip gap |
 | 2rem | 2rem | 32px | `.flip-illustration` desktop gap between SVGs |
 
 Pico base spacing tokens inherited (not overridden): `--pico-spacing` ≈ 1rem (16px) drives default gaps between form controls, article padding, table cell padding, headings.
+
+`#status-message > p` also carries `border-left: var(--pico-border-width) solid transparent`, so its text starts at the same x as the `#status-area` line (border plus 1rem padding). It adds no margin: Pico's `p { margin: 0 0 1rem }` collapses with `#status-area`'s `margin-top: 1rem`, so every vertical gap around the slot stays 16px. The empty slot has no children and a computed height of 0px.
 
 | Non-spacing size | Value | Usage |
 |------------------|-------|-------|
@@ -128,7 +135,7 @@ Neither override constitutes a new type scale entry. Future phases should normal
 
 Color is delegated to PicoCSS v2 semantic tokens. Nearly every `app.css` colour is written as `var(--pico-token, fallback)`; the only literal hexes in the file are the light and dark values of `--saneless-status-fallback`, the single scheme-dependent colour the app owns, because Pico has no amber among its semantic tokens.
 
-**Two findings recorded in Phase 23, resolved in Phase 23.1, both verified against the CDN build linked by `base.html`:**
+**Two findings recorded in Phase 23, resolved in Phase 23.1, both verified against the Pico 2.1.1 build `base.html` then loaded from a CDN (Phase 26 vendored the same bytes, so the findings and measurements stand):**
 
 1. `pico.min.css` carries the semantic tokens (`--pico-ins-color`, `--pico-del-color`, …) but **not** the colour palette — that ships separately as `pico.colors.css`, which the page does not link. Linking it would **not** have been the no-op Phase 23 assumed: Pico v2.1.1's `--pico-color-amber-600` is `#785800`, not the `#a16207` the app renders, and `#785800` measures 2.74:1 on the dark surface — a worse failure than the one being fixed. The palette file is therefore not shipped (DARK-03), and `.status-fallback` reads the app-owned `--saneless-status-fallback` instead.
 2. `base.html` set `data-theme="auto"`, but Pico v2's automatic dark rule is scoped to `:root:not([data-theme])` — the attribute has to be *absent*, not `"auto"` (that was the Pico v1 spelling). The attribute was removed in Phase 23.1, so the OS preference is now honoured.
@@ -155,7 +162,7 @@ Status text sits on the page surface in `#status-area` and on the `td` backgroun
 | `.status-error` | dark | `rgb(206, 126, 123)` | 5.89:1 | 5.60:1 | PASS |
 | `.status-fallback` | dark | `rgb(202, 138, 4)` | 6.11:1 | 5.80:1 | PASS |
 
-**60/30/10 compliance:** the ratio is enforced by Pico's classless defaults rather than by this project. The only app-specific colored surface is the 4px (Pico `--pico-border-width`) left border on `#status-area` painted with `--pico-primary` — the single accent moment on the page.
+**60/30/10 compliance:** the ratio is enforced by Pico's classless defaults rather than by this project. The only app-specific colored surface is the 1px (0.0625rem, Pico 2.1.1 `--pico-border-width`) left border on `#status-area` painted with `--pico-primary` — the single accent moment on the page. (Earlier revisions of this spec said 4px; the rendered border was always 1px.) The `#status-message > p` border uses the same token but is `transparent`, so it adds no colour.
 
 Accent (`--pico-primary`) is reserved for:
 1. Primary submit button `#scan-btn` (default Pico styling of `<button>`)
@@ -187,12 +194,13 @@ Inventory of every interactive/presentational component currently shipped.
 | Page heading | `<h1>saneless</h1>` | `base.html` | Only H1 on page |
 | Scan card | `<article>` with `<h2>Scan</h2>` + form | `index.html` | Card 1 |
 | Profile select | `<select name="profile">` | `index.html` | Server-rendered options from Settings |
-| Title input | `<input type="text">` with placeholder "Document title (auto-generated if empty)" | `index.html` | |
+| Title input | `<input type="text">` with placeholder "Document title (auto-generated if empty)" and `maxlength="256"` (from `vocabulary.TITLE_MAX_LENGTH`, the same cap the server enforces) | `index.html` | |
 | Tags multi-select | `<select multiple>` hydrated via `hx-get="/api/tags" hx-trigger="load"` | `index.html` + `partials/tags.html` | TTL-cached |
 | Tag refresh button | Icon-only `<button>` U+21BB with `aria-label` + `.sr-only` text, `hx-post="/api/cache/invalidate?resource=tags"` | `index.html` | |
 | Correspondent select | `<select>` with leading "No correspondent" option, hydrated via `hx-get="/api/correspondents"` | `index.html` + `partials/correspondents.html` | TTL-cached |
 | Correspondent refresh button | Mirror of tag refresh | `index.html` | |
-| Primary scan button | `<button type="submit" id="scan-btn">` | `index.html` | Disabled + `aria-busy="true"` during active job; label swaps to `Scanning...` / `Scanning\u2026` |
+| Primary scan button | `<button type="submit" id="scan-btn">`, server-rendered from the current (else most recent run) job | `partials/scan_button.html` (the only copy of its markup), included inline by `index.html` and out-of-band (`hx-swap-oob="true"`) by `partials/status_response.html` | Every status response (scan success, status poll, flip Continue/Abort) re-renders it out of band, so the server alone decides its state. Disabled while a job is active; `aria-busy="true"` only while busy (omitted, never `"false"`, otherwise); label `Scanning\u2026` while busy, `Waiting for flip\u2026` at `AWAITING_FLIP`, else `Scan` (both use the `&#8230;` entity). Full state table under Interaction Patterns |
+| Request error message | `<div id="status-message" role="alert"></div>`, a sibling placed directly above `#status-area`, outside the form and outside the polled element; empty (no children, 0px tall) until an error lands | `index.html` + `partials/error.html` | Any 4xx/5xx from an htmx request is retargeted here and renders `<p class="status-error">\u2717 {message}</p>` (`.status-error` text, no `role="alert"` on the `<p>`). Cleared out of band only by a successful `POST /api/scan` |
 | Status area | `<div id="status-area">` polling itself `hx-get="/api/jobs/current/status" hx-trigger="every 1s"` when active | `partials/status.html` | Only polls when state is PENDING/SCANNING/AWAITING_FLIP/SCANNING_REVERSE/ASSEMBLING/UPLOADING |
 | Status states | Eleven presentations, one per row of the Status area table below: Idle/Starting/Scanning/AwaitingFlip/AwaitingFlipAnswered/ScanningReverse/Assembling/Uploading/Done/Error/Fallback | `partials/status.html` | Each uses `aria-busy="true"` on the `<p>` during non-terminal in-progress states. Fallback renders two `.status-fallback` paragraphs — the outcome line and the inline `{job.warning}` — and, unlike Error, carries no `role="alert"`: a fallback is a degradation, not a failure |
 | Thumbnail preview | `<img class="thumbnail">` with base64 data URI | `partials/status.html` | alt text "First page preview" |
@@ -203,7 +211,7 @@ Inventory of every interactive/presentational component currently shipped.
 | Humanized state labels | Jinja filter `state_label` maps each enum value to its humanized status label; the full list is under Job history in the Copywriting Contract | `vocabulary.py:state_label`, registered as a filter in `app.py` | Presented in history Status column, and (since Phase 23) in the `saneless jobs` table |
 | Empty history | Single `<tr><td colspan="4">No scan history yet.</td></tr>` | `partials/history.html` | |
 
-**Component count:** 18 distinct UI elements across 7 template files.
+**Component count:** 19 distinct UI elements across 10 template files.
 
 ---
 
@@ -231,7 +239,8 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | Correspondent refresh `aria-label` / tooltip | `Refresh correspondents` |
 | Correspondent "none" option | `No correspondent` (index.html) / `-- None --` (partial hydration) ⚠️ inconsistency |
 | Primary CTA (idle) | `Scan` |
-| Primary CTA (busy) | `Scanning...` (Jinja) and `Scanning…` (JS — uses U+2026 ellipsis) ⚠️ minor inconsistency |
+| Primary CTA (busy) | `Scanning…` (U+2026, written `Scanning&#8230;` in `partials/scan_button.html`) |
+| Primary CTA (waiting on the flip) | `Waiting for flip…` (U+2026, written `Waiting for flip&#8230;`) |
 
 ### Status area (`partials/status.html`)
 
@@ -273,6 +282,40 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | Empty state | `No scan history yet.` |
 | Humanized status labels | `Pending`, `Scanning`, `Waiting for flip`, `Scanning backs`, `Assembling`, `Uploading`, `Complete`, `Failed`, `Saved to folder` |
 
+### Request error messages (`#status-message`, Phase 26)
+
+All strings are developer-authored constants owned by `vocabulary.rejection_message`; templates and routes never compose error prose, and no message contains request input or exception text. The htmx branch renders `✗ ` + message in `partials/error.html`; the JSON branch's `detail` is the message alone, with the same status code. Slot messages are full sentences ending with a period, naming the problem and then the next step. There is no `Error:` prefix.
+
+| Case | Status | Message (verbatim) |
+|---|---|---|
+| Queue full | 429 | `The scan queue is full. Wait for a scan to finish, then try again.` |
+| Worker thread down | 503 | `The scan service is not running, so the scan was not started. Restart saneless, then try again.` |
+| Worker degraded: job store failing | 503 | `Job history cannot be saved right now, so the scan was not started. Check the server's free disk space and log, then try again.` |
+| Unknown profile | 422 | `That scan profile does not exist. Reload the page to see the current profiles.` |
+| Title too long | 422 | `The title is too long. Shorten it to 256 characters or fewer.` |
+| Any other request validation failure (bad `resource`, missing or malformed form field such as `job_id`, non-integer tag) | 422 | `The request was not valid. Reload the page, then try again.` |
+| Cross-site request blocked | 403 | `This request was blocked because it did not come from the saneless page. If saneless is behind a reverse proxy, make sure the proxy passes the original Host header.` |
+| Not found (router 404, `StaticFiles` 404) | 404 | `That page or action does not exist. Reload the page, then try again.` |
+| Method not allowed | 405 | `That action is not allowed. Reload the page, then try again.` |
+| Unhandled exception | 500 | `Something went wrong on the server. Check the server log for details, then try again.` |
+| Any other 4xx not listed | as raised | `The request could not be completed. Reload the page, then try again.` |
+| Any other 5xx not listed | as raised | same as the 500 message |
+
+The number `256` comes from `vocabulary.TITLE_MAX_LENGTH`, the same constant as the title input's `maxlength` and the server's form cap.
+
+### Job-row `error` texts (Phase 26)
+
+Written to the job store; like every other `job.error` they carry no trailing period.
+
+| Case | `error` text (verbatim) | Where the user sees it |
+|---|---|---|
+| Submit rejected: queue full | `Not started: the scan queue was full` | History Status cell `Failed` (`.status-error`); CLI job listing. Never the status area |
+| Submit rejected: worker down | `Not started: the scan service was not running` | same |
+| Submit rejected: worker degraded (row write succeeded) | `Not started: the scan service was unavailable` | same |
+| Crash recovery at startup; also a flip wait aborted by shutdown | `The server restarted before this scan finished` | Status area when it is the most recent run job: `✗ Error: The server restarted before this scan finished` (existing ERROR branch, `role="alert"`, `.status-error`); History `Failed` |
+
+Rejected rows use the existing presentation: humanised label `Failed`, class `.status-error`. There is no "Rejected" label and no new history column.
+
 ### Copy style guide (observed)
 
 - Sentence case for all UI strings; no title case.
@@ -292,7 +335,7 @@ The following patterns would flag on generic copywriting heuristics but are **in
 ### Known copy inconsistencies (candidates for future normalization)
 
 1. Correspondent "none" option reads `No correspondent` in the initial index render but `-- None --` after htmx hydration. Recommend picking one.
-2. Busy CTA label is `Scanning...` (three dots, Jinja) vs `Scanning…` (U+2026, JS). Recommend unifying on the JS ellipsis form used by PicoCSS spinner conventions.
+2. **Status: resolved in Phase 26.** Busy CTA label was `Scanning...` (three dots, Jinja) vs `Scanning…` (U+2026, JS). With the app script deleted, `partials/scan_button.html` is the only source of the label and uses the `&#8230;` entity, so only `Scanning…` remains. The status area's progress prose keeps its three ASCII periods; that is a different string with a different owner.
 
 ---
 
@@ -302,27 +345,73 @@ The following patterns would flag on generic copywriting heuristics but are **in
 
 | Trigger | Verb + URL | Target | Swap |
 |---------|-----------|--------|------|
-| Scan form submit | `POST /api/scan` | `#status-area` | `outerHTML` |
-| Status area self-poll (active states only) | `GET /api/jobs/current/status` every 1s | `#status-area` | `outerHTML` |
+| Scan form submit (`hx-disabled-elt="#scan-btn"`, `hx-disinherit="hx-disabled-elt"`) | `POST /api/scan` | `#status-area` | `outerHTML`; the 200 response also carries an OOB `#scan-btn` and an OOB clear of `#status-message` |
+| Status area self-poll (active states only) | `GET /api/jobs/current/status` every 1s | `#status-area` | `outerHTML`; the response also carries an OOB `#scan-btn` (never the slot clear) |
 | Tags select load | `GET /api/tags` on `load` | self (`this`) | `innerHTML` |
 | Correspondent select load | `GET /api/correspondents` on `load` | self (`this`) | `innerHTML` |
 | Tag refresh | `POST /api/cache/invalidate?resource=tags` | `#tags-select` | `innerHTML` |
 | Correspondent refresh | `POST /api/cache/invalidate?resource=correspondents` | `#correspondent-select` | `innerHTML` |
-| Flip continue | `POST /api/flip/continue` | `#status-area` | `outerHTML` |
-| Flip abort | `POST /api/flip/abort` | `#status-area` | `outerHTML` |
+| Flip continue | `POST /api/flip/continue` | `#status-area` | `outerHTML`; the response also carries an OOB `#scan-btn` |
+| Flip abort | `POST /api/flip/abort` | `#status-area` | `outerHTML`; the response also carries an OOB `#scan-btn` |
 | Terminal DONE/ERROR/FALLBACK hidden history reload | `GET /api/jobs/history` on `load` | `#history-body` | `outerHTML` |
+| Any 4xx/5xx from any htmx request (Phase 26) | as issued | `#status-message`, via the `HX-Retarget` response header | `innerHTML`, via `HX-Reswap`, so the container and its `role="alert"` survive |
+| Rejected-submit history refresh (429/503 from `POST /api/scan`, only when the rejected row was written) | `GET /api/jobs/history` on `load`, inside the error partial | `#history-body` | `outerHTML` |
+
+`base.html` carries a `<meta name="htmx-config">` whose `responseHandling` restates all three entries (`204` no swap, `[23]..` swap, `[45]..` swap with `error: true`), so htmx swaps 4xx/5xx bodies instead of dropping them. htmx 2.0.8 merges meta config shallowly: a meta holding only the `[45]..` entry would replace the array and stop every 2xx swap.
+
+**Which responses carry what (Phase 26).**
+
+| Response | `#status-area` | OOB `#scan-btn` | OOB clear `#status-message` |
+|---|---|---|---|
+| `GET /` (full page) | inline | inline, not OOB (exactly one) | n/a (slot rendered empty) |
+| `POST /api/scan` success | yes | yes | yes |
+| `GET /api/jobs/current/status` | yes | yes | no |
+| `POST /api/flip/continue`, `POST /api/flip/abort` success | yes | yes | no |
+| Any error response | no | no | no |
+| Tags / correspondents / cache invalidate / history | no | no | no |
+
+The slot clear rides only on a successful scan: a poll or flip response carrying it would erase a rejection shown mid-scan within a second.
 
 **Flip routes (Phase 25).** Both flip buttons still target `#status-area` with an `outerHTML` swap, and both routes answer immediately — neither waits for pass B to start. The status partial they return reports the job resolved as "current job, else most recent", the same lookup the status poll and the index page use, so a click that lands just as the job ends shows that job rather than `Ready to scan.`. The flip controls are rendered only while the job is `AWAITING_FLIP` and unanswered. Both buttons send the job's id as a `job_id` form field via `hx-vals`, and the routes drop an answer that names any other job or arrives before that job reached `AWAITING_FLIP` (CR-01). The first answer (Continue, Abort, or the flip timeout) is final; a later click is dropped and the route returns the job's current status. An accepted answer renders the acknowledgment row (`Flip confirmed. Scanning reverse sides next...` / `Aborting scan...`) rather than re-rendering the prompt, and the status poll keeps showing it until the job leaves `AWAITING_FLIP`.
 
-### Button lifecycle (app.js)
+### Scan button: form wiring (Phase 26, replaces the deleted client-script button lifecycle)
 
-- On `htmx:beforeRequest` for the scan form: disable `#scan-btn`, set `aria-busy="true"`, label → `Scanning…`.
-- On `htmx:afterSwap` of `#status-area`: if the swapped content contains `.status-done`, `.status-error` or `.status-fallback` — i.e. any terminal state — re-enable the button, clear busy, restore label to `Scan`. Every terminal state must be named here; omitting one leaves the button permanently disabled until the user reloads the page.
-- All JS is IIFE-wrapped in `"use strict"`. No globals, no inline scripts, no `hx-on` attributes (normalized in Phase 12).
+```html
+<form hx-post="/api/scan"
+      hx-target="#status-area"
+      hx-swap="outerHTML"
+      hx-disabled-elt="#scan-btn"
+      hx-disinherit="hx-disabled-elt">
+```
+
+- `hx-disabled-elt="#scan-btn"` disables the button for the round-trip, so there is no double submit.
+- `hx-disinherit="hx-disabled-elt"` is **mandatory**. Without it the tags and correspondents `<select>`s (`hx-trigger="load"`) and both refresh buttons inherit `hx-disabled-elt`; on htmx 2.0.8, finishing those requests strips `disabled` from a button the server rendered disabled, so the Scan button would come back enabled on page load during an active job (C-10).
+- No `hx-on`, no inline script, no `hx-indicator`, and no application JavaScript at all.
+
+**Button state table** (job = current, else most recent run job):
+
+| Job | `disabled` | `aria-busy` | Rendered label |
+|---|---|---|---|
+| none (idle) | absent | absent | Scan |
+| `PENDING`, `SCANNING`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING` | present | `"true"` | Scanning… |
+| `AWAITING_FLIP` (answered or not) | present | absent | Waiting for flip… |
+| `DONE` / `FALLBACK` / `ERROR` | absent | absent | Scan |
+
+### Scan button: interaction timeline
+
+| Moment | Button | Status area | Slot |
+|---|---|---|---|
+| Click (request in flight) | disabled by htmx; label still `Scan` | unchanged | unchanged |
+| 200 from `POST /api/scan` | replaced OOB: disabled, `aria-busy="true"`, `Scanning…` | `Starting scan...` + 1s poll | emptied |
+| Each poll while active | replaced OOB per the state table | per state | unchanged |
+| Terminal poll | replaced OOB: enabled, `Scan`, no `aria-busy` | terminal line; poll stops; history reloads | unchanged |
+| 4xx/5xx from `POST /api/scan` | htmx removes the `disabled` it added, so the button returns to its pre-click (enabled) state | unchanged | error message |
+
+The busy label appears one round-trip after the click, when the OOB copy lands, rather than instantly; the button is disabled immediately, so there is no double-submit window. A 429/503 on a page that loaded idle does not start the status poll; the slot says what happened.
 
 ### Form semantics
 
-- Native `<form>` submit via htmx; no client-side validation.
+- Native `<form>` submit via htmx; no client-side validation beyond the title input's `maxlength`. The server validates authoritatively and reports failures in `#status-message`.
 - Multi-select (`<select multiple>`) uses native browser UI — no custom token picker.
 - No confirmation dialogs anywhere (see "Deliberate design decisions" above for the Abort rationale).
 - Only state mutation the user can perform mid-job is Continue / Abort during `AWAITING_FLIP`.
@@ -343,8 +432,11 @@ Current a11y affordances observed in markup:
 | Viewport | `<meta name="viewport" content="width=device-width, initial-scale=1">` |
 | Theme | The OS `prefers-color-scheme` is honoured, through the *absence* of `data-theme` on `<html>` (what Pico v2's automatic dark rule requires) plus `<meta name="color-scheme" content="light dark">`, which keeps the pre-stylesheet canvas dark for a dark-preference user |
 | Icon-only buttons | Refresh buttons carry `aria-label`, `title`, and `.sr-only` screen-reader text (validated Phase 12) |
-| Busy states | `aria-busy="true"` on `<p>` during PENDING/SCANNING/ASSEMBLING/UPLOADING; `aria-busy` toggled on `#scan-btn` |
-| Error announcements | Error `<p>` carries `role="alert"` for live-region announcement |
+| Busy states | `aria-busy="true"` on `<p>` during PENDING/SCANNING/ASSEMBLING/UPLOADING; on `#scan-btn`, `aria-busy="true"` exactly for the busy states (see the button state table) and **omitted, never `"false"`**, otherwise |
+| Error announcements | The status area's `✗ Error:` `<p>` carries `role="alert"` for live-region announcement |
+| Alert region (request errors) | `#status-message` carries `role="alert"` (implicit `aria-live="assertive"`, `aria-atomic="true"`) and is present and empty in the initial HTML, so a later insertion is announced reliably; it is never created dynamically. Clearing removes children only, which is not announced |
+| Single announcement | The error partial's `<p>` has **no** nested `role="alert"`, so a request error is announced once. The status area's own `✗ Error:` line is a separate region with different content, so the two never announce the same text |
+| Focus | Nothing moves focus when an error lands: the slot has no `tabindex`, and no `autofocus`, `focus()` call, `hx-on` handler or `show:`/`focus-scroll` swap modifier is used. A disabled `#scan-btn` is skipped by Tab natively |
 | Data tables | `<table role="grid">` for job history |
 | Action grouping | Flip prompt buttons wrapped in `<div role="group">` |
 | Decorative SVG | Each flip SVG has `aria-label`; captions reinforce with visible `<small>` text |
@@ -358,7 +450,7 @@ Not currently present (documented for checker awareness, not necessarily gaps):
 - No focus-visible overrides (relies on Pico defaults)
 - No prefers-reduced-motion overrides (no project animations; htmx spinner is Pico-provided)
 - No destructive-action confirmation dialog — Abort scan is one click (intentional; see Copywriting)
-- No toast system — all feedback lives in `#status-area`
+- No toast system — request errors live in `#status-message`, job feedback in `#status-area`
 
 ---
 
@@ -369,15 +461,15 @@ Not currently present (documented for checker awareness, not necessarily gaps):
 | shadcn official | none | not applicable — project does not use shadcn |
 | Third-party registries | none declared | not applicable |
 
-External runtime dependencies (CDN):
+Vendored front-end assets (served from the package under `/static/vendor/` since Phase 26; no runtime CDN dependency):
 
-| Source | Artifact | Version | Notes |
-|--------|----------|---------|-------|
-| cdn.jsdelivr.net | `@picocss/pico@2.1.1/css/pico.min.css` | 2.1.1 (exact) | Classless stylesheet; pinned in Phase 23.1 because the dark-mode tests assert this build's exact surface colours |
-| cdn.jsdelivr.net | `@picocss/pico@2.1.1/css/pico.colors.min.css` | none | Palette file explicitly **not** linked (DARK-03); the app owns its one amber instead |
-| cdn.jsdelivr.net | `htmx.org@2.0.8/dist/htmx.min.js` | 2.0.8 (exact) | Interaction engine |
+| File | Source | Version | `integrity` (SHA-384) | Licence file |
+|------|--------|---------|-----------------------|--------------|
+| `static/vendor/pico-2.1.1.min.css` | npm `@picocss/pico` | 2.1.1 (exact) | `sha384-L1dWfspMTHU/ApYnFiMz2QID/PlP1xCW9visvBdbEkOLkSSWsP6ZJWhPw6apiXxU` | `static/vendor/LICENSE-pico.md` (MIT) |
+| `static/vendor/htmx-2.0.8.min.js` | npm `htmx.org` | 2.0.8 (exact; do not bump: 2.0.9 changes `hx-disabled-elt` semantics) | `sha384-/TgkGk7p307TH7EXJDuUlgG3Ce1UVolAOFopFekQkkXihi5u/6OCvVKyz1W+idaz` | `static/vendor/LICENSE-htmx.txt` (0BSD) |
+| `pico.colors.css` | — | none | — | **not vendored, not linked** (DARK-03); the app owns its one amber instead |
 
-Supply-chain posture: both assets ship from jsDelivr with SRI not currently applied. That is a known gap (not in scope for this retrospective spec — logged for future hardening).
+Supply-chain posture: both assets are same-origin files pinned by SHA-384 `integrity` attributes in `base.html` (no `crossorigin` attribute), and Pico 2.1.1 remains pinned because the dark-mode tests assert this build's exact surface colours. `static/vendor/` is excluded from the prek byte-rewriting hooks and marked `-text` in `.gitattributes`, so its bytes stay as published; `tests/test_vendor_assets.py` checks each `integrity` value against the file's bytes.
 
 ---
 
