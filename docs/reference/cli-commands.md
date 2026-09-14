@@ -113,7 +113,7 @@ saneless [--config PATH] [-v] serve [--host ADDR] [--port N]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--host` | TEXT | `0.0.0.0` (from config) | Bind address |
+| `--host` | TEXT | `0.0.0.0` (from config) | Bind address. The default `0.0.0.0` listens on all network interfaces |
 | `--port` | int | `8080` (from config) | Bind port |
 
 **Exit codes:**
@@ -145,6 +145,8 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 | 1 | No scanners found |
 | 2 | Configuration error — the config file could not be loaded |
 
-Profiles are written to the TOML config file. Without `--force`, existing profiles are preserved and only new ones are added.
+Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, they are written to `./saneless.toml`. Without `--force`, existing profiles are preserved and only new ones are added.
+
+`saneless serve` also generates profiles once at startup when the config holds only the untouched `default` profile. See [Auto-generated profiles](../how-to/configure-scan-profiles.md#auto-generated-profiles).
 
 A `default` profile is always written, because saneless requires one: your scanner's flatbed backs it when it has one, and otherwise its first reported source does. Regenerating never removes that profile; every other auto-generated profile a new run no longer produces is pruned, while profiles you wrote yourself are left alone.

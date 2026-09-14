@@ -108,6 +108,30 @@ You can configure saneless entirely through environment variables using the `SAN
 
 See [Environment Variables](../reference/environment-variables.md) for the full list.
 
+## Running behind a reverse proxy
+
+saneless rejects state-changing requests that did not come from a saneless page (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A reverse proxy in front of saneless has to leave the browser's view of the site intact, or saneless mistakes your own scans for cross-site requests.
+
+**Behind an HTTPS proxy, nothing extra is needed.** Over HTTPS the browser sends `Sec-Fetch-Site`, and saneless decides from that header alone.
+
+**Behind a plain-HTTP proxy, the proxy must pass the original `Host` header, or set `X-Forwarded-Host`.** Without `Sec-Fetch-Site`, saneless compares the browser's `Origin` with `Host` and `X-Forwarded-Host`. nginx replaces `Host` with the upstream address by default, so tell it to pass the original:
+
+```nginx
+location / {
+    proxy_pass http://saneless:8080;
+    proxy_set_header Host $host;
+}
+```
+
+nginx's `$host` carries no port. If the proxy listens on a port other than 80, the browser's `Origin` includes that port, so pass the header unchanged with `$http_host` instead.
+
+Other proxies:
+
+- **Caddy** passes the incoming `Host` header through and sets `X-Forwarded-Host` by default, so `reverse_proxy` needs no extra configuration.
+- **Traefik** forwards the client's `Host` header by default (`passHostHeader` is `true`). Leave it enabled.
+
+**What a rejection looks like.** The web UI shows "This request was blocked because it did not come from the saneless page. If saneless is behind a reverse proxy, make sure the proxy passes the original Host header." and the request gets a `403`. The saneless log records a warning beginning `Blocked cross-site POST` that names the `Origin`, `Host`, `X-Forwarded-Host` and `Sec-Fetch-Site` values it received: if `Origin` and `Host` disagree there, the proxy is rewriting `Host`.
+
 ## Updating
 
 Pull the latest image and recreate the container:

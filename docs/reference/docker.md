@@ -20,7 +20,9 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 ```
 
-The `/health` endpoint returns 200 when the worker thread is alive, 503 when it is down.
+The `/health` endpoint returns `200` when saneless is healthy. It returns `503` when the worker thread is down (`worker thread is down`) or when the worker is degraded because its job store is failing (`job store failing`); see [`GET /health`](web-api.md#get-health). After three failed checks in a row, Docker reports the container as unhealthy.
+
+Docker's restart policies act only when a container exits, so an unhealthy container keeps running and `restart: unless-stopped` does not restart it. A degraded worker clears itself once the job store accepts writes again; a worker thread that is down needs saneless restarted.
 
 ## Volumes
 
