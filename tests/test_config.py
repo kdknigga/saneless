@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+import saneless.config as config_mod
 from saneless.config import (
     DEFAULT_RESOLUTION,
     OutputConfig,
@@ -294,6 +297,194 @@ class TestMinFreeSpaceMb:
         """OutputConfig has min_free_space_mb defaulting to 500."""
         output = OutputConfig()
         assert output.min_free_space_mb == 500
+
+
+class TestFlipTimeoutSeconds:
+    """OutputConfig flip_timeout_seconds field (DPLX-05, D-10)."""
+
+    def test_flip_timeout_seconds_default(self) -> None:
+        """Settings default the manual-duplex flip wait to ten minutes."""
+        assert Settings().output.flip_timeout_seconds == 600
+
+    def test_flip_timeout_seconds_accepts_zero(self) -> None:
+        """
+        Zero is a valid timeout.
+
+        It is the zero-cost seam later plans use to make a flip timeout
+        observable without waiting for one.
+        """
+        assert OutputConfig(flip_timeout_seconds=0).flip_timeout_seconds == 0
+
+    def test_flip_timeout_seconds_from_toml(self, tmp_config_dir: Path) -> None:
+        """The timeout is read from the [output] section."""
+        toml_content = """\
+[output]
+flip_timeout_seconds = 90
+
+[profiles.default]
+"""
+        config_file = tmp_config_dir / "flip_timeout.toml"
+        config_file.write_text(toml_content)
+        settings = load_settings(config_path=str(config_file))
+        assert settings.output.flip_timeout_seconds == 90
+
+
+class TestDuplexField:
+    """ProfileConfig duplex field validation (DPLX-01)."""
+
+    def test_duplex_default_none(self) -> None:
+        """ProfileConfig defaults duplex to 'none'."""
+        assert ProfileConfig().duplex == "none"
+
+    def test_duplex_hardware(self) -> None:
+        """ProfileConfig accepts duplex='hardware'."""
+        assert ProfileConfig(duplex="hardware").duplex == "hardware"
+
+    def test_duplex_manual(self) -> None:
+        """ProfileConfig accepts duplex='manual'."""
+        assert ProfileConfig(duplex="manual").duplex == "manual"
+
+    def test_duplex_invalid_raises(self) -> None:
+        """A fourth duplex value is rejected at load."""
+        with pytest.raises(ValidationError, match="duplex"):
+            ProfileConfig.model_validate({"duplex": "both"})
+
+    def test_duplex_manual_keeps_a_real_source(self) -> None:
+        """Setting duplex leaves source exactly as written."""
+        profile = ProfileConfig(source="ADF", duplex="manual")
+        assert profile.source == "ADF"
+        assert profile.duplex == "manual"
+
+
+class TestLegacyManualDuplexSource:
+    """
+    Tests for the legacy manual-duplex source predicate.
+
+    Relocated from tests/test_pipeline.py: the substring rule no longer
+    chooses a scanning strategy, but it still recognises the deprecated
+    ``source = "Manual Duplex"`` form (DPLX-02) and keeps its edge cases.
+    """
+
+    def test_adf_manual_duplex(self) -> None:
+        """Source 'ADF Manual Duplex' is the legacy manual duplex form."""
+        assert config_mod._is_legacy_manual_duplex_source("ADF Manual Duplex") is True
+
+    def test_manual_duplex_case_insensitive(self) -> None:
+        """Case insensitive detection."""
+        assert config_mod._is_legacy_manual_duplex_source("adf manual duplex") is True
+        assert config_mod._is_legacy_manual_duplex_source("MANUAL DUPLEX") is True
+
+    def test_flatbed_not_manual_duplex(self) -> None:
+        """Flatbed is not manual duplex."""
+        assert config_mod._is_legacy_manual_duplex_source("Flatbed") is False
+
+    def test_adf_not_manual_duplex(self) -> None:
+        """Plain ADF (no manual) is not manual duplex."""
+        assert config_mod._is_legacy_manual_duplex_source("ADF") is False
+
+    def test_hardware_duplex_not_manual(self) -> None:
+        """Hardware duplex without 'manual' is not manual duplex."""
+        assert config_mod._is_legacy_manual_duplex_source("ADF Duplex") is False
+
+
+class TestLegacyManualDuplexTranslation:
+    """A legacy source = "Manual Duplex" loads as duplex = "manual" (DPLX-02)."""
+
+    def test_manual_duplex_source_translates(self) -> None:
+        """The legacy marker sets duplex and leaves source verbatim."""
+        profile = ProfileConfig(source="Manual Duplex")
+        assert profile.duplex == "manual"
+        assert profile.source == "Manual Duplex"
+
+    def test_adf_manual_duplex_source_translates(self) -> None:
+        """Any source carrying both words is the legacy marker."""
+        assert ProfileConfig(source="ADF Manual Duplex").duplex == "manual"
+
+    def test_hardware_duplex_source_does_not_translate(self) -> None:
+        """A hardware duplex source is not manual duplex."""
+        assert ProfileConfig(source="ADF Duplex").duplex == "none"
+
+    def test_explicit_duplex_is_never_overwritten(self) -> None:
+        """An explicitly written duplex beats the legacy inference (Pitfall 3)."""
+        profile = ProfileConfig(source="Manual Duplex", duplex="none")
+        assert profile.duplex == "none"
+
+    def test_nested_profile_dict_translates(self) -> None:
+        """A raw nested profile dict, as the merged sources produce, translates."""
+        settings = Settings.model_validate(
+            {"profiles": {"default": {}, "legacy": {"source": "Manual Duplex"}}}
+        )
+        assert settings.profiles["legacy"].duplex == "manual"
+        assert settings.profiles["default"].duplex == "none"
+
+    def test_legacy_toml_round_trips(self, tmp_config_dir: Path) -> None:
+        """A legacy TOML profile still loads, read as manual duplex."""
+        toml_content = """\
+[profiles.default]
+source = "Flatbed"
+
+[profiles.legacy]
+source = "Manual Duplex"
+"""
+        config_file = tmp_config_dir / "legacy_duplex.toml"
+        config_file.write_text(toml_content)
+        settings = load_settings(config_path=str(config_file))
+        legacy = settings.profiles["legacy"]
+        assert legacy.duplex == "manual"
+        assert legacy.source == "Manual Duplex"
+
+
+class TestLegacyDuplexWarning:
+    """Loading a legacy manual-duplex profile warns once, by name (D-04, D-18)."""
+
+    @staticmethod
+    def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        """Return the WARNING messages saneless.config emitted."""
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == "saneless.config"
+        ]
+
+    def test_legacy_profile_warns_once_with_migration_instruction(
+        self, tmp_config_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The WARNING names the profile, the replacement and the source command."""
+        toml_content = """\
+[profiles.default]
+source = "Flatbed"
+
+[profiles.legacy]
+source = "Manual Duplex"
+"""
+        config_file = tmp_config_dir / "legacy_warning.toml"
+        config_file.write_text(toml_content)
+        with caplog.at_level(logging.WARNING, logger="saneless.config"):
+            load_settings(config_path=str(config_file))
+
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        message = "\n".join(warnings)
+        assert "legacy" in message
+        assert 'duplex = "manual"' in message
+        assert "devices --capabilities" in message
+
+    def test_explicit_manual_duplex_does_not_warn(
+        self, tmp_config_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A profile already using duplex = "manual" and a real source is quiet."""
+        toml_content = """\
+[profiles.default]
+source = "ADF"
+duplex = "manual"
+"""
+        config_file = tmp_config_dir / "modern_duplex.toml"
+        config_file.write_text(toml_content)
+        with caplog.at_level(logging.WARNING, logger="saneless.config"):
+            settings = load_settings(config_path=str(config_file))
+
+        assert settings.profiles["default"].duplex == "manual"
+        assert self._warnings(caplog) == []
 
 
 class TestAutoSourceMode:
