@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import tempfile
 import threading
 from pathlib import Path
@@ -847,6 +848,56 @@ class TestCliFlags:
         result = runner.invoke(cli, ["--config", "/path/to/config.toml", "devices"])
         assert result.exit_code == 0
         assert captured["config_path"] == "/path/to/config.toml"
+
+
+class TestLegacyDuplexWarningReachesLogFile:
+    """The legacy manual-duplex warning lands in the configured log file (WR-05)."""
+
+    def test_warning_is_written_to_log_file(self, tmp_path: Path) -> None:
+        """
+        A real config load through ``cli()`` writes the warning to ``log_file``.
+
+        Deliberately not ``_patch_cli``: the subject is the order of loading
+        settings against configuring logging, so both run for real.  The
+        warning is only useful to an operator if it reaches the log file the
+        appliance keeps, and it can only reach it once that handler exists.
+        """
+        log_file = tmp_path / "logs" / "saneless.log"
+        doc = tomlkit.document()
+        output = tomlkit.table()
+        output.add("tmp_dir", str(tmp_path / "tmp"))
+        output.add("data_dir", str(tmp_path / "data"))
+        output.add("log_file", str(log_file))
+        doc.add("output", output)
+        profiles_table = tomlkit.table(is_super_table=True)
+        profiles_table.add("default", tomlkit.table())
+        legacy = tomlkit.table()
+        legacy.add("source", "Manual Duplex")
+        profiles_table.add("legacy", legacy)
+        doc.add("profiles", profiles_table)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(tomlkit.dumps(doc))
+
+        root_logger = logging.getLogger()
+        handlers_before = list(root_logger.handlers)
+        level_before = root_logger.level
+        try:
+            result = CliRunner().invoke(
+                cli, ["--config", str(config_file), "jobs", "--limit", "1"]
+            )
+        finally:
+            # configure_logging adds to the ROOT logger; remove what this
+            # invocation added so later tests do not write into tmp_path.
+            for handler in list(root_logger.handlers):
+                if handler not in handlers_before:
+                    root_logger.removeHandler(handler)
+                    handler.close()
+            root_logger.setLevel(level_before)
+
+        assert result.exit_code == 0, result.output
+        content = log_file.read_text()
+        assert "'legacy'" in content
+        assert 'duplex = "manual"' in content
 
 
 class TestJobsCommand:
