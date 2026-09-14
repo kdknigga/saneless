@@ -1,7 +1,7 @@
 """
 Per-state rendering contract for the web templates.
 
-Covers requirements: UI-03, UI-07, CTR-01, ROBU-04.
+Covers requirements: UI-03, UI-07, CTR-01, ROBU-04, ROBU-08.
 
 The templates are the one surface neither ``ty`` nor ``pyrefly`` can see. Once
 the hand-written state lists moved behind ``Job.is_active`` / ``Job.is_busy``
@@ -44,8 +44,11 @@ from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
     TERMINAL_STATES,
+    TITLE_MAX_LENGTH,
     JobState,
+    RequestRejection,
     progress_label,
+    rejection_message,
     state_label,
 )
 from saneless.web.app import create_app
@@ -405,6 +408,65 @@ def test_scan_error_response_carries_no_button(client: TestClient) -> None:
     )
     assert response.status_code == 422
     assert "scan-btn" not in response.text
+
+
+_SCAN_FORM = re.compile(r'<form hx-post="/api/scan"[^>]*>')
+_TITLE_INPUT = re.compile(r'<input[^>]*id="title-input"[^>]*>')
+
+
+def test_scan_form_disables_the_button_without_inheritance(
+    client: TestClient,
+) -> None:
+    """
+    The form disables the button for its own round-trip only (ROBU-04, S4).
+
+    ``hx-disabled-elt`` replaces the deleted app.js handler.  ``hx-disinherit``
+    is mandatory: on htmx 2.0.8 the selects and refresh buttons inside the form
+    would otherwise inherit it and strip ``disabled`` from a server-disabled
+    button when their own requests finish (C-10).
+    """
+    match = _SCAN_FORM.search(client.get("/").text)
+    assert match is not None, "scan form markup not found"
+    form = match.group(0)
+    assert 'hx-disabled-elt="#scan-btn"' in form
+    assert 'hx-disinherit="hx-disabled-elt"' in form
+
+
+def test_title_input_is_capped_at_the_server_limit(client: TestClient) -> None:
+    """``#title-input`` carries the server's title cap as maxlength (ROBU-08)."""
+    match = _TITLE_INPUT.search(client.get("/").text)
+    assert match is not None, "title input markup not found"
+    assert f'maxlength="{TITLE_MAX_LENGTH}"' in match.group(0)
+    assert 'maxlength="256"' in match.group(0)
+
+
+def test_title_input_cap_comes_from_the_route_context(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The maxlength number is the route's constant, not a template literal."""
+    monkeypatch.setattr("saneless.web.routes.TITLE_MAX_LENGTH", 99)
+    match = _TITLE_INPUT.search(client.get("/").text)
+    assert match is not None, "title input markup not found"
+    assert 'maxlength="99"' in match.group(0)
+
+
+def test_page_loads_no_app_script_and_no_remote_url(client: TestClient) -> None:
+    """No application JavaScript and no off-box URL remain on the page (S4)."""
+    text = client.get("/").text
+    assert "app.js" not in text
+    assert "http://" not in text
+    assert "https://" not in text
+    assert "hx-on" not in text
+
+
+def test_app_script_is_gone(client: TestClient) -> None:
+    """``/static/app.js`` no longer exists; its 404 uses the one renderer."""
+    response = client.get("/static/app.js")
+    assert response.status_code == 404
+    assert response.json() == {
+        "status": "error",
+        "detail": rejection_message(RequestRejection.NOT_FOUND),
+    }
 
 
 def test_idle_page_button_and_status(client: TestClient) -> None:
