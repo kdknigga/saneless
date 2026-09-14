@@ -1160,6 +1160,158 @@ class TestAutoSourceRecognition:
         assert mock_dev.calls.count("snap") == 1
 
 
+def _options_reporting(sources: list[str]) -> list[tuple]:
+    """Return the shared fake's option table with the given source list."""
+    device = FakeSaneDev()
+    device.report_sources(sources)
+    return device.get_options()
+
+
+class TestResolveSourceForManualDuplex:
+    """
+    Manual duplex resolves a real feeder from the device's own list (D-02, C-01).
+
+    ``"Manual Duplex"`` used to reach ``_resolve_source`` verbatim, where it
+    either raised or -- on a device offering ``Auto`` -- was silently swapped for
+    ``Auto``.  With ``auto_source_mode`` defaulting to ``"flatbed"``, that swap
+    took one platen snapshot per pass and reported a green Complete.  These
+    tests pin the feeder branch, and above all that the ``Auto`` substitution is
+    unreachable from it.
+
+    No expected feeder name here is a plain ``"ADF"``: real consumer feeders
+    report ``"Automatic Document Feeder"``, and a hardcoded ``"ADF"`` (the code
+    review's suggestion, declined by D-02) would fail on exactly that hardware.
+    """
+
+    def test_selects_the_first_source_that_feeds(self) -> None:
+        """The device's own first feeder is chosen, not a guessed name."""
+        raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
+
+        effective, has_source_option = sane_backend_mod._resolve_source(
+            raw, "Flatbed", resolve_feeder=True
+        )
+
+        assert effective == "Automatic Document Feeder"
+        assert has_source_option is True
+
+    def test_a_reported_feeder_the_operator_named_is_honoured(self) -> None:
+        """An operator who picked one of two feeders gets that one (T-25-28)."""
+        raw = _options_reporting(["Flatbed", "Automatic Document Feeder", "ADF Duplex"])
+
+        effective, _ = sane_backend_mod._resolve_source(
+            raw, "ADF Duplex", resolve_feeder=True
+        )
+
+        assert effective == "ADF Duplex"
+
+    def test_an_unreported_source_falls_back_to_a_reported_feeder(self) -> None:
+        """``source = "ADF"`` on a device that says "Automatic Document Feeder"."""
+        raw = _options_reporting(["Flatbed", "Automatic Document Feeder"])
+
+        effective, _ = sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+
+        assert effective == "Automatic Document Feeder"
+
+    def test_a_flatbed_only_device_is_refused_naming_its_sources(self) -> None:
+        """No feeder means no manual duplex, said loudly and before any scan."""
+        raw = _options_reporting(["Flatbed"])
+
+        with pytest.raises(ScanError, match="feeder") as excinfo:
+            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+
+        assert "['Flatbed']" in str(excinfo.value)
+
+    def test_auto_is_never_substituted_for_manual_duplex(self) -> None:
+        """
+        C-01's mechanism, closed: ``Auto`` on offer still ends in a refusal.
+
+        Substituting ``Auto`` here is how a flatbed-only device used to take two
+        platen snapshots and report success.
+        """
+        raw = _options_reporting(["Flatbed", "Auto"])
+
+        with pytest.raises(ScanError, match="feeder") as excinfo:
+            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+
+        assert "['Flatbed', 'Auto']" in str(excinfo.value)
+
+    def test_a_device_with_no_source_option_is_refused(self) -> None:
+        """A device exposing no ``source`` option at all cannot be told to feed."""
+        raw = build_option_table(omit=("source",))
+
+        with pytest.raises(ScanError, match="feeder"):
+            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=True)
+
+    def test_without_the_flag_auto_is_still_substituted(self) -> None:
+        """The simplex path's validate-or-substitute behaviour is unchanged."""
+        raw = _options_reporting(["Flatbed", "Auto"])
+
+        assert sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=False) == (
+            "Auto",
+            True,
+        )
+
+    def test_without_the_flag_an_unsupported_source_still_raises(self) -> None:
+        """The simplex path's refusal message keeps its existing shape."""
+        raw = _options_reporting(["Flatbed"])
+
+        with pytest.raises(ScanError, match="Device does not support source 'ADF'"):
+            sane_backend_mod._resolve_source(raw, "ADF", resolve_feeder=False)
+
+    def test_without_the_flag_a_reported_flatbed_is_kept(self) -> None:
+        """Only manual duplex looks for a feeder; a simplex flatbed stays put."""
+        raw = _options_reporting(["Flatbed", "Automatic Document Feeder"])
+
+        assert sane_backend_mod._resolve_source(
+            raw, "Flatbed", resolve_feeder=False
+        ) == ("Flatbed", True)
+
+    def test_scan_settings_does_not_resolve_a_feeder_by_default(self) -> None:
+        """Every existing simplex construction keeps today's behaviour."""
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        assert settings.resolve_feeder_source is False
+
+    def test_scan_pages_feeds_through_the_resolved_feeder(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """The flag reaches the backend, which assigns and drives the real feeder."""
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "Automatic Document Feeder"])
+        settings = ScanSettings(
+            source="ADF",
+            resolution=300,
+            mode="Color",
+            resolve_feeder_source=True,
+        )
+
+        pages = SaneBackend().scan_pages(_TEST_DEVICE, settings).pages
+
+        assert mock_dev.source == "Automatic Document Feeder"
+        assert len(pages) == 3
+        assert mock_dev.calls == _THREE_SHEET_FEEDER_CALLS
+
+    def test_scan_pages_refuses_before_touching_the_platen(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """A flatbed-plus-Auto device takes no snapshot at all for manual duplex."""
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.report_sources(["Flatbed", "Auto"])
+        settings = ScanSettings(
+            source="ADF",
+            resolution=300,
+            mode="Color",
+            auto_source_mode="flatbed",
+            resolve_feeder_source=True,
+        )
+
+        with pytest.raises(ScanError, match="feeder"):
+            SaneBackend().scan_pages(_TEST_DEVICE, settings)
+
+        assert mock_dev.calls == []
+        assert "source" not in mock_dev.assignments
+
+
 class TestSaneBackendPerPageTimeout:
     """Per-page timeout tests."""
 
