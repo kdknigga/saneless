@@ -23,10 +23,12 @@ from saneless.exceptions import StorageError
 from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
 from saneless.vocabulary import (
     ACTIVE_STATES,
+    QUEUE_FULL_JOB_ERROR,
     TERMINAL_STATES,
     ScanOutcome,
     job_state_for,
 )
+from saneless.vocabulary import RESTART_REASON as SERVER_RESTART_REASON
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -474,6 +476,52 @@ def _seed_queue(store: JobStore) -> list[str]:
         )
     store._conn.commit()
     return ids
+
+
+def _create_in_order(store: JobStore, count: int) -> list[str]:
+    """
+    Create count jobs whose created_at order matches their insertion order.
+
+    Stamped by raw SQL a minute apart, as ``_seed_queue`` does, so the ordering
+    ``latest_run_job`` depends on is deterministic without sleeping.
+
+    Args:
+        store: The store to write to.
+        count: How many jobs to create.
+
+    Returns:
+        The job ids oldest-first -- index 0 is the OLDEST by created_at.
+
+    """
+    base = datetime.now(tz=UTC) - timedelta(hours=QUEUE_BASE_HOURS)
+    ids: list[str] = []
+    for index in range(count):
+        job = store.create_job(profile="default", title=f"Ordered {index:02d}")
+        ids.append(job.id)
+        stamp = base + timedelta(minutes=index)
+        store._conn.execute(
+            "UPDATE jobs SET created_at = ? WHERE id = ?",
+            (stamp.isoformat(), job.id),
+        )
+    store._conn.commit()
+    return ids
+
+
+def _reject(store: JobStore, job_id: str) -> None:
+    """
+    Finish a job the way a refused submit records it (D-05, D-06).
+
+    Args:
+        store: The store to write to.
+        job_id: The job to mark rejected.
+
+    """
+    store.finish_job(
+        job_id,
+        JobState.ERROR,
+        error=QUEUE_FULL_JOB_ERROR,
+        error_category=ErrorCategory.REJECTED,
+    )
 
 
 def test_list_recent() -> None:
@@ -1452,3 +1500,132 @@ class TestQueryMethods:
                 assert isinstance(job.tags, list)
         finally:
             store.close()
+
+    def test_latest_run_job_on_an_empty_store_is_none(self) -> None:
+        """latest_run_job on a store with no jobs returns None (D-06)."""
+        store = JobStore()
+        try:
+            assert store.latest_run_job() is None
+        finally:
+            store.close()
+
+    def test_latest_run_job_skips_a_newer_rejection(self) -> None:
+        """A rejection newer than a finished job does not replace it (D-06)."""
+        store = JobStore()
+        try:
+            done_id, rejected_id = _create_in_order(store, 2)
+            store.finish_job(done_id, JobState.DONE)
+            _reject(store, rejected_id)
+
+            latest = store.latest_run_job()
+
+            assert latest is not None
+            assert latest.id == done_id
+            # History still shows the rejection first: only the status area's
+            # "job that just ended" skips it.
+            assert store.list_recent(1)[0].id == rejected_id
+        finally:
+            store.close()
+
+    def test_latest_run_job_returns_a_real_failure(self) -> None:
+        """A newer non-rejected failure is a run job and is returned (D-06)."""
+        store = JobStore()
+        try:
+            scanning_id, rejected_id, failed_id = _create_in_order(store, 3)
+            store.update_state(scanning_id, JobState.SCANNING)
+            _reject(store, rejected_id)
+            store.finish_job(
+                failed_id,
+                JobState.ERROR,
+                error="boom",
+                error_category=ErrorCategory.UNKNOWN,
+            )
+
+            latest = store.latest_run_job()
+
+            assert latest is not None
+            assert latest.id == failed_id
+        finally:
+            store.close()
+
+    def test_latest_run_job_returns_a_restart_failed_job(self) -> None:
+        """A job failed by restart recovery has no category and is returned (D-06)."""
+        store = JobStore()
+        try:
+            interrupted_id, rejected_id = _create_in_order(store, 2)
+            _reject(store, rejected_id)
+            # Make the interrupted job the newest, so a NULL-unsafe predicate
+            # (`error_category != ?`) would skip it and fail this test.
+            store._conn.execute(
+                "UPDATE jobs SET created_at = ? WHERE id = ?",
+                (datetime.now(tz=UTC).isoformat(), interrupted_id),
+            )
+            store._conn.commit()
+            store.update_state(interrupted_id, JobState.SCANNING)
+            store.fail_active_jobs(SERVER_RESTART_REASON)
+
+            latest = store.latest_run_job()
+
+            assert latest is not None
+            assert latest.id == interrupted_id
+            assert latest.error == SERVER_RESTART_REASON
+            assert latest.error_category is None
+        finally:
+            store.close()
+
+    def test_latest_run_job_with_only_rejections_is_none(self) -> None:
+        """A store holding only rejected rows has no run job (D-06)."""
+        store = JobStore()
+        try:
+            for job_id in _create_in_order(store, 2):
+                _reject(store, job_id)
+
+            assert store.latest_run_job() is None
+        finally:
+            store.close()
+
+    def test_latest_run_job_survives_a_reopen(self, tmp_path: Path) -> None:
+        """The REJECTED marker is durable across a close and reopen (D-06)."""
+        db_path = str(tmp_path / "jobs.db")
+        store = JobStore(db_path=db_path)
+        try:
+            done_id, rejected_id = _create_in_order(store, 2)
+            store.finish_job(done_id, JobState.DONE)
+            _reject(store, rejected_id)
+        finally:
+            store.close()
+
+        reopened = JobStore(db_path=db_path)
+        try:
+            latest = reopened.latest_run_job()
+
+            assert latest is not None
+            assert latest.id == done_id
+        finally:
+            reopened.close()
+
+    def test_probe_on_a_healthy_store_changes_nothing(self) -> None:
+        """A probe returns None and leaves rows and user_version untouched (D-12)."""
+        store = JobStore()
+        try:
+            first_id, second_id = _create_in_order(store, 2)
+            store.finish_job(first_id, JobState.DONE)
+            _reject(store, second_id)
+            rows_before = store.list_recent()
+            version_before = store._conn.execute("PRAGMA user_version").fetchone()[0]
+
+            store.probe()
+
+            assert store.list_recent() == rows_before
+            version_after = store._conn.execute("PRAGMA user_version").fetchone()[0]
+            assert version_after == version_before == HEAD_VERSION
+        finally:
+            store.close()
+
+    def test_probe_after_close_raises(self) -> None:
+        """A probe touches the connection, so a closed store raises (D-12)."""
+        store = JobStore()
+        store.close()
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            store.probe()
