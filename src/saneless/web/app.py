@@ -21,7 +21,7 @@ from saneless.vocabulary import (
     progress_label,
     state_label,
 )
-from saneless.worker import ScanWorker
+from saneless.worker import STOP_JOIN_SECONDS, ScanWorker
 
 from .cache import MetadataCache
 from .cross_origin import CrossOriginGuard
@@ -88,6 +88,9 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         runs the recovery.  A prune failure is only logged: history that
         outlives its retention is harmless, and a service that will not come
         up over it is not.
+
+        Shutdown stops the worker first and closes the Paperless client and
+        the job store only when the worker confirms it stopped (D-09).
         """
         validate_settings_dirs(settings)
         try:
@@ -114,7 +117,20 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         worker.start()
         logger.info("App started")
         yield
-        worker.stop()
+        # worker.stop() blocks the event loop for at most STOP_JOIN_SECONDS,
+        # during lifespan shutdown, after uvicorn has stopped serving (D-08).
+        if not worker.stop():
+            # D-09: the store closes only after a confirmed stop, so a stuck
+            # thread never hits "Cannot operate on a closed database".  D-07:
+            # the abandoned job is not written here -- that would race its own
+            # final write; the next startup's recovery records it.
+            logger.warning(
+                "Scan worker did not stop within %s s (job %s still running); "
+                "leaving the job store and Paperless client open for process exit",
+                STOP_JOIN_SECONDS,
+                worker.current_job_id,
+            )
+            return
         paperless.close()
         job_store.close()
         logger.info("App shutdown complete")
