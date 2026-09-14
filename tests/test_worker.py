@@ -285,6 +285,52 @@ def _mock_manual_duplex_pipeline(
     return _success_result()
 
 
+def _captured_flip_coordinator(
+    scanner: MagicMock,
+    paperless: MagicMock,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    profile_name: str,
+) -> object:
+    """
+    Run one job on ``profile_name`` and return the coordinator its request carried.
+
+    The pipeline is replaced by a stub that records the request's
+    ``flip_coordinator`` and returns at once, so only the worker's own decision
+    about building flip machinery is observed.
+    """
+    captured: list[object] = []
+
+    def capturing_pipeline(
+        _scanner: object,
+        _paperless: object,
+        _settings: object,
+        request: PipelineRequest,
+    ) -> ScanResult:
+        """Record the request's flip coordinator."""
+        captured.append(request.flip_coordinator)
+        return _success_result()
+
+    monkeypatch.setattr("saneless.worker.run_pipeline", capturing_pipeline)
+
+    store = JobStore()
+    try:
+        worker = ScanWorker(scanner, paperless, settings, store)
+        worker.start()
+        job = store.create_job(profile_name, "Coordinator Capture")
+        worker.submit(job)
+        for _ in range(100):
+            if captured and _get(store, job.id).state in TERMINAL_STATES:
+                break
+            time.sleep(0.02)
+        worker.stop()
+    finally:
+        store.close()
+
+    assert len(captured) == 1
+    return captured[0]
+
+
 class TestScanWorkerManualDuplex:
     """Worker manual duplex coordination tests."""
 
@@ -452,6 +498,42 @@ class TestScanWorkerManualDuplex:
             assert captured_request["flip_coordinator"] is None
         finally:
             store.close()
+
+    def test_flip_coordinator_follows_profile_duplex_on_a_plain_source(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A ``duplex = "manual"`` profile gets a coordinator whatever its source."""
+        default_settings.profiles["duplex"] = ProfileConfig(
+            source="ADF Front", duplex="manual"
+        )
+
+        coordinator = _captured_flip_coordinator(
+            mock_scanner, mock_paperless, default_settings, monkeypatch, "duplex"
+        )
+
+        assert isinstance(coordinator, WorkerFlipCoordinator)
+
+    def test_a_manual_duplex_looking_source_alone_gets_no_coordinator(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An explicit ``duplex = "none"`` is not overruled by the source name."""
+        default_settings.profiles["looks"] = ProfileConfig(
+            source="ADF Manual Duplex", duplex="none"
+        )
+
+        coordinator = _captured_flip_coordinator(
+            mock_scanner, mock_paperless, default_settings, monkeypatch, "looks"
+        )
+
+        assert coordinator is None
 
     def test_current_job_id_tracked(
         self,

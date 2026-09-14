@@ -12,7 +12,9 @@ import pytest
 from PIL import Image, ImageDraw
 
 import saneless.scanner.sane_backend as sane_backend_mod
+from saneless.config import ProfileConfig
 from saneless.exceptions import (
+    ConfigError,
     PaperlessError,
     PaperlessTimeoutError,
     ScanError,
@@ -29,7 +31,7 @@ from saneless.pipeline import (
     _preserving,
     run_pipeline,
 )
-from saneless.scanner.base import ScannerBackend
+from saneless.scanner.base import DeviceInfo, ScannerBackend
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     ErrorCategory,
@@ -476,6 +478,7 @@ class TestManualDuplex:
         """Manual duplex: 3 fronts + 3 backs -> 6 interleaved pages."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         fronts = [_make_content_image(c) for c in ["red", "green", "blue"]]
         backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
@@ -512,6 +515,7 @@ class TestManualDuplex:
         """Pass A yields 3 pages, pass B yields 2 -> saves both as separate PDFs."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         fronts = [_make_content_image() for _ in range(3)]
         backs = [_make_content_image() for _ in range(2)]
@@ -563,6 +567,7 @@ class TestManualDuplex:
         """
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         mock_paperless.upload_document.return_value = UploadResult(
             delivered_to_api=False,
             consume_dir_path=tmp_path / "consume" / "doc.pdf",
@@ -599,6 +604,7 @@ class TestManualDuplex:
         """A partially-delivered mismatch is still FALLBACK, not SUCCESS (CTR-02)."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         mock_paperless.upload_document.side_effect = [
             UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
             UploadResult(
@@ -635,6 +641,7 @@ class TestManualDuplex:
         """Matching front/back counts still interleave and upload single PDF."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         fronts = [_make_content_image("red"), _make_content_image("blue")]
         backs = [_make_content_image("green"), _make_content_image("yellow")]
@@ -672,6 +679,7 @@ class TestManualDuplex:
         """Empty page detection runs on interleaved result, not individual passes."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         # 2 fronts: 1 content + 1 content, 2 backs: 1 empty + 1 content
         fronts = [_make_content_image("red"), _make_content_image("blue")]
@@ -710,6 +718,7 @@ class TestManualDuplex:
         """Thumbnail generated from first front page in manual duplex."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         fronts = [_make_content_image()]
         backs = [_make_content_image()]
@@ -750,6 +759,7 @@ class TestManualDuplex:
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.output.flip_timeout_seconds = 42
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = [
@@ -787,6 +797,7 @@ class TestManualDuplex:
         """ABORTED fails the run naming the flip prompt, before pass B (D-15)."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.return_value = scan_batch([_make_content_image()])
@@ -818,6 +829,7 @@ class TestManualDuplex:
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.output.flip_timeout_seconds = 17
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.return_value = scan_batch([_make_content_image()])
@@ -839,6 +851,120 @@ class TestManualDuplex:
         assert "17" in str(excinfo.value)
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
+
+
+def _two_pass_scanner() -> MagicMock:
+    """
+    Build a scanner mock whose ``scan_pages`` calls can be counted.
+
+    It has two batches queued, so a simplex run makes one call and a manual
+    duplex run makes two. ``get_devices`` reports one device, so an
+    auto-detecting run can proceed if nothing stops it first.
+    """
+    scanner = MagicMock(spec=ScannerBackend)
+    scanner.get_devices.return_value = [
+        DeviceInfo(name="test:auto:001", vendor="V", model="M", device_type="t"),
+    ]
+    scanner.scan_pages.side_effect = [
+        scan_batch([_make_content_image("red")]),
+        scan_batch([_make_content_image("blue")]),
+    ]
+    return scanner
+
+
+class TestDuplexStrategy:
+    """
+    ``profile.duplex`` alone chooses the scanning strategy (DPLX-01, DPLX-03).
+
+    ``source`` is a pure SANE value: a source that merely reads like manual
+    duplex must not start the two-pass flow, and a manual-duplex profile must
+    not need a special source name.
+    """
+
+    def test_manual_duplex_without_a_coordinator_is_refused_before_the_scanner(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        No coordinator means no run, and the device is never contacted.
+
+        The device is left empty so that ``_resolve_device`` would call
+        ``get_devices``. The refusal has to come before that call, and so before
+        the first ``scan_pages`` call too.
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.scanner.device = ""
+        default_settings.profiles["default"] = ProfileConfig(
+            source="ADF Front", duplex="manual"
+        )
+        scanner = _two_pass_scanner()
+
+        with pytest.raises(ConfigError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="No Coordinator"),
+            )
+
+        message = str(excinfo.value)
+        assert "'default'" in message
+        assert "flip coordinator" in message
+        scanner.get_devices.assert_not_called()
+        scanner.scan_pages.assert_not_called()
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_a_manual_duplex_looking_source_on_a_simplex_profile_runs_simplex(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """An explicit ``duplex = "none"`` wins over a legacy-looking source."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"] = ProfileConfig(
+            source="ADF Manual Duplex", duplex="none"
+        )
+        scanner = _two_pass_scanner()
+
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=PipelineRequest(profile_name="default", title="Looks Duplex"),
+        )
+
+        assert scanner.scan_pages.call_count == 1
+        assert result.pages_scanned == 1
+
+    def test_manual_duplex_needs_no_special_source_name(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A ``duplex = "manual"`` profile on a plain feeder source scans twice."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"] = ProfileConfig(
+            source="ADF Front", duplex="manual"
+        )
+        scanner = _two_pass_scanner()
+
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=PipelineRequest(
+                profile_name="default",
+                title="Plain Feeder Duplex",
+                flip_coordinator=AlwaysContinueFlipCoordinator(),
+            ),
+        )
+
+        assert scanner.scan_pages.call_count == 2
+        assert result.pages_scanned == 2
 
 
 class TestManualDuplexOverTheSharedFake:
@@ -873,6 +999,7 @@ class TestManualDuplexOverTheSharedFake:
         default_settings.output.tmp_dir = str(tmp_path)
         profile = default_settings.profiles["default"]
         profile.source = "ADF Manual Duplex"
+        profile.duplex = "manual"
         # The fake carries the real device's list constraints, which reject an
         # unlisted value -- so the mode is the device's own spelling.
         profile.mode = "Color"
@@ -1862,6 +1989,7 @@ class TestDuplexMismatchDelivery:
         """Leaving either task unpolled is C-03 surviving in a corner."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         paperless = _both_halves_delivered()
 
         result = run_pipeline(
@@ -1888,6 +2016,7 @@ class TestDuplexMismatchDelivery:
         """Both halves honour output.paperless_task_timeout."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         default_settings.output.paperless_task_timeout = 17
         paperless = _both_halves_delivered()
 
@@ -1921,6 +2050,7 @@ class TestDuplexMismatchDelivery:
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         paperless = _both_halves_delivered()
         paperless.poll_task.side_effect = PaperlessError("Paperless reported FAILURE")
 
@@ -1947,6 +2077,7 @@ class TestDuplexMismatchDelivery:
         """A clean fronts poll followed by a failing backs poll still raises."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         paperless = _both_halves_delivered()
         paperless.poll_task.side_effect = [
             None,
@@ -1977,6 +2108,7 @@ class TestDuplexMismatchDelivery:
         """Two same-named halves would destroy the one this path exists to save."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         paperless = _both_halves_delivered()
         paperless.poll_task.side_effect = PaperlessError("Paperless reported FAILURE")
 
@@ -2008,6 +2140,7 @@ class TestDuplexMismatchDelivery:
         failed_dir.parent.mkdir(parents=True, exist_ok=True)
         failed_dir.write_text("a regular file where the directory should be")
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         paperless = _both_halves_delivered()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
 
@@ -2036,6 +2169,7 @@ class TestDuplexMismatchDelivery:
         """OUTC-03: the worker needs an outcome, a warning and three counts."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         result = run_pipeline(
             scanner=_mismatched_duplex_scanner(fronts=4, backs=3),
@@ -2064,6 +2198,7 @@ class TestDuplexMismatchDelivery:
         """A consume-dir half is not a success, and carries no task to poll."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         paperless = MagicMock()
         paperless.upload_document.side_effect = [
             UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
@@ -2137,6 +2272,7 @@ class TestTheDpiTheDeviceActuallyChose:
         """The recovery path builds its two partial PDFs at the device's dpi."""
         _isolate_dirs(default_settings, tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
         default_settings.profiles["default"].resolution = 600
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -2184,6 +2320,7 @@ class TestTheDpiTheDeviceActuallyChose:
         """
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
+        default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = [
