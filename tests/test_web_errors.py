@@ -650,16 +650,22 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A rejection the store cannot record still renders, without a loader (D-05)."""
+    """
+    A rejection the store cannot record still renders, without a loader (D-05).
+
+    The refused-before-row path records the rejection in one statement, so when
+    that statement fails no row exists at all -- never a PENDING row (WR-01).
+    """
     offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
     _force_health(monkeypatch, WorkerHealth.DEGRADED)
     store = _job_store(client)
+    before = store.list_recent(limit=50)
 
-    def failing_create_job(*_args: object, **_kwargs: object) -> Job:
+    def failing_create_rejected_job(*_args: object, **_kwargs: object) -> Job:
         msg = "disk I/O error"
         raise sqlite3.OperationalError(msg)
 
-    monkeypatch.setattr(store, "create_job", failing_create_job)
+    monkeypatch.setattr(store, "create_rejected_job", failing_create_rejected_job)
     with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
         response = client.post(
             "/api/scan",
@@ -669,6 +675,7 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
     _assert_htmx_error(response, RequestRejection.WORKER_DEGRADED, 503)
     assert "/api/jobs/history" not in response.text
     assert offered == []
+    assert store.list_recent(limit=50) == before
     warnings = [
         r
         for r in caplog.records
