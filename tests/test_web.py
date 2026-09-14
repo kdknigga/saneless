@@ -8,8 +8,11 @@ HLTH-01, HLTH-02, LOG-03.
 from __future__ import annotations
 
 import html
+import inspect
 import json
 import re
+import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -19,6 +22,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -151,6 +155,64 @@ def test_health_endpoint_no_auth(client: TestClient) -> None:
     """GET /health requires no authentication (HLTH-02)."""
     response = client.get("/health")
     assert response.status_code == 200
+
+
+def test_no_route_handler_is_a_coroutine(app: FastAPI) -> None:
+    """
+    Every route handler is a plain ``def`` (ROBU-05, M-01).
+
+    Each handler calls blocking code, and FastAPI only moves ``def`` handlers
+    onto its threadpool; an ``async def`` one would block the event loop.
+    """
+    routes = [route for route in app.routes if isinstance(route, APIRoute)]
+    assert routes
+    for route in routes:
+        assert not inspect.iscoroutinefunction(route.endpoint), route.path
+
+
+def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
+    """/health answers promptly while another request is blocked in I/O (ROBU-05)."""
+    gate = threading.Event()
+    app = _app(client)
+
+    def blocking_get_tags() -> list[dict[str, object]]:
+        gate.wait(5)
+        return []
+
+    app.state.paperless.get_tags = blocking_get_tags
+    app.state.cache.invalidate("tags")
+    slow = threading.Thread(target=lambda: client.get("/api/tags"))
+    slow.start()
+    try:
+        time.sleep(0.2)
+        started = time.monotonic()
+        response = client.get("/health")
+        elapsed = time.monotonic() - started
+        assert response.status_code == 200
+        assert elapsed < 1.0
+    finally:
+        gate.set()
+        slow.join(5)
+
+
+def test_health_reports_degraded_worker(client: TestClient) -> None:
+    """A degraded worker makes /health a 503 naming the store (ROBU-05, D-10)."""
+    worker = _app(client).state.worker
+    worker._degraded.set()
+    try:
+        response = client.get("/health")
+    finally:
+        worker._degraded.clear()
+    assert response.status_code == 503
+    assert response.json() == {"status": "error", "detail": "job store failing"}
+
+
+def test_health_reports_down_worker(client: TestClient) -> None:
+    """A stopped worker makes /health a 503 naming the thread (ROBU-05, D-10)."""
+    assert _app(client).state.worker.stop()
+    response = client.get("/health")
+    assert response.status_code == 503
+    assert response.json() == {"status": "error", "detail": "worker thread is down"}
 
 
 def test_profile_dropdown(client: TestClient, test_settings: Settings) -> None:
