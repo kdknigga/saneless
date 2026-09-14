@@ -383,8 +383,8 @@ Plans:
 
 **Gap Wave 1**
 
-- [ ] 26-15-PLAN.md — CR-01: owed job-store writes retried on every idle tick, corrected locked-in test, Scan button re-enables (gap wave 1)
-- [ ] 26-16-PLAN.md — WR-01: JobStore.create_rejected_job single statement for refused-before-row submits (gap wave 1)
+- [x] 26-15-PLAN.md — CR-01: owed job-store writes retried on every idle tick, corrected locked-in test, Scan button re-enables (gap wave 1)
+- [x] 26-16-PLAN.md — WR-01: JobStore.create_rejected_job single statement for refused-before-row submits (gap wave 1)
 
 **Gap Wave 2** *(blocked on Gap Wave 1 completion)*
 
@@ -499,7 +499,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
-| 26. Worker and Web Robustness | 14/14 | Complete   | 2026-09-14 |
+| 26. Worker and Web Robustness | 16/17 | In Progress|  |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
