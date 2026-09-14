@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import threading
 import time
+import tomllib
 from typing import TYPE_CHECKING
 
 import pytest
 from PIL import Image, ImageDraw
 
 from saneless import worker as worker_module
-from saneless.config import ProfileConfig, Settings
+from saneless.auto_profiles import generate_profiles
+from saneless.config import ProfileConfig, Settings, config_search_paths
 from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
@@ -2696,12 +2699,27 @@ class TestScanWorkerQueuing:
             store.close()
 
 
-class TestLazyAutoGenerate:
-    """Worker lazy auto-profile generation tests."""
+class TestStartupProfileGeneration:
+    """
+    Auto-profile generation is the worker thread's first act (D-14, M-04).
+
+    It used to run inside the first job, write to a path re-derived from the
+    working directory rather than the file ``--config`` loaded, and mutate the
+    profiles from the worker thread with no lock.  Now it runs once per start
+    (D-15), persists only to ``settings.config_path`` (D-16), keeps the profiles
+    in memory when there is no loaded file (D-17) or it cannot be written
+    (D-18), and swaps them in under the profile lock (D-19).
+    """
 
     @staticmethod
-    def _mock_caps_scanner(mock_scanner: MagicMock) -> None:
-        """Configure mock scanner with devices and capabilities."""
+    def _mock_caps_scanner(mock_scanner: MagicMock) -> DeviceCapabilities:
+        """
+        Configure mock scanner with devices and capabilities.
+
+        Returns:
+            The capabilities the mock scanner reports.
+
+        """
         mock_scanner.get_devices.return_value = [
             DeviceInfo(
                 name="test:device:001",
@@ -2710,140 +2728,238 @@ class TestLazyAutoGenerate:
                 device_type="scanner",
             ),
         ]
-        mock_scanner.get_capabilities.return_value = DeviceCapabilities(
+        caps = DeviceCapabilities(
             sources=["Flatbed", "ADF"],
             resolutions=[150, 300, 600],
             modes=["Color", "Gray"],
         )
+        mock_scanner.get_capabilities.return_value = caps
+        return caps
 
-    def test_lazy_auto_generate_on_bare_default(
+    def test_startup_generation_writes_the_loaded_config_file(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """Worker auto-generates profiles when only bare default exists."""
-        self._mock_caps_scanner(mock_scanner)
-        # Ensure settings have only bare default
-        assert len(default_settings.profiles) == 1
-        assert "default" in default_settings.profiles
-
-        # Patch resolve_config_path to use tmp dir
+        """D-14 / D-16: generated profiles land in memory and in the loaded file."""
+        caps = self._mock_caps_scanner(mock_scanner)
+        expected = generate_profiles(caps)
         config_file = tmp_path / "saneless.toml"
-        monkeypatch.setattr(
-            "saneless.worker.resolve_config_path",
-            lambda *_a, **_k: config_file,
-        )
-        monkeypatch.setattr(
-            "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: _success_result(),
-        )
+        config_file.write_text("# loaded by --config\n")
+        default_settings._config_path = config_file
 
         store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
             worker.start()
-
-            job = store.create_job("default", "Auto Gen Test")
-            worker.submit(job)
-
-            time.sleep(0.5)
-            worker.stop()
-
-            # Profiles should now include generated ones
-            assert len(default_settings.profiles) > 1
-            assert "flatbed" in default_settings.profiles
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
         finally:
+            worker.stop()
             store.close()
 
-    def test_lazy_auto_generate_skips_customized(
+        assert generated
+        assert set(worker.profile_names()) == set(expected)
+        assert "default" in worker.profile_names()
+        on_disk = tomllib.loads(config_file.read_text())
+        assert set(on_disk["profiles"]) == set(expected)
+
+    def test_startup_generation_without_a_loaded_file_writes_nothing(
         self,
         mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """Worker does not auto-generate when profiles are already customized."""
-        # Add a custom profile so it's no longer bare default
-        default_settings.profiles["photo"] = ProfileConfig(
-            source="Flatbed", resolution=600, mode="Color"
-        )
-
-        monkeypatch.setattr(
-            "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: _success_result(),
-        )
-
-        store = JobStore()
-        try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
-            worker.start()
-
-            job = store.create_job("default", "Custom Test")
-            worker.submit(job)
-
-            time.sleep(0.5)
-            worker.stop()
-
-            # get_capabilities should not have been called
-            mock_scanner.get_capabilities.assert_not_called()
-        finally:
-            store.close()
-
-    def test_lazy_auto_generate_scanner_unreachable(
-        self,
-        mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
+        worker_for: Callable[[JobStore], ScanWorker],
+        tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """Worker falls back to bare default if scanner is unreachable."""
-        mock_scanner.get_devices.side_effect = RuntimeError("Connection refused")
+        """
+        D-17 / T-26-32: no loaded file means memory only, and no file anywhere.
 
-        monkeypatch.setattr(
-            "saneless.worker.run_pipeline",
-            lambda *_args, **_kwargs: _success_result(),
-        )
+        The working directory and HOME both point into ``tmp_path``, so a write
+        to any re-derived location -- ``./saneless.toml`` or the XDG path --
+        would show up as a new file there.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        self._mock_caps_scanner(mock_scanner)
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(home))
+        before = sorted(tmp_path.rglob("*"))
 
         store = JobStore()
+        worker = worker_for(store)
+        assert worker._settings.config_path is None
         try:
-            with caplog.at_level(logging.WARNING):
-                worker = ScanWorker(
-                    mock_scanner, mock_paperless, default_settings, store
-                )
-                worker.start()
-
-                job = store.create_job("default", "Unreachable Test")
-                worker.submit(job)
-
-                time.sleep(0.5)
-                worker.stop()
-
-            # Job should still complete (fallback to bare default)
-            fetched = _get(store, job.id)
-            assert fetched.state == JobState.DONE
-            assert "scanner unreachable" in caplog.text
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
         finally:
+            worker.stop()
             store.close()
 
-    def test_lazy_auto_generate_only_once(
+        assert generated
+        assert sorted(tmp_path.rglob("*")) == before
+        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert "--config" in message
+        for path in config_search_paths():
+            assert str(path) in message
+
+    def test_startup_generation_keeps_profiles_when_the_file_is_unwritable(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-18: an OSError writing the loaded file keeps the profiles in memory."""
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses file permissions")
+        self._mock_caps_scanner(mock_scanner)
+        locked = tmp_path / "locked"
+        locked.mkdir()
+        config_file = locked / "saneless.toml"
+        config_file.write_text("# read-only\n")
+        config_file.chmod(0o400)
+        locked.chmod(0o500)
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+        finally:
+            worker.stop()
+            store.close()
+            locked.chmod(0o700)
+            config_file.chmod(0o600)
+
+        assert generated
+        assert config_file.read_text() == "# read-only\n"
+        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert str(config_file) in message
+        assert "PermissionError" in message
+
+    def test_startup_generation_keeps_profiles_when_profiles_is_not_a_table(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-18: a ConfigError from the write is handled like an OSError."""
+        self._mock_caps_scanner(mock_scanner)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("profiles = 1\n")
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert config_file.read_text() == "profiles = 1\n"
+        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert str(config_file) in message
+        assert "ConfigError" in message
+
+    def test_startup_generation_scanner_failure_keeps_the_bare_default(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        D-15 / T-26-34: the WARNING names the real exception, not a guessed cause.
+
+        The old message called every failure "scanner unreachable", which sent
+        operators hunting network faults for what was often a parsing error.
+        """
+        mock_scanner.get_devices.side_effect = ScanError("boom")
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            warned = _wait_until(
+                lambda: bool(_worker_records(caplog, logging.WARNING, "ScanError")),
+                _STATE_BUDGET,
+            )
+            names = worker.profile_names()
+            alive = worker.is_alive
+        finally:
+            worker.stop()
+            store.close()
+
+        assert warned
+        assert alive
+        assert names == ["default"]
+        assert "scanner unreachable" not in caplog.text
+
+    def test_startup_generation_no_scanners_keeps_the_bare_default(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-15: no devices found keeps the bare default with a WARNING."""
+        mock_scanner.get_devices.return_value = []
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            warned = _wait_until(
+                lambda: bool(
+                    _worker_records(caplog, logging.WARNING, "no scanners found")
+                ),
+                _STATE_BUDGET,
+            )
+            names = worker.profile_names()
+        finally:
+            worker.stop()
+            store.close()
+
+        assert warned
+        assert names == ["default"]
+        mock_scanner.get_capabilities.assert_not_called()
+
+    def test_startup_generation_skips_customized_profiles(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
+        wait_for_state: Callable[..., Job],
     ) -> None:
-        """Worker only attempts auto-generation once across multiple jobs."""
+        """A profile set that is not the bare default never asks the scanner."""
         self._mock_caps_scanner(mock_scanner)
-
-        config_file = tmp_path / "saneless.toml"
-        monkeypatch.setattr(
-            "saneless.worker.resolve_config_path",
-            lambda *_a, **_k: config_file,
+        default_settings.profiles["photo"] = ProfileConfig(
+            source="Flatbed", resolution=600, mode="Color"
         )
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
@@ -2851,22 +2967,118 @@ class TestLazyAutoGenerate:
         )
 
         store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
             worker.start()
-
-            job1 = store.create_job("default", "Job 1")
-            job2 = store.create_job("default", "Job 2")
-            worker.submit(job1)
-            worker.submit(job2)
-
-            time.sleep(1.0)
-            worker.stop()
-
-            # get_capabilities called exactly once, not twice
-            assert mock_scanner.get_capabilities.call_count == 1
+            job = store.create_job("default", "Custom Test")
+            worker.submit(job)
+            wait_for_state(store, job.id, TERMINAL_STATES)
         finally:
+            worker.stop()
             store.close()
+
+        mock_scanner.get_devices.assert_not_called()
+        mock_scanner.get_capabilities.assert_not_called()
+        assert list(default_settings.profiles) == ["default", "photo"]
+
+    def test_startup_generation_is_tried_once_per_start(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """D-15: three jobs later the scanner has still been asked only once."""
+        self._mock_caps_scanner(mock_scanner)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            jobs = [store.create_job("default", f"Job {n}") for n in range(3)]
+            for job in jobs:
+                worker.submit(job)
+            for job in jobs:
+                wait_for_state(store, job.id, TERMINAL_STATES)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert mock_scanner.get_devices.call_count == 1
+        assert mock_scanner.get_capabilities.call_count == 1
+
+    def test_startup_generation_precedes_the_first_job(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        D-14: a job submitted during generation waits, then sees the new profiles.
+
+        ``get_capabilities`` is held on an event.  While it is held the job
+        stays PENDING and the pipeline has not run; once released, the job's
+        profile resolves against the generated set.
+        """
+        caps = self._mock_caps_scanner(mock_scanner)
+        expected = generate_profiles(caps)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def held_capabilities(_device_id: str) -> DeviceCapabilities:
+            entered.set()
+            release.wait(_STATE_BUDGET * 5)
+            return caps
+
+        mock_scanner.get_capabilities.side_effect = held_capabilities
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        seen: list[tuple[list[str], ProfileConfig | None]] = []
+
+        def recording_pipeline(
+            _scanner: object,
+            _paperless: object,
+            settings: Settings,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            seen.append(
+                (list(settings.profiles), worker.get_profile(request.profile_name))
+            )
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", recording_pipeline)
+        try:
+            worker.start()
+            assert entered.wait(_STATE_BUDGET)
+            job = store.create_job("default", "First Job")
+            submitted = worker.submit(job)
+            # A bounded hold: long enough for a worker that skipped ahead to
+            # the queue to have started the job.
+            time.sleep(0.2)
+            held_state = _get(store, job.id).state
+            runs_while_held = len(seen)
+            release.set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
+        finally:
+            release.set()
+            worker.stop()
+            store.close()
+
+        assert submitted is SubmitResult.ACCEPTED
+        assert held_state is JobState.PENDING
+        assert runs_while_held == 0
+        assert finished.state is JobState.DONE
+        assert len(seen) == 1
+        names, profile = seen[0]
+        assert set(names) == set(expected)
+        assert profile == expected["default"]
 
 
 class TestWorkerEnumDispatch:
