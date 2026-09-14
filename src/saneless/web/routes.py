@@ -193,6 +193,8 @@ def index(request: Request) -> Response:
             "correspondents": correspondents,
             **status,
             "jobs": jobs,
+            # The title input's maxlength; templates own no vocabulary (ROBU-08).
+            "title_max_length": TITLE_MAX_LENGTH,
         },
     )
 
@@ -334,7 +336,10 @@ def start_scan(
     the worker's profile lock) is a 422 and writes nothing (ROBU-08, D-19).
 
     A valid submit creates the job row and offers it to the worker, returning
-    the status partial once the job is queued.  A refused submit records a
+    the status partial once the job is queued.  That response re-renders the
+    Scan button out-of-band from server state (ROBU-04) and clears the
+    ``#status-message`` slot out-of-band, so an error left there by an earlier
+    rejected submit disappears (D-03).  A refused submit records a
     REJECTED error row and raises: 429 with ``Retry-After`` when the queue is
     full, 503 when the worker is down or degraded (ROBU-02, D-05, D-11).  The
     rendered error reloads Job History only when that row was written.
@@ -378,10 +383,11 @@ def start_scan(
     match result:
         case SubmitResult.ACCEPTED:
             # A job created by this request cannot have a flip answer yet.
+            # Only a successful scan clears the status-message slot (D-03).
             return state.templates.TemplateResponse(
                 request,
-                "partials/status.html",
-                {"job": job, "flip_answer": None},
+                "partials/status_response.html",
+                {"job": job, "flip_answer": None, "clear_message": True},
             )
         case SubmitResult.QUEUE_FULL:
             rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
@@ -406,11 +412,15 @@ def current_job_status(request: Request) -> Response:
     Returns the status partial template for HTMX polling swap.  While an
     answered job is still recorded ``AWAITING_FLIP``, the partial shows the
     acknowledgment rather than the flip buttons (CR-01).
+
+    The response re-renders the Scan button out-of-band from server state
+    (ROBU-04).  It never clears ``#status-message``: a poll carrying that clear
+    would erase a rejection shown mid-scan within a second (D-03).
     """
     state = request.app.state
     return state.templates.TemplateResponse(
         request,
-        "partials/status.html",
+        "partials/status_response.html",
         _status_context(state.worker, state.job_store),
     )
 
@@ -519,12 +529,15 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     partial acknowledges the answer in place of the Continue and Abort
     buttons, so a claimed or repeated click never re-renders a prompt that
     looks unanswered (CR-01).
+
+    The response re-renders the Scan button out-of-band from server state
+    (ROBU-04) and leaves ``#status-message`` alone (D-03).
     """
     state = request.app.state
     claimed = state.worker.continue_flip(job_id)
     return state.templates.TemplateResponse(
         request,
-        "partials/status.html",
+        "partials/status_response.html",
         _status_context(
             state.worker,
             state.job_store,
@@ -547,12 +560,15 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     While the store still reads ``AWAITING_FLIP`` for an answered job, the
     partial shows "Aborting scan..." (or the answer that won) in place of the
     buttons, so the response never invites a second click (CR-01).
+
+    The response re-renders the Scan button out-of-band from server state
+    (ROBU-04) and leaves ``#status-message`` alone (D-03).
     """
     state = request.app.state
     claimed = state.worker.abort_flip(job_id)
     return state.templates.TemplateResponse(
         request,
-        "partials/status.html",
+        "partials/status_response.html",
         _status_context(
             state.worker,
             state.job_store,

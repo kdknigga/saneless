@@ -1,7 +1,7 @@
 """
 Per-state rendering contract for the web templates.
 
-Covers requirements: UI-03, UI-07, CTR-01.
+Covers requirements: UI-03, UI-07, CTR-01, ROBU-04, ROBU-08.
 
 The templates are the one surface neither ``ty`` nor ``pyrefly`` can see. Once
 the hand-written state lists moved behind ``Job.is_active`` / ``Job.is_busy``
@@ -44,8 +44,11 @@ from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
     TERMINAL_STATES,
+    TITLE_MAX_LENGTH,
     JobState,
+    RequestRejection,
     progress_label,
+    rejection_message,
     state_label,
 )
 from saneless.web.app import create_app
@@ -279,12 +282,200 @@ def test_scan_button_text(client: TestClient, state: JobState) -> None:
     assert text == expected
 
 
+_OOB_ATTR = ' hx-swap-oob="true"'
+_OOB_MESSAGE_CLEAR = '<div id="status-message" hx-swap-oob="innerHTML"></div>'
+
+
+def _only_scan_button(text: str) -> re.Match[str]:
+    """Return the single scan button in `text`, failing on none or several."""
+    assert text.count('id="scan-btn"') == 1, "expected exactly one scan button"
+    match = _SCAN_BUTTON.search(text)
+    assert match is not None, "scan button markup not found"
+    return match
+
+
+def test_page_renders_one_inline_scan_button(client: TestClient) -> None:
+    """
+    The full page carries exactly one Scan button, and it is not OOB (T1).
+
+    The button markup lives in one partial (ROBU-04, C-10).  If the OOB include
+    ever moved into ``partials/status.html``, which the page also includes, the
+    page would carry two ``id="scan-btn"`` and this count would catch it.
+    """
+    match = _only_scan_button(client.get("/").text)
+    assert "hx-swap-oob" not in match.group("attrs")
+
+
+@pytest.mark.parametrize("state", list(JobState))
+def test_poll_scan_button_matches_the_page_button(
+    client: TestClient, state: JobState
+) -> None:
+    """
+    The poll's OOB button is the page's button plus the OOB flag (T2, ROBU-04).
+
+    One template renders both, so for the same job the two copies must be
+    byte-identical once ``hx-swap-oob`` is removed.  A second source of truth
+    for the button's state is exactly what C-10 was.
+    """
+    _job_in_state(client, state)
+    page = _only_scan_button(client.get("/").text)
+    poll = _only_scan_button(client.get("/api/jobs/current/status").text)
+
+    assert _OOB_ATTR in poll.group("attrs")
+    assert poll.group(0).replace(_OOB_ATTR, "", 1) == page.group(0)
+
+
+@pytest.mark.parametrize("state", list(JobState))
+def test_poll_scan_button_follows_the_state_table(
+    client: TestClient, state: JobState
+) -> None:
+    """
+    The OOB button on every poll carries the S4 state table (T2, ROBU-04).
+
+    ``aria-busy`` is omitted, never ``"false"``, when the job is not busy.
+    """
+    _job_in_state(client, state)
+    text = client.get("/api/jobs/current/status").text
+    match = _only_scan_button(text)
+    attrs = match.group("attrs")
+
+    assert ("disabled" in attrs) is (state in ACTIVE_STATES)
+    assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
+    assert 'aria-busy="false"' not in text
+
+    if state is JobState.AWAITING_FLIP:
+        expected = "Waiting for flip&#8230;"
+    elif state in BUSY_STATES:
+        expected = "Scanning&#8230;"
+    else:
+        expected = "Scan"
+    assert match.group("text").strip() == expected
+
+
+def test_scan_success_carries_button_status_and_message_clear(
+    client: TestClient,
+) -> None:
+    """
+    A successful scan re-renders the button and clears the slot OOB (T3, D-03).
+
+    The clear is for this response only: it empties an error left in
+    ``#status-message`` by an earlier rejected submit.
+    """
+    response = client.post(
+        "/api/scan", data={"profile": "default", "title": "Button Test"}
+    )
+    assert response.status_code == 200
+    text = response.text
+
+    match = _only_scan_button(text)
+    assert _OOB_ATTR in match.group("attrs")
+    assert text.count('id="status-area"') == 1
+    assert text.count(_OOB_MESSAGE_CLEAR) == 1
+    assert text.count("status-message") == 1
+
+
+def test_poll_never_clears_the_status_message(client: TestClient) -> None:
+    """
+    A poll re-renders the button OOB but never touches the slot (T3, D-03).
+
+    Carrying the clear here would erase a 429 shown mid-scan within a second.
+    """
+    _job_in_state(client, JobState.SCANNING)
+    text = client.get("/api/jobs/current/status").text
+    assert _OOB_ATTR in _only_scan_button(text).group("attrs")
+    assert "status-message" not in text
+
+
+@pytest.mark.parametrize("answer", ["continue", "abort"])
+def test_flip_responses_never_clear_the_status_message(
+    client: TestClient, answer: str
+) -> None:
+    """Flip Continue and Abort re-render the button OOB, not the slot (T3, D-03)."""
+    _job_in_state(client, JobState.AWAITING_FLIP)
+    job_id = _app(client).state.worker._current_job_id
+    response = client.post(f"/api/flip/{answer}", data={"job_id": job_id})
+    assert response.status_code == 200
+    assert _OOB_ATTR in _only_scan_button(response.text).group("attrs")
+    assert "status-message" not in response.text
+
+
+def test_scan_error_response_carries_no_button(client: TestClient) -> None:
+    """A rejected scan renders only the error, never the button (ROBU-04, S4)."""
+    response = client.post(
+        "/api/scan",
+        data={"profile": "no-such-profile", "title": "Rejected"},
+        headers={"HX-Request": "true"},
+    )
+    assert response.status_code == 422
+    assert "scan-btn" not in response.text
+
+
+_SCAN_FORM = re.compile(r'<form hx-post="/api/scan"[^>]*>')
+_TITLE_INPUT = re.compile(r'<input[^>]*id="title-input"[^>]*>')
+
+
+def test_scan_form_disables_the_button_without_inheritance(
+    client: TestClient,
+) -> None:
+    """
+    The form disables the button for its own round-trip only (ROBU-04, S4).
+
+    ``hx-disabled-elt`` replaces the deleted app.js handler.  ``hx-disinherit``
+    is mandatory: on htmx 2.0.8 the selects and refresh buttons inside the form
+    would otherwise inherit it and strip ``disabled`` from a server-disabled
+    button when their own requests finish (C-10).
+    """
+    match = _SCAN_FORM.search(client.get("/").text)
+    assert match is not None, "scan form markup not found"
+    form = match.group(0)
+    assert 'hx-disabled-elt="#scan-btn"' in form
+    assert 'hx-disinherit="hx-disabled-elt"' in form
+
+
+def test_title_input_is_capped_at_the_server_limit(client: TestClient) -> None:
+    """``#title-input`` carries the server's title cap as maxlength (ROBU-08)."""
+    match = _TITLE_INPUT.search(client.get("/").text)
+    assert match is not None, "title input markup not found"
+    assert f'maxlength="{TITLE_MAX_LENGTH}"' in match.group(0)
+    assert 'maxlength="256"' in match.group(0)
+
+
+def test_title_input_cap_comes_from_the_route_context(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The maxlength number is the route's constant, not a template literal."""
+    monkeypatch.setattr("saneless.web.routes.TITLE_MAX_LENGTH", 99)
+    match = _TITLE_INPUT.search(client.get("/").text)
+    assert match is not None, "title input markup not found"
+    assert 'maxlength="99"' in match.group(0)
+
+
+def test_page_loads_no_app_script_and_no_remote_url(client: TestClient) -> None:
+    """No application JavaScript and no off-box URL remain on the page (S4)."""
+    text = client.get("/").text
+    assert "app.js" not in text
+    assert "http://" not in text
+    assert "https://" not in text
+    assert "hx-on" not in text
+
+
+def test_app_script_is_gone(client: TestClient) -> None:
+    """``/static/app.js`` no longer exists; its 404 uses the one renderer."""
+    response = client.get("/static/app.js")
+    assert response.status_code == 404
+    assert response.json() == {
+        "status": "error",
+        "detail": rejection_message(RequestRejection.NOT_FOUND),
+    }
+
+
 def test_idle_page_button_and_status(client: TestClient) -> None:
     """With no job at all the button reads Scan and the status area is idle."""
     match = _SCAN_BUTTON.search(client.get("/").text)
     assert match is not None, "scan button markup not found"
     assert match.group("text").strip() == "Scan"
     assert "disabled" not in match.group("attrs")
+    assert "aria-busy" not in match.group("attrs")
 
     status = client.get("/api/jobs/current/status").text
     assert "<p>Ready to scan.</p>" in status
