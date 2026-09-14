@@ -2,8 +2,10 @@
 Job model with state machine and SQLite persistence.
 
 Tracks scan jobs through their lifecycle (PENDING -> SCANNING ->
-ASSEMBLING -> UPLOADING -> DONE) with SQLite-backed persistence
-for crash recovery and history.
+ASSEMBLING -> UPLOADING -> DONE) and persists them in SQLite for
+history.  A job survives the process that ran it only as a row: on
+startup the web app fails every job still in an active state through
+``fail_active_jobs`` before the worker starts (ROBU-06).
 """
 
 from __future__ import annotations
@@ -897,11 +899,11 @@ class JobStore:
         additionally be the wrong value: an interrupted restart is not an
         unknown failure, it is a precisely known one.
 
-        This method has NO production caller in this phase.  Calling it at
-        startup, before the worker thread begins, is ROBU-05 and belongs to
-        Phase 26; the defaulted ``reason`` is the seam that phase needs, and the
-        returned count is what lets a caller -- today, only the tests -- learn
-        what happened without a second query.
+        Its caller is the web lifespan at startup, before the worker thread
+        begins, passing ``RESTART_REASON`` (ROBU-06); when that call raises,
+        the worker's recovery makes the same call once the store accepts
+        writes again (26-06).  The returned count is what lets the lifespan
+        log how many jobs it failed without a second query.
 
         Args:
             reason: The error text recorded on every job this fails.
