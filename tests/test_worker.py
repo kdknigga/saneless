@@ -2293,6 +2293,147 @@ class TestWorkerGuard:
         assert health_after is WorkerHealth.HEALTHY
 
 
+# Owed rejections the many-thread test hands over, and the threads handing them.
+_OWING_THREADS = 4
+_OWED_PER_THREAD = 25
+_MANY_OWED_BUDGET = 5.0
+
+
+class TestOwedRejections:
+    """
+    A refused submit whose REJECTED write failed is written by the worker.
+
+    WR-01: the route creates the row before ``submit()`` (D-05), so a refusal
+    needs a second write, and when that write fails the row would stay PENDING
+    with no REJECTED marker (D-06).  The route owes it to the worker instead,
+    and the worker's idle flush -- shared with the guard's owed failures --
+    writes it on its next tick, never counting a failed retry (D-12, D-10).
+    """
+
+    def test_an_owed_rejection_is_written_on_the_next_idle_tick(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A healthy worker records an owed rejection without probing (D-12)."""
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        probes = _StoreFault(store.probe, frozenset())
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = store.create_job("default", "Refused")
+            worker.owe_rejection(job.id, "queue full")
+            recorded = wait_for_state(store, job.id, JobState.ERROR, _STATE_BUDGET)
+            latest = store.latest_run_job()
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert recorded.error == "queue full"
+        assert recorded.error_category is ErrorCategory.REJECTED
+        assert latest is None
+        assert health is WorkerHealth.HEALTHY
+        assert probes.calls == []
+
+    def test_an_owed_rejection_retry_failure_never_counts_towards_degraded(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A request-side debt the store refuses is retried, never counted (D-10)."""
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        finishes = _StoreFault(store.finish_job, None)
+        monkeypatch.setattr(store, "finish_job", finishes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = store.create_job("default", "Refused While Failing")
+            worker.owe_rejection(job.id, "queue full")
+            retried = _wait_until(lambda: len(finishes.calls) >= 3, _STATE_BUDGET)
+            state_before = _get(store, job.id).state
+            failures_before = worker._consecutive_loop_failures
+            health_before = worker.health
+            finishes.heal()
+            recorded = wait_for_state(store, job.id, JobState.ERROR, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert retried
+        assert state_before is JobState.PENDING
+        assert failures_before == 0
+        assert health_before is WorkerHealth.HEALTHY
+        assert recorded.error == "queue full"
+        assert recorded.error_category is ErrorCategory.REJECTED
+
+    def test_owed_rejections_from_many_threads_are_all_written(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Rejections owed while the worker flushes are none of them lost."""
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        worker = worker_for(store)
+        barrier = threading.Barrier(_OWING_THREADS)
+        raised: list[BaseException] = []
+        raised_lock = threading.Lock()
+
+        def owe(job_ids: list[str]) -> None:
+            barrier.wait()
+            try:
+                for job_id in job_ids:
+                    worker.owe_rejection(job_id, "queue full")
+            except Exception as exc:
+                with raised_lock:
+                    raised.append(exc)
+
+        try:
+            worker.start()
+            ids = [
+                store.create_job("default", f"Refused {n}").id
+                for n in range(_OWING_THREADS * _OWED_PER_THREAD)
+            ]
+            threads = [
+                threading.Thread(
+                    target=owe,
+                    args=(ids[n * _OWED_PER_THREAD : (n + 1) * _OWED_PER_THREAD],),
+                )
+                for n in range(_OWING_THREADS)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            if raised:
+                raise raised[0]
+
+            def all_recorded() -> bool:
+                # The flush drops an entry just after its write lands.
+                written = all(
+                    _get(store, job_id).state is JobState.ERROR for job_id in ids
+                )
+                return written and not worker._unrecorded_failures
+
+            recorded = _wait_until(all_recorded, _MANY_OWED_BUDGET)
+            rows = [_get(store, job_id) for job_id in ids]
+            owed_after = dict(worker._unrecorded_failures)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert recorded
+        assert all(row.error_category is ErrorCategory.REJECTED for row in rows)
+        assert all(row.error == "queue full" for row in rows)
+        assert owed_after == {}
+
+
 # Loop-level failures in a row that make a worker degraded (D-10).
 _DEGRADING_JOBS = 3
 
