@@ -54,8 +54,10 @@ saneless jobs --json --limit 5
 ```
 
 `state` is always the raw uppercase enum value — `PENDING`, `SCANNING`,
-`AWAITING_FLIP`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR` or `FALLBACK` — so
-it is safe to compare against in a script. The human-readable labels the table
+`AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`
+or `FALLBACK` — so it is safe to compare against in a script. `AWAITING_FLIP`
+and `SCANNING_REVERSE` only occur in manual duplex jobs: the wait for the
+operator to flip the stack, and the second pass over the back sides. The human-readable labels the table
 view prints ("Complete", "Failed", "Saved to folder") never appear in `--json`.
 
 `outcome` is `"SUCCESS"`, `"FALLBACK"` or `null`, and `warning` carries a note
@@ -72,8 +74,22 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 |---|---|---|
 | 0 | Success | Scan completed and uploaded |
 | 1 | Scan or runtime error | Scanner disconnected mid-scan, no pages scanned |
-| 2 | Configuration or profile error | Unknown profile name, missing config file |
+| 2 | Configuration or profile error | Unknown profile name, missing config file, a manual duplex profile run without an interactive terminal |
 | 3 | Paperless upload error | paperless-ngx unreachable, invalid API token |
+
+!!! warning "Manual duplex profiles cannot be scripted"
+    A profile with `duplex = "manual"` needs a person to flip the stack between the two passes,
+    and `saneless scan` asks for that confirmation at the terminal. When stdin is not a terminal
+    -- cron, a pipe, redirected input, most CI runners -- `saneless scan` refuses the profile
+    and exits with code 2 before the scanner feeds a single page, so no stack is half-scanned:
+
+    ```
+    Profile 'manual-duplex' is manual duplex, which needs an interactive terminal: saneless must prompt you to flip the stack between the two passes. Run it from a terminal, or scan from the web UI.
+    ```
+
+    Use a simplex or hardware duplex profile for automation. From a terminal, a manual duplex
+    scan that is aborted at the flip prompt or not confirmed within `flip_timeout_seconds` exits
+    with code 1. See [Set Up ADF Duplex Scanning](set-up-adf-duplex.md#manual-duplex).
 
 ## Scripting examples
 
