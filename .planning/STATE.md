@@ -4,8 +4,8 @@ milestone: v2.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 25 context gathered
-last_updated: "2026-09-14T05:57:24.806Z"
-last_activity: 2026-09-14 -- Phase 25 planning complete
+last_updated: "2026-09-14T13:52:23.105Z"
+last_activity: 2026-09-14 -- Phase 25 execution started
 progress:
   total_phases: 14
   completed_phases: 6
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 24 — Scanner Truthfulness
+**Current focus:** Phase 25 — manual-duplex
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 24 (Scanner Truthfulness) — COMPLETE & VERIFIED
-Plan: 8 of 8
-Status: Ready to execute
+Phase: 25 (manual-duplex) — EXECUTING
+Plan: 1 of 9
+Status: Executing Phase 25
 Progress: [██████████] 100%
 Next: Phase 25 (Manual Duplex) — not started, no phase directory yet
-Last activity: 2026-09-14 -- Phase 25 planning complete
+Last activity: 2026-09-14 -- Phase 25 execution started
 
 ## Performance Metrics
 
