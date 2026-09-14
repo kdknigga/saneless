@@ -13,7 +13,7 @@ import tomlkit
 from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
-from saneless.cli import _truncate, cli
+from saneless.cli import ClickFlipCoordinator, _truncate, cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -31,7 +31,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.vocabulary import JobState, state_label
+from saneless.vocabulary import FlipOutcome, JobState, state_label
 
 if TYPE_CHECKING:
     import pytest
@@ -531,6 +531,48 @@ class TestManualDuplexPrompt:
         answered_no, interrupted = outcomes
         assert interrupted == answered_no
         assert "flip prompt" in interrupted[1]
+
+    def test_ctrl_c_during_the_wait_is_an_abort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Ctrl-C while the prompt is up resolves ``ABORTED``, not a raw interrupt.
+
+        SIGINT is handled on the main thread, so a real Ctrl-C does not reach
+        ``click.confirm`` on the prompt thread at all -- it raises
+        ``KeyboardInterrupt`` out of the calling thread's bounded wait (measured
+        with a real SIGINT against a never-answering stdin).  A real signal
+        cannot be sent here without taking the pytest session down with it if
+        the handling regressed, so the wait itself is made to raise.
+        """
+
+        class InterruptedEvent:
+            """An event whose wait is cut short by Ctrl-C."""
+
+            def wait(self, timeout: float | None = None) -> bool:
+                """Raise as SIGINT would on the main thread."""
+                raise KeyboardInterrupt
+
+            def set(self) -> None:
+                """Accept the prompt thread's late signal."""
+
+        release = threading.Event()
+
+        def never_answered(*_args: object, **_kwargs: object) -> bool:
+            """Block until the test lets go, then decline."""
+            release.wait()
+            return False
+
+        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        coordinator = ClickFlipCoordinator()
+        monkeypatch.setattr(coordinator, "_event", InterruptedEvent())
+
+        try:
+            outcome = coordinator.wait_for_flip(600)
+        finally:
+            release.set()
+
+        assert outcome is FlipOutcome.ABORTED
 
     def test_unanswered_prompt_times_out_before_pass_b(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
