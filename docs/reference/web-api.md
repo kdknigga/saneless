@@ -38,8 +38,11 @@ Health check for container orchestration and monitoring.
 
 | Status Code | Body | Condition |
 |-------------|------|-----------|
-| 200 | `{"status": "ok"}` | Worker thread is alive |
-| 503 | `{"status": "error", "detail": "worker thread is down"}` | Worker thread has stopped |
+| 200 | `{"status": "ok"}` | Worker thread is alive and its job store is working |
+| 503 | `{"status": "error", "detail": "job store failing"}` | Worker thread is alive but degraded: the job store is failing |
+| 503 | `{"status": "error", "detail": "worker thread is down"}` | Worker thread is not running |
+
+The worker becomes degraded after three job-store failures in a row (its own job writes or its periodic history prune), or at startup when the job store cannot be written. While degraded, new scans are refused with `503`. Degraded clears itself: while no scan is running, the worker checks the job store every 5 seconds, and the first check that succeeds returns `/health` to `200`.
 
 ---
 
@@ -73,11 +76,21 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `profile` | string | yes | Scan profile name from config |
-| `title` | string | no | Document title (auto-generated from timestamp if empty) |
+| `title` | string | no | Document title, at most 256 characters (auto-generated from timestamp if empty) |
 | `tags` | int[] | no | Paperless-ngx tag IDs |
 | `correspondent` | int | no | Paperless-ngx correspondent ID |
 
-**Response:** HTML partial (status indicator for HTMX swap).
+**Responses:**
+
+| Status Code | Meaning |
+|-------------|---------|
+| 200 | The job is queued. HTML partial: the status indicator for HTMX swap, plus an out-of-band Scan button and an out-of-band clear of any earlier error message. |
+| 403 | The request was blocked as cross-site. See [Cross-site requests](#cross-site-requests). |
+| 422 | The request is not valid: the profile does not exist, the title is longer than 256 characters, or a required field is missing. No job is created. |
+| 429 | The scan queue is full: 10 jobs are already waiting to start. The response carries `Retry-After: 30`. |
+| 503 | The worker is not running, or it is degraded (see [`GET /health`](#get-health)). |
+
+A `429` or `503` is a refused attempt, not a missing one: it is recorded in job history as a failed job ("Not started: ..."), provided the job store accepts the write. A `422` records nothing. Error bodies follow [Errors](#errors).
 
 ---
 
@@ -115,7 +128,7 @@ Invalidates a specific cache entry and returns fresh data from paperless-ngx.
 |-----------|------|-------------|
 | `resource` | string | Resource to invalidate: `tags` or `correspondents` |
 
-**Response:** HTML partial with refreshed data.
+**Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched.
 
 ---
 
@@ -166,8 +179,35 @@ Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt.
 
 ---
 
+## Errors
+
+Every error response saneless renders -- a refused scan, a validation failure, a blocked cross-site request, an unknown path, an unexpected server error -- has one of two body forms, chosen by the `HX-Request` request header. The status code is the same either way.
+
+| Request | Body | Extra headers |
+|---------|------|---------------|
+| `HX-Request: true` (the web UI) | HTML fragment containing the message | `HX-Retarget: #status-message` and `HX-Reswap: innerHTML`, so the message appears in the page's message area instead of the element the request was aimed at |
+| Anything else | `{"status": "error", "detail": "<message>"}` | none |
+
+A `429` carries `Retry-After: 30` in both forms.
+
+The message is a fixed sentence chosen by saneless for the kind of error. It never echoes request input or internal exception text. The error from [`GET /api/paperless/test`](#get-apipaperlesstest) and the `503` bodies from [`GET /health`](#get-health) keep their own shapes, documented above.
+
+---
+
 ## Notes
 
-- Most endpoints return **HTML partials** designed for HTMX swap. Only `/health` and `/api/paperless/test` return JSON.
-- There is no authentication on the API. saneless assumes a trusted LAN; use a reverse proxy for auth if needed.
-- The `/api/scan` endpoint returns immediately after queuing the job. Poll `/api/jobs/current/status` for progress updates.
+- Most endpoints return **HTML partials** designed for HTMX swap. Only `/health` and `/api/paperless/test` return JSON, along with the JSON error form described under [Errors](#errors).
+- There is no authentication on the API. saneless assumes a trusted LAN; use a reverse proxy for auth if needed. The web server binds to `web_host`, which defaults to `0.0.0.0` -- all network interfaces -- so every host that can reach the port can use the API.
+- `POST /api/scan` returns once the job is queued or refused; it does not wait for the scan. Poll `/api/jobs/current/status` for progress.
+
+### Cross-site requests
+
+saneless rejects state-changing requests that did not come from a saneless page, so a web page on another site cannot start a scan or answer a flip prompt in your browser. `GET`, `HEAD` and `OPTIONS` requests are never checked; every other request is checked as follows:
+
+- If the browser sends `Sec-Fetch-Site`, the values `same-origin` and `none` are allowed and anything else (`same-site`, `cross-site`) is rejected. A paperless-ngx page on the same host but another port counts as `same-site` and is rejected.
+- Otherwise, if the request has an `Origin` header, its host and port must equal the `Host` header or one of the entries in `X-Forwarded-Host`.
+- A request with neither header -- `curl`, scripts, other non-browser clients -- is allowed.
+
+A rejected request gets `403` with the message "This request was blocked because it did not come from the saneless page. If saneless is behind a reverse proxy, make sure the proxy passes the original Host header.", and the server logs a warning that names the `Origin`, `Host`, `X-Forwarded-Host` and `Sec-Fetch-Site` values it saw.
+
+Browsers do not send `Sec-Fetch-Site` to a plain-HTTP address such as `http://<lan-ip>:8080`, so a browser talking plain HTTP to saneless is checked by `Origin` against `Host`. If a reverse proxy sits in front of saneless over plain HTTP, it must preserve the original `Host` header (nginx: `proxy_set_header Host $host;`) or set `X-Forwarded-Host`; otherwise every scan from the browser is rejected. See [Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy).
