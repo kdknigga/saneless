@@ -34,6 +34,7 @@ from .vocabulary import (
     FlipOutcome,
     JobState,
     SubmitResult,
+    WorkerHealth,
     classify_error,
     job_state_for,
 )
@@ -245,11 +246,51 @@ class ScanWorker:
         # id, with the error text and category the guard tried to record.
         # Touched only by the worker thread.
         self._unrecorded_failures: dict[str, tuple[str, ErrorCategory | None]] = {}
+        # Set and cleared by the worker thread (and by mark_recovery_pending,
+        # before the thread exists); read by request threads through health and
+        # submit(), so an Event rather than a bare bool (D-10, D-11).
+        self._degraded = threading.Event()
+        # Whether the first successful probe must also fail the rows a crashed
+        # process left active, because startup recovery could not.
+        self._restart_recovery_pending = False
 
     def start(self) -> None:
         """Start the worker thread."""
         self._thread.start()
         logger.info("ScanWorker started")
+
+    def mark_recovery_pending(self) -> None:
+        """
+        Start degraded, owing startup's crash recovery to the first good probe.
+
+        The lifespan calls this before ``start()`` when ``fail_active_jobs``
+        raised at startup (research Open Question 1).  The app still starts,
+        ``/health`` answers a truthful 503 and scans are rejected, instead of
+        the service refusing to come up over a store that may recover.  The
+        first successful idle probe then fails the rows the previous process
+        left active with ``RESTART_REASON`` and clears degraded (D-12, D-13).
+        """
+        self._restart_recovery_pending = True
+        self._degraded.set()
+
+    @property
+    def health(self) -> WorkerHealth:
+        """
+        The worker's health, as ``/health`` reports it (26-10).
+
+        ``DOWN`` when the thread is not running -- not started, or stopped --
+        which ``/health`` reports as "worker thread is down".  ``DEGRADED``
+        when the job store has failed the loop ``_DEGRADED_AFTER`` times in a
+        row and no probe has succeeded since, reported as "job store failing".
+        Otherwise ``HEALTHY``.
+        """
+        if not self._thread.is_alive():
+            health = WorkerHealth.DOWN
+        elif self._degraded.is_set():
+            health = WorkerHealth.DEGRADED
+        else:
+            health = WorkerHealth.HEALTHY
+        return health
 
     def stop(self) -> bool:
         """
@@ -302,12 +343,17 @@ class ScanWorker:
 
         Returns:
             ``ACCEPTED`` when the job is queued, ``QUEUE_FULL`` when the queue
-            has no room, or ``DOWN`` when the worker is not started, is
-            stopping, or has stopped.
+            has no room, ``DEGRADED`` when the job store is failing, or
+            ``DOWN`` when the worker is not started, is stopping, or has
+            stopped.
 
         """
         if not self._thread.is_alive() or self._stopping.is_set():
             return SubmitResult.DOWN
+        if self._degraded.is_set():
+            # D-11: nobody is asked to feed paper into a job whose outcome
+            # could not be recorded.
+            return SubmitResult.DEGRADED
         # Two except clauses rather than one bracketless PEP 758 clause: the
         # two exceptions mean different things to the caller.
         try:
@@ -547,8 +593,18 @@ class ScanWorker:
         return str(exc), classify_error(exc)
 
     def _record_loop_failure(self) -> None:
-        """Count one loop-level failure (D-10)."""
+        """Count one loop-level failure, degrading at ``_DEGRADED_AFTER`` (D-10)."""
         self._consecutive_loop_failures += 1
+        if (
+            self._consecutive_loop_failures >= _DEGRADED_AFTER
+            and not self._degraded.is_set()
+        ):
+            self._degraded.set()
+            logger.warning(
+                "Scan worker degraded after %d consecutive job store failures; "
+                "rejecting scans until the store recovers",
+                self._consecutive_loop_failures,
+            )
 
     def _best_effort_fail(self, job: Job, exc: Exception) -> None:
         """
@@ -579,11 +635,14 @@ class ScanWorker:
 
     def _idle_housekeeping(self) -> None:
         """
-        Use an idle tick: prune job history when the interval is due (D-13).
+        Use an idle tick: probe while degraded, then prune when due.
 
-        A prune failure is a loop-level failure (D-10), and it can never fail
-        a job: no job is running on an idle tick.
+        The probe comes first, so a degraded worker gets its chance to heal on
+        every tick (D-12).  A prune failure is a loop-level failure (D-10), and
+        it can never fail a job: no job is running on an idle tick (D-13).
         """
+        if self._degraded.is_set():
+            self._try_recover()
         if time.monotonic() - self._last_prune < _PRUNE_INTERVAL_SECONDS:
             return
         self._last_prune = time.monotonic()
@@ -595,6 +654,46 @@ class ScanWorker:
         except Exception:
             logger.exception("Idle history prune failed")
             self._record_loop_failure()
+
+    def _try_recover(self) -> None:
+        """
+        Probe the job store and, if it reads and writes again, clear degraded.
+
+        Before clearing, recovery ends the rows the loop could not (research
+        Pitfall 6).  This runs on an Empty tick, so the queue is empty, no job
+        is current, and every submit was rejected while degraded: an active
+        row is an orphan.  A submit racing the clear below is accepted, and its
+        row is new, so it is neither of the rows written here.
+
+        Each row gets a text that already exists: the failure the guard tried
+        to write, or ``RESTART_REASON`` for rows a failed startup recovery left
+        behind.  Any raise leaves the worker degraded to try again next tick;
+        it is not counted again, and whatever was written stays written.
+        """
+        try:
+            self._job_store.probe()
+        except Exception:
+            logger.debug("Job store probe failed; still degraded", exc_info=True)
+            return
+        try:
+            # The guard's own failures first: once ERROR they are no longer
+            # active, so the restart recovery below cannot give them its text.
+            for job_id, (error, category) in list(self._unrecorded_failures.items()):
+                self._job_store.finish_job(
+                    job_id, JobState.ERROR, error=error, error_category=category
+                )
+                del self._unrecorded_failures[job_id]
+            if self._restart_recovery_pending:
+                self._job_store.fail_active_jobs(RESTART_REASON)
+                self._restart_recovery_pending = False
+        except Exception:
+            logger.debug(
+                "Job store recovery write failed; still degraded", exc_info=True
+            )
+            return
+        self._consecutive_loop_failures = 0
+        self._degraded.clear()
+        logger.info("Scan worker recovered: the job store accepted a write")
 
     def _maybe_auto_generate(self) -> None:
         """Auto-generate profiles from scanner if only bare default exists."""
