@@ -52,23 +52,23 @@ class PipelineEvent(StrEnum):
     DONE = "DONE"
 
     @property
-    def job_state(self) -> JobState | None:
+    def job_state(self) -> JobState:
         """
-        Return the persisted job state this event implies, if any.
+        Return the job state this event implies.
 
-        ``None`` means this event changes no persisted state.  Today that is
-        exactly ``SCANNING_REVERSE``: the second pass of a manual-duplex scan
-        is reported to the operator as progress prose, but the job stays in
-        whichever state it was already in because there is no ``JobState``
-        twin for it.  A future member gains one; until then the seam is typed
-        and visible here rather than hidden in a caller's ``if``/``elif``.
+        The projection is total: every event has a ``JobState`` twin.
+        ``SCANNING_REVERSE`` projects to ``JobState.SCANNING_REVERSE``, so the
+        second pass of a manual-duplex scan is persisted as its own busy state
+        and the job leaves ``AWAITING_FLIP`` the moment pass B starts -- which
+        is what takes the flip prompt, and its Continue and Abort controls, off
+        the screen while the backs feed (DPLX-06).
 
         Note that a non-``None`` result is not an instruction to write that
         state: ``DONE`` is terminal and the worker writes it only after the
         pipeline has returned.  Callers decide which states they apply.
 
         Returns:
-            The matching JobState, or None when the event persists nothing.
+            The matching JobState.
 
         Raises:
             AssertionError: If the value is not a PipelineEvent member.
@@ -80,8 +80,7 @@ class PipelineEvent(StrEnum):
             case PipelineEvent.AWAITING_FLIP:
                 state = JobState.AWAITING_FLIP
             case PipelineEvent.SCANNING_REVERSE:
-                # No JobState twin: progress prose only, nothing persisted.
-                state = None
+                state = JobState.SCANNING_REVERSE
             case PipelineEvent.ASSEMBLING:
                 state = JobState.ASSEMBLING
             case PipelineEvent.UPLOADING:

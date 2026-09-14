@@ -1107,14 +1107,16 @@ class TestWorkerEnumDispatch:
             assert JobState.DONE not in from_callback
 
             # The states applied are exactly the in-flight ones, in the order
-            # the events were emitted.  SCANNING_REVERSE (no JobState) and
-            # DONE (terminal) contribute nothing -- and neither does SCANNING,
+            # the events were emitted.  SCANNING_REVERSE is persisted as its own
+            # busy state, so pass B takes the job out of AWAITING_FLIP (DPLX-06).
+            # DONE (terminal) contributes nothing -- and neither does SCANNING,
             # which the worker persisted before starting the pipeline and which
             # run_pipeline merely re-announces as its first event.  Rewriting it
             # would blank error/error_category a second time and signal a
             # transition that did not occur.
             assert from_callback == [
                 JobState.AWAITING_FLIP,
+                JobState.SCANNING_REVERSE,
                 JobState.ASSEMBLING,
                 JobState.UPLOADING,
             ]

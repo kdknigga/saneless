@@ -122,13 +122,6 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         state = event.job_state
         if event is PipelineEvent.DONE:
             click.echo(f"Done: {title}")
-        elif state is None:
-            # SCANNING_REVERSE is the only event that persists no state, so it
-            # is the only one with no progress_label to read.  When it gains a
-            # JobState twin this branch collapses into the general one below.
-            # Branching on `state is None` rather than on the member name is
-            # also what lets the type checkers accept progress_label(state).
-            click.echo("Scanning reverse sides...")
         else:
             click.echo(progress_label(state))
 
