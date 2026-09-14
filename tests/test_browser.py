@@ -26,6 +26,7 @@ Requires: pytest-playwright, chromium browser (uv run playwright install chromiu
 from __future__ import annotations
 
 import re
+import socket
 import threading
 import time
 from typing import TYPE_CHECKING, Literal, NamedTuple
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
     from playwright.sync_api import BrowserContext, Page, Response, Route
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
     from saneless.job import Job, JobStore
 
@@ -198,7 +200,7 @@ class _RunningUvicorn(NamedTuple):
     port: int
 
 
-def _start_uvicorn(app: FastAPI, host: str) -> _RunningUvicorn:
+def _start_uvicorn(app: ASGIApp, host: str) -> _RunningUvicorn:
     """Run ``app`` under uvicorn on a daemon thread, bound to ``host`` on a free port."""
     # Note: uvicorn.Server.capture_signals already skips signal handling
     # when running in a non-main thread, so no special config is needed.
@@ -1536,4 +1538,150 @@ class TestRequestErrorSlot:
         )
         assert slot.evaluate("(el) => el.getBoundingClientRect().height") == 0
         assert slot.get_attribute("role") == "alert"
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+
+
+def _non_loopback_ipv4() -> str | None:
+    """
+    Return this machine's outbound IPv4 address, or None when it has none.
+
+    Connecting a UDP socket sends no packet; it only asks the kernel which
+    local address would route to the target. The target is TEST-NET-1
+    (192.0.2.1, RFC 5737), which is never assigned to a real host. A runner
+    with no default route raises, and a loopback-only one answers 127.x.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))
+        address = str(probe.getsockname()[0])
+    except OSError:
+        address = None
+    finally:
+        probe.close()
+    if address is None or address.startswith("127."):
+        return None
+    return address
+
+
+class _ScanHeaderRecorder:
+    """
+    An ASGI wrapper that records the headers of every ``POST /api/scan`` it passes on.
+
+    The browser's own view of a request cannot answer whether it sent
+    ``Sec-Fetch-Site``: under the egress gate's ``context.route``, Playwright's
+    ``Request.all_headers()`` omits the ``Sec-Fetch-*`` headers even when the
+    server receives them (measured: a routed 127.0.0.1 page reports none while
+    the server gets ``same-origin``). So the headers are read where the guard
+    reads them, in front of the app. Every scope, lifespan included, is passed
+    through unchanged.
+    """
+
+    def __init__(self, app: FastAPI) -> None:
+        """Wrap ``app`` with an empty record."""
+        self.app = app
+        self.scan_headers: list[dict[str, str]] = []
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Record a scan submit's headers, then hand the request to the app."""
+        if (
+            scope["type"] == "http"
+            and scope["method"] == "POST"
+            and scope["path"] == "/api/scan"
+        ):
+            self.scan_headers.append(
+                {
+                    name.decode("latin-1").lower(): value.decode("latin-1")
+                    for name, value in scope["headers"]
+                }
+            )
+        await self.app(scope, receive, send)
+
+
+class _LanServer(NamedTuple):
+    """A function-scoped app served on a non-loopback address over plain HTTP."""
+
+    url: str
+    app: FastAPI
+    scan_headers: list[dict[str, str]]
+
+
+@pytest.fixture
+def lan_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_LanServer]:
+    """
+    Serve a separate app on this machine's LAN address, then shut it down.
+
+    It is its own app with its own store under ``tmp_path``, so nothing it does
+    touches the session server. Uvicorn binds all interfaces on a free port
+    because the browser has to reach it by the LAN address, and it runs only for
+    this one test, with a stub scanner and a stubbed Paperless (T-26-56).
+    """
+    address = _non_loopback_ipv4()
+    if address is None:
+        pytest.skip("no non-loopback IPv4 address")
+    app = create_app(_browser_test_settings(tmp_path), _BrowserTestScanner())
+    recorder = _ScanHeaderRecorder(app)
+    running = _start_uvicorn(recorder, host="0.0.0.0")
+    try:
+        _make_paperless_deliver(app, monkeypatch)
+        yield _LanServer(
+            url=f"http://{address}:{running.port}",
+            app=app,
+            scan_headers=recorder.scan_headers,
+        )
+    finally:
+        _stop_uvicorn(running)
+
+
+@pytest.mark.browser
+class TestPlainHttpLanOrigin:
+    """
+    The cross-site guard lets the app's own page scan from a LAN address (D-20).
+
+    saneless's documented deployment is plain HTTP on a LAN address, and there a
+    browser sends no ``Sec-Fetch-Site`` at all, so only the guard's Origin
+    branch stands between a user and a 403 on every scan.
+    """
+
+    def test_same_origin_scan_from_a_lan_address_is_not_blocked(
+        self,
+        page: Page,
+        egress_allowlist: list[str],
+        lan_server: _LanServer,
+    ) -> None:
+        """
+        A same-origin Scan click from ``http://<lan-ip>`` is accepted (ROBU-10).
+
+        Research assumption A6: the Fetch Metadata spec adds ``Sec-Fetch-*``
+        only for potentially trustworthy URLs, so Chromium omits it on a plain
+        HTTP LAN origin and the guard decides on ``Origin`` against ``Host``
+        (D-20 branch 2). ``localhost`` and ``127.0.0.1`` cannot prove this: they
+        are secure contexts, always get ``Sec-Fetch-Site``, and exercise branch
+        1 instead. The TestClient branch-2 tests in ``tests/test_cross_origin.py``
+        prove the rule; this proves the browser really takes that branch.
+
+        The headers are checked as the server received them, not through
+        Playwright's request object, which hides ``Sec-Fetch-*`` under routing
+        (see ``_ScanHeaderRecorder``).
+        """
+        lan_url = lan_server.url
+        egress_allowlist.append(lan_url)
+        page.goto(lan_url)
+
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST" and response.url.endswith("/api/scan")
+            )
+        ) as response_info:
+            page.locator("#scan-btn").click()
+
+        assert response_info.value.status == 200, response_info.value.status
+        assert len(lan_server.scan_headers) == 1, lan_server.scan_headers
+        headers = lan_server.scan_headers[0]
+        assert "sec-fetch-site" not in headers, (
+            f"Chromium sent Sec-Fetch-Site={headers['sec-fetch-site']!r} to "
+            f"{lan_url}, so this test no longer exercises D-20 branch 2: the "
+            "runner's address is being treated as potentially trustworthy"
+        )
+        assert headers.get("origin") == lan_url, headers
+        expect(page.locator("#status-message")).to_be_empty()
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
