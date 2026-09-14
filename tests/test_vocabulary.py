@@ -1,7 +1,7 @@
 """
 Tests for the shared saneless vocabulary module.
 
-Covers requirements: CTR-01, CTR-02, CTR-05.
+Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
 """
 
 from __future__ import annotations
@@ -26,19 +26,30 @@ from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    QUEUE_FULL_JOB_ERROR,
+    RESTART_REASON,
     TERMINAL_STATES,
+    TITLE_MAX_LENGTH,
+    WORKER_DEGRADED_JOB_ERROR,
+    WORKER_DOWN_JOB_ERROR,
     ConnectionStatus,
     ErrorCategory,
     FlipOutcome,
     JobState,
+    RequestRejection,
     ScanOutcome,
+    SubmitResult,
+    WorkerHealth,
     classify_error,
     connection_status_message,
     error_message,
     flip_answer_label,
     job_state_for,
     progress_label,
+    rejection_message,
+    rejection_status_code,
     state_label,
+    worker_health_detail,
 )
 
 
@@ -67,10 +78,11 @@ class TestErrorCategoryMembers:
 
     def test_error_category_member_names(self) -> None:
         """
-        ErrorCategory names are the five documented categories (CTR-05).
+        ErrorCategory names are the documented categories (CTR-05, D-06).
 
-        Compared as a set: declaration order is not part of any contract, and
-        pinning it would fail a harmless reordering.
+        The documented categories include REJECTED for a submit that never
+        ran (D-06).  Compared as a set: declaration order is not part of any
+        contract, and pinning it would fail a harmless reordering.
         """
         assert {category.name for category in ErrorCategory} == {
             "FEEDER",
@@ -78,6 +90,7 @@ class TestErrorCategoryMembers:
             "SCANNER",
             "UPLOAD",
             "UNKNOWN",
+            "REJECTED",
         }
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
@@ -272,6 +285,257 @@ class TestErrorMessage:
             "The document could not be sent to paperless-ngx."
         )
         assert error_message(ErrorCategory.UNKNOWN) == "Something went wrong."
+
+    def test_rejected_error_message(self) -> None:
+        """REJECTED explains that the scan never started (D-05, D-06)."""
+        assert error_message(ErrorCategory.REJECTED) == (
+            "This scan was not started. Wait for the current scan to finish, "
+            "then try again."
+        )
+
+
+class TestWorkerHealth:
+    """WorkerHealth membership and /health detail tests."""
+
+    def test_worker_health_members(self) -> None:
+        """WorkerHealth is exactly HEALTHY, DEGRADED and DOWN (ROBU-01)."""
+        assert [health.value for health in WorkerHealth] == [
+            "HEALTHY",
+            "DEGRADED",
+            "DOWN",
+        ]
+
+    @pytest.mark.parametrize("health", list(WorkerHealth))
+    def test_worker_health_value_equals_name(self, health: WorkerHealth) -> None:
+        """Every WorkerHealth value is identical to its member name (ROBU-01)."""
+        assert health.value == health.name
+
+    @pytest.mark.parametrize(
+        ("health", "expected"),
+        [
+            (WorkerHealth.HEALTHY, "ok"),
+            (WorkerHealth.DEGRADED, "job store failing"),
+            (WorkerHealth.DOWN, "worker thread is down"),
+        ],
+    )
+    def test_worker_health_detail_strings(
+        self, health: WorkerHealth, expected: str
+    ) -> None:
+        """worker_health_detail returns the documented /health detail (ROBU-01)."""
+        assert worker_health_detail(health) == expected
+
+    @pytest.mark.parametrize("health", list(WorkerHealth))
+    def test_worker_health_detail_is_complete(self, health: WorkerHealth) -> None:
+        """Every WorkerHealth has a non-empty detail string (ROBU-01)."""
+        assert worker_health_detail(health)
+
+    def test_worker_health_detail_raises_on_unrecognised_value(self) -> None:
+        """worker_health_detail raises on a value outside WorkerHealth (ROBU-01)."""
+        bad = cast("WorkerHealth", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            worker_health_detail(bad)
+
+
+class TestSubmitResult:
+    """SubmitResult membership tests."""
+
+    def test_submit_result_members(self) -> None:
+        """SubmitResult is exactly ACCEPTED, QUEUE_FULL, DOWN, DEGRADED (ROBU-02)."""
+        assert [result.value for result in SubmitResult] == [
+            "ACCEPTED",
+            "QUEUE_FULL",
+            "DOWN",
+            "DEGRADED",
+        ]
+
+    @pytest.mark.parametrize("result", list(SubmitResult))
+    def test_submit_result_value_equals_name(self, result: SubmitResult) -> None:
+        """Every SubmitResult value is identical to its member name (ROBU-02)."""
+        assert result.value == result.name
+
+
+_REJECTION_MESSAGES: list[tuple[RequestRejection, str]] = [
+    (
+        RequestRejection.QUEUE_FULL,
+        "The scan queue is full. Wait for a scan to finish, then try again.",
+    ),
+    (
+        RequestRejection.WORKER_DOWN,
+        "The scan service is not running, so the scan was not started. "
+        "Restart saneless, then try again.",
+    ),
+    (
+        RequestRejection.WORKER_DEGRADED,
+        "Job history cannot be saved right now, so the scan was not started. "
+        "Check the server's free disk space and log, then try again.",
+    ),
+    (
+        RequestRejection.UNKNOWN_PROFILE,
+        "That scan profile does not exist. Reload the page to see the current "
+        "profiles.",
+    ),
+    (
+        RequestRejection.TITLE_TOO_LONG,
+        "The title is too long. Shorten it to 256 characters or fewer.",
+    ),
+    (
+        RequestRejection.INVALID_REQUEST,
+        "The request was not valid. Reload the page, then try again.",
+    ),
+    (
+        RequestRejection.CROSS_SITE,
+        "This request was blocked because it did not come from the saneless "
+        "page. If saneless is behind a reverse proxy, make sure the proxy passes "
+        "the original Host header.",
+    ),
+    (
+        RequestRejection.NOT_FOUND,
+        "That page or action does not exist. Reload the page, then try again.",
+    ),
+    (
+        RequestRejection.METHOD_NOT_ALLOWED,
+        "That action is not allowed. Reload the page, then try again.",
+    ),
+    (
+        RequestRejection.INTERNAL,
+        "Something went wrong on the server. Check the server log for details, "
+        "then try again.",
+    ),
+    (
+        RequestRejection.CLIENT_ERROR,
+        "The request could not be completed. Reload the page, then try again.",
+    ),
+]
+
+_REJECTION_STATUS_CODES: list[tuple[RequestRejection, int]] = [
+    (RequestRejection.QUEUE_FULL, 429),
+    (RequestRejection.WORKER_DOWN, 503),
+    (RequestRejection.WORKER_DEGRADED, 503),
+    (RequestRejection.UNKNOWN_PROFILE, 422),
+    (RequestRejection.TITLE_TOO_LONG, 422),
+    (RequestRejection.INVALID_REQUEST, 422),
+    (RequestRejection.CROSS_SITE, 403),
+    (RequestRejection.NOT_FOUND, 404),
+    (RequestRejection.METHOD_NOT_ALLOWED, 405),
+    (RequestRejection.INTERNAL, 500),
+    (RequestRejection.CLIENT_ERROR, 400),
+]
+
+_JOB_ROW_TEXTS: list[str] = [
+    QUEUE_FULL_JOB_ERROR,
+    WORKER_DOWN_JOB_ERROR,
+    WORKER_DEGRADED_JOB_ERROR,
+    RESTART_REASON,
+]
+
+
+class TestRequestRejection:
+    """RequestRejection membership, message, status code and job-row copy tests."""
+
+    def test_request_rejection_members(self) -> None:
+        """RequestRejection names one member per rendered error (D-05, ROBU-02)."""
+        assert {rejection.name for rejection in RequestRejection} == {
+            "QUEUE_FULL",
+            "WORKER_DOWN",
+            "WORKER_DEGRADED",
+            "UNKNOWN_PROFILE",
+            "TITLE_TOO_LONG",
+            "INVALID_REQUEST",
+            "CROSS_SITE",
+            "NOT_FOUND",
+            "METHOD_NOT_ALLOWED",
+            "INTERNAL",
+            "CLIENT_ERROR",
+        }
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_request_rejection_value_equals_name(
+        self, rejection: RequestRejection
+    ) -> None:
+        """Every RequestRejection value is identical to its member name (D-05)."""
+        assert rejection.value == rejection.name
+
+    def test_message_table_covers_every_member(self) -> None:
+        """The pinned message table names every RequestRejection member (D-05)."""
+        assert {rejection for rejection, _ in _REJECTION_MESSAGES} == set(
+            RequestRejection
+        )
+
+    def test_status_code_table_covers_every_member(self) -> None:
+        """The pinned status-code table names every RequestRejection member (D-05)."""
+        assert {rejection for rejection, _ in _REJECTION_STATUS_CODES} == set(
+            RequestRejection
+        )
+
+    @pytest.mark.parametrize(("rejection", "expected"), _REJECTION_MESSAGES)
+    def test_rejection_message_strings(
+        self, rejection: RequestRejection, expected: str
+    ) -> None:
+        """rejection_message returns the approved S3 copy verbatim (D-05, ROBU-02)."""
+        assert rejection_message(rejection) == expected
+
+    @pytest.mark.parametrize(("rejection", "expected"), _REJECTION_STATUS_CODES)
+    def test_rejection_status_codes(
+        self, rejection: RequestRejection, expected: int
+    ) -> None:
+        """rejection_status_code returns the documented HTTP status (ROBU-02)."""
+        assert rejection_status_code(rejection) == expected
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_rejection_message_is_complete(self, rejection: RequestRejection) -> None:
+        """Every RequestRejection has a non-empty message (D-05)."""
+        assert rejection_message(rejection)
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_rejection_status_code_is_complete(
+        self, rejection: RequestRejection
+    ) -> None:
+        """Every RequestRejection has an HTTP error status (ROBU-02)."""
+        assert 400 <= rejection_status_code(rejection) <= 599
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_rejection_message_style(self, rejection: RequestRejection) -> None:
+        """Every rejection message ends with a period and has no "!" (S3 style)."""
+        message = rejection_message(rejection)
+        assert message.endswith(".")
+        assert "!" not in message
+
+    def test_rejection_message_raises_on_unrecognised_value(self) -> None:
+        """rejection_message raises on a value outside RequestRejection (D-05)."""
+        bad = cast("RequestRejection", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            rejection_message(bad)
+
+    def test_rejection_status_code_raises_on_unrecognised_value(self) -> None:
+        """rejection_status_code raises on a value outside RequestRejection (D-05)."""
+        bad = cast("RequestRejection", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            rejection_status_code(bad)
+
+    def test_title_max_length(self) -> None:
+        """The title cap is 256 characters (ROBU-08)."""
+        assert TITLE_MAX_LENGTH == 256
+
+    def test_title_too_long_message_reads_the_cap(self) -> None:
+        """The TITLE_TOO_LONG message names the same cap the form enforces (ROBU-08)."""
+        assert str(TITLE_MAX_LENGTH) in rejection_message(
+            RequestRejection.TITLE_TOO_LONG
+        )
+
+    def test_job_row_texts(self) -> None:
+        """The rejected-row texts and the restart reason are verbatim S3 (D-05)."""
+        assert QUEUE_FULL_JOB_ERROR == "Not started: the scan queue was full"
+        assert WORKER_DOWN_JOB_ERROR == "Not started: the scan service was not running"
+        assert WORKER_DEGRADED_JOB_ERROR == (
+            "Not started: the scan service was unavailable"
+        )
+        assert RESTART_REASON == "The server restarted before this scan finished"
+
+    @pytest.mark.parametrize("text", _JOB_ROW_TEXTS)
+    def test_job_row_texts_have_no_trailing_period(self, text: str) -> None:
+        """Job-row texts follow the job.error convention of no trailing period (D-05)."""
+        assert text
+        assert not text.endswith(".")
 
 
 class TestConnectionStatus:
