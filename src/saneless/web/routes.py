@@ -274,23 +274,23 @@ def _unhealthy_rejection(
     return outcome
 
 
-def _record_rejected_submit(
-    job_store: JobStore, form: _ScanForm, *, job_id: str | None, error: str
-) -> bool:
+def _record_refused_submit(job_store: JobStore, form: _ScanForm, *, error: str) -> bool:
     """
-    Record a refused scan submit as a REJECTED error row in job history.
+    Record a submit refused before any job row existed, in one statement.
 
     D-05 departs from C-09's "create the row only after enqueue" because the
-    user wants the refused attempt visible in history.  The row has to exist
-    before ``put_nowait`` anyway, or the worker could dequeue an id with no
-    row.  The ``ErrorCategory.REJECTED`` marker is what keeps the row out of
-    the status area (D-06).
+    user wants the refused attempt visible in history.  The row is written
+    already ``ERROR`` with ``ErrorCategory.REJECTED``, the marker that keeps it
+    out of the status area (D-06).
+
+    ``create_rejected_job`` is a single ``INSERT``.  Create-then-finish would be
+    two transactions, and a failure between them would leave a PENDING row with
+    no marker that nothing ever reconciles, disabling the Scan button for good
+    (WR-01).  With one statement a failure leaves no row at all.
 
     Args:
         job_store: The job store to write to.
-        form: The submitted scan fields, used when no row exists yet.
-        job_id: The row already created for this submit, or ``None`` when the
-            request was refused before one was created.
+        form: The submitted scan fields the row records.
         error: The job-row error text for the rejection.
 
     Returns:
@@ -299,13 +299,41 @@ def _record_rejected_submit(
 
     """
     try:
-        if job_id is None:
-            job_id = job_store.create_job(
-                profile=form.profile,
-                title=form.title,
-                tags=form.tags,
-                correspondent=form.correspondent,
-            ).id
+        job_store.create_rejected_job(
+            profile=form.profile,
+            title=form.title,
+            error=error,
+            tags=form.tags,
+            correspondent=form.correspondent,
+        )
+    except Exception:
+        logger.warning(
+            "Could not record the rejected scan in job history", exc_info=True
+        )
+        return False
+    return True
+
+
+def _reject_created_job(job_store: JobStore, job_id: str, *, error: str) -> bool:
+    """
+    Mark a job row the worker then refused as a REJECTED error (D-05, D-06).
+
+    The row had to exist before ``put_nowait``, or the worker could dequeue an
+    id with no row (D-05), so this refusal is recorded by finishing that row.
+    The ``ErrorCategory.REJECTED`` marker is what keeps it out of the status
+    area (D-06).
+
+    Args:
+        job_store: The job store to write to.
+        job_id: The row already created for this submit.
+        error: The job-row error text for the rejection.
+
+    Returns:
+        Whether the row was written.  ``False`` means the store refused the
+        write, so the rendered error must not reload Job History.
+
+    """
+    try:
         job_store.finish_job(
             job_id,
             JobState.ERROR,
@@ -367,9 +395,7 @@ def start_scan(
     unhealthy = _unhealthy_rejection(state.worker.health)
     if unhealthy is not None:
         rejection, error = unhealthy
-        written = _record_rejected_submit(
-            state.job_store, form, job_id=None, error=error
-        )
+        written = _record_refused_submit(state.job_store, form, error=error)
         raise RequestRejected(rejection, refresh_history=written)
 
     job = state.job_store.create_job(
@@ -400,7 +426,7 @@ def start_scan(
             )
         case _:
             assert_never(result)
-    written = _record_rejected_submit(state.job_store, form, job_id=job.id, error=error)
+    written = _reject_created_job(state.job_store, job.id, error=error)
     raise RequestRejected(rejection, refresh_history=written)
 
 
