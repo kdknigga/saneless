@@ -26,7 +26,6 @@ from saneless.pipeline import (
     ScanResult,
     _check_disk_space,
     _interleave_duplex,
-    _is_manual_duplex,
     _preserving,
     run_pipeline,
 )
@@ -232,31 +231,6 @@ def _make_content_image(color: str = "black") -> Image.Image:
 def _make_empty_image() -> Image.Image:
     """Create a nearly-white image that should be detected as empty."""
     return Image.new("RGB", (200, 300), (254, 254, 254))
-
-
-class TestIsManualDuplex:
-    """Tests for _is_manual_duplex helper."""
-
-    def test_adf_manual_duplex(self) -> None:
-        """Source 'ADF Manual Duplex' is manual duplex."""
-        assert _is_manual_duplex("ADF Manual Duplex") is True
-
-    def test_manual_duplex_case_insensitive(self) -> None:
-        """Case insensitive detection."""
-        assert _is_manual_duplex("adf manual duplex") is True
-        assert _is_manual_duplex("MANUAL DUPLEX") is True
-
-    def test_flatbed_not_manual_duplex(self) -> None:
-        """Flatbed is not manual duplex."""
-        assert _is_manual_duplex("Flatbed") is False
-
-    def test_adf_not_manual_duplex(self) -> None:
-        """Plain ADF (no manual) is not manual duplex."""
-        assert _is_manual_duplex("ADF") is False
-
-    def test_hardware_duplex_not_manual(self) -> None:
-        """Hardware duplex without 'manual' is not manual duplex."""
-        assert _is_manual_duplex("ADF Duplex") is False
 
 
 class TestInterleave:
