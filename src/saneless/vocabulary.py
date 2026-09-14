@@ -25,6 +25,7 @@ __all__ = [
     "TERMINAL_STATES",
     "ConnectionStatus",
     "ErrorCategory",
+    "FlipOutcome",
     "JobState",
     "ScanOutcome",
     "classify_error",
@@ -73,6 +74,28 @@ class ScanOutcome(StrEnum):
 
     SUCCESS = "SUCCESS"
     FALLBACK = "FALLBACK"
+
+
+class FlipOutcome(StrEnum):
+    """
+    How a manual-duplex flip wait resolved.
+
+    The three members are exhaustive over the ways that wait can end: the
+    operator turned the stack and said so, the operator gave up, or the clock
+    ran out first.  ``FlipCoordinator.wait_for_flip`` returns exactly one of
+    them, as one atomic answer -- which is the point, because the two events it
+    replaced let a waiter wake up and then have to ask a second question to
+    learn why.
+
+    There is deliberately no "still waiting" member.  The method only returns
+    once the wait has resolved, so a fourth value could never be observed, and
+    a member no caller can receive is an arm every ``match`` would have to
+    carry for nothing.
+    """
+
+    CONTINUED = "CONTINUED"
+    ABORTED = "ABORTED"
+    TIMED_OUT = "TIMED_OUT"
 
 
 # The wire string for a rejected API token, named rather than written inline
