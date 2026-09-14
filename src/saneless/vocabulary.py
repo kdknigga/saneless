@@ -10,7 +10,7 @@ permitted is ``saneless.exceptions``, which is itself a leaf.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import assert_never
+from typing import Final, assert_never
 
 from saneless.exceptions import (
     ConfigError,
@@ -22,19 +22,30 @@ from saneless.exceptions import (
 __all__ = [
     "ACTIVE_STATES",
     "BUSY_STATES",
+    "QUEUE_FULL_JOB_ERROR",
+    "RESTART_REASON",
     "TERMINAL_STATES",
+    "TITLE_MAX_LENGTH",
+    "WORKER_DEGRADED_JOB_ERROR",
+    "WORKER_DOWN_JOB_ERROR",
     "ConnectionStatus",
     "ErrorCategory",
     "FlipOutcome",
     "JobState",
+    "RequestRejection",
     "ScanOutcome",
+    "SubmitResult",
+    "WorkerHealth",
     "classify_error",
     "connection_status_message",
     "error_message",
     "flip_answer_label",
     "job_state_for",
     "progress_label",
+    "rejection_message",
+    "rejection_status_code",
     "state_label",
+    "worker_health_detail",
 ]
 
 
@@ -53,13 +64,23 @@ class JobState(StrEnum):
 
 
 class ErrorCategory(StrEnum):
-    """Categories of errors for programmatic handling."""
+    """
+    Categories of errors for programmatic handling.
+
+    ``REJECTED`` is not a failure of a scan that ran.  It marks a job row
+    written for a submit that was refused -- the queue was full, or the worker
+    was down or degraded -- so the job never ran at all (D-05).
+    ``JobStore.latest_run_job`` skips it, so the status area never reports a
+    rejection as the job that just ended (D-06), while the history table still
+    lists the row.
+    """
 
     FEEDER = "FEEDER"
     CONFIG = "CONFIG"
     SCANNER = "SCANNER"
     UPLOAD = "UPLOAD"
     UNKNOWN = "UNKNOWN"
+    REJECTED = "REJECTED"
 
 
 class ScanOutcome(StrEnum):
@@ -126,7 +147,8 @@ class ConnectionStatus(StrEnum):
     reason ``classify_error`` is an ``isinstance`` chain: it dispatches on a
     range of integers rather than on a closed set of enum members, so
     ``assert_never`` does not apply and a trailing fallback is the correct
-    total answer.  This module imports no HTTP client and knows no status codes.
+    total answer.  This module imports no HTTP client and never maps a
+    response status to a connection outcome.
     """
 
     CONNECTED = "connected"
@@ -134,6 +156,82 @@ class ConnectionStatus(StrEnum):
     NOT_FOUND = "not_found"
     SERVER_ERROR = "server_error"
     UNREACHABLE = "unreachable"
+
+
+class WorkerHealth(StrEnum):
+    """
+    How healthy the scan worker is, as ``/health`` reports it.
+
+    ``DOWN`` means the worker thread is not alive.  ``DEGRADED`` means the
+    thread is alive but has hit N consecutive loop-level failures -- job store
+    writes, pruning -- and no store probe has succeeded since (D-10, D-12).
+    ``HEALTHY`` is everything else.
+    """
+
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    DOWN = "DOWN"
+
+
+class SubmitResult(StrEnum):
+    """
+    What ``ScanWorker.submit`` reports instead of blocking (C-09).
+
+    ``ACCEPTED`` means the job is queued.  ``QUEUE_FULL`` means the bounded
+    queue had no room.  ``DOWN`` covers every state in which the worker cannot
+    take work at all: not started, stopped, and stopping.  ``DEGRADED`` means
+    the thread is alive but the job store is failing, so a job could not be
+    recorded truthfully.
+    """
+
+    ACCEPTED = "ACCEPTED"
+    QUEUE_FULL = "QUEUE_FULL"
+    DOWN = "DOWN"
+    DEGRADED = "DEGRADED"
+
+
+class RequestRejection(StrEnum):
+    """
+    Every error the web layer renders, one member per message.
+
+    ``rejection_message`` and ``rejection_status_code`` give each member its
+    user-facing sentence and its HTTP status.  The messages are developer
+    constants: none of them contains request input or exception text, so
+    nothing a client sent and nothing internal can reach the page through this
+    path (V7).
+    """
+
+    QUEUE_FULL = "QUEUE_FULL"
+    WORKER_DOWN = "WORKER_DOWN"
+    WORKER_DEGRADED = "WORKER_DEGRADED"
+    UNKNOWN_PROFILE = "UNKNOWN_PROFILE"
+    TITLE_TOO_LONG = "TITLE_TOO_LONG"
+    INVALID_REQUEST = "INVALID_REQUEST"
+    CROSS_SITE = "CROSS_SITE"
+    NOT_FOUND = "NOT_FOUND"
+    METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"
+    INTERNAL = "INTERNAL"
+    CLIENT_ERROR = "CLIENT_ERROR"
+
+
+# The one title length cap.  The ``Form(max_length=...)`` validation on the scan
+# route, the ``maxlength`` attribute on the title input and the TITLE_TOO_LONG
+# message all read this constant, so the three cannot drift apart (ROBU-08,
+# UI-SPEC S5).
+TITLE_MAX_LENGTH: Final = 256
+
+# Job-row error texts.  A submit refused because the queue was full or the
+# worker was down or degraded still writes a job row, so history shows the
+# attempt (D-05); these are that row's ``error``.  Like every other
+# ``job.error`` they carry no trailing period.
+QUEUE_FULL_JOB_ERROR: Final = "Not started: the scan queue was full"
+WORKER_DOWN_JOB_ERROR: Final = "Not started: the scan service was not running"
+WORKER_DEGRADED_JOB_ERROR: Final = "Not started: the scan service was unavailable"
+
+# What startup recovery passes to ``JobStore.fail_active_jobs`` for a job the
+# previous process left in flight (D-13), and what a flip wait aborted by
+# shutdown records.
+RESTART_REASON: Final = "The server restarted before this scan finished"
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
@@ -372,6 +470,11 @@ def error_message(category: ErrorCategory) -> str:
             message = "The document could not be sent to paperless-ngx."
         case ErrorCategory.UNKNOWN:
             message = "Something went wrong."
+        case ErrorCategory.REJECTED:
+            message = (
+                "This scan was not started. Wait for the current scan to finish, "
+                "then try again."
+            )
         case _:
             assert_never(category)
     return message
@@ -409,6 +512,148 @@ def connection_status_message(status: ConnectionStatus) -> str:
         case _:
             assert_never(status)
     return message
+
+
+def worker_health_detail(health: WorkerHealth) -> str:
+    """
+    Return the ``/health`` detail string for a worker health state.
+
+    These strings are a wire contract: the ``/health`` response body and
+    ``docs/reference/web-api.md`` pin them, so they must not be reworded.
+
+    Args:
+        health: The worker health state to describe.
+
+    Returns:
+        The short detail string, e.g. ``"job store failing"``.
+
+    Raises:
+        AssertionError: If the value is not a WorkerHealth member.
+
+    """
+    match health:
+        case WorkerHealth.HEALTHY:
+            detail = "ok"
+        case WorkerHealth.DEGRADED:
+            detail = "job store failing"
+        case WorkerHealth.DOWN:
+            detail = "worker thread is down"
+        case _:
+            assert_never(health)
+    return detail
+
+
+def rejection_message(rejection: RequestRejection) -> str:
+    """
+    Return the user-facing message for a web-layer rejection.
+
+    This is the approved copy from 26-UI-SPEC S3, and the only place it lives.
+    Every message is a developer-authored constant that ends with a period.
+    The TITLE_TOO_LONG message is built from ``TITLE_MAX_LENGTH`` so the number
+    it names cannot drift from the cap the form enforces.
+
+    Args:
+        rejection: The rejection to describe.
+
+    Returns:
+        A sentence that says what happened and what to do next.
+
+    Raises:
+        AssertionError: If the value is not a RequestRejection member.
+
+    """
+    match rejection:
+        case RequestRejection.QUEUE_FULL:
+            message = (
+                "The scan queue is full. Wait for a scan to finish, then try again."
+            )
+        case RequestRejection.WORKER_DOWN:
+            message = (
+                "The scan service is not running, so the scan was not started. "
+                "Restart saneless, then try again."
+            )
+        case RequestRejection.WORKER_DEGRADED:
+            message = (
+                "Job history cannot be saved right now, so the scan was not "
+                "started. Check the server's free disk space and log, then try "
+                "again."
+            )
+        case RequestRejection.UNKNOWN_PROFILE:
+            message = (
+                "That scan profile does not exist. Reload the page to see the "
+                "current profiles."
+            )
+        case RequestRejection.TITLE_TOO_LONG:
+            message = (
+                "The title is too long. Shorten it to "
+                f"{TITLE_MAX_LENGTH} characters or fewer."
+            )
+        case RequestRejection.INVALID_REQUEST:
+            message = "The request was not valid. Reload the page, then try again."
+        case RequestRejection.CROSS_SITE:
+            message = (
+                "This request was blocked because it did not come from the "
+                "saneless page. If saneless is behind a reverse proxy, make sure "
+                "the proxy passes the original Host header."
+            )
+        case RequestRejection.NOT_FOUND:
+            message = (
+                "That page or action does not exist. Reload the page, then try again."
+            )
+        case RequestRejection.METHOD_NOT_ALLOWED:
+            message = "That action is not allowed. Reload the page, then try again."
+        case RequestRejection.INTERNAL:
+            message = (
+                "Something went wrong on the server. Check the server log for "
+                "details, then try again."
+            )
+        case RequestRejection.CLIENT_ERROR:
+            message = (
+                "The request could not be completed. Reload the page, then try again."
+            )
+        case _:
+            assert_never(rejection)
+    return message
+
+
+def rejection_status_code(rejection: RequestRejection) -> int:
+    """
+    Return the HTTP status code a web-layer rejection is sent with.
+
+    Args:
+        rejection: The rejection to map.
+
+    Returns:
+        The HTTP status code, e.g. ``429`` for a full queue.
+
+    Raises:
+        AssertionError: If the value is not a RequestRejection member.
+
+    """
+    match rejection:
+        case RequestRejection.QUEUE_FULL:
+            status_code = 429
+        case RequestRejection.WORKER_DOWN | RequestRejection.WORKER_DEGRADED:
+            status_code = 503
+        case (
+            RequestRejection.UNKNOWN_PROFILE
+            | RequestRejection.TITLE_TOO_LONG
+            | RequestRejection.INVALID_REQUEST
+        ):
+            status_code = 422
+        case RequestRejection.CROSS_SITE:
+            status_code = 403
+        case RequestRejection.NOT_FOUND:
+            status_code = 404
+        case RequestRejection.METHOD_NOT_ALLOWED:
+            status_code = 405
+        case RequestRejection.INTERNAL:
+            status_code = 500
+        case RequestRejection.CLIENT_ERROR:
+            status_code = 400
+        case _:
+            assert_never(rejection)
+    return status_code
 
 
 def classify_error(exc: Exception) -> ErrorCategory:
