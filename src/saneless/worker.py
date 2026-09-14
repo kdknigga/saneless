@@ -20,10 +20,11 @@ from .auto_profiles import (
     write_profiles_to_config,
 )
 from .job import JobResult
-from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
+from .pipeline import FlipCoordinator, PipelineEvent, PipelineRequest, run_pipeline
 from .vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    FlipOutcome,
     JobState,
     classify_error,
     job_state_for,
@@ -35,9 +36,85 @@ if TYPE_CHECKING:
     from .paperless import PaperlessClient
     from .scanner.base import ScannerBackend
 
-__all__ = ["ScanWorker"]
+__all__ = ["ScanWorker", "WorkerFlipCoordinator"]
 
 logger = logging.getLogger(__name__)
+
+
+class WorkerFlipCoordinator(FlipCoordinator):
+    """
+    The web flip coordinator: one answer, claimed once, and final (D-16).
+
+    The Continue and Abort routes signal it from request threads while the
+    worker thread waits on it.  Whichever of Continue, Abort or the timeout
+    claims the answer first is the answer; anything arriving later is dropped.
+
+    The answer is written under a lock *before* the event is set, so a waiter
+    that wakes always finds an answer to read -- there is no window in which
+    the event says "resolved" and the slot still says nothing.  That ordering
+    is what makes it race-free by construction rather than by timing.
+    """
+
+    def __init__(self) -> None:
+        """Start unanswered."""
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._outcome: FlipOutcome | None = None
+
+    def signal_continue(self) -> None:
+        """Answer the wait: the operator flipped the stack."""
+        self._resolve(FlipOutcome.CONTINUED)
+
+    def signal_abort(self) -> None:
+        """Answer the wait: the operator gave up at the flip prompt."""
+        self._resolve(FlipOutcome.ABORTED)
+
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Block until answered, or claim ``TIMED_OUT`` when ``timeout`` elapses.
+
+        On expiry the timeout is claimed through the same single-answer path
+        as the two signals, and what comes back is whatever answer is actually
+        in effect -- so a Continue that landed between the wait expiring and
+        this claim is honoured rather than overwritten.
+
+        Args:
+            timeout: The longest to wait, in seconds.
+
+        Returns:
+            The one answer this coordinator resolved to.
+
+        """
+        # One path for both endings.  If a signal set the event, _resolve finds
+        # that answer already claimed and hands it back; if the wait expired,
+        # TIMED_OUT is offered and wins unless a signal claimed first after
+        # all.  Either way the result is the claimed answer, never a guess.
+        self._event.wait(timeout)
+        return self._resolve(FlipOutcome.TIMED_OUT)
+
+    def _resolve(self, outcome: FlipOutcome) -> FlipOutcome:
+        """
+        Claim the single answer, unless one is already claimed.
+
+        Returning the answer in effect, rather than asserting one exists, is
+        what lets ``wait_for_flip`` narrow ``FlipOutcome | None`` to
+        ``FlipOutcome`` without an ``assert`` -- which ``S101`` bans in
+        ``src/``.
+
+        Args:
+            outcome: The answer this caller is offering.
+
+        Returns:
+            The claimed answer: ``outcome`` if it was first, otherwise the
+            answer that beat it.
+
+        """
+        with self._lock:
+            if self._outcome is None:
+                self._outcome = outcome
+            claimed = self._outcome
+        self._event.set()
+        return claimed
 
 
 class ScanWorker:
@@ -66,8 +143,7 @@ class ScanWorker:
         self._job_store: JobStore = job_store
         self._queue: queue.Queue[Job | None] = queue.Queue(maxsize=10)
         self._thread = threading.Thread(target=self._run, daemon=True)
-        self._flip_event: threading.Event | None = None
-        self._abort_event: threading.Event | None = None
+        self._flip_coordinator: WorkerFlipCoordinator | None = None
         self._transition_event = threading.Event()
         self._current_job_id: str | None = None
         self._auto_generated = False
@@ -96,16 +172,16 @@ class ScanWorker:
 
     def continue_flip(self) -> None:
         """Signal the worker to continue with pass B of manual duplex."""
-        if self._flip_event is not None:
-            self._flip_event.set()
+        coordinator = self._flip_coordinator
+        if coordinator is not None:
+            coordinator.signal_continue()
             logger.info("Manual duplex: continue signal sent")
 
     def abort_flip(self) -> None:
         """Signal the worker to abort manual duplex scan."""
-        if self._abort_event is not None:
-            self._abort_event.set()
-        if self._flip_event is not None:
-            self._flip_event.set()  # Unblock the wait
+        coordinator = self._flip_coordinator
+        if coordinator is not None:
+            coordinator.signal_abort()
             logger.info("Manual duplex: abort signal sent")
 
     def wait_transition(self, timeout: float = 2.0) -> bool:
@@ -193,12 +269,7 @@ class ScanWorker:
         source = profile.source.lower() if profile else ""
         is_manual_duplex = "manual" in source and "duplex" in source
 
-        if is_manual_duplex:
-            self._flip_event = threading.Event()
-            self._abort_event = threading.Event()
-        else:
-            self._flip_event = None
-            self._abort_event = None
+        self._flip_coordinator = WorkerFlipCoordinator() if is_manual_duplex else None
 
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
             self._job_store.update_thumbnail(_jid, thumb)
@@ -244,8 +315,7 @@ class ScanWorker:
                 correspondent=job.correspondent,
                 status_callback=_status_cb,
                 thumbnail_callback=_thumbnail_cb,
-                flip_event=self._flip_event,
-                abort_event=self._abort_event,
+                flip_coordinator=self._flip_coordinator,
             )
             result = run_pipeline(
                 self._scanner,
@@ -282,8 +352,7 @@ class ScanWorker:
             )
             logger.error("Job %s failed (%s): %s", job.id, category.value.lower(), exc)
         finally:
-            self._flip_event = None
-            self._abort_event = None
+            self._flip_coordinator = None
             self._current_job_id = None
             self._job_store.prune(
                 self._settings.output.history_retention_days,
