@@ -25,12 +25,15 @@ The `run_pipeline()` function coordinates the full scan flow:
 
 1. **Resolve scanner** -- find the configured device or auto-detect the first available one.
 2. **Set parameters** -- apply the selected profile's source, resolution, and color mode.
-3. **Acquire pages** -- scan via the scanner backend. For manual duplex, this involves two passes with a flip prompt between them (see [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md)).
+3. **Acquire pages** -- scan via the scanner backend. For a simplex or hardware duplex profile this is a single `scan_pages()` call. A profile with `duplex = "manual"` splits this stage into three (see [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex)):
+    1. **Pass A** -- scan the front sides through the feeder.
+    2. **Flip wait** -- wait, for at most `flip_timeout_seconds`, for the operator to flip the stack and confirm. An abort or a timeout fails the job here, before pass B.
+    3. **Pass B** -- scan the back sides, then reverse them and interleave them with the fronts. If the two passes disagree on page count, the fronts and backs are delivered as two separate PDFs instead.
 4. **Filter empty pages** -- remove blank pages using the [dual-threshold algorithm](empty-page-detection.md).
 5. **Assemble PDF** -- convert scanned PIL images to a PDF document.
 6. **Upload to paperless-ngx** -- send the PDF with metadata via the REST API, or fall back to the [consume directory](consume-directory-fallback.md) if the API is unavailable.
 
-Each stage emits a `PipelineEvent` (`SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`). The web UI uses these events to update the live status indicator via HTMX polling.
+Each stage emits a `PipelineEvent` (`SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`). `AWAITING_FLIP` marks the start of the flip wait and `SCANNING_REVERSE` the start of pass B, and each becomes a job state of the same name. The web UI uses these events to update the live status indicator via HTMX polling.
 
 ### PDF Assembly
 
@@ -48,7 +51,9 @@ The web server runs a background worker thread that processes one scan job at a 
 
 The worker communicates progress back to the web layer via state transitions on the `Job` object stored in SQLite. The UI polls the job status endpoint, and HTMX updates the status indicator when the state changes. This design keeps the web layer fully responsive during long-running scans.
 
-For manual duplex scanning, the worker blocks between pass A (fronts) and pass B (backs) using a `threading.Event`. The web UI displays a flip prompt, and when the user clicks Continue, the event is set and the worker proceeds with the second pass.
+For manual duplex scanning, the pipeline waits between pass A (fronts) and pass B (backs) through a `FlipCoordinator`, a small interface with one method, `wait_for_flip(timeout)`, that returns one of three outcomes: continued, aborted or timed out. The pipeline does not know who answers. In the web server, the worker's coordinator is answered by the `/api/flip/continue` and `/api/flip/abort` routes, which the flip prompt's Continue and Abort scan buttons call. In the CLI, a coordinator asks the operator a yes/no question at the terminal. Whichever answer arrives first -- including the timeout -- is final, and later answers are dropped.
+
+The wait is bounded by `flip_timeout_seconds` (600 seconds by default), so an abandoned flip prompt cannot hold the worker thread forever: when the timeout elapses the job fails and the next queued job runs. The scanner itself is not what the timeout frees. The backend opens and closes the device inside each `scan_pages()` call, so the scanner handle is already released between the two passes; what the timeout releases is the worker thread.
 
 ## Job Storage
 
