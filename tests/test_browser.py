@@ -30,13 +30,14 @@ import time
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from fastapi import FastAPI
     from playwright.sync_api import BrowserContext, Page, Route
 
-    from saneless.job import JobStore
+    from saneless.job import Job, JobStore
 
+import httpx
 import pytest
 import uvicorn
 from PIL import Image
@@ -50,6 +51,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.job import JobResult
+from saneless.paperless import UploadResult
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -57,7 +59,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
+from saneless.vocabulary import TERMINAL_STATES, FlipOutcome, JobState, ScanOutcome
 from saneless.web.app import create_app
 from saneless.worker import WorkerFlipCoordinator
 
@@ -79,8 +81,24 @@ _AMBER = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
 """The app's fallback amber (#a16207 / #ca8a04, from app.css), as computed."""
 
 
+_SCAN_GATE_TIMEOUT = 30.0
+"""Longest a closed gate holds ``scan_pages``, so a test that forgets it cannot hang."""
+
+
 class _BrowserTestScanner(ScannerBackend):
-    """Concrete scanner stub for browser tests."""
+    """
+    Concrete scanner stub for browser tests, with a gate on ``scan_pages``.
+
+    The gate is open by default, so a scan returns at once. A test closes it
+    (``gate.clear()``) to hold a job in SCANNING while it looks at the page, and
+    opens it again (``gate.set()``) to let the job finish. The wait is bounded,
+    so a gate left closed by a failing test ends the scan rather than the run.
+    """
+
+    def __init__(self) -> None:
+        """Create the stub with its gate open."""
+        self.gate = threading.Event()
+        self.gate.set()
 
     def get_devices(self) -> list[DeviceInfo]:
         """Return a single fake device."""
@@ -102,9 +120,18 @@ class _BrowserTestScanner(ScannerBackend):
         )
 
     def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-        """Return a batch holding a single white test image."""
+        """
+        Wait for the gate, then return one page with content on it.
+
+        The page is half black rather than blank: the default profile's empty
+        page detection would drop an all-white page and end the job in ERROR,
+        and the browser tests need a scan that can reach DONE.
+        """
+        self.gate.wait(timeout=_SCAN_GATE_TIMEOUT)
+        page = Image.new("RGB", (100, 100), "white")
+        page.paste((0, 0, 0), (0, 0, 50, 100))
         return ScanBatch(
-            pages=[Image.new("RGB", (100, 100), "white")],
+            pages=[page],
             actual_resolution=settings.resolution,
             pages_rejected=0,
         )
@@ -117,11 +144,13 @@ class _BrowserServer(NamedTuple):
     Yielding only the URL made the server a black box -- a test could look at
     the idle page and nothing else, because there was no way to put a job into
     a given state. Carrying the app alongside the URL is what lets a test drive
-    a job to FALLBACK and then look at it through a real browser.
+    a job to FALLBACK and then look at it through a real browser; carrying the
+    scanner is what lets a test hold a real scan in SCANNING through its gate.
     """
 
     url: str
     app: FastAPI
+    scanner: _BrowserTestScanner
 
 
 @pytest.fixture(scope="session")
@@ -169,7 +198,7 @@ def browser_server(
 
     # Get actual assigned port
     port = server.servers[0].sockets[0].getsockname()[1]
-    yield _BrowserServer(url=f"http://127.0.0.1:{port}", app=app)
+    yield _BrowserServer(url=f"http://127.0.0.1:{port}", app=app, scanner=scanner)
 
     server.should_exit = True
     thread.join(timeout=5)
@@ -230,6 +259,90 @@ def context(
     context.route("**/*", _gate)
     yield context
     assert blocked == [], f"the page tried to reach the network: {blocked}"
+
+
+@pytest.fixture
+def delivering_paperless(
+    browser_server: _BrowserServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Make the live app's Paperless client deliver every upload at once.
+
+    The worker holds the same client instance as ``app.state.paperless``, so
+    patching its methods affects real scans. Without this the upload goes to
+    ``localhost:9999``, spends about 3 s in retry backoff and ends ERROR, which is
+    neither the outcome under test nor fast enough to wait for. ``poll_task``
+    returning None is what success means since plan 23-04 (it raises on
+    failure). ``monkeypatch`` restores both methods at teardown.
+    """
+    paperless = browser_server.app.state.paperless
+
+    def _upload_document(*_args: object, **_kwargs: object) -> UploadResult:
+        return UploadResult(delivered_to_api=True, task_uuid="browser-test-task")
+
+    def _poll_task(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(paperless, "upload_document", _upload_document)
+    monkeypatch.setattr(paperless, "poll_task", _poll_task)
+
+
+class _ScanHarness(NamedTuple):
+    """What a test that runs real scans needs: the server and the jobs before it."""
+
+    server: _BrowserServer
+    job_store: JobStore
+    existing_job_ids: frozenset[str]
+
+    def created_job_ids(self) -> list[str]:
+        """Return the ids of jobs created since the harness was set up."""
+        return [
+            job.id
+            for job in self.job_store.list_recent(100)
+            if job.id not in self.existing_job_ids
+        ]
+
+
+_JOB_FINISH_TIMEOUT = 30.0
+"""How long teardown waits for a scan a test started to reach a terminal state."""
+
+
+@pytest.fixture
+def scan_harness(
+    browser_server: _BrowserServer,
+    delivering_paperless: None,
+    wait_for_state: Callable[..., Job],
+) -> Iterator[_ScanHarness]:
+    """
+    Let a test run real scans, then put the session-scoped server back to idle.
+
+    Depends on ``delivering_paperless`` so its teardown runs first: every job
+    is finished while uploads are still stubbed. The teardown opens the scanner
+    gate, waits for every job the test created to reach a terminal state, then
+    deletes those rows and clears the worker's pointer, the same discipline as
+    ``fallback_page`` -- otherwise the most-recent-job fallback would show this
+    test's job on every later test's supposedly idle page.
+    """
+    job_store: JobStore = browser_server.app.state.job_store
+    harness = _ScanHarness(
+        server=browser_server,
+        job_store=job_store,
+        existing_job_ids=frozenset(job.id for job in job_store.list_recent(100)),
+    )
+    try:
+        yield harness
+    finally:
+        browser_server.scanner.gate.set()
+        created = harness.created_job_ids()
+        try:
+            for job_id in created:
+                wait_for_state(
+                    job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT
+                )
+        finally:
+            for job_id in created:
+                job_store.delete_job(job_id)
+            browser_server.app.state.worker._current_job_id = None
 
 
 @pytest.mark.browser
@@ -477,6 +590,133 @@ class TestFlipPromptUI:
             job_store.delete_job(job.id)
 
 
+_COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').length"
+
+# Counts htmx:afterRequest for the two selects that load on page load. htmx
+# 2.0.8 strips hx-disabled-elt's `disabled` inside the request's onload handler,
+# before it fires afterRequest, so once both events have fired the inheritance
+# trap has either sprung or it has not. Registered as an init script so the
+# listener exists before htmx issues the load requests.
+_RECORD_LOAD_REQUESTS = """
+window.__selectLoadsFinished = 0;
+document.addEventListener("htmx:afterRequest", (event) => {
+    const id = event.detail.elt && event.detail.elt.id;
+    if (id === "tags-select" || id === "correspondent-select") {
+        window.__selectLoadsFinished += 1;
+    }
+});
+"""
+
+
+@pytest.mark.browser
+class TestServerOwnedScanButton:
+    """
+    The Scan button through a real scan, in Chromium (ROBU-04, ROBU-11).
+
+    C-10 shipped because its fix was proven by reading: the button's state had
+    two owners, the server's template and a client script, and they disagreed.
+    The script is gone and the server re-renders the button out of band with
+    every status response. These tests drive real scans through the live worker
+    and watch the button the user sees.
+    """
+
+    def _assert_released(self, page: Page) -> None:
+        """Assert the terminal state: one enabled ``Scan`` button, not busy."""
+        scan_btn = page.locator("#scan-btn")
+        expect(scan_btn).to_be_enabled()
+        assert (scan_btn.text_content() or "").strip() == "Scan"
+        assert scan_btn.get_attribute("aria-busy") is None
+        assert page.evaluate(_COUNT_ARRAY_SCAN_BUTTONS) == 1
+
+    def test_scan_button_re_enables_after_a_real_scan(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        Click Scan, reach DONE, and the button is usable again (B5, ROBU-11, C-10).
+
+        This is roadmap success criterion 5 as a test: clicking Scan in a real
+        browser, waiting for the terminal status, and finding the button enabled
+        again -- with no app script on the page, and exactly one button, so the
+        release is the server's out-of-band render and not a duplicate.
+        """
+        page.goto(scan_harness.server.url)
+        assert page.locator("script[src*='app.js']").count() == 0
+
+        page.locator("#scan-btn").click()
+
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+        self._assert_released(page)
+
+    def test_scan_button_shows_busy_while_the_job_is_held(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        While a scan is in flight the button is disabled and busy (B6, ROBU-04).
+
+        The gate holds the job in SCANNING, so the out-of-band button every
+        poll delivers has to say so; releasing the gate then has to give the
+        button back.
+        """
+        scanner = scan_harness.server.scanner
+        page.goto(scan_harness.server.url)
+        scanner.gate.clear()
+        try:
+            page.locator("#scan-btn").click()
+
+            scan_btn = page.locator("#scan-btn")
+            expect(scan_btn).to_be_disabled(timeout=3_000)
+            expect(scan_btn).to_have_attribute("aria-busy", "true", timeout=3_000)
+            expect(scan_btn).to_have_text("Scanning…", timeout=3_000)
+            assert page.evaluate(_COUNT_ARRAY_SCAN_BUTTONS) == 1
+        finally:
+            scanner.gate.set()
+
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+        self._assert_released(page)
+
+    def test_page_loaded_during_an_active_job_keeps_the_button_disabled(
+        self,
+        page: Page,
+        scan_harness: _ScanHarness,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A page opened mid-scan keeps Scan disabled after its selects load (B7).
+
+        The form carries ``hx-disabled-elt="#scan-btn"``. Without
+        ``hx-disinherit`` the tags and correspondents selects inherit it, and on
+        htmx 2.0.8 finishing their load requests strips ``disabled`` from the
+        button the server rendered disabled -- C-10 again, on every page load
+        during a scan (T-26-48).
+        """
+        server = scan_harness.server
+        server.scanner.gate.clear()
+        try:
+            response = httpx.post(server.url + "/api/scan", data={"profile": "default"})
+            assert response.status_code == 200, response.text
+            created = scan_harness.created_job_ids()
+            assert len(created) == 1, created
+            wait_for_state(scan_harness.job_store, created[0], JobState.SCANNING)
+
+            page.add_init_script(_RECORD_LOAD_REQUESTS)
+            with (
+                page.expect_response(lambda r: "/api/tags" in r.url),
+                page.expect_response(lambda r: "/api/correspondents" in r.url),
+            ):
+                page.goto(server.url)
+            page.wait_for_function("window.__selectLoadsFinished >= 2")
+
+            # Read once, without retrying. expect(...).to_be_disabled() polls for
+            # up to 5 s, and the status poll re-renders the button disabled
+            # every second, so a retrying check waits out the trap and passes
+            # with it sprung -- observed with hx-disinherit removed.
+            assert page.locator("#scan-btn").is_disabled(), (
+                "a page load during an active scan re-enabled the Scan button"
+            )
+        finally:
+            server.scanner.gate.set()
+
+
 # Builds one <p> per status class, reads the colour the cascade actually
 # resolved, and removes it again. Reading all three from the same live page is
 # the only way to compare them: only one status renders at a time, so there is
@@ -493,18 +733,6 @@ _PROBE_STATUS_COLOURS = """
         probe.remove();
     }
     return out;
-}
-"""
-
-# Mimics what app.js does on htmx:beforeRequest, so the afterSwap handler has
-# something to undo. Calling the real handler is not possible from a test: it
-# lives inside an IIFE and exposes no globals, by design.
-_DISABLE_SCAN_BUTTON = """
-() => {
-    const btn = document.getElementById("scan-btn");
-    btn.disabled = true;
-    btn.setAttribute("aria-busy", "true");
-    btn.textContent = "Scanning\\u2026";
 }
 """
 
@@ -817,23 +1045,23 @@ class TestFallbackStatusRendering:
         scheme: Literal["light", "dark"],
     ) -> None:
         """
-        A fallback swap releases the Scan button (T-23-23).
+        A fallback swap releases a stale disabled Scan button (T-23-23, ROBU-04).
 
-        Before `.status-fallback` joined the `htmx:afterSwap` condition the
-        button stayed disabled until the user reloaded the page -- a successful
-        scan that looked like a locked-up application. A grep cannot prove the
-        handler fires; this drives a real swap and watches the button.
+        A FALLBACK is a finished scan, so a button still disabled when it lands
+        would look like a locked-up application. What releases it now is the
+        server's out-of-band button in the status response, not JavaScript:
+        the page carries no app script, so the only thing that can re-enable a
+        button forced disabled here is the swapped-in server render.
         """
         self._goto(fallback_page, browser_server.url, scheme)
-        fallback_page.evaluate(_DISABLE_SCAN_BUTTON)
+        fallback_page.evaluate("document.getElementById('scan-btn').disabled = true")
         assert fallback_page.locator("#scan-btn").is_disabled()
 
         fallback_page.evaluate(_SWAP_STATUS_AREA)
         fallback_page.wait_for_selector("#scan-btn:not([disabled])")
         scan_btn = fallback_page.locator("#scan-btn")
-        assert not scan_btn.is_disabled()
-        assert scan_btn.get_attribute("aria-busy") == "false"
-        assert scan_btn.inner_text() == "Scan"
+        assert (scan_btn.text_content() or "").strip() == "Scan"
+        assert scan_btn.get_attribute("aria-busy") is None
 
     def test_fallback_swap_refreshes_the_history_table(
         self, fallback_page: Page, browser_server: _BrowserServer
