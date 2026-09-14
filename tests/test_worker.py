@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
 from typing import TYPE_CHECKING
 
+import pytest
 from PIL import Image, ImageDraw
 
 from saneless import worker as worker_module
@@ -31,6 +33,7 @@ from saneless.vocabulary import (
     FlipOutcome,
     ScanOutcome,
     SubmitResult,
+    classify_error,
 )
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import scan_batch
@@ -39,8 +42,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
     from unittest.mock import MagicMock
-
-    import pytest
 
     from saneless.pipeline import PipelineRequest
     from saneless.scanner.base import ScanSettings
@@ -1776,6 +1777,419 @@ class TestWorkerStopAndSubmit:
         assert scanner.scan_calls == 1
 
 
+# The error text every simulated job store failure below carries.
+_DISK_ERROR = "disk I/O error"
+
+# The idle tick the guard tests run at, so housekeeping gets a turn many times
+# inside a test instead of once every five seconds.
+_FAST_TICK = 0.02
+
+
+class _StoreFault:
+    """
+    A job store method that raises ``sqlite3.OperationalError`` on chosen calls.
+
+    Every call is recorded.  A call whose 1-based number is in ``fail_calls``
+    raises -- or every call does, when ``fail_calls`` is ``None`` -- until
+    :meth:`heal` is called; the rest delegate to the real method, so the row
+    the worker writes is the row the test reads back.
+
+    Args:
+        original: The bound store method being replaced.
+        fail_calls: Which calls raise, or ``None`` for all of them.
+
+    """
+
+    def __init__(
+        self,
+        original: Callable[..., object],
+        fail_calls: frozenset[int] | None = None,
+    ) -> None:
+        """Wrap ``original``, failing on ``fail_calls`` until healed."""
+        self._original = original
+        self._fail_calls = fail_calls
+        self._healed = threading.Event()
+        self._lock = threading.Lock()
+        self._calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    @property
+    def calls(self) -> list[tuple[tuple[object, ...], dict[str, object]]]:
+        """A snapshot of every call so far, as ``(args, kwargs)``."""
+        with self._lock:
+            return list(self._calls)
+
+    def heal(self) -> None:
+        """Stop raising: every later call delegates to the real method."""
+        self._healed.set()
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        """Record the call, then raise or delegate."""
+        with self._lock:
+            self._calls.append((args, kwargs))
+            number = len(self._calls)
+        failing = self._fail_calls is None or number in self._fail_calls
+        if failing and not self._healed.is_set():
+            raise sqlite3.OperationalError(_DISK_ERROR)
+        return self._original(*args, **kwargs)
+
+
+def _wait_until(predicate: Callable[[], bool], budget: float) -> bool:
+    """
+    Poll ``predicate`` until it holds or ``budget`` seconds pass.
+
+    Returns:
+        Whether the predicate held before the budget ran out.
+
+    """
+    deadline = time.monotonic() + budget
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+def _worker_records(
+    caplog: pytest.LogCaptureFixture, level: int, text: str
+) -> list[logging.LogRecord]:
+    """Return the ``saneless.worker`` records at ``level`` whose message has ``text``."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "saneless.worker"
+        and record.levelno == level
+        and text in record.getMessage()
+    ]
+
+
+@pytest.fixture(name="worker_for")
+def _worker_for_fixture(
+    mock_scanner: MagicMock,
+    mock_paperless: MagicMock,
+    default_settings: Settings,
+) -> Callable[[JobStore], ScanWorker]:
+    """
+    Build unstarted workers over the shared scanner, Paperless and settings mocks.
+
+    Returns:
+        A factory taking the job store the worker writes to.
+
+    """
+
+    def build(store: JobStore) -> ScanWorker:
+        return ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+
+    return build
+
+
+class TestWorkerGuard:
+    """
+    No exception from the pipeline, the job store or prune ends the worker.
+
+    C-09 found the loop unguarded: a raise from ``update_state``, from the
+    failure-path ``finish_job`` or from the per-job ``prune`` ended the thread
+    silently, and every later scan sat PENDING until restart.  ROBU-01 guards
+    the loop; D-10 keeps a pipeline failure a job failure and makes a failure
+    of the loop's own store writes a loop failure; D-13 moves prune out of the
+    job path onto an hourly idle tick.  Each test proves the worker survived by
+    finishing a later job, not by reading ``is_alive`` alone.
+    """
+
+    def test_a_failed_scanning_write_does_not_end_the_worker(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """ROBU-01, C-09: a raise from ``update_state`` is logged and survived."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        fault = _StoreFault(store.update_state, frozenset({1}))
+        monkeypatch.setattr(store, "update_state", fault)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            first = store.create_job("default", "Store Fails")
+            worker.submit(first)
+            failed = wait_for_state(store, first.id, TERMINAL_STATES, _STATE_BUDGET)
+            second = store.create_job("default", "After The Failure")
+            worker.submit(second)
+            finished = wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
+            alive = worker.is_alive
+        finally:
+            worker.stop()
+            store.close()
+
+        assert failed.state is JobState.ERROR
+        assert finished.state is JobState.DONE
+        assert alive
+        records = _worker_records(caplog, logging.ERROR, first.id)
+        assert records
+        assert records[0].exc_info is not None
+
+    def test_a_failed_error_write_after_a_pipeline_failure_does_not_end_the_worker(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        ROBU-01, D-10: the failure-path ``finish_job`` raising is a loop failure.
+
+        The pipeline fails job 1; recording that failure raises once.  The guard
+        logs it and its own best-effort write lands the ERROR, and job 2 runs.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        runs: list[str] = []
+
+        def failing_once(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            runs.append(request.job_id)
+            if len(runs) == 1:
+                msg = "Scanner jammed"
+                raise ScanError(msg)
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing_once)
+        store = JobStore()
+        fault = _StoreFault(store.finish_job, frozenset({1}))
+        monkeypatch.setattr(store, "finish_job", fault)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            first = store.create_job("default", "Unrecordable Failure")
+            worker.submit(first)
+            failed = wait_for_state(store, first.id, TERMINAL_STATES, _STATE_BUDGET)
+            second = store.create_job("default", "After The Failure")
+            worker.submit(second)
+            finished = wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
+            alive = worker.is_alive
+        finally:
+            worker.stop()
+            store.close()
+
+        assert failed.state is JobState.ERROR
+        assert failed.error is not None
+        assert finished.state is JobState.DONE
+        assert alive
+        records = _worker_records(caplog, logging.ERROR, first.id)
+        assert any(record.exc_info is not None for record in records)
+
+    def test_a_prune_failure_never_fails_a_job(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """ROBU-01, D-13: a raising prune is logged, and jobs around it finish."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        fault = _StoreFault(store.prune, frozenset({1}))
+        monkeypatch.setattr(store, "prune", fault)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            pruned = _wait_until(lambda: len(fault.calls) >= 1, _STATE_BUDGET)
+            jobs = [store.create_job("default", f"Around Prune {n}") for n in (1, 2)]
+            for job in jobs:
+                worker.submit(job)
+            finished = [
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+                for job in jobs
+            ]
+            alive = worker.is_alive
+        finally:
+            worker.stop()
+            store.close()
+
+        assert pruned
+        assert [job.state for job in finished] == [JobState.DONE, JobState.DONE]
+        assert alive
+        records = _worker_records(caplog, logging.ERROR, "Idle history prune failed")
+        assert records
+        assert records[0].exc_info is not None
+
+    def test_pipeline_failures_are_job_failures_not_loop_failures(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """D-10: three pipeline failures in a row are three ERROR jobs, and no more."""
+
+        def failing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
+            msg = "Scanner jammed"
+            raise ScanError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing_pipeline)
+        store = JobStore()
+        worker = worker_for(store)
+        try:
+            worker.start()
+            jobs = [store.create_job("default", f"Jammed {n}") for n in (1, 2, 3)]
+            for job in jobs:
+                worker.submit(job)
+            finished = [
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+                for job in jobs
+            ]
+            loop_failures = worker._consecutive_loop_failures
+            alive = worker.is_alive
+        finally:
+            worker.stop()
+            store.close()
+
+        assert [job.state for job in finished] == [JobState.ERROR] * 3
+        assert loop_failures == 0
+        assert alive
+
+    def test_idle_worker_prunes_history_on_its_interval(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D-13: an idle worker prunes with the configured limits once due."""
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
+        store = JobStore()
+        spy = _StoreFault(store.prune, frozenset())
+        monkeypatch.setattr(store, "prune", spy)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            pruned = _wait_until(lambda: len(spy.calls) >= 1, 1.0)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert pruned
+        output = worker._settings.output
+        assert spy.calls[0] == (
+            (output.history_retention_days, output.history_max_rows),
+            {},
+        )
+
+    def test_idle_worker_does_not_prune_before_the_interval(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D-13: the idle prune is hourly, not every tick."""
+        assert worker_module._PRUNE_INTERVAL_SECONDS >= 3600.0
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        spy = _StoreFault(store.prune, frozenset())
+        monkeypatch.setattr(store, "prune", spy)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            # A bounded window in which nothing may happen: ten idle ticks.
+            time.sleep(10 * _FAST_TICK)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert spy.calls == []
+
+    def test_the_guard_records_the_failure_it_could_not_hide(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        ROBU-01, research Pitfall 6: a job whose SCANNING write failed still ends.
+
+        The guard makes one best-effort ``finish_job`` with the failure's own
+        text and category, so the row does not sit active until restart.
+        """
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        monkeypatch.setattr(store, "update_state", _StoreFault(store.update_state))
+        spy = _StoreFault(store.finish_job, frozenset())
+        monkeypatch.setattr(store, "finish_job", spy)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = store.create_job("default", "Never Scanning")
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        expected_category = classify_error(sqlite3.OperationalError(_DISK_ERROR))
+        assert spy.calls == [
+            (
+                (job.id, JobState.ERROR),
+                {"error": _DISK_ERROR, "error_category": expected_category},
+            )
+        ]
+        assert finished.state is JobState.ERROR
+        assert finished.error == _DISK_ERROR
+
+    def test_a_failed_best_effort_write_is_only_logged(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """ROBU-01: when the guard's own write raises too, the worker still goes on."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        updates = _StoreFault(store.update_state, frozenset({1}))
+        finishes = _StoreFault(store.finish_job, frozenset({1}))
+        monkeypatch.setattr(store, "update_state", updates)
+        monkeypatch.setattr(store, "finish_job", finishes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            first = store.create_job("default", "Twice Unrecordable")
+            second = store.create_job("default", "After Both Failures")
+            worker.submit(first)
+            worker.submit(second)
+            finished = wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
+            alive = worker.is_alive
+            stranded = _get(store, first.id)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert finished.state is JobState.DONE
+        assert alive
+        assert len(finishes.calls) == 2
+        # Still active: only the recovery probe (D-12) reconciles this row.
+        assert stranded.is_active
+        records = _worker_records(caplog, logging.WARNING, first.id)
+        assert records
+        assert records[0].exc_info is not None
+
+
 # Rounds each thread runs in the profile lock stress test.
 _PROFILE_LOCK_ROUNDS = 200
 
@@ -2264,14 +2678,22 @@ class TestWorkerEnumDispatch:
         finally:
             store.close()
 
-    def test_worker_prunes_after_job_completion(
+    def test_worker_makes_no_prune_call_in_the_job_path(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
-        """Worker calls job_store.prune() after each job completes."""
+        """
+        D-13: a completed job is not followed by a prune.
+
+        Prune runs on the idle tick instead, so a prune failure can never fail
+        a job (ROBU-01).  The prune interval stays at its hourly default, and
+        stop() joins the thread, so the job's ``finally`` has run before the
+        spy is read.
+        """
         prune_calls: list[tuple[int, int]] = []
         store = JobStore()
         try:
@@ -2291,15 +2713,11 @@ class TestWorkerEnumDispatch:
             worker.start()
             job = store.create_job("default", "Prune Test")
             worker.submit(job)
-            time.sleep(0.5)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
 
-            assert len(prune_calls) >= 1
-            # Verify it used settings values
-            assert prune_calls[0] == (
-                default_settings.output.history_retention_days,
-                default_settings.output.history_max_rows,
-            )
+            assert finished.state is JobState.DONE
+            assert prune_calls == []
         finally:
             store.close()
 
@@ -2548,7 +2966,7 @@ class TestWorkerFinish:
         finally:
             store.close()
 
-    def test_finish_prunes_history_after_a_fallback_outcome(
+    def test_finish_clears_the_job_without_a_prune_after_a_fallback_outcome(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
@@ -2556,9 +2974,16 @@ class TestWorkerFinish:
         monkeypatch: pytest.MonkeyPatch,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """The finally block still runs on the new terminal path (STOR-05)."""
+        """
+        The ``finally`` still clears the current job on FALLBACK, and prunes nothing.
+
+        STOR-05's history bound is kept by the idle-tick prune now (D-13), so
+        the terminal path of any outcome makes no prune call.
+        """
         store = JobStore()
+        prune_spy = _StoreFault(store.prune, frozenset())
         try:
+            monkeypatch.setattr(store, "prune", prune_spy)
             monkeypatch.setattr(
                 "saneless.worker.run_pipeline",
                 lambda *_args, **_kwargs: _fallback_result(),
@@ -2572,5 +2997,6 @@ class TestWorkerFinish:
             worker.stop()
 
             assert worker.current_job_id is None
+            assert prune_spy.calls == []
         finally:
             store.close()
