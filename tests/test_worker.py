@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING
+
+from PIL import Image, ImageDraw
 
 from saneless.config import ProfileConfig, Settings
 from saneless.exceptions import (
@@ -15,9 +18,15 @@ from saneless.exceptions import (
 )
 from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
 from saneless.pipeline import PipelineEvent, ScanResult
-from saneless.scanner.base import DeviceCapabilities, DeviceInfo
+from saneless.scanner.base import (
+    DeviceCapabilities,
+    DeviceInfo,
+    ScanBatch,
+    ScannerBackend,
+)
 from saneless.vocabulary import TERMINAL_STATES, FlipOutcome, ScanOutcome
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
+from tests.conftest import scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -27,6 +36,7 @@ if TYPE_CHECKING:
     import pytest
 
     from saneless.pipeline import PipelineRequest
+    from saneless.scanner.base import ScanSettings
 
 
 def _get(store: JobStore, job_id: str) -> Job:
@@ -880,99 +890,218 @@ class TestWorkerErrorCategories:
             store.close()
 
 
-class TestWorkerFlipTiming:
-    """Worker flip timing synchronization tests."""
+# How long the gated scanner below holds pass B if a test never releases it.
+# A safety net only: every test here releases the gate itself.  It is kept
+# below ScanWorker.stop()'s 5 s join and far below pytest-timeout's 60 s
+# SIGALRM, so a broken test fails with its own wait_for_state message rather
+# than a traceback delivered to the main thread.
+_PASS_B_GATE_CEILING = 4.0
 
-    def test_wait_transition_returns_true(
+# The wait_for_state budget for the tests below: generous against a worker that
+# only has to write a row, and far below pytest-timeout's 60 s ceiling.
+_STATE_BUDGET = 2.0
+
+
+def _inked_page() -> Image.Image:
+    """
+    Draw a page with enough ink that the real empty-page filter keeps it.
+
+    Returns:
+        A clearly non-blank RGB image.
+
+    """
+    page = Image.new("RGB", (120, 160), "white")
+    ImageDraw.Draw(page).rectangle((10, 10, 110, 150), fill="black")
+    return page
+
+
+class _PassBGatedScanner(ScannerBackend):
+    """
+    A scanner whose second ``scan_pages`` call waits for the test to release it.
+
+    Without the gate, pass B returns in microseconds and ``SCANNING_REVERSE`` is
+    an instantaneous transition no poll can ever observe.  Holding pass B open
+    on a test-held ``Event`` turns it into a state the store genuinely records
+    for as long as the test needs to look at it.
+
+    A concrete class rather than a ``MagicMock``, as this suite's fakes are: a
+    subclass of the ABC is caught by the type checkers when the backend
+    contract changes, and a mock is not.
+
+    Attributes:
+        release_pass_b: Set by the test to let pass B return.
+        scan_calls: How many times ``scan_pages`` has been entered.
+
+    """
+
+    def __init__(self) -> None:
+        """Start with pass B held."""
+        self.release_pass_b = threading.Event()
+        self.scan_calls = 0
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """Report no devices; the worker never asks when a device is configured."""
+        return []
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Report a feeder-only device.
+
+        Args:
+            device_id: Ignored.
+
+        Returns:
+            Capabilities naming a single feeder source.
+
+        """
+        return DeviceCapabilities(sources=["ADF"], resolutions=[300], modes=["color"])
+
+    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+        """
+        Return one inked page, holding the second and later calls on the gate.
+
+        Args:
+            device_id: Ignored.
+            settings: Ignored.
+
+        Returns:
+            A batch of one non-blank page.
+
+        """
+        self.scan_calls += 1
+        if self.scan_calls >= 2:
+            self.release_pass_b.wait(_PASS_B_GATE_CEILING)
+        return scan_batch([_inked_page()])
+
+
+def _manual_duplex_settings(settings: Settings) -> Settings:
+    """
+    Add a ``duplex = "manual"`` profile named ``duplex`` to ``settings``.
+
+    ``source`` is a real feeder name: it no longer selects the strategy.
+
+    Args:
+        settings: The fixture settings to extend in place.
+
+    Returns:
+        The same settings, for chaining.
+
+    """
+    settings.profiles["duplex"] = ProfileConfig(source="ADF", duplex="manual")
+    return settings
+
+
+class TestWorkerPassB:
+    """
+    Pass B through the real pipeline, observed from outside the worker (DPLX-06).
+
+    These run the real ``run_pipeline``: the flip wait, the pass-B event and the
+    state the worker persists for it are exactly what is under test, so stubbing
+    the pipeline would stub the subject.  Only the scanner and the paperless
+    client are fakes.
+    """
+
+    def test_pass_b_is_persisted_as_scanning_reverse(
         self,
-        mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
-        """wait_transition returns True when event fires within timeout."""
-        default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
-        monkeypatch.setattr(
-            "saneless.worker.run_pipeline", _mock_manual_duplex_pipeline
-        )
+        """While pass B is in flight the job row reads SCANNING_REVERSE."""
+        scanner = _PassBGatedScanner()
+        settings = _manual_duplex_settings(default_settings)
         store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
         try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
             worker.start()
-            job = store.create_job("duplex", "Timing Test")
+            job = store.create_job("duplex", "Pass B Visible")
             worker.submit(job)
-            for _ in range(50):
-                time.sleep(0.05)
-                if _get(store, job.id).state == JobState.AWAITING_FLIP:
-                    break
+
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
             worker.continue_flip()
-            result = worker.wait_transition(timeout=2.0)
-            assert result is True
-            worker.stop()
+
+            # Held open by the gate, so this is a state, not a blink.
+            during = wait_for_state(
+                store, job.id, JobState.SCANNING_REVERSE, _STATE_BUDGET
+            )
+            assert during.state is JobState.SCANNING_REVERSE
+
+            scanner.release_pass_b.set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
+            scanner.release_pass_b.set()
+            worker.stop()
             store.close()
 
-    def test_transition_event_is_clear_while_awaiting_flip(
+        assert finished.state is JobState.DONE
+        assert scanner.scan_calls == 2
+
+    def test_abort_at_the_flip_prompt_fails_the_job_before_pass_b(
         self,
-        mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
-        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """An Abort at the prompt ends the job ERROR, naming the flip prompt."""
+        scanner = _PassBGatedScanner()
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Aborted At Prompt")
+            worker.submit(job)
+
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.abort_flip()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert finished.state is JobState.ERROR
+        assert finished.error is not None
+        assert "flip prompt" in finished.error
+        # The abort was answered before pass B: the backs were never fed.
+        assert scanner.scan_calls == 1
+
+    def test_a_late_abort_after_continue_is_dropped(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        The transition event is CLEAR for the whole AWAITING_FLIP window (CTR-01).
+        D-16: an Abort arriving once pass B has begun changes nothing.
 
-        21-CONTEXT.md names the clear-before-write ordering as a concrete
-        instance of what "no behaviour change" means for this phase: the flip
-        window must read as "not busy" to the one-second web poll while a human
-        is being waited on.
-
-        This asserts the event state directly rather than only
-        wait_transition()'s return value.  Deleting the
-        `self._transition_event.clear()` in worker._status_cb makes this test
-        fail; it does not make test_wait_transition_returns_true fail, because
-        by then the event is already set from an earlier write.
+        The coordinator's first answer is final.  Pass B has genuinely started,
+        stopping it mid-pass is Phase 29's HARD-02, and so the job completes.
         """
-        default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
-        monkeypatch.setattr(
-            "saneless.worker.run_pipeline", _mock_manual_duplex_pipeline
-        )
+        scanner = _PassBGatedScanner()
+        settings = _manual_duplex_settings(default_settings)
         store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
         try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
             worker.start()
-            job = store.create_job("duplex", "Flip Window Test")
+            job = store.create_job("duplex", "Late Abort")
             worker.submit(job)
-            for _ in range(50):
-                time.sleep(0.05)
-                if _get(store, job.id).state == JobState.AWAITING_FLIP:
-                    break
-            assert _get(store, job.id).state == JobState.AWAITING_FLIP
 
-            # The job is parked on a human. Nothing is in flight, so the
-            # transition event must not be signalled.
-            assert worker.wait_transition(timeout=0.1) is False
-
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
             worker.continue_flip()
-            assert worker.wait_transition(timeout=2.0) is True
-            worker.stop()
+            wait_for_state(store, job.id, JobState.SCANNING_REVERSE, _STATE_BUDGET)
+
+            worker.abort_flip()
+            scanner.release_pass_b.set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
         finally:
+            scanner.release_pass_b.set()
+            worker.stop()
             store.close()
 
-    def test_wait_transition_timeout(
-        self,
-        mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
-    ) -> None:
-        """wait_transition returns False when timeout expires."""
-        store = JobStore()
-        try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
-            result = worker.wait_transition(timeout=0.1)
-            assert result is False
-        finally:
-            store.close()
+        assert finished.state is JobState.DONE
+        assert finished.error is None
+        assert scanner.scan_calls == 2
 
 
 class TestScanWorkerQueuing:
@@ -1539,36 +1668,37 @@ class TestWorkerFinish:
         finally:
             store.close()
 
-    def test_finish_signals_a_transition_for_a_fallback_outcome(
+    def test_finish_releases_a_poller_on_a_fallback_outcome(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
-        """A UI waiter is released on FALLBACK as it is on DONE (OUTC-02)."""
+        """
+        A UI poller is released on FALLBACK as it is on DONE (OUTC-02).
+
+        The web UI learns a job has ended only by re-reading its row, and stops
+        polling once that row is no longer active.  So the row is what this
+        waits on -- there is no worker-side signal to wait for any more.
+        """
         store = JobStore()
         try:
+            monkeypatch.setattr(
+                "saneless.worker.run_pipeline",
+                lambda *_args, **_kwargs: _fallback_result(),
+            )
             worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
-
-            def clearing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
-                # Clear as the pipeline's last act, so any set observed after
-                # this point can only be the worker's terminal write.  Waiting
-                # on the event rather than polling the row also removes the
-                # window between the finish_job commit and the set().
-                worker._transition_event.clear()
-                return _fallback_result()
-
-            monkeypatch.setattr("saneless.worker.run_pipeline", clearing_pipeline)
             worker.start()
 
             job = store.create_job("default", "Fallback Waiter")
             worker.submit(job)
-            assert worker.wait_transition(timeout=2.0) is True
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, 2.0)
             worker.stop()
 
-            fetched = _get(store, job.id)
-            assert fetched.state is JobState.FALLBACK
+            assert finished.state is JobState.FALLBACK
+            assert not finished.is_active
         finally:
             store.close()
 

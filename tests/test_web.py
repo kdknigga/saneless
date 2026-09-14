@@ -242,15 +242,47 @@ def test_cache_invalidate(client: TestClient) -> None:
 
 
 def test_flip_continue(client: TestClient) -> None:
-    """POST /api/flip/continue returns 200 (UI-03)."""
+    """
+    A Continue arriving after the job ended reports that job (UI-03, M-02).
+
+    The worker clears its current job id in ``_process_job``'s ``finally``, so
+    a click landing as the job ends finds no current job.  The route must fall
+    back to the most recent job, as the status poll does, rather than render
+    the idle copy for a job that plainly exists.
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="duplex", title="Flip Just Finished")
+    job_store.finish_job(job.id, JobState.DONE)
+    assert _app(client).state.worker.current_job_id is None
+
     response = client.post("/api/flip/continue")
+
     assert response.status_code == 200
+    assert "Done: Flip Just Finished" in response.text
+    assert "Ready to scan." not in response.text
 
 
 def test_flip_abort(client: TestClient) -> None:
-    """POST /api/flip/abort returns 200 (UI-03)."""
+    """
+    An Abort arriving after the job ended reports that job (UI-03, M-02).
+
+    Otherwise an abort that aborted nothing reports nothing either: the partial
+    would say "Ready to scan." while the job that timed out sits in history.
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="duplex", title="Flip Timed Out")
+    job_store.finish_job(
+        job.id,
+        JobState.ERROR,
+        error="Manual duplex flip wait timed out after 600 seconds",
+    )
+    assert _app(client).state.worker.current_job_id is None
+
     response = client.post("/api/flip/abort")
+
     assert response.status_code == 200
+    assert "Manual duplex flip wait timed out after 600 seconds" in response.text
+    assert "Ready to scan." not in response.text
 
 
 def test_paperless_test_connected(client: TestClient) -> None:
