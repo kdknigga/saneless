@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 24 verified (5/5, human_needed)
-last_updated: "2026-09-14T01:59:32.000Z"
-last_activity: 2026-09-13 -- Phase 24 verified 5/5 (3 human-verification items open)
+status: verifying
+stopped_at: Phase 25 context gathered
+last_updated: "2026-09-14T04:19:03.094Z"
+last_activity: 2026-09-13 -- Phase 24 verified
 progress:
   total_phases: 14
   completed_phases: 6
@@ -241,6 +241,6 @@ None yet.
 ## Session Continuity
 
 Last activity: 2026-09-13 - Phase 24 verified 5/5 via gsd-verifier; 24-VERIFICATION.md written
-Last session: 2026-09-14T01:59:32.000Z
-Stopped at: Phase 24 verified (5/5, human_needed)
-Resume file: None
+Last session: 2026-09-14T04:19:03.089Z
+Stopped at: Phase 25 context gathered
+Resume file: .planning/phases/25-manual-duplex/25-CONTEXT.md
