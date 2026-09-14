@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -44,18 +45,28 @@ from saneless.scanner.base import (
     ScanSettings,
 )
 from saneless.vocabulary import (
+    QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
+    WORKER_DEGRADED_JOB_ERROR,
+    WORKER_DOWN_JOB_ERROR,
+    ErrorCategory,
+    JobState,
     RequestRejection,
+    SubmitResult,
+    WorkerHealth,
     rejection_message,
     rejection_status_code,
 )
 from saneless.web import errors
 from saneless.web.app import create_app
+from saneless.worker import ScanWorker
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     import httpx
+
+    from saneless.job import Job, JobStore
 
 HTMX_HEADERS = {"HX-Request": "true"}
 
@@ -388,6 +399,238 @@ def test_unhandled_exception_is_500_and_logged_not_leaked(
     ]
     assert records
     assert all(r.exc_info is not None for r in records)
+
+
+# --- The production scan route: 422 before any row, 429 and 503 with one ------
+
+
+def _job_store(client: TestClient) -> JobStore:
+    """Return the served app's job store."""
+    app = client.app
+    assert isinstance(app, FastAPI)
+    return app.state.job_store
+
+
+def _worker(client: TestClient) -> ScanWorker:
+    """Return the served app's scan worker."""
+    app = client.app
+    assert isinstance(app, FastAPI)
+    return app.state.worker
+
+
+def _force_health(monkeypatch: pytest.MonkeyPatch, health: WorkerHealth) -> None:
+    """
+    Make every worker report ``health`` for the rest of the test.
+
+    Patching the property rather than setting the degraded Event keeps the
+    worker thread's idle recovery probe from clearing it mid-request.
+    """
+    monkeypatch.setattr(ScanWorker, "health", property(lambda _self: health))
+
+
+def _refuse_submit(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, result: SubmitResult
+) -> list[Job]:
+    """Make the worker refuse every submit with ``result``; return the offers."""
+    offered: list[Job] = []
+
+    def submit(job: Job) -> SubmitResult:
+        offered.append(job)
+        return result
+
+    monkeypatch.setattr(_worker(client), "submit", submit)
+    return offered
+
+
+def _assert_rejected_row(client: TestClient, error: str) -> None:
+    """Assert the newest job row records a rejected submit with ``error``."""
+    newest = _job_store(client).list_recent(limit=1)
+    assert len(newest) == 1
+    assert newest[0].state is JobState.ERROR
+    assert newest[0].error == error
+    assert newest[0].error_category is ErrorCategory.REJECTED
+
+
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_unknown_profile_is_422_without_a_row(
+    client: TestClient, *, htmx: bool
+) -> None:
+    """An unknown profile is refused before any job row exists (ROBU-08, D-19)."""
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    response = client.post(
+        "/api/scan",
+        data={"profile": f"{INPUT_MARKER}-<script>", "title": "Profile Test"},
+        headers=headers,
+    )
+    rejection = RequestRejection.UNKNOWN_PROFILE
+    if htmx:
+        _assert_htmx_error(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert INPUT_MARKER not in response.text
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_title_too_long_is_422_without_a_row(
+    client: TestClient, *, htmx: bool
+) -> None:
+    """A title over the cap is refused before any job row exists (ROBU-08)."""
+    title = (INPUT_MARKER * 29)[: TITLE_MAX_LENGTH + 1]
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    response = client.post(
+        "/api/scan", data={"profile": "default", "title": title}, headers=headers
+    )
+    rejection = RequestRejection.TITLE_TOO_LONG
+    if htmx:
+        _assert_htmx_error(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert INPUT_MARKER not in response.text
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_scan_title_at_the_cap_is_not_422(client: TestClient) -> None:
+    """A title exactly at the cap is accepted (ROBU-08)."""
+    title = "t" * TITLE_MAX_LENGTH
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": title},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert 'id="status-area"' in response.text
+
+
+def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full queue is a visible 429 that reloads history (ROBU-02, D-05)."""
+    _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Queue Full"},
+        headers=HTMX_HEADERS,
+    )
+    rejection = RequestRejection.QUEUE_FULL
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "30"
+    assert response.headers["HX-Retarget"] == "#status-message"
+    assert response.text.strip() == f"{_error_paragraph(rejection)}\n{HISTORY_LOADER}"
+    _assert_rejected_row(client, QUEUE_FULL_JOB_ERROR)
+
+
+def test_scan_queue_full_is_429_json(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-htmx submit refused by a full queue is JSON with Retry-After (D-04)."""
+    _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
+    response = client.post(
+        "/api/scan", data={"profile": "default", "title": "Queue Full"}
+    )
+    _assert_json_error(response, RequestRejection.QUEUE_FULL, 429)
+    assert response.headers["Retry-After"] == "30"
+    _assert_rejected_row(client, QUEUE_FULL_JOB_ERROR)
+
+
+@pytest.mark.parametrize(
+    ("result", "rejection", "error"),
+    [
+        (SubmitResult.DOWN, RequestRejection.WORKER_DOWN, WORKER_DOWN_JOB_ERROR),
+        (
+            SubmitResult.DEGRADED,
+            RequestRejection.WORKER_DEGRADED,
+            WORKER_DEGRADED_JOB_ERROR,
+        ),
+    ],
+    ids=["down", "degraded"],
+)
+def test_scan_refused_submit_is_503_with_a_rejected_row(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: SubmitResult,
+    rejection: RequestRejection,
+    error: str,
+) -> None:
+    """A submit refused as down or degraded is a 503 with a row (D-05, D-11)."""
+    _refuse_submit(client, monkeypatch, result)
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Refused"},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 503
+    assert "Retry-After" not in response.headers
+    assert response.text.strip() == f"{_error_paragraph(rejection)}\n{HISTORY_LOADER}"
+    _assert_rejected_row(client, error)
+
+
+@pytest.mark.parametrize(
+    ("health", "rejection", "error"),
+    [
+        (WorkerHealth.DOWN, RequestRejection.WORKER_DOWN, WORKER_DOWN_JOB_ERROR),
+        (
+            WorkerHealth.DEGRADED,
+            RequestRejection.WORKER_DEGRADED,
+            WORKER_DEGRADED_JOB_ERROR,
+        ),
+    ],
+    ids=["down", "degraded"],
+)
+def test_scan_unhealthy_worker_is_503_before_submit(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    health: WorkerHealth,
+    rejection: RequestRejection,
+    error: str,
+) -> None:
+    """An unhealthy worker refuses the scan without offering it the job (D-11)."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    _force_health(monkeypatch, health)
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Unhealthy"},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 503
+    assert response.text.strip() == f"{_error_paragraph(rejection)}\n{HISTORY_LOADER}"
+    assert offered == []
+    _assert_rejected_row(client, error)
+
+
+def test_scan_degraded_store_failing_is_503_without_a_loader(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rejection the store cannot record still renders, without a loader (D-05)."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    _force_health(monkeypatch, WorkerHealth.DEGRADED)
+    store = _job_store(client)
+
+    def failing_create_job(*_args: object, **_kwargs: object) -> Job:
+        msg = "disk I/O error"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(store, "create_job", failing_create_job)
+    with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Store Failing"},
+            headers=HTMX_HEADERS,
+        )
+    _assert_htmx_error(response, RequestRejection.WORKER_DEGRADED, 503)
+    assert "/api/jobs/history" not in response.text
+    assert offered == []
+    warnings = [
+        r
+        for r in caplog.records
+        if r.name == "saneless.web.routes" and r.levelno == logging.WARNING
+    ]
+    assert warnings
+    assert all(r.exc_info is not None for r in warnings)
 
 
 # --- The client half: htmx-config meta and the #status-message slot ----------
