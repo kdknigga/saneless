@@ -93,6 +93,11 @@ discussion — **D-18** — and it is called out where it appears.
     (`_resolve_device` only calls `get_devices()` when `scanner.device` is empty).
   - Rejected: keeping `source = "Manual Duplex"` and failing loudly with guidance. Most
     honest, but it conflicts with success criterion 1's "still loads **and scans**".
+  - **Amended 2026-09-14 (gap closure, WR-02, user-approved; implemented by plan 25-13):**
+    resolution prefers a `FEEDER` source; a named `FEEDER_DUPLEX` source is overridden with a
+    warning; when the device offers only `FEEDER_DUPLEX` sources, manual duplex is refused with
+    a `ScanError` pointing to `duplex = "hardware"`. A both-sided feeder under manual duplex
+    yields a green DONE for a scrambled document, so "either kind" was withdrawn.
 
 - **D-03: the translation lives in `ProfileConfig`, the named warning lives in `Settings`.**
   A `model_validator(mode="before")` on `ProfileConfig` performs the translation, so every
@@ -103,6 +108,11 @@ discussion — **D-18** — and it is called out where it appears.
   profiles and emits the deprecation warning **naming the profile**, once per load.
   - `ProfileConfig` cannot name itself — it does not know its own key — which is the whole
     reason the roles are split.
+  - **Amended 2026-09-14 (gap closure, WR-05, user-approved; implemented by plan 25-12):** the
+    named warning moves out of the `Settings` validator into
+    `warn_on_legacy_duplex_sources(settings)`, called by `cli()` after `configure_logging`, so
+    it reaches `log_file`. The translation stays in `ProfileConfig`. Constructing `Settings(...)`
+    directly in code no longer logs the warning — accepted.
   - Validators running after source merging is pydantic-settings' own contract (sources are
     merged into one dict, then the model validates). **Do not spend a test proving it.**
 
