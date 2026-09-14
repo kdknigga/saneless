@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from PIL import Image, ImageDraw
 
+from saneless import worker as worker_module
 from saneless.config import ProfileConfig, Settings
 from saneless.exceptions import (
     ConfigError,
@@ -24,7 +25,13 @@ from saneless.scanner.base import (
     ScanBatch,
     ScannerBackend,
 )
-from saneless.vocabulary import TERMINAL_STATES, FlipOutcome, ScanOutcome
+from saneless.vocabulary import (
+    RESTART_REASON,
+    TERMINAL_STATES,
+    FlipOutcome,
+    ScanOutcome,
+    SubmitResult,
+)
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import scan_batch
 
@@ -193,6 +200,7 @@ class TestScanWorker:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Submit job to worker -> job reaches DONE state."""
         store = JobStore()
@@ -209,8 +217,8 @@ class TestScanWorker:
             job = store.create_job("default", "Worker Test")
             worker.submit(job)
 
-            # Wait for processing
-            time.sleep(0.5)
+            # stop() abandons unstarted work (D-07), so wait for the row itself.
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
 
             fetched = _get(store, job.id)
@@ -224,6 +232,7 @@ class TestScanWorker:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Pipeline raises exception -> job state is ERROR with message."""
         store = JobStore()
@@ -244,7 +253,7 @@ class TestScanWorker:
             job = store.create_job("default", "Failing Test")
             worker.submit(job)
 
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
 
             fetched = _get(store, job.id)
@@ -350,6 +359,7 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """A manual duplex job waits on a coordinator that continue_flip answers."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -367,20 +377,15 @@ class TestScanWorkerManualDuplex:
             job = store.create_job("duplex", "Duplex Test")
             worker.submit(job)
 
-            # Wait for the pipeline to reach AWAITING_FLIP
-            for _ in range(50):
-                time.sleep(0.05)
-                fetched = _get(store, job.id)
-                if fetched.state == JobState.AWAITING_FLIP:
-                    break
-
-            fetched = _get(store, job.id)
+            fetched = wait_for_state(
+                store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET
+            )
             assert fetched.state == JobState.AWAITING_FLIP
 
             # Continue the flip
             worker.continue_flip(job.id)
 
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
             worker.stop()
 
             fetched = _get(store, job.id)
@@ -394,6 +399,7 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """abort_flip(job.id) answers the coordinator ABORTED; the pipeline raises."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -411,16 +417,10 @@ class TestScanWorkerManualDuplex:
             job = store.create_job("duplex", "Abort Test")
             worker.submit(job)
 
-            # Wait for AWAITING_FLIP
-            for _ in range(50):
-                time.sleep(0.05)
-                fetched = _get(store, job.id)
-                if fetched.state == JobState.AWAITING_FLIP:
-                    break
-
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
             worker.abort_flip(job.id)
 
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
             worker.stop()
 
             fetched = _get(store, job.id)
@@ -436,6 +436,7 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker stores thumbnail on job via JobStore when thumbnail_callback fires."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
@@ -453,18 +454,14 @@ class TestScanWorkerManualDuplex:
             job = store.create_job("duplex", "Thumb Store Test")
             worker.submit(job)
 
-            # Wait for AWAITING_FLIP (thumbnail should be stored by now)
-            for _ in range(50):
-                time.sleep(0.05)
-                fetched = _get(store, job.id)
-                if fetched.state == JobState.AWAITING_FLIP:
-                    break
-
-            fetched = _get(store, job.id)
+            # Thumbnail should be stored by the time AWAITING_FLIP is written.
+            fetched = wait_for_state(
+                store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET
+            )
             assert fetched.thumbnail == "dGh1bWI="
 
             worker.continue_flip(job.id)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
             worker.stop()
         finally:
             store.close()
@@ -475,6 +472,7 @@ class TestScanWorkerManualDuplex:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Non-duplex jobs carry no flip coordinator."""
         captured_request: dict[str, object] = {}
@@ -502,7 +500,7 @@ class TestScanWorkerManualDuplex:
             job = store.create_job("default", "Simplex Test")
             worker.submit(job)
 
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
 
             assert captured_request["flip_coordinator"] is None
@@ -793,6 +791,7 @@ class TestWorkerIntermediateStates:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker sets ASSEMBLING when pipeline emits 'Assembling PDF...'."""
         states_seen: list[str] = []
@@ -828,7 +827,7 @@ class TestWorkerIntermediateStates:
             worker.start()
             job = store.create_job("default", "Assembling Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
             assert JobState.ASSEMBLING in states_seen
         finally:
@@ -840,6 +839,7 @@ class TestWorkerIntermediateStates:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker sets UPLOADING when pipeline emits 'Uploading to paperless-ngx...'."""
         states_seen: list[str] = []
@@ -875,7 +875,7 @@ class TestWorkerIntermediateStates:
             worker.start()
             job = store.create_job("default", "Uploading Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
             assert JobState.UPLOADING in states_seen
         finally:
@@ -891,6 +891,7 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """FeederEmptyError sets ErrorCategory.FEEDER."""
 
@@ -905,7 +906,7 @@ class TestWorkerErrorCategories:
             worker.start()
             job = store.create_job("default", "Feeder Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
             fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.FEEDER
@@ -918,6 +919,7 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """ScanError sets ErrorCategory.SCANNER."""
 
@@ -932,7 +934,7 @@ class TestWorkerErrorCategories:
             worker.start()
             job = store.create_job("default", "Scanner Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
             fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.SCANNER
@@ -945,6 +947,7 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """PaperlessError sets ErrorCategory.UPLOAD."""
 
@@ -959,7 +962,7 @@ class TestWorkerErrorCategories:
             worker.start()
             job = store.create_job("default", "Upload Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
             fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.UPLOAD
@@ -972,6 +975,7 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """ConfigError sets ErrorCategory.CONFIG."""
 
@@ -986,7 +990,7 @@ class TestWorkerErrorCategories:
             worker.start()
             job = store.create_job("default", "Config Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
             fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.CONFIG
@@ -999,6 +1003,7 @@ class TestWorkerErrorCategories:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Generic Exception sets ErrorCategory.UNKNOWN."""
 
@@ -1013,7 +1018,7 @@ class TestWorkerErrorCategories:
             worker.start()
             job = store.create_job("default", "Unknown Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
             fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.UNKNOWN
@@ -1493,6 +1498,284 @@ class TestFlipSignalsAreJobScoped:
         ]
 
 
+# The queue depth ScanWorker keeps (not configurable).  Restated here so a
+# change to it has to be made on purpose in both places.
+_QUEUE_DEPTH = 10
+
+
+def _fill_the_queue(worker: ScanWorker, store: JobStore) -> list[SubmitResult]:
+    """
+    Submit enough jobs to fill the worker's queue, reporting each result.
+
+    The caller must already hold a job inside ``scan_pages``, so the queue is
+    empty when this starts and every one of these submits waits in it.
+
+    Args:
+        worker: A started worker whose current job is held.
+        store: The worker's job store, which creates the rows.
+
+    Returns:
+        What ``submit`` reported for each of the ``_QUEUE_DEPTH`` jobs.
+
+    """
+    return [
+        worker.submit(store.create_job("default", f"Queued {n}"))
+        for n in range(_QUEUE_DEPTH)
+    ]
+
+
+class TestWorkerStopAndSubmit:
+    """
+    Stopping is a flag, bounded and reported; submitting never blocks.
+
+    C-09 found two ways a full queue hung the service: ``submit`` blocked a
+    request thread on ``put``, and ``stop`` blocked shutdown on putting its
+    ``None`` sentinel.  D-07 replaces the sentinel with a stop flag and a queue
+    shutdown, D-08 bounds the join at five seconds and reports whether the
+    thread stopped, and ROBU-02 makes ``submit`` report ``QUEUE_FULL`` or
+    ``DOWN`` instead of waiting.  ROBU-03: every wait below is on a state, a
+    staged gate, or a bounded clock -- none relies on ``stop`` draining work.
+    """
+
+    def test_an_idle_worker_stops_at_once(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """
+        D-07: an idle worker's stop() wakes the loop, not the idle tick.
+
+        The idle tick is left at its default, far above the bound asserted
+        here, so only the queue shutdown can explain a prompt return.
+        """
+        assert worker_module._IDLE_TICK_SECONDS >= 5.0
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            started = time.monotonic()
+            stopped = worker.stop()
+            elapsed = time.monotonic() - started
+        finally:
+            worker.stop()
+            store.close()
+
+        assert stopped is True
+        assert elapsed < 0.5
+        assert not worker.is_alive
+
+    def test_stop_is_safe_twice_and_before_start(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """D-08: stop() reports True for a stopped thread, however it got there."""
+        store = JobStore()
+        never_started = ScanWorker(
+            mock_scanner, mock_paperless, default_settings, store
+        )
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            assert never_started.stop() is True
+            worker.start()
+            assert worker.stop() is True
+            assert worker.stop() is True
+        finally:
+            worker.stop()
+            store.close()
+
+    def test_submit_reports_down_before_start_and_after_stop(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """ROBU-02: a worker that cannot take work says so instead of queueing."""
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            before = worker.submit(store.create_job("default", "Too Early"))
+            worker.start()
+            worker.stop()
+            after = worker.submit(store.create_job("default", "Too Late"))
+        finally:
+            worker.stop()
+            store.close()
+
+        assert before is SubmitResult.DOWN
+        assert after is SubmitResult.DOWN
+
+    def test_a_full_queue_is_reported_without_blocking(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """
+        C-09 / ROBU-02: the submit that finds no room returns QUEUE_FULL at once.
+
+        Job 1 is held inside ``scan_pages``, so the queue is empty when the
+        next ten arrive; they fill it, and the eleventh has nowhere to go.
+        """
+        scanner = _GatedScanner(frozenset({1}))
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            first = worker.submit(store.create_job("default", "Held"))
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+
+            queued = _fill_the_queue(worker, store)
+            started = time.monotonic()
+            overflow = worker.submit(store.create_job("default", "No Room"))
+            elapsed = time.monotonic() - started
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        assert first is SubmitResult.ACCEPTED
+        assert queued == [SubmitResult.ACCEPTED] * _QUEUE_DEPTH
+        assert overflow is SubmitResult.QUEUE_FULL
+        assert elapsed < 0.1
+
+    def test_stop_on_a_full_queue_is_bounded_and_reports_false(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        C-09 / D-08: a full queue cannot hold stop(), and a stuck join says so.
+
+        Job 1 stays held past the (shortened) join, so the thread is still
+        alive when stop() gives up: it must return False within its bound
+        rather than block on the full queue.  Once the gate opens the thread
+        finishes job 1 and exits without starting the queued ones (D-07).
+        """
+        monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
+        scanner = _GatedScanner(frozenset({1}))
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            worker.submit(store.create_job("default", "Held"))
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+            _fill_the_queue(worker, store)
+
+            started = time.monotonic()
+            stopped = worker.stop()
+            elapsed = time.monotonic() - started
+        finally:
+            scanner.release_all()
+            # Joined here, not through stop(), whose join is shortened: the
+            # store must not close under a thread still finishing job 1.
+            worker._thread.join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+            exited = not worker.is_alive
+            store.close()
+
+        assert stopped is False
+        assert elapsed < 1.0
+        assert exited
+        assert scanner.scan_calls == 1
+
+    def test_stop_aborts_an_open_flip_wait_with_the_restart_reason(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        D-07: a job waiting at the flip prompt does not hold shutdown.
+
+        stop() answers the open wait with Abort, so the thread exits at once
+        rather than after ``flip_timeout_seconds``.  The row records that the
+        server stopped the scan, not that the operator aborted it.
+        """
+        scanner = _PassBGatedScanner()
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Stopped At Prompt")
+            worker.submit(job)
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+
+            started = time.monotonic()
+            stopped = worker.stop()
+            elapsed = time.monotonic() - started
+            finished = _get(store, job.id)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert stopped is True
+        assert elapsed < 1.0
+        assert finished.state is JobState.ERROR
+        assert finished.error == RESTART_REASON
+        assert finished.error_category is None
+        assert scanner.scan_calls == 1
+
+    def test_a_job_reaching_the_prompt_while_stopping_aborts_at_once(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        D-07, research Pitfall 5: stopping during pass A still ends the flip wait.
+
+        stop() can find no coordinator to abort because the job is still in
+        pass A.  The stop flag is set while pass A is held, then pass A is
+        released: the job must announce AWAITING_FLIP and abort immediately,
+        well inside the state budget and nowhere near the flip timeout.
+        """
+        scanner = _GatedScanner(frozenset({1}))
+        settings = _manual_duplex_settings(default_settings)
+        assert settings.flip_timeout_seconds > _STATE_BUDGET * 10
+        states_seen: list[JobState] = []
+        store = JobStore()
+        original_update = store.update_state
+
+        def tracking_update(
+            job_id: str,
+            state: JobState,
+            error: str | None = None,
+            error_category: ErrorCategory | None = None,
+        ) -> None:
+            """Record every state the worker persists."""
+            states_seen.append(state)
+            original_update(job_id, state, error=error, error_category=error_category)
+
+        monkeypatch.setattr(store, "update_state", tracking_update)
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Stopping In Pass A")
+            worker.submit(job)
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+
+            worker._stopping.set()
+            started = time.monotonic()
+            scanner.gates[1].set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            elapsed = time.monotonic() - started
+        finally:
+            scanner.release_all()
+            worker.stop()
+            store.close()
+
+        assert JobState.AWAITING_FLIP in states_seen
+        assert elapsed < _STATE_BUDGET
+        assert finished.state is JobState.ERROR
+        assert finished.error == RESTART_REASON
+        assert scanner.scan_calls == 1
+
+
 class TestScanWorkerQueuing:
     """Worker sequential queuing tests."""
 
@@ -1502,6 +1785,7 @@ class TestScanWorkerQueuing:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Two submitted jobs are both processed to DONE (SCAN-11)."""
         monkeypatch.setattr(
@@ -1519,7 +1803,8 @@ class TestScanWorkerQueuing:
             worker.submit(job1)
             worker.submit(job2)
 
-            time.sleep(1.0)
+            wait_for_state(store, job1.id, TERMINAL_STATES)
+            wait_for_state(store, job2.id, TERMINAL_STATES)
             worker.stop()
 
             assert _get(store, job1.id).state == JobState.DONE
@@ -1710,6 +1995,7 @@ class TestWorkerEnumDispatch:
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
     ) -> None:
         """Worker applies only ACTIVE_STATES from inside the pipeline callback."""
         states_seen: list[JobState] = []
@@ -1771,7 +2057,7 @@ class TestWorkerEnumDispatch:
             worker.start()
             job = store.create_job("default", "Enum Dispatch Test")
             worker.submit(job)
-            time.sleep(0.5)
+            wait_for_state(store, job.id, TERMINAL_STATES)
             worker.stop()
 
             assert JobState.ASSEMBLING in states_seen
