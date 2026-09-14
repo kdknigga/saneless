@@ -789,7 +789,53 @@ def _acquire_pages(
     return pages, rejected_pages
 
 
-def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool]:
+def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
+    """
+    Pick the document feeder a manual-duplex pass scans through (D-02).
+
+    The operator's ``requested`` source wins when the device reports it and it
+    feeds, so someone who deliberately chose one of two feeders gets that one.
+    Otherwise the first reported source that feeds is used -- read from the
+    device, never guessed. Hardcoding the short feeder name was declined:
+    consumer feeders report ``"Automatic Document Feeder"``, and a name the
+    device does not list would fail on exactly the hardware manual duplex
+    exists for.
+
+    Whether a source feeds is asked of ``classify_source`` and nothing else;
+    Phase 24's D-01 makes it the only classification rule.
+
+    There is deliberately no ``Auto`` fallback here. ``Auto`` does not feed,
+    and with ``auto_source_mode`` at its ``"flatbed"`` default substituting it
+    takes one platen snapshot per pass and reports success -- C-01's exact
+    failure. A device with no feeder is refused instead, before any page.
+
+    Args:
+        available_sources: The source names the device reports. Empty when
+            the device exposes no readable ``source`` option.
+        requested: The source name the profile asked for.
+
+    Returns:
+        The feeder source name to assign to the device.
+
+    Raises:
+        ScanError: If the device reports no source that feeds.
+
+    """
+    if requested in available_sources and classify_source(requested).uses_feeder:
+        return requested
+    for source in available_sources:
+        if classify_source(source).uses_feeder:
+            return source
+    msg = (
+        f"Manual duplex needs a document feeder, and the device reports none. "
+        f"Available: {available_sources}"
+    )
+    raise ScanError(msg)
+
+
+def _resolve_source(
+    raw_options: list[tuple], requested: str, *, resolve_feeder: bool = False
+) -> tuple[str, bool]:
     """
     Decide which source name to use, and whether the device has the option.
 
@@ -813,18 +859,31 @@ def _resolve_source(raw_options: list[tuple], requested: str) -> tuple[str, bool
         raw_options: The device's option tuples, as ``get_options()`` returns
             them.
         requested: The source name the caller asked for.
+        resolve_feeder: Manual duplex. Resolve a feeder from the device's own
+            list via ``_resolve_feeder_source`` instead of validating
+            ``requested`` verbatim.
 
     Returns:
         A ``(effective_source, has_source_option)`` pair.
 
     Raises:
         ScanError: If the device exposes a source list that contains neither
-            the requested name nor ``"Auto"`` to fall back to.
+            the requested name nor ``"Auto"`` to fall back to, or -- for
+            manual duplex -- if the device reports no source that feeds.
 
     """
     reported = _constraint(raw_options, "source")
     has_source_option = reported.present
     available_sources = [str(s) for s in reported.values or []]
+
+    # A disjoint early branch, not a guard inside the flow below: returning
+    # here makes the Auto substitution structurally unreachable for manual
+    # duplex rather than merely conditioned off, and that substitution is
+    # C-01's mechanism. A device with no source option at all yields an empty
+    # list and is refused the same way -- it cannot be told to feed.
+    if resolve_feeder:
+        feeder = _resolve_feeder_source(available_sources, requested)
+        return feeder, has_source_option
 
     effective_source = requested
     if has_source_option and effective_source not in available_sources:
@@ -1099,7 +1158,9 @@ class SaneBackend(ScannerBackend):
 
             # Validate source option against device capabilities
             effective_source, has_source_option = _resolve_source(
-                raw_options, settings.source
+                raw_options,
+                settings.source,
+                resolve_feeder=settings.resolve_feeder_source,
             )
 
             # Set device options.  The return value is the resolution the
