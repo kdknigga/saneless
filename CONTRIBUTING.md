@@ -53,10 +53,10 @@ ls "$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
 To add a dependency, use `uv add <package>` (or `uv add --dev <package>`) and commit
 the resulting `uv.lock` change alongside the `pyproject.toml` change.
 
-## The six checks
+## The seven checks
 
-Every push to `master` and every pull request runs these six commands, split across
-two parallel jobs in `.github/workflows/ci.yml`:
+Every push to `master` and every pull request runs these seven commands, split across
+three parallel jobs in `.github/workflows/ci.yml`:
 
 | Job | Command |
 |--------|---------|
@@ -66,6 +66,7 @@ two parallel jobs in `.github/workflows/ci.yml`:
 | `lint` | `uv run pyrefly check src tests` |
 | `test` | `uv run pytest -m "not browser and not sane_hardware"` |
 | `test` | `uv run pytest -m sane_hardware` |
+| `browser` | `uv run pytest -m browser` |
 
 You can reproduce the gate exactly, in the same order, with:
 
@@ -76,20 +77,25 @@ uv run ty check
 uv run pyrefly check src tests
 uv run pytest -m "not browser and not sane_hardware"
 uv run pytest -m sane_hardware
+uv run playwright install chromium   # once, to fetch the browser
+uv run pytest -m browser
 ```
 
-All six must exit 0. Fix what they report -- do not silence them. `# noqa`,
+All seven must exit 0. Fix what they report -- do not silence them. `# noqa`,
 `# type: ignore` and rule-disabling are not accepted, and both type checkers must be
 clean because they do not always report the same issues for the same code.
 
-The `browser` marker deselects the Playwright tests, which need a real Chromium
-install. Run those locally with `uv run pytest -m browser` when you touch the web UI.
+The `test` job deselects the `browser` marker because the `browser` job runs those
+Playwright tests, with Chromium installed (`uv run playwright install --with-deps
+chromium`). They need no internet: every page is routed through an egress gate that
+fails the test if the UI tries to reach anything but the local test server, so they
+pass the same way on a laptop with no network as in CI.
 
 The `sane_hardware` marker deselects the tests that drive the real SANE `test`
 backend through a `SANE_CONFIG_DIR` pointed at a temporary `dll.conf`. Run those
 locally with `uv run pytest -m sane_hardware` when you touch the scanner layer. No
 extra apt package is needed: `libsane-dev` depends on `libsane1`, which ships
-`libsane-test.so.1`, and both CI jobs already install it.
+`libsane-test.so.1`, and every CI job already installs it.
 
 CI runs this marker too, as its own step in the `test` job, so these are not
 optional local extras: a red `sane_hardware` run blocks merge exactly like a red
@@ -122,7 +128,7 @@ as inspecting what a commit is about to run.
 formatter, the linter and both type checkers, but the type checkers only cover `src/`
 there. For the full type check over `src/` and `tests/`, run
 `uv run prek run --stage pre-push --all-files`. prek does not run the test suite at
-any stage, so run the six commands above as well.
+any stage, so run the seven commands above as well.
 
 ## Where the type checkers run
 
@@ -177,14 +183,15 @@ failure later and makes it slower to find.
 
 The same is true of merges and pushes. `git merge --no-verify` skips the
 `pre-merge-commit` hook, and `git push --no-verify` skips the `pre-push` hook. CI
-still runs all six checks on the pull request, so skipping them locally only moves
+still runs all seven checks on the pull request, so skipping them locally only moves
 the failure later.
 
 ## How `master` is protected
 
 `master` is protected by a branch ruleset requiring both `lint` and `test` to be
 green, and forbidding branch deletion and non-fast-forward pushes. Contributors reach
-`master` through a pull request with both required checks green.
+`master` through a pull request with both required checks green. The `browser` job
+runs on the same pull requests but is not yet a required check in the ruleset.
 
 The repository administrator holds a bypass actor on this ruleset, so the maintainer
 retains an emergency path for the cases where the gate must be overridden. The ruleset
