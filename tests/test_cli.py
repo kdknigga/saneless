@@ -78,10 +78,18 @@ def _patch_cli(
     """
     settings = settings or _make_settings()
 
-    monkeypatch.setattr(
-        "saneless.cli.load_settings",
-        lambda *_args, **_kwargs: settings,
-    )
+    def _fake_load_settings(config_path: str | None = None) -> Settings:
+        """
+        Return the test settings, recording ``--config`` as load_settings does.
+
+        ``auto-profiles`` writes to ``settings.config_path`` (D-16); a stub that
+        dropped the path would send its writes to ``./saneless.toml`` in the
+        suite's working directory.
+        """
+        settings._config_path = Path(config_path) if config_path else None
+        return settings
+
+    monkeypatch.setattr("saneless.cli.load_settings", _fake_load_settings)
     monkeypatch.setattr(
         "saneless.cli.configure_logging",
         lambda *_args, **_kwargs: None,
@@ -1312,6 +1320,33 @@ class TestAutoProfiles:
         # so a looser assertion would pass before and after the rename.
         assert "  flatbed: source=Flatbed" in result.output
         assert "  adf: source=ADF" in result.output
+
+    def test_auto_profiles_writes_to_loaded_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """auto-profiles writes to the file settings were loaded from (D-16)."""
+        monkeypatch.chdir(tmp_path)
+        config_file = tmp_path / "elsewhere" / "config.toml"
+        config_file.parent.mkdir()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0
+        assert config_file.exists()
+        assert not (tmp_path / "saneless.toml").exists()
+
+    def test_auto_profiles_without_loaded_file_writes_cwd_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With no config file loaded, auto-profiles keeps ./saneless.toml."""
+        monkeypatch.chdir(tmp_path)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0
+        assert (tmp_path / "saneless.toml").exists()
 
     def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """auto-profiles with no scanners exits with code 1."""
