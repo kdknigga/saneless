@@ -791,18 +791,30 @@ def _acquire_pages(
 
 def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
     """
-    Pick the document feeder a manual-duplex pass scans through (D-02).
+    Pick the single-sided document feeder a manual-duplex pass scans through.
 
     The operator's ``requested`` source wins when the device reports it and it
-    feeds, so someone who deliberately chose one of two feeders gets that one.
-    Otherwise the first reported source that feeds is used -- read from the
-    device, never guessed. Hardcoding the short feeder name was declined:
-    consumer feeders report ``"Automatic Document Feeder"``, and a name the
-    device does not list would fail on exactly the hardware manual duplex
-    exists for.
+    is a single-sided feeder, so someone who deliberately chose one of two
+    feeders gets that one. Otherwise the first reported single-sided feeder is
+    used -- read from the device, never guessed. Hardcoding the short feeder
+    name was declined: consumer feeders report ``"Automatic Document
+    Feeder"``, and a name the device does not list would fail on exactly the
+    hardware manual duplex exists for.
 
-    Whether a source feeds is asked of ``classify_source`` and nothing else;
-    Phase 24's D-01 makes it the only classification rule.
+    Whether a source feeds, and whether it scans both sides, is asked of
+    ``classify_source`` and nothing else; Phase 24's D-01 makes it the only
+    classification rule.
+
+    A feeder that scans both sides (``SourceKind.FEEDER_DUPLEX``) is never
+    used (WR-02). Each pass through it returns 2N pages, the two passes'
+    counts agree, ``_interleave_duplex`` pairs a front+back sequence with a
+    reversed back+front one, and the job reports ``DONE`` with 4N pages in
+    scrambled order. This narrows D-02's "``FEEDER`` or ``FEEDER_DUPLEX``"
+    wording on purpose: when the operator named a both-sides source and a
+    single-sided one exists, the single-sided one is used with a WARNING
+    naming both; when every feeder scans both sides, manual duplex is refused
+    before any page, because a WARNING beside a green ``DONE`` on an
+    unattended appliance is still the silent corruption D-02 exists to stop.
 
     There is deliberately no ``Auto`` fallback here. ``Auto`` does not feed,
     and with ``auto_source_mode`` at its ``"flatbed"`` default substituting it
@@ -811,21 +823,42 @@ def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
 
     Args:
         available_sources: The source names the device reports. Empty when
-            the device exposes no readable ``source`` option.
+            the device's ``source`` constraint cannot be read.
         requested: The source name the profile asked for.
 
     Returns:
-        The feeder source name to assign to the device.
+        The single-sided feeder source name to assign to the device.
 
     Raises:
-        ScanError: If the device reports no source that feeds.
+        ScanError: If every feeder the device reports scans both sides, or
+            if the device reports no source that feeds.
 
     """
-    if requested in available_sources and classify_source(requested).uses_feeder:
+    kinds = {source: classify_source(source) for source in available_sources}
+    if kinds.get(requested) is SourceKind.FEEDER:
         return requested
-    for source in available_sources:
-        if classify_source(source).uses_feeder:
-            return source
+    feeder = next(
+        (source for source, kind in kinds.items() if kind is SourceKind.FEEDER),
+        None,
+    )
+    if feeder is not None:
+        if kinds.get(requested) is SourceKind.FEEDER_DUPLEX:
+            logger.warning(
+                "Source %r scans both sides of each sheet, so a manual duplex "
+                "pass through it would return every page twice; using the "
+                "single-sided feeder %r instead",
+                requested,
+                feeder,
+            )
+        return feeder
+    if SourceKind.FEEDER_DUPLEX in kinds.values():
+        msg = (
+            "Manual duplex needs a single-sided document feeder, and every "
+            "feeder the device reports scans both sides; set "
+            'duplex = "hardware" with one of them instead. '
+            f"Available: {available_sources}"
+        )
+        raise ScanError(msg)
     msg = (
         f"Manual duplex needs a document feeder, and the device reports none. "
         f"Available: {available_sources}"
@@ -868,8 +901,10 @@ def _resolve_source(
 
     Raises:
         ScanError: If the device exposes a source list that contains neither
-            the requested name nor ``"Auto"`` to fall back to, or -- for
-            manual duplex -- if the device reports no source that feeds.
+            the requested name nor ``"Auto"`` to fall back to. For manual
+            duplex: if the device has no source option and ``requested`` does
+            not name a feeder, if every feeder it reports scans both sides, or
+            if it reports no source that feeds.
 
     """
     reported = _constraint(raw_options, "source")
@@ -879,11 +914,22 @@ def _resolve_source(
     # A disjoint early branch, not a guard inside the flow below: returning
     # here makes the Auto substitution structurally unreachable for manual
     # duplex rather than merely conditioned off, and that substitution is
-    # C-01's mechanism. A device with no source option at all yields an empty
-    # list and is refused the same way -- it cannot be told to feed.
+    # C-01's mechanism. A device with no source option at all feeds without
+    # being told and nothing is assigned to it, so the both-sides concern
+    # cannot arise; the simplex path already trusts the classifier on the
+    # configured name for such a device, and manual duplex does the same
+    # (WR-03), which keeps a legacy "Manual Duplex" profile working there.
     if resolve_feeder:
-        feeder = _resolve_feeder_source(available_sources, requested)
-        return feeder, has_source_option
+        if not has_source_option:
+            if classify_source(requested).uses_feeder:
+                return requested, False
+            msg = (
+                "Manual duplex needs a feeder source, and this device "
+                "exposes no source option to choose one; set source to the "
+                f"name of its feeder (got {requested!r})"
+            )
+            raise ScanError(msg)
+        return _resolve_feeder_source(available_sources, requested), True
 
     effective_source = requested
     if has_source_option and effective_source not in available_sources:
