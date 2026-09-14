@@ -294,7 +294,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 25-04-PLAN.md — One strategy reader, the refusal guard, the total dispatch (wave 4)
+- [x] 25-04-PLAN.md — One strategy reader, the refusal guard, the total dispatch (wave 4)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -432,7 +432,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
-| 25. Manual Duplex | 4/9 | In Progress|  |
+| 25. Manual Duplex | 5/9 | In Progress|  |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
