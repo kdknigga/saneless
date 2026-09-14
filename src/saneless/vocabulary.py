@@ -31,6 +31,7 @@ __all__ = [
     "classify_error",
     "connection_status_message",
     "error_message",
+    "flip_answer_label",
     "job_state_for",
     "progress_label",
     "state_label",
@@ -261,6 +262,42 @@ def progress_label(state: JobState) -> str:
             label = "Saved to folder"
         case _:
             assert_never(state)
+    return label
+
+
+def flip_answer_label(outcome: FlipOutcome) -> str:
+    """
+    Return the acknowledgment the status area shows for an answered flip wait.
+
+    Once a job's flip wait has been answered but the worker has not yet
+    persisted the job's next state, the status area shows this sentence in
+    place of the flip prompt, so the Continue and Abort buttons do not come
+    back as though the click did nothing (CR-01).  The trailing ellipsis is
+    three ASCII periods, matching ``progress_label``.
+
+    ``TIMED_OUT`` has an arm for totality: a timed-out job moves to ``ERROR``
+    within the same worker step, so the status area is not expected to show
+    it.
+
+    Args:
+        outcome: The answer the job's flip wait received.
+
+    Returns:
+        The user-facing acknowledgment, e.g. ``"Aborting scan..."``.
+
+    Raises:
+        AssertionError: If the value is not a FlipOutcome member.
+
+    """
+    match outcome:
+        case FlipOutcome.CONTINUED:
+            label = "Flip confirmed. Scanning reverse sides next..."
+        case FlipOutcome.ABORTED:
+            label = "Aborting scan..."
+        case FlipOutcome.TIMED_OUT:
+            label = "Flip wait timed out..."
+        case _:
+            assert_never(outcome)
     return label
 
 
