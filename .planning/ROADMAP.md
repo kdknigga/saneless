@@ -281,7 +281,7 @@ Note (carried from Phase 21's security audit, finding W-01 in `.planning/phases/
 Plans:
 **Wave 1**
 
-- [ ] 25-01-PLAN.md — Config: the `duplex` field, the legacy translation, the flip timeout (wave 1)
+- [x] 25-01-PLAN.md — Config: the `duplex` field, the legacy translation, the flip timeout (wave 1)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -432,7 +432,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
-| 25. Manual Duplex | 0/? | Not started | - |
+| 25. Manual Duplex | 1/9 | In Progress|  |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
