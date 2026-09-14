@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 import pytest
 import uvicorn
 from PIL import Image
+from playwright.sync_api import expect
 
 from saneless.config import (
     OutputConfig,
@@ -49,8 +50,9 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.vocabulary import JobState, ScanOutcome
+from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
 from saneless.web.app import create_app
+from saneless.worker import WorkerFlipCoordinator
 
 # Every palette value these tests assert against, in one place. All of them are
 # valid only for @picocss/pico@2.1.1, the version pinned in base.html. Pico is
@@ -277,6 +279,50 @@ class TestFlipPromptUI:
         page.goto(browser_server_url)
         scan_btn = page.locator("button[type='submit'], input[type='submit']").first
         assert scan_btn.is_visible()
+
+    def test_flip_continue_click_answers_the_waiting_job(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> None:
+        """
+        A real Continue click answers its own job and is acknowledged (CR-01).
+
+        The string tests in ``test_web.py`` see the ``hx-vals`` attribute but not
+        what htmx actually sends.  Here Chromium clicks the rendered button: if
+        the job id did not reach the route through htmx's form encoding, the
+        route would answer 422, nothing would swap, and the coordinator would
+        stay unanswered.
+        """
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        worker = app.state.worker
+        job = job_store.create_job(profile="duplex", title="Flip In Browser")
+        job_store.update_state(job.id, JobState.AWAITING_FLIP)
+        coordinator = WorkerFlipCoordinator(job.id)
+        coordinator.arm()
+        worker._current_job_id = job.id
+        worker._flip_coordinator = coordinator
+        try:
+            page.goto(browser_server.url)
+            continue_button = page.locator(
+                "#status-area button[hx-post='/api/flip/continue']"
+            )
+            expect(continue_button).to_be_visible()
+
+            continue_button.click()
+
+            status = page.locator("#status-area")
+            expect(status).to_contain_text(
+                "Flip confirmed. Scanning reverse sides next..."
+            )
+            expect(status.locator("button")).to_have_count(0)
+            assert coordinator.answer is FlipOutcome.CONTINUED
+        finally:
+            # Session-scoped server and store: clear the worker's pointers and
+            # delete the row, as fallback_page does, so later tests see the idle
+            # page rather than this job through the most-recent-job fallback.
+            worker._flip_coordinator = None
+            worker._current_job_id = None
+            job_store.delete_job(job.id)
 
 
 # Builds one <p> per status class, reads the colour the cascade actually
