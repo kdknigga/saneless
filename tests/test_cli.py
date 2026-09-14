@@ -6,10 +6,12 @@ import json
 import logging
 import tempfile
 import threading
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 import tomlkit
 from click.testing import CliRunner
 from PIL import Image, ImageDraw
@@ -33,10 +35,6 @@ from saneless.scanner.base import (
     ScanSettings,
 )
 from saneless.vocabulary import FlipOutcome, JobState, state_label
-
-if TYPE_CHECKING:
-    import pytest
-
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
 # Keeps the suite out of the developer's real ~/.local/state/saneless.
@@ -544,18 +542,12 @@ class TestManualDuplexPrompt:
         ``KeyboardInterrupt`` out of the calling thread's bounded wait (measured
         with a real SIGINT against a never-answering stdin).  A real signal
         cannot be sent here without taking the pytest session down with it if
-        the handling regressed, so the wait itself is made to raise.
+        the handling regressed, so the answer slot's wait is made to raise.
         """
 
-        class InterruptedEvent:
-            """An event whose wait is cut short by Ctrl-C."""
-
-            def wait(self, timeout: float | None = None) -> bool:
-                """Raise as SIGINT would on the main thread."""
-                raise KeyboardInterrupt
-
-            def set(self) -> None:
-                """Accept the prompt thread's late signal."""
+        def interrupted_wait(timeout: float) -> None:
+            """Raise as SIGINT would on the main thread."""
+            raise KeyboardInterrupt
 
         release = threading.Event()
 
@@ -566,7 +558,7 @@ class TestManualDuplexPrompt:
 
         monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
         coordinator = ClickFlipCoordinator()
-        monkeypatch.setattr(coordinator, "_event", InterruptedEvent())
+        monkeypatch.setattr(coordinator._slot, "wait", interrupted_wait)
 
         try:
             outcome = coordinator.wait_for_flip(600)
@@ -574,6 +566,57 @@ class TestManualDuplexPrompt:
             release.set()
 
         assert outcome is FlipOutcome.ABORTED
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            # A terminal that went away mid-prompt (a closed SSH session).
+            OSError(5, "Input/output error"),
+            # Bytes on stdin that are not valid in the terminal's encoding.
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
+        ],
+        ids=["lost-terminal", "undecodable-input"],
+    )
+    def test_a_broken_prompt_aborts_at_once_with_a_logged_traceback(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        failure: Exception,
+    ) -> None:
+        """
+        WR-08: an unexpected prompt failure ends the wait now, as ``ABORTED``.
+
+        A prompt thread that died on anything but ``click.Abort`` used to leave
+        the calling thread waiting out the whole ``flip_timeout_seconds`` and
+        then report that nobody confirmed the flip, which was false.  It is an
+        abort, not a fourth outcome (D-09), and the traceback in the log carries
+        the real cause.  The suite's ``filterwarnings = ["error"]`` also turns a
+        prompt thread that died unhandled into a failure here.
+        """
+
+        def broken_confirm(*_args: object, **_kwargs: object) -> bool:
+            """Fail the way a broken terminal does."""
+            raise failure
+
+        monkeypatch.setattr("saneless.cli.click.confirm", broken_confirm)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        coordinator = ClickFlipCoordinator()
+
+        started = time.monotonic()
+        outcome = coordinator.wait_for_flip(600)
+        elapsed = time.monotonic() - started
+
+        assert outcome is FlipOutcome.ABORTED
+        assert elapsed < 5
+        records = [
+            record
+            for record in caplog.records
+            if record.name == "saneless.cli"
+            and record.levelno == logging.ERROR
+            and "Flip prompt failed" in record.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
 
     def test_the_coordinator_times_out_at_a_zero_timeout(
         self, monkeypatch: pytest.MonkeyPatch
