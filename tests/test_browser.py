@@ -25,15 +25,19 @@ Requires: pytest-playwright, chromium browser (uv run playwright install chromiu
 
 from __future__ import annotations
 
+import re
+import socket
 import threading
 import time
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
 
     from fastapi import FastAPI
-    from playwright.sync_api import BrowserContext, Page, Route
+    from playwright.sync_api import BrowserContext, Page, Response, Route
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
     from saneless.job import Job, JobStore
 
@@ -59,7 +63,13 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.vocabulary import TERMINAL_STATES, FlipOutcome, JobState, ScanOutcome
+from saneless.vocabulary import (
+    TERMINAL_STATES,
+    FlipOutcome,
+    JobState,
+    ScanOutcome,
+    WorkerHealth,
+)
 from saneless.web.app import create_app
 from saneless.worker import WorkerFlipCoordinator
 
@@ -79,6 +89,9 @@ _PICO_SURFACE = {"light": "rgb(255, 255, 255)", "dark": "rgb(19, 23, 31)"}
 
 _AMBER = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
 """The app's fallback amber (#a16207 / #ca8a04, from app.css), as computed."""
+
+_ERROR_RED = {"light": "rgb(136, 57, 53)", "dark": "rgb(206, 126, 123)"}
+"""Pico's ``--pico-del-color`` behind ``.status-error``, per 26-UI-SPEC, as computed."""
 
 
 _SCAN_GATE_TIMEOUT = 30.0
@@ -153,18 +166,19 @@ class _BrowserServer(NamedTuple):
     scanner: _BrowserTestScanner
 
 
-@pytest.fixture(scope="session")
-def browser_server(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[_BrowserServer]:
-    """Start a real uvicorn server for browser tests."""
-    tmp_dir = tmp_path_factory.mktemp("browser")
-    test_token = "fake-token"
-    settings = Settings(
+def _browser_test_settings(tmp_dir: Path) -> Settings:
+    """
+    Build the settings every browser test server runs with, rooted at ``tmp_dir``.
+
+    Two profiles are configured so the worker never generates profiles at
+    startup, and Paperless points at a closed local port so an unstubbed upload
+    fails fast instead of reaching the network.
+    """
+    return Settings(
         scanner=ScannerConfig(device="test:browser:001"),
         paperless=PaperlessConfig(
             url="http://localhost:9999",
-            token=test_token,
+            token="fake-token",
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_dir),
@@ -176,12 +190,21 @@ def browser_server(
             "duplex": ProfileConfig(source="ADF Manual Duplex"),
         },
     )
-    scanner = _BrowserTestScanner()
-    app = create_app(settings, scanner)
 
+
+class _RunningUvicorn(NamedTuple):
+    """A uvicorn server running on a daemon thread, and the port it bound."""
+
+    server: uvicorn.Server
+    thread: threading.Thread
+    port: int
+
+
+def _start_uvicorn(app: ASGIApp, host: str) -> _RunningUvicorn:
+    """Run ``app`` under uvicorn on a daemon thread, bound to ``host`` on a free port."""
     # Note: uvicorn.Server.capture_signals already skips signal handling
     # when running in a non-main thread, so no special config is needed.
-    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="warning")
+    config = uvicorn.Config(app, host=host, port=0, log_level="warning")
     server = uvicorn.Server(config)
 
     thread = threading.Thread(target=server.run, daemon=True)
@@ -198,14 +221,32 @@ def browser_server(
 
     # Get actual assigned port
     port = server.servers[0].sockets[0].getsockname()[1]
-    yield _BrowserServer(url=f"http://127.0.0.1:{port}", app=app, scanner=scanner)
+    return _RunningUvicorn(server=server, thread=thread, port=port)
 
-    server.should_exit = True
-    thread.join(timeout=5)
+
+def _stop_uvicorn(running: _RunningUvicorn) -> None:
+    """Stop a server started by ``_start_uvicorn`` and assert its thread ended."""
+    running.server.should_exit = True
+    running.thread.join(timeout=5)
     # join() reports nothing on timeout. A uvicorn thread that fails to stop
     # leaves a bound port and a live app behind for the rest of the session,
     # so the outcome is asserted rather than discarded.
-    assert not thread.is_alive(), "uvicorn test server did not shut down"
+    assert not running.thread.is_alive(), "uvicorn test server did not shut down"
+
+
+@pytest.fixture(scope="session")
+def browser_server(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[_BrowserServer]:
+    """Start a real uvicorn server for browser tests."""
+    tmp_dir = tmp_path_factory.mktemp("browser")
+    scanner = _BrowserTestScanner()
+    app = create_app(_browser_test_settings(tmp_dir), scanner)
+    running = _start_uvicorn(app, host="127.0.0.1")
+    yield _BrowserServer(
+        url=f"http://127.0.0.1:{running.port}", app=app, scanner=scanner
+    )
+    _stop_uvicorn(running)
 
 
 @pytest.fixture(scope="session")
@@ -275,7 +316,12 @@ def delivering_paperless(
     returning None is what success means since plan 23-04 (it raises on
     failure). ``monkeypatch`` restores both methods at teardown.
     """
-    paperless = browser_server.app.state.paperless
+    _make_paperless_deliver(browser_server.app, monkeypatch)
+
+
+def _make_paperless_deliver(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch ``app``'s started Paperless client so every upload is delivered at once."""
+    paperless = app.state.paperless
 
     def _upload_document(*_args: object, **_kwargs: object) -> UploadResult:
         return UploadResult(delivered_to_api=True, task_uuid="browser-test-task")
@@ -343,6 +389,10 @@ def scan_harness(
             for job_id in created:
                 job_store.delete_job(job_id)
             browser_server.app.state.worker._current_job_id = None
+        # Reached only when every job finished, so it cannot mask the failure
+        # that stopped a wait. A row left behind here would follow every later
+        # test onto its supposedly idle page.
+        assert harness.created_job_ids() == [], "a test's job rows were not deleted"
 
 
 @pytest.mark.browser
@@ -760,8 +810,41 @@ _READ_ROOT_SURFACE = """
 # a translucent layer does not hide what is under it, so compositing is left to
 # _flatten rather than being decided here. Adding, reading and removing all
 # happen in this one call, so no htmx swap can land in between.
-_PROBE_CONTEXT_CONTRAST = """
+_JS_BACKGROUND_STACK_OF = """
+    const alphaOf = (value) => {
+        if (value === "transparent") return 0;
+        if (!value.startsWith("rgba(")) return 1;
+        return parseFloat(value.slice(value.lastIndexOf(",") + 1));
+    };
+    const backgroundStackOf = (start) => {
+        // Fully transparent layers paint nothing and are skipped; translucent
+        // ones are collected and the walk continues, because what is beneath
+        // them still shows through. Only a fully opaque layer ends the walk.
+        const backgroundStack = [];
+        for (let el = start; el !== null; el = el.parentElement) {
+            const value = getComputedStyle(el).backgroundColor;
+            const alpha = alphaOf(value);
+            if (alpha === 0) continue;
+            backgroundStack.push(value);
+            if (alpha === 1) break;
+        }
+        const last = backgroundStack[backgroundStack.length - 1];
+        if (backgroundStack.length === 0 || alphaOf(last) < 1) {
+            // Nothing out to <html> painted an opaque layer, so what shows
+            // through is the browser canvas, which is white.
+            backgroundStack.push("rgb(255, 255, 255)");
+        }
+        return backgroundStack;
+    };
+"""
+"""The background walk shared by the contrast probes, as two JS declarations."""
+
+_PROBE_CONTEXT_CONTRAST = (
+    """
 ({cls, context}) => {
+"""
+    + _JS_BACKGROUND_STACK_OF
+    + """
     const probe = document.createElement(context === "status-area" ? "p" : "td");
     probe.className = cls;
     probe.textContent = "probe";
@@ -775,32 +858,29 @@ _PROBE_CONTEXT_CONTRAST = """
         added = row;
     }
     const colour = getComputedStyle(probe).color;
-    const alphaOf = (value) => {
-        if (value === "transparent") return 0;
-        if (!value.startsWith("rgba(")) return 1;
-        return parseFloat(value.slice(value.lastIndexOf(",") + 1));
-    };
-    // Fully transparent layers paint nothing and are skipped; translucent ones
-    // are collected and the walk continues, because what is beneath them still
-    // shows through. Only a fully opaque layer ends the walk.
-    const backgroundStack = [];
-    for (let el = probe; el !== null; el = el.parentElement) {
-        const value = getComputedStyle(el).backgroundColor;
-        const alpha = alphaOf(value);
-        if (alpha === 0) continue;
-        backgroundStack.push(value);
-        if (alpha === 1) break;
-    }
-    const last = backgroundStack[backgroundStack.length - 1];
-    if (backgroundStack.length === 0 || alphaOf(last) < 1) {
-        // Nothing out to <html> painted an opaque layer, so what shows through
-        // is the browser canvas, which is white.
-        backgroundStack.push("rgb(255, 255, 255)");
-    }
+    const backgroundStack = backgroundStackOf(probe);
     added.remove();
     return {colour, backgroundStack};
 }
 """
+)
+
+# The same measurement taken on an element already in the page rather than on a
+# probe: the rendered markup is what is under test, so nothing is added.
+_READ_ELEMENT_CONTRAST = (
+    """
+(selector) => {
+"""
+    + _JS_BACKGROUND_STACK_OF
+    + """
+    const element = document.querySelector(selector);
+    return {
+        colour: getComputedStyle(element).color,
+        backgroundStack: backgroundStackOf(element),
+    };
+}
+"""
+)
 
 
 def _parse_rgba(css_colour: str) -> tuple[float, float, float, float]:
@@ -1173,3 +1253,435 @@ class TestDarkModeEngagement:
         page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
         colours = page.evaluate(_PROBE_STATUS_COLOURS)
         assert colours["status-fallback"] == _AMBER["dark"], colours
+
+
+_QUEUE_FULL_TEXT = (
+    "✗ The scan queue is full. Wait for a scan to finish, then try again."
+)
+"""The slot's exact text for a 429: the error partial's cross plus the S3 copy."""
+
+_DEGRADED_TEXT = (
+    "✗ Job history cannot be saved right now, so the scan was not started. "
+    "Check the server's free disk space and log, then try again."
+)
+"""The slot's exact text for a 503 WORKER_DEGRADED, the longest slot message."""
+
+_UNKNOWN_PROFILE_TEXT = "That scan profile does not exist."
+"""The start of the 422 UNKNOWN_PROFILE message."""
+
+_FILL_ATTEMPTS = 15
+"""Most submits the queue fill makes: one running job, ten queued, a 429, and slack."""
+
+_TOO_MANY_REQUESTS = 429
+
+# The left edge of the first visible character of an element's first non-blank
+# text node. The paragraph box is not what the eye lines up -- the text is -- so
+# the measurement is a Range over one glyph rather than a bounding box.
+_READ_TEXT_LEFT_EDGE = """
+(selector) => {
+    const element = document.querySelector(selector);
+    const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
+    for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+        const start = node.textContent.search(/\\S/);
+        if (start === -1) continue;
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, start + 1);
+        return range.getBoundingClientRect().left;
+    }
+    return null;
+}
+"""
+
+# How many line boxes the slot message's text occupies.
+_COUNT_SLOT_TEXT_LINES = """
+() => {
+    const paragraph = document.querySelector("#status-message p");
+    const range = document.createRange();
+    range.selectNodeContents(paragraph);
+    const tops = new Set(
+        Array.from(range.getClientRects(), (rect) => Math.round(rect.top))
+    );
+    return tops.size;
+}
+"""
+
+# Fires the unknown-profile submit through htmx, the way the page's own form
+# would, without awaiting htmx.ajax's promise: a 4xx settles it in a way the
+# test has no use for, and the swap itself is what the test waits on.
+_SUBMIT_UNKNOWN_PROFILE = """
+() => {
+    htmx.ajax("POST", "/api/scan", {values: {profile: "zz-nonexistent-profile"}});
+}
+"""
+
+_POLL_PATH = "/api/jobs/current/status"
+
+
+def _fill_queue_until_rejected(url: str) -> None:
+    """
+    Submit scans over plain HTTP until one is refused with 429, and assert it was.
+
+    With the gate closed the first job sits in SCANNING and the next ten fill
+    the queue, so the twelfth submit is the first refusal. The count is not
+    assumed: the worker may not have taken the first job off the queue yet when
+    the eleventh arrives, so the loop stops at the first 429 whenever it comes.
+    """
+    statuses: list[int] = []
+    for _ in range(_FILL_ATTEMPTS):
+        response = httpx.post(url + "/api/scan", data={"profile": "default"})
+        statuses.append(response.status_code)
+        if response.status_code == _TOO_MANY_REQUESTS:
+            return
+    pytest.fail(f"the queue never refused a submit: {statuses}")
+
+
+@pytest.mark.browser
+class TestRequestErrorSlot:
+    """
+    Request errors are seen where 26-UI-SPEC S2 puts them (ROBU-02, D-02..D-06).
+
+    A 429 that is returned but never shown is the failure this class exists for:
+    the TestClient tests prove the response, and only a browser proves that htmx
+    retargets it into ``#status-message``, that the text is legible and aligned,
+    that polling does not erase it, and that a successful scan does. The Scan
+    button is disabled while a job is active, so the queue is filled over HTTP
+    after an idle page has loaded (B8).
+    """
+
+    @pytest.fixture
+    def queue_full_page(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> Callable[..., Page]:
+        """
+        Return an opener that loads an idle page and then fills the queue behind it.
+
+        The opener takes the colour scheme and viewport width, because both
+        have to be set before ``goto``. ``scan_harness`` owns the teardown: it
+        opens the gate, waits for every created row -- the queued jobs and the
+        rejected attempts -- to be terminal, deletes them, clears the worker's
+        pointer and asserts nothing was left behind.
+        """
+        server = scan_harness.server
+
+        def _open(
+            scheme: Literal["light", "dark"] = "light", width: int = 1280
+        ) -> Page:
+            page.set_viewport_size({"width": width, "height": 812})
+            page.emulate_media(color_scheme=scheme)
+            server.scanner.gate.clear()
+            page.goto(server.url)
+            expect(page.locator("#scan-btn")).to_be_enabled()
+            _fill_queue_until_rejected(server.url)
+            page.locator("#scan-btn").click()
+            expect(page.locator("#status-message")).to_have_text(_QUEUE_FULL_TEXT)
+            return page
+
+        return _open
+
+    def test_queue_full_message_is_visible_and_recorded(
+        self, queue_full_page: Callable[..., Page]
+    ) -> None:
+        """
+        A 429 lands in the slot, as announced text, and in Job History (B8).
+
+        Covers ROBU-02's visible message, D-02 (errors go to the slot, not the
+        status area), D-05 (the rejected attempt is recorded) and the UI-SPEC
+        accessibility contract: the slot itself is the alert, so the message
+        must not carry a second ``role="alert"``, and focus stays where the user
+        left it.
+        """
+        page = queue_full_page()
+        slot = page.locator("#status-message")
+        expect(slot.locator("p.status-error")).to_have_count(1)
+        expect(slot.locator('[role="alert"]')).to_have_count(0)
+        expect(page.locator("#status-area")).to_have_count(1)
+        expect(page.locator("#scan-btn")).to_be_enabled()
+        focus_in_slot = page.evaluate(
+            "document.getElementById('status-message').contains(document.activeElement)"
+        )
+        assert focus_in_slot is False
+
+        status_cell = page.locator("#history-body tr").first.locator("td").nth(3)
+        expect(status_cell).to_have_text("Failed", timeout=5_000)
+        expect(status_cell).to_have_class(re.compile(r"\bstatus-error\b"))
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_error_message_colour_and_contrast(
+        self,
+        queue_full_page: Callable[..., Page],
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        The slot message is the error red at WCAG AA in both schemes (B9).
+
+        The colour is asserted by value so a palette drift is named, and the
+        ratio is measured against the layers the real paragraph sits on.
+        """
+        page = queue_full_page(scheme=scheme)
+        reading = page.evaluate(_READ_ELEMENT_CONTRAST, "#status-message p")
+        colour = reading["colour"]
+        background = _flatten(reading["backgroundStack"])
+        ratio = _contrast_ratio(colour, background)
+        assert colour == _ERROR_RED[scheme], (colour, background, ratio)
+        assert ratio >= 4.5, (colour, background, ratio)
+
+    @pytest.mark.parametrize("width", [1280, 375])
+    def test_error_text_aligns_with_status_text(
+        self, queue_full_page: Callable[..., Page], width: int
+    ) -> None:
+        """
+        The slot's text starts at the same x as the status text (B12).
+
+        ``app.css`` insets the slot paragraph by the status area's border and
+        padding; the check is on the glyphs, within 1 px, at desktop and phone
+        widths.
+        """
+        page = queue_full_page(width=width)
+        expect(page.locator("#status-area p")).to_have_count(1)
+        slot_left = page.evaluate(_READ_TEXT_LEFT_EDGE, "#status-message p")
+        status_left = page.evaluate(_READ_TEXT_LEFT_EDGE, "#status-area p")
+        assert slot_left is not None
+        assert status_left is not None
+        assert abs(slot_left - status_left) <= 1, (slot_left, status_left)
+
+    def test_long_error_wraps_on_a_narrow_viewport(
+        self,
+        page: Page,
+        scan_harness: _ScanHarness,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The longest slot message wraps at 375 px with no horizontal overflow (B13).
+
+        The route reads ``worker.health`` before any submit, so replacing the
+        property makes the 503 deterministic. Setting the worker's degraded
+        Event instead would race its idle probe, which clears the flag on a
+        healthy store.
+        """
+        server = scan_harness.server
+        worker = server.app.state.worker
+        monkeypatch.setattr(
+            type(worker), "health", property(lambda _self: WorkerHealth.DEGRADED)
+        )
+        page.set_viewport_size({"width": 375, "height": 812})
+        page.goto(server.url)
+
+        page.locator("#scan-btn").click()
+
+        expect(page.locator("#status-message")).to_have_text(_DEGRADED_TEXT)
+        assert page.evaluate(_COUNT_SLOT_TEXT_LINES) > 1
+        overflow = page.evaluate(
+            "() => { const main = document.querySelector('main');"
+            " return [main.scrollWidth, main.clientWidth]; }"
+        )
+        assert overflow[0] <= overflow[1], overflow
+
+    def test_error_survives_status_polling(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        An error shown mid-scan outlives at least two status polls (B10, D-03).
+
+        The poll re-renders ``#status-area`` every second while a job is active.
+        If a poll response carried the slot clear that a successful scan
+        carries, the message would vanish within a second -- before a user
+        could read it. The submitted profile is also checked not to be echoed.
+        """
+        server = scan_harness.server
+        polls: list[str] = []
+
+        def _record_poll(response: Response) -> None:
+            if response.url.endswith(_POLL_PATH):
+                polls.append(response.url)
+
+        page.on("response", _record_poll)
+        server.scanner.gate.clear()
+        page.goto(server.url)
+        page.locator("#scan-btn").click()
+        expect(page.locator('#status-area p[aria-busy="true"]')).to_be_visible()
+
+        page.evaluate(_SUBMIT_UNKNOWN_PROFILE)
+
+        slot = page.locator("#status-message")
+        expect(slot).to_contain_text(_UNKNOWN_PROFILE_TEXT)
+        assert "zz-nonexistent-profile" not in slot.inner_text()
+        polls_before = len(polls)
+        page.wait_for_timeout(2500)
+        polls_during = len(polls) - polls_before
+        assert polls_during >= 2, f"only {polls_during} polls arrived in 2.5 s"
+        # Read once, without retrying: the claim is that the message is there
+        # now, after the polls, not that it can be found again within a timeout.
+        assert _UNKNOWN_PROFILE_TEXT in slot.inner_text(), "a poll erased the error"
+        assert page.locator("#status-area").count() == 1
+
+    def test_successful_scan_clears_the_error(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """
+        A successful scan empties the slot back to zero height (B11, D-03).
+
+        The slot must also stay the same ``role="alert"`` element: the clear
+        replaces its contents, not the element, so the next error is still
+        announced.
+        """
+        server = scan_harness.server
+        page.goto(server.url)
+        page.evaluate(_SUBMIT_UNKNOWN_PROFILE)
+        slot = page.locator("#status-message")
+        expect(slot).to_contain_text(_UNKNOWN_PROFILE_TEXT)
+
+        page.locator("#scan-btn").click()
+
+        page.wait_for_function(
+            "document.getElementById('status-message').childNodes.length === 0"
+        )
+        assert slot.evaluate("(el) => el.getBoundingClientRect().height") == 0
+        assert slot.get_attribute("role") == "alert"
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+
+
+def _non_loopback_ipv4() -> str | None:
+    """
+    Return this machine's outbound IPv4 address, or None when it has none.
+
+    Connecting a UDP socket sends no packet; it only asks the kernel which
+    local address would route to the target. The target is TEST-NET-1
+    (192.0.2.1, RFC 5737), which is never assigned to a real host. A runner
+    with no default route raises, and a loopback-only one answers 127.x.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))
+        address = str(probe.getsockname()[0])
+    except OSError:
+        address = None
+    finally:
+        probe.close()
+    if address is None or address.startswith("127."):
+        return None
+    return address
+
+
+class _ScanHeaderRecorder:
+    """
+    An ASGI wrapper that records the headers of every ``POST /api/scan`` it passes on.
+
+    The browser's own view of a request cannot answer whether it sent
+    ``Sec-Fetch-Site``: under the egress gate's ``context.route``, Playwright's
+    ``Request.all_headers()`` omits the ``Sec-Fetch-*`` headers even when the
+    server receives them (measured: a routed 127.0.0.1 page reports none while
+    the server gets ``same-origin``). So the headers are read where the guard
+    reads them, in front of the app. Every scope, lifespan included, is passed
+    through unchanged.
+    """
+
+    def __init__(self, app: FastAPI) -> None:
+        """Wrap ``app`` with an empty record."""
+        self.app = app
+        self.scan_headers: list[dict[str, str]] = []
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Record a scan submit's headers, then hand the request to the app."""
+        if (
+            scope["type"] == "http"
+            and scope["method"] == "POST"
+            and scope["path"] == "/api/scan"
+        ):
+            self.scan_headers.append(
+                {
+                    name.decode("latin-1").lower(): value.decode("latin-1")
+                    for name, value in scope["headers"]
+                }
+            )
+        await self.app(scope, receive, send)
+
+
+class _LanServer(NamedTuple):
+    """A function-scoped app served on a non-loopback address over plain HTTP."""
+
+    url: str
+    app: FastAPI
+    scan_headers: list[dict[str, str]]
+
+
+@pytest.fixture
+def lan_server(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_LanServer]:
+    """
+    Serve a separate app on this machine's LAN address, then shut it down.
+
+    It is its own app with its own store under ``tmp_path``, so nothing it does
+    touches the session server. Uvicorn binds all interfaces on a free port
+    because the browser has to reach it by the LAN address, and it runs only for
+    this one test, with a stub scanner and a stubbed Paperless (T-26-56).
+    """
+    address = _non_loopback_ipv4()
+    if address is None:
+        pytest.skip("no non-loopback IPv4 address")
+    app = create_app(_browser_test_settings(tmp_path), _BrowserTestScanner())
+    recorder = _ScanHeaderRecorder(app)
+    running = _start_uvicorn(recorder, host="0.0.0.0")
+    try:
+        _make_paperless_deliver(app, monkeypatch)
+        yield _LanServer(
+            url=f"http://{address}:{running.port}",
+            app=app,
+            scan_headers=recorder.scan_headers,
+        )
+    finally:
+        _stop_uvicorn(running)
+
+
+@pytest.mark.browser
+class TestPlainHttpLanOrigin:
+    """
+    The cross-site guard lets the app's own page scan from a LAN address (D-20).
+
+    saneless's documented deployment is plain HTTP on a LAN address, and there a
+    browser sends no ``Sec-Fetch-Site`` at all, so only the guard's Origin
+    branch stands between a user and a 403 on every scan.
+    """
+
+    def test_same_origin_scan_from_a_lan_address_is_not_blocked(
+        self,
+        page: Page,
+        egress_allowlist: list[str],
+        lan_server: _LanServer,
+    ) -> None:
+        """
+        A same-origin Scan click from ``http://<lan-ip>`` is accepted (ROBU-10).
+
+        Research assumption A6: the Fetch Metadata spec adds ``Sec-Fetch-*``
+        only for potentially trustworthy URLs, so Chromium omits it on a plain
+        HTTP LAN origin and the guard decides on ``Origin`` against ``Host``
+        (D-20 branch 2). ``localhost`` and ``127.0.0.1`` cannot prove this: they
+        are secure contexts, always get ``Sec-Fetch-Site``, and exercise branch
+        1 instead. The TestClient branch-2 tests in ``tests/test_cross_origin.py``
+        prove the rule; this proves the browser really takes that branch.
+
+        The headers are checked as the server received them, not through
+        Playwright's request object, which hides ``Sec-Fetch-*`` under routing
+        (see ``_ScanHeaderRecorder``).
+        """
+        lan_url = lan_server.url
+        egress_allowlist.append(lan_url)
+        page.goto(lan_url)
+
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "POST" and response.url.endswith("/api/scan")
+            )
+        ) as response_info:
+            page.locator("#scan-btn").click()
+
+        assert response_info.value.status == 200, response_info.value.status
+        assert len(lan_server.scan_headers) == 1, lan_server.scan_headers
+        headers = lan_server.scan_headers[0]
+        assert "sec-fetch-site" not in headers, (
+            f"Chromium sent Sec-Fetch-Site={headers['sec-fetch-site']!r} to "
+            f"{lan_url}, so this test no longer exercises D-20 branch 2: the "
+            "runner's address is being treated as potentially trustworthy"
+        )
+        assert headers.get("origin") == lan_url, headers
+        expect(page.locator("#status-message")).to_be_empty()
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
