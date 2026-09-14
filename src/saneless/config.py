@@ -8,12 +8,20 @@ always be present in the configuration.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import (
     BaseSettings,
     PydanticBaseSettingsSource,
@@ -37,12 +45,34 @@ __all__ = [
     "validate_settings_dirs",
 ]
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_RESOLUTION = 300
 """Default scan resolution in DPI.
 
 300 DPI is the minimum recommended by Tesseract OCR and the industry
 standard for professional document scanning. See Phase 11 research.
 """
+
+
+def _is_legacy_manual_duplex_source(source: str) -> bool:
+    """
+    Recognise the deprecated ``source = "Manual Duplex"`` config form (DPLX-02).
+
+    This exists ONLY to detect a legacy profile at config load so it can be
+    translated to ``duplex = "manual"`` and warned about. It is never consulted
+    to choose a scanning strategy: ``pipeline._is_manual_duplex`` is deleted in
+    favour of ``ProfileConfig.duplex``, and ``source`` is a pure SANE value.
+
+    Args:
+        source: The profile's configured source string.
+
+    Returns:
+        True if the source contains both "manual" and "duplex", ignoring case.
+
+    """
+    lowered = source.lower()
+    return "manual" in lowered and "duplex" in lowered
 
 
 class ScannerConfig(BaseModel):
@@ -69,6 +99,14 @@ class ProfileConfig(BaseModel):
     resolution: int = DEFAULT_RESOLUTION
     mode: str = "color"
     auto_source_mode: Literal["flatbed", "adf"] = "flatbed"
+    # How the profile scans both sides of a sheet. "manual" drives the two-pass
+    # flip workflow. Nothing reads "hardware": the device decides duplexing
+    # from the source name it is handed, so the value only records operator
+    # intent and makes a profile self-describing. Phase 30's APPL-05 (the
+    # generated label/description) is its eventual reader. It is deliberately
+    # not cross-validated against a FEEDER_DUPLEX source -- profile fields have
+    # never been cross-checked (auto_source_mode is not checked against Auto).
+    duplex: Literal["none", "hardware", "manual"] = "none"
     paper_size: Literal["full", "a3", "a4", "a5", "letter", "legal"] = "full"
     default_tags: list[int] = []
     default_correspondent: int | None = None
@@ -77,6 +115,31 @@ class ProfileConfig(BaseModel):
     empty_page_stddev_threshold: float = 5.0
     enable_empty_page_detection: bool = True
     auto_generated: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_legacy_manual_duplex(cls, data: object) -> object:
+        """
+        Read a legacy ``source = "Manual Duplex"`` profile as manual duplex.
+
+        Runs before field validation so every construction path is covered:
+        TOML, environment variables, and direct ``ProfileConfig(...)`` calls.
+        ``source`` is left verbatim, and an explicitly written ``duplex`` is
+        never overwritten -- explicit configuration beats the inference.
+        The input mapping is copied, not mutated.
+
+        Args:
+            data: The raw input before pydantic validates it.
+
+        Returns:
+            The input, with ``duplex = "manual"`` added for a legacy source.
+
+        """
+        if isinstance(data, dict) and "duplex" not in data:
+            source = data.get("source")
+            if isinstance(source, str) and _is_legacy_manual_duplex_source(source):
+                return {**data, "duplex": "manual"}
+        return data
 
 
 class OutputConfig(BaseModel):
@@ -96,6 +159,12 @@ class OutputConfig(BaseModel):
     history_max_rows: int = 500
     paperless_task_timeout: int = 300
     paperless_cache_ttl_seconds: int = 60
+    # How long a manual-duplex job waits for the operator to flip the stack.
+    # A config key, unlike the scan-side module constants
+    # (_DEFAULT_PAGE_TIMEOUT_SECONDS, _MAX_ADF_PAGES): this is the only timeout
+    # that waits on a human rather than a machine, and ten minutes is a guess
+    # about someone else's household (D-10).
+    flip_timeout_seconds: int = 600
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
@@ -184,6 +253,42 @@ class Settings(BaseSettings):
         if "default" not in v:
             msg = "A 'default' profile must be defined in config"
             raise ValueError(msg)
+        return v
+
+    @field_validator("profiles")
+    @classmethod
+    def warn_on_legacy_duplex_source(
+        cls,
+        v: dict[str, ProfileConfig],
+    ) -> dict[str, ProfileConfig]:
+        """
+        Warn, by profile name, about each legacy manual-duplex source.
+
+        ``ProfileConfig`` translates the legacy form but cannot name itself, so
+        the warning lives here. The legacy form is documented nowhere, which
+        makes this message the operator's only migration instruction: it states
+        the replacement inline. It makes no removal promise.
+
+        Args:
+            v: The already-constructed, already-translated profiles.
+
+        Returns:
+            The profiles, unchanged.
+
+        """
+        for name, profile in v.items():
+            if profile.duplex == "manual" and _is_legacy_manual_duplex_source(
+                profile.source
+            ):
+                logger.warning(
+                    "Profile %r requests manual duplex through the deprecated "
+                    'source value %r. saneless has read it as duplex = "manual" '
+                    'for this run. Update the profile to set duplex = "manual" '
+                    "and source to a source your scanner actually reports -- run "
+                    "'saneless devices --capabilities' to list them.",
+                    name,
+                    profile.source,
+                )
         return v
 
 
