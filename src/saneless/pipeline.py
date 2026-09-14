@@ -452,11 +452,6 @@ def _consume_dir_warning(destination: Path | None) -> str:
     )
 
 
-def _is_manual_duplex(source: str) -> bool:
-    """Check if the source string indicates manual duplex scanning."""
-    return "manual" in source.lower() and "duplex" in source.lower()
-
-
 @dataclass(frozen=True)
 class _DeliveryContext:
     """
@@ -705,6 +700,80 @@ def _handle_duplex_mismatch(
     return warning, delivered
 
 
+def _finish_duplex_mismatch(
+    mismatch: _DuplexMismatch,
+    tmp_path: Path,
+    paperless: PaperlessClient,
+    request: PipelineRequest,
+    settings: Settings,
+) -> ScanResult:
+    """
+    Deliver a mismatched manual duplex run and report how it resolved.
+
+    This is ``run_pipeline``'s ``_DuplexMismatch`` arm. It is a separate
+    function only because ``run_pipeline`` would otherwise go over ruff's
+    ``PLR0915`` statement limit, and CLAUDE.md forbids suppressing that rule.
+
+    Args:
+        mismatch: Both passes, the resolution the device used, and the sheets
+            it could not read.
+        tmp_path: Temporary directory for PDF assembly.
+        paperless: Paperless-ngx client for upload.
+        request: Pipeline request with title, tags, correspondent, job id and
+            status callback.
+        settings: Application settings, for the preservation directory and the
+            task timeout.
+
+    Returns:
+        SUCCESS when both partial PDFs reached the paperless-ngx API, otherwise
+        FALLBACK, always carrying the mismatch warning.
+
+    Raises:
+        PaperlessError: If either upload or either poll fails.
+
+    """
+    warning, delivered = _handle_duplex_mismatch(
+        (mismatch.fronts, mismatch.backs),
+        tmp_path,
+        paperless,
+        request,
+        _DeliveryContext(
+            dpi=mismatch.dpi,
+            failed_dir=settings.output.failed_dir,
+            task_timeout=settings.output.paperless_task_timeout,
+        ),
+    )
+    notify = request.status_callback or _noop_callback
+    notify(PipelineEvent.DONE)
+    logger.info("Pipeline complete for '%s' (duplex mismatch recovery)", request.title)
+    mismatch_pages = len(mismatch.fronts) + len(mismatch.backs)
+    # The mismatch path does not run _drop_empty_pages, on purpose (D-08), so
+    # pages_removed is a hardcoded 0.  A mismatched run is an anomaly sent to a
+    # person for manual review, and a blank back side is evidence about why
+    # the two passes disagreed.  Removing it would destroy the information the
+    # partial PDFs exist to provide.
+    #
+    # Filtering here was considered and rejected because it is dangerous:
+    # _drop_empty_pages raises ScanError when every page is empty, so an
+    # all-blank backs pass would fail the run and lose the fronts too.  That
+    # turns a recoverable anomaly into exactly the data loss Phase 23 spent a
+    # phase removing.  Because nothing is filtered, pages_removed=0 is simply
+    # true.
+    #
+    # Per Phase 24 D-04, _MAX_ADF_PAGES applies to each scan_pages call, so to
+    # each pass: each pass can feed up to that many sheets.
+    return ScanResult(
+        outcome=ScanOutcome.SUCCESS if delivered else ScanOutcome.FALLBACK,
+        pages_scanned=mismatch_pages,
+        pages_removed=0,
+        pages_uploaded=mismatch_pages,
+        warning=_join_warnings(
+            warning,
+            _rejected_pages_warning(mismatch.pages_rejected),
+        ),
+    )
+
+
 def _interleave_duplex(
     fronts: list[Image.Image],
     backs: list[Image.Image],
@@ -833,6 +902,10 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
     """
     Build the flip context for a manual-duplex run, refusing one with no coordinator.
 
+    Called only by ``run_pipeline``, only for a ``duplex = "manual"`` profile, and
+    before any scanner contact -- see the comment at the call site for why that
+    placement matters.
+
     Args:
         request: The pipeline request, which must carry a flip coordinator.
         settings: Application settings, for ``output.flip_timeout_seconds``.
@@ -844,18 +917,17 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
         ConfigError: If the request carries no flip coordinator.
 
     """
-    coordinator = request.flip_coordinator
-    if coordinator is None:
-        # Placeholder until plan 25-04 moves this refusal up front, ahead of
-        # _resolve_device and any other scanner contact -- today it fires just
-        # before pass A.  Refusing is the only safe answer: with no coordinator
-        # pass B would start the instant pass A ends, re-feeding an empty tray
-        # (C-02).
+    if request.flip_coordinator is None:
+        # Refusing is the only safe answer: with no coordinator, pass B would
+        # start the instant pass A ends and re-feed an empty tray (C-02).
+        # Starting anyway would turn a bad request into lost pages.
         msg = (
             f"Profile '{request.profile_name}' is manual duplex, which needs a "
-            "flip coordinator, and none was supplied"
+            "flip coordinator to tell saneless when the stack has been turned "
+            "over, and none was supplied"
         )
         raise ConfigError(msg)
+    coordinator = request.flip_coordinator
     return _FlipContext(
         coordinator=coordinator,
         timeout=settings.output.flip_timeout_seconds,
@@ -964,6 +1036,18 @@ def run_pipeline(
         raise ConfigError(msg)
 
     profile = settings.profiles[request.profile_name]
+
+    # The one place saneless decides a scan is manual duplex, and it reads
+    # profile.duplex -- never source, which is a pure SANE value (DPLX-03).
+    #
+    # _flip_context refuses a manual-duplex request that has no flip
+    # coordinator, and where it is called matters: it must come before
+    # _resolve_device, which calls get_devices() when scanner.device is empty,
+    # so a request that cannot run never touches the device.  Refusing inside
+    # _scan_manual_duplex would be too late -- that function scans pass A
+    # first, so it would use up a full feeder pass before failing.
+    flip = _flip_context(request, settings) if profile.duplex == "manual" else None
+
     device_id = _resolve_device(scanner, settings)
 
     scan_settings = ScanSettings(
@@ -989,47 +1073,33 @@ def run_pipeline(
             device_id,
         )
 
-        if _is_manual_duplex(profile.source):
-            duplex_result = _scan_manual_duplex(
-                scanner,
-                device_id,
-                scan_settings,
-                request,
-                _flip_context(request, settings),
-            )
-            if isinstance(duplex_result, _DuplexMismatch):
-                warning, delivered = _handle_duplex_mismatch(
-                    (duplex_result.fronts, duplex_result.backs),
-                    tmp_path,
-                    paperless,
-                    request,
-                    _DeliveryContext(
-                        dpi=duplex_result.dpi,
-                        failed_dir=settings.output.failed_dir,
-                        task_timeout=settings.output.paperless_task_timeout,
-                    ),
-                )
-                notify(PipelineEvent.DONE)
-                logger.info(
-                    "Pipeline complete for '%s' (duplex mismatch recovery)",
-                    request.title,
-                )
-                mismatch_pages = len(duplex_result.fronts) + len(duplex_result.backs)
-                return ScanResult(
-                    outcome=(
-                        ScanOutcome.SUCCESS if delivered else ScanOutcome.FALLBACK
-                    ),
-                    pages_scanned=mismatch_pages,
-                    pages_removed=0,
-                    pages_uploaded=mismatch_pages,
-                    warning=_join_warnings(
-                        warning,
-                        _rejected_pages_warning(duplex_result.pages_rejected),
-                    ),
-                )
-            batch = duplex_result
-        else:
+        if flip is None:
             batch = _scan_simplex(scanner, device_id, scan_settings, request)
+        else:
+            duplex_result = _scan_manual_duplex(
+                scanner, device_id, scan_settings, request, flip
+            )
+            # A match with assert_never, not a dict or an isinstance chain, on
+            # purpose: a variant missing from a dict draws no diagnostic from
+            # either ty or pyrefly, while the same omission in a match is
+            # caught by both, at edit time, before a third result type can fall
+            # silently through an else.
+            #
+            # This dispatch is what closes N-07.  N-07's other half -- "replace
+            # the tuple with a result dataclass" -- was already done in an
+            # earlier phase, when the (fronts, backs) tuple became
+            # _DuplexMismatch.
+            match duplex_result:
+                case ScanBatch():
+                    batch = duplex_result
+                case _DuplexMismatch():
+                    # Returns early and deliberately skips _drop_empty_pages
+                    # below -- see _finish_duplex_mismatch for why (D-08).
+                    return _finish_duplex_mismatch(
+                        duplex_result, tmp_path, paperless, request, settings
+                    )
+                case _:
+                    assert_never(duplex_result)
 
         images = batch.pages
         actual_dpi = batch.actual_resolution
