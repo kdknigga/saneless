@@ -342,7 +342,7 @@ Plans:
   4. Jobs left non-terminal by a crash are FAILED with a "server restarted" reason before the worker starts, and profiles are generated at startup from the config path that was actually loaded
   5. A browser test in CI with no CDN egress clicks Scan, waits for the terminal status, and asserts `#scan-btn` is enabled again with no duplicate `id="scan-btn"` in the DOM and `app.js` deleted
 
-**Plans**: 14 plans
+**Plans**: 17 plans (14 executed in 7 waves, plus 3 gap-closure plans in 2 waves)
 
 **Wave 1**
 
@@ -378,6 +378,17 @@ Plans:
 **Wave 7** *(blocked on Wave 6 completion)*
 
 - [x] 26-13-PLAN.md — Request error slot browser proof (ROBU-02 visibility) and plain-HTTP LAN origin (wave 7)
+
+**Gap closure** (from 26-VERIFICATION.md and 26-REVIEW.md: CR-01, WR-01)
+
+**Gap Wave 1**
+
+- [ ] 26-15-PLAN.md — CR-01: owed job-store writes retried on every idle tick, corrected locked-in test, Scan button re-enables (gap wave 1)
+- [ ] 26-16-PLAN.md — WR-01: JobStore.create_rejected_job single statement for refused-before-row submits (gap wave 1)
+
+**Gap Wave 2** *(blocked on Gap Wave 1 completion)*
+
+- [ ] 26-17-PLAN.md — WR-01: failed post-submit rejection write owed to the worker under a lock (gap wave 2)
 
 Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 must be paired with an explicit `htmx-config` override or it is invisible — reintroducing the exact C-10 symptom this phase fixes. Worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper here, not in Phase 32.
 
