@@ -24,7 +24,11 @@ from .auto_profiles import (
     resolve_config_path,
     write_profiles_to_config,
 )
-from .config import load_settings, validate_settings_dirs
+from .config import (
+    load_settings,
+    validate_settings_dirs,
+    warn_on_legacy_duplex_sources,
+)
 from .exceptions import PaperlessError, ScanError
 from .job import JobStore
 from .logging_config import configure_logging
@@ -198,6 +202,8 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
         settings.output.log_backup_count,
         verbose=verbose,
     )
+    # WR-05: emitted only now, once the log file handler exists to receive it.
+    warn_on_legacy_duplex_sources(settings)
 
     ctx.obj["settings"] = settings
     ctx.obj["verbose"] = verbose

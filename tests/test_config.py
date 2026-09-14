@@ -17,6 +17,7 @@ from saneless.config import (
     Settings,
     load_settings,
     validate_settings_dirs,
+    warn_on_legacy_duplex_sources,
 )
 from saneless.exceptions import (
     ConfigError,
@@ -300,20 +301,45 @@ class TestMinFreeSpaceMb:
 
 
 class TestFlipTimeoutSeconds:
-    """OutputConfig flip_timeout_seconds field (DPLX-05, D-10)."""
+    """
+    OutputConfig flip_timeout_seconds field (DPLX-05, D-10, WR-01).
+
+    The wait is bounded to one second through one day.  Zero or a negative
+    value makes the flip wait expire at once, failing every manual-duplex job
+    right after pass A; a value above ``threading.TIMEOUT_MAX`` makes
+    ``Event.wait`` raise ``OverflowError`` at the same point.  Both are
+    rejected at load, where the CLI reports a configuration error.
+    """
 
     def test_flip_timeout_seconds_default(self) -> None:
         """Settings default the manual-duplex flip wait to ten minutes."""
         assert Settings().output.flip_timeout_seconds == 600
 
-    def test_flip_timeout_seconds_accepts_zero(self) -> None:
-        """
-        Zero is a valid timeout.
+    @pytest.mark.parametrize("value", [0, -5, 86_401])
+    def test_flip_timeout_seconds_out_of_bounds_rejected(self, value: int) -> None:
+        """Zero, a negative value and anything above a day fail validation."""
+        with pytest.raises(ValidationError, match="flip_timeout_seconds"):
+            OutputConfig(flip_timeout_seconds=value)
 
-        It is the zero-cost seam later plans use to make a flip timeout
-        observable without waiting for one.
-        """
-        assert OutputConfig(flip_timeout_seconds=0).flip_timeout_seconds == 0
+    @pytest.mark.parametrize("value", [1, 86_400])
+    def test_flip_timeout_seconds_bounds_accepted(self, value: int) -> None:
+        """One second and exactly one day are the inclusive bounds."""
+        assert OutputConfig(flip_timeout_seconds=value).flip_timeout_seconds == value
+
+    def test_flip_timeout_seconds_zero_in_toml_rejected(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A TOML ``flip_timeout_seconds = 0`` fails at load, not after pass A."""
+        toml_content = """\
+[output]
+flip_timeout_seconds = 0
+
+[profiles.default]
+"""
+        config_file = tmp_config_dir / "flip_timeout_zero.toml"
+        config_file.write_text(toml_content)
+        with pytest.raises(ValidationError, match="flip_timeout_seconds"):
+            load_settings(config_path=str(config_file))
 
     def test_flip_timeout_seconds_from_toml(self, tmp_config_dir: Path) -> None:
         """The timeout is read from the [output] section."""
@@ -435,7 +461,21 @@ source = "Manual Duplex"
 
 
 class TestLegacyDuplexWarning:
-    """Loading a legacy manual-duplex profile warns once, by name (D-04, D-18)."""
+    """
+    A legacy manual-duplex source is warned about once, by name (D-04, D-18).
+
+    The warning is emitted by ``warn_on_legacy_duplex_sources``, which the CLI
+    calls after logging is configured (WR-05), not by loading settings -- a
+    record logged inside ``load_settings`` would never reach ``log_file``.
+    """
+
+    _LEGACY_TOML = """\
+[profiles.default]
+source = "Flatbed"
+
+[profiles.legacy]
+source = "Manual Duplex"
+"""
 
     @staticmethod
     def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -446,27 +486,71 @@ class TestLegacyDuplexWarning:
             if record.levelno == logging.WARNING and record.name == "saneless.config"
         ]
 
+    def test_loading_settings_alone_emits_nothing(
+        self, tmp_config_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Loading happens before logging is configured, so it must stay quiet."""
+        config_file = tmp_config_dir / "legacy_load_only.toml"
+        config_file.write_text(self._LEGACY_TOML)
+        with caplog.at_level(logging.WARNING, logger="saneless.config"):
+            settings = load_settings(config_path=str(config_file))
+
+        assert settings.profiles["legacy"].duplex == "manual"
+        assert self._warnings(caplog) == []
+
     def test_legacy_profile_warns_once_with_migration_instruction(
         self, tmp_config_dir: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The WARNING names the profile, the replacement and the source command."""
-        toml_content = """\
-[profiles.default]
-source = "Flatbed"
-
-[profiles.legacy]
-source = "Manual Duplex"
-"""
         config_file = tmp_config_dir / "legacy_warning.toml"
-        config_file.write_text(toml_content)
+        config_file.write_text(self._LEGACY_TOML)
+        settings = load_settings(config_path=str(config_file))
         with caplog.at_level(logging.WARNING, logger="saneless.config"):
-            load_settings(config_path=str(config_file))
+            warn_on_legacy_duplex_sources(settings)
 
         warnings = self._warnings(caplog)
         assert len(warnings) == 1
-        message = "\n".join(warnings)
-        assert "legacy" in message
+        message = warnings[0]
+        assert "'legacy'" in message
         assert 'duplex = "manual"' in message
+        assert "devices --capabilities" in message
+
+    @pytest.mark.parametrize("duplex", ["none", "hardware"])
+    def test_legacy_source_with_non_manual_duplex_warns(
+        self,
+        duplex: str,
+        tmp_config_dir: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A legacy-looking source with an explicit non-manual duplex is warned (IN-04).
+
+        Explicit configuration still wins -- the profile is not read as manual
+        duplex -- but the source goes to the scanner verbatim, so the operator
+        is told rather than left to find out from a SANE error.
+        """
+        toml_content = f"""\
+[profiles.default]
+source = "Flatbed"
+
+[profiles.odd]
+source = "Manual Duplex"
+duplex = "{duplex}"
+"""
+        config_file = tmp_config_dir / f"legacy_{duplex}.toml"
+        config_file.write_text(toml_content)
+        settings = load_settings(config_path=str(config_file))
+        with caplog.at_level(logging.WARNING, logger="saneless.config"):
+            warn_on_legacy_duplex_sources(settings)
+
+        assert settings.profiles["odd"].duplex == duplex
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        message = warnings[0]
+        assert "'odd'" in message
+        assert "'Manual Duplex'" in message
+        assert f"duplex = '{duplex}'" in message
+        assert "has not read it as manual duplex" in message
         assert "devices --capabilities" in message
 
     def test_explicit_manual_duplex_does_not_warn(
@@ -480,8 +564,9 @@ duplex = "manual"
 """
         config_file = tmp_config_dir / "modern_duplex.toml"
         config_file.write_text(toml_content)
+        settings = load_settings(config_path=str(config_file))
         with caplog.at_level(logging.WARNING, logger="saneless.config"):
-            settings = load_settings(config_path=str(config_file))
+            warn_on_legacy_duplex_sources(settings)
 
         assert settings.profiles["default"].duplex == "manual"
         assert self._warnings(caplog) == []
