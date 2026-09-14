@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -12,7 +13,7 @@ import tomlkit
 from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
-from saneless.cli import _truncate, cli
+from saneless.cli import ClickFlipCoordinator, _truncate, cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -30,7 +31,7 @@ from saneless.scanner.base import (
     ScannerBackend,
     ScanSettings,
 )
-from saneless.vocabulary import JobState, state_label
+from saneless.vocabulary import FlipOutcome, JobState, state_label
 
 if TYPE_CHECKING:
     import pytest
@@ -313,6 +314,356 @@ class TestScanCommand:
         request = captured["request"]
         assert hasattr(request, "profile_name")
         assert request.profile_name == "photo"
+
+
+_DUPLEX_PROFILE = "duplex"
+
+# A distinctive fragment of the CLI's flip prompt, asserted rather than the whole
+# sentence so a rewording of the tail does not break the ordering checks.
+_FLIP_PROMPT_FRAGMENT = "Flip the stack"
+
+
+def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Settings:
+    """
+    Build settings with a manual-duplex profile, writing only under ``tmp_path``.
+
+    ``_make_settings`` replaces a whole section on override, so the three path
+    fields are re-supplied here -- leaving them out would send the run into the
+    developer's real state directory.
+
+    Args:
+        tmp_path: The pytest temporary directory for tmp, data and log files.
+        flip_timeout_seconds: The flip-wait bound, in seconds.
+
+    Returns:
+        Settings whose ``duplex`` profile is manual duplex on a feeder source.
+
+    """
+    return _make_settings(
+        output=OutputConfig(
+            tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
+            log_file=str(tmp_path / "saneless.log"),
+            flip_timeout_seconds=flip_timeout_seconds,
+        ),
+        profiles={
+            "default": ProfileConfig(),
+            _DUPLEX_PROFILE: ProfileConfig(source="ADF", duplex="manual"),
+        },
+    )
+
+
+def _counting_scanner(calls: list[str]) -> type[ScannerBackend]:
+    """
+    Build a scanner backend class that records every ``scan_pages`` call.
+
+    A class rather than an instance because ``cli.scan`` constructs the backend
+    itself; the list is closed over so the test can read the count afterwards.
+
+    Args:
+        calls: Receives one device id per ``scan_pages`` call.
+
+    Returns:
+        A ``ScannerBackend`` subclass accepting ``host`` like ``SaneBackend``.
+
+    """
+
+    class CountingScanner(ScannerBackend):
+        """Scanner reporting a feeder, returning one inked page per pass."""
+
+        def __init__(self, host: str = "") -> None:
+            """Accept host parameter for API compatibility."""
+
+        def get_devices(self) -> list[DeviceInfo]:
+            """Return one feeder-equipped device."""
+            return [DeviceInfo("test:device:001", "Test", "Feeder", "scanner")]
+
+        def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+            """Report a flatbed and a real feeder source."""
+            return DeviceCapabilities(
+                sources=["Flatbed", "ADF"],
+                resolutions=[300],
+                modes=["color"],
+            )
+
+        def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+            """Record the call and return a single page with content."""
+            calls.append(device_id)
+            img = Image.new("RGB", (100, 100), "white")
+            draw = ImageDraw.Draw(img)
+            draw.rectangle([10, 10, 90, 90], fill="black")
+            return ScanBatch(pages=[img], actual_resolution=300, pages_rejected=0)
+
+    return CountingScanner
+
+
+def _recording_paperless(uploads: list[str]) -> type:
+    """
+    Build a paperless client class that records every upload.
+
+    Args:
+        uploads: Receives one entry per ``upload_document`` call.
+
+    Returns:
+        A class standing in for ``PaperlessClient``.
+
+    """
+
+    class RecordingPaperless:
+        """Paperless client that remembers what it was asked to upload."""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            """Accept and ignore all constructor arguments."""
+
+        def upload_document(self, *_args: object, **_kwargs: object) -> UploadResult:
+            """Record the upload and report it delivered."""
+            uploads.append("uploaded")
+            return UploadResult(delivered_to_api=True, task_uuid="mock-task-uuid")
+
+        def poll_task(self, *_args: object, **_kwargs: object) -> dict[str, str]:
+            """Return a successful task result."""
+            return {"status": "SUCCESS"}
+
+        def close(self) -> None:
+            """No-op close."""
+
+    return RecordingPaperless
+
+
+class TestManualDuplexPrompt:
+    """
+    The CLI flip prompt, its non-terminal refusal, abort, and bounded wait.
+
+    Read the two halves of the TTY policy together, because they look
+    contradictory and are not.  ``CliRunner`` genuinely is not a terminal, so
+    the refusal test runs with ``_stdin_is_interactive`` *unpatched* -- it is
+    telling the truth about its environment.  The prompt tests patch that one
+    seam to ``True`` so they can reach ``click.confirm`` at all.  Neither test
+    lies, and neither can be "simplified" into the other: without the seam, one
+    of the two could not be written.
+    """
+
+    def _interactive(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Pretend stdin is a terminal a human can answer on."""
+        monkeypatch.setattr("saneless.cli._stdin_is_interactive", lambda: True)
+
+    def test_prompt_between_passes_then_scans_backs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Answering yes scans both passes, and the prompt sits between them."""
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+
+        result = runner.invoke(
+            cli,
+            ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Both sides"],
+            input="y\n",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 2
+        assert uploads == ["uploaded"]
+        # C-02's own prescribed check: the prompt is echoed into the output,
+        # and it lands after the fronts and before the backs.
+        fronts = result.output.index("Scanning...")
+        prompt = result.output.index(_FLIP_PROMPT_FRAGMENT)
+        backs = result.output.index("Scanning reverse sides...")
+        assert fronts < prompt < backs
+
+    def test_answering_no_aborts_without_scanning_backs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Answering no fails the job at the flip prompt and uploads nothing."""
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+
+        result = runner.invoke(
+            cli,
+            ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Fronts only"],
+            input="n\n",
+        )
+
+        assert result.exit_code != 0
+        assert "flip prompt" in result.output
+        assert len(calls) == 1
+        assert uploads == []
+
+    def test_eof_at_prompt_matches_answering_no(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """EOF (as Ctrl-C) at the prompt ends the job exactly as a web Abort does."""
+        outcomes: list[tuple[int, str, int, int]] = []
+        for answer in ("n\n", ""):
+            calls: list[str] = []
+            uploads: list[str] = []
+            runner, _ = _patch_cli(
+                monkeypatch,
+                settings=_duplex_settings(tmp_path),
+                scanner_cls=_counting_scanner(calls),
+                paperless_cls=_recording_paperless(uploads),
+            )
+            self._interactive(monkeypatch)
+            result = runner.invoke(
+                cli,
+                ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Abort"],
+                input=answer,
+            )
+            # Sliced from the message rather than taken by line: at EOF the
+            # prompt gets no newline, so the error shares the prompt's line.
+            error_line = result.output[result.output.index("Scan error") :]
+            error_line = error_line.splitlines()[0]
+            outcomes.append((result.exit_code, error_line, len(calls), len(uploads)))
+
+        answered_no, interrupted = outcomes
+        assert interrupted == answered_no
+        assert "flip prompt" in interrupted[1]
+
+    def test_ctrl_c_during_the_wait_is_an_abort(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Ctrl-C while the prompt is up resolves ``ABORTED``, not a raw interrupt.
+
+        SIGINT is handled on the main thread, so a real Ctrl-C does not reach
+        ``click.confirm`` on the prompt thread at all -- it raises
+        ``KeyboardInterrupt`` out of the calling thread's bounded wait (measured
+        with a real SIGINT against a never-answering stdin).  A real signal
+        cannot be sent here without taking the pytest session down with it if
+        the handling regressed, so the wait itself is made to raise.
+        """
+
+        class InterruptedEvent:
+            """An event whose wait is cut short by Ctrl-C."""
+
+            def wait(self, timeout: float | None = None) -> bool:
+                """Raise as SIGINT would on the main thread."""
+                raise KeyboardInterrupt
+
+            def set(self) -> None:
+                """Accept the prompt thread's late signal."""
+
+        release = threading.Event()
+
+        def never_answered(*_args: object, **_kwargs: object) -> bool:
+            """Block until the test lets go, then decline."""
+            release.wait()
+            return False
+
+        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        coordinator = ClickFlipCoordinator()
+        monkeypatch.setattr(coordinator, "_event", InterruptedEvent())
+
+        try:
+            outcome = coordinator.wait_for_flip(600)
+        finally:
+            release.set()
+
+        assert outcome is FlipOutcome.ABORTED
+
+    def test_unanswered_prompt_times_out_before_pass_b(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An answer that never arrives fails the job on the flip wait (D-19).
+
+        The timeout is ``0``, not a small float and not a wall-clock wait.
+        ``flip_timeout_seconds`` is typed ``int``, so pydantic rejects ``0.05``
+        outright (a float with a fractional part is not a lax-mode int), and
+        widening a production field for a test is not worth it.  Zero costs no
+        wall clock and proves the same property: the bounded wait expires at
+        once and ``TIMED_OUT`` is claimed before pass B.
+        """
+        # The only test in this class that stubs click.confirm instead of
+        # driving the real one, and it has to.  CliRunner's empty input stream
+        # hits EOF immediately, click.confirm raises Abort, and the coordinator
+        # would claim ABORTED in a race against TIMED_OUT -- a flaky test that
+        # passes on one machine.  This stub makes "the answer never comes"
+        # deterministic, and the finally releases it so the daemon thread ends
+        # with the test instead of lingering in the pytest process.
+        release = threading.Event()
+
+        def never_answered(*_args: object, **_kwargs: object) -> bool:
+            """Block until the test lets go, then decline."""
+            release.wait()
+            return False
+
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path, flip_timeout_seconds=0),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+
+        try:
+            result = runner.invoke(
+                cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Forgotten"]
+            )
+        finally:
+            release.set()
+
+        assert result.exit_code != 0
+        assert "flip wait" in result.output
+        assert len(calls) == 1
+        assert uploads == []
+
+    def test_non_interactive_stdin_refused_up_front(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Without a terminal, manual duplex exits 2 before any paper moves.
+
+        Deliberately *not* patched: ``CliRunner`` is honestly not a TTY.
+        """
+        calls: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+        )
+
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Cron"]
+        )
+
+        assert result.exit_code == 2
+        assert "interactive terminal" in result.output
+        assert calls == []
+
+    def test_simplex_profile_neither_prompts_nor_refuses(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A non-duplex profile off a terminal scans once with no prompt."""
+        calls: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Simplex"])
+
+        assert result.exit_code == 0, result.output
+        assert _FLIP_PROMPT_FRAGMENT not in result.output
+        assert "interactive terminal" not in result.output
+        assert len(calls) == 1
 
 
 class TestDevicesCommand:

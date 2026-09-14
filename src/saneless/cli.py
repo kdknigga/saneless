@@ -12,6 +12,7 @@ import logging
 import shutil
 import socket
 import sys
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -28,15 +29,15 @@ from .exceptions import PaperlessError, ScanError
 from .job import JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
-from .pipeline import PipelineEvent, PipelineRequest, run_pipeline
+from .pipeline import FlipCoordinator, PipelineEvent, PipelineRequest, run_pipeline
 from .scanner.sane_backend import SaneBackend
-from .vocabulary import JobState, progress_label, state_label
+from .vocabulary import FlipOutcome, JobState, progress_label, state_label
 from .web.app import create_app
 
 if TYPE_CHECKING:
     from .scanner.base import DeviceCapabilities
 
-__all__ = ["_truncate", "cli"]
+__all__ = ["ClickFlipCoordinator", "_truncate", "cli"]
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,117 @@ logger = logging.getLogger(__name__)
 # and a ninth JobState member must not be able to overflow an 80-column
 # terminal without anyone noticing.
 _STATUS_COL_WIDTH = max(len(state_label(state)) for state in JobState)
+
+# What the operator is asked between the two manual-duplex passes.  A yes/no
+# question rather than "press Enter" on purpose: click's pause(), the only API that
+# matches "press Enter", is a documented no-op off a terminal and would start
+# pass B on the unflipped stack without a word (C-02).
+_FLIP_PROMPT = (
+    "Flip the stack over and load it back into the feeder. Scan the back sides?"
+)
+
+
+# Whether a human can answer a prompt here, behind a function of its own rather
+# than written inline: CliRunner is genuinely not a terminal, so the non-TTY
+# refusal test runs unpatched and the prompt test patches this one name.
+# Written as a bare sys.stdin.isatty() in scan, one of the two could not exist.
+def _stdin_is_interactive() -> bool:
+    """Whether stdin is a terminal a human can answer a prompt on."""
+    return sys.stdin.isatty()
+
+
+class ClickFlipCoordinator(FlipCoordinator):
+    """
+    The CLI flip coordinator: a terminal prompt with a bounded wait (D-19).
+
+    ``click.confirm`` has no timeout of its own, so it runs on a daemon thread
+    while the calling thread waits on an event for at most ``timeout`` seconds.
+    Whichever of the operator's answer or the clock claims the single answer
+    first is the answer -- the same claim-once shape as the web worker's
+    coordinator, so an answer that lands as the wait expires is honoured rather
+    than overwritten.
+
+    A yes is ``CONTINUED``; a no is ``ABORTED``; and so are EOF at the prompt
+    (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
+    the calling thread, where Python delivers SIGINT), so giving up at the
+    terminal and clicking Abort in the web UI end the job the same way.
+
+    Accepted cost, deliberate and not a leak: after a timeout the prompt thread
+    is abandoned.  It keeps its read on stdin until the process exits, and its
+    prompt may be left sitting on the terminal.  That is bounded -- the job has
+    already failed and the CLI is on its way out -- and a daemon thread parked
+    on stdin was measured not to delay interpreter shutdown.  It must stay a
+    daemon thread: a non-daemon one would hold the interpreter open at exit
+    waiting for an answer nobody is going to give.
+    """
+
+    def __init__(self) -> None:
+        """Start unanswered."""
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._outcome: FlipOutcome | None = None
+
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Prompt the operator, and claim ``TIMED_OUT`` if ``timeout`` elapses first.
+
+        Args:
+            timeout: The longest to wait for an answer, in seconds.
+
+        Returns:
+            The one answer this coordinator resolved to.
+
+        """
+        prompt = threading.Thread(
+            target=self._prompt, name="saneless-flip-prompt", daemon=True
+        )
+        prompt.start()
+        try:
+            self._event.wait(timeout)
+        except KeyboardInterrupt:
+            # Ctrl-C lands here, not in click.confirm: Python handles SIGINT on
+            # the main thread, which is this one, parked in the wait.  Offered
+            # as ABORTED so it ends the job the way a web Abort does.
+            return self._resolve(FlipOutcome.ABORTED)
+        # One path for both endings.  If the prompt answered, _resolve finds
+        # that answer already claimed and hands it back; if the wait expired,
+        # TIMED_OUT is offered and wins unless the answer beat it after all.
+        return self._resolve(FlipOutcome.TIMED_OUT)
+
+    def _prompt(self) -> None:
+        """Ask the operator on the prompt thread and claim their answer."""
+        # No bare ``except Exception`` here: anything unexpected leaves the
+        # event unset, and the bounded wait turns that into TIMED_OUT, which is
+        # the right fallback for a prompt that never produced an answer.
+        try:
+            flipped = click.confirm(_FLIP_PROMPT, default=True)
+        except click.Abort:
+            self._resolve(FlipOutcome.ABORTED)
+            return
+        self._resolve(FlipOutcome.CONTINUED if flipped else FlipOutcome.ABORTED)
+
+    def _resolve(self, outcome: FlipOutcome) -> FlipOutcome:
+        """
+        Claim the single answer, unless one is already claimed.
+
+        Returning the answer in effect, rather than asserting one exists, is
+        what narrows ``FlipOutcome | None`` without an ``assert`` -- which
+        ``S101`` bans in ``src/``.
+
+        Args:
+            outcome: The answer this caller is offering.
+
+        Returns:
+            The claimed answer: ``outcome`` if it was first, otherwise the
+            answer that beat it.
+
+        """
+        with self._lock:
+            if self._outcome is None:
+                self._outcome = outcome
+            claimed = self._outcome
+        self._event.set()
+        return claimed
 
 
 def _truncate(value: str, width: int) -> str:
@@ -111,6 +223,18 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         click.echo(f"Unknown profile: {profile}", err=True)
         sys.exit(2)
 
+    manual_duplex = settings.profiles[profile].duplex == "manual"
+    # Refused here, before the backend exists, so no paper moves: from cron or a
+    # pipe there is nobody to flip the stack, and pass A would be wasted.
+    if manual_duplex and not _stdin_is_interactive():
+        click.echo(
+            f"Profile '{profile}' is manual duplex, which needs an interactive "
+            "terminal: saneless must prompt you to flip the stack between the "
+            "two passes. Run it from a terminal, or scan from the web UI.",
+            err=True,
+        )
+        sys.exit(2)
+
     scanner = SaneBackend(host=settings.scanner.host)
     paperless = PaperlessClient(
         settings.paperless.url,
@@ -132,6 +256,9 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             tags=settings.profiles[profile].default_tags or None,
             correspondent=settings.profiles[profile].default_correspondent,
             status_callback=status_callback,
+            # run_pipeline is synchronous, so the flip wait holds this thread;
+            # only the click.confirm read itself moves to the prompt thread.
+            flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
         )
         run_pipeline(
             scanner,
