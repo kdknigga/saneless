@@ -368,7 +368,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 26-11-PLAN.md — Server-owned Scan button via OOB swap, app.js deleted, title cap (wave 5)
+- [x] 26-11-PLAN.md — Server-owned Scan button via OOB swap, app.js deleted, title cap (wave 5)
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
@@ -488,7 +488,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
-| 26. Worker and Web Robustness | 10/14 | In Progress|  |
+| 26. Worker and Web Robustness | 11/14 | In Progress|  |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
