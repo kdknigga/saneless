@@ -574,18 +574,46 @@ class TestManualDuplexPrompt:
 
         assert outcome is FlipOutcome.ABORTED
 
+    def test_the_coordinator_times_out_at_a_zero_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``wait_for_flip(0)`` with nobody answering resolves ``TIMED_OUT``.
+
+        The coordinator's own contract, independent of the config bounds that
+        keep zero out of ``flip_timeout_seconds`` (WR-01): its ``timeout``
+        argument is the zero-cost seam, so no wall clock is spent here.
+        """
+        release = threading.Event()
+
+        def never_answered(*_args: object, **_kwargs: object) -> bool:
+            """Block until the test lets go, then decline."""
+            release.wait()
+            return False
+
+        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        coordinator = ClickFlipCoordinator()
+
+        try:
+            outcome = coordinator.wait_for_flip(0)
+        finally:
+            release.set()
+
+        assert outcome is FlipOutcome.TIMED_OUT
+
     def test_unanswered_prompt_times_out_before_pass_b(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
         An answer that never arrives fails the job on the flip wait (D-19).
 
-        The timeout is ``0``, not a small float and not a wall-clock wait.
-        ``flip_timeout_seconds`` is typed ``int``, so pydantic rejects ``0.05``
-        outright (a float with a fractional part is not a lax-mode int), and
-        widening a production field for a test is not worth it.  Zero costs no
-        wall clock and proves the same property: the bounded wait expires at
-        once and ``TIMED_OUT`` is claimed before pass B.
+        The timeout is one second, the smallest value config accepts: zero is
+        no longer a legal ``flip_timeout_seconds`` (WR-01), and the field is
+        typed ``int``, so a fractional float is rejected too.  One second of
+        wall clock buys the whole ``scan`` command end to end -- the bounded
+        wait expires and ``TIMED_OUT`` is claimed before pass B.  The
+        zero-cost version of the coordinator's own contract is
+        ``test_the_coordinator_times_out_at_a_zero_timeout``.
         """
         # The only test in this class that stubs click.confirm instead of
         # driving the real one, and it has to.  CliRunner's empty input stream
@@ -605,7 +633,7 @@ class TestManualDuplexPrompt:
         uploads: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_duplex_settings(tmp_path, flip_timeout_seconds=0),
+            settings=_duplex_settings(tmp_path, flip_timeout_seconds=1),
             scanner_cls=_counting_scanner(calls),
             paperless_cls=_recording_paperless(uploads),
         )
