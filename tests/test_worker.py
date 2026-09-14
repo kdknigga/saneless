@@ -16,8 +16,8 @@ from saneless.exceptions import (
 from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
 from saneless.pipeline import PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo
-from saneless.vocabulary import TERMINAL_STATES, ScanOutcome
-from saneless.worker import ScanWorker
+from saneless.vocabulary import TERMINAL_STATES, FlipOutcome, ScanOutcome
+from saneless.worker import ScanWorker, WorkerFlipCoordinator
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -255,6 +255,13 @@ def _success_result() -> ScanResult:
     )
 
 
+# How long the simulated pipeline below waits for a flip.  Generous against
+# the half-second polls the tests use to reach AWAITING_FLIP, and far below
+# pytest-timeout's 60 s ceiling, so a test that never answers fails as a
+# timed-out job rather than as a SIGALRM traceback.
+_MOCK_FLIP_TIMEOUT = 5.0
+
+
 def _mock_manual_duplex_pipeline(
     _scanner: object,
     _paperless: object,
@@ -264,12 +271,16 @@ def _mock_manual_duplex_pipeline(
     """Simulate pipeline behavior for manual duplex tests."""
     if request.thumbnail_callback:
         request.thumbnail_callback("dGh1bWI=")  # base64 "thumb"
-    if request.flip_event:
+    coordinator = request.flip_coordinator
+    if coordinator is not None:
         if request.status_callback:
             request.status_callback(PipelineEvent.AWAITING_FLIP)
-        request.flip_event.wait()
-        if request.abort_event and request.abort_event.is_set():
-            msg = "Manual duplex scan cancelled by user"
+        outcome = coordinator.wait_for_flip(_MOCK_FLIP_TIMEOUT)
+        if outcome is FlipOutcome.ABORTED:
+            msg = "Manual duplex scan aborted at the flip prompt"
+            raise ScanError(msg)
+        if outcome is FlipOutcome.TIMED_OUT:
+            msg = "Manual duplex flip wait timed out"
             raise ScanError(msg)
     return _success_result()
 
@@ -277,14 +288,14 @@ def _mock_manual_duplex_pipeline(
 class TestScanWorkerManualDuplex:
     """Worker manual duplex coordination tests."""
 
-    def test_worker_creates_flip_event_for_manual_duplex(
+    def test_worker_supplies_a_flip_coordinator_for_manual_duplex(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Worker creates flip_event and abort_event for manual duplex jobs."""
+        """A manual duplex job waits on a coordinator that continue_flip answers."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -328,7 +339,7 @@ class TestScanWorkerManualDuplex:
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """abort_flip() sets abort and flip events, causing pipeline to raise."""
+        """abort_flip() answers the coordinator ABORTED, so the pipeline raises."""
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -359,7 +370,7 @@ class TestScanWorkerManualDuplex:
             fetched = _get(store, job.id)
             assert fetched.state == JobState.ERROR
             assert fetched.error is not None
-            assert "cancelled by user" in fetched.error
+            assert "flip prompt" in fetched.error
         finally:
             store.close()
 
@@ -402,14 +413,14 @@ class TestScanWorkerManualDuplex:
         finally:
             store.close()
 
-    def test_non_duplex_no_flip_events(
+    def test_non_duplex_no_flip_coordinator(
         self,
         mock_scanner: MagicMock,
         mock_paperless: MagicMock,
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Non-duplex jobs do not create flip/abort events."""
+        """Non-duplex jobs carry no flip coordinator."""
         captured_request: dict[str, object] = {}
 
         def capturing_pipeline(
@@ -418,9 +429,8 @@ class TestScanWorkerManualDuplex:
             _settings: object,
             request: PipelineRequest,
         ) -> ScanResult:
-            """Capture pipeline request events."""
-            captured_request["flip_event"] = request.flip_event
-            captured_request["abort_event"] = request.abort_event
+            """Capture the request's flip coordinator."""
+            captured_request["flip_coordinator"] = request.flip_coordinator
             return _success_result()
 
         monkeypatch.setattr(
@@ -439,8 +449,7 @@ class TestScanWorkerManualDuplex:
             time.sleep(0.5)
             worker.stop()
 
-            assert captured_request["flip_event"] is None
-            assert captured_request["abort_event"] is None
+            assert captured_request["flip_coordinator"] is None
         finally:
             store.close()
 
@@ -484,6 +493,72 @@ class TestScanWorkerManualDuplex:
             assert worker.current_job_id is None
         finally:
             store.close()
+
+
+class TestWorkerFlipCoordinator:
+    """
+    The web flip coordinator answers once, and its answer is final (D-16).
+
+    Every wait here is bounded by ``0``: ``threading.Event().wait(0)`` returns
+    in microseconds, so nothing in this class waits on a wall clock.
+    """
+
+    def test_continue_before_the_wait_resolves_continued(self) -> None:
+        """A Continue that arrives first is the answer the wait returns."""
+        coordinator = WorkerFlipCoordinator()
+        coordinator.signal_continue()
+        assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
+
+    def test_abort_before_the_wait_resolves_aborted(self) -> None:
+        """An Abort that arrives first is the answer the wait returns."""
+        coordinator = WorkerFlipCoordinator()
+        coordinator.signal_abort()
+        assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
+
+    def test_a_later_abort_after_continue_is_dropped(self) -> None:
+        """
+        D-16: once Continue has answered, a late Abort changes nothing.
+
+        Pass B has genuinely started by then, and stopping it mid-pass is
+        Phase 29's HARD-02, so the honest answer is the first one.
+        """
+        coordinator = WorkerFlipCoordinator()
+        coordinator.signal_continue()
+        coordinator.signal_abort()
+        assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
+
+    def test_an_unanswered_wait_times_out(self) -> None:
+        """Nothing signalled within the bound resolves TIMED_OUT (DPLX-05)."""
+        coordinator = WorkerFlipCoordinator()
+        assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
+
+    def test_a_continue_after_a_timeout_does_not_revive_the_wait(self) -> None:
+        """The timeout is an answer too; a Continue arriving after it is dropped."""
+        coordinator = WorkerFlipCoordinator()
+        assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
+        coordinator.signal_continue()
+        assert coordinator.wait_for_flip(0) is FlipOutcome.TIMED_OUT
+
+    def test_a_continue_racing_the_timeout_is_honoured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A Continue landing between the wait expiring and the timeout's claim wins.
+
+        The race is staged rather than timed: the event's ``wait`` is replaced
+        by one that delivers Continue and then reports expiry, which is exactly
+        the interleaving a real race produces.  The coordinator must return the
+        answer already claimed, not overwrite it with ``TIMED_OUT``.
+        """
+        coordinator = WorkerFlipCoordinator()
+
+        def _continue_then_expire(timeout: float | None = None) -> bool:
+            """Deliver Continue, then report the wait as expired."""
+            coordinator.signal_continue()
+            return False
+
+        monkeypatch.setattr(coordinator._event, "wait", _continue_then_expire)
+        assert coordinator.wait_for_flip(0) is FlipOutcome.CONTINUED
 
 
 class TestWorkerIntermediateStates:
