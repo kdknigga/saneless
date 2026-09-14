@@ -1,53 +1,72 @@
 ---
 phase: 26-worker-and-web-robustness
-verified: 2026-09-14T22:20:28Z
+verified: 2026-09-14T23:55:00Z
 status: gaps_found
-score: 4/5 roadmap success criteria verified (1 blocked)
+score: 4/5 roadmap success criteria verified (1 partially reopened by a fresh finding)
 overrides_applied: 0
+re_verification:
+  previous_status: gaps_found
+  previous_score: 4/5 roadmap success criteria verified (1 blocked)
+  gaps_closed:
+    - "A single, transient loop-level job-store failure (below `_DEGRADED_AFTER = 3`) that also broke the guard's own best-effort ERROR write no longer strands the row: `ScanWorker._flush_unrecorded_failures` retries it on every idle tick, degraded or not (26-15, CR-01), verified by `tests/test_worker.py::test_a_failed_best_effort_write_is_retried_until_it_lands` and `test_owed_failures_below_the_degraded_threshold_are_written_once_the_store_heals[1|2]`, and at the web layer by `tests/test_web_state_rendering.py::test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written`."
+    - "A submit refused before any job row exists (worker DOWN/DEGRADED) is now written by `JobStore.create_rejected_job` in a single INSERT, so a mid-write store failure leaves no row at all instead of a PENDING row with no REJECTED marker (26-16, WR-01 half 1), verified by `tests/test_job.py::TestCreateRejectedJob` (trace-callback test pins exactly one INSERT, no UPDATE) and `tests/test_web_errors.py::test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails[down|degraded]`."
+    - "A submit refused after its row was created (queue full / down / degraded at `submit()`) whose `finish_job(ERROR, REJECTED)` write fails is now owed to the worker via `ScanWorker.owe_rejection` under a new `_unrecorded_lock`, and drained on the next idle tick (26-17, WR-01 half 2), verified by `tests/test_worker.py::TestOwedRejections` (3 tests) and `tests/test_web_errors.py::test_a_refused_submit_whose_rejection_write_fails_is_recorded_by_the_worker[queue_full|down|degraded]`."
+    - "The previously locked-in test (`test_a_failed_best_effort_write_is_only_logged`, which asserted the stranded-active state as expected behaviour) is gone; its replacement asserts the row reaches ERROR without a restart."
+  gaps_remaining:
+    - "WR-10 (new, from the fresh 26-REVIEW.md re-review, independently reproduced here): a *persistent* (non-healing) job-store fault that starts below `_DEGRADED_AFTER` is never escalated to degraded through the idle-flush retry path introduced by 26-15, so `/health` stays 200 and the status area keeps showing the stuck row as the live job indefinitely (bounded only by two later hourly `prune` failures, ~2 hours) instead of promptly surfacing the fault the way a transient failure now does."
+  regressions: []
 gaps:
-  - truth: "A pipeline, job-store, or `prune` exception is logged with `exc_info` and the worker keeps serving the next job — with the browser reflecting reality afterward"
-    status: failed
+  - truth: "The browser (status area, Scan button, `/health`) reflects reality after a job-store exception, per the phase goal, not only for a transient fault that heals but for the persistent fault D-12's own motivating scenario (\"a freed disk heals on its own\") anticipates"
+    status: partial
     reason: >
-      The worker thread itself never dies (ROBU-01's literal text holds), but a single
-      transient job-store write failure (one `finish_job`/`update_state` raise, store heals
-      immediately after) leaves that job's row permanently active. `_idle_housekeeping` only
-      calls `_try_recover` — the only code that drains `_unrecorded_failures` — when
-      `self._degraded.is_set()`. `_DEGRADED_AFTER = 3` and a single loop-level failure resets
-      to 0 on the next job's success (`worker.py` `_run`, `else: self._consecutive_loop_failures
-      = 0`), so degraded is never reached and the stranded row is never reconciled without a
-      process restart. Reproduced by reading `tests/test_worker.py:2173-2212`
-      (`test_a_failed_best_effort_write_is_only_logged`), which submits one job that fails
-      both `update_state` and `finish_job`, then a second job that succeeds, and asserts
-      `stranded.is_active` is still `True` with the comment "only the recovery probe (D-12)
-      reconciles this row" — but the probe never ran because the worker never degraded (only
-      1 of 3 failures). This directly breaks the phase goal ("the browser always reflects
-      reality") and D-12's contract ("Recovery needs no user scan, so a freed disk heals on
-      its own"): `#status-area` polls the stranded row forever, `scan_button.html` renders it
-      `disabled` forever (`job.is_active`), and `/health` stays 200 throughout, so nothing
-      signals the operator. This is CR-01 in `26-REVIEW.md`, independently reproduced here by
-      reading `worker.py:756-816` and the locked-in test; no fix commit exists after the
-      review (`git log` shows `docs(26): add code review report` as the latest commit touching
-      the phase, no follow-up to `worker.py`).
+      26-15's fix (`_flush_unrecorded_failures` retried on every idle tick) correctly closes the
+      scenario the previous verification blocked on: a failure that eventually heals now reaches
+      ERROR and re-enables the Scan button without a restart. But `_idle_housekeeping`'s non-degraded
+      branch (`worker.py:803-810`) swallows every failed retry at `logger.debug` and never counts it
+      towards `_consecutive_loop_failures` -- by design, per 26-15's own must-have ("A failed retry of
+      an owed write is logged at DEBUG and does not count towards degraded"). If the store fault does
+      NOT heal (kept-full disk, read-only remount, a lock held by another process), the guard's
+      original failure counted once, and nothing else can add to the count: the stuck row disables the
+      Scan button, so no new job runs through the loop to fail again, and the flush's own repeated
+      failures are explicitly excluded from `_record_loop_failure()`. Independently reproduced (not
+      just taken from `26-REVIEW.md`'s WR-10): a scratch pytest using the project's own `_StoreFault`
+      helper against a real `ScanWorker`/`JobStore` pair, with `update_state` failing once and
+      `finish_job` failing on every call, ran for 2 real seconds and produced
+      `finish_calls=100 health=HEALTHY row_state=PENDING is_active=True
+      consecutive_loop_failures=1 latest_run_job=<the same stuck PENDING row>` -- i.e. `/health`
+      reports 200, the status poll's `latest_run_job()` returns the stuck row itself (so the status
+      area renders it, "Starting scan..." with the button disabled) with no expiry, for as long as the
+      fault persists. The only bound is `_idle_housekeeping`'s hourly `prune` call: if `prune` also
+      raises against the same broken store, that IS still counted (`worker.py:819-821`), so degraded is
+      reached roughly two hourly ticks after the first failure (~2 hours), not never. This is the same
+      symptom class CR-01 fixed (stuck row + lying health + disabled button, no restart-free recovery
+      signal), reopened for the narrower but realistic precondition of a fault that does not heal on
+      its own -- the literal scenario D-12's own comment ("a freed disk heals on its own") implies as
+      the headline case being designed for. Consistent with how the previous verification treated an
+      analogous narrower-than-the-enumerated-text reading of criterion 1 (appending "with the browser
+      reflecting reality afterward" from the phase goal, not from ROBU-01's or criterion 1's own
+      literal wording) as blocking, the same standard applies here: no enumerated ROBU-01..11
+      requirement or roadmap success-criterion sentence literally demands this, but the phase goal's
+      "the browser always reflects reality" does, and this reproduces a genuine, bounded-but-slow
+      violation of it.
     artifacts:
       - path: "src/saneless/worker.py"
-        issue: "_idle_housekeeping (lines 756-776) only calls _try_recover when self._degraded.is_set(); below-threshold unrecorded failures in _unrecorded_failures are never retried"
+        issue: "_idle_housekeeping (802-810) logs a failed _flush_unrecorded_failures() retry at DEBUG and never calls _record_loop_failure() for it, so a persistently-failing store's retries never accumulate towards _DEGRADED_AFTER on their own; only a later hourly prune failure eventually does"
       - path: "tests/test_worker.py"
-        issue: "test_a_failed_best_effort_write_is_only_logged (lines 2173-2212) asserts the stranded-active state as expected behaviour instead of catching the bug"
-      - path: "src/saneless/web/routes.py"
-        issue: "_record_rejected_submit (lines 277-320, WR-01 in 26-REVIEW.md) has the same two-transaction gap for rejected-submit rows: if finish_job raises after create_job committed, the row is stranded PENDING with no REJECTED marker and no worker-side reconciliation"
+        issue: "No test exercises a store that never heals through the non-degraded flush path and asserts health eventually becomes DEGRADED; TestWorkerGuard's below-threshold tests all call finishes.heal() before asserting ERROR, so the persistent-fault path is untested"
     missing:
-      - "Retry unrecorded/owed job-store writes on every idle tick whenever any are owed, independent of degraded state (keep the probe + degraded-clear exclusive to the degraded path, per 26-REVIEW.md CR-01's suggested fix)"
-      - "A single-statement path (or equivalent) for rejected-submit rows so a mid-write failure cannot leave a PENDING row with no REJECTED marker and no reconciliation path (WR-01)"
-      - "A test that reaches the stranded state with only 1-2 loop-level failures (below _DEGRADED_AFTER) and asserts the row reaches ERROR without a restart"
+      - "Count a streak of failed flush ticks towards degraded (e.g. a `_failed_flush_ticks` counter incremented on each failed retry and folded into `_record_loop_failure()` after N consecutive failures, per 26-REVIEW.md's WR-10 suggested fix), so a persistent fault reaches degraded promptly instead of only via the next hourly prune failure"
+      - "A test with a `finish_job`/`update_state` fault that never heals, asserting `worker.health` becomes `WorkerHealth.DEGRADED` within a bounded number of idle ticks (not hours)"
+      - "Consider also flagging IN-08 (a refused post-submit attempt can render as a live PENDING job until its rejection lands) and WR-11 (a race in test_owed_failures_below_the_degraded_threshold_are_written_once_the_store_heals reading _unrecorded_failures without waiting for/locking the post-write delete) in the same remediation pass, since they touch the same code paths -- non-blocking on their own"
 human_verification: []
 ---
 
 # Phase 26: Worker and Web Robustness Verification Report
 
 **Phase Goal:** The server survives everything the pipeline can throw at it and the browser always reflects reality — a guarded worker loop, 429 backpressure that is actually visible, blocking routes declared `def`, crash recovery at startup, and a server-owned Scan button served from vendored assets that work on an offline LAN — with the deployment and API docs updated in-phase
-**Verified:** 2026-09-14T22:20:28Z
+**Verified:** 2026-09-14T23:55:00Z
 **Status:** gaps_found
-**Re-verification:** No — initial verification
+**Re-verification:** Yes — after gap closure (26-15, 26-16, 26-17), referencing the previous `26-VERIFICATION.md` (status `gaps_found`, one blocking gap on success criterion 1: CR-01 + WR-01) and the fresh `26-REVIEW.md` (`538df02`, re-review after gap closure).
 
 ## Goal Achievement
 
@@ -55,93 +74,111 @@ human_verification: []
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | A pipeline, job-store, or `prune` exception is logged with `exc_info` and the worker keeps serving the next job | ✗ FAILED | Worker thread survives (verified: `_run`'s `while` loop has no bare exit on exception, `_process_job` is wrapped in try/except in `_run`, `logger.exception` used). But the *reconciliation* half of this guarantee is broken: a job whose terminal write fails once (below `_DEGRADED_AFTER=3`) is never retried and stays "active" forever in the job store and UI. See gap above — reproduced from `worker.py:756-816` and `tests/test_worker.py:2173-2212`. |
-| 2 | Submitting past a full queue returns 429 with `Retry-After` and a message the user can actually see in the status area, the event loop never blocks, and shutdown never blocks on the worker | ✓ VERIFIED | `routes.py:392-404` returns `SubmitResult.QUEUE_FULL` → `RequestRejection.QUEUE_FULL`, rendered by `render_error` (`errors.py:145-147`) which sets `Retry-After` for 429 on both the htmx and JSON branches, retargeted to `#status-message` (D-02/D-03) — separate from the polled `#status-area`. `ScanWorker.submit` (`worker.py:332-365`) uses `put_nowait`/queue full detection, never blocks. `stop()` (`worker.py:294-330`) uses `queue.shutdown()` + bounded `join(STOP_JOIN_SECONDS)`, called only in lifespan shutdown after uvicorn stops serving (`app.py:118-135`), so it cannot block request handling. Local browser test suite (48 tests, `TestRequestErrorSlot` in `test_browser.py`, covering the visible-message assertion) passes offline. |
-| 3 | `/health` answers while a scan is running, and concurrent threadpool requests neither stampede the metadata cache nor mutate profiles mid-iteration | ✓ VERIFIED | All routes are plain `def` (confirmed via grep of every handler in `routes.py`: `index`, `health`, `start_scan`, `current_job_status`, `get_tags`, etc. — none `async def`), so FastAPI dispatches them to the threadpool and a blocking scan in one worker thread cannot block `/health` in another. `MetadataCache.get_or_fetch` (`cache.py:64-103`) takes a per-key lock with a double-check, single-flighting concurrent fetches. Profile reads/writes share `_profiles_lock` (`worker.py`, confirmed via `has_profile`/`get_profile`/`_set_profiles`/`_generate_startup_profiles` all taking the lock). Note: `MetadataCache.invalidate` (`cache.py:105-112`) does not take the per-key lock, so a narrow race (WR-05 in `26-REVIEW.md`, confirmed by reading the code) can let a concurrent in-flight fetch's stale result overwrite an invalidation — a real but narrow defect, not a stampede and not a profile-mutation race, so it does not falsify this criterion as worded. |
-| 4 | Jobs left non-terminal by a crash are FAILED with a "server restarted" reason before the worker starts, and profiles are generated at startup from the config path that was actually loaded | ✓ VERIFIED | `lifespan` (`app.py:72-135`) runs `job_store.fail_active_jobs(RESTART_REASON)` before `worker.start()`, exactly matching D-13's ordering; a recovery-write failure calls `worker.mark_recovery_pending()` rather than refusing to start. `ScanWorker._run` (`worker.py:651-696`) calls `_generate_startup_profiles()` as its first act, before entering the job loop. `Settings.config_path` is recorded by `load_settings` (`config.py`, confirmed present) and `_generate_startup_profiles`/`_persist_generated_profiles` write to `settings.config_path`, not a re-derived path. Note: WR-03/WR-04 in `26-REVIEW.md` (in-memory `default` can diverge from the persisted file after a restart; a persist exception outside `OSError`/`ConfigError` can silently drop generated profiles from memory) are real but narrower defects around this mechanism — confirmed plausible from the code shape, not independently reproduced here — and don't contradict the criterion's literal wording (recovery + startup generation both do happen, from the loaded path). |
-| 5 | A browser test in CI with no CDN egress clicks Scan, waits for the terminal status, and asserts `#scan-btn` is enabled again with no duplicate `id="scan-btn"` in the DOM and `app.js` deleted | ✓ VERIFIED | `tests/test_browser.py` contains the ROBU-11 assertions per `26-12-PLAN.md`'s must-haves; local offline run: `uv run pytest -m browser -q` → 48 passed. `id="scan-btn"` appears exactly once as markup, in `partials/scan_button.html` (grep confirms no other occurrence in templates). `src/saneless/web/static/` contains only `app.css` and `vendor/` — no `app.js`; no `app.js` reference anywhere under `src/saneless/web/`. `.github/workflows/ci.yml` has a `browser` job running `uv run pytest -m browser` behind Chromium, with a comment describing the in-test egress gate. The remote CI run itself has not executed yet (nothing pushed), so "runs in CI" is confirmed by config + local offline equivalent, not by a live GitHub Actions run — treated as pending remote confirmation per the task's environment notes, not a gap. |
+| 1 | A pipeline, job-store, or `prune` exception is logged with `exc_info` and the worker keeps serving the next job — with the browser reflecting reality afterward | ⚠️ PARTIAL (previously ✗ FAILED) | The three previously-blocking sub-issues are now closed and independently verified (see Re-verification below): a single transient loop-level failure below the degraded threshold now reaches ERROR and re-enables the Scan button without a restart (26-15), and both the pre-row and post-row rejected-submit paths can no longer strand a PENDING row without a REJECTED marker (26-16, 26-17). A **new, narrower** finding from the fresh review (WR-10) is independently reproduced: a *persistent* (non-healing) store fault starting below the degraded threshold is never escalated to degraded through the idle-flush retry path (only a later hourly `prune` failure would eventually do so, ~2 hours out), so `/health` stays 200 and the status area shows the stuck row as the live job indefinitely while the fault persists. See the gap entry for the full reproduction. |
+| 2 | Submitting past a full queue returns 429 with `Retry-After` and a message the user can actually see in the status area, the event loop never blocks, and shutdown never blocks on the worker | ✓ VERIFIED (regression-checked) | No code touched by 26-15/16/17 affects this path. `routes.py:409-441`'s `_record_refused_submit`/`_reject_created_job` split (26-16/17) preserves the same `RequestRejected(rejection, refresh_history=written)` shape used by `render_error`'s `Retry-After`/`#status-message` retargeting. Full non-browser suite (1400 passed) and offline browser suite (48 passed) both green. |
+| 3 | `/health` answers while a scan is running, and concurrent threadpool requests neither stampede the metadata cache nor mutate profiles mid-iteration | ✓ VERIFIED (regression-checked) | Untouched by the gap-closure plans (`cache.py`, route `def` handlers unchanged). Same WR-05 narrow-caveat noted previously (`cache.py` `invalidate` doesn't take the per-key lock) still applies and still doesn't falsify this criterion as worded. |
+| 4 | Jobs left non-terminal by a crash are FAILED with a "server restarted" reason before the worker starts, and profiles are generated at startup from the config path that was actually loaded | ✓ VERIFIED (regression-checked) | `app.py` lifespan ordering untouched by 26-15/16/17. `_try_recover`'s `fail_active_jobs(RESTART_REASON)` call now runs after the shared `_flush_unrecorded_failures()` (26-15), preserving "the guard's own failures first ... so the restart recovery below cannot give them its text" (`worker.py:879-885`), confirmed by reading the code and by the still-passing `test_app_lifespan.py`/`TestWorkerDegradedHealth` suites. |
+| 5 | A browser test in CI with no CDN egress clicks Scan, waits for the terminal status, and asserts `#scan-btn` is enabled again with no duplicate `id="scan-btn"` in the DOM and `app.js` deleted | ✓ VERIFIED (regression-checked) | `uv run pytest -m browser -q` → 48 passed locally, offline, run independently in this verification. `id="scan-btn"` still appears exactly once in `scan_button.html`; `static/` still contains only `app.css` and `vendor/` (htmx 2.0.8, Pico 2.1.1); `.github/workflows/ci.yml`'s `browser` job unchanged. |
 
-**Score:** 4/5 roadmap success criteria verified; criterion 1 fails on the reconciliation half of its guarantee.
+**Score:** 4/5 roadmap success criteria fully verified; criterion 1's previously-blocking scenario (CR-01/WR-01) is closed, but a new, narrower finding (WR-10) reopens a residual gap in the same criterion under a persistent-fault precondition.
+
+### Deferred Items
+
+None. The WR-10 gap is not addressed by any later phase in the roadmap (Phase 27 "Configuration Strictness" and beyond do not mention job-store degraded-detection); it is a genuine open gap in this phase, not deferred work.
 
 ### Required Artifacts
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `src/saneless/worker.py` | Guarded loop, stop flag, degraded health, startup profile generation | ⚠️ PARTIAL | Exists, substantive, wired — thread never dies, degraded mechanism exists and is exercised by tests — but the reconciliation path for sub-threshold failures is incomplete (CR-01). |
-| `src/saneless/web/app.py` | Lifespan ordering, crash recovery, guarded shutdown | ✓ VERIFIED | `lifespan` matches D-13 exactly; guarded close per D-09. |
-| `src/saneless/web/routes.py` | `def` handlers, 429/503/422 validation | ✓ VERIFIED (with WR-01 caveat) | All handlers `def`; 422 pre-job-creation validation confirmed at `start_scan:359-360`; rejected-submit row mechanism has the same two-transaction gap as CR-01 (WR-01). |
-| `src/saneless/web/cache.py` | Single-flight metadata cache | ✓ VERIFIED (with WR-05 caveat) | Single-flight get_or_fetch confirmed; `invalidate` race is narrower than "stampede" and doesn't block this artifact's core claim. |
-| `src/saneless/web/templates/` | Server-owned Scan button, message slot, vendored assets | ✓ VERIFIED | `scan_button.html` is the sole button source; `#status-message` slot present (used by `errors.py`/`render_error`); `base.html` not re-inspected line-by-line here but vendored-asset test suite (`test_vendor_assets.py`) is in the passing 1386-test run. |
-| `src/saneless/web/static/` | Vendored htmx/Pico, `app.js` deleted | ✓ VERIFIED | `static/vendor/` present, `app.js` absent, no reference to it anywhere in `src/saneless/web/`. |
-| `.github/workflows/ci.yml` | Browser job | ✓ VERIFIED | `browser` job present, installs Chromium, runs `-m browser`. |
-| Docs (`web-api.md`, `architecture.md`, config/env/cli references) | Updated in-phase | ✓ VERIFIED | "returns immediately"/"fully responsive" phrases gone; `0.0.0.0` bind documented in configuration.md, environment-variables.md, cli-commands.md, web-api.md. |
+| `src/saneless/worker.py` — `_flush_unrecorded_failures` | Shared owed-write retry helper called from both the degraded and non-degraded idle paths | ✓ VERIFIED | `grep -c "self._flush_unrecorded_failures()"` = 2 (`_idle_housekeeping:805`, `_try_recover:882`); one INSERT-shaped loop `for job_id, owed in owed_writes:` at 846, snapshot and delete both under `_unrecorded_lock` (844, 851-853). Substantive and wired; exercised by 15 passing targeted tests (see Behavioral Spot-Checks). |
+| `src/saneless/worker.py` — `owe_rejection` | Public method under `_unrecorded_lock`, shared dict with request threads | ✓ VERIFIED | `def owe_rejection(self, job_id: str, error: str) -> None` at line 280, body takes `self._unrecorded_lock` (301) and sets `(error, ErrorCategory.REJECTED)`. Called once, from `routes._reject_created_job` (routes.py:357). |
+| `src/saneless/job.py` — `create_rejected_job` | Single-INSERT terminal REJECTED row | ✓ VERIFIED | `job.py:658`, `@_locked`, one `with self._conn:` block (695-718) executing `_INSERT` then the `_SELECT_BY_ID` read-back; no call to `create_job`/`finish_job`. `tests/test_job.py::TestCreateRejectedJob` (3 tests, all pass) pins the single-INSERT/no-UPDATE shape with a trace callback. |
+| `src/saneless/web/routes.py` — `_record_refused_submit` / `_reject_created_job` | Replace `_record_rejected_submit`, split pre-row vs. post-row paths | ✓ VERIFIED | `_record_refused_submit` (277) calls only `create_rejected_job`; `_reject_created_job` (317) calls `finish_job` and falls back to `worker.owe_rejection(job_id, error)` on failure (357). `grep -rn "_record_rejected_submit" src tests docs` returns nothing. |
+| `tests/test_worker.py` | Corrected best-effort test, below-threshold owed-write test, `TestOwedRejections` | ✓ VERIFIED | `test_a_failed_best_effort_write_is_only_logged` absent (0 matches); `test_a_failed_best_effort_write_is_retried_until_it_lands` present; `test_owed_failures_below_the_degraded_threshold_are_written_once_the_store_heals[1|2]` present and passing; `class TestOwedRejections` present with 3 passing tests. But (see gap) no test exercises a *never-healing* fault through this path. |
+| `tests/test_web_state_rendering.py` / `tests/test_web_errors.py` | Web-level proof the Scan button re-enables after an owed write lands | ✓ VERIFIED | `test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written` and `test_a_refused_submit_whose_rejection_write_fails_is_recorded_by_the_worker[queue_full|down|degraded]` and `test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails[down|degraded]` all present and passing. |
+| `docs/explanation/architecture.md` | Failure-handling paragraph describes owed-write retries on every idle tick, degraded or not | ✓ VERIFIED | Line 56: "Whenever the worker has no job, every 5 seconds it retries any job-failure records it could not write earlier, degraded or not -- including the rejection of a refused scan that the web request could not record". Honestly scoped: does not claim protection for a fault that never heals, which matches the actual (gapped) behaviour rather than overclaiming. |
 
 ### Key Link Verification
 
 | From | To | Via | Status | Details |
 |------|-----|-----|--------|---------|
-| `ScanWorker._idle_housekeeping` | `JobStore.probe` / reconciliation | idle tick, only while degraded | ⚠️ PARTIAL | Wired for the degraded case; not wired for the sub-threshold `_unrecorded_failures` case (CR-01) — this is the crux of the blocking gap. |
-| `routes.start_scan` (429/503 paths) | `#status-message` | `HX-Retarget` header from `render_error` | ✓ WIRED | Confirmed in `errors.py:149-158`. |
-| `create_app` | `CrossOriginGuard` | app-wide ASGI middleware | ✓ WIRED (not independently re-derived; consistent with passing `test_cross_origin.py` in the 1386-test run) | |
-| `lifespan` startup | `fail_active_jobs` → `worker.start()` | ordering | ✓ WIRED | Confirmed via direct read of `app.py:72-135`. |
+| `ScanWorker._idle_housekeeping` (non-degraded branch) | `ScanWorker._flush_unrecorded_failures` | every idle tick, degraded or not | ✓ WIRED | Confirmed at `worker.py:803-810`; failure logged at DEBUG only, not counted (by design, per gap). |
+| `ScanWorker._try_recover` | `ScanWorker._flush_unrecorded_failures` | after a successful probe, before `fail_active_jobs` | ✓ WIRED | Confirmed at `worker.py:879-885`. |
+| `routes._record_refused_submit` | `JobStore.create_rejected_job` | pre-row refusal | ✓ WIRED | `routes.py:301-308`. |
+| `routes._reject_created_job` | `ScanWorker.owe_rejection` | except branch after `finish_job` raises | ✓ WIRED | `routes.py:351-358`. |
+| `ScanWorker.owe_rejection` | `ScanWorker._flush_unrecorded_failures` | shared `_unrecorded_failures` dict under `_unrecorded_lock` | ✓ WIRED | Confirmed lock usage at 4 sites (`owe_rejection`, `_best_effort_fail`, flush snapshot, flush delete). |
+| `ScanWorker._idle_housekeeping` (persistent-fault case) | `ScanWorker._record_loop_failure` | none — this is the gap | ✗ NOT_WIRED | Flush failures never reach `_record_loop_failure()`; only a later `prune` failure (hourly) does. This is the crux of the WR-10 gap. |
 
-### Requirements Coverage
+### Data-Flow Trace (Level 4)
 
-| Requirement | Source Plan | Status | Evidence |
-|---|---|---|---|
-| ROBU-01 | 26-01, 26-06 | ✗ BLOCKED | Worker survives (literal text true) but reconciliation for sub-threshold failures is missing — see gap. |
-| ROBU-02 | 26-01, 26-04, 26-05, 26-09, 26-10, 26-13 | ✓ SATISFIED | 429 + Retry-After + visible message + non-blocking submit + non-blocking shutdown all confirmed. |
-| ROBU-03 | 26-04 | ✓ SATISFIED | `stop()` uses stop flag + bounded join (no sentinel); `wait_for_state` helper used pervasively in `test_worker.py` (confirmed by grep hits in the passing suite). |
-| ROBU-04 | 26-11, 26-12 | ✓ SATISFIED | Single `id="scan-btn"` source, OOB re-render, `app.js` deleted — confirmed by grep + passing browser suite. |
-| ROBU-05 | 26-04, 26-08, 26-10 | ✓ SATISFIED | `def` routes, single-flight cache (with narrow WR-05 caveat that doesn't break the requirement's wording), profile lock. |
-| ROBU-06 | 26-01, 26-09 | ✓ SATISFIED | `fail_active_jobs` called before `worker.start()`; shutdown stops worker before closing store (D-09). |
-| ROBU-07 | 26-02, 26-08 | ✓ SATISFIED (with WR-03/WR-04 caveats) | Startup generation from `settings.config_path`; `is_bare_default` shape coverage not independently re-derived here beyond the passing `test_auto_profiles.py` suite. |
-| ROBU-08 | 26-01, 26-10, 26-11 | ✓ SATISFIED | `start_scan` validates profile + title length (422) before any job row; `invalidate_cache` takes a `MetadataResource` literal. |
-| ROBU-09 | 26-03, 26-12 | ✓ SATISFIED | Vendored assets present; no CDN URLs found in templates (not re-grepped exhaustively here, but `test_vendor_assets.py` passes and browser tests run with an egress gate). |
-| ROBU-10 | 26-07, 26-13, 26-14 | ✓ SATISFIED (with WR-09 doc caveat) | Cross-origin guard implemented per D-20/D-21/D-23; bind address documented. `26-REVIEW.md`'s WR-09 (docs overstate protection against DNS rebinding) is a documentation-accuracy warning, not a missing requirement. |
-| ROBU-11 | 26-12 | ✓ SATISFIED | Browser test suite passes offline (48/48); CI job present. Remote CI run pending (nothing pushed yet), noted per task instructions as not a gap. |
+Traced the status-area / Scan-button rendering path under the WR-10 fault condition specifically, since this is where the gap is user-visible:
 
-All 11 ROBU-01..ROBU-11 requirement IDs are claimed by at least one plan; none are orphaned.
-
-### Anti-Patterns Found
-
-| File | Line | Pattern | Severity | Impact |
-|------|------|---------|----------|--------|
-| `src/saneless/worker.py` | 756-776 | Reconciliation logic gated on `_degraded.is_set()` only, silently drops sub-threshold failures | 🛑 Blocker | CR-01 — see gap |
-| `src/saneless/web/routes.py` | 277-320 | Two-transaction rejected-row write with no reconciliation on partial failure | ⚠️ Warning | WR-01 — same root cause as CR-01, narrower trigger (store failure specifically on the rejection write) |
-| `src/saneless/web/cache.py` | 105-112 | `invalidate` does not take the per-key lock | ⚠️ Warning | WR-05 — narrow stale-read race on manual cache refresh |
-| `src/saneless/web/errors.py` | 166-181 | `HTTPException.headers` (e.g. `Allow` on 405) not forwarded to `render_error` | ⚠️ Warning | WR-08 — RFC 9110 §15.5.6 minor violation, not phase-goal-blocking |
-| `src/saneless/worker.py` | 568-579, 610-649 | Persist-before-swap ordering + narrow exception catch on persist | ⚠️ Warning | WR-03/WR-04 — in-memory/file `default` can diverge after restart; a non-`OSError`/`ConfigError` persist failure can drop generated profiles from memory, contrary to D-18 |
-| `docs/reference/web-api.md` | Cross-site section | Overstates protection (no DNS-rebinding caveat) | ⚠️ Warning | WR-09 — documentation accuracy, not functional |
-| No `TBD`/`FIXME`/`XXX` markers found in phase-modified files | — | — | — | Debt-marker gate: clean |
-
-No `TBD`, `FIXME`, or `XXX` markers were found in the files this phase touched.
+| Artifact | Data Variable | Source | Produces Real Data | Status |
+|----------|---------------|--------|---------------------|--------|
+| `scan_button.html` (`disabled` attr) | `job.is_active` | `JobStore.latest_run_job()` via the status-poll route | Reflects the actual DB row state — but that row state is itself stuck (see gap) | ⚠️ HOLLOW under a persistent fault: technically accurate to the (stuck) row, but the row never resolves, so the rendered "Starting scan..." is misleading about *why* |
+| `/health` response | `worker.health` | `ScanWorker._consecutive_loop_failures` / `_degraded` | Independently reproduced: stays `HEALTHY` for the full 2-second/100-retry test window despite every `finish_job` call failing | ✗ DISCONNECTED from the actual store-write success rate under a persistent fault (bounded only by the ~hourly `prune` path) |
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |---|---|---|---|
-| Full non-browser suite passes | `uv run pytest -m "not browser and not sane_hardware" -q` | 1386 passed, 53 deselected | ✓ PASS |
-| Browser suite passes fully offline | `uv run pytest -m browser -q` | 48 passed, 1391 deselected | ✓ PASS |
-| CR-01 reproduction via existing test | Read `tests/test_worker.py:2173-2212` | `stranded.is_active` asserted `True` with a comment attributing recovery to a probe that this trace shows never runs at 1-of-3 failures | ✗ FAIL (confirms gap) |
+| Full non-browser suite passes | `uv run pytest -m "not browser and not sane_hardware" -q` | 1400 passed, 53 deselected | ✓ PASS |
+| Browser suite passes fully offline | `uv run pytest -m browser -q` | 48 passed, 1405 deselected | ✓ PASS |
+| All 6 gap-closure tests named in 26-15/16/17 pass together | `uv run pytest tests/test_worker.py tests/test_web_state_rendering.py tests/test_job.py tests/test_web_errors.py -q -k "best_effort_write_is_retried or below_the_degraded_threshold or reenables_the_scan_button or TestCreateRejectedJob or never_leaves_an_active_row or TestOwedRejections or rejection_write_fails_is_recorded_by_the_worker"` | 15 passed | ✓ PASS |
+| Lint/format/type gates | `ruff check .`, `ruff format --check .`, `ty check`, `pyrefly check src tests` | all clean (0 errors; pyrefly's 4 informational warnings are in files this phase did not touch) | ✓ PASS |
+| Debt-marker gate | `grep -n -E "TBD\|FIXME\|XXX"` over worker.py, job.py, routes.py, architecture.md, and the four gap-closure test files | 0 matches | ✓ PASS |
+| **WR-10 independent reproduction** | Scratch pytest built directly on the project's own `_StoreFault` test helper and a real `ScanWorker`/`JobStore`, `update_state` failing call 1 only, `finish_job` failing every call, run for 2 real seconds | `finish_calls=100 health=HEALTHY row_state=PENDING is_active=True consecutive_loop_failures=1 latest_run_job=<the stuck row>` | ✗ FAIL (confirms gap; scratch file deleted after the run, not committed) |
+| **WR-11 code inspection** (test race, not independently re-triggered with an injected delay) | Read `tests/test_worker.py:2264-2273` | `owed_after = dict(worker._unrecorded_failures)` is read immediately after `wait_for_state` on the last row without waiting for/locking the post-write delete in `_flush_unrecorded_failures` (`worker.py:851-853`); the sibling many-thread test (`test_owed_rejections_from_many_threads_are_all_written`, line ~2415-2421) *was* hardened with a `not worker._unrecorded_failures` wait, this one was not | ⚠️ Confirmed present by code inspection, consistent with 26-REVIEW.md WR-11 | ⚠️ WARNING (latent flakiness, non-blocking) |
 
 ### Probe Execution
 
-Not applicable — this is not a migration/tooling phase with `scripts/*/tests/probe-*.sh` files; none found, and none referenced by the phase's plans/summaries.
+Not applicable — no `scripts/*/tests/probe-*.sh` files exist in this repository and none are referenced by the phase's plans or summaries.
+
+### Requirements Coverage
+
+| Requirement | Source Plan | Status | Evidence |
+|---|---|---|---|
+| ROBU-01 | 26-01, 26-06, 26-15 | ✓ SATISFIED (literal text); ⚠️ residual gap against the broader phase goal | Literal text ("survives any exception ... logged with exc_info and the worker keeps serving") holds even under the WR-10 fault — the worker thread never dies and every failure is logged with `exc_info`. The phase-goal-level "browser reflects reality" aspiration has the WR-10 residual gap documented above. |
+| ROBU-02 | 26-01, 26-04, 26-05, 26-09, 26-10, 26-13, 26-16, 26-17 | ✓ SATISFIED | 429/503 + visible message + non-blocking submit/shutdown; both rejected-submit paths (pre-row and post-row) now atomic-or-owed, closing WR-01. |
+| ROBU-03 | 26-04 | ✓ SATISFIED (regression-checked) | Unchanged by gap closure. |
+| ROBU-04 | 26-11, 26-12 | ✓ SATISFIED (regression-checked) | Unchanged; browser suite green. |
+| ROBU-05 | 26-04, 26-08, 26-10 | ✓ SATISFIED (regression-checked) | Unchanged. |
+| ROBU-06 | 26-01, 26-09 | ✓ SATISFIED (regression-checked) | `fail_active_jobs` ordering relative to `_flush_unrecorded_failures` inside `_try_recover` preserved correctly (26-15 traced this explicitly and 26-REVIEW.md confirmed it sound). |
+| ROBU-07 | 26-02, 26-08 | ✓ SATISFIED (regression-checked, WR-03/WR-04 caveats carried forward, unchanged and out of scope for this gap-closure wave) | |
+| ROBU-08 | 26-01, 26-10, 26-11 | ✓ SATISFIED (regression-checked) | |
+| ROBU-09 | 26-03, 26-12 | ✓ SATISFIED (regression-checked) | |
+| ROBU-10 | 26-07, 26-13, 26-14 | ✓ SATISFIED (WR-09 doc caveat carried forward, unchanged) | |
+| ROBU-11 | 26-12 | ✓ SATISFIED (regression-checked) | 48/48 offline browser tests pass; CI `browser` job present. |
+
+All 11 ROBU-01..ROBU-11 requirement IDs are claimed by at least one plan; none are orphaned. No requirement's literal text is BLOCKED; the residual gap sits at the phase-goal level, attached to ROBU-01/criterion 1 for consistency with how the previous verification scoped this same finding class.
+
+### Anti-Patterns Found
+
+| File | Line | Pattern | Severity | Impact |
+|------|------|---------|----------|--------|
+| `src/saneless/worker.py` | 801-810 | A persistent (non-healing) flush failure is logged at DEBUG only and never counted towards `_DEGRADED_AFTER`, so `/health` and the status area misrepresent reality for as long as the fault lasts (bounded only by an hourly `prune` failure) | 🛑 Blocker | WR-10 — see gap |
+| `tests/test_worker.py` | 2264-2273 | `owed_after = dict(worker._unrecorded_failures)` read without waiting for/locking the flush's post-write delete; latent race, reproduced by the review with an injected 50 ms delay (not re-triggered here) | ⚠️ Warning | WR-11 — non-blocking test flakiness, worth fixing alongside WR-10 |
+| `src/saneless/web/routes.py` | 412-441 | A refused post-submit attempt can render as a live PENDING job in the status area until its rejection lands (short window for a healthy store, longer while owed) | ⚠️ Warning | IN-08 — narrower than WR-10, self-heals on the very next idle tick in the common case |
+| `src/saneless/web/cache.py` | 105-113 | `invalidate` does not take the per-key lock | ⚠️ Warning | WR-05 — carried forward unchanged, out of scope for this gap-closure wave |
+| `src/saneless/worker.py` | 1032-1042, 717-722, 773-786, 846-853 | A failed success-path write (a document already accepted by Paperless) is now guaranteed to eventually be recorded as `ERROR` rather than staying active until restart, which the review flags as an aggravation of the pre-existing WR-02 | ⚠️ Warning | WR-02 (aggravated) — carried forward, explicitly out of scope for 26-15/16/17 per those plans' own `<objective>` sections |
+| `src/saneless/worker.py` | 592-607, 599-607 | WR-03/WR-04 (`default` profile drift after restart; narrow persist-exception catch) | ⚠️ Warning | Carried forward unchanged, out of scope |
+| `src/saneless/web/errors.py` | 166-181, 198-225 | WR-08 (missing `Allow` header on 405), WR-07 (raw path logged with `%s`) | ⚠️ Warning | Carried forward unchanged, out of scope |
+| `docs/reference/web-api.md` | Cross-site section | WR-09 (DNS-rebinding caveat missing) | ⚠️ Warning | Carried forward unchanged, out of scope |
+| No `TBD`/`FIXME`/`XXX` markers found in phase-modified files | — | — | — | Debt-marker gate: clean |
 
 ### Human Verification Required
 
-None. All success criteria and the CR-01 gap are verifiable by static code reading, the existing automated test suite (including offline browser tests, per the project's Playwright-first policy), and reproduction via an existing test's own assertions — no browser-only visual/UX judgment call remains open.
+None. Every finding in this report — including the new WR-10 reproduction — was established by static code reading, the existing automated test suite (1400 non-browser + 48 offline browser tests, all passing), and an independent scratch reproduction built directly on the codebase's own test helpers (not committed). No browser-only visual/UX judgment call remains open, consistent with the project's Playwright-first policy.
 
 ### Gaps Summary
 
-The phase substantially achieves its goal: four of five roadmap success criteria are solidly verified in the codebase (visible 429 backpressure, non-blocking event loop and shutdown, `/health` during a scan with threadpool safety, crash recovery + startup profile generation from the loaded config path, and the offline CI-ready browser test proving the Scan button re-enables with no duplicate id and `app.js` gone).
+The gap-closure wave (26-15, 26-16, 26-17) fully and verifiably closes everything the previous verification's `missing:` list asked for: owed job-store writes (both the loop guard's own failed ERROR writes and now, separately, failed rejected-submit writes) are retried on every idle tick regardless of degraded state; the previously locked-in test that blessed the stranded-active state is corrected; refused-before-row submits are now a single INSERT that can never leave a PENDING row with no marker; and a new below-threshold test proves a 1- or 2-failure stranded row reaches ERROR without a restart. All of this is independently re-verified here, not just re-read from the SUMMARY.md files: 15 targeted tests pass, the full 1400-test non-browser suite and 48-test offline browser suite are green, and ruff/ruff-format/ty/pyrefly are all clean.
 
-The one blocking gap is CR-01 from `26-REVIEW.md`, independently confirmed here by reading `worker.py`'s idle-housekeeping/recovery code and the existing test that documents the exact symptom it claims to guard against: a single transient job-store write failure (well below the 3-failure degraded threshold) permanently strands a job row as "active," which permanently disables the server-owned Scan button and never surfaces through `/health`. This falls squarely inside the phase's own stated goal — "the browser always reflects reality" — and inside D-12's explicit contract ("Recovery needs no user scan, so a freed disk heals on its own"), which this phase's own `26-06-PLAN.md` lists as a must-have truth. The fix is narrow and already sketched in `26-REVIEW.md`'s CR-01 (retry owed writes on every idle tick whenever any are owed, not only while degraded) and should also cover the structurally identical WR-01 gap in the rejected-submit row path.
+The fresh `26-REVIEW.md` re-review (`538df02`) surfaces one new finding, WR-10, that this verification independently reproduces rather than takes on trust: the fix that makes a *transient* below-threshold store fault self-heal deliberately excludes every failed retry from counting towards `_consecutive_loop_failures` (a 26-15 design choice, justified as "the failure that created the debt was already counted"). That exclusion is unconditional, so a *persistent* fault of the same kind — the disk staying full, rather than briefly failing and healing, which is the scenario D-12's own "a freed disk heals on its own" comment names as the headline case — never accumulates towards degraded through this path. `/health` reports 200 and the status area shows the stuck row as the live job indefinitely, bounded only by a much slower, incidental path (two hourly `prune` failures, roughly two hours). This reproduces the same class of user-facing symptom CR-01 fixed (a stuck row that disables the Scan button and a `/health` that doesn't tell the truth), for a narrower but realistic precondition the closed fix does not cover. Following the same interpretive standard the previous verification applied to reach its own blocking conclusion (reading "the browser always reflects reality" from the phase goal into criterion 1, beyond that criterion's own narrower literal text), this is treated here as a genuine, if narrower, unresolved gap rather than a cosmetic one — not because any single enumerated ROBU requirement's literal wording demands it, but because the phase's own stated goal does, and the violation is concretely reproducible rather than theoretical.
 
-The remaining review warnings (WR-02 through WR-09, IN-01 through IN-05) were spot-checked (WR-01, WR-05, WR-08 independently confirmed in code) or accepted on the strength of the review's own reproductions (WR-03, WR-04, WR-09) as real but non-blocking: they degrade correctness or documentation accuracy in narrower scenarios (a success write that fails after Paperless already accepted the document, a profile-generation persistence edge case, a cache-invalidate race, a missing `Allow` header, a documentation overstatement about DNS rebinding) without contradicting any of the five numbered roadmap success criteria as worded. They are worth closing in the same remediation pass as CR-01/WR-01 since they share code paths, but they do not independently block phase sign-off.
+This is a materially smaller gap than the one this verification closes: it requires a persistent rather than transient fault, it is bounded (not literally forever), and the operator does get one WARNING-level log line when the debt is first created. The suggested fix is narrow and already sketched in `26-REVIEW.md`'s WR-10 (count a streak of failed flush ticks and fold it into `_record_loop_failure()` after N), and should be paired with a test using a store that never heals, asserting `DEGRADED` within a bounded number of ticks. WR-11 (a latent test race reading `_unrecorded_failures` without waiting for the flush's delete) and IN-08 (a narrow window where a refused-but-not-yet-recorded post-submit job renders as live) touch the same code and are worth closing in the same pass, but are not blocking on their own. WR-02 (aggravated), WR-03, WR-04, WR-05, WR-06, WR-07, WR-08, WR-09 and IN-01 through IN-07 are unchanged from the previous verification's assessment: real but narrower, out of the explicit scope of 26-15/16/17, and non-blocking against the roadmap's five numbered success criteria as worded.
 
 ---
 
-_Verified: 2026-09-14T22:20:28Z_
+_Verified: 2026-09-14T23:55:00Z_
 _Verifier: Claude (gsd-verifier)_
