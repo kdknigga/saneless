@@ -23,6 +23,7 @@ from saneless.vocabulary import (
 from saneless.worker import ScanWorker
 
 from .cache import MetadataCache
+from .cross_origin import CrossOriginGuard
 from .errors import install_error_handlers
 from .routes import router
 
@@ -87,6 +88,10 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     app = FastAPI(lifespan=lifespan)
     # Every error response the app sends is rendered there (D-01).
     install_error_handlers(app)
+    # App-wide, on every method except GET, HEAD and OPTIONS, so a POST route
+    # added later cannot forget the cross-site check (D-23).  web_host still
+    # defaults to 0.0.0.0; the LAN exposure that implies is documented.
+    app.add_middleware(CrossOriginGuard)
 
     app.state.worker = worker
     app.state.job_store = job_store

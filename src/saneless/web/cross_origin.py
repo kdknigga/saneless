@@ -33,13 +33,23 @@ send a mixed-case ``Host``.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Final
 from urllib.parse import urlsplit
 
+from starlette.requests import Request
+
+from saneless.vocabulary import RequestRejection, rejection_status_code
+
+from .errors import render_error
+
 if TYPE_CHECKING:
     from starlette.datastructures import Headers
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
-__all__ = ["is_cross_origin_request"]
+__all__ = ["CrossOriginGuard", "is_cross_origin_request"]
+
+logger = logging.getLogger(__name__)
 
 _SAFE_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
 _ALLOWED_FETCH_SITES: Final = frozenset({"same-origin", "none"})
@@ -93,3 +103,67 @@ def is_cross_origin_request(method: str, headers: Headers) -> bool:
     else:
         rejected = False
     return rejected
+
+
+class CrossOriginGuard:
+    """
+    Pure ASGI middleware that answers a cross-site request with a 403 (D-22).
+
+    It is installed app-wide and inspects every HTTP request, so a
+    state-changing route added later is covered without a per-route
+    dependency (D-23).
+
+    It is a plain ASGI class rather than ``BaseHTTPMiddleware``, which does
+    not propagate ``contextvars`` changes and wraps streaming responses.
+
+    A rejection calls ``render_error`` directly instead of raising.  Starlette's
+    ``ExceptionMiddleware`` sits *inside* user middleware, so an
+    ``HTTPException`` raised here would never reach the error handlers and
+    would surface as a 500.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        """
+        Wrap the next application in the middleware stack.
+
+        Args:
+            app: The ASGI application to call for allowed requests.
+
+        """
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """
+        Reject a cross-site HTTP request, or pass the request on.
+
+        Args:
+            scope: The ASGI connection scope.
+            receive: The ASGI receive channel.
+            send: The ASGI send channel.
+
+        """
+        if scope["type"] == "http":
+            request = Request(scope)
+            headers = request.headers
+            if is_cross_origin_request(request.method, headers):
+                # %r keeps the attacker-chosen path and header values on one
+                # escaped line; a percent-encoded newline in the path is decoded.
+                logger.warning(
+                    "Blocked cross-site %s %r: "
+                    "Origin=%r Host=%r X-Forwarded-Host=%r Sec-Fetch-Site=%r",
+                    request.method,
+                    request.url.path,
+                    headers.get("origin"),
+                    headers.get("host"),
+                    headers.get("x-forwarded-host"),
+                    headers.get("sec-fetch-site"),
+                )
+                rejection = RequestRejection.CROSS_SITE
+                response = render_error(
+                    request,
+                    rejection,
+                    status_code=rejection_status_code(rejection),
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)

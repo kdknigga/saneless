@@ -23,6 +23,7 @@ Covers requirement ROBU-10 (decisions D-20, D-21, D-22, D-23).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import TYPE_CHECKING
@@ -50,13 +51,14 @@ from saneless.scanner.base import (
 )
 from saneless.vocabulary import RequestRejection, rejection_message
 from saneless.web.app import create_app
-from saneless.web.cross_origin import is_cross_origin_request
+from saneless.web.cross_origin import CrossOriginGuard, is_cross_origin_request
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
     from fastapi import FastAPI
+    from starlette.types import Message, Receive, Scope, Send
 
 LAN_HOST = "192.168.1.5:8080"
 LAN_ORIGIN = f"http://{LAN_HOST}"
@@ -442,4 +444,55 @@ def test_rejection_logs_one_warning_naming_every_header(
         f"Sec-Fetch-Site={'cross-site'!r}",
     ):
         assert expected in message
+    assert "\n" not in message
+
+
+async def _never_called(scope: Scope, receive: Receive, send: Send) -> None:
+    """Fail if the guard passes a rejected request on to the application."""
+    _ = (scope, receive, send)
+    pytest.fail("a rejected request reached the application")
+
+
+def test_rejection_log_escapes_control_characters_in_the_path(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Control characters in the decoded path reach the log line escaped.
+
+    uvicorn percent-decodes ``%0A`` and ``%1B`` into ``scope["path"]``, but
+    httpx strips control characters from a URL, so the scope is driven into
+    the guard directly rather than through ``TestClient``.  The standard
+    library's URL parser drops the newline; ``%r`` escapes the rest, so a
+    terminal escape sequence cannot rewrite what an operator reads.
+    """
+    path = "/api/zz\x1b[2J\nFAKE LOG LINE"
+    scope: Scope = {
+        "type": "http",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "server": ("testserver", 80),
+        "headers": [(b"host", b"testserver"), (b"sec-fetch-site", b"cross-site")],
+    }
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    guard = CrossOriginGuard(_never_called)
+    with caplog.at_level(logging.WARNING, logger=GUARD_LOGGER):
+        asyncio.run(guard(scope, receive, send))
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 403
+    records = [r for r in caplog.records if r.name == GUARD_LOGGER]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "\\x1b[2J" in message
+    assert "\x1b" not in message
     assert "\n" not in message
