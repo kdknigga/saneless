@@ -469,7 +469,7 @@ class TestIsBareDefault:
 class TestNoRederivedConfigPath:
     """Generated profiles are written only to the loaded config file (D-16)."""
 
-    def test_resolve_config_path_is_gone(self) -> None:
+    def test_the_rederived_write_path_is_gone(self) -> None:
         """
         M-04: the re-derived write path no longer exists.
 
