@@ -291,6 +291,41 @@ def _auto_source_mode(source: str, *, has_flatbed: bool) -> Literal["flatbed", "
     return "flatbed"
 
 
+def _duplex(source: str) -> Literal["none", "hardware"]:
+    """
+    Decide the ``duplex`` value a generated profile should carry.
+
+    A source the classifier calls ``FEEDER_DUPLEX`` is one the device duplexes
+    itself, so its profile says ``"hardware"``; every other source says
+    ``"none"``. ``"manual"`` is deliberately outside this function's range:
+    manual duplex is not a device source at all, so auto-profiles has no
+    evidence for it and those profiles are always written by hand.
+
+    Nothing reads ``"hardware"`` (D-05). It records operator intent and makes a
+    generated profile self-describing, and Phase 30's APPL-05 -- generated
+    ``label`` / ``description`` such as "Feeder, double-sided" -- is its
+    eventual reader. ``config.py`` states the same fact; it is repeated here
+    because this is where the value is produced, and a reader here will ask
+    what consumes it.
+
+    The value is always passed explicitly, never left to the field default:
+    the config loader reads a source name containing both "manual" and
+    "duplex" as ``duplex = "manual"`` when no duplex is given. Such a name
+    classifies as ``FEEDER_DUPLEX`` here, so passing the value is what keeps
+    a generated profile from turning into a manual-duplex one.
+
+    Args:
+        source: The SANE source name the profile will carry.
+
+    Returns:
+        The ``duplex`` the profile should carry.
+
+    """
+    if classify_source(source) is SourceKind.FEEDER_DUPLEX:
+        return "hardware"
+    return "none"
+
+
 def generate_profiles(
     capabilities: DeviceCapabilities,
 ) -> dict[str, ProfileConfig]:
@@ -364,6 +399,7 @@ def generate_profiles(
             mode=mode,
             auto_generated=True,
             auto_source_mode=_auto_source_mode(source, has_flatbed=has_flatbed),
+            duplex=_duplex(source),
         )
 
     if default_source is not None:
@@ -377,6 +413,9 @@ def generate_profiles(
             # route a whole stack as a single page, disagreeing with the very
             # profile it was copied from.
             auto_source_mode=_auto_source_mode(default_source, has_flatbed=has_flatbed),
+            # Mirrors the loop for the same reason: the default duplicates a
+            # source profile and must not claim a different duplex strategy.
+            duplex=_duplex(default_source),
         )
 
     return profiles
@@ -522,6 +561,14 @@ def write_profiles_to_config(
         profile_table.add("mode", profile.mode)
         if profile.auto_source_mode != "flatbed":
             profile_table.add("auto_source_mode", profile.auto_source_mode)
+        # Written only when non-default, like auto_source_mode. In a generated
+        # set that means "hardware" on a FEEDER_DUPLEX source; see _duplex for
+        # why nothing reads it yet. Omitting "none" cannot let the loader's
+        # legacy translation turn a profile manual on reload: a "none" source
+        # classified as something other than FEEDER_DUPLEX, so its name does
+        # not contain "duplex".
+        if profile.duplex != "none":
+            profile_table.add("duplex", profile.duplex)
         auto_generated_flag = True
         profile_table.add("auto_generated", auto_generated_flag)
         profiles_section[name] = profile_table
