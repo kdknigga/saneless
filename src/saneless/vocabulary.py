@@ -42,6 +42,7 @@ class JobState(StrEnum):
     PENDING = "PENDING"
     SCANNING = "SCANNING"
     AWAITING_FLIP = "AWAITING_FLIP"
+    SCANNING_REVERSE = "SCANNING_REVERSE"
     ASSEMBLING = "ASSEMBLING"
     UPLOADING = "UPLOADING"
     DONE = "DONE"
@@ -116,6 +117,7 @@ ACTIVE_STATES: frozenset[JobState] = frozenset(
         JobState.PENDING,
         JobState.SCANNING,
         JobState.AWAITING_FLIP,
+        JobState.SCANNING_REVERSE,
         JobState.ASSEMBLING,
         JobState.UPLOADING,
     }
@@ -171,6 +173,8 @@ def state_label(state: JobState) -> str:
             label = "Scanning"
         case JobState.AWAITING_FLIP:
             label = "Waiting for flip"
+        case JobState.SCANNING_REVERSE:
+            label = "Scanning backs"
         case JobState.ASSEMBLING:
             label = "Assembling"
         case JobState.UPLOADING:
@@ -191,9 +195,12 @@ def progress_label(state: JobState) -> str:
     Return the progress prose for a job state.
 
     This is the longer sentence the status area shows while a scan is running,
-    and the line the CLI echoes.  The five in-flight strings are byte identical
+    and the line the CLI echoes.  The six in-flight strings are byte identical
     to what shipped before -- including the literal three-period spelling of
     the trailing ellipsis, which is three ASCII periods and not U+2026.
+    ``SCANNING_REVERSE`` is the newest of them, and its prose is the exact line
+    the CLI printed for the second duplex pass before the state existed, so
+    giving pass B its own state changed no CLI output.
 
     ``DONE``, ``ERROR`` and ``FALLBACK`` have no progress prose in production:
     the status partial and the CLI both branch structurally for the three
@@ -217,6 +224,8 @@ def progress_label(state: JobState) -> str:
             label = "Scanning..."
         case JobState.AWAITING_FLIP:
             label = "Awaiting flip..."
+        case JobState.SCANNING_REVERSE:
+            label = "Scanning reverse sides..."
         case JobState.ASSEMBLING:
             label = "Assembling PDF..."
         case JobState.UPLOADING:
