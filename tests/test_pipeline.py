@@ -989,21 +989,26 @@ class TestPipelineEventEnum:
 
     @pytest.mark.parametrize("event", list(PipelineEvent))
     def test_job_state_projection_is_total(self, event: PipelineEvent) -> None:
-        """Every PipelineEvent projects to a JobState or explicitly to None (CTR-01)."""
-        state = event.job_state
-        assert state is None or isinstance(state, JobState)
+        """Every PipelineEvent projects to a JobState, with no None escape (DPLX-06)."""
+        assert isinstance(event.job_state, JobState)
 
     def test_job_state_projection_mapping(self) -> None:
         """Each state-changing event names the state the worker persists (CTR-01)."""
         assert PipelineEvent.SCANNING.job_state is JobState.SCANNING
         assert PipelineEvent.AWAITING_FLIP.job_state is JobState.AWAITING_FLIP
+        assert PipelineEvent.SCANNING_REVERSE.job_state is JobState.SCANNING_REVERSE
         assert PipelineEvent.ASSEMBLING.job_state is JobState.ASSEMBLING
         assert PipelineEvent.UPLOADING.job_state is JobState.UPLOADING
         assert PipelineEvent.DONE.job_state is JobState.DONE
 
-    def test_scanning_reverse_has_no_job_state(self) -> None:
-        """SCANNING_REVERSE changes no persisted state, so it maps to None (CTR-01)."""
-        assert PipelineEvent.SCANNING_REVERSE.job_state is None
+    def test_scanning_reverse_projects_to_its_own_job_state(self) -> None:
+        """
+        Pass B persists SCANNING_REVERSE, so the job leaves AWAITING_FLIP (DPLX-06).
+
+        While this projected to None the job stayed AWAITING_FLIP for the whole
+        of pass B, leaving the flip prompt and its dead Abort on screen as pages fed.
+        """
+        assert PipelineEvent.SCANNING_REVERSE.job_state is JobState.SCANNING_REVERSE
 
 
 class TestScanResultContract:

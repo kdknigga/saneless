@@ -43,16 +43,16 @@ from saneless.vocabulary import (
 class TestJobStateMembers:
     """JobState membership tests."""
 
-    def test_job_state_has_exactly_eight_members(self) -> None:
+    def test_job_state_has_exactly_nine_members(self) -> None:
         """
-        JobState declares exactly eight lifecycle members (CTR-01).
+        JobState declares exactly nine lifecycle members (CTR-01, DPLX-06).
 
         A count guard, not a name list: adding a member should fail the
         parametrised completeness tests below -- which force a label and a
         classification decision -- rather than a hand-written roster that only
         records what the enum happened to contain when it was written.
         """
-        assert len(list(JobState)) == 8
+        assert len(list(JobState)) == 9
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:
@@ -121,13 +121,14 @@ class TestStateClassifications:
         assert not (ACTIVE_STATES & TERMINAL_STATES)
 
     def test_active_states_membership(self) -> None:
-        """ACTIVE_STATES is the five in-flight lifecycle states (CTR-01)."""
+        """ACTIVE_STATES is the six in-flight lifecycle states (CTR-01, DPLX-06)."""
         assert (
             frozenset(
                 {
                     JobState.PENDING,
                     JobState.SCANNING,
                     JobState.AWAITING_FLIP,
+                    JobState.SCANNING_REVERSE,
                     JobState.ASSEMBLING,
                     JobState.UPLOADING,
                 }
@@ -165,6 +166,7 @@ class TestStateLabel:
             (JobState.PENDING, "Pending"),
             (JobState.SCANNING, "Scanning"),
             (JobState.AWAITING_FLIP, "Waiting for flip"),
+            (JobState.SCANNING_REVERSE, "Scanning backs"),
             (JobState.ASSEMBLING, "Assembling"),
             (JobState.UPLOADING, "Uploading"),
             (JobState.DONE, "Complete"),
@@ -193,6 +195,7 @@ class TestProgressLabel:
             (JobState.PENDING, "Starting scan..."),
             (JobState.SCANNING, "Scanning..."),
             (JobState.AWAITING_FLIP, "Awaiting flip..."),
+            (JobState.SCANNING_REVERSE, "Scanning reverse sides..."),
             (JobState.ASSEMBLING, "Assembling PDF..."),
             (JobState.UPLOADING, "Uploading to paperless-ngx..."),
         ],
