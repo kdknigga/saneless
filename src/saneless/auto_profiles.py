@@ -198,8 +198,16 @@ def is_bare_default(settings: Settings) -> bool:
     """
     Check if settings have only the uncustomized default profile.
 
-    Returns True only when there is exactly one profile named "default"
-    with all default field values and auto_generated is False.
+    Returns True only when there is exactly one profile, named "default",
+    equal to ``ProfileConfig()`` in every field.
+
+    The whole profile is compared rather than a hand-picked subset, so a field
+    added later cannot be silently ignored -- as ``duplex`` was, which let a
+    hand-written manual-duplex default be replaced in memory by a generated
+    flatbed profile (WR-04). Pydantic model equality compares field values,
+    not which fields were set, so a config that spells out default values
+    explicitly still counts as bare. ``auto_generated=True`` is covered by the
+    same equality, because the bare profile has ``auto_generated=False``.
 
     Args:
         settings: Application settings to inspect.
@@ -212,14 +220,7 @@ def is_bare_default(settings: Settings) -> bool:
         return False
     if "default" not in settings.profiles:
         return False
-    default = settings.profiles["default"]
-    bare = ProfileConfig()
-    return (
-        default.source == bare.source
-        and default.resolution == bare.resolution
-        and default.mode == bare.mode
-        and not default.auto_generated
-    )
+    return settings.profiles["default"] == ProfileConfig()
 
 
 def _claim_slug(source: str, claimed: dict[str, str]) -> str:
