@@ -175,6 +175,19 @@ class ScanSettings:
     resolution: int
     mode: str
     auto_source_mode: str = "flatbed"
+    # Manual duplex: resolve a document feeder from the device's own source
+    # list instead of validating ``source`` verbatim (D-02). The backend
+    # prefers ``source`` when the device reports it and it feeds, falls back
+    # to the first reported feeder, and refuses when there is none -- it never
+    # substitutes ``Auto``, which is how C-01 took two platen snapshots.
+    #
+    # A plain bool, not a scanner-side DuplexMode enum: inside the scanner
+    # that enum's NONE and HARDWARE members would behave identically, one
+    # behaviour with two spellings. The bool also keeps ProfileConfig.duplex's
+    # Literal as the only spelling of "duplex", with one conversion point in
+    # run_pipeline. Like auto_source_mode it is a plain value, because Phase 21
+    # D-03 forbids this package depending on the job-state enums.
+    resolve_feeder_source: bool = False
     paper_size: str = "full"
 
 

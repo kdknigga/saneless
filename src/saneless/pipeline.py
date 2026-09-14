@@ -1046,7 +1046,8 @@ def run_pipeline(
     # so a request that cannot run never touches the device.  Refusing inside
     # _scan_manual_duplex would be too late -- that function scans pass A
     # first, so it would use up a full feeder pass before failing.
-    flip = _flip_context(request, settings) if profile.duplex == "manual" else None
+    manual_duplex = profile.duplex == "manual"
+    flip = _flip_context(request, settings) if manual_duplex else None
 
     device_id = _resolve_device(scanner, settings)
 
@@ -1055,6 +1056,10 @@ def run_pipeline(
         resolution=profile.resolution,
         mode=profile.mode,
         auto_source_mode=profile.auto_source_mode,
+        # The single conversion point from the config Literal to the scanner's
+        # feeder-resolution flag (D-02). Do not add a second: the scanner
+        # package never sees ProfileConfig.duplex or the job vocabulary.
+        resolve_feeder_source=manual_duplex,
         paper_size=profile.paper_size,
     )
 
