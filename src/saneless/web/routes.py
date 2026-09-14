@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import JSONResponse
 
+from saneless.vocabulary import FlipOutcome, JobState
+
 if TYPE_CHECKING:
     from starlette.responses import Response
 
@@ -93,6 +95,49 @@ def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | Non
     return job
 
 
+def _status_context(
+    worker: ScanWorker,
+    job_store: JobStore,
+    claimed: tuple[str, FlipOutcome] | None = None,
+) -> dict[str, object]:
+    """
+    Build the context ``partials/status.html`` renders from.
+
+    The job comes from ``_current_or_recent_job`` (D-17), and the store's
+    recorded state still selects the branch the partial renders, so D-16's
+    objection to a route asserting state the store has not recorded does not
+    apply.  What this adds is ``flip_answer``: for a job the store still reads
+    as ``AWAITING_FLIP``, whether its flip wait has already been answered, and
+    with what.  That is a fact the worker genuinely holds, and it lets the
+    partial acknowledge the answer instead of re-rendering the Continue and
+    Abort buttons as though the click did nothing (CR-01).
+
+    ``claimed`` exists because the worker may already have cleared its flip
+    coordinator by the time the route reads it: a route that just claimed an
+    answer is authoritative for its own job.  It is used only when it names
+    the job being rendered, so a posted foreign job id cannot acknowledge a
+    job nobody answered (T-25-49).
+
+    Args:
+        worker: The scan worker, for the job in flight and its flip answer.
+        job_store: The job store to read the job from.
+        claimed: The job id and answer this request itself claimed, if any.
+
+    Returns:
+        ``{"job": ..., "flip_answer": ...}`` where ``flip_answer`` is None
+        unless the rendered job is ``AWAITING_FLIP`` and has been answered.
+
+    """
+    job = _current_or_recent_job(worker, job_store)
+    answer: FlipOutcome | None = None
+    if job is not None and job.state is JobState.AWAITING_FLIP:
+        if claimed is not None and claimed[0] == job.id:
+            answer = claimed[1]
+        else:
+            answer = worker.flip_answer(job.id)
+    return {"job": job, "flip_answer": answer}
+
+
 @router.get("/")
 async def index(request: Request) -> Response:
     """
@@ -109,7 +154,7 @@ async def index(request: Request) -> Response:
         state.cache, state.paperless, "correspondents"
     )
 
-    current_job = _current_or_recent_job(state.worker, state.job_store)
+    status = _status_context(state.worker, state.job_store)
 
     jobs = state.job_store.list_recent(limit=50)
 
@@ -120,7 +165,7 @@ async def index(request: Request) -> Response:
             "profiles": profiles,
             "tags": tags,
             "correspondents": correspondents,
-            "job": current_job,
+            **status,
             "jobs": jobs,
         },
     )
@@ -195,10 +240,11 @@ async def start_scan(
     )
     state.worker.submit(job)
 
+    # A job created by this request cannot have a flip answer yet.
     return state.templates.TemplateResponse(
         request,
         "partials/status.html",
-        {"job": job},
+        {"job": job, "flip_answer": None},
     )
 
 
@@ -207,15 +253,15 @@ async def current_job_status(request: Request) -> Response:
     """
     Poll the current or most recent job status.
 
-    Returns the status partial template for HTMX polling swap.
+    Returns the status partial template for HTMX polling swap.  While an
+    answered job is still recorded ``AWAITING_FLIP``, the partial shows the
+    acknowledgment rather than the flip buttons (CR-01).
     """
     state = request.app.state
-    job = _current_or_recent_job(state.worker, state.job_store)
-
     return state.templates.TemplateResponse(
         request,
         "partials/status.html",
-        {"job": job},
+        _status_context(state.worker, state.job_store),
     )
 
 
@@ -317,14 +363,22 @@ async def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     returns the current status rather than an error (D-16).  Nothing is
     waited for: the route renders whatever the store has recorded and the
     one-second poll picks up pass B from there.
+
+    While the store still reads ``AWAITING_FLIP`` for an answered job, the
+    partial acknowledges the answer in place of the Continue and Abort
+    buttons, so a claimed or repeated click never re-renders a prompt that
+    looks unanswered (CR-01).
     """
     state = request.app.state
-    state.worker.continue_flip(job_id)
-    job = _current_or_recent_job(state.worker, state.job_store)
+    claimed = state.worker.continue_flip(job_id)
     return state.templates.TemplateResponse(
         request,
         "partials/status.html",
-        {"job": job},
+        _status_context(
+            state.worker,
+            state.job_store,
+            claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
+        ),
     )
 
 
@@ -338,12 +392,19 @@ async def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     before that job reached the flip prompt, or one arriving after Continue
     already answered is dropped rather than reported as an error (D-16): the
     route returns the current status either way.
+
+    While the store still reads ``AWAITING_FLIP`` for an answered job, the
+    partial shows "Aborting scan..." (or the answer that won) in place of the
+    buttons, so the response never invites a second click (CR-01).
     """
     state = request.app.state
-    state.worker.abort_flip(job_id)
-    job = _current_or_recent_job(state.worker, state.job_store)
+    claimed = state.worker.abort_flip(job_id)
     return state.templates.TemplateResponse(
         request,
         "partials/status.html",
-        {"job": job},
+        _status_context(
+            state.worker,
+            state.job_store,
+            claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+        ),
     )
