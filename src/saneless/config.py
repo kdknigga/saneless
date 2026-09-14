@@ -43,6 +43,7 @@ __all__ = [
     "Settings",
     "load_settings",
     "validate_settings_dirs",
+    "warn_on_legacy_duplex_sources",
 ]
 
 logger = logging.getLogger(__name__)
@@ -60,8 +61,9 @@ def _is_legacy_manual_duplex_source(source: str) -> bool:
     Recognise the deprecated ``source = "Manual Duplex"`` config form (DPLX-02).
 
     This exists ONLY to detect a legacy profile at config load so it can be
-    translated to ``duplex = "manual"`` and warned about. It is never consulted
-    to choose a scanning strategy: ``pipeline._is_manual_duplex`` is deleted in
+    translated to ``duplex = "manual"``, and so ``warn_on_legacy_duplex_sources``
+    can warn about it once logging is configured. It is never consulted to
+    choose a scanning strategy: ``pipeline._is_manual_duplex`` is deleted in
     favour of ``ProfileConfig.duplex``, and ``source`` is a pure SANE value.
 
     Args:
@@ -258,41 +260,55 @@ class Settings(BaseSettings):
             raise ValueError(msg)
         return v
 
-    @field_validator("profiles")
-    @classmethod
-    def warn_on_legacy_duplex_source(
-        cls,
-        v: dict[str, ProfileConfig],
-    ) -> dict[str, ProfileConfig]:
-        """
-        Warn, by profile name, about each legacy manual-duplex source.
 
-        ``ProfileConfig`` translates the legacy form but cannot name itself, so
-        the warning lives here. The legacy form is documented nowhere, which
-        makes this message the operator's only migration instruction: it states
-        the replacement inline. It makes no removal promise.
+def warn_on_legacy_duplex_sources(settings: Settings) -> None:
+    """
+    Warn, by profile name, about each profile with a legacy-looking source.
 
-        Args:
-            v: The already-constructed, already-translated profiles.
+    A function the CLI calls right after ``configure_logging``, not a
+    ``Settings`` validator (WR-05): a validator runs inside ``load_settings``,
+    before ``cli()`` has configured logging, so its record went to Python's
+    ``lastResort`` handler on stderr and never reached ``log_file`` -- and
+    this message is the operator's only migration instruction, since the
+    legacy form is documented nowhere. D-03's split is intact: the translation
+    stays in ``ProfileConfig`` (every construction path), and the naming lives
+    here because a profile cannot name itself. The replacement is stated
+    inline (D-18); no removal is promised.
 
-        Returns:
-            The profiles, unchanged.
+    A legacy-looking source with an explicit non-manual ``duplex`` is warned
+    about too (IN-04): explicit configuration still wins, so it is not read as
+    manual duplex, but its source goes to the scanner verbatim.
 
-        """
-        for name, profile in v.items():
-            if profile.duplex == "manual" and _is_legacy_manual_duplex_source(
-                profile.source
-            ):
-                logger.warning(
-                    "Profile %r requests manual duplex through the deprecated "
-                    'source value %r. saneless has read it as duplex = "manual" '
-                    'for this run. Update the profile to set duplex = "manual" '
-                    "and source to a source your scanner actually reports -- run "
-                    "'saneless devices --capabilities' to list them.",
-                    name,
-                    profile.source,
-                )
-        return v
+    Args:
+        settings: The loaded, already-translated settings.
+
+    """
+    for name, profile in settings.profiles.items():
+        if not _is_legacy_manual_duplex_source(profile.source):
+            continue
+        if profile.duplex == "manual":
+            logger.warning(
+                "Profile %r requests manual duplex through the deprecated "
+                'source value %r. saneless has read it as duplex = "manual" '
+                'for this run. Update the profile to set duplex = "manual" '
+                "and source to a source your scanner actually reports -- run "
+                "'saneless devices --capabilities' to list them.",
+                name,
+                profile.source,
+            )
+        else:
+            logger.warning(
+                "Profile %r sets source %r, which looks like the deprecated "
+                "manual-duplex value, but also sets duplex = %r, so saneless "
+                "has not read it as manual duplex and passes that source to "
+                "the scanner unchanged. Set source to a source your scanner "
+                "actually reports -- run 'saneless devices --capabilities' to "
+                'list them -- and set duplex = "manual" if you meant a manual '
+                "duplex scan.",
+                name,
+                profile.source,
+                profile.duplex,
+            )
 
 
 _VALID_SECTIONS = ("scanner", "paperless", "output", "profiles")
