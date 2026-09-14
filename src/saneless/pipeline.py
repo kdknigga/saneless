@@ -11,6 +11,7 @@ import contextlib
 import logging
 import shutil
 import tempfile
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
     from saneless.scanner.base import ScannerBackend
 
 __all__ = [
+    "FlipAnswerSlot",
     "FlipCoordinator",
     "PipelineEvent",
     "PipelineRequest",
@@ -69,8 +71,8 @@ class PipelineEvent(StrEnum):
         is what takes the flip prompt, and its Continue and Abort controls, off
         the screen while the backs feed (DPLX-06).
 
-        Note that a non-``None`` result is not an instruction to write that
-        state: ``DONE`` is terminal and the worker writes it only after the
+        Note that the returned state is not an instruction to write it:
+        ``DONE`` is terminal and the worker writes it only after the
         pipeline has returned.  Callers decide which states they apply.
 
         Returns:
@@ -147,6 +149,95 @@ class FlipCoordinator(ABC):
             within ``timeout``.
 
         """
+
+
+class FlipAnswerSlot:
+    """
+    One flip answer, claimed once, and final: the claim both coordinators share.
+
+    The web worker's and the CLI's coordinators differ in where an answer comes
+    from -- the Continue and Abort routes, or a terminal prompt -- but not in
+    how it is claimed.  That claim lives here, once, so a fix to it reaches both
+    (IN-02).  This is a concrete helper the coordinators compose, not a second
+    seam: ``FlipCoordinator`` stays the only contract the pipeline waits on
+    (D-09), and anything a coordinator adds on top -- the web one's arming, for
+    instance -- stays in that coordinator.
+
+    The answer is written under the lock *before* the event is set, so a waiter
+    that wakes always finds an answer to read -- there is no window in which the
+    event says "resolved" and the slot still says nothing.  That ordering is
+    what makes it race-free by construction rather than by timing.
+    """
+
+    def __init__(self) -> None:
+        """Start unanswered."""
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._outcome: FlipOutcome | None = None
+
+    @property
+    def answer(self) -> FlipOutcome | None:
+        """The claimed answer, or ``None`` while the slot is unanswered."""
+        with self._lock:
+            return self._outcome
+
+    def offer(self, outcome: FlipOutcome) -> bool:
+        """
+        Claim the answer with ``outcome`` if nothing has claimed it yet.
+
+        An offer that loses leaves the slot and the event untouched (D-16).
+
+        Args:
+            outcome: The answer this caller is offering.
+
+        Returns:
+            Whether ``outcome`` became the answer.
+
+        """
+        with self._lock:
+            if self._outcome is not None:
+                return False
+            self._outcome = outcome
+        self._event.set()
+        return True
+
+    def settle(self, outcome: FlipOutcome) -> FlipOutcome:
+        """
+        Claim the answer with ``outcome`` unless one is claimed, and return it.
+
+        This is the path that ends a wait: a timeout, or a CLI answer.
+        Returning the answer in effect, rather than asserting one exists, is
+        what narrows ``FlipOutcome | None`` to ``FlipOutcome`` without an
+        ``assert`` -- which ``S101`` bans in ``src/``.
+
+        Args:
+            outcome: The answer this caller is offering.
+
+        Returns:
+            The claimed answer: ``outcome`` if it was first, otherwise the
+            answer that beat it.
+
+        """
+        with self._lock:
+            if self._outcome is None:
+                self._outcome = outcome
+            claimed = self._outcome
+        self._event.set()
+        return claimed
+
+    def wait(self, timeout: float) -> None:
+        """
+        Block until the slot is answered, for at most ``timeout`` seconds.
+
+        It reports nothing: the caller reads the result through ``settle``, which
+        is right whether the wait was answered or expired.  A
+        ``KeyboardInterrupt`` raised while waiting propagates to the caller.
+
+        Args:
+            timeout: The longest to wait, in seconds.
+
+        """
+        self._event.wait(timeout)
 
 
 @dataclass(frozen=True)
