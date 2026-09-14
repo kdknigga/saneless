@@ -33,6 +33,7 @@ The scanner scans both sides of each page automatically in a single pass. This r
 ```toml
 [profiles.duplex]
 source = "ADF Duplex"
+duplex = "hardware"
 resolution = 300
 mode = "Color"
 ```
@@ -41,31 +42,18 @@ mode = "Color"
 saneless scan --profile duplex --title "Contract"
 ```
 
+The scanner decides to scan both sides from the source name it is given, so `source = "ADF Duplex"` is what makes this a duplex scan. `duplex = "hardware"` is optional and changes nothing about how the scan runs: it records what the scanner does, so the profile describes itself. `saneless auto-profiles` writes it for hardware duplex sources.
+
 ### Manual Duplex
 
 For scanners without hardware duplex, saneless coordinates a two-pass scan: first the front sides, then the back sides. saneless reverses and interleaves the pages to produce the correct page order.
 
-!!! note "Manual duplex needs a document feeder"
-    Manual duplex feeds the same stack through the ADF twice. A source name
-    containing "duplex" is treated as a feeder source, so each pass acquires the
-    whole stack. It is not a flatbed workflow -- on a flatbed-only scanner, use a
-    plain flatbed profile and scan each side as its own job.
-
-The manual duplex flow:
-
-1. Load pages face-up in the ADF
-2. Start the scan -- saneless scans all front sides (Pass A)
-3. A prompt appears asking you to flip the page stack
-4. Flip the entire stack face-down and reload it in the ADF
-5. Click Continue (web UI) or press Enter (CLI) -- saneless scans all back sides (Pass B)
-6. saneless reverses the backs and interleaves them with the fronts: page 1 front, page 1 back, page 2 front, page 2 back, etc.
-7. The assembled PDF is uploaded to paperless-ngx
-
-To use manual duplex, set the source to any string containing both "manual" and "duplex" (case-insensitive):
+A manual duplex profile takes two keys: `source`, set to a feeder source your scanner actually reports, and `duplex = "manual"`, which tells saneless to run the two-pass flow. Run `saneless devices --capabilities` to list the sources your scanner reports.
 
 ```toml
 [profiles.manual-duplex]
-source = "Manual Duplex"
+source = "ADF"
+duplex = "manual"
 resolution = 300
 mode = "Color"
 ```
@@ -74,7 +62,58 @@ mode = "Color"
 saneless scan --profile manual-duplex --title "Double-sided doc"
 ```
 
-In the CLI, saneless prompts you to flip the pages between passes. In the web UI, a flip prompt with Continue and Cancel buttons appears automatically.
+!!! note "Manual duplex needs a document feeder"
+    Manual duplex feeds the same stack through the feeder twice, so both passes
+    use a feeder source. saneless uses the `source` you configured when your
+    scanner reports it and it is a feeder; otherwise it picks the first feeder
+    source the scanner reports. It is not a flatbed workflow -- on a
+    flatbed-only scanner, use a plain flatbed profile and scan each side as its
+    own job.
+
+The manual duplex flow:
+
+1. Load the stack face-up in the feeder
+2. Start the scan -- saneless scans all front sides (pass A)
+3. A prompt appears asking you to flip the stack
+4. Keep the pages in the same order, flip the whole stack over the long edge, and load it back into the feeder
+5. Confirm the flip -- saneless scans all back sides (pass B)
+6. saneless reverses the backs and interleaves them with the fronts: page 1 front, page 1 back, page 2 front, page 2 back, etc.
+7. The assembled PDF is uploaded to paperless-ngx
+
+How you confirm the flip depends on where you started the scan:
+
+- **Web UI:** a flip prompt with **Continue** and **Abort scan** buttons appears automatically once the front sides are scanned. The buttons disappear on their own as soon as pass B starts.
+- **CLI:** `saneless scan` asks a yes/no question and waits until you answer:
+
+    ```
+    Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:
+    ```
+
+    Answering yes (or pressing Enter, since yes is the default) starts pass B. Answering no, pressing Ctrl-C, or closing input ends the scan with `Scan error: Manual duplex scan aborted at the flip prompt` and exit code 1. Nothing is uploaded.
+
+Either way, the wait is bounded by `flip_timeout_seconds` in the `[output]` section (600 seconds by default). If nobody confirms the flip in time, the job fails with `Manual duplex flip wait timed out after 600 seconds: nobody confirmed the stack was flipped` and nothing is uploaded. See [Configuration](../reference/configuration.md#output).
+
+!!! warning "The CLI needs an interactive terminal for manual duplex"
+    Someone has to flip the stack between the two passes, so `saneless scan` refuses a manual
+    duplex profile when it is not run from a terminal -- from cron, a pipe, or a script with
+    redirected input. It exits with code 2 before the scanner feeds a single page:
+
+    ```
+    Profile 'manual-duplex' is manual duplex, which needs an interactive terminal: saneless must prompt you to flip the stack between the two passes. Run it from a terminal, or scan from the web UI.
+    ```
+
+    For unattended automation, use a simplex or hardware duplex profile instead. See
+    [CLI Scripting](cli-scripting.md#exit-codes).
+
+### Scanners with no document feeder
+
+If your scanner reports no feeder source at all, a manual duplex scan fails before pass A starts, and the error lists the sources the scanner does report:
+
+```
+Manual duplex needs a document feeder, and the device reports none. Available: ['Flatbed', 'Auto']
+```
+
+saneless does not fall back to a flatbed or `Auto` source for manual duplex, because that would scan the platen twice instead of feeding your stack.
 
 !!! info "Auto source scanners"
     If your scanner reports only an `Auto` source instead of `ADF` or `ADF Duplex`, you can
@@ -100,6 +139,10 @@ To tune the thresholds or disable empty page detection, see [Configure Scan Prof
 ## Page count mismatch handling
 
 If the front and back pass produce different page counts during manual duplex, saneless does not discard your scans. Instead, it assembles the fronts and backs into separate PDFs and uploads both to paperless-ngx for manual review.
+
+Empty page detection is deliberately skipped for these two partial PDFs, even when the profile has `enable_empty_page_detection = true`. When the passes disagree, a blank back side is evidence about why -- a sheet that double-fed, or one that did not feed at all -- and the partial PDFs exist so you can see exactly what each pass picked up. Removing blank pages would throw that evidence away. Every scan that does not hit a mismatch still has its blank pages removed as usual.
+
+The feeder page cap applies to each pass separately, not to the whole job: each pass can feed up to 500 sheets.
 
 !!! tip
     Always test with a few pages first to confirm page ordering before scanning a large batch. This helps verify that your scanner feeds pages in the expected direction.

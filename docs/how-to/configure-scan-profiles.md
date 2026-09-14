@@ -54,6 +54,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `source` | string | `"Flatbed"` | Paper source: `"Flatbed"`, `"ADF"`, or `"ADF Duplex"` |
+| `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow; `"hardware"` only records that the source scans both sides and does not change the scan |
 | `resolution` | integer | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `"Color"`, `"Gray"`, or `"Lineart"` |
 | `title` | string | `""` | Default title template for scanned documents |
@@ -74,7 +75,17 @@ The `source` field determines how pages are fed to the scanner:
 - **`"ADF"`** -- Automatic Document Feeder, one side per page. Load a stack of pages.
 - **`"ADF Duplex"`** -- Hardware duplex via ADF. The scanner scans both sides of each page automatically (requires hardware support).
 
-For manual two-pass duplex scanning, see [Set Up ADF Duplex Scanning](set-up-adf-duplex.md).
+For manual two-pass duplex scanning on a scanner without hardware duplex, keep `source` set to a feeder source your scanner reports and add `duplex = "manual"`:
+
+```toml
+[profiles.manual-duplex]
+source = "ADF"
+duplex = "manual"
+resolution = 300
+mode = "Color"
+```
+
+See [Set Up ADF Duplex Scanning](set-up-adf-duplex.md#manual-duplex) for the full flow.
 
 ## Auto source
 
