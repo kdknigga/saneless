@@ -29,11 +29,13 @@ from saneless.vocabulary import (
     TERMINAL_STATES,
     ConnectionStatus,
     ErrorCategory,
+    FlipOutcome,
     JobState,
     ScanOutcome,
     classify_error,
     connection_status_message,
     error_message,
+    flip_answer_label,
     job_state_for,
     progress_label,
     state_label,
@@ -216,6 +218,33 @@ class TestProgressLabel:
         assert progress_label(JobState.DONE) == "Complete"
         assert progress_label(JobState.ERROR) == "Failed"
         assert progress_label(JobState.FALLBACK) == "Saved to folder"
+
+
+class TestFlipAnswerLabel:
+    """flip_answer_label acknowledgment-copy lookup tests."""
+
+    @pytest.mark.parametrize(
+        ("outcome", "expected"),
+        [
+            (FlipOutcome.CONTINUED, "Flip confirmed. Scanning reverse sides next..."),
+            (FlipOutcome.ABORTED, "Aborting scan..."),
+            (FlipOutcome.TIMED_OUT, "Flip wait timed out..."),
+        ],
+    )
+    def test_flip_answer_label_strings(
+        self, outcome: FlipOutcome, expected: str
+    ) -> None:
+        """flip_answer_label returns the acknowledgment copy (DPLX-06, CR-01)."""
+        assert flip_answer_label(outcome) == expected
+
+    @pytest.mark.parametrize("outcome", list(FlipOutcome))
+    def test_flip_answer_label_is_complete(self, outcome: FlipOutcome) -> None:
+        """Every FlipOutcome has acknowledgment prose ending in ASCII dots (CR-01)."""
+        label = flip_answer_label(outcome)
+        assert label
+        assert label != outcome.value
+        assert label.endswith("...")
+        assert "…" not in label
 
 
 class TestErrorMessage:
