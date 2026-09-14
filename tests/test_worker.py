@@ -33,6 +33,7 @@ from saneless.vocabulary import (
     FlipOutcome,
     ScanOutcome,
     SubmitResult,
+    WorkerHealth,
     classify_error,
 )
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
@@ -2051,6 +2052,7 @@ class TestWorkerGuard:
                 for job in jobs
             ]
             loop_failures = worker._consecutive_loop_failures
+            health = worker.health
             alive = worker.is_alive
         finally:
             worker.stop()
@@ -2058,6 +2060,7 @@ class TestWorkerGuard:
 
         assert [job.state for job in finished] == [JobState.ERROR] * 3
         assert loop_failures == 0
+        assert health is WorkerHealth.HEALTHY
         assert alive
 
     def test_idle_worker_prunes_history_on_its_interval(
@@ -2188,6 +2191,301 @@ class TestWorkerGuard:
         records = _worker_records(caplog, logging.WARNING, first.id)
         assert records
         assert records[0].exc_info is not None
+
+
+# Loop-level failures in a row that make a worker degraded (D-10).
+_DEGRADING_JOBS = 3
+
+
+def _submit_jobs(worker: ScanWorker, store: JobStore, count: int) -> list[Job]:
+    """
+    Create and submit ``count`` jobs, asserting each was accepted.
+
+    Returns:
+        The submitted jobs, in submission order.
+
+    """
+    jobs = [store.create_job("default", f"Job {n}") for n in range(1, count + 1)]
+    for job in jobs:
+        assert worker.submit(job) is SubmitResult.ACCEPTED
+    return jobs
+
+
+def _degrade(worker: ScanWorker, store: JobStore) -> list[Job]:
+    """
+    Drive a started worker whose SCANNING write always raises into DEGRADED.
+
+    ``_DEGRADING_JOBS`` jobs make that many loop-level failures in a row
+    (D-10).  Degraded is set before the guard's write for the last job, so a
+    caller that heals the store right away may see that one row written by
+    the guard rather than by recovery -- with the same text either way.
+
+    Returns:
+        The jobs whose loop-level failures degraded the worker.
+
+    """
+    jobs = _submit_jobs(worker, store, _DEGRADING_JOBS)
+    assert _wait_until(lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET)
+    return jobs
+
+
+class TestWorkerDegradedHealth:
+    """
+    The worker reports HEALTHY, DEGRADED or DOWN, and heals on its own.
+
+    D-10: three consecutive loop-level failures -- the loop's own job store
+    writes raising -- make the worker DEGRADED while its thread stays alive.
+    D-11: a degraded worker rejects scans with ``SubmitResult.DEGRADED``, so
+    nobody feeds paper into a job that cannot be recorded.  D-12: each idle
+    tick while degraded probes the store; the first success clears DEGRADED
+    with no scan needed.  Research Pitfall 6: that recovery also ends rows the
+    guard could not end, using only the texts that already exist.
+    """
+
+    def test_health_is_down_unless_the_thread_runs_not_degraded(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+    ) -> None:
+        """A worker not started, or stopped, is DOWN; a running one is HEALTHY."""
+        store = JobStore()
+        worker = worker_for(store)
+        try:
+            before = worker.health
+            worker.start()
+            running = worker.health
+            worker.stop()
+            after = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert before is WorkerHealth.DOWN
+        assert running is WorkerHealth.HEALTHY
+        assert after is WorkerHealth.DOWN
+
+    def test_three_loop_failures_in_a_row_make_the_worker_degraded(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-10, D-11: degraded after three store failures, alive, and rejecting."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        monkeypatch.setattr(store, "update_state", _StoreFault(store.update_state))
+        monkeypatch.setattr(store, "probe", _StoreFault(store.probe))
+        worker = worker_for(store)
+        try:
+            worker.start()
+            _degrade(worker, store)
+            health = worker.health
+            alive = worker.is_alive
+            fourth = worker.submit(store.create_job("default", "While Degraded"))
+        finally:
+            worker.stop()
+            store.close()
+
+        assert health is WorkerHealth.DEGRADED
+        assert alive
+        assert fourth is SubmitResult.DEGRADED
+        assert _worker_records(caplog, logging.WARNING, "degraded")
+
+    def test_degraded_needs_consecutive_failures_not_cumulative_ones(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """D-10: two failures, a success, two failures -- still HEALTHY."""
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        updates = _StoreFault(store.update_state, frozenset({1, 2, 4, 5}))
+        monkeypatch.setattr(store, "update_state", updates)
+        # A wrongly degraded worker must stay degraded for the assertion to see.
+        monkeypatch.setattr(store, "probe", _StoreFault(store.probe))
+        worker = worker_for(store)
+        try:
+            worker.start()
+            jobs = _submit_jobs(worker, store, 5)
+            finished = [
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+                for job in jobs
+            ]
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert [job.state for job in finished] == [
+            JobState.ERROR,
+            JobState.ERROR,
+            JobState.DONE,
+            JobState.ERROR,
+            JobState.ERROR,
+        ]
+        assert health is WorkerHealth.HEALTHY
+
+    def test_a_successful_probe_clears_degraded(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """D-12: a failing probe keeps DEGRADED; the first success heals it."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        updates = _StoreFault(store.update_state)
+        probes = _StoreFault(store.probe)
+        monkeypatch.setattr(store, "update_state", updates)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            _degrade(worker, store)
+            probed = _wait_until(lambda: len(probes.calls) >= 3, _STATE_BUDGET)
+            still_degraded = worker.health
+            updates.heal()
+            probes.heal()
+            recovered = _wait_until(
+                lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
+            )
+            job = store.create_job("default", "After Recovery")
+            accepted = worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert probed
+        assert still_degraded is WorkerHealth.DEGRADED
+        assert recovered
+        assert accepted is SubmitResult.ACCEPTED
+        assert finished.state is JobState.DONE
+        assert _worker_records(caplog, logging.INFO, "recovered")
+
+    def test_degraded_recovery_ends_jobs_whose_failure_went_unrecorded(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Research Pitfall 6: a row the guard could not end is ended on recovery.
+
+        Both the SCANNING write and the guard's ERROR write raise, so the rows
+        stay PENDING through degraded.  The first successful probe writes the
+        error the guard tried to write, and nothing is left active.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        faults = [
+            _StoreFault(store.update_state),
+            _StoreFault(store.finish_job),
+            _StoreFault(store.probe),
+        ]
+        for name, fault in zip(
+            ("update_state", "finish_job", "probe"), faults, strict=True
+        ):
+            monkeypatch.setattr(store, name, fault)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            jobs = _degrade(worker, store)
+            for fault in faults:
+                fault.heal()
+            recovered = _wait_until(
+                lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
+            )
+            rows = [_get(store, job.id) for job in jobs]
+        finally:
+            worker.stop()
+            store.close()
+
+        expected_category = classify_error(sqlite3.OperationalError(_DISK_ERROR))
+        assert recovered
+        assert [row.state for row in rows] == [JobState.ERROR] * _DEGRADING_JOBS
+        assert all(row.error == _DISK_ERROR for row in rows)
+        assert all(row.error_category is expected_category for row in rows)
+        assert not any(row.is_active for row in rows)
+
+    def test_mark_recovery_pending_starts_degraded_and_fails_orphans_on_recovery(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        D-13, research Open Question 1: a failed startup recovery starts degraded.
+
+        The first successful probe fails the row the crashed process left
+        SCANNING with ``RESTART_REASON``, then reports HEALTHY.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        orphan = store.create_job("default", "Left Scanning")
+        store.update_state(orphan.id, JobState.SCANNING)
+        probes = _StoreFault(store.probe)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.mark_recovery_pending()
+            worker.start()
+            at_start = worker.health
+            rejected = worker.submit(store.create_job("default", "Too Soon"))
+            probes.heal()
+            recovered = _wait_until(
+                lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
+            )
+            row = _get(store, orphan.id)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert at_start is WorkerHealth.DEGRADED
+        assert rejected is SubmitResult.DEGRADED
+        assert recovered
+        assert row.state is JobState.ERROR
+        assert row.error == RESTART_REASON
+
+    def test_probe_is_not_called_while_not_degraded(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """D-12: probing is the degraded worker's business only."""
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        probes = _StoreFault(store.probe, frozenset())
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            # A bounded window in which nothing may happen: ten idle ticks.
+            time.sleep(10 * _FAST_TICK)
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert health is WorkerHealth.HEALTHY
+        assert probes.calls == []
 
 
 # Rounds each thread runs in the profile lock stress test.
