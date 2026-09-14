@@ -17,7 +17,10 @@ Covers requirements: ROBU-02, ROBU-08.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import pytest
@@ -51,7 +54,6 @@ from saneless.web.app import create_app
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
     import httpx
 
@@ -386,3 +388,73 @@ def test_unhandled_exception_is_500_and_logged_not_leaked(
     ]
     assert records
     assert all(r.exc_info is not None for r in records)
+
+
+# --- The client half: htmx-config meta and the #status-message slot ----------
+
+WEB_DIR = Path(__file__).parent.parent / "src" / "saneless" / "web"
+STATUS_MESSAGE_SLOT = '<div id="status-message" role="alert"></div>'
+_HTMX_CONFIG_META = re.compile(r"""<meta name="htmx-config"\s+content='([^']*)'>""")
+_CSS_RULE = re.compile(r"#status-message > p \{(?P<body>[^}]*)\}")
+
+
+def test_status_message_slot_is_one_empty_alert_above_the_status_area(
+    client: TestClient,
+) -> None:
+    """
+    The page has one empty alert slot, just above #status-area (D-03).
+
+    It is a sibling of the polled status area, so the 1 s outerHTML poll never
+    replaces it, and it sits outside the form.
+    """
+    page = client.get("/").text
+    assert page.count(STATUS_MESSAGE_SLOT) == 1
+    assert page.count('id="status-message"') == 1
+    slot = page.index(STATUS_MESSAGE_SLOT)
+    assert slot < page.index('id="status-area"')
+    form = page[page.index("<form") : page.index("</form>")]
+    assert STATUS_MESSAGE_SLOT not in form
+    assert page.index("</form>") < slot
+
+
+def test_htmx_config_restates_all_three_response_handling_entries(
+    client: TestClient,
+) -> None:
+    """
+    The htmx-config meta swaps error bodies without breaking 2xx swaps (D-01).
+
+    htmx 2.0.8 merges meta config shallowly, so a meta holding only the
+    ``[45]..`` entry would replace the whole array and stop every 2xx swap.
+    All three entries have to be restated.
+    """
+    page = client.get("/").text
+    match = _HTMX_CONFIG_META.search(page)
+    assert match is not None
+    config = json.loads(match.group(1))
+    assert isinstance(config, dict)
+    assert config["responseHandling"] == [
+        {"code": "204", "swap": False},
+        {"code": "[23]..", "swap": True},
+        {"code": "[45]..", "swap": True, "error": True},
+    ]
+
+
+def test_htmx_config_meta_sits_between_color_scheme_and_title() -> None:
+    """The meta follows the color-scheme meta and precedes <title> (UI-SPEC S1)."""
+    base = (WEB_DIR / "templates" / "base.html").read_text()
+    assert base.count('name="htmx-config"') == 1
+    color_scheme = base.index('<meta name="color-scheme"')
+    htmx_config = base.index('<meta name="htmx-config"')
+    title = base.index("<title>")
+    assert color_scheme < htmx_config < title
+
+
+def test_status_message_paragraph_is_inset_like_the_status_area() -> None:
+    """An error paragraph lines up with the status area's text (D-03)."""
+    css = (WEB_DIR / "static" / "app.css").read_text()
+    assert "!important" not in css
+    rules = _CSS_RULE.findall(css)
+    assert len(rules) == 1
+    body = rules[0]
+    assert "padding-left: 1rem;" in body
+    assert "border-left: var(--pico-border-width) solid transparent;" in body
