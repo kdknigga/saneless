@@ -76,9 +76,10 @@ class ClickFlipCoordinator(FlipCoordinator):
     coordinator, so an answer that lands as the wait expires is honoured rather
     than overwritten.
 
-    A yes is ``CONTINUED``; a no is ``ABORTED``; and ``click.Abort`` (EOF at the
-    prompt) is also ``ABORTED``, so giving up at the terminal and clicking Abort
-    in the web UI end the job the same way.
+    A yes is ``CONTINUED``; a no is ``ABORTED``; and so are EOF at the prompt
+    (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
+    the calling thread, where Python delivers SIGINT), so giving up at the
+    terminal and clicking Abort in the web UI end the job the same way.
 
     Accepted cost, deliberate and not a leak: after a timeout the prompt thread
     is abandoned.  It keeps its read on stdin until the process exits, and its
@@ -110,10 +111,16 @@ class ClickFlipCoordinator(FlipCoordinator):
             target=self._prompt, name="saneless-flip-prompt", daemon=True
         )
         prompt.start()
+        try:
+            self._event.wait(timeout)
+        except KeyboardInterrupt:
+            # Ctrl-C lands here, not in click.confirm: Python handles SIGINT on
+            # the main thread, which is this one, parked in the wait.  Offered
+            # as ABORTED so it ends the job the way a web Abort does.
+            return self._resolve(FlipOutcome.ABORTED)
         # One path for both endings.  If the prompt answered, _resolve finds
         # that answer already claimed and hands it back; if the wait expired,
         # TIMED_OUT is offered and wins unless the answer beat it after all.
-        self._event.wait(timeout)
         return self._resolve(FlipOutcome.TIMED_OUT)
 
     def _prompt(self) -> None:
