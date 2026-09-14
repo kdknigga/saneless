@@ -313,3 +313,126 @@ def test_recovery_failure_starts_the_worker_degraded(
         and "Crash recovery" in record.getMessage()
         for record in caplog.records
     )
+
+
+# --- Guarded close at shutdown (ROBU-06, D-07, D-09) -------------------------
+
+
+def test_shutdown_closes_resources_after_the_worker_stops(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A confirmed stop is followed by closing Paperless, then the store."""
+    app = _build_app(settings)
+    worker = app.state.worker
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    calls: list[str] = []
+    original_stop = worker.stop
+    original_paperless_close = paperless.close
+    original_store_close = store.close
+
+    def recording_stop() -> bool:
+        calls.append("worker.stop")
+        return original_stop()
+
+    def recording_paperless_close() -> None:
+        calls.append("paperless.close")
+        original_paperless_close()
+
+    def recording_store_close() -> None:
+        calls.append("job_store.close")
+        original_store_close()
+
+    monkeypatch.setattr(worker, "stop", recording_stop)
+    monkeypatch.setattr(paperless, "close", recording_paperless_close)
+    monkeypatch.setattr(store, "close", recording_store_close)
+    caplog.set_level(logging.INFO, logger=_APP_LOGGER)
+    with TestClient(app):
+        pass
+    assert calls == ["worker.stop", "paperless.close", "job_store.close"]
+    assert any(
+        record.name == _APP_LOGGER
+        and record.levelno == logging.INFO
+        and record.getMessage() == "App shutdown complete"
+        for record in caplog.records
+    )
+
+
+def test_shutdown_leaves_resources_open_when_the_worker_does_not_stop(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A stuck worker keeps the store and client open, and nothing is written."""
+    app = _build_app(settings)
+    worker = app.state.worker
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    existing = store.create_job("default", "written before startup")
+    calls: list[str] = []
+    stop_requested = False
+    real_stop = worker.stop
+    real_store_close = store.close
+    real_paperless_close = paperless.close
+
+    def stuck_stop() -> bool:
+        nonlocal stop_requested
+        stop_requested = True
+        return False
+
+    def spy_paperless_close() -> None:
+        calls.append("paperless.close")
+
+    def spy_store_close() -> None:
+        calls.append("job_store.close")
+
+    # The worker is idle, so nothing should write at all; any write after
+    # stop() was asked would be the shutdown-time write D-07 forbids.
+    def spy_finish_job(*args: object, **kwargs: object) -> None:
+        if stop_requested:
+            calls.append("finish_job")
+
+    def spy_update_state(*args: object, **kwargs: object) -> None:
+        if stop_requested:
+            calls.append("update_state")
+
+    monkeypatch.setattr(worker, "stop", stuck_stop)
+    monkeypatch.setattr(worker, "_current_job_id", "job-xyz")
+    monkeypatch.setattr(paperless, "close", spy_paperless_close)
+    monkeypatch.setattr(store, "close", spy_store_close)
+    monkeypatch.setattr(store, "finish_job", spy_finish_job)
+    monkeypatch.setattr(store, "update_state", spy_update_state)
+    caplog.set_level(logging.INFO, logger=_APP_LOGGER)
+    try:
+        with TestClient(app):
+            pass
+        assert stop_requested
+        assert calls == []
+        still_open = store.get_job(existing.id)
+        assert still_open is not None
+        assert any(
+            record.name == _APP_LOGGER
+            and record.levelno == logging.WARNING
+            and "job-xyz" in record.getMessage()
+            and "5" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        # The real thread is idle; stop it and release what the app left open,
+        # so this test leaks neither a thread nor a database handle.
+        assert real_stop()
+        real_paperless_close()
+        real_store_close()
+
+
+def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
+    """With the real, idle worker, leaving the lifespan closes the job store."""
+    app = _build_app(settings)
+    store: JobStore = app.state.job_store
+    existing = store.create_job("default", "written before startup")
+    with TestClient(app):
+        pass
+    with pytest.raises(sqlite3.ProgrammingError):
+        store.get_job(existing.id)
