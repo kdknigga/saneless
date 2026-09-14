@@ -64,11 +64,14 @@ saneless scan --profile manual-duplex --title "Double-sided doc"
 
 !!! note "Manual duplex needs a document feeder"
     Manual duplex feeds the same stack through the feeder twice, so both passes
-    use a feeder source. saneless uses the `source` you configured when your
-    scanner reports it and it is a feeder; otherwise it picks the first feeder
-    source the scanner reports. It is not a flatbed workflow -- on a
-    flatbed-only scanner, use a plain flatbed profile and scan each side as its
-    own job.
+    use a single-sided feeder source. saneless uses the `source` you configured
+    when your scanner reports it and it is a single-sided feeder; otherwise it
+    uses the first single-sided feeder the scanner reports. A source that
+    already scans both sides (such as `ADF Duplex`) is never used for manual
+    duplex -- each pass would return every page twice -- so if you name one,
+    saneless logs a warning and uses the single-sided feeder instead. It is not
+    a flatbed workflow -- on a flatbed-only scanner, use a plain flatbed profile
+    and scan each side as its own job.
 
 The manual duplex flow:
 
@@ -82,14 +85,14 @@ The manual duplex flow:
 
 How you confirm the flip depends on where you started the scan:
 
-- **Web UI:** a flip prompt with **Continue** and **Abort scan** buttons appears automatically once the front sides are scanned. The buttons disappear on their own as soon as pass B starts.
+- **Web UI:** a flip prompt with **Continue** and **Abort scan** buttons appears automatically once the front sides are scanned. As soon as saneless receives your click, the buttons are replaced by a short confirmation, and the status moves on once pass B starts.
 - **CLI:** `saneless scan` asks a yes/no question and waits until you answer:
 
     ```
     Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:
     ```
 
-    Answering yes (or pressing Enter, since yes is the default) starts pass B. Answering no, pressing Ctrl-C, or closing input ends the scan with `Scan error: Manual duplex scan aborted at the flip prompt` and exit code 1. Nothing is uploaded.
+    Answering yes (or pressing Enter, since yes is the default) starts pass B. Answering no, pressing Ctrl-C, or closing input ends the scan with `Scan error: Manual duplex scan aborted at the flip prompt` and exit code 1. An error reading the terminal at the prompt ends the scan the same way, straight away, and the error is logged. Nothing is uploaded.
 
 Either way, the wait is bounded by `flip_timeout_seconds` in the `[output]` section (600 seconds by default). If nobody confirms the flip in time, the job fails with `Manual duplex flip wait timed out after 600 seconds: nobody confirmed the stack was flipped` and nothing is uploaded. See [Configuration](../reference/configuration.md#output).
 
@@ -114,6 +117,24 @@ Manual duplex needs a document feeder, and the device reports none. Available: [
 ```
 
 saneless does not fall back to a flatbed or `Auto` source for manual duplex, because that would scan the platen twice instead of feeding your stack.
+
+#### Scanners whose only feeder scans both sides
+
+If every feeder source your scanner reports already scans both sides of each sheet, manual duplex is refused before any page is fed:
+
+```
+Manual duplex needs a single-sided document feeder, and every feeder the device reports scans both sides; set duplex = "hardware" with one of them instead. Available: ['Flatbed', 'ADF Duplex']
+```
+
+Such a scanner does not need the flip workflow: set `duplex = "hardware"` and use that source, as in [ADF Hardware Duplex](#adf-hardware-duplex).
+
+#### Scanners that report no source list
+
+Some scanners expose no `source` option at all, so saneless has no source to select. Manual duplex still runs on such a scanner when `source` names its feeder (for example `ADF`), because the scanner feeds without being told. With a source that is not a feeder, such as `Flatbed`, manual duplex is refused before any page is fed:
+
+```
+Manual duplex needs a feeder source, and this device exposes no source option to choose one; set source to the name of its feeder (got 'Flatbed')
+```
 
 !!! info "Auto source scanners"
     If your scanner reports only an `Auto` source instead of `ADF` or `ADF Duplex`, you can
