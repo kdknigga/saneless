@@ -244,7 +244,8 @@ class ScanWorker:
         self._last_prune = time.monotonic()
         # Jobs whose failure could not be written even by the loop guard, by
         # id, with the error text and category the guard tried to record.
-        # Touched only by the worker thread.
+        # Every idle tick retries them (CR-01).  Touched only by the worker
+        # thread.
         self._unrecorded_failures: dict[str, tuple[str, ErrorCategory | None]] = {}
         # Set and cleared by the worker thread (and by mark_recovery_pending,
         # before the thread exists); read by request threads through health and
@@ -661,7 +662,8 @@ class ScanWorker:
         is recorded by ``_process_job`` itself; whatever still escapes it is a
         failure of the loop's own job store writes, which is logged, counted
         towards degraded (D-10), and answered with one best-effort ERROR write
-        so the row does not sit active until restart (research Pitfall 6).
+        so the row does not sit active until restart (research Pitfall 6).  If
+        that write fails too, idle ticks retry it until it lands (CR-01).
 
         Before any job, the thread generates profiles (D-14).  A job submitted
         meanwhile waits in the queue and then runs against the generated set.
@@ -732,8 +734,9 @@ class ScanWorker:
         Try once to record ``job`` as failed after a loop-level failure.
 
         The store just raised, so this may raise too; that is only logged.
-        The failure is remembered instead, for the recovery probe to write once
-        the store accepts writes again (research Pitfall 6).
+        The failure is remembered instead, and the next idle tick retries the
+        write -- through the recovery path while degraded -- until the store
+        accepts it (research Pitfall 6, CR-01).
 
         Args:
             job: The job the loop was handling.
@@ -756,14 +759,27 @@ class ScanWorker:
 
     def _idle_housekeeping(self) -> None:
         """
-        Use an idle tick: probe while degraded, then prune when due.
+        Use an idle tick: retry owed writes (probing while degraded), then prune.
 
-        The probe comes first, so a degraded worker gets its chance to heal on
-        every tick (D-12).  A prune failure is a loop-level failure (D-10), and
-        it can never fail a job: no job is running on an idle tick (D-13).
+        Owed writes come first and are retried on every tick, degraded or not,
+        so a row the guard could not end reaches ERROR as soon as the store
+        accepts writes, without a restart or a scan (CR-01).  The probe and the
+        degraded clear stay the degraded worker's business (D-12).  A failed
+        retry is only logged: the guard already counted the failure that
+        created the debt (D-10).  A prune failure is a loop-level failure
+        (D-10), and it can never fail a job: no job is running on an idle tick
+        (D-13).
         """
         if self._degraded.is_set():
             self._try_recover()
+        else:
+            try:
+                self._flush_unrecorded_failures()
+            except Exception:
+                logger.debug(
+                    "Owed job store writes failed; retrying on the next idle tick",
+                    exc_info=True,
+                )
         if time.monotonic() - self._last_prune < _PRUNE_INTERVAL_SECONDS:
             return
         self._last_prune = time.monotonic()
@@ -775,6 +791,31 @@ class ScanWorker:
         except Exception:
             logger.exception("Idle history prune failed")
             self._record_loop_failure()
+
+    def _flush_unrecorded_failures(self) -> None:
+        """
+        Write the ERROR rows the loop guard could not, dropping each once written.
+
+        This runs only on an Empty tick -- from ``_idle_housekeeping`` or
+        ``_try_recover`` -- so no job is current, and an owed id belongs to a
+        job the loop already abandoned: none can be the job in flight.  With
+        nothing owed it returns without touching the store.
+
+        Raises:
+            Exception: Whatever the store raises.  Rows already written stay
+                written and are no longer owed; the rest wait for the next
+                tick.
+
+        """
+        for job_id, (error, category) in list(self._unrecorded_failures.items()):
+            self._job_store.finish_job(
+                job_id, JobState.ERROR, error=error, error_category=category
+            )
+            del self._unrecorded_failures[job_id]
+            logger.info(
+                "Recorded job %s as failed now that the job store accepts writes",
+                job_id,
+            )
 
     def _try_recover(self) -> None:
         """
@@ -799,11 +840,7 @@ class ScanWorker:
         try:
             # The guard's own failures first: once ERROR they are no longer
             # active, so the restart recovery below cannot give them its text.
-            for job_id, (error, category) in list(self._unrecorded_failures.items()):
-                self._job_store.finish_job(
-                    job_id, JobState.ERROR, error=error, error_category=category
-                )
-                del self._unrecorded_failures[job_id]
+            self._flush_unrecorded_failures()
             if self._restart_recovery_pending:
                 self._job_store.fail_active_jobs(RESTART_REASON)
                 self._restart_recovery_pending = False
