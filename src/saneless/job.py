@@ -655,6 +655,75 @@ class JobStore:
         return job
 
     @_locked
+    def create_rejected_job(
+        self,
+        profile: str,
+        title: str,
+        *,
+        error: str,
+        tags: list[int] | None = None,
+        correspondent: int | None = None,
+    ) -> Job:
+        """
+        Record a submit that was refused before any job row existed.
+
+        The refused attempt still gets a row, so history shows the user that
+        their scan was not started and why (D-05).  The row is written already
+        terminal -- ``ERROR`` with ``ErrorCategory.REJECTED`` -- and that marker
+        is what :meth:`latest_run_job` skips, so the rejection never replaces
+        the job that just ended in the status area (D-06).
+
+        One ``INSERT``, not :meth:`create_job` followed by :meth:`finish_job`.
+        Those are two transactions: if the second one raised, the first would
+        already have committed a ``PENDING`` row with no marker.  No worker ever
+        saw that id and restart recovery never runs again, so the row would stay
+        active for good, showing "Starting scan..." and disabling the Scan
+        button (WR-01).  With a single statement a failure leaves no row at all.
+
+        Args:
+            profile: Scan profile name the refused submit named.
+            title: Document title the refused submit named.
+            error: The job-history error text explaining the refusal.
+            tags: Optional list of tag IDs.
+            correspondent: Optional correspondent ID.
+
+        Returns:
+            The newly created, already-terminal Job instance.
+
+        """
+        job_id = str(uuid.uuid4())
+        with self._conn:
+            self._conn.execute(
+                _INSERT,
+                (
+                    job_id,
+                    profile,
+                    title,
+                    JobState.ERROR.value,
+                    error,
+                    ErrorCategory.REJECTED.value,
+                    json.dumps(tags or []),
+                    correspondent,
+                    None,  # thumbnail -- a refused submit never scanned
+                    datetime.now(tz=UTC).isoformat(),
+                    # Nothing ran, so nothing was recorded: every result column
+                    # is NULL ("never recorded"), never a measured zero.
+                    None,  # outcome
+                    None,  # pages_scanned
+                    None,  # pages_removed
+                    None,  # pages_uploaded
+                    None,  # warning
+                    None,  # owner_token
+                ),
+            )
+            # Read back inside the same transaction, as create_job does, so the
+            # row mapping stays in _row_to_job alone.
+            row = self._conn.execute(_SELECT_BY_ID, (job_id,)).fetchone()
+        job = self._row_to_job(row)
+        logger.debug("Created rejected job %s: %s", job.id, job.title)
+        return job
+
+    @_locked
     def get_job(self, job_id: str) -> Job | None:
         """
         Fetch a job by ID.
