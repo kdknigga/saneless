@@ -33,9 +33,9 @@ saneless [--config PATH] [-v] scan --title TEXT [--profile NAME]
 | 0 | Scan and upload completed successfully |
 | 1 | Scan error (scanner unavailable, feeder jam, manual duplex aborted at the flip prompt or flip wait timed out, etc.) |
 | 2 | Configuration or profile error (unknown profile, invalid config, or a manual duplex profile run without an interactive terminal) |
-
-For a profile with `duplex = "manual"`, `scan` pauses between the two passes and asks `Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:`. Yes (the default) scans the back sides; no, Ctrl-C or end of input aborts the scan. When stdin is not a terminal, `scan` refuses the profile with exit code 2 before any page is fed. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
 | 3 | Paperless-ngx upload error (unreachable, auth failure, etc.) |
+
+For a profile with `duplex = "manual"`, `scan` pauses between the two passes and asks `Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:`. Yes (the default) scans the back sides; no, Ctrl-C or end of input aborts the scan. An error reading the terminal at the prompt also aborts the scan at once, and the error is logged as `Flip prompt failed; treating it as an abort` with its traceback. When stdin is not a terminal, `scan` refuses the profile with exit code 2 before any page is fed. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
 
 ---
 

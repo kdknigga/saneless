@@ -41,7 +41,7 @@ The status area below the form updates as the scan progresses through these stag
 
 A thumbnail of the first scanned page appears once the first page is acquired.
 
-If your profile uses manual duplex scanning, a flip prompt appears after the front sides are scanned. Keep the pages in the same order, flip the whole stack over the long edge, load it back into the feeder, and click **Continue** to scan the back sides. The prompt disappears as soon as the back sides start scanning. To stop instead, click **Abort scan**: the back sides are not scanned and nothing is uploaded. If nobody answers the prompt within `flip_timeout_seconds` (10 minutes by default), the scan fails the same way. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
+If your profile uses manual duplex scanning, a flip prompt appears after the front sides are scanned. Keep the pages in the same order, flip the whole stack over the long edge, load it back into the feeder, and click **Continue** to scan the back sides. As soon as the click is received, the prompt is replaced by a short confirmation, and the status moves on once the back sides start scanning. To stop instead, click **Abort scan**: the back sides are not scanned and nothing is uploaded. If nobody answers the prompt within `flip_timeout_seconds` (10 minutes by default), the scan fails the same way. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
 
 If an error occurs, the status area displays the error message with details about what went wrong.
 
