@@ -4,9 +4,17 @@
 {# --- Section 1: Scan Form --- #}
 <article>
     <h2>Scan</h2>
+    {# hx-disabled-elt replaces the deleted app script's beforeRequest handler:
+       the button is disabled for the round-trip, so there is no double submit.
+       hx-disinherit is mandatory: the tags/correspondent selects and refresh
+       buttons inside this form issue their own requests and, on htmx 2.0.8, an
+       inherited hx-disabled-elt strips disabled from a server-disabled button
+       when they finish (C-10 again; fixed only in 2.0.9). #}
     <form hx-post="/api/scan"
           hx-target="#status-area"
-          hx-swap="outerHTML">
+          hx-swap="outerHTML"
+          hx-disabled-elt="#scan-btn"
+          hx-disinherit="hx-disabled-elt">
 
         <label for="profile-select">Profile</label>
         <select name="profile" id="profile-select">
@@ -16,7 +24,7 @@
         </select>
 
         <label for="title-input">Title</label>
-        <input type="text" name="title" id="title-input"
+        <input type="text" name="title" id="title-input" maxlength="{{ title_max_length }}"
                placeholder="Document title (auto-generated if empty)">
 
         <label for="tags-select">
