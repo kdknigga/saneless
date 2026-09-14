@@ -15,6 +15,7 @@ from saneless.config import validate_settings_dirs
 from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
 from saneless.vocabulary import (
+    RESTART_REASON,
     JobState,
     flip_answer_label,
     progress_label,
@@ -71,14 +72,47 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-        """Manage worker lifecycle and job pruning on startup/shutdown."""
+        """
+        Recover, prune and start the worker at startup; stop it at shutdown.
+
+        Startup runs in a fixed order (D-13): validate the directories, fail
+        every job a previous process left active, prune history, and only
+        then start the worker.  Recovery comes before the worker so the
+        worker never sees an orphan as live work, and so a queued job that
+        was lost from memory in a restart can never be picked up and scan
+        whatever paper happens to be in the feeder now.
+
+        A recovery that cannot write does not refuse to start the app.  The
+        worker starts degraded with recovery pending instead, so ``/health``
+        answers a truthful 503 and the worker's first successful store probe
+        runs the recovery.  A prune failure is only logged: history that
+        outlives its retention is harmless, and a service that will not come
+        up over it is not.
+        """
         validate_settings_dirs(settings)
+        try:
+            failed = job_store.fail_active_jobs(RESTART_REASON)
+        except Exception:
+            # logger.exception is an ERROR record with the traceback attached.
+            logger.exception(
+                "Crash recovery could not update the job store; "
+                "starting degraded until it accepts writes"
+            )
+            worker.mark_recovery_pending()
+        else:
+            if failed:
+                logger.warning(
+                    "Marked %d interrupted job(s) as failed at startup", failed
+                )
+        try:
+            job_store.prune(
+                settings.output.history_retention_days,
+                settings.output.history_max_rows,
+            )
+        except Exception:
+            logger.warning("Startup history prune failed", exc_info=True)
         worker.start()
-        job_store.prune(
-            settings.output.history_retention_days,
-            settings.output.history_max_rows,
-        )
-        logger.info("App started, old jobs pruned")
+        logger.info("App started")
         yield
         worker.stop()
         paperless.close()
