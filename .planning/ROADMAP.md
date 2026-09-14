@@ -318,8 +318,8 @@ Plans:
 
 **Gap Wave 2** *(blocked on Gap Wave 1 completion)*
 
-- [ ] 25-11-PLAN.md — CR-01: flip routes acknowledge a claimed answer instead of re-rendering the prompt, Playwright check (gap wave 2)
-- [ ] 25-12-PLAN.md — WR-01/WR-05/IN-04: bounded flip timeout, deprecation warning after logging setup (gap wave 2)
+- [x] 25-11-PLAN.md — CR-01: flip routes acknowledge a claimed answer instead of re-rendering the prompt, Playwright check (gap wave 2)
+- [x] 25-12-PLAN.md — WR-01/WR-05/IN-04: bounded flip timeout, deprecation warning after logging setup (gap wave 2)
 
 **Gap Wave 3** *(blocked on Gap Wave 2 completion)*
 
@@ -452,7 +452,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 22. Job Store Hardening | 6/6 | Complete   | 2026-09-10 |
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
-| 25. Manual Duplex | 11/15 | In Progress|  |
+| 25. Manual Duplex | 13/15 | In Progress|  |
 | 26. Worker and Web Robustness | 0/? | Not started | - |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
