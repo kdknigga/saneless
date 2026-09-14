@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import logging
-import threading
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -21,6 +20,7 @@ from saneless.exceptions import (
 from saneless.paperless import UploadResult
 from saneless.pipeline import (
     FAILED_DIR_WARN_THRESHOLD,
+    FlipCoordinator,
     PipelineEvent,
     PipelineRequest,
     ScanResult,
@@ -33,11 +33,12 @@ from saneless.scanner.base import ScannerBackend
 from saneless.scanner.sane_backend import SaneBackend
 from saneless.vocabulary import (
     ErrorCategory,
+    FlipOutcome,
     JobState,
     ScanOutcome,
     classify_error,
 )
-from tests.conftest import scan_batch
+from tests.conftest import AlwaysContinueFlipCoordinator, scan_batch
 from tests.fake_sane import FakeSaneDev, FakeSaneModule
 
 if TYPE_CHECKING:
@@ -420,6 +421,49 @@ class TestPipelineEmptyPageFilter:
             )
 
 
+class _FixedFlipCoordinator(FlipCoordinator):
+    """
+    A flip coordinator that resolves to one chosen outcome, and records the ask.
+
+    Subclasses the ABC for the same reason as ``AlwaysContinueFlipCoordinator``:
+    a contract change must reach this stub through the type checkers.
+    """
+
+    def __init__(
+        self,
+        outcome: FlipOutcome,
+        events: list[PipelineEvent] | None = None,
+    ) -> None:
+        """
+        Remember the outcome to answer with and the event log to snapshot.
+
+        Args:
+            outcome: What every wait resolves to.
+            events: The status-callback log, snapshotted at each wait so a test
+                can see which events preceded it.
+
+        """
+        self._outcome = outcome
+        self._events = events if events is not None else []
+        self.timeouts: list[float] = []
+        self.events_at_wait: list[PipelineEvent] = []
+
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Record the timeout and the events so far, then answer at once.
+
+        Args:
+            timeout: The bound the pipeline asked for.
+
+        Returns:
+            The outcome this stub was built with.
+
+        """
+        self.timeouts.append(timeout)
+        self.events_at_wait = list(self._events)
+        return self._outcome
+
+
 class TestManualDuplex:
     """Manual duplex pipeline tests."""
 
@@ -442,6 +486,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Test",
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
@@ -477,6 +522,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Mismatch Test",
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
         result = run_pipeline(
@@ -532,7 +578,11 @@ class TestManualDuplex:
             scanner=scanner,
             paperless=mock_paperless,
             settings=default_settings,
-            request=PipelineRequest(profile_name="default", title="Mismatch Fallback"),
+            request=PipelineRequest(
+                profile_name="default",
+                title="Mismatch Fallback",
+                flip_coordinator=AlwaysContinueFlipCoordinator(),
+            ),
         )
 
         assert result.outcome is ScanOutcome.FALLBACK
@@ -567,7 +617,11 @@ class TestManualDuplex:
             scanner=scanner,
             paperless=mock_paperless,
             settings=default_settings,
-            request=PipelineRequest(profile_name="default", title="Half Delivered"),
+            request=PipelineRequest(
+                profile_name="default",
+                title="Half Delivered",
+                flip_coordinator=AlwaysContinueFlipCoordinator(),
+            ),
         )
 
         assert result.outcome is ScanOutcome.FALLBACK
@@ -591,6 +645,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Normal Duplex",
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
@@ -628,6 +683,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Duplex Filter Test",
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
@@ -666,6 +722,7 @@ class TestManualDuplex:
             profile_name="default",
             title="Duplex Thumb Test",
             thumbnail_callback=thumb_results.append,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
         run_pipeline(
@@ -678,32 +735,37 @@ class TestManualDuplex:
         assert len(thumb_results) == 1
         assert len(thumb_results[0]) > 0
 
-    def test_manual_duplex_flip_event_wait(
+    def test_manual_duplex_waits_on_the_coordinator_with_the_configured_timeout(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Pipeline waits on flip_event for manual duplex."""
+        """
+        The flip wait is one bounded call to the coordinator (DPLX-04, DPLX-05).
+
+        ``AWAITING_FLIP`` is announced before the wait and ``SCANNING_REVERSE``
+        only after it, and the timeout handed over is the configured one.
+        """
         default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.flip_timeout_seconds = 42
         default_settings.profiles["default"].source = "ADF Manual Duplex"
 
-        fronts = [_make_content_image()]
-        backs = [_make_content_image()]
-
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
+        scanner.scan_pages.side_effect = [
+            scan_batch([_make_content_image()]),
+            scan_batch([_make_content_image()]),
+        ]
 
-        flip_event = threading.Event()
-        flip_event.set()  # Pre-set so it doesn't block
-
+        events: list[PipelineEvent] = []
+        coordinator = _FixedFlipCoordinator(FlipOutcome.CONTINUED, events)
         request = PipelineRequest(
             profile_name="default",
-            title="Flip Event Test",
-            flip_event=flip_event,
+            title="Coordinator Wait Test",
+            status_callback=events.append,
+            flip_coordinator=coordinator,
         )
 
-        # Should not block since event is pre-set
         run_pipeline(
             scanner=scanner,
             paperless=mock_paperless,
@@ -711,40 +773,72 @@ class TestManualDuplex:
             request=request,
         )
 
-    def test_manual_duplex_abort(
+        assert coordinator.timeouts == [42]
+        assert coordinator.events_at_wait[-1] is PipelineEvent.AWAITING_FLIP
+        assert PipelineEvent.SCANNING_REVERSE not in coordinator.events_at_wait
+        assert PipelineEvent.SCANNING_REVERSE in events
+
+    def test_manual_duplex_abort_at_the_flip_prompt_raises(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Abort event set -> raises ScanError."""
+        """ABORTED fails the run naming the flip prompt, before pass B (D-15)."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF Manual Duplex"
 
-        fronts = [_make_content_image()]
-
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(fronts)
-
-        flip_event = threading.Event()
-        abort_event = threading.Event()
-        flip_event.set()
-        abort_event.set()
+        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
 
         request = PipelineRequest(
             profile_name="default",
             title="Abort Test",
-            flip_event=flip_event,
-            abort_event=abort_event,
+            flip_coordinator=_FixedFlipCoordinator(FlipOutcome.ABORTED),
         )
 
-        with pytest.raises(ScanError, match="cancelled by user"):
+        with pytest.raises(ScanError, match="flip prompt"):
             run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
                 request=request,
             )
+
+        assert scanner.scan_pages.call_count == 1
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_manual_duplex_flip_wait_timeout_raises(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """TIMED_OUT fails the run naming the flip wait and its timeout (DPLX-05)."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.flip_timeout_seconds = 17
+        default_settings.profiles["default"].source = "ADF Manual Duplex"
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Timeout Test",
+            flip_coordinator=_FixedFlipCoordinator(FlipOutcome.TIMED_OUT),
+        )
+
+        with pytest.raises(ScanError, match="flip wait") as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert "17" in str(excinfo.value)
+        assert scanner.scan_pages.call_count == 1
+        mock_paperless.upload_document.assert_not_called()
 
 
 class TestManualDuplexOverTheSharedFake:
@@ -763,7 +857,7 @@ class TestManualDuplexOverTheSharedFake:
     device per pass and drains the feeder to its end, so the stack has to be
     reloaded between them -- which is precisely the physical act manual duplex
     asks the operator to perform.  The pipeline announces that moment with
-    ``AWAITING_FLIP`` *before* it waits on the flip event, so the status
+    ``AWAITING_FLIP`` *before* it asks the flip coordinator, so the status
     callback is the honest place to do the reload: no second device, no thread,
     and the reload happens exactly when the operator's would.
     """
@@ -790,19 +884,16 @@ class TestManualDuplexOverTheSharedFake:
         dev.load_feeder(fronts)
         monkeypatch.setattr(sane_backend_mod, "sane", FakeSaneModule(device=dev))
 
-        flip = threading.Event()
-
         def _reload_the_stack(event: PipelineEvent) -> None:
             """Put the flipped stack back when the pipeline asks for it."""
             if event is PipelineEvent.AWAITING_FLIP:
                 dev.load_feeder(backs)
-                flip.set()
 
         request = PipelineRequest(
             profile_name="default",
             title="Duplex over the shared fake",
             status_callback=_reload_the_stack,
-            flip_event=flip,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
         )
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
@@ -1778,7 +1869,10 @@ class TestDuplexMismatchDelivery:
             paperless=paperless,
             settings=default_settings,
             request=PipelineRequest(
-                profile_name="default", title="Polled Twice", job_id="job-dx-1"
+                profile_name="default",
+                title="Polled Twice",
+                job_id="job-dx-1",
+                flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
 
@@ -1802,7 +1896,10 @@ class TestDuplexMismatchDelivery:
             paperless=paperless,
             settings=default_settings,
             request=PipelineRequest(
-                profile_name="default", title="Timeout Wired", job_id="job-dx-2"
+                profile_name="default",
+                title="Timeout Wired",
+                job_id="job-dx-2",
+                flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
 
@@ -1833,7 +1930,10 @@ class TestDuplexMismatchDelivery:
                 paperless=paperless,
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Fronts Fail", job_id="job-dx-3"
+                    profile_name="default",
+                    title="Fronts Fail",
+                    job_id="job-dx-3",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
                 ),
             )
 
@@ -1859,7 +1959,10 @@ class TestDuplexMismatchDelivery:
                 paperless=paperless,
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Backs Fail", job_id="job-dx-4"
+                    profile_name="default",
+                    title="Backs Fail",
+                    job_id="job-dx-4",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
                 ),
             )
 
@@ -1883,7 +1986,10 @@ class TestDuplexMismatchDelivery:
                 paperless=paperless,
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Distinct Halves", job_id="job-dx-5"
+                    profile_name="default",
+                    title="Distinct Halves",
+                    job_id="job-dx-5",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
                 ),
             )
 
@@ -1911,7 +2017,10 @@ class TestDuplexMismatchDelivery:
                 paperless=paperless,
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Duplex Both Fail", job_id="job-dx-6"
+                    profile_name="default",
+                    title="Duplex Both Fail",
+                    job_id="job-dx-6",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
                 ),
             )
 
@@ -1933,7 +2042,10 @@ class TestDuplexMismatchDelivery:
             paperless=_both_halves_delivered(),
             settings=default_settings,
             request=PipelineRequest(
-                profile_name="default", title="Counts And Warning", job_id="job-dx-7"
+                profile_name="default",
+                title="Counts And Warning",
+                job_id="job-dx-7",
+                flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
 
@@ -1967,7 +2079,10 @@ class TestDuplexMismatchDelivery:
             paperless=paperless,
             settings=default_settings,
             request=PipelineRequest(
-                profile_name="default", title="Half Fallback", job_id="job-dx-8"
+                profile_name="default",
+                title="Half Fallback",
+                job_id="job-dx-8",
+                flip_coordinator=AlwaysContinueFlipCoordinator(),
             ),
         )
 
@@ -2043,7 +2158,10 @@ class TestTheDpiTheDeviceActuallyChose:
                 paperless=_both_halves_delivered(),
                 settings=default_settings,
                 request=PipelineRequest(
-                    profile_name="default", title="Mismatch Dpi", job_id="job-dpi-1"
+                    profile_name="default",
+                    title="Mismatch Dpi",
+                    job_id="job-dpi-1",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
                 ),
             )
 
@@ -2084,7 +2202,11 @@ class TestTheDpiTheDeviceActuallyChose:
                 scanner=scanner,
                 paperless=mock_paperless,
                 settings=default_settings,
-                request=PipelineRequest(profile_name="default", title="Two Dpis"),
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Two Dpis",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
             )
 
         messages = [
