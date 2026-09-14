@@ -264,10 +264,12 @@ class ScanWorker:
         self._job_store.update_state(job.id, JobState.SCANNING)
         self._transition_event.set()
 
-        # Detect manual duplex from profile source
+        # Flip machinery follows profile.duplex alone, the same field
+        # run_pipeline reads to choose the strategy.  source is a pure SANE
+        # value and is never consulted: a second copy of the detection rule
+        # here could drift from the pipeline's and skip the flip wait (C-02).
         profile = self._settings.profiles.get(job.profile)
-        source = profile.source.lower() if profile else ""
-        is_manual_duplex = "manual" in source and "duplex" in source
+        is_manual_duplex = profile is not None and profile.duplex == "manual"
 
         self._flip_coordinator = WorkerFlipCoordinator() if is_manual_duplex else None
 
