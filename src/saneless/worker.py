@@ -20,7 +20,13 @@ from .auto_profiles import (
     write_profiles_to_config,
 )
 from .job import JobResult
-from .pipeline import FlipCoordinator, PipelineEvent, PipelineRequest, run_pipeline
+from .pipeline import (
+    FlipAnswerSlot,
+    FlipCoordinator,
+    PipelineEvent,
+    PipelineRequest,
+    run_pipeline,
+)
 from .vocabulary import (
     ACTIVE_STATES,
     FlipOutcome,
@@ -56,12 +62,14 @@ class WorkerFlipCoordinator(FlipCoordinator):
     during pass A, would otherwise pre-answer a prompt nobody has seen yet and
     abort the wrong job or start pass B on an unflipped stack (CR-01).
     ``FlipCoordinator`` itself is unchanged (D-09): arming is this class's
-    detail, not part of the contract the pipeline waits on.
+    detail, not part of the contract the pipeline waits on, and not part of
+    the shared ``FlipAnswerSlot`` either.
 
-    The answer is written under a lock *before* the event is set, so a waiter
-    that wakes always finds an answer to read -- there is no window in which
-    the event says "resolved" and the slot still says nothing.  That ordering
-    is what makes it race-free by construction rather than by timing.
+    The claim itself -- first answer wins, and a waiter that wakes always finds
+    an answer -- is ``FlipAnswerSlot``'s, shared with the CLI coordinator so a
+    fix to it reaches both (IN-02).  Arming is a one-way latch checked before
+    an offer: once set it is never cleared, so a signal that sees it set may
+    offer, and one that sees it unset is dropped, never deferred.
 
     Args:
         job_id: The id of the job whose flip this coordinator answers.
@@ -71,10 +79,8 @@ class WorkerFlipCoordinator(FlipCoordinator):
     def __init__(self, job_id: str) -> None:
         """Start unarmed and unanswered, bound to ``job_id``."""
         self._job_id = job_id
-        self._lock = threading.Lock()
-        self._event = threading.Event()
-        self._armed = False
-        self._outcome: FlipOutcome | None = None
+        self._slot = FlipAnswerSlot()
+        self._armed = threading.Event()
 
     @property
     def job_id(self) -> str:
@@ -84,19 +90,16 @@ class WorkerFlipCoordinator(FlipCoordinator):
     @property
     def armed(self) -> bool:
         """Whether the flip prompt exists, so a signal can claim the answer."""
-        with self._lock:
-            return self._armed
+        return self._armed.is_set()
 
     @property
     def answer(self) -> FlipOutcome | None:
         """The claimed answer, or ``None`` while the wait is unanswered."""
-        with self._lock:
-            return self._outcome
+        return self._slot.answer
 
     def arm(self) -> None:
         """Open the flip prompt to signals.  Idempotent."""
-        with self._lock:
-            self._armed = True
+        self._armed.set()
 
     def signal_continue(self) -> bool:
         """
@@ -140,19 +143,20 @@ class WorkerFlipCoordinator(FlipCoordinator):
 
         """
         self.arm()
-        # One path for both endings.  If a signal set the event, _resolve finds
-        # that answer already claimed and hands it back; if the wait expired,
+        # One path for both endings.  If a signal answered, settle finds that
+        # answer already claimed and hands it back; if the wait expired,
         # TIMED_OUT is offered and wins unless a signal claimed first after
         # all.  Either way the result is the claimed answer, never a guess.
-        self._event.wait(timeout)
-        return self._resolve(FlipOutcome.TIMED_OUT)
+        self._slot.wait(timeout)
+        return self._slot.settle(FlipOutcome.TIMED_OUT)
 
     def _signal(self, outcome: FlipOutcome) -> bool:
         """
-        Claim the answer for an operator signal, if the prompt is armed and open.
+        Offer an operator signal to the answer slot, if the prompt is armed.
 
-        Unlike ``_resolve``, this honours ``armed``: a signal before the prompt
-        exists, or after an answer, leaves the slot and the event untouched.
+        Unlike the timeout's ``settle``, this honours ``armed``: a signal before
+        the prompt exists is dropped here, and one after an answer is dropped by
+        the slot, leaving the answer untouched either way (CR-01, D-16).
 
         Args:
             outcome: The answer the operator is offering.
@@ -161,39 +165,9 @@ class WorkerFlipCoordinator(FlipCoordinator):
             Whether ``outcome`` became the answer.
 
         """
-        with self._lock:
-            if not self._armed or self._outcome is not None:
-                return False
-            self._outcome = outcome
-        self._event.set()
-        return True
-
-    def _resolve(self, outcome: FlipOutcome) -> FlipOutcome:
-        """
-        Claim the single answer unconditionally, unless one is already claimed.
-
-        Only the timeout uses this path; it ignores ``armed``, which is why the
-        operator signals go through ``_signal`` instead.
-
-        Returning the answer in effect, rather than asserting one exists, is
-        what lets ``wait_for_flip`` narrow ``FlipOutcome | None`` to
-        ``FlipOutcome`` without an ``assert`` -- which ``S101`` bans in
-        ``src/``.
-
-        Args:
-            outcome: The answer this caller is offering.
-
-        Returns:
-            The claimed answer: ``outcome`` if it was first, otherwise the
-            answer that beat it.
-
-        """
-        with self._lock:
-            if self._outcome is None:
-                self._outcome = outcome
-            claimed = self._outcome
-        self._event.set()
-        return claimed
+        if not self._armed.is_set():
+            return False
+        return self._slot.offer(outcome)
 
 
 class ScanWorker:

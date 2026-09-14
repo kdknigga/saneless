@@ -33,7 +33,13 @@ from .exceptions import PaperlessError, ScanError
 from .job import JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
-from .pipeline import FlipCoordinator, PipelineEvent, PipelineRequest, run_pipeline
+from .pipeline import (
+    FlipAnswerSlot,
+    FlipCoordinator,
+    PipelineEvent,
+    PipelineRequest,
+    run_pipeline,
+)
 from .scanner.sane_backend import SaneBackend
 from .vocabulary import FlipOutcome, JobState, progress_label, state_label
 from .web.app import create_app
@@ -74,16 +80,18 @@ class ClickFlipCoordinator(FlipCoordinator):
     The CLI flip coordinator: a terminal prompt with a bounded wait (D-19).
 
     ``click.confirm`` has no timeout of its own, so it runs on a daemon thread
-    while the calling thread waits on an event for at most ``timeout`` seconds.
-    Whichever of the operator's answer or the clock claims the single answer
-    first is the answer -- the same claim-once shape as the web worker's
-    coordinator, so an answer that lands as the wait expires is honoured rather
-    than overwritten.
+    while the calling thread waits for at most ``timeout`` seconds.  Whichever
+    of the operator's answer or the clock claims the single answer first is the
+    answer -- claimed through ``FlipAnswerSlot``, the same slot the web worker's
+    coordinator uses, so an answer that lands as the wait expires is honoured
+    rather than overwritten.
 
     A yes is ``CONTINUED``; a no is ``ABORTED``; and so are EOF at the prompt
     (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
     the calling thread, where Python delivers SIGINT), so giving up at the
-    terminal and clicking Abort in the web UI end the job the same way.
+    terminal and clicking Abort in the web UI end the job the same way.  A
+    prompt that fails unexpectedly -- a lost terminal, undecodable input -- is
+    an abort too, logged with its traceback (WR-08).
 
     Accepted cost, deliberate and not a leak: after a timeout the prompt thread
     is abandoned.  It keeps its read on stdin until the process exits, and its
@@ -96,9 +104,7 @@ class ClickFlipCoordinator(FlipCoordinator):
 
     def __init__(self) -> None:
         """Start unanswered."""
-        self._lock = threading.Lock()
-        self._event = threading.Event()
-        self._outcome: FlipOutcome | None = None
+        self._slot = FlipAnswerSlot()
 
     def wait_for_flip(self, timeout: float) -> FlipOutcome:
         """
@@ -116,51 +122,35 @@ class ClickFlipCoordinator(FlipCoordinator):
         )
         prompt.start()
         try:
-            self._event.wait(timeout)
+            self._slot.wait(timeout)
         except KeyboardInterrupt:
             # Ctrl-C lands here, not in click.confirm: Python handles SIGINT on
             # the main thread, which is this one, parked in the wait.  Offered
             # as ABORTED so it ends the job the way a web Abort does.
-            return self._resolve(FlipOutcome.ABORTED)
-        # One path for both endings.  If the prompt answered, _resolve finds
-        # that answer already claimed and hands it back; if the wait expired,
+            return self._slot.settle(FlipOutcome.ABORTED)
+        # One path for both endings.  If the prompt answered, settle finds that
+        # answer already claimed and hands it back; if the wait expired,
         # TIMED_OUT is offered and wins unless the answer beat it after all.
-        return self._resolve(FlipOutcome.TIMED_OUT)
+        return self._slot.settle(FlipOutcome.TIMED_OUT)
 
     def _prompt(self) -> None:
         """Ask the operator on the prompt thread and claim their answer."""
-        # No bare ``except Exception`` here: anything unexpected leaves the
-        # event unset, and the bounded wait turns that into TIMED_OUT, which is
-        # the right fallback for a prompt that never produced an answer.
         try:
             flipped = click.confirm(_FLIP_PROMPT, default=True)
         except click.Abort:
-            self._resolve(FlipOutcome.ABORTED)
+            self._slot.settle(FlipOutcome.ABORTED)
             return
-        self._resolve(FlipOutcome.CONTINUED if flipped else FlipOutcome.ABORTED)
-
-    def _resolve(self, outcome: FlipOutcome) -> FlipOutcome:
-        """
-        Claim the single answer, unless one is already claimed.
-
-        Returning the answer in effect, rather than asserting one exists, is
-        what narrows ``FlipOutcome | None`` without an ``assert`` -- which
-        ``S101`` bans in ``src/``.
-
-        Args:
-            outcome: The answer this caller is offering.
-
-        Returns:
-            The claimed answer: ``outcome`` if it was first, otherwise the
-            answer that beat it.
-
-        """
-        with self._lock:
-            if self._outcome is None:
-                self._outcome = outcome
-            claimed = self._outcome
-        self._event.set()
-        return claimed
+        except Exception:
+            # WR-08: anything else used to kill this thread silently, leaving
+            # the calling thread waiting out the whole timeout and then
+            # reporting that nobody confirmed the flip, which was false.  The
+            # prompt broke, so the scan stops now: ABORTED rather than a fourth
+            # outcome (D-09), with the real cause in the logged traceback.
+            # Logged before the claim, so the record exists once the wait wakes.
+            logger.exception("Flip prompt failed; treating it as an abort")
+            self._slot.settle(FlipOutcome.ABORTED)
+            return
+        self._slot.settle(FlipOutcome.CONTINUED if flipped else FlipOutcome.ABORTED)
 
 
 def _truncate(value: str, width: int) -> str:
