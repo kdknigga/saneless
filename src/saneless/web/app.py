@@ -15,12 +15,13 @@ from saneless.config import validate_settings_dirs
 from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
 from saneless.vocabulary import (
+    RESTART_REASON,
     JobState,
     flip_answer_label,
     progress_label,
     state_label,
 )
-from saneless.worker import ScanWorker
+from saneless.worker import STOP_JOIN_SECONDS, ScanWorker
 
 from .cache import MetadataCache
 from .cross_origin import CrossOriginGuard
@@ -71,16 +72,65 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
-        """Manage worker lifecycle and job pruning on startup/shutdown."""
+        """
+        Recover, prune and start the worker at startup; stop it at shutdown.
+
+        Startup runs in a fixed order (D-13): validate the directories, fail
+        every job a previous process left active, prune history, and only
+        then start the worker.  Recovery comes before the worker so the
+        worker never sees an orphan as live work, and so a queued job that
+        was lost from memory in a restart can never be picked up and scan
+        whatever paper happens to be in the feeder now.
+
+        A recovery that cannot write does not refuse to start the app.  The
+        worker starts degraded with recovery pending instead, so ``/health``
+        answers a truthful 503 and the worker's first successful store probe
+        runs the recovery.  A prune failure is only logged: history that
+        outlives its retention is harmless, and a service that will not come
+        up over it is not.
+
+        Shutdown stops the worker first and closes the Paperless client and
+        the job store only when the worker confirms it stopped (D-09).
+        """
         validate_settings_dirs(settings)
+        try:
+            failed = job_store.fail_active_jobs(RESTART_REASON)
+        except Exception:
+            # logger.exception is an ERROR record with the traceback attached.
+            logger.exception(
+                "Crash recovery could not update the job store; "
+                "starting degraded until it accepts writes"
+            )
+            worker.mark_recovery_pending()
+        else:
+            if failed:
+                logger.warning(
+                    "Marked %d interrupted job(s) as failed at startup", failed
+                )
+        try:
+            job_store.prune(
+                settings.output.history_retention_days,
+                settings.output.history_max_rows,
+            )
+        except Exception:
+            logger.warning("Startup history prune failed", exc_info=True)
         worker.start()
-        job_store.prune(
-            settings.output.history_retention_days,
-            settings.output.history_max_rows,
-        )
-        logger.info("App started, old jobs pruned")
+        logger.info("App started")
         yield
-        worker.stop()
+        # worker.stop() blocks the event loop for at most STOP_JOIN_SECONDS,
+        # during lifespan shutdown, after uvicorn has stopped serving (D-08).
+        if not worker.stop():
+            # D-09: the store closes only after a confirmed stop, so a stuck
+            # thread never hits "Cannot operate on a closed database".  D-07:
+            # the abandoned job is not written here -- that would race its own
+            # final write; the next startup's recovery records it.
+            logger.warning(
+                "Scan worker did not stop within %s s (job %s still running); "
+                "leaving the job store and Paperless client open for process exit",
+                STOP_JOIN_SECONDS,
+                worker.current_job_id,
+            )
+            return
         paperless.close()
         job_store.close()
         logger.info("App shutdown complete")
