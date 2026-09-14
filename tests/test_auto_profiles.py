@@ -396,6 +396,75 @@ class TestIsBareDefault:
 
         assert is_bare_default(settings) is True
 
+    @pytest.mark.parametrize(
+        ("toml_text", "env", "expected"),
+        [
+            pytest.param(
+                '[scanner]\nhost = "scanner.local"\n',
+                {},
+                True,
+                id="toml-without-profiles-section",
+            ),
+            pytest.param(
+                "[profiles.default]\n",
+                {},
+                True,
+                id="empty-default-table",
+            ),
+            pytest.param(None, {}, True, id="env-only-no-file"),
+            pytest.param(
+                None,
+                {"SANELESS_PROFILES__DEFAULT__RESOLUTION": str(DEFAULT_RESOLUTION)},
+                True,
+                id="env-var-set-to-default-value",
+            ),
+            pytest.param(
+                '[profiles.default]\ntitle = ""\n',
+                {},
+                True,
+                id="title-alias-default-value",
+            ),
+            pytest.param(
+                '[profiles.default]\nsource = "Manual Duplex"\n',
+                {},
+                False,
+                id="legacy-manual-duplex-source",
+            ),
+        ],
+    )
+    def test_untouched_default_shapes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        toml_text: str | None,
+        env: dict[str, str],
+        *,
+        expected: bool,
+    ) -> None:
+        """
+        Every untouched shape of the default profile is bare (ROBU-07, WR-04).
+
+        Each shape goes through the real ``load_settings`` path, so the profile
+        is whatever TOML parsing, the nested-env merge and the ``title`` alias
+        actually produce. The legacy ``source = "Manual Duplex"`` default is
+        translated to ``duplex = "manual"`` at load, so it is customised and
+        must not be replaced by generated profiles.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+
+        if toml_text is None:
+            settings = load_settings()
+            assert settings.config_path is None
+        else:
+            config_file = tmp_path / "shape.toml"
+            config_file.write_text(toml_text)
+            settings = load_settings(str(config_file))
+
+        assert is_bare_default(settings) is expected
+
 
 class TestResolveConfigPath:
     """Config path resolution."""
