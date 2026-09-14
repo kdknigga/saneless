@@ -600,21 +600,72 @@ def test_scan_unhealthy_worker_is_503_before_submit(
     _assert_rejected_row(client, error)
 
 
+@pytest.mark.parametrize(
+    ("health", "error"),
+    [
+        (WorkerHealth.DOWN, WORKER_DOWN_JOB_ERROR),
+        (WorkerHealth.DEGRADED, WORKER_DEGRADED_JOB_ERROR),
+    ],
+    ids=["down", "degraded"],
+)
+def test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    health: WorkerHealth,
+    error: str,
+) -> None:
+    """
+    A refused-before-row submit cannot strand a PENDING row (WR-01, D-05, D-06).
+
+    ``finish_job`` failing is the store failing between two statements.  If the
+    refusal were recorded as create-then-finish, the create would already have
+    committed a PENDING row with no REJECTED marker: nothing reconciles it, so
+    the status area would read "Starting scan..." and the Scan button would stay
+    disabled for good.  Recorded in one statement, ``finish_job`` is never on
+    this path, so the row is terminal and history still reloads.
+    """
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    _force_health(monkeypatch, health)
+    store = _job_store(client)
+
+    def failing_finish_job(*_args: object, **_kwargs: object) -> None:
+        msg = "disk I/O error"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(store, "finish_job", failing_finish_job)
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Refused Mid-Write"},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 503
+    assert offered == []
+    assert [job for job in store.list_recent(limit=50) if job.is_active] == []
+    _assert_rejected_row(client, error)
+    assert response.text.strip().endswith(HISTORY_LOADER)
+
+
 def test_scan_degraded_store_failing_is_503_without_a_loader(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A rejection the store cannot record still renders, without a loader (D-05)."""
+    """
+    A rejection the store cannot record still renders, without a loader (D-05).
+
+    The refused-before-row path records the rejection in one statement, so when
+    that statement fails no row exists at all -- never a PENDING row (WR-01).
+    """
     offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
     _force_health(monkeypatch, WorkerHealth.DEGRADED)
     store = _job_store(client)
+    before = store.list_recent(limit=50)
 
-    def failing_create_job(*_args: object, **_kwargs: object) -> Job:
+    def failing_create_rejected_job(*_args: object, **_kwargs: object) -> Job:
         msg = "disk I/O error"
         raise sqlite3.OperationalError(msg)
 
-    monkeypatch.setattr(store, "create_job", failing_create_job)
+    monkeypatch.setattr(store, "create_rejected_job", failing_create_rejected_job)
     with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
         response = client.post(
             "/api/scan",
@@ -624,6 +675,7 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
     _assert_htmx_error(response, RequestRejection.WORKER_DEGRADED, 503)
     assert "/api/jobs/history" not in response.text
     assert offered == []
+    assert store.list_recent(limit=50) == before
     warnings = [
         r
         for r in caplog.records

@@ -25,6 +25,7 @@ from saneless.vocabulary import (
     ACTIVE_STATES,
     QUEUE_FULL_JOB_ERROR,
     TERMINAL_STATES,
+    WORKER_DOWN_JOB_ERROR,
     ScanOutcome,
     job_state_for,
 )
@@ -1629,3 +1630,83 @@ class TestQueryMethods:
 
         with pytest.raises(sqlite3.ProgrammingError):
             store.probe()
+
+
+class TestCreateRejectedJob:
+    """create_rejected_job(): a refused submit recorded in one statement (WR-01)."""
+
+    def test_create_rejected_job_writes_a_terminal_rejected_row(self) -> None:
+        """The row is already ERROR/REJECTED and reads back unchanged (D-05, D-06)."""
+        store = JobStore()
+        try:
+            job = store.create_rejected_job(
+                "default",
+                "Refused",
+                error=WORKER_DOWN_JOB_ERROR,
+                tags=[1, 2],
+                correspondent=7,
+            )
+
+            assert job.state is JobState.ERROR
+            assert job.error == WORKER_DOWN_JOB_ERROR
+            assert job.error_category is ErrorCategory.REJECTED
+            assert job.profile == "default"
+            assert job.title == "Refused"
+            assert job.tags == [1, 2]
+            assert job.correspondent == 7
+            # A refused submit never scanned, so nothing was recorded: NULL,
+            # not a measured zero.
+            assert job.thumbnail is None
+            assert job.outcome is None
+            assert job.warning is None
+            assert job.pages_scanned is None
+            assert job.pages_removed is None
+            assert job.pages_uploaded is None
+            assert not job.is_active
+            assert store.get_job(job.id) == job
+        finally:
+            store.close()
+
+    def test_create_rejected_job_runs_one_insert_and_no_update(self) -> None:
+        """One INSERT and no UPDATE, so no failure can strand a PENDING row (WR-01)."""
+        store = JobStore()
+        traced: list[str] = []
+        try:
+            store._conn.set_trace_callback(traced.append)
+
+            store.create_rejected_job("default", "Refused", error=WORKER_DOWN_JOB_ERROR)
+
+            statements = _row_touching(traced)
+            verbs = [text.split()[0].upper() for text in statements]
+            # Create-then-finish is two transactions; if the second one raises,
+            # the first has already committed a PENDING row with no REJECTED
+            # marker, and nothing ever reconciles it (WR-01, D-06).
+            assert verbs.count("INSERT") == 1, (
+                f"create_rejected_job ran {verbs.count('INSERT')} INSERTs: "
+                f"{'; '.join(statements)}"
+            )
+            assert "UPDATE" not in verbs, (
+                f"create_rejected_job ran an UPDATE: {'; '.join(statements)}"
+            )
+        finally:
+            store._conn.set_trace_callback(None)
+            store.close()
+
+    def test_latest_run_job_skips_a_created_rejected_job(self) -> None:
+        """The status area skips the row while history still lists it (D-05, D-06)."""
+        store = JobStore()
+        try:
+            # Backdated, so the rejected row is strictly newer without sleeping.
+            (done_id,) = _create_in_order(store, 1)
+            store.finish_job(done_id, JobState.DONE)
+            rejected = store.create_rejected_job(
+                "default", "Refused", error=WORKER_DOWN_JOB_ERROR
+            )
+
+            latest = store.latest_run_job()
+
+            assert latest is not None
+            assert latest.id == done_id
+            assert store.list_recent(limit=1)[0].id == rejected.id
+        finally:
+            store.close()
