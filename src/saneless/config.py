@@ -163,8 +163,11 @@ class OutputConfig(BaseModel):
     # A config key, unlike the scan-side module constants
     # (_DEFAULT_PAGE_TIMEOUT_SECONDS, _MAX_ADF_PAGES): this is the only timeout
     # that waits on a human rather than a machine, and ten minutes is a guess
-    # about someone else's household (D-10).
-    flip_timeout_seconds: int = 600
+    # about someone else's household (D-10). Bounded at load (WR-01): zero or a
+    # negative value would fail every manual-duplex job right after pass A, and
+    # a value above threading.TIMEOUT_MAX makes Event.wait raise OverflowError
+    # at the same point. One day is the ceiling -- far beyond any real flip.
+    flip_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
