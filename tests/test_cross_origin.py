@@ -24,8 +24,9 @@ Covers requirement ROBU-10 (decisions D-20, D-21, D-22, D-23).
 from __future__ import annotations
 
 import pytest
-from saneless.web.cross_origin import is_cross_origin_request
 from starlette.datastructures import Headers
+
+from saneless.web.cross_origin import is_cross_origin_request
 
 LAN_HOST = "192.168.1.5:8080"
 LAN_ORIGIN = f"http://{LAN_HOST}"
