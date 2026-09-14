@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from typing import TYPE_CHECKING, Final, Literal
 
 from .auto_profiles import (
@@ -44,6 +45,7 @@ if TYPE_CHECKING:
     from .job import Job, JobStore
     from .paperless import PaperlessClient
     from .scanner.base import ScannerBackend
+    from .vocabulary import ErrorCategory
 
 __all__ = ["STOP_JOIN_SECONDS", "ScanWorker", "WorkerFlipCoordinator"]
 
@@ -63,6 +65,18 @@ _IDLE_TICK_SECONDS: Final = 5.0
 # How many unstarted jobs may wait behind the running one.  Not configurable:
 # a submit beyond it is reported as QUEUE_FULL rather than queued (C-09).
 _QUEUE_DEPTH: Final = 10
+
+# How many loop-level failures in a row -- the loop's own job store writes, or
+# the idle prune, raising -- make the worker degraded (D-10).  A pipeline
+# failure is a job failure and never counts.  Three rides out one transient
+# error without calling the store broken.  Not configurable.
+_DEGRADED_AFTER: Final = 3
+
+# How often an idle worker prunes job history (D-13).  Prune left the per-job
+# path so its failure can never fail a job; hourly keeps a long-running
+# appliance inside history_max_rows.  The startup prune is the lifespan's.  Not
+# configurable.  Read at call time, so tests can shorten it.
+_PRUNE_INTERVAL_SECONDS: Final = 3600.0
 
 
 class WorkerFlipCoordinator(FlipCoordinator):
@@ -222,6 +236,15 @@ class ScanWorker:
         self._flip_coordinator: WorkerFlipCoordinator | None = None
         self._current_job_id: str | None = None
         self._auto_generated = False
+        # Loop-level failures in a row.  Touched only by the worker thread.
+        self._consecutive_loop_failures = 0
+        # When the idle loop last pruned.  Starts now: the startup prune is the
+        # lifespan's (26-09), so the first idle prune is an interval away.
+        self._last_prune = time.monotonic()
+        # Jobs whose failure could not be written even by the loop guard, by
+        # id, with the error text and category the guard tried to record.
+        # Touched only by the worker thread.
+        self._unrecorded_failures: dict[str, tuple[str, ErrorCategory | None]] = {}
 
     def start(self) -> None:
         """Start the worker thread."""
@@ -474,13 +497,20 @@ class ScanWorker:
         Worker loop: process jobs until stop() sets the stop flag.
 
         There is no sentinel.  An idle ``get`` wakes every
-        ``_IDLE_TICK_SECONDS``, and stop()'s queue shutdown wakes it at once
-        with ``queue.ShutDown``.
+        ``_IDLE_TICK_SECONDS`` for housekeeping, and stop()'s queue shutdown
+        wakes it at once with ``queue.ShutDown``.
+
+        Nothing ends the loop but stopping (ROBU-01, C-09).  A pipeline failure
+        is recorded by ``_process_job`` itself; whatever still escapes it is a
+        failure of the loop's own job store writes, which is logged, counted
+        towards degraded (D-10), and answered with one best-effort ERROR write
+        so the row does not sit active until restart (research Pitfall 6).
         """
         while not self._stopping.is_set():
             try:
                 job = self._queue.get(timeout=_IDLE_TICK_SECONDS)
             except queue.Empty:
+                self._idle_housekeeping()
                 continue
             except queue.ShutDown:
                 break
@@ -488,7 +518,83 @@ class ScanWorker:
                 # Dequeued just as stopping began: not started.  Its row stays
                 # PENDING and the next startup's recovery fails it (D-07).
                 break
-            self._process_job(job)
+            try:
+                self._process_job(job)
+            except Exception as exc:
+                logger.exception("Worker loop failed while handling job %s", job.id)
+                self._record_loop_failure()
+                self._best_effort_fail(job, exc)
+            else:
+                # A job whose store writes all landed breaks the run.  It does
+                # not clear degraded: only a successful idle probe does.
+                self._consecutive_loop_failures = 0
+
+    def _failure_record(self, exc: Exception) -> tuple[str, ErrorCategory | None]:
+        """
+        Choose the error text and category a failed job is recorded with.
+
+        Args:
+            exc: What ended the job.
+
+        Returns:
+            ``RESTART_REASON`` with no category while stopping -- shutdown ended
+            the job, not the operator -- otherwise the exception's own text and
+            its classified category.
+
+        """
+        if self._stopping.is_set():
+            return RESTART_REASON, None
+        return str(exc), classify_error(exc)
+
+    def _record_loop_failure(self) -> None:
+        """Count one loop-level failure (D-10)."""
+        self._consecutive_loop_failures += 1
+
+    def _best_effort_fail(self, job: Job, exc: Exception) -> None:
+        """
+        Try once to record ``job`` as failed after a loop-level failure.
+
+        The store just raised, so this may raise too; that is only logged.
+        The failure is remembered instead, for the recovery probe to write once
+        the store accepts writes again (research Pitfall 6).
+
+        Args:
+            job: The job the loop was handling.
+            exc: The loop-level failure.
+
+        """
+        error, category = self._failure_record(exc)
+        try:
+            self._job_store.finish_job(
+                job.id, JobState.ERROR, error=error, error_category=category
+            )
+        except Exception:
+            logger.warning(
+                "Could not record job %s as failed; it stays active until the "
+                "job store recovers",
+                job.id,
+                exc_info=True,
+            )
+            self._unrecorded_failures[job.id] = (error, category)
+
+    def _idle_housekeeping(self) -> None:
+        """
+        Use an idle tick: prune job history when the interval is due (D-13).
+
+        A prune failure is a loop-level failure (D-10), and it can never fail
+        a job: no job is running on an idle tick.
+        """
+        if time.monotonic() - self._last_prune < _PRUNE_INTERVAL_SECONDS:
+            return
+        self._last_prune = time.monotonic()
+        try:
+            self._job_store.prune(
+                self._settings.output.history_retention_days,
+                self._settings.output.history_max_rows,
+            )
+        except Exception:
+            logger.exception("Idle history prune failed")
+            self._record_loop_failure()
 
     def _maybe_auto_generate(self) -> None:
         """Auto-generate profiles from scanner if only bare default exists."""
@@ -528,13 +634,38 @@ class ScanWorker:
 
     def _process_job(self, job: Job) -> None:
         """
-        Execute a single scan job through the pipeline.
+        Execute a single scan job, clearing the live-job state however it ends.
 
         Args:
             job: The Job to process.
 
         """
         self._current_job_id = job.id
+        try:
+            self._scan_job(job)
+        finally:
+            # Cleared on every ending, a loop-level failure included, so a
+            # raise from the SCANNING write cannot leave a stale current job
+            # or flip coordinator behind.  No prune here any more: it runs on
+            # the idle tick, where its failure cannot fail a job (D-13).
+            self._flip_coordinator = None
+            self._current_job_id = None
+
+    def _scan_job(self, job: Job) -> None:
+        """
+        Run one job through the pipeline and record how it ended.
+
+        A pipeline failure is a job failure: it is recorded as ERROR here and
+        this returns normally.  That includes a store write inside a pipeline
+        callback, which reaches here through ``run_pipeline``.  The loop's own
+        store writes -- SCANNING before the pipeline, and the terminal write of
+        either outcome -- sit outside any catch, so their failure escapes to
+        ``_run`` as a loop-level failure (D-10).
+
+        Args:
+            job: The Job to process.
+
+        """
         self._maybe_auto_generate()
         self._job_store.update_state(job.id, JobState.SCANNING)
 
@@ -590,72 +721,63 @@ class ScanWorker:
             self._job_store.update_state(_jid, state)
             persisted_state = state
 
+        request = PipelineRequest(
+            profile_name=job.profile,
+            title=job.title,
+            # The assembled PDF is named from this id, which is what makes two
+            # same-second scans of the same title two files rather than one
+            # overwriting the other.
+            job_id=job.id,
+            tags=job.tags or None,
+            correspondent=job.correspondent,
+            status_callback=_status_cb,
+            thumbnail_callback=_thumbnail_cb,
+            flip_coordinator=coordinator,
+        )
         try:
-            request = PipelineRequest(
-                profile_name=job.profile,
-                title=job.title,
-                # The assembled PDF is named from this id, which is what makes
-                # two same-second scans of the same title two files rather than
-                # one overwriting the other.
-                job_id=job.id,
-                tags=job.tags or None,
-                correspondent=job.correspondent,
-                status_callback=_status_cb,
-                thumbnail_callback=_thumbnail_cb,
-                flip_coordinator=coordinator,
-            )
             result = run_pipeline(
                 self._scanner,
                 self._paperless,
                 self._settings,
                 request,
             )
-            # The terminal state is derived from the outcome the pipeline
-            # returned, never assumed.  The mapping below is a match with
-            # assert_never, so a future third ScanOutcome member fails the type
-            # gate at edit time rather than falling silently into an else.
-            self._job_store.finish_job(
-                job.id,
-                job_state_for(result.outcome),
-                result=JobResult(
-                    outcome=result.outcome,
-                    warning=result.warning,
-                    pages_scanned=result.pages_scanned,
-                    pages_removed=result.pages_removed,
-                    pages_uploaded=result.pages_uploaded,
-                ),
-            )
         except Exception as exc:
+            error, category = self._failure_record(exc)
             # No result argument: outcome, warning and all three page counts
             # stay NULL.  NULL means "never recorded"; 0 would claim a
             # measurement a job that never reached the scanner did not make.
-            if self._stopping.is_set():
-                # Shutdown ended this job, not the operator: stop() answered
-                # its flip wait with Abort.  This is the worker thread's own
-                # final write, so D-07's "no shutdown-time write" -- which is
-                # about the lifespan writing over a running thread -- holds.
-                self._job_store.finish_job(
-                    job.id,
-                    JobState.ERROR,
-                    error=RESTART_REASON,
-                    error_category=None,
-                )
+            # Outside any further catch on purpose: if this write raises, the
+            # job failure could not be recorded, and that is the loop's
+            # failure (D-10).  While stopping this is the worker thread's own
+            # final write, so D-07's "no shutdown-time write" -- which is about
+            # the lifespan writing over a running thread -- holds.
+            self._job_store.finish_job(
+                job.id,
+                JobState.ERROR,
+                error=error,
+                error_category=category,
+            )
+            if category is None:
+                # Only a shutdown records no category: stop() answered the
+                # flip wait with Abort, so the operator did not end this job.
                 logger.info("Job %s ended by shutdown: %s", job.id, exc)
             else:
-                category = classify_error(exc)
-                self._job_store.finish_job(
-                    job.id,
-                    JobState.ERROR,
-                    error=str(exc),
-                    error_category=category,
-                )
                 logger.error(
                     "Job %s failed (%s): %s", job.id, category.value.lower(), exc
                 )
-        finally:
-            self._flip_coordinator = None
-            self._current_job_id = None
-            self._job_store.prune(
-                self._settings.output.history_retention_days,
-                self._settings.output.history_max_rows,
-            )
+            return
+        # The terminal state is derived from the outcome the pipeline returned,
+        # never assumed.  The mapping below is a match with assert_never, so a
+        # future third ScanOutcome member fails the type gate at edit time
+        # rather than falling silently into an else.
+        self._job_store.finish_job(
+            job.id,
+            job_state_for(result.outcome),
+            result=JobResult(
+                outcome=result.outcome,
+                warning=result.warning,
+                pages_scanned=result.pages_scanned,
+                pages_removed=result.pages_removed,
+                pages_uploaded=result.pages_uploaded,
+            ),
+        )
