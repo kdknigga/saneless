@@ -358,6 +358,44 @@ class TestIsBareDefault:
         )
         assert is_bare_default(settings) is False
 
+    def test_manual_duplex_default_not_bare(self) -> None:
+        """
+        A hand-written manual-duplex default is not bare (WR-04).
+
+        Comparing only source, resolution and mode treated it as untouched, so
+        the first web job's auto-generation replaced it in memory with a
+        generated flatbed profile: the operator got one flatbed snapshot and a
+        green DONE instead of a flip prompt.
+        """
+        settings = Settings(profiles={"default": ProfileConfig(duplex="manual")})
+        assert is_bare_default(settings) is False
+
+    def test_feeder_manual_duplex_default_not_bare(self) -> None:
+        """A manual-duplex default naming a feeder is not bare either."""
+        settings = Settings(
+            profiles={"default": ProfileConfig(source="ADF", duplex="manual")},
+        )
+        assert is_bare_default(settings) is False
+
+    def test_default_customised_in_another_field_not_bare(self) -> None:
+        """Any customised field, not a hand-picked subset, makes it not bare."""
+        settings = Settings(profiles={"default": ProfileConfig(paper_size="a4")})
+        assert is_bare_default(settings) is False
+
+    def test_default_values_spelled_out_in_toml_are_bare(self, tmp_path: Path) -> None:
+        """Writing the default values explicitly still counts as untouched."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'source = "Flatbed"\n'
+            f"resolution = {DEFAULT_RESOLUTION}\n"
+            'mode = "color"\n'
+        )
+
+        settings = load_settings(str(config_file))
+
+        assert is_bare_default(settings) is True
+
 
 class TestResolveConfigPath:
     """Config path resolution."""
