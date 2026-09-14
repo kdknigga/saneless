@@ -26,8 +26,8 @@ SQLite job store, and a real background thread.  Every assertion reads the
 because a row in the database is the thing a user's web page and ``saneless
 jobs`` actually render (T-23-38).
 
-**On speed.**  All the cases together sleep for well under a second, using
-only seams that already exist:
+**On speed.**  Apart from the one-second flip timeout below, all the cases
+together sleep for well under a second, using only seams that already exist:
 
 * ``max_retries=1`` makes both exponential-backoff pauses in
   ``upload_document`` unreachable (measured 3.00 s at 3 retries, 1.00 s at 2,
@@ -35,8 +35,9 @@ only seams that already exist:
 * ``paperless_task_timeout`` is 0 for the poll-timeout case, so ``poll_task``'s
   monotonic deadline has already passed when the first poll comes back without
   a terminal status.  See ``_TIMEOUT_BUDGET`` for why it is 0 and not 0.05.
-* ``flip_timeout_seconds`` is 0 for the flip-timeout case, so the flip wait
-  resolves in microseconds.  See ``_FLIP_TIMEOUT_BUDGET``.
+* ``flip_timeout_seconds`` is 1 for the flip-timeout case, the smallest value
+  config accepts, so the flip wait costs one second -- the only wall clock
+  this module spends.  See ``_FLIP_TIMEOUT_BUDGET``.
 * The other cases reach a terminal status, or fall back, on the first
   request, before any sleep, and cost nothing.
 
@@ -125,14 +126,15 @@ _TIMEOUT_BUDGET = 0
 # answer arrives first, so the bound never elapses.
 _PRODUCTION_FLIP_TIMEOUT = 600
 
-# Zero, for the same reasons as _TIMEOUT_BUDGET.  flip_timeout_seconds is typed
-# ``int``, so pydantic rejects a fractional float like 0.05 outright, and
-# assigning one afterwards would be a type lie that ty and pyrefly are right to
-# reject.  Zero costs no wall clock -- ``threading.Event().wait(0)`` was
-# measured at 4 microseconds -- and proves the same property end to end:
-# nothing answered within the bound, so the coordinator resolves TIMED_OUT and
-# the pipeline raises before pass B.
-_FLIP_TIMEOUT_BUDGET = 0
+# One second, the smallest value config accepts.  Zero used to be the zero-cost
+# seam here, but OutputConfig now rejects it (WR-01: a zero wait fails every
+# manual-duplex job right after pass A), and the field is typed ``int``, so a
+# fractional float like 0.05 is rejected too.  This one second is the only wall
+# clock this module spends, and it proves the same property end to end: nothing
+# answered within the bound, so the coordinator resolves TIMED_OUT and the
+# pipeline raises before pass B.  Every terminal wait on a run that waits this
+# out uses ``case.flip_timeout + 2.0``, keeping the 2 s margin on top of it.
+_FLIP_TIMEOUT_BUDGET = 1
 
 _FAILURE_TASK = "e2e-task-failure"
 _PENDING_TASK = "e2e-task-never-finishes"
@@ -687,7 +689,12 @@ class TestFiveOutcomesEndToEnd:
             # signal method delivers to the MAIN thread whichever thread is
             # stuck, so letting this run to the global ceiling would print a
             # traceback for this wait loop rather than for the stuck worker.
-            finished = wait_for_state(store, job.id, TERMINAL_STATES, 2.0)
+            # A run that waits out the flip timeout gets that timeout on top,
+            # so the 2 s margin survives the one-second flip wait (WR-01).
+            budget = 2.0
+            if case.awaits_flip and not case.operator_flips:
+                budget = case.flip_timeout + 2.0
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, budget)
         finally:
             worker.stop()
             paperless.close()
@@ -735,9 +742,12 @@ class TestFlipTimeoutReleasesTheWorker:
             worker.start()
             parked = store.create_job(_PROFILE, "Forgotten Flip")
             worker.submit(parked)
-            # Nothing signals the flip.  The 2 s budget is far below
-            # pytest-timeout's 60 s SIGALRM, which lands on the main thread.
-            timed_out = wait_for_state(store, parked.id, TERMINAL_STATES, 2.0)
+            # Nothing signals the flip.  The flip timeout plus a 2 s margin is
+            # far below pytest-timeout's 60 s SIGALRM, which lands on the main
+            # thread.
+            timed_out = wait_for_state(
+                store, parked.id, TERMINAL_STATES, case.flip_timeout + 2.0
+            )
 
             # The simplex "default" profile, so the follow-up job needs no flip
             # of its own and can only be held up by the worker being stuck.
