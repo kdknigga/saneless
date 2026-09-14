@@ -314,7 +314,9 @@ def _record_refused_submit(job_store: JobStore, form: _ScanForm, *, error: str) 
     return True
 
 
-def _reject_created_job(job_store: JobStore, job_id: str, *, error: str) -> bool:
+def _reject_created_job(
+    worker: ScanWorker, job_store: JobStore, job_id: str, *, error: str
+) -> bool:
     """
     Mark a job row the worker then refused as a REJECTED error (D-05, D-06).
 
@@ -323,14 +325,20 @@ def _reject_created_job(job_store: JobStore, job_id: str, *, error: str) -> bool
     The ``ErrorCategory.REJECTED`` marker is what keeps it out of the status
     area (D-06).
 
+    The row already exists, so a failed write cannot simply be dropped: the
+    row would stay PENDING with no marker, disabling the Scan button until a
+    restart.  It is owed to the worker instead, which records it on its next
+    idle tick (WR-01).
+
     Args:
+        worker: The worker a failed write is owed to.
         job_store: The job store to write to.
         job_id: The row already created for this submit.
         error: The job-row error text for the rejection.
 
     Returns:
         Whether the row was written.  ``False`` means the store refused the
-        write, so the rendered error must not reload Job History.
+        write, so the rendered error must not reload Job History yet.
 
     """
     try:
@@ -342,8 +350,11 @@ def _reject_created_job(job_store: JobStore, job_id: str, *, error: str) -> bool
         )
     except Exception:
         logger.warning(
-            "Could not record the rejected scan in job history", exc_info=True
+            "Could not record the rejected scan in job history; "
+            "the worker will record it",
+            exc_info=True,
         )
+        worker.owe_rejection(job_id, error)
         return False
     return True
 
@@ -426,7 +437,7 @@ def start_scan(
             )
         case _:
             assert_never(result)
-    written = _reject_created_job(state.job_store, job.id, error=error)
+    written = _reject_created_job(state.worker, state.job_store, job.id, error=error)
     raise RequestRejected(rejection, refresh_history=written)
 
 
