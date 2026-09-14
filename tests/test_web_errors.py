@@ -600,6 +600,51 @@ def test_scan_unhealthy_worker_is_503_before_submit(
     _assert_rejected_row(client, error)
 
 
+@pytest.mark.parametrize(
+    ("health", "error"),
+    [
+        (WorkerHealth.DOWN, WORKER_DOWN_JOB_ERROR),
+        (WorkerHealth.DEGRADED, WORKER_DEGRADED_JOB_ERROR),
+    ],
+    ids=["down", "degraded"],
+)
+def test_a_refused_submit_never_leaves_an_active_row_when_the_store_fails(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    health: WorkerHealth,
+    error: str,
+) -> None:
+    """
+    A refused-before-row submit cannot strand a PENDING row (WR-01, D-05, D-06).
+
+    ``finish_job`` failing is the store failing between two statements.  If the
+    refusal were recorded as create-then-finish, the create would already have
+    committed a PENDING row with no REJECTED marker: nothing reconciles it, so
+    the status area would read "Starting scan..." and the Scan button would stay
+    disabled for good.  Recorded in one statement, ``finish_job`` is never on
+    this path, so the row is terminal and history still reloads.
+    """
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    _force_health(monkeypatch, health)
+    store = _job_store(client)
+
+    def failing_finish_job(*_args: object, **_kwargs: object) -> None:
+        msg = "disk I/O error"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(store, "finish_job", failing_finish_job)
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Refused Mid-Write"},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 503
+    assert offered == []
+    assert [job for job in store.list_recent(limit=50) if job.is_active] == []
+    _assert_rejected_row(client, error)
+    assert response.text.strip().endswith(HISTORY_LOADER)
+
+
 def test_scan_degraded_store_failing_is_503_without_a_loader(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
