@@ -85,7 +85,7 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 
 Returns the current or most recent job status. Used by HTMX polling to update the status indicator.
 
-**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`.
+**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`.
 
 ---
 
@@ -129,17 +129,25 @@ Returns the job history table body (most recent 50 jobs).
 
 ### `POST /api/flip/continue`
 
-Signals the worker to continue with pass B (back sides) of a manual duplex scan. Only meaningful when the current job is in `AWAITING_FLIP` state.
+Tells a manual duplex job waiting in `AWAITING_FLIP` that the stack has been flipped, so the worker starts pass B (back sides) and the job moves to `SCANNING_REVERSE`.
 
-**Response:** HTML partial with updated job status.
+**Response:** HTML partial (the status indicator for HTMX swap), for the job the call acted on: the current job, else the most recent one. A call arriving just after the job ended reports that job, not the idle "Ready to scan." state. The endpoint does not wait for pass B to start, so the partial shows whatever state the job has recorded at that moment; the one-second status poll picks up pass B from there.
 
 ---
 
 ### `POST /api/flip/abort`
 
-Signals the worker to abort the current manual duplex scan. Cancels the job when in `AWAITING_FLIP` state.
+Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt. Pass B never starts, nothing is uploaded, and the job ends `ERROR` with `Manual duplex scan aborted at the flip prompt`.
 
-**Response:** HTML partial with updated job status.
+**Response:** HTML partial (the status indicator for HTMX swap), for the job the call acted on: the current job, else the most recent one, exactly as for `/api/flip/continue`.
+
+---
+
+#### How the two flip endpoints interact
+
+- **The first answer is final.** A job waiting at the flip prompt accepts exactly one answer -- Continue, Abort, or the `flip_timeout_seconds` timeout, whichever comes first -- and ignores everything after it. An Abort that arrives after a Continue is dropped: pass B carries on, and the endpoint returns the job's current status rather than an error. The same applies to a Continue after an Abort, and to either call after the wait has timed out.
+- **Call them only while the job is `AWAITING_FLIP`.** When no manual duplex job is running, both endpoints change nothing and still return the status partial. A manual duplex job accepts its answer from the moment it starts, though, so a Continue or Abort sent during pass A is kept and used as soon as the fronts finish -- a Continue sent that early starts pass B without waiting for the stack to be flipped. The web UI cannot do this, because it only shows the buttons during `AWAITING_FLIP`; a direct API caller should poll `/api/jobs/current/status` for that state first.
+- **The controls disappear on their own.** The web UI renders the Continue and Abort scan buttons only while the job is `AWAITING_FLIP`. Once pass B starts the status indicator shows `Scanning reverse sides...` instead, so the buttons are gone before a second click can land on them.
 
 ---
 
