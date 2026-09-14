@@ -9,12 +9,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from saneless import auto_profiles
 from saneless.auto_profiles import (
     generate_profiles,
     is_bare_default,
     pick_closest_resolution,
     pick_preferred_mode,
-    resolve_config_path,
     source_to_slug,
     write_profiles_to_config,
 )
@@ -466,18 +466,17 @@ class TestIsBareDefault:
         assert is_bare_default(settings) is expected
 
 
-class TestResolveConfigPath:
-    """Config path resolution."""
+class TestNoRederivedConfigPath:
+    """Generated profiles are written only to the loaded config file (D-16)."""
 
-    def test_explicit_path(self) -> None:
-        """Explicit path is returned as-is."""
-        result = resolve_config_path(config_path="/explicit/path.toml")
-        assert str(result) == "/explicit/path.toml"
+    def test_the_rederived_write_path_is_gone(self) -> None:
+        """
+        M-04: the re-derived write path no longer exists.
 
-    def test_none_returns_default(self, tmp_path: Path) -> None:
-        """None config_path returns default saneless.toml path."""
-        result = resolve_config_path(config_path=None)
-        assert result.name.endswith(".toml")
+        It ignored ``--config`` and could drop ``./saneless.toml`` into the
+        daemon's working directory; ``Settings.config_path`` replaced it.
+        """
+        assert not hasattr(auto_profiles, "resolve_config_path")
 
 
 class TestGenerateProfiles:

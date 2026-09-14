@@ -25,7 +25,7 @@ from saneless.scanner.base import ScanBatch, ScannerBackend
 from saneless.vocabulary import FlipOutcome
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from saneless.job import Job, JobStore
     from saneless.vocabulary import JobState
@@ -86,6 +86,45 @@ def sample_pil_images() -> list[Image.Image]:
         Image.new("RGB", (200, 200), "red"),
         Image.new("RGB", (150, 150), "blue"),
     ]
+
+
+def _config_file_stamp(path: Path) -> tuple[int, int] | None:
+    """
+    Stamp a config file by modification time and size, or None when absent.
+
+    Only ``stat`` is read, never the contents: in a developer's checkout this
+    file is their real, gitignored configuration.
+
+    Returns:
+        ``(st_mtime_ns, st_size)``, or ``None`` when the file does not exist.
+
+    """
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return None
+    return status.st_mtime_ns, status.st_size
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _suite_leaves_cwd_config_alone() -> Iterator[None]:
+    """
+    Fail the run if the suite creates or changes ``./saneless.toml`` (T-26-32).
+
+    The retired lazy auto-profile generation wrote there from inside a job, and
+    the file is gitignored, so ``git status`` after a run cannot show a stray
+    copy.  The path is fixed when the session starts, before any test changes
+    the working directory.
+
+    Yields:
+        Nothing; the check runs after the last test.
+
+    """
+    path = Path.cwd() / "saneless.toml"
+    before = _config_file_stamp(path)
+    yield
+    if _config_file_stamp(path) != before:
+        pytest.fail(f"the test suite created or modified {path}")
 
 
 @pytest.fixture(autouse=True)

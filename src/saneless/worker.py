@@ -17,9 +17,10 @@ from typing import TYPE_CHECKING, Final, Literal
 from .auto_profiles import (
     generate_profiles,
     is_bare_default,
-    resolve_config_path,
     write_profiles_to_config,
 )
+from .config import config_search_paths
+from .exceptions import ConfigError
 from .job import JobResult
 from .pipeline import (
     FlipAnswerSlot,
@@ -236,7 +237,6 @@ class ScanWorker:
         self._profiles_lock = threading.Lock()
         self._flip_coordinator: WorkerFlipCoordinator | None = None
         self._current_job_id: str | None = None
-        self._auto_generated = False
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
         # When the idle loop last pruned.  Starts now: the startup prune is the
@@ -538,6 +538,117 @@ class ScanWorker:
         with self._profiles_lock:
             self._settings.profiles = replacement
 
+    def _generate_startup_profiles(self) -> None:
+        """
+        Generate profiles from the scanner once, as the thread's first act.
+
+        D-14: this runs on the worker thread before it takes any job, so the
+        server is already answering requests while it works.  A page loaded
+        meanwhile may list only ``default`` until it is reloaded; a job
+        submitted meanwhile waits in the queue and then runs against the
+        generated set.
+
+        D-15: it is tried once per start.  A scanner failure is logged with the
+        real exception class and the bare default is kept; the cause is never
+        guessed.  Restarting saneless, or ``saneless auto-profiles``, retries.
+
+        D-16..D-18: the profiles are written only to ``settings.config_path``,
+        the file these settings were loaded from.  With no loaded file they are
+        used in memory for this run (INFO); when the loaded file cannot be
+        written they are used in memory too (WARNING).  Nothing is ever written
+        to a path worked out afresh here.
+
+        D-19: the swap happens under the profile lock, after re-checking that
+        the set is still the bare default.
+        """
+        with self._profiles_lock:
+            bare = is_bare_default(self._settings)
+        if not bare:
+            return
+        profiles = self._read_generated_profiles()
+        if profiles is None:
+            return
+        self._persist_generated_profiles(profiles)
+        with self._profiles_lock:
+            # Re-checked under the lock: only the exact bare default is ever
+            # replaced.  REPLACE rather than merge -- the one entry being
+            # replaced is the untouched default, and a generated set always
+            # carries its own ``default`` (DPLX-07).  Rebound, never mutated,
+            # so a reader holding the old dict keeps a consistent view.
+            if is_bare_default(self._settings):
+                self._settings.profiles = dict(profiles)
+
+    def _read_generated_profiles(self) -> dict[str, ProfileConfig] | None:
+        """
+        Ask the scanner for its capabilities and build profiles from them.
+
+        Returns:
+            The generated profiles, or ``None`` when no scanner was found or the
+            scanner could not be read -- both logged, with the bare default kept.
+
+        """
+        try:
+            devices = self._scanner.get_devices()
+            if not devices:
+                logger.warning("Auto-profiles: no scanners found, using bare default")
+                return None
+            device_id = self._settings.scanner.device or devices[0].name
+            caps = self._scanner.get_capabilities(device_id)
+            return generate_profiles(caps)
+        except Exception as exc:
+            # D-15: the exception class is named, never interpreted.  The old
+            # message blamed the network for every failure, a parse error
+            # included, and sent operators after faults that were not there.
+            logger.warning(
+                "Auto-profiles: could not read scanner capabilities (%s); keeping "
+                "the bare default profile. Restart saneless or run "
+                "'saneless auto-profiles' to retry",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return None
+
+    def _persist_generated_profiles(self, profiles: dict[str, ProfileConfig]) -> None:
+        """
+        Write generated profiles to the loaded config file, if there is one.
+
+        Failure to write is logged, never raised: the profiles are still used
+        in memory for this run (D-17, D-18).
+
+        Args:
+            profiles: The generated profiles.
+
+        """
+        config_path = self._settings.config_path
+        if config_path is None:
+            logger.info(
+                "Auto-profiles: no config file was loaded, so the generated "
+                "profiles are used for this run only and were not written; pass "
+                "--config or create one of %s to keep them",
+                ", ".join(str(path) for path in config_search_paths()),
+            )
+            return
+        try:
+            written = write_profiles_to_config(config_path, profiles)
+        except (OSError, ConfigError) as exc:
+            # The OSError text goes to the server log for the operator, never
+            # into an HTTP response.
+            logger.warning(
+                "Auto-profiles: could not write %s (%s: %s); the generated "
+                "profiles are used for this run only and will not survive a "
+                "restart",
+                config_path,
+                type(exc).__name__,
+                exc,
+            )
+            return
+        logger.info(
+            "Auto-profiles: wrote %d profile(s) to %s: %s",
+            len(written),
+            config_path,
+            ", ".join(written) or "(none new)",
+        )
+
     def _run(self) -> None:
         """
         Worker loop: process jobs until stop() sets the stop flag.
@@ -551,7 +662,17 @@ class ScanWorker:
         failure of the loop's own job store writes, which is logged, counted
         towards degraded (D-10), and answered with one best-effort ERROR write
         so the row does not sit active until restart (research Pitfall 6).
+
+        Before any job, the thread generates profiles (D-14).  A job submitted
+        meanwhile waits in the queue and then runs against the generated set.
         """
+        try:
+            self._generate_startup_profiles()
+        except Exception:
+            # _generate_startup_profiles catches what it expects itself; this
+            # is the backstop that keeps a surprise from ending the thread
+            # before it has taken a single job (ROBU-01).
+            logger.exception("Auto-profiles: startup generation failed")
         while not self._stopping.is_set():
             try:
                 job = self._queue.get(timeout=_IDLE_TICK_SECONDS)
@@ -695,42 +816,6 @@ class ScanWorker:
         self._degraded.clear()
         logger.info("Scan worker recovered: the job store accepted a write")
 
-    def _maybe_auto_generate(self) -> None:
-        """Auto-generate profiles from scanner if only bare default exists."""
-        if self._auto_generated:
-            return
-        self._auto_generated = True  # Only try once regardless of outcome
-
-        if not is_bare_default(self._settings):
-            return
-
-        try:
-            devices = self._scanner.get_devices()
-            if not devices:
-                logger.warning("Auto-profiles: no scanners found, using bare default")
-                return
-            device_id = self._settings.scanner.device or devices[0].name
-            caps = self._scanner.get_capabilities(device_id)
-            profiles = generate_profiles(caps)
-            config_path = resolve_config_path()
-            written = write_profiles_to_config(config_path, profiles)
-            # Update in-memory settings by rebinding a merged dict under the
-            # profile lock, never by mutating the live one (D-19).
-            with self._profiles_lock:
-                current = dict(self._settings.profiles)
-            self._set_profiles({**current, **profiles})
-            if written:
-                logger.info(
-                    "Auto-generated %d profile(s): %s",
-                    len(written),
-                    ", ".join(written),
-                )
-        except Exception:
-            logger.warning(
-                "Auto-profiles: scanner unreachable, using bare default",
-                exc_info=True,
-            )
-
     def _process_job(self, job: Job) -> None:
         """
         Execute a single scan job, clearing the live-job state however it ends.
@@ -765,7 +850,6 @@ class ScanWorker:
             job: The Job to process.
 
         """
-        self._maybe_auto_generate()
         self._job_store.update_state(job.id, JobState.SCANNING)
 
         # Flip machinery follows profile.duplex alone, the same field
