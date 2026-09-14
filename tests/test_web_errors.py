@@ -21,6 +21,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -62,7 +63,7 @@ from saneless.web.app import create_app
 from saneless.worker import ScanWorker
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     import httpx
 
@@ -193,6 +194,22 @@ def mock_paperless(app: FastAPI) -> object:
 def client(app: FastAPI, mock_paperless: object) -> Iterator[TestClient]:
     """TestClient that handles lifespan enter/exit automatically."""
     _ = mock_paperless  # Ensure paperless is patched before requests
+    with TestClient(app) as tc:
+        yield tc
+
+
+@pytest.fixture
+def fast_tick_client(
+    app: FastAPI, mock_paperless: object, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[TestClient]:
+    """
+    TestClient whose worker takes an idle tick every 20 ms instead of every 5 s.
+
+    The tick is patched before the lifespan starts the worker: patched later,
+    the worker would already sit in its first five-second queue wait.
+    """
+    _ = mock_paperless
+    monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 0.02)
     with TestClient(app) as tc:
         yield tc
 
@@ -683,6 +700,95 @@ def test_scan_degraded_store_failing_is_503_without_a_loader(
     ]
     assert warnings
     assert all(r.exc_info is not None for r in warnings)
+
+
+# How long a rejection owed to the worker may take to land: many fast ticks.
+_OWED_REJECTION_BUDGET = 2.0
+
+_SCAN_BUTTON_TAG = re.compile(r'<button type="submit" id="scan-btn"(?P<attrs>[^>]*)>')
+
+
+def _fail_first_call(original: Callable[..., object]) -> Callable[..., object]:
+    """
+    Wrap a job store write so its first call raises and later calls delegate.
+
+    The parameter widens the bound method's type, so the wrapper may forward
+    arbitrary arguments to it.
+
+    Returns:
+        The wrapper, raising ``sqlite3.OperationalError`` only on call one.
+
+    """
+    calls: list[None] = []
+
+    def wrapper(*args: object, **kwargs: object) -> object:
+        calls.append(None)
+        if len(calls) == 1:
+            msg = "disk I/O error"
+            raise sqlite3.OperationalError(msg)
+        return original(*args, **kwargs)
+
+    return wrapper
+
+
+@pytest.mark.parametrize(
+    ("result", "status", "error"),
+    [
+        (SubmitResult.QUEUE_FULL, 429, QUEUE_FULL_JOB_ERROR),
+        (SubmitResult.DOWN, 503, WORKER_DOWN_JOB_ERROR),
+        (SubmitResult.DEGRADED, 503, WORKER_DEGRADED_JOB_ERROR),
+    ],
+    ids=["queue_full", "down", "degraded"],
+)
+def test_a_refused_submit_whose_rejection_write_fails_is_recorded_by_the_worker(
+    fast_tick_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: SubmitResult,
+    status: int,
+    error: str,
+) -> None:
+    """
+    A post-submit rejection the request could not write still lands (WR-01).
+
+    The row has to exist before ``submit()``, or the worker could dequeue an id
+    with no row (D-05), so a refusal from ``submit()`` needs a second write.
+    When that write fails the row is PENDING with no REJECTED marker (D-06):
+    the status area shows it and the Scan button stays disabled.  The request
+    owes the write to the worker, whose next idle tick records it, so the row
+    reaches ERROR/REJECTED and the button re-enables with no restart.
+
+    Only ``submit`` is patched, so the ``down`` case keeps a live worker thread
+    and proves the owe path.  A truly dead thread never ticks; the next
+    startup's recovery ends that row instead (26-09).
+    """
+    _refuse_submit(fast_tick_client, monkeypatch, result)
+    store = _job_store(fast_tick_client)
+    monkeypatch.setattr(store, "finish_job", _fail_first_call(store.finish_job))
+
+    response = fast_tick_client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Refused Then Owed"},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == status
+    assert "/api/jobs/history" not in response.text
+
+    deadline = time.monotonic() + _OWED_REJECTION_BUDGET
+    newest = store.list_recent(limit=1)
+    while newest[0].state is not JobState.ERROR and time.monotonic() < deadline:
+        time.sleep(0.01)
+        newest = store.list_recent(limit=1)
+    assert newest[0].state is JobState.ERROR, (
+        f"row still {newest[0].state.value} after {_OWED_REJECTION_BUDGET}s"
+    )
+    _assert_rejected_row(fast_tick_client, error)
+    assert store.latest_run_job() is None
+
+    poll = fast_tick_client.get("/api/jobs/current/status").text
+    assert "Ready to scan." in poll
+    button = _SCAN_BUTTON_TAG.search(poll)
+    assert button is not None
+    assert "disabled" not in button.group("attrs")
 
 
 # --- The client half: htmx-config meta and the #status-message slot ----------
