@@ -86,6 +86,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ Tutorial relocated from tutorials/ to getting-started/, refreshed for Python 3.14 — Phase 19
 - ✓ Web UI honours the operator's OS dark-mode preference, with every status colour at WCAG AA in both schemes — Phase 23.1
 - ✓ A TDD RED commit lands with hooks enabled and no suppression, while type errors are still rejected at merge, push and CI — Phase 23.1
+- ✓ Working manual duplex: `duplex` profile field (legacy `source = "Manual Duplex"` translated with a logged warning), source passed to SANE verbatim, one strategy dispatch, a required FlipCoordinator with a bounded timeout for CLI and web, job-scoped flip answers, visible SCANNING_REVERSE (C-01, C-02, M-02, M-07) — Phase 25
 
 ### Active
 
@@ -155,4 +156,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-11 — Phase 23.1 complete: the dark palette engages from the OS preference, and the commit gate is re-staged so TDD RED commits land without suppressions (4/4 plans, verification passed 5/5)*
+*Last updated: 2026-09-14 — Phase 25 complete: manual duplex works end to end with job-scoped flip answers; gap closure fixed CR-01 and every review finding (15/15 plans, re-verification passed 5/5)*
