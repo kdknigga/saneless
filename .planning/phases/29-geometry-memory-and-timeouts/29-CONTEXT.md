@@ -288,8 +288,12 @@ Delivers HARD-01..HARD-05 (review findings M-08, N-02, M-12, M-13, N-04):
 
 ### Claude's Discretion
 The planner may refine these defaults, but should not reverse them without cause.
-- Module and type names (`spool.py`, `PageSink`, `PageRecord`, `SpooledPage`) and whether the
-  sink is a `Protocol` or an ABC.
+- Module and type names (`spool.py`, `PageSink`, `PageRecord`, `SpooledPage`).
+- ~~Whether the sink is a `Protocol` or an ABC~~ — resolved by pattern mapping: **an ABC**. The
+  repo already states the rule in `pipeline.FlipCoordinator`'s docstring (`pipeline.py:127-132`)
+  — `Protocol` describes shapes the project does not own, `ABC` defines seams it implements
+  itself — and the sink is a seam this project implements. Following the existing rule beats
+  amending a docstring that is itself a doc-truth site.
 - ~~PNG compression level~~ — resolved by research: Pillow's default 6 (D-03).
 - ~~`_CANCEL_GRACE_SECONDS`~~ — resolved by research: 10.0. ~~Hand-off primitive~~ — resolved:
   an `Event` plus a slot, prototyped and measured (D-11, D-12).
