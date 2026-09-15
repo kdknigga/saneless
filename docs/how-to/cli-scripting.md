@@ -74,7 +74,7 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 |---|---|---|
 | 0 | Success | Scan completed and uploaded |
 | 1 | Scan or runtime error | Scanner disconnected mid-scan, no pages scanned |
-| 2 | Configuration or profile error | Unknown profile name, missing config file, a manual duplex profile run without an interactive terminal |
+| 2 | Configuration or profile error | Unknown profile name, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal |
 | 3 | Paperless upload error | paperless-ngx unreachable, invalid API token |
 
 !!! warning "Manual duplex profiles cannot be scripted"
@@ -94,6 +94,8 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 ## Scripting examples
 
 ### Basic scan with error handling
+
+`--title` may be omitted, in which case the profile's `title` (else `Scan <date time>`) is used, so a cron entry can rely on a profile title instead of building one.
 
 ```bash
 #!/bin/bash
@@ -152,4 +154,4 @@ If your scanner's capabilities change (e.g., after a firmware update or switchin
 saneless auto-profiles --force
 ```
 
-This overwrites existing auto-generated profiles with fresh profiles based on the scanner's current capabilities. Manually-created profiles are not affected unless they have the same name as an auto-generated one.
+This refreshes the generated keys of profiles marked `auto_generated = true` from the scanner's current capabilities, and keeps their other keys, such as `default_tags` and `title`. Profiles you wrote yourself are never changed, even when one has the same name as a generated profile; it is reported as skipped. See [Auto-generated profiles](configure-scan-profiles.md#auto-generated-profiles).
