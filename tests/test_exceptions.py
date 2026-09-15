@@ -70,3 +70,20 @@ class TestDescribe:
     def test_describe_falls_back_to_the_class_name_with_no_args(self) -> None:
         """An exception raised with no arguments is named by its class (D-08)."""
         assert describe(RuntimeError()) == "RuntimeError"
+
+    def test_describe_collapses_a_multi_line_message_to_one_line(self) -> None:
+        """
+        A message with newlines is described on one line (EXC-02, WR-01).
+
+        Exit 5 exists for text saneless does not control -- pydantic's
+        ``ValidationError`` renders over several lines -- and every wrapped
+        SANE, img2pdf, Pillow or OSError message reaches ``job.error`` and the
+        CLI line through ``describe``.
+        """
+        assert describe(RuntimeError("kaboom\n  second\tline\n")) == (
+            "kaboom second line"
+        )
+
+    def test_describe_falls_back_to_the_class_name_for_whitespace_text(self) -> None:
+        """Text that is only whitespace is as empty as no text at all (D-08)."""
+        assert describe(OSError(" \n ")) == "OSError"

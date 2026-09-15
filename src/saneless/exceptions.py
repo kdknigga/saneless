@@ -82,11 +82,17 @@ def describe(exc: BaseException) -> str:
     line reading "Upload failed: " says nothing.  Falling back to the class
     name keeps the line readable (D-08).
 
+    Others stringify over several lines -- pydantic's ``ValidationError`` and
+    httpx's ``HTTPStatusError`` do -- so the whitespace is collapsed here, once,
+    and every boundary that wraps a message through ``describe`` keeps the CLI
+    line and ``job.error`` to one line (EXC-02, WR-01).
+
     Args:
         exc: The exception to describe.
 
     Returns:
-        ``str(exc)``, or the exception's class name when that is empty.
+        ``str(exc)`` with every run of whitespace collapsed to one space, or
+        the exception's class name when that leaves nothing.
 
     """
-    return str(exc) or type(exc).__name__
+    return " ".join(str(exc).split()) or type(exc).__name__

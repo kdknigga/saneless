@@ -2822,6 +2822,25 @@ class TestExitCodes:
         assert records[0].exc_info is not None
         assert records[0].exc_info[1] is exc
 
+    def test_multi_line_unexpected_message_prints_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An exception whose text spans lines still prints one line (WR-01)."""
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(RuntimeError("kaboom\nsecond line")),
+        )
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: True)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 5
+        assert len(result.stderr.splitlines()) == 1
+        assert result.stderr.startswith(
+            "Unexpected error (RuntimeError): kaboom second line. Full details in "
+        )
+
     def test_unexpected_error_before_logging_exits_5_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
