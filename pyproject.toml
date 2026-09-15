@@ -26,6 +26,7 @@ dependencies = [
     "httpx>=0.28.1",
     "img2pdf>=0.6.3",
     "jinja2>=3.1.6",
+    "pikepdf>=10.5.1",
     "pillow>=12.1.1",
     "pydantic-settings[toml]>=2.13.1",
     "python-multipart>=0.0.22",
@@ -173,5 +174,4 @@ dev = [
     "ty>=0.0.80",
     "mkdocs-material>=9.7.6",
     "pytest-timeout>=2.4.0",
-    "pikepdf>=10.5.1",
 ]
