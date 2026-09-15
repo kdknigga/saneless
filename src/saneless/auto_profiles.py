@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Literal, cast
+import tomllib
+from collections.abc import Mapping, MutableMapping
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Final, Literal, cast
 
 import tomlkit
+from tomlkit.items import InlineTable
 
+from saneless.atomic_write import replace_file_atomically
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
 from saneless.exceptions import ConfigError
 from saneless.scanner.base import SourceKind, classify_source
@@ -22,9 +26,12 @@ from saneless.scanner.base import SourceKind, classify_source
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from tomlkit import TOMLDocument
+
     from saneless.scanner.base import DeviceCapabilities
 
 __all__ = [
+    "ProfileWriteResult",
     "generate_profiles",
     "is_bare_default",
     "pick_closest_resolution",
@@ -456,26 +463,294 @@ def _is_auto_generated(table: object) -> bool:
 _UNPRUNABLE = frozenset({"default"})
 
 
+# The keys a generation writes, and so the keys the tool owns in a profile that
+# carries ``auto_generated = true`` (D-02). ``--force`` overwrites exactly these
+# on the existing table and deletes any of them the fresh generation omits
+# (D-03); every other key -- default_tags, title, thresholds -- is the user's.
+# A hand edit to an owned key is overwritten while the flag is set: to keep it,
+# remove ``auto_generated`` and the profile is never touched again (D-01).
+_OWNED_KEYS: Final = (
+    "source",
+    "resolution",
+    "mode",
+    "auto_source_mode",
+    "duplex",
+    "auto_generated",
+)
+
+# Why an unflagged same-name profile was left alone, and how to hand it back to
+# the tool (D-01). There is deliberately no flag that overrides this.
+_NOT_GENERATED_REASON: Final = (
+    "not created by auto-profiles (no auto_generated = true); "
+    "rename or delete it to regenerate"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileWriteResult:
+    """
+    What one ``write_profiles_to_config`` call did, grouped by action (D-04).
+
+    The CLI and the worker's startup log both print it through ``describe``,
+    so the two front ends share one vocabulary rather than two spellings.
+
+    Attributes:
+        path: The config file the result describes.
+        added: Generated names the file did not have, now written.
+        refreshed: Flagged profiles whose owned keys ``force`` rewrote.
+        skipped_not_generated: Same-name profiles without a truthy
+            ``auto_generated``, never touched, under ``force`` too (D-01).
+        skipped_existing: Flagged profiles left alone because ``force`` was
+            not passed.
+        removed: Flagged profiles the scanner no longer produces, pruned
+            (Phase 24 D-16).
+
+    """
+
+    path: Path
+    added: tuple[str, ...] = ()
+    refreshed: tuple[str, ...] = ()
+    skipped_not_generated: tuple[str, ...] = ()
+    skipped_existing: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
+
+    @property
+    def persisted(self) -> frozenset[str]:
+        """Names whose file table now matches the generated profile."""
+        return frozenset(self.added + self.refreshed)
+
+    def groups(self) -> list[tuple[str, tuple[str, ...]]]:
+        """
+        Pair each non-empty group's line with the names it wrote.
+
+        The second element is the group's names for Added and Refreshed, whose
+        profiles a front end may detail, and empty for every other group.
+
+        Returns:
+            ``(line, written_names)`` in the fixed order Added, Refreshed,
+            Skipped (not auto-generated), Skipped (already exists), Removed.
+
+        """
+        labelled = (
+            ("Added", self.added, "", True),
+            ("Refreshed", self.refreshed, "", True),
+            (
+                "Skipped (not auto-generated)",
+                self.skipped_not_generated,
+                f" -- {_NOT_GENERATED_REASON}",
+                False,
+            ),
+            (
+                "Skipped (already exists; use --force to refresh)",
+                self.skipped_existing,
+                "",
+                False,
+            ),
+            ("Removed (scanner no longer offers it)", self.removed, "", False),
+        )
+        lines: list[tuple[str, tuple[str, ...]]] = []
+        for label, names, suffix, written in labelled:
+            if not names:
+                continue
+            shown = ", ".join(repr(name) for name in names)
+            lines.append((f"{label}: {shown}{suffix}", names if written else ()))
+        return lines
+
+    def describe(self) -> list[str]:
+        """
+        Render the result as one line per non-empty group.
+
+        Returns:
+            The group lines, empty when nothing was added, refreshed, skipped
+            or removed.
+
+        """
+        return [line for line, _ in self.groups()]
+
+
+def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
+    """
+    Build the owned key values a fresh generation writes for ``profile``.
+
+    Insertion order is the file's key order for a new table. Only non-default
+    values of ``auto_source_mode`` and ``duplex`` are included (Phase 25 D-06),
+    so a refreshed table reads the way a freshly generated one does.
+
+    Args:
+        profile: A generated profile.
+
+    Returns:
+        The owned keys to write, in file order; always a subset of
+        ``_OWNED_KEYS``.
+
+    """
+    values: dict[str, str | int | bool] = {
+        "source": profile.source,
+        "resolution": profile.resolution,
+        "mode": profile.mode,
+    }
+    if profile.auto_source_mode != "flatbed":
+        values["auto_source_mode"] = profile.auto_source_mode
+    # Written only when non-default, like auto_source_mode. In a generated set
+    # that means "hardware" on a FEEDER_DUPLEX source; see _duplex for why
+    # nothing reads it yet. Omitting "none" cannot let the loader's legacy
+    # translation turn a profile manual on reload: a "none" source classified
+    # as something other than FEEDER_DUPLEX, so its name does not contain
+    # "duplex".
+    if profile.duplex != "none":
+        values["duplex"] = profile.duplex
+    values["auto_generated"] = True
+    return values
+
+
+def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
+    """
+    Parse the config file for a merge, or start an empty document.
+
+    Args:
+        config_path: The config file; it need not exist.
+
+    Returns:
+        The parsed document and the exact text it was parsed from (empty for
+        a file that does not exist yet).
+
+    Raises:
+        ConfigError: The file's bytes are not valid UTF-8.
+
+    """
+    if not config_path.exists():
+        return tomlkit.document(), ""
+    # D-05 / Pitfall 4: bytes decoded as UTF-8 here. Path's text-mode reader
+    # uses the locale encoding and translates CRLF to LF, silently re-encoding
+    # the file and rewriting its line endings on the way back out.
+    try:
+        text = config_path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        msg = f"{config_path} is not valid UTF-8; refusing to rewrite it"
+        raise ConfigError(msg) from None
+    return tomlkit.parse(text), text
+
+
+def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) -> str:
+    """
+    Dump the merged document, keep its line endings, and prove it parses.
+
+    Args:
+        config_path: The config file, for the error message.
+        doc: The merged document.
+        original_text: The text the document was parsed from.
+
+    Returns:
+        The text to write.
+
+    Raises:
+        ConfigError: The dumped text is not valid TOML; nothing was written.
+
+    """
+    new_text = tomlkit.dumps(doc)
+    if "\r\n" in original_text:
+        # tomlkit keeps the CRLF of the lines it parsed but ends the lines it
+        # adds with a bare LF; normalise those so the file stays CRLF (D-05).
+        new_text = re.sub(r"(?<!\r)\n", "\r\n", new_text)
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError:
+        # The guard: whatever shape the operator's file has, and whatever
+        # tomlkit makes of it, text that does not parse never replaces a
+        # working config.
+        msg = (
+            f"Cannot update {config_path}: the merged profiles do not form "
+            "valid TOML; refusing to rewrite it, so the file is left intact"
+        )
+        raise ConfigError(msg) from None
+    return new_text
+
+
+_MergeOutcome = Literal[
+    "added", "refreshed", "skipped_not_generated", "skipped_existing"
+]
+
+
+def _merge_profile(
+    section: MutableMapping[str, object],
+    name: str,
+    profile: ProfileConfig,
+    *,
+    force: bool,
+) -> _MergeOutcome:
+    """
+    Merge one generated profile into the parsed ``[profiles]`` section.
+
+    Args:
+        section: The parsed ``[profiles]`` section, changed in place.
+        name: The generated profile's name.
+        profile: The generated profile.
+        force: Whether a flagged profile's owned keys are refreshed.
+
+    Returns:
+        Which ``ProfileWriteResult`` group ``name`` belongs in.
+
+    """
+    values = _generated_values(profile)
+    existing = section.get(name)
+    if existing is None:
+        # A standard table inside an inline ``profiles = { ... }`` section
+        # dumps as invalid TOML (verified, tomlkit 0.14), so an inline section
+        # gets an inline table. The tomllib guard backs this up.
+        table = (
+            tomlkit.inline_table()
+            if isinstance(section, InlineTable)
+            else tomlkit.table()
+        )
+        for key, value in values.items():
+            table.add(key, value)
+        section[name] = table
+        return "added"
+    if not _is_auto_generated(existing) or not isinstance(existing, MutableMapping):
+        # D-01: not created by the tool (a stray scalar included), so not the
+        # tool's to change. Reported, never overwritten, under force too.
+        return "skipped_not_generated"
+    if not force:
+        return "skipped_existing"
+    # D-02: keys are set on the EXISTING table -- never a fresh table assigned
+    # over it, which would drop default_tags, title and the comments. D-03: an
+    # owned key this generation omits is deleted, so a stale
+    # ``duplex = "hardware"`` does not outlive the source that produced it.
+    owned = cast("MutableMapping[str, object]", existing)
+    for key in _OWNED_KEYS:
+        if key in values:
+            owned[key] = values[key]
+        elif key in owned:
+            del owned[key]
+    return "refreshed"
+
+
 def write_profiles_to_config(
     config_path: Path,
     profiles: dict[str, ProfileConfig],
     *,
     force: bool = False,
-) -> list[str]:
+) -> ProfileWriteResult:
     """
-    Write generated profiles to TOML config file, preserving existing content.
+    Merge generated profiles into a TOML config file, preserving what is there.
 
-    Uses tomlkit for comment-preserving TOML round-tripping. Profiles that
-    already exist in the config are skipped unless force=True.
+    Uses tomlkit for comment-preserving TOML round-tripping. For each
+    generated name:
+
+    * absent from the file: a new table is added;
+    * present without a truthy ``auto_generated``: left byte for byte alone and
+      reported, whether or not ``force`` is passed (D-01);
+    * present and flagged, without ``force``: skipped as already existing;
+    * present and flagged, with ``force``: the owned keys (``_OWNED_KEYS``) are
+      written onto the existing table and any the generation omits are
+      deleted, so every other key and every comment survives (D-02, D-03).
 
     Auto-generated profiles that the freshly generated set no longer names are
     pruned first, so renaming does not strand the profiles it replaced. The
     prune runs whether or not ``force`` is passed, and that is deliberate:
-    ``force`` governs overwriting keys that are *present* in the generated set,
-    while an orphan is by definition absent from it, so ``force`` has nothing
-    to say about it. A profile without a truthy ``auto_generated`` flag is
-    never touched -- CFG-07's literal wording, which keeps this from
-    pre-empting the general merge semantics owned by a later phase.
+    ``force`` governs refreshing profiles that are *present* in the generated
+    set, while an orphan is by definition absent from it, so ``force`` has
+    nothing to say about it.
 
     ``default`` is never pruned either, whatever it is flagged with: it is not
     an ordinary profile but a schema requirement (``_UNPRUNABLE``), and a
@@ -484,17 +759,31 @@ def write_profiles_to_config(
     Args:
         config_path: Path to the TOML config file.
         profiles: Dictionary of profile name to ProfileConfig.
-        force: If True, overwrite existing profiles.
+        force: If True, refresh the owned keys of flagged profiles.
+
+    The rewrite is durable (CFG-08): the file is read as UTF-8 bytes, CRLF
+    line endings are kept, the new text is re-parsed before anything is
+    replaced, and ``replace_file_atomically`` swaps it in through any symlink
+    (D-05, D-07). A merge that changes nothing does not rewrite the file.
+
+    Args:
+        config_path: Path to the TOML config file.
+        profiles: Dictionary of profile name to ProfileConfig.
+        force: If True, refresh the owned keys of flagged profiles.
 
     Returns:
-        List of profile names that were actually written. Pruned profiles are
-        not named here -- they were removed, not written.
+        What was added, refreshed, skipped and removed, with ``path`` the real
+        file (the symlink's target when ``config_path`` is a link).
+
+    Raises:
+        ConfigError: ``[profiles]`` in the file is not a table, the file is not
+            valid UTF-8, the merged text does not parse as TOML, or the file is
+            bind-mounted as a single file (EBUSY) and cannot be replaced.
+        OSError: Any other failure to read or replace the file, including
+            ``PermissionError`` for a file this process may not write.
 
     """
-    if config_path.exists():
-        doc = tomlkit.parse(config_path.read_text())
-    else:
-        doc = tomlkit.document()
+    doc, original_text = _read_config(config_path)
 
     if "profiles" not in doc:
         doc.add("profiles", tomlkit.table(is_super_table=True))
@@ -526,28 +815,33 @@ def write_profiles_to_config(
         )
         del profiles_section[name]
 
-    written: list[str] = []
+    outcomes: dict[_MergeOutcome, list[str]] = {
+        "added": [],
+        "refreshed": [],
+        "skipped_not_generated": [],
+        "skipped_existing": [],
+    }
     for name, profile in profiles.items():
-        if name in profiles_section and not force:
-            continue
-        profile_table = tomlkit.table()
-        profile_table.add("source", profile.source)
-        profile_table.add("resolution", profile.resolution)
-        profile_table.add("mode", profile.mode)
-        if profile.auto_source_mode != "flatbed":
-            profile_table.add("auto_source_mode", profile.auto_source_mode)
-        # Written only when non-default, like auto_source_mode. In a generated
-        # set that means "hardware" on a FEEDER_DUPLEX source; see _duplex for
-        # why nothing reads it yet. Omitting "none" cannot let the loader's
-        # legacy translation turn a profile manual on reload: a "none" source
-        # classified as something other than FEEDER_DUPLEX, so its name does
-        # not contain "duplex".
-        if profile.duplex != "none":
-            profile_table.add("duplex", profile.duplex)
-        auto_generated_flag = True
-        profile_table.add("auto_generated", auto_generated_flag)
-        profiles_section[name] = profile_table
-        written.append(name)
+        outcome = _merge_profile(profiles_section, name, profile, force=force)
+        outcomes[outcome].append(name)
 
-    config_path.write_text(tomlkit.dumps(doc))
-    return written
+    if not (outcomes["added"] or outcomes["refreshed"] or orphans):
+        # Nothing changed, so nothing is replaced -- and a legacy single-file
+        # mount gets no EBUSY error for a run that had nothing to write.
+        target = config_path.resolve()
+    else:
+        new_text = _render_checked(config_path, doc, original_text)
+        target = replace_file_atomically(config_path, new_text)
+        if target != config_path.absolute():
+            # D-07: the operator edits the link, the write lands on the target;
+            # naming both explains which file changed.
+            logger.info("Wrote profiles to %s (symlink to %s)", config_path, target)
+
+    return ProfileWriteResult(
+        path=target,
+        added=tuple(outcomes["added"]),
+        refreshed=tuple(outcomes["refreshed"]),
+        skipped_not_generated=tuple(outcomes["skipped_not_generated"]),
+        skipped_existing=tuple(outcomes["skipped_existing"]),
+        removed=tuple(orphans),
+    )

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 import tempfile
 import threading
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -1304,17 +1307,45 @@ class TestAutoProfiles:
 
         return _AutoScanner
 
-    def test_auto_profiles_generates_profiles(
+    @staticmethod
+    def _group_line(output: str, label: str) -> str:
+        """Return the one output line that starts with ``label``."""
+        lines = [line for line in output.splitlines() if line.startswith(label)]
+        assert len(lines) == 1, output
+        return lines[0]
+
+    @staticmethod
+    def _flatbed_config(config_file: Path, *, flagged: bool) -> str:
+        """Write a config holding a stale ``flatbed`` profile; return its text."""
+        doc = tomlkit.document()
+        profiles_table = tomlkit.table(is_super_table=True)
+        existing = tomlkit.table()
+        existing.add("source", "Old Source")
+        existing.add("resolution", 150)
+        existing.add("mode", "Gray")
+        existing.add("default_tags", [4])
+        if flagged:
+            existing.add("auto_generated", flagged)
+        profiles_table["flatbed"] = existing
+        doc.add("profiles", profiles_table)
+        text = tomlkit.dumps(doc)
+        config_file.write_text(text)
+        return text
+
+    def test_auto_profiles_generates_profiles_grouped(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """auto-profiles generates profiles and prints summary."""
+        """auto-profiles prints the Added group, detail lines and the real path."""
         config_file = tmp_path / "saneless.toml"
         scanner_cls = self._make_auto_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
 
         result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
         assert result.exit_code == 0
-        assert "Generated" in result.output
+        assert f"Profiles in {config_file.resolve()}:" in result.output
+        added = self._group_line(result.output, "Added: ")
+        assert "'flatbed'" in added
+        assert "'adf'" in added
         # Match the whole printed "  <name>: source=..." line, not a bare
         # substring: "flatbed" alone is a substring of the pre-D-14 name too,
         # so a looser assertion would pass before and after the rename.
@@ -1347,6 +1378,9 @@ class TestAutoProfiles:
 
         assert result.exit_code == 0
         assert (tmp_path / "saneless.toml").exists()
+        # Orchestrator resolution 2: the relative default is named absolutely.
+        resolved = (tmp_path / "saneless.toml").resolve()
+        assert f"Profiles in {resolved}:" in result.output
 
     def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """auto-profiles with no scanners exits with code 1."""
@@ -1360,18 +1394,9 @@ class TestAutoProfiles:
     def test_auto_profiles_force_flag(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """auto-profiles --force overwrites existing profiles."""
+        """auto-profiles --force refreshes a flagged profile's generated keys."""
         config_file = tmp_path / "saneless.toml"
-        # Pre-populate config with an existing flatbed profile
-        doc = tomlkit.document()
-        profiles_table = tomlkit.table(is_super_table=True)
-        existing = tomlkit.table()
-        existing.add("source", "Old Source")
-        existing.add("resolution", 150)
-        existing.add("mode", "Gray")
-        profiles_table["flatbed"] = existing
-        doc.add("profiles", profiles_table)
-        config_file.write_text(tomlkit.dumps(doc))
+        self._flatbed_config(config_file, flagged=True)
 
         scanner_cls = self._make_auto_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
@@ -1380,22 +1405,107 @@ class TestAutoProfiles:
             cli, ["--config", str(config_file), "auto-profiles", "--force"]
         )
         assert result.exit_code == 0
-        assert "Generated" in result.output
+        assert self._group_line(result.output, "Refreshed: ") == "Refreshed: 'flatbed'"
         assert "  flatbed: source=Flatbed" in result.output
+        flatbed = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
+        assert flatbed["source"] == "Flatbed"
+        # D-02: a key the tool does not own survives the refresh.
+        assert flatbed["default_tags"] == [4]
+
+    def test_auto_profiles_force_skips_an_unflagged_profile_grouped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-01: --force reports a hand-written profile and leaves it unchanged."""
+        config_file = tmp_path / "saneless.toml"
+        self._flatbed_config(config_file, flagged=False)
+        before = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "auto-profiles", "--force"]
+        )
+        assert result.exit_code == 0
+        line = self._group_line(result.output, "Skipped (not auto-generated): ")
+        assert line.startswith("Skipped (not auto-generated): 'flatbed'")
+        assert "not created by auto-profiles (no auto_generated = true)" in line
+        assert "rename or delete it to regenerate" in line
+        after = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
+        assert after == before
+        assert "  flatbed: source=Flatbed" not in result.output
+
+    def test_auto_profiles_ebusy_exits_2_without_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-08: a single-file bind mount prints the fix and exits 2."""
+        config_file = tmp_path / "saneless.toml"
+        self._flatbed_config(config_file, flagged=True)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        def busy(_self: Path, _target: object) -> Path:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+        monkeypatch.setattr(Path, "replace", busy)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 2
+        assert "Mount its directory instead" in result.output
+        assert isinstance(result.exception, SystemExit)
+        assert "Traceback" not in result.output
+
+    def test_auto_profiles_unwritable_file_exits_2_like_ebusy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A PermissionError from the write is a clean exit 2 naming the path."""
+        config_file = tmp_path / "saneless.toml"
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        def denied(path: Path, _text: str) -> Path:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+
+        monkeypatch.setattr("saneless.auto_profiles.replace_file_atomically", denied)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 2
+        assert str(config_file) in result.output
+        assert isinstance(result.exception, SystemExit)
+
+    def test_auto_profiles_force_in_a_config_directory_mount(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """SC3: --force refreshes a config held in a mounted directory."""
+        config_file = tmp_path / "config" / "config.toml"
+        config_file.parent.mkdir()
+        self._flatbed_config(config_file, flagged=True)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "auto-profiles", "--force"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Refreshed: " in result.output
+        flatbed = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
+        assert flatbed["default_tags"] == [4]
+        assert [path.name for path in config_file.parent.iterdir()] == ["config.toml"]
 
     def test_auto_profiles_no_force_skips_existing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """auto-profiles without --force does not overwrite existing profiles."""
+        """auto-profiles without --force reports flagged profiles as existing."""
         config_file = tmp_path / "saneless.toml"
         # Pre-populate config with ALL profiles that would be generated
         doc = tomlkit.document()
         profiles_table = tomlkit.table(is_super_table=True)
+        flag = True
         for name in ("default", "flatbed", "adf"):
             entry = tomlkit.table()
             entry.add("source", "Existing")
             entry.add("resolution", 150)
             entry.add("mode", "Gray")
+            entry.add("auto_generated", flag)
             profiles_table[name] = entry
         doc.add("profiles", profiles_table)
         config_file.write_text(tomlkit.dumps(doc))
@@ -1405,7 +1515,12 @@ class TestAutoProfiles:
 
         result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
         assert result.exit_code == 0
-        assert "No new profiles written" in result.output
+        line = self._group_line(
+            result.output, "Skipped (already exists; use --force to refresh): "
+        )
+        for name in ("default", "flatbed", "adf"):
+            assert repr(name) in line
+        assert "Added: " not in result.output
 
 
 class TestTruncation:
