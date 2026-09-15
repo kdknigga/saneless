@@ -50,6 +50,10 @@ _EMPTY_BODY = "(empty response body)"
 
 _NO_FAILURE_MESSAGE = "Paperless reported a failure but supplied no message"
 
+_DUPLICATE_HINT = (
+    "the document may already be in Paperless; check before scanning again"
+)
+
 
 def _extract_task(payload: object) -> dict[str, object] | None:
     """
@@ -124,6 +128,63 @@ def _failure_message(task: dict[str, object]) -> str:
             if isinstance(message, str) and message:
                 return message
     return _NO_FAILURE_MESSAGE
+
+
+def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
+    """
+    Say whether a failed task was paperless-ngx refusing a duplicate document.
+
+    The shapes differ by version: API v9 says ``Not consuming: It is a
+    duplicate of document #N``, paperless-ngx 2.x says ``... It is a Duplicate
+    of <title> (#id).``, and API v10 carries only ``result_data`` =
+    ``{"duplicate_of": N, "duplicate_in_trash": bool}`` with no message at all.
+
+    D-10's accepted risk is why this is worth recognising: an upload retried
+    after its response was lost usually makes current paperless-ngx store a
+    silent second copy.  Only with ``CONSUMER_DELETE_DUPLICATES`` is the
+    duplicate reported as a failure, and then the user is told the document
+    may already be there, rather than being left to scan it again.
+
+    Args:
+        task: A task dict whose status is FAILURE or REVOKED.
+        message: The failure text ``_failure_message`` chose for it.
+
+    Returns:
+        True when the text contains "duplicate of" in any case, or
+        ``result_data`` has a ``duplicate_of`` key.
+
+    """
+    if "duplicate of" in message.casefold():
+        return True
+    data = task.get("result_data")
+    return isinstance(data, dict) and "duplicate_of" in data
+
+
+def _one_line_reason(exc: BaseException) -> str:
+    """
+    Describe a failure cause as one line for a ``PaperlessError`` message.
+
+    A CLI or web message must be a single line (EXC-02), but httpx's own text
+    for an ``HTTPStatusError`` is two: ``Server error '503 ...' for url
+    '...'`` followed by ``For more information check: <mdn url>``.  A status
+    error is therefore rendered as its status, reason phrase and the body
+    reduced to one bounded line by ``_render_error_body``; anything else is
+    ``describe`` with its whitespace collapsed.
+
+    Args:
+        exc: The cause.
+
+    Returns:
+        A non-empty single line.
+
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        return (
+            f"{response.status_code} {response.reason_phrase}: "
+            f"{_render_error_body(response)}"
+        )
+    return " ".join(describe(exc).split()) or type(exc).__name__
 
 
 def _first_message(value: object) -> str | None:
@@ -418,7 +479,11 @@ class PaperlessClient:
         if self._consume_dir:
             return self._fall_back_to_consume_dir(pdf_path)
 
-        reason = "no attempt was made" if last_error is None else describe(last_error)
+        reason = (
+            "no attempt was made"
+            if last_error is None
+            else _one_line_reason(last_error)
+        )
         if fast_fail:
             msg = f"Could not reach Paperless at {self._base_url}: {reason}"
         else:
@@ -623,6 +688,13 @@ class PaperlessClient:
         as what it is within a second, not as a timeout several minutes
         later.
 
+        A transport error while polling (a connection refused, a reset, a
+        read timeout, a proxy closing the connection) does *not* end the
+        poll.  The upload has already been accepted, so failing the job now
+        would invite the user to scan the document again and create a
+        duplicate (D-11, M-17).  The error is logged and remembered, and the
+        poll backs off and asks again within the same monotonic deadline.
+
         Args:
             task_id: Task UUID returned from upload.
             timeout: Maximum seconds to wait, measured on a monotonic clock
@@ -633,54 +705,110 @@ class PaperlessClient:
 
         Raises:
             PaperlessError: If the task ends FAILURE or REVOKED, carrying
-                the message paperless-ngx supplied, or if any poll returns a
-                non-200 response, carrying the status code, the reason
-                phrase and the body reduced to one bounded line by
-                ``_render_error_body`` (D-09).
+                the message paperless-ngx supplied (plus a check-before-
+                rescanning hint when it was a duplicate, D-10); if any poll
+                returns a non-200 response, carrying the status code, the
+                reason phrase and the body reduced to one bounded line by
+                ``_render_error_body`` (D-09); or if a 200 body is not JSON,
+                chained to the ValueError (EXC-01).
             PaperlessTimeoutError: If the deadline passes before the task
                 reaches a terminal status. The message names the task id so
-                the task can be looked up in paperless-ngx directly.
+                the task can be looked up in paperless-ngx directly, and,
+                when a transport error was seen, ends by naming the last one
+                and is chained to it.
 
         """
         deadline = time.monotonic() + timeout
         delay = 0.5
+        last_transport_error: httpx.TransportError | None = None
 
         while True:
-            response = self._client.get(
-                "/api/tasks/",
-                params={"task_id": task_id},
-            )
-            if response.status_code != 200:
-                msg = (
-                    f"Paperless task poll failed ({response.status_code} "
-                    f"{response.reason_phrase}): {_render_error_body(response)}"
+            try:
+                response = self._client.get(
+                    "/api/tasks/",
+                    params={"task_id": task_id},
                 )
-                raise PaperlessError(msg)
-
-            task = _extract_task(response.json())
-            if task is not None:
-                status = _task_status(task)
-                if status == "SUCCESS":
-                    logger.info("Task %s completed: %s", task_id, status)
+            except httpx.TransportError as exc:
+                last_transport_error = exc
+                logger.warning(
+                    "Polling task %s failed, retrying until the deadline: %s",
+                    task_id,
+                    describe(exc),
+                )
+            else:
+                task = self._finished_task(task_id, response)
+                if task is not None:
                     return task
-                if status in _TERMINAL_STATUSES:
-                    msg = (
-                        f"Paperless task {task_id} ended {status}: "
-                        f"{_failure_message(task)}"
-                    )
-                    raise PaperlessError(msg)
 
+            # Every path through the loop body reaches this check -- a
+            # transport error included -- so the poll cannot outlive its
+            # deadline (T-28-38).
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.warning("Task %s did not finish within %ss", task_id, timeout)
                 msg = f"Paperless task {task_id} did not finish within {timeout}s"
-                raise PaperlessTimeoutError(msg)
+                if last_transport_error is None:
+                    raise PaperlessTimeoutError(msg)
+                msg = f"{msg}; last error: {_one_line_reason(last_transport_error)}"
+                raise PaperlessTimeoutError(msg) from last_transport_error
 
             # Clamped so the poll never sleeps past its own deadline -- that
             # is what makes a sub-second timeout cost what it says it does
             # rather than the 0.5s first backoff.
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, 30.0)
+
+    def _finished_task(
+        self, task_id: str, response: httpx.Response
+    ) -> dict[str, object] | None:
+        """
+        Read one task poll response.
+
+        Args:
+            task_id: The task being polled, for the messages.
+            response: The response to ``GET /api/tasks/``.
+
+        Returns:
+            The task dict when it reached SUCCESS; None when it is not
+            visible yet or has not reached a terminal status, so the caller
+            keeps polling.
+
+        Raises:
+            PaperlessError: If the response is not a 200, if its body is not
+                JSON, or if the task ended FAILURE or REVOKED.  Every message
+                is one line (EXC-02).
+
+        """
+        if response.status_code != 200:
+            msg = (
+                f"Paperless task poll failed ({response.status_code} "
+                f"{response.reason_phrase}): {_render_error_body(response)}"
+            )
+            raise PaperlessError(msg)
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            msg = (
+                f"Paperless at {self._base_url} returned a task response that is "
+                f"not JSON: {_one_line_reason(exc)}"
+            )
+            raise PaperlessError(msg) from exc
+
+        task = _extract_task(payload)
+        if task is None:
+            return None
+        status = _task_status(task)
+        if status == "SUCCESS":
+            logger.info("Task %s completed: %s", task_id, status)
+            return task
+        if status in _TERMINAL_STATUSES:
+            failure = " ".join(_failure_message(task).split())
+            msg = f"Paperless task {task_id} ended {status}: {failure}"
+            if _is_duplicate_failure(task, failure):
+                msg = f"{msg}; {_DUPLICATE_HINT}"
+            raise PaperlessError(msg)
+        return None
 
     def test_connection(self) -> ConnectionStatus:
         """
