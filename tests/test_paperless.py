@@ -1178,6 +1178,12 @@ _POLL_TRANSPORT_CASES = [
         httpx.RemoteProtocolError("Server disconnected without sending a response."),
         id="remote-protocol-error",
     ),
+    # A RequestError but not a TransportError: a proxy sending a corrupt gzip
+    # body.  It must not escape poll_task raw or fail the accepted upload (WR-05).
+    pytest.param(
+        httpx.DecodingError("Error -3 while decompressing data"),
+        id="decoding-error",
+    ),
 ]
 
 _DUPLICATE_SENTENCE = (
@@ -1233,7 +1239,7 @@ class TestPollTaskFailureTranslation:
 
     @pytest.mark.parametrize("failure", _POLL_TRANSPORT_CASES)
     def test_poll_deadline_after_transport_errors_names_the_last_error(
-        self, failure: httpx.TransportError, sleeps: list[float]
+        self, failure: httpx.RequestError, sleeps: list[float]
     ) -> None:
         """
         D-11 / OUTC-07 / T-28-38: transport errors still end at the deadline.
@@ -1261,6 +1267,33 @@ class TestPollTaskFailureTranslation:
         # a sleep: the error fell through to the backoff, not a bare `continue`.
         assert handler.calls >= 1
         assert len(sleeps) == handler.calls - 1
+
+    def test_poll_continues_through_a_decoding_error_to_success(
+        self, sleeps: list[float]
+    ) -> None:
+        """
+        WR-05: an undecodable poll response is a blip, not a raw httpx escape.
+
+        ``httpx.DecodingError`` is a ``RequestError`` but not a
+        ``TransportError``; the upload was already accepted, so the poll keeps
+        asking within its deadline (D-11).
+        """
+
+        def respond(call: int) -> httpx.Response:
+            if call == 1:
+                msg = "Error -3 while decompressing data"
+                raise httpx.DecodingError(msg)
+            return httpx.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
+
+        handler = _CountingHandler(respond)
+        client = _poll_client(handler)
+        try:
+            result = client.poll_task("t1", timeout=5)
+        finally:
+            client.close()
+        assert result["status"] == "SUCCESS"
+        assert handler.calls == 2
+        assert sleeps == [0.5]
 
     def test_poll_deadline_without_transport_error_has_no_last_error(
         self, sleeps: list[float]
