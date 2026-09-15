@@ -168,8 +168,21 @@ def _expand_user(value: str) -> str:
     Returns:
         The path with ``~`` expanded, or the empty string unchanged.
 
+    Raises:
+        ValueError: ``~user`` names an unknown user, or ``~`` has no home
+            directory to expand to. ``Path.expanduser`` raises RuntimeError,
+            which pydantic would let escape the D-10 renderer; as a
+            ValueError it becomes a validation error naming the section and
+            key (WR-03). The message never repeats the value (D-14).
+
     """
-    return str(Path(value).expanduser()) if value else value
+    if not value:
+        return value
+    try:
+        return str(Path(value).expanduser())
+    except RuntimeError:
+        msg = "cannot expand '~': unknown user or home directory"
+        raise ValueError(msg) from None
 
 
 def _is_legacy_manual_duplex_source(source: str) -> bool:
@@ -1096,13 +1109,19 @@ def load_settings(config_path: str | None = None) -> Settings:
         a regular file, else None when no file was found.
 
     Raises:
-        ConfigError: If an explicit path is missing or not a regular file
-            (CFG-02), or if the configuration fails validation (D-10).
+        ConfigError: If an explicit path cannot have its ``~`` expanded, is
+            missing or is not a regular file (CFG-02), or if the configuration
+            fails validation (D-10).
 
     """
     path: Path | None
     if config_path:
-        explicit = Path(config_path).expanduser()
+        try:
+            explicit = Path(config_path).expanduser()
+        except RuntimeError:
+            # ``~nosuchuser/...``, or ``~`` with no home directory (WR-03).
+            msg = f"Cannot expand '~' in --config path: {config_path}"
+            raise ConfigError(msg) from None
         # A directory counts as missing: Docker creates one where a
         # single-file bind mount's source does not exist (CFG-02, M-19).
         if not explicit.is_file():
