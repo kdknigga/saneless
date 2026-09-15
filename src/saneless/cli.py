@@ -34,6 +34,7 @@ from .config import (
     warn_on_legacy_duplex_sources,
 )
 from .exceptions import (
+    ConfigError,
     SanelessError,
     ScanCancelledError,
     StorageError,
@@ -215,8 +216,8 @@ _CLICK_CONTROL_FLOW: tuple[type[Exception], ...] = (
 """click's own control-flow exceptions, which the group guard re-raises untouched.
 
 ``--help`` raises ``Exit``, EOF at a prompt raises ``Abort``, and a usage error
-or ``serve``'s bind failure is a ``ClickException``; click's ``main`` turns each
-into its own output and exit code. Held under a name so the guard's clause is
+is a ``ClickException``; click's ``main`` turns each into its own output and exit
+code. Held under a name so the guard's clause is
 one short, parenthesis-free ``except``: the multi-type spelling ruff formats to
 (PEP 758) does not parse on the older interpreter the pre-commit AST hooks run.
 """
@@ -736,13 +737,16 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     scanner = SaneBackend(host=settings.scanner.host)
     app = create_app(settings, scanner)
 
-    # Check port availability before starting to give a clear error
+    # Check port availability before starting to give a clear error. A port
+    # that cannot be bound is a setup problem -- "can't start, fix your
+    # setup" -- so it is a ConfigError, one line and exit 2 through the guard
+    # (D-07 amendment), not exit 1, which means a scan error.
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         sock.bind((actual_host, actual_port))
     except OSError as e:
-        msg = f"Cannot bind to {actual_host}:{actual_port}: {e}"
-        raise click.ClickException(msg) from e
+        msg = f"Cannot bind to {actual_host}:{actual_port}: {describe(e)}"
+        raise ConfigError(msg) from e
     finally:
         sock.close()
 
@@ -752,14 +756,29 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # detail and must not turn on uvicorn's or httpx's debug output
     # (orchestrator resolution 5). The validated LogLevel Literal lower-cases
     # to a name uvicorn accepts.
-    uvicorn.run(
-        app,
-        host=actual_host,
-        port=actual_port,
-        log_config=None,
-        log_level=settings.output.log_level.lower(),
-        access_log=True,
-    )
+    #
+    # uvicorn exits 3 on a startup failure, which would read as "Paperless
+    # error" in saneless's table; every command shares one table, so a failure
+    # status becomes a ConfigError, exit 2 (D-07 amendment). A clean SystemExit
+    # passes through unchanged. Ctrl-C needs no handling: uvicorn.run swallows
+    # KeyboardInterrupt and returns (measured), so a normal stop exits 0 (D-03).
+    try:
+        uvicorn.run(
+            app,
+            host=actual_host,
+            port=actual_port,
+            log_config=None,
+            log_level=settings.output.log_level.lower(),
+            access_log=True,
+        )
+    except SystemExit as exc:
+        if exc.code is None or exc.code == 0:
+            raise
+        msg = (
+            f"The web server could not start on {actual_host}:{actual_port} "
+            f"(uvicorn exit status {exc.code}); the cause is in the log"
+        )
+        raise ConfigError(msg) from exc
 
 
 def _echo_write_result(
