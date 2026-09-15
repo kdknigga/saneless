@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
@@ -32,8 +33,11 @@ from pydantic_settings import (
 )
 
 from saneless.exceptions import ConfigError
+from saneless.vocabulary import TITLE_MAX_LENGTH
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from pydantic_settings.main import InitSettingsSource
 
 __all__ = [
@@ -46,6 +50,7 @@ __all__ = [
     "Settings",
     "config_search_paths",
     "load_settings",
+    "resolve_job_title",
     "validate_settings_dirs",
     "warn_on_legacy_duplex_sources",
 ]
@@ -126,7 +131,11 @@ class ProfileConfig(BaseModel):
     paper_size: Literal["full", "a3", "a4", "a5", "letter", "legal"] = "full"
     default_tags: list[int] = []
     default_correspondent: int | None = None
-    default_title_template: str = Field(default="", alias="title")
+    # A literal title, not a template: no placeholder vocabulary (D-15). Used
+    # when a scan is submitted with a blank title (resolve_job_title, D-16).
+    # Bounded because the route's Form(max_length=...) only checks the typed
+    # title, so an unbounded profile title would bypass ROBU-08.
+    default_title: str = Field(default="", alias="title", max_length=TITLE_MAX_LENGTH)
     empty_page_mean_threshold: float = 250.0
     empty_page_stddev_threshold: float = 5.0
     enable_empty_page_detection: bool = True
@@ -156,6 +165,33 @@ class ProfileConfig(BaseModel):
             if isinstance(source, str) and _is_legacy_manual_duplex_source(source):
                 return {**data, "duplex": "manual"}
         return data
+
+
+def resolve_job_title(
+    typed: str | None, profile: ProfileConfig | None, *, now: datetime
+) -> str:
+    """
+    Choose a scan job's title by the one rule every front end shares (D-16).
+
+    A typed title that is non-blank after stripping wins; otherwise the
+    profile's ``title``, when it is non-blank; otherwise ``Scan <time>``. The
+    timestamp is rendered in UTC whatever the zone of ``now`` (local time is
+    APPL-12). A chosen title is returned as given, not stripped.
+
+    Args:
+        typed: The title the operator typed, if any.
+        profile: The profile the scan uses, if known.
+        now: An aware timestamp for the fallback title.
+
+    Returns:
+        The title to give the job.
+
+    """
+    if typed is not None and typed.strip():
+        return typed
+    if profile is not None and profile.default_title.strip():
+        return profile.default_title
+    return f"Scan {now.astimezone(UTC).strftime('%Y-%m-%d %H:%M')}"
 
 
 class OutputConfig(BaseModel):

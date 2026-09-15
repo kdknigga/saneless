@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, assert_never
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import JSONResponse
 
+from saneless.config import resolve_job_title
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
@@ -394,7 +395,8 @@ def start_scan(
     Args:
         request: The incoming HTTP request.
         profile: Scan profile name.
-        title: Document title (auto-generated if empty).
+        title: Document title; when blank, the profile's title, else
+            'Scan <time>' (D-16).
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
 
@@ -403,10 +405,12 @@ def start_scan(
 
     """
     state = request.app.state
-    if not state.worker.has_profile(profile):
+    # One locked lookup both validates the profile and yields its title, so
+    # there is no check-then-read gap for a profile rewrite to fall into.
+    found = state.worker.get_profile(profile)
+    if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
-    if not title:
-        title = f"Scan {datetime.now(tz=UTC).strftime('%Y-%m-%d %H:%M')}"
+    title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
     form = _ScanForm(
         profile=profile, title=title, tags=tags, correspondent=correspondent
     )
