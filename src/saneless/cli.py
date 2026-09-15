@@ -233,7 +233,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     scanner = SaneBackend(host=settings.scanner.host)
     paperless = PaperlessClient(
         settings.paperless.url,
-        settings.paperless.token,
+        settings.paperless.token.get_secret_value(),
         settings.paperless.consume_dir,
     )
 
