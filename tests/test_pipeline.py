@@ -576,6 +576,31 @@ class _FixedFlipCoordinator(FlipCoordinator):
         return self._outcome
 
 
+class TestFlipCoordinatorContract:
+    """The parts of the flip contract a coordinator gets without writing them."""
+
+    def test_abort_cause_defaults_to_none(self) -> None:
+        """
+        A coordinator implementing only ``wait_for_flip`` reports no abort cause.
+
+        ``abort_cause`` is concrete on the ABC, so an ``ABORTED`` answer from a
+        coordinator that never overrides it is always an operator's abort -- a
+        cancel -- and existing coordinators need no change (D-02).
+        """
+        coordinator = _FixedFlipCoordinator(FlipOutcome.ABORTED)
+
+        assert coordinator.wait_for_flip(0) is FlipOutcome.ABORTED
+        assert coordinator.abort_cause is None
+
+    def test_abort_cause_adds_no_fourth_flip_outcome(self) -> None:
+        """The cause travels beside the outcome, never as a new member (D-09)."""
+        assert set(FlipOutcome) == {
+            FlipOutcome.CONTINUED,
+            FlipOutcome.ABORTED,
+            FlipOutcome.TIMED_OUT,
+        }
+
+
 class TestZeroPages:
     """
     An empty batch is reported truthfully at the pipeline boundary (EXC-03, N-06).
