@@ -1375,6 +1375,29 @@ class _GatedScanner(ScannerBackend):
         return scan_batch([_inked_page()])
 
 
+class _JammingGatedScanner(_GatedScanner):
+    """A ``_GatedScanner`` whose held calls jam with a ``ScanError`` once released."""
+
+    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+        """
+        Wait on the gate like ``_GatedScanner``, then fail as a paper jam.
+
+        Args:
+            device_id: Ignored.
+            settings: Ignored.
+
+        Raises:
+            ScanError: Always, after the gate is released.
+
+        """
+        super().scan_pages(device_id, settings)
+        raise ScanError(_JAM_MESSAGE)
+
+
+# The scanner's own text for the jam above, asserted verbatim on the job row.
+_JAM_MESSAGE = "Scanner error on test:device:001: Document feeder jammed"
+
+
 class TestFlipSignalsAreJobScoped:
     """
     A flip answer belongs to one job, and counts only at that job's prompt (CR-01).
@@ -1873,6 +1896,60 @@ class TestWorkerStopAndSubmit:
         assert finished.state is JobState.ERROR
         assert finished.error == message
         assert finished.error_category == classify_error(PaperlessError(message))
+
+    def test_a_pass_a_failure_after_stop_claimed_the_flip_stays_a_failure(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        WR-02, EXC-05: shutdown claiming the flip does not relabel a real failure.
+
+        stop() pre-answers the flip wait while pass A is still scanning, so the
+        coordinator is marked as aborted by shutdown before the pipeline ever
+        reaches the prompt.  Pass A then jams.  The job did not end at the flip,
+        so the row keeps the scanner's text and category, and the failure is
+        logged with its traceback rather than as a restart at INFO.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
+        scanner = _JammingGatedScanner(frozenset({1}))
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Jammed In Pass A")
+            worker.submit(job)
+            assert scanner.entered[1].wait(_PASS_B_GATE_CEILING)
+            worker.stop()
+            coordinator = worker._flip_coordinator
+            assert coordinator is not None
+            assert coordinator.aborted_by_shutdown
+            scanner.gates[1].set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_all()
+            worker._thread.join(_PASS_B_GATE_CEILING + _STATE_BUDGET)
+            store.close()
+
+        assert finished.state is JobState.ERROR
+        assert finished.error is not None
+        assert _JAM_MESSAGE in finished.error
+        assert finished.error != RESTART_REASON
+        assert finished.error_category == classify_error(ScanError(_JAM_MESSAGE))
+        failures = [
+            record.exc_info
+            for record in caplog.records
+            if record.name == "saneless.worker" and record.levelno >= logging.ERROR
+        ]
+        assert len(failures) == 1
+        exc_info = failures[0]
+        assert exc_info is not None
+        assert isinstance(exc_info[1], ScanError)
 
     def test_an_operator_abort_while_stopping_is_not_recorded_as_a_restart(
         self,

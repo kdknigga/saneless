@@ -314,6 +314,34 @@ class WorkerFlipCoordinator(FlipCoordinator):
         return self._slot.offer(outcome)
 
 
+def _ended_by_shutdown(
+    exc: Exception, coordinator: WorkerFlipCoordinator | None
+) -> bool:
+    """
+    Say whether a job ended because shutdown answered its flip wait with Abort.
+
+    ``stop()`` claims the answer as soon as a manual-duplex job is current,
+    including while pass A is still scanning, so the coordinator's marker alone
+    does not mean the job ended there.  Only a ``ScanCancelledError`` -- the
+    pipeline coming back through that aborted flip -- is a shutdown ending.  A
+    jam, an empty feeder or any other pass-A failure raised after the claim
+    stays a failure, with its own text, category and traceback (WR-02, EXC-05).
+
+    Args:
+        exc: What ended the job.
+        coordinator: The job's flip coordinator, if it has one.
+
+    Returns:
+        True only for a cancel whose flip answer shutdown claimed.
+
+    """
+    return (
+        isinstance(exc, ScanCancelledError)
+        and coordinator is not None
+        and coordinator.aborted_by_shutdown
+    )
+
+
 class ScanWorker:
     """
     Background worker that processes scan jobs from a queue.
@@ -949,8 +977,9 @@ class ScanWorker:
 
         Stopping alone is not a cause: a Paperless error, a jam or an
         operator's Abort that happens inside the shutdown join window keeps
-        its own text and category.  Only a flip answer the shutdown itself
-        claimed is recorded as a restart (WR-06, D-15).
+        its own text and category.  Only a job that came back through a flip
+        answer the shutdown itself claimed is recorded as a restart (WR-06,
+        WR-02, D-15).
 
         ``_best_effort_fail`` records a loop-level failure through this.  A
         pipeline exception in ``_scan_job`` does not: that path tells its three
@@ -962,12 +991,12 @@ class ScanWorker:
             coordinator: The job's flip coordinator, if it has one.
 
         Returns:
-            ``RESTART_REASON`` with no category when shutdown claimed the flip
-            answer, otherwise the exception's own text and its classified
+            ``RESTART_REASON`` with no category when the job ended at a flip
+            answer shutdown claimed, otherwise the exception's own text and its classified
             category.
 
         """
-        if coordinator is not None and coordinator.aborted_by_shutdown:
+        if _ended_by_shutdown(exc, coordinator):
             return RESTART_REASON, None
         return str(exc), classify_error(exc)
 
@@ -1333,8 +1362,12 @@ class ScanWorker:
             # Three endings, three branches (D-01).  The shutdown check stays
             # first: stop() answers the flip wait with Abort, and that Abort
             # reaches the pipeline exactly as an operator's does, so it comes
-            # back as ScanCancelledError too (D-02, WR-06).
-            if coordinator is not None and coordinator.aborted_by_shutdown:
+            # back as ScanCancelledError too (D-02, WR-06).  It is a shutdown
+            # only when the job really came back through that aborted flip:
+            # stop() claims the answer while pass A is still scanning, and a
+            # jam or an empty feeder there is a failure with its own text,
+            # category and traceback, not a restart (WR-02, EXC-05).
+            if _ended_by_shutdown(exc, coordinator):
                 self._finish_or_owe(
                     job.id, _OwedWrite(JobState.ERROR, error=RESTART_REASON)
                 )
