@@ -117,6 +117,45 @@ class _OwedWrite:
     category: ErrorCategory | None = None
 
 
+def _profiles_after_persist(
+    loaded: Mapping[str, ProfileConfig],
+    generated: Mapping[str, ProfileConfig],
+    written: list[str] | None,
+) -> dict[str, ProfileConfig]:
+    """
+    Choose the profiles to use in memory, matching what a restart will load.
+
+    ``write_profiles_to_config`` skips a name the file already defines, so a
+    file that spells out a bare ``[profiles.default]`` keeps it.  Swapping the
+    generated ``default`` into memory anyway would give this run one
+    ``default`` and every later run another (WR-03).
+
+    Args:
+        loaded: The bare default profile set the settings were loaded with.
+        generated: The profiles generated from the scanner.
+        written: The names persisted to the config file, or ``None`` when
+            nothing was persisted and the generated set is for this run only.
+
+    Returns:
+        A new dict: the generated set when nothing was persisted, otherwise
+        each generated profile that was written, with the loaded profile kept
+        for every name the file already defined.
+
+    """
+    if written is None:
+        return dict(generated)
+    persisted = set(written)
+    profiles: dict[str, ProfileConfig] = {}
+    for name, profile in generated.items():
+        if name in persisted:
+            profiles[name] = profile
+        elif name in loaded:
+            profiles[name] = loaded[name]
+    for name, profile in loaded.items():
+        profiles.setdefault(name, profile)
+    return profiles
+
+
 class WorkerFlipCoordinator(FlipCoordinator):
     """
     The web flip coordinator: one answer, for one job, claimed once, and final.
@@ -659,23 +698,27 @@ class ScanWorker:
 
         D-19: the swap happens under the profile lock, after re-checking that
         the set is still the bare default.
+
+        WR-03: memory matches what the file will load after a restart.  When
+        the file already defines ``default``, the write keeps it, so the loaded
+        ``default`` is kept in memory too rather than the generated one.
         """
         with self._profiles_lock:
             bare = is_bare_default(self._settings)
+            loaded = self._settings.profiles
         if not bare:
             return
         profiles = self._read_generated_profiles()
         if profiles is None:
             return
-        self._persist_generated_profiles(profiles)
+        written = self._persist_generated_profiles(profiles)
+        replacement = _profiles_after_persist(loaded, profiles, written)
         with self._profiles_lock:
             # Re-checked under the lock: only the exact bare default is ever
-            # replaced.  REPLACE rather than merge -- the one entry being
-            # replaced is the untouched default, and a generated set always
-            # carries its own ``default`` (DPLX-07).  Rebound, never mutated,
-            # so a reader holding the old dict keeps a consistent view.
+            # replaced.  Rebound, never mutated, so a reader holding the old
+            # dict keeps a consistent view.
             if is_bare_default(self._settings):
-                self._settings.profiles = dict(profiles)
+                self._settings.profiles = replacement
 
     def _read_generated_profiles(self) -> dict[str, ProfileConfig] | None:
         """
@@ -707,7 +750,9 @@ class ScanWorker:
             )
             return None
 
-    def _persist_generated_profiles(self, profiles: dict[str, ProfileConfig]) -> None:
+    def _persist_generated_profiles(
+        self, profiles: dict[str, ProfileConfig]
+    ) -> list[str] | None:
         """
         Write generated profiles to the loaded config file, if there is one.
 
@@ -716,6 +761,10 @@ class ScanWorker:
 
         Args:
             profiles: The generated profiles.
+
+        Returns:
+            The names written to the file, or ``None`` when nothing was
+            persisted because no file was loaded or the write failed.
 
         """
         config_path = self._settings.config_path
@@ -726,7 +775,7 @@ class ScanWorker:
                 "--config or create one of %s to keep them",
                 ", ".join(str(path) for path in config_search_paths()),
             )
-            return
+            return None
         try:
             written = write_profiles_to_config(config_path, profiles)
         except (OSError, ConfigError) as exc:
@@ -740,13 +789,14 @@ class ScanWorker:
                 type(exc).__name__,
                 exc,
             )
-            return
+            return None
         logger.info(
             "Auto-profiles: wrote %d profile(s) to %s: %s",
             len(written),
             config_path,
             ", ".join(written) or "(none new)",
         )
+        return written
 
     def _run(self) -> None:
         """
