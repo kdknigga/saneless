@@ -12,7 +12,12 @@ import httpx
 import pytest
 
 from saneless.exceptions import PaperlessError, PaperlessTimeoutError, describe
-from saneless.paperless import PaperlessClient, UploadResult, _render_error_body
+from saneless.paperless import (
+    PaperlessClient,
+    UploadResult,
+    _render_error_body,
+    _without_userinfo,
+)
 from saneless.vocabulary import ConnectionStatus
 
 if TYPE_CHECKING:
@@ -469,6 +474,149 @@ class TestPaperlessUrlValidation:
             PaperlessClient("http://host:abc", "tok-SECRET-5d1", "")
         assert isinstance(exc_info.value.__cause__, httpx.InvalidURL)
         assert "tok-SECRET-5d1" not in str(exc_info.value)
+
+
+_URL_SECRET = "pr0xy-S3CRET"
+
+
+class TestUrlCredentialsNeverShown:
+    """
+    WR-08 / D-08: a ``user:password@`` in paperless.url never reaches a message.
+
+    Messages land in ``job.error`` (rendered in the web status area), on the
+    terminal and in the log, so each surface is checked for the password.
+    """
+
+    def test_unreachable_message_names_the_url_without_its_password(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """The exhausted-retry message shows the host, not the credentials."""
+        handler = _CountingHandler(_raising(httpx.ConnectError("refused")))
+        client = PaperlessClient(
+            url=f"https://scanner:{_URL_SECRET}@paperless.example",
+            token=_MOCK_AUTH,
+            _transport=_make_transport(handler),
+            max_retries=3,
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Behind a proxy")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Upload to Paperless at https://paperless.example failed after "
+            "3 attempts: refused"
+        )
+        assert len(sleeps) == 2
+
+    def test_credentials_are_still_sent_as_basic_auth(self) -> None:
+        """Stripping the userinfo from the URL does not change the request."""
+        seen: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return httpx.Response(200, json={"results": []})
+
+        client = PaperlessClient(
+            url=f"https://scanner:{_URL_SECRET}@paperless.example/sub/",
+            token=_MOCK_AUTH,
+            _transport=_make_transport(handler),
+        )
+        try:
+            client.get_tags()
+        finally:
+            client.close()
+        expected = httpx.BasicAuth("scanner", _URL_SECRET)
+        probe = next(expected.auth_flow(httpx.Request("GET", "https://x/")))
+        assert seen[0].headers["authorization"] == probe.headers["authorization"]
+        assert str(seen[0].url).startswith("https://paperless.example/sub/api/tags/")
+        assert _URL_SECRET not in str(seen[0].url)
+
+    def test_no_log_record_carries_the_password(
+        self, sample_pdf: Path, sleeps: list[float], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Neither saneless's log lines nor httpx's request log name it."""
+        caplog.set_level(logging.DEBUG)
+
+        def respond(call: int) -> httpx.Response:
+            if call == 1:
+                return httpx.Response(503, text="down")
+            return httpx.Response(200, json="task-id")
+
+        client = PaperlessClient(
+            url=f"https://scanner:{_URL_SECRET}@paperless.example",
+            token=_MOCK_AUTH,
+            _transport=_make_transport(_CountingHandler(respond)),
+        )
+        try:
+            client.upload_document(sample_pdf, title="Logged")
+        finally:
+            client.close()
+        assert caplog.records
+        assert all(_URL_SECRET not in record.getMessage() for record in caplog.records)
+        assert sleeps == [1]
+
+    def test_invalid_url_message_strips_the_password(self) -> None:
+        """A URL httpx rejects is shown without its userinfo too."""
+        with pytest.raises(PaperlessError) as exc_info:
+            PaperlessClient(f"http://scanner:{_URL_SECRET}@host:abc", _MOCK_AUTH, "")
+        assert str(exc_info.value) == (
+            "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
+        )
+
+    def test_scheme_less_url_message_strips_the_password(
+        self, sample_pdf: Path, sleeps: list[float], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A URL with no scheme, which httpx cannot parse as userinfo, is cut too."""
+        caplog.set_level(logging.WARNING, logger="saneless.paperless")
+        client = PaperlessClient(
+            url=f"scanner:{_URL_SECRET}@paperless:8000", token=_MOCK_AUTH
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="No scheme")
+        finally:
+            client.close()
+        assert str(exc_info.value).startswith(
+            "Could not reach Paperless at paperless:8000: "
+        )
+        assert all(_URL_SECRET not in message for message in caplog.messages)
+        assert sleeps == []
+
+    @pytest.mark.parametrize(
+        ("url", "shown"),
+        [
+            ("https://u:pw@paperless.example/sub", "https://paperless.example/sub"),
+            ("http://scanner:p@ss/w0rd@host:8000", "http://host:8000"),
+            ("scanner:pw@paperless:8000", "paperless:8000"),
+            ("http://paperless:8000", "http://paperless:8000"),
+            ("", ""),
+        ],
+        ids=["userinfo", "raw-at-and-slash", "no-scheme", "no-userinfo", "empty"],
+    )
+    def test_userinfo_is_cut_through_the_last_at(self, url: str, shown: str) -> None:
+        """No piece of a password holding a raw ``@`` or ``/`` is left behind."""
+        assert _without_userinfo(url) == shown
+
+    def test_redirect_target_is_shown_without_credentials(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """A redirect target carrying userinfo is redacted like the base URL."""
+        target = f"https://scanner:{_URL_SECRET}@paperless.example/api/"
+        handler = _CountingHandler(
+            _answering(httpx.Response(302, headers={"location": target}))
+        )
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Redirected")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Paperless redirected the upload (302 Found) to "
+            "https://paperless.example/api/; check paperless.url"
+        )
+        assert sleeps == []
 
 
 class TestUploadFailureTranslation:
