@@ -419,7 +419,18 @@ Note (added in 23.1, DARK-03 coupling): when ROBU-09 vendors Pico, follow `23.1-
   4. The Paperless token never appears in `repr(settings)`, logs, or error messages, while the loaded config path and the env-sourced keys are logged at INFO on startup
   5. `saneless <subcommand> --help` works with no valid configuration file, and a blank title falls back to the profile's documented `title` key
 
-**Plans**: TBD
+**Plans**: 8 plans
+
+Plans:
+
+- [ ] 27-01-PLAN.md — (wave 1) SecretStr token, validated `log_level`, literal `default_title` + shared `resolve_job_title` wired into the web route
+- [ ] 27-02-PLAN.md — (wave 1) `atomic_write.replace_file_atomically`: same-dir mkstemp, fsync, rename, mode/owner copy, symlink write-through, EBUSY -> ConfigError
+- [ ] 27-03-PLAN.md — (wave 2) nested `extra="forbid"`, loc/msg error renderer with did-you-mean, env attribution, unknown `SANELESS_*` rejection, CFG-02, CFG-11 functions
+- [ ] 27-04-PLAN.md — (wave 2) `auto-profiles --force` merge with `ProfileWriteResult`, UTF-8/CRLF/tomllib-guarded atomic rewrite, EBUSY exit 2 and worker fallback
+- [ ] 27-05-PLAN.md — (wave 2) `./config:/etc/saneless` directory mount in compose and Docker docs, profile how-to merge/title text, static deployment test
+- [ ] 27-06-PLAN.md — (wave 3) lazy memoised CLI settings (`--help` without config), `-v` = saneless DEBUG, CFG-11 startup line, optional `--title`
+- [ ] 27-07-PLAN.md — (wave 3) `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` at call time, `~` expansion, nearest-ancestor writability, conftest XDG hygiene
+- [ ] 27-08-PLAN.md — (wave 3) configuration/env/CLI references, scripting how-to, empty-page tip, search-path lists, TOML example, doc-truth tests
 
 Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship together. `os.replace` over a bind-mounted *file* returns `EBUSY`, so shipping the atomic write alone delivers a durable-write feature that is broken for the documented deployment.
 
