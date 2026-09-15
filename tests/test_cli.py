@@ -1134,9 +1134,9 @@ class TestLazySettingsLoading:
     missing configuration. Click runs the group callback *before* a subcommand
     parses its own ``--help``, and ``ctx.resilient_parsing`` is False there
     (verified against Click 8.3), so the group callback cannot load anything;
-    each command loads on first need instead. M-21: configuring logging sits in
-    the same error handling, so an unexpected failure there is a one-line exit
-    2 too; an unwritable log file is not a failure, it falls back to stderr.
+    each command loads on first need instead. A ConfigError from loading is
+    printed by the group guard as rendered, exit 2; an unwritable log file is
+    not a failure, it falls back to stderr.
     """
 
     @pytest.mark.parametrize("command", _ALL_COMMANDS)

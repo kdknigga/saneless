@@ -13,9 +13,10 @@ import shutil
 import socket
 import sys
 import threading
+import traceback
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, assert_never
 
 import click
 import uvicorn
@@ -32,7 +33,12 @@ from .config import (
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
 )
-from .exceptions import ConfigError, PaperlessError, ScanError
+from .exceptions import (
+    SanelessError,
+    ScanCancelledError,
+    StorageError,
+    describe,
+)
 from .job import JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
@@ -44,7 +50,16 @@ from .pipeline import (
     run_pipeline,
 )
 from .scanner.sane_backend import SaneBackend
-from .vocabulary import FlipOutcome, JobState, progress_label, state_label
+from .vocabulary import (
+    ErrorCategory,
+    ExitCode,
+    FlipOutcome,
+    JobState,
+    classify_error,
+    exit_code_for,
+    progress_label,
+    state_label,
+)
 from .web.app import create_app
 
 if TYPE_CHECKING:
@@ -165,7 +180,201 @@ def _truncate(value: str, width: int) -> str:
     return value[: width - 1] + "\u2026"
 
 
-@click.group()
+_CLICK_CONTROL_FLOW: tuple[type[Exception], ...] = (
+    click.exceptions.Exit,
+    click.exceptions.Abort,
+    click.ClickException,
+)
+"""click's own control-flow exceptions, which the group guard re-raises untouched.
+
+``--help`` raises ``Exit``, EOF at a prompt raises ``Abort``, and a usage error
+or ``serve``'s bind failure is a ``ClickException``; click's ``main`` turns each
+into its own output and exit code. Held under a name so the guard's clause is
+one short, parenthesis-free ``except``: the multi-type spelling ruff formats to
+(PEP 758) does not parse on the older interpreter the pre-commit AST hooks run.
+"""
+
+
+def _logging_ready(ctx: click.Context) -> bool:
+    """
+    Whether ``_load_cli_settings`` has configured logging for this process.
+
+    Before that, an ERROR record has no handler but ``logging.lastResort``,
+    which would print it -- traceback and all -- straight to stderr, so the
+    guard must not log at all (Pitfall 3).
+
+    Args:
+        ctx: The group's context; its ``obj`` is shared with the subcommand's.
+
+    Returns:
+        True once logging is configured.
+
+    """
+    obj = ctx.obj
+    return isinstance(obj, dict) and bool(obj.get("logging_configured"))
+
+
+def _unexpected_line(exc: BaseException) -> str:
+    """
+    Render the one line an exception that is not a saneless type is reported as.
+
+    Args:
+        exc: The exception to report.
+
+    Returns:
+        ``Unexpected error (<Type>): <message>``, with no trailing hint.
+
+    """
+    return f"Unexpected error ({type(exc).__name__}): {describe(exc)}"
+
+
+def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
+    """
+    Render the one line a classified saneless failure is reported as.
+
+    The prefixes are documented (``docs/how-to/set-up-adf-duplex.md`` quotes
+    them), so they are kept as they were before the guard existed. A
+    configuration error is printed as-is: the loader's renderer already wrote
+    its own ``Configuration error in <file>:`` header (Phase 27 D-10).
+
+    Args:
+        exc: The failure.
+        category: What ``classify_error`` made of it.
+
+    Returns:
+        The line to print on stderr.
+
+    """
+    match category:
+        case ErrorCategory.FEEDER | ErrorCategory.SCANNER:
+            line = f"Scan error: {exc}"
+        case ErrorCategory.CONFIG:
+            line = str(exc)
+        case ErrorCategory.UPLOAD:
+            line = f"Paperless error: {exc}"
+        case ErrorCategory.ASSEMBLY:
+            line = f"PDF error: {exc}"
+        case ErrorCategory.UNKNOWN | ErrorCategory.REJECTED:
+            line = _unexpected_line(exc)
+        case _:
+            assert_never(category)
+    return line
+
+
+def _log_failure(ctx: click.Context, exc: Exception) -> None:
+    """
+    Log a failure with its traceback, but only once logging is configured.
+
+    Args:
+        ctx: The group's context.
+        exc: The failure to log.
+
+    """
+    if _logging_ready(ctx):
+        logger.error("saneless %s failed", ctx.invoked_subcommand, exc_info=exc)
+
+
+def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
+    """
+    Report an exception that is not a saneless type as one stderr line (D-06).
+
+    Once logging is configured the traceback goes to the log, and the line
+    points at the log file only when the file handler really attached
+    (``configure_logging``'s return value): a stderr fallback must not be
+    called a log file. Before logging is configured nothing is logged
+    (Pitfall 3); ``-v`` prints the traceback to stderr instead, and without it
+    the line says how to get one.
+
+    Args:
+        ctx: The group's context.
+        exc: The exception to report.
+
+    """
+    obj = ctx.obj if isinstance(ctx.obj, dict) else {}
+    line = _unexpected_line(exc)
+    if _logging_ready(ctx):
+        logger.error(
+            "Unexpected error in saneless %s", ctx.invoked_subcommand, exc_info=exc
+        )
+        log_file = obj.get("log_file")
+        if log_file:
+            line = f"{line}. Full details in {log_file}"
+    elif obj.get("verbose"):
+        click.echo("".join(traceback.format_exception(exc)), err=True, nl=False)
+    else:
+        line = f"{line}. Run again with -v to see the traceback"
+    click.echo(line, err=True)
+
+
+class _GuardedGroup(click.Group):
+    """
+    The CLI group with one last-resort handler around every command (EXC-02).
+
+    Every failure a command raises becomes one stderr message and its D-07
+    exit code, and no user ever sees a traceback unless they asked for one
+    with ``-v`` (D-06). The ``except`` clauses are ordered, and the order is
+    the design:
+
+    1. click's ``Exit``, ``Abort`` and ``ClickException`` are re-raised first.
+       ``Exit`` and ``Abort`` subclass ``RuntimeError``, so a later
+       ``except Exception`` would turn ``--help`` into exit 5 (Pitfall 2).
+    2. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
+       failure: one line and exit 130 (D-03, D-01).
+    3. ``StorageError`` -- a job database saneless cannot use -- is a setup
+       problem and exits 2 (D-07 amendment). It is mapped here by type and
+       sits before the ``SanelessError`` clause because ``ErrorCategory`` is
+       persisted on job records, and ``classify_error`` deliberately keeps
+       ``StorageError`` ``UNKNOWN`` rather than growing a category for it.
+       Its message already names the database path and the reason.
+    4. Any other ``SanelessError`` is classified once, by the same
+       ``classify_error`` the web worker uses, so the CLI's exit code and the
+       job's category cannot disagree.
+    5. Anything else is not a saneless type: ``Unexpected error (<Type>)``,
+       exit 5, the traceback in the log (M-17).
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        """
+        Invoke the subcommand, translating whatever it raises.
+
+        Args:
+            ctx: The group's context.
+
+        Returns:
+            Whatever the subcommand returned.
+
+        """
+        try:
+            return super().invoke(ctx)
+        except _CLICK_CONTROL_FLOW:
+            raise
+        except KeyboardInterrupt:
+            logger.info("Command interrupted")
+            click.echo("Cancelled (interrupted)", err=True)
+            ctx.exit(ExitCode.CANCELLED)
+        except ScanCancelledError as exc:
+            logger.info("Scan cancelled: %s", exc)
+            click.echo(str(exc), err=True)
+            ctx.exit(ExitCode.CANCELLED)
+        except StorageError as exc:
+            _log_failure(ctx, exc)
+            click.echo(f"Job database error: {exc}", err=True)
+            ctx.exit(ExitCode.CONFIG)
+        except SanelessError as exc:
+            category = classify_error(exc)
+            code = exit_code_for(category)
+            if code is ExitCode.UNEXPECTED:
+                _report_unexpected(ctx, exc)
+            else:
+                _log_failure(ctx, exc)
+                click.echo(_failure_line(exc, category), err=True)
+            ctx.exit(code)
+        except Exception as exc:
+            _report_unexpected(ctx, exc)
+            ctx.exit(ExitCode.UNEXPECTED)
+
+
+@click.group(cls=_GuardedGroup)
 @click.option(
     "--config",
     "config_path",
@@ -195,13 +404,19 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
     Load and validate settings and configure logging, once per process.
 
     Called by every command on first need rather than by the group callback,
-    so ``--help`` never touches the configuration (CFG-10). Loading, directory
-    validation and logging setup share one error handler, so a failure in any
-    of them is one message and exit 2, never a traceback (M-21). An unwritable
-    ``log_file`` is not such a failure: ``configure_logging`` warns on stderr,
-    logs there instead, and the command runs. ``load_settings`` and
+    so ``--help`` never touches the configuration (CFG-10). Nothing is caught
+    here: every failure reaches the group guard. Loading and directory
+    validation raise ``ConfigError`` for every problem with the file --
+    including a TOML syntax error (D-12) -- which the guard prints as rendered
+    and exits 2; anything else is an unexpected error, exit 5 (D-06). An
+    unwritable ``log_file`` is not a failure: ``configure_logging`` warns on
+    stderr, logs there instead, and the command runs. ``load_settings`` and
     ``configure_logging`` are called by their module-global names, which is
     where the tests patch them.
+
+    Once logging is configured, ``ctx.obj`` records it (``logging_configured``)
+    and records ``log_file`` only if the file handler really attached, so the
+    guard logs failures and names the log file truthfully.
 
     Args:
         ctx: The command's context; its ``obj`` carries ``config_path`` and
@@ -215,27 +430,17 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
     if isinstance(cached, Settings):
         return cached
 
-    try:
-        settings = load_settings(ctx.obj.get("config_path"))
-        validate_settings_dirs(settings)
-        configure_logging(
-            settings.output.log_file,
-            settings.output.log_level,
-            settings.output.log_max_bytes,
-            settings.output.log_backup_count,
-            verbose=bool(ctx.obj.get("verbose")),
-        )
-    except ConfigError as exc:
-        # The loader's renderer already wrote its own "Configuration error in
-        # <file>:" header; a second prefix would double it (D-10).
-        click.echo(str(exc), err=True)
-        sys.exit(2)
-    except Exception as exc:
-        # Anything else -- a TOML syntax error (still a ValueError until Phase
-        # 28), or an unexpected error from logging setup (an unwritable log file
-        # is not one: it falls back to stderr) -- keeps the documented exit 2.
-        click.echo(f"Configuration error: {exc}", err=True)
-        sys.exit(2)
+    settings = load_settings(ctx.obj.get("config_path"))
+    validate_settings_dirs(settings)
+    attached = configure_logging(
+        settings.output.log_file,
+        settings.output.log_level,
+        settings.output.log_max_bytes,
+        settings.output.log_backup_count,
+        verbose=bool(ctx.obj.get("verbose")),
+    )
+    ctx.obj["logging_configured"] = True
+    ctx.obj["log_file"] = settings.output.log_file if attached else None
 
     # WR-05: emitted only now, once the log file handler exists to receive it.
     warn_on_legacy_duplex_sources(settings)
@@ -264,7 +469,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
 
     if profile not in settings.profiles:
         click.echo(f"Unknown profile: {profile}", err=True)
-        sys.exit(2)
+        ctx.exit(ExitCode.CONFIG)
 
     # D-16: the one title rule the web form shares -- typed, else the profile's
     # title, else "Scan <time>"; blank after stripping counts as not typed.
@@ -281,7 +486,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             "two passes. Run it from a terminal, or scan from the web UI.",
             err=True,
         )
-        sys.exit(2)
+        ctx.exit(ExitCode.CONFIG)
 
     scanner = SaneBackend(host=settings.scanner.host)
     paperless = PaperlessClient(
@@ -314,13 +519,9 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             settings,
             request,
         )
-    except ScanError as exc:
-        click.echo(f"Scan error: {exc}", err=True)
-        sys.exit(1)
-    except PaperlessError as exc:
-        click.echo(f"Paperless error: {exc}", err=True)
-        sys.exit(3)
     finally:
+        # Failures reach the group guard, which prints one line and exits with
+        # the D-07 code; the client is closed either way.
         paperless.close()
 
 
@@ -570,7 +771,7 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     device_list = scanner.get_devices()
     if not device_list:
         click.echo("No scanners found.", err=True)
-        sys.exit(1)
+        ctx.exit(ExitCode.SCAN)
 
     # Use configured device or first discovered device
     device_id = settings.scanner.device or device_list[0].name
@@ -582,15 +783,12 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     # absolute path so the operator sees where it went (orchestrator
     # resolution 2).
     config_path = settings.config_path or Path("./saneless.toml")
+    # A ConfigError here (D-08: a single-file bind mount, a non-UTF-8 file, or
+    # merged text that would not parse) names the file and the fix; the group
+    # guard prints it as-is and exits 2, with no traceback.
     try:
         result = write_profiles_to_config(config_path, profiles, force=force)
-    except ConfigError as exc:
-        # D-08: a single-file bind mount (EBUSY), a non-UTF-8 file, or merged
-        # text that would not parse. The message names the file and the fix;
-        # exit 2 is the documented configuration-error code, with no traceback.
-        click.echo(str(exc), err=True)
-        sys.exit(2)
     except OSError as exc:
         click.echo(f"Cannot write {config_path}: {exc.strerror or exc}", err=True)
-        sys.exit(2)
+        ctx.exit(ExitCode.CONFIG)
     _echo_write_result(result, profiles)
