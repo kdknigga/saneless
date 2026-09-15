@@ -1575,6 +1575,37 @@ class TestPollTaskFailureTranslation:
         )
         assert message == "Paperless task t1 ended FAILURE: bad things"
 
+    def test_poll_failure_text_is_length_bounded(self) -> None:
+        """
+        IN-05 / T-23-16: a long task failure cannot flood job.error or the CLI.
+
+        Paperless failure results can embed whole OCR or consumer tracebacks;
+        they are cut like an error body, with an ellipsis.
+        """
+        message = _failed_poll_message(
+            _task_answer({"task_id": "t1", "status": "FAILURE", "result": "x" * 500})
+        )
+        assert message == f"Paperless task t1 ended FAILURE: {'x' * 200}…"
+
+    def test_duplicate_past_the_cut_still_says_check_before_rescanning(self) -> None:
+        """The duplicate check reads the whole failure text, not the cut one."""
+        text = f"{'consumer output ' * 20}It is a duplicate of document #42"
+        message = _failed_poll_message(
+            _task_answer({"task_id": "t1", "status": "FAILURE", "result": text})
+        )
+        assert "duplicate of document" not in message
+        assert message.endswith(f"…; {_DUPLICATE_SENTENCE}")
+
+    def test_whitespace_only_failure_text_still_says_something(self) -> None:
+        """A failure text of only whitespace is as empty as none."""
+        message = _failed_poll_message(
+            _task_answer({"task_id": "t1", "status": "FAILURE", "result": " \n "})
+        )
+        assert message == (
+            "Paperless task t1 ended FAILURE: Paperless reported a failure but "
+            "supplied no message"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Metadata fetches
