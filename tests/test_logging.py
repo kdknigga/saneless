@@ -18,12 +18,18 @@ class TestConfigureLogging:
     """Logging setup tests."""
 
     def _cleanup_handlers(self) -> None:
-        """Remove all handlers from root logger to prevent leaks."""
+        """
+        Remove all handlers from root logger to prevent leaks.
+
+        The ``saneless`` logger is reset too: a verbose call sets it to DEBUG,
+        and that must not leak into whichever test runs next.
+        """
         root = logging.getLogger()
         for handler in root.handlers[:]:
             handler.close()
             root.removeHandler(handler)
         root.setLevel(logging.WARNING)
+        logging.getLogger("saneless").setLevel(logging.NOTSET)
 
     def test_configure_logging_creates_file_handler(self, tmp_path: Path) -> None:
         """configure_logging adds a RotatingFileHandler to the root logger."""
@@ -60,6 +66,71 @@ class TestConfigureLogging:
             assert root.level == logging.INFO
         finally:
             self._cleanup_handlers()
+
+    def test_log_level_warning_and_critical_by_name(self, tmp_path: Path) -> None:
+        """WARNING and CRITICAL resolve to their numeric levels (CFG-04)."""
+        log_file = tmp_path / "test.log"
+        try:
+            configure_logging(log_file=str(log_file), log_level="WARNING")
+            assert logging.getLogger().level == 30
+            configure_logging(log_file=str(log_file), log_level="CRITICAL")
+            assert logging.getLogger().level == 50
+        finally:
+            self._cleanup_handlers()
+
+    def test_verbose_sets_saneless_loggers_to_debug_only(self, tmp_path: Path) -> None:
+        """
+        -v is DEBUG for saneless's own loggers, not for the root or libraries.
+
+        httpx logs request headers at DEBUG, and those can carry the Paperless
+        Authorization header (T-27-23), so the root keeps the configured level.
+        """
+        log_file = tmp_path / "test.log"
+        try:
+            configure_logging(log_file=str(log_file), log_level="INFO", verbose=True)
+            assert (
+                logging.getLogger("saneless.pipeline").getEffectiveLevel()
+                == logging.DEBUG
+            )
+            assert logging.getLogger("httpx").getEffectiveLevel() == logging.INFO
+            assert logging.getLogger().level == logging.INFO
+        finally:
+            self._cleanup_handlers()
+
+    def test_verbose_debug_record_reaches_log_file(self, tmp_path: Path) -> None:
+        """A DEBUG record from a saneless logger is written under -v."""
+        log_file = tmp_path / "test.log"
+        try:
+            configure_logging(log_file=str(log_file), log_level="INFO", verbose=True)
+            logging.getLogger("saneless.pipeline").debug("verbose-detail-7f3e")
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            assert "verbose-detail-7f3e" in log_file.read_text()
+        finally:
+            self._cleanup_handlers()
+
+    def test_non_verbose_call_resets_verbose_debug(self, tmp_path: Path) -> None:
+        """A later non-verbose configure_logging does not inherit -v's DEBUG."""
+        log_file = tmp_path / "test.log"
+        try:
+            configure_logging(log_file=str(log_file), log_level="INFO", verbose=True)
+            self._remove_root_handlers()
+            configure_logging(log_file=str(log_file), log_level="WARNING")
+            assert logging.getLogger("saneless").level == logging.NOTSET
+            assert (
+                logging.getLogger("saneless.pipeline").getEffectiveLevel()
+                == logging.WARNING
+            )
+        finally:
+            self._cleanup_handlers()
+
+    @staticmethod
+    def _remove_root_handlers() -> None:
+        """Close and detach the root handlers without touching any level."""
+        root = logging.getLogger()
+        for handler in root.handlers[:]:
+            handler.close()
+            root.removeHandler(handler)
 
     def test_log_rotation_params(self, tmp_path: Path) -> None:
         """Custom max_bytes and backup_count are passed to RotatingFileHandler."""
