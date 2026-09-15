@@ -7,6 +7,7 @@ import errno
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -33,6 +34,7 @@ from saneless.config import (
 from saneless.exceptions import ConfigError, PaperlessError, ScanError
 from saneless.job import JobStore
 from saneless.paperless import UploadResult
+from saneless.pipeline import PipelineEvent, PipelineRequest
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -44,6 +46,8 @@ from saneless.vocabulary import FlipOutcome, JobState, state_label
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from click.testing import Result
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
 # Keeps the suite out of the developer's real ~/.local/state/saneless.
@@ -218,11 +222,96 @@ class TestCliHelp:
 class TestScanCommand:
     """Scan command tests."""
 
-    def test_scan_requires_title(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Scan without --title exits with non-zero code."""
+    def test_scan_without_title_falls_back_to_timestamp_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--title`` is optional; with no profile title it is ``Scan <time>``."""
         runner, _ = _patch_cli(monkeypatch)
         result = runner.invoke(cli, ["scan"])
-        assert result.exit_code != 0
+        assert result.exit_code == 0, result.output
+        assert re.search(r"Done: Scan \d{4}-\d{2}-\d{2} \d{2}:\d{2}", result.output)
+
+    @staticmethod
+    def _capture_title_run(
+        monkeypatch: pytest.MonkeyPatch, args: list[str]
+    ) -> tuple[Result, PipelineRequest | None]:
+        """
+        Run ``scan`` against a ``receipt`` profile titled "Receipt".
+
+        ``run_pipeline`` is replaced by a recorder that captures the request and
+        reports DONE through its callback, as the real pipeline does.
+
+        Args:
+            monkeypatch: The test's monkeypatch fixture.
+            args: The CLI arguments.
+
+        Returns:
+            The CliRunner result and the captured request, if the pipeline ran.
+
+        """
+        settings = _make_settings(
+            profiles={
+                "default": ProfileConfig(),
+                "receipt": ProfileConfig(title="Receipt"),
+            }
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        captured: list[PipelineRequest] = []
+
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> None:
+            captured.append(request)
+            if request.status_callback is not None:
+                request.status_callback(PipelineEvent.DONE)
+
+        monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
+        result = runner.invoke(cli, args)
+        return result, (captured[0] if captured else None)
+
+    @pytest.mark.parametrize("typed", [None, "", "   "])
+    def test_scan_blank_title_uses_the_profile_title(
+        self, monkeypatch: pytest.MonkeyPatch, typed: str | None
+    ) -> None:
+        """An omitted or blank ``--title`` resolves to the profile's title (D-16)."""
+        args = ["scan", "--profile", "receipt"]
+        if typed is not None:
+            args += ["--title", typed]
+
+        result, request = self._capture_title_run(monkeypatch, args)
+
+        assert result.exit_code == 0, result.output
+        assert request is not None
+        assert request.title == "Receipt"
+        assert "Done: Receipt" in result.output
+
+    def test_scan_typed_title_beats_the_profile_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-blank ``--title`` is kept as typed."""
+        result, request = self._capture_title_run(
+            monkeypatch, ["scan", "--profile", "receipt", "--title", "Typed"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert request is not None
+        assert request.title == "Typed"
+        assert "Done: Typed" in result.output
+
+    def test_scan_unknown_profile_exits_2_before_title_resolution(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unknown profile is still refused with exit 2 and no pipeline run."""
+        result, request = self._capture_title_run(
+            monkeypatch, ["scan", "--profile", "nope"]
+        )
+
+        assert result.exit_code == 2
+        assert "Unknown profile" in result.output
+        assert request is None
 
     def test_scan_happy_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan with --title succeeds and shows Done message."""
