@@ -39,7 +39,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 24: Scanner Truthfulness** - One source classifier wired everywhere, real SANE error messages, correct geometry and read-back DPI, fakes that model real python-sane (completed 2026-09-13)
 - [x] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass (completed 2026-09-14)
 - [x] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets (completed 2026-09-14)
-- [ ] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible
+- [x] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible (completed 2026-09-15)
 - [ ] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback
 - [ ] **Phase 29: Geometry, Memory, and Timeouts** - Pages spooled to disk in explicit order, safe cancel, shared flatbed/ADF timeout, guarded `sane.init()`
 - [ ] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt
@@ -436,9 +436,9 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 27-06-PLAN.md — (wave 3) lazy memoised CLI settings (`--help` without config), `-v` = saneless DEBUG, CFG-11 startup line, optional `--title`
-- [ ] 27-07-PLAN.md — (wave 3) `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` at call time, `~` expansion, nearest-ancestor writability, conftest XDG hygiene
-- [ ] 27-08-PLAN.md — (wave 3) configuration/env/CLI references, scripting how-to, empty-page tip, search-path lists, TOML example, doc-truth tests
+- [x] 27-06-PLAN.md — (wave 3) lazy memoised CLI settings (`--help` without config), `-v` = saneless DEBUG, CFG-11 startup line, optional `--title`
+- [x] 27-07-PLAN.md — (wave 3) `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` at call time, `~` expansion, nearest-ancestor writability, conftest XDG hygiene
+- [x] 27-08-PLAN.md — (wave 3) configuration/env/CLI references, scripting how-to, empty-page tip, search-path lists, TOML example, doc-truth tests
 
 Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship together. `os.replace` over a bind-mounted *file* returns `EBUSY`, so shipping the atomic write alone delivers a durable-write feature that is broken for the documented deployment.
 
@@ -529,7 +529,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
-| 27. Configuration Strictness | 5/8 | In Progress|  |
+| 27. Configuration Strictness | 8/8 | Complete   | 2026-09-15 |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
 | 30. Appliance Layer | 0/? | Not started | - |
