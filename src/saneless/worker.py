@@ -315,6 +315,33 @@ class ScanWorker:
         with self._unrecorded_lock:
             self._unrecorded_failures[job_id] = (error, ErrorCategory.REJECTED)
 
+    def owed_rejection_ids(self) -> frozenset[str]:
+        """
+        List the refused submits whose REJECTED write the worker still owes.
+
+        The status area must not show these as a live job: until the worker
+        writes one, its row is PENDING with no REJECTED marker (IN-08, D-06).
+        Failures the loop guard could not write are left out on purpose, because
+        those jobs ran and D-17 still reports them as the job that just ended.
+        ``classify_error`` never yields REJECTED, so a REJECTED entry can only
+        come from :meth:`owe_rejection`.
+
+        An id leaves the set only after its row is written ERROR/REJECTED,
+        which ``JobStore.latest_run_job`` already skips, so no poll can see it
+        as live in between.
+
+        Returns:
+            An immutable snapshot of the owed rejection ids, taken under the
+            lock the worker thread and request threads share.
+
+        """
+        with self._unrecorded_lock:
+            return frozenset(
+                job_id
+                for job_id, (_error, category) in self._unrecorded_failures.items()
+                if category is ErrorCategory.REJECTED
+            )
+
     @property
     def health(self) -> WorkerHealth:
         """
