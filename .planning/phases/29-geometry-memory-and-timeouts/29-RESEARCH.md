@@ -639,18 +639,18 @@ Exact for `L` and `RGB` — verified 26,099,520 == `len(im.tobytes())`. `snap()`
 | A4 | `pikepdf.Job.run()` holding the GIL for ~12 ms/page is acceptable for a 500-page job (~6 s) | Finding 3 | A long assembly stalls `/api/status` polling; visible as a frozen UI, not as data loss |
 | A5 | Click's `ctx.call_on_close` runs before `_GuardedGroup.invoke`'s handlers | Finding 10 | If wrong, `sane.exit()` would run after the error line — cosmetic ordering only |
 
-## Open Questions
+## Open Questions (ALL RESOLVED — resolutions recorded in 29-CONTEXT.md and carried into the plans)
 
-1. **Does D-03 stand as written, or gain the qpdf merge?**
+1. **Does D-03 stand as written, or gain the qpdf merge?** — **RESOLVED: gains the merge.** CONTEXT.md D-03 amended 2026-09-15; delivered by plan 29-08.
    - Known: `outputstream=` alone leaves assembly memory linear in page count (measured, both engines).
    - Unclear: whether the phase prefers a true bound (adds `pikepdf` as a declared dependency and a GIL-holding merge step) or an honest weaker claim.
    - Recommendation: take the merge. It keeps D-03's two locked clauses literally true, keeps the PDF byte-equivalent, and is the only version of the phase in which "peak memory stays bounded by roughly one page" is a true sentence end to end. Flag it to the user as the one research-driven amendment.
 
-2. **Is `snap()`'s truncated-on-cancel return worth a dedicated test?**
+2. **Is `snap()`'s truncated-on-cancel return worth a dedicated test?** — **RESOLVED: yes.** CONTEXT.md D-12/D-16 amended; plan 29-07's `post_cancel_page_discarded` test.
    - Known: measured on the real `test` backend; the fake currently cannot express it.
    - Recommendation: yes — `FakeSaneDev`'s blocking mode should support both "unblocks by *returning a partial page*" and "unblocks by raising", because the first is what real hardware does and the second is what the code was written to expect.
 
-3. **How does D-13's wedge interact with `get_capabilities` in `auto-profiles`?**
+3. **How does D-13's wedge interact with `get_capabilities` in `auto-profiles`?** — **RESOLVED: check both entry points.** Plan 29-10 guards `scan_pages` and `get_capabilities`.
    - Known: D-13 says both refuse; `auto-profiles` constructs its own backend.
    - Unclear: whether a wedge in a *previous* CLI process matters — it cannot, the flag is per process. Only `serve` can observe it.
    - Recommendation: keep the check in both entry points anyway; it is one `if`.
