@@ -29,7 +29,10 @@ def configure_logging(
     Configure application logging with rotating file handler.
 
     Creates parent directories for the log file if they don't exist,
-    then attaches a RotatingFileHandler to the root logger.
+    then attaches a RotatingFileHandler to the root logger. If the directory
+    cannot be created or the file cannot be opened, a stderr handler is
+    attached instead and a warning names the log file; this function does not
+    raise for an unwritable log, so the caller keeps running.
 
     Args:
         log_file: Path to the log file.

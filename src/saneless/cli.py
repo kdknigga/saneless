@@ -197,9 +197,11 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
     Called by every command on first need rather than by the group callback,
     so ``--help`` never touches the configuration (CFG-10). Loading, directory
     validation and logging setup share one error handler, so a failure in any
-    of them -- including an unwritable log (M-21) -- is one message and exit 2,
-    never a traceback. ``load_settings`` and ``configure_logging`` are called by
-    their module-global names, which is where the tests patch them.
+    of them is one message and exit 2, never a traceback (M-21). An unwritable
+    ``log_file`` is not such a failure: ``configure_logging`` warns on stderr,
+    logs there instead, and the command runs. ``load_settings`` and
+    ``configure_logging`` are called by their module-global names, which is
+    where the tests patch them.
 
     Args:
         ctx: The command's context; its ``obj`` carries ``config_path`` and
@@ -230,7 +232,8 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
         sys.exit(2)
     except Exception as exc:
         # Anything else -- a TOML syntax error (still a ValueError until Phase
-        # 28), or configure_logging failing -- keeps the documented exit 2.
+        # 28), or an unexpected error from logging setup (an unwritable log file
+        # is not one: it falls back to stderr) -- keeps the documented exit 2.
         click.echo(f"Configuration error: {exc}", err=True)
         sys.exit(2)
 
