@@ -169,7 +169,7 @@ def _one_line_reason(exc: BaseException) -> str:
     '...'`` followed by ``For more information check: <mdn url>``.  A status
     error is therefore rendered as its status, reason phrase and the body
     reduced to one bounded line by ``_render_error_body``; anything else is
-    ``describe`` with its whitespace collapsed.
+    ``describe``, which already collapses whitespace.
 
     Args:
         exc: The cause.
@@ -184,7 +184,7 @@ def _one_line_reason(exc: BaseException) -> str:
             f"{response.status_code} {response.reason_phrase}: "
             f"{_render_error_body(response)}"
         )
-    return " ".join(describe(exc).split()) or type(exc).__name__
+    return describe(exc)
 
 
 def _first_message(value: object) -> str | None:
