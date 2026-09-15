@@ -61,16 +61,16 @@ from saneless.vocabulary import (
 class TestJobStateMembers:
     """JobState membership tests."""
 
-    def test_job_state_has_exactly_nine_members(self) -> None:
+    def test_job_state_has_exactly_ten_members(self) -> None:
         """
-        JobState declares exactly nine lifecycle members (CTR-01, DPLX-06).
+        JobState declares exactly ten lifecycle members (CTR-01, DPLX-06, D-01).
 
         A count guard, not a name list: adding a member should fail the
         parametrised completeness tests below -- which force a label and a
         classification decision -- rather than a hand-written roster that only
         records what the enum happened to contain when it was written.
         """
-        assert len(list(JobState)) == 9
+        assert len(list(JobState)) == 10
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:
@@ -159,11 +159,23 @@ class TestStateClassifications:
         )
 
     def test_terminal_states_membership(self) -> None:
-        """TERMINAL_STATES is exactly DONE, ERROR and FALLBACK (CTR-01, OUTC-02)."""
+        """TERMINAL_STATES is DONE, ERROR, FALLBACK and CANCELLED (OUTC-02, D-01)."""
         assert (
-            frozenset({JobState.DONE, JobState.ERROR, JobState.FALLBACK})
+            frozenset(
+                {
+                    JobState.DONE,
+                    JobState.ERROR,
+                    JobState.FALLBACK,
+                    JobState.CANCELLED,
+                }
+            )
             == TERMINAL_STATES
         )
+
+    def test_cancelled_is_not_busy(self) -> None:
+        """A cancelled job is finished, so the machine is not working (D-01)."""
+        assert JobState.CANCELLED not in BUSY_STATES
+        assert JobState.CANCELLED.value == "CANCELLED"
 
     def test_busy_states_is_derived_from_active_states(self) -> None:
         """BUSY_STATES is ACTIVE_STATES minus AWAITING_FLIP (CTR-01)."""
@@ -194,6 +206,7 @@ class TestStateLabel:
             (JobState.DONE, "Complete"),
             (JobState.ERROR, "Failed"),
             (JobState.FALLBACK, "Saved to folder"),
+            (JobState.CANCELLED, "Cancelled"),
         ],
     )
     def test_state_label_strings(self, state: JobState, expected: str) -> None:
@@ -234,10 +247,11 @@ class TestProgressLabel:
         assert label != state.value
 
     def test_terminal_states_have_progress_prose_for_totality(self) -> None:
-        """The three terminal states carry prose purely to stay total (CTR-01)."""
+        """The four terminal states carry prose purely to stay total (CTR-01)."""
         assert progress_label(JobState.DONE) == "Complete"
         assert progress_label(JobState.ERROR) == "Failed"
         assert progress_label(JobState.FALLBACK) == "Saved to folder"
+        assert progress_label(JobState.CANCELLED) == "Cancelled"
 
 
 class TestFlipAnswerLabel:
@@ -873,6 +887,7 @@ class TestJobActivityProperties:
             (JobState.DONE, (False, False)),
             (JobState.ERROR, (False, False)),
             (JobState.FALLBACK, (False, False)),
+            (JobState.CANCELLED, (False, False)),
         ],
     )
     def test_job_reports_activity(

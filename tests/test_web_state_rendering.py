@@ -208,12 +208,13 @@ def test_history_cell_shows_the_shared_label(
 
 @pytest.mark.parametrize("state", list(JobState))
 def test_history_cell_css_class(client: TestClient, state: JobState) -> None:
-    """Only the three terminal history cells carry a status CSS class (CTR-01)."""
+    """Only the four terminal history cells carry a status CSS class (CTR-01, D-01)."""
     _job_in_state(client, state)
     text = client.get("/api/jobs/history").text
     assert ('<td class="status-done">' in text) is (state is JobState.DONE)
     assert ('<td class="status-error">' in text) is (state is JobState.ERROR)
     assert ('<td class="status-fallback">' in text) is (state is JobState.FALLBACK)
+    assert ('<td class="status-cancelled">' in text) is (state is JobState.CANCELLED)
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -260,8 +261,12 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
         )
         # A fallback is a degradation, not a failure: no role="alert" here.
         assert 'role="alert"' not in text
-    # The history-refresh hook belongs to the terminal states only -- all three
-    # of them, FALLBACK included, or the table goes stale after a fallback.
+    if state is JobState.CANCELLED:
+        assert '<p class="status-cancelled">&#8856; Cancelled: Render Test</p>' in text
+        # A cancel is a deliberate stop, not a failure: no role="alert" here (D-01).
+        assert 'role="alert"' not in text
+    # The history-refresh hook belongs to the terminal states only -- all four
+    # of them, FALLBACK and CANCELLED included, or the table goes stale.
     assert ('hx-get="/api/jobs/history"' in text) is (state in TERMINAL_STATES)
 
 
