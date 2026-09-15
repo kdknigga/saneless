@@ -89,10 +89,30 @@ Delivers HARD-01..HARD-05 (review findings M-08, N-02, M-12, M-13, N-04):
   - The two passes of a manual duplex job spool into distinguishable names (e.g. `a-0001.png`,
     `b-0001.png`) for debuggability only. Order still comes from the record list.
 - **D-03: the spooled file is PNG, and it is exactly what img2pdf embeds.** `assemble_pdf` takes
-  records (paths) and stops re-saving every page as a second PNG (`pdf.py:208-214` goes). It
-  passes `outputstream=` so the PDF streams to its file instead of being built as one `bytes`
-  object (M-08). The PNG compression level is the planner's call, measured on a 300 DPI colour
-  page.
+  records (paths) and stops re-saving every page as a second PNG (`pdf.py:208-214` goes).
+  - **Amended 2026-09-15 after research (29-RESEARCH.md Finding 3, Open Question 1).** The
+    locked clause "passes `outputstream=` so the PDF streams to its file" does not achieve what
+    it was locked for: `img2pdf.convert` reads every page fully into memory and finalises the
+    whole document before `outputstream` is ever written, so peak memory stays linear in page
+    count (measured: 787 MB at 48 pages, versus 1395 MB today). **Assembly therefore runs
+    per page — one `img2pdf.convert(..., outputstream=...)` per page — and the single-page PDFs
+    are merged with `pikepdf.Job(["qpdf", "--empty", "--pages", *singles, "--", out])`.**
+    Measured flat at 131 MB for both 12 and 48 pages, byte-identical `/FlateDecode` image
+    streams, same MediaBox, same wall clock. Both of D-03's locked clauses stay literally true,
+    and this is the only shape in which success criterion 1's memory sentence is true end to end.
+    - Accepted cost: `Job.run()` holds the GIL for roughly 12 ms per page, so a 500-page job
+      stalls its thread for about 6 s during assembly. It is the worker thread, already blocked
+      for the whole scan, and the alternative is gigabytes of RAM.
+    - **`pikepdf` becomes an explicit runtime dependency in `pyproject.toml`.** It is already
+      installed as a hard transitive dependency of img2pdf and as a dev dependency, but a
+      mandatory runtime import must be declared, not inherited: a missing mandatory dependency
+      has to fail loudly at install time, never at scan time.
+  - **PNG compression level: Pillow's default (6), passed implicitly by not passing the
+    argument.** Measured 13.7 MB / 1.57 s versus 15.8 MB / 0.62 s at level 1 on a noisy A4
+    300 DPI colour page. The PNG *is* the PDF's page content, so the 13% is saved in the PDF, in
+    the upload and in Paperless storage forever, while the second is paid once against a 10-15 s
+    scan. `pdf.py` already saves at the default, so output stays byte-comparable. Level 1 is
+    recorded in the module docstring as the throughput fallback, not as a config key.
 - **D-04: `_interleave_duplex` operates on records.** Backs are reversed and zipped with fronts
   as record objects, and no file is renamed. Success criterion 1's test builds a duplex job
   whose filesystem order differs from its document order.
@@ -115,10 +135,14 @@ Delivers HARD-01..HARD-05 (review findings M-08, N-02, M-12, M-13, N-04):
 - **D-08 (proof of the memory bound): count live page images, don't sample RSS.** Pillow
   allocates pixel memory outside `tracemalloc`'s view, and RSS is too noisy for CI. The fake
   device tracks every page image it hands out with a `weakref`. A 12-page scan asserts that the
-  high-water mark of live page images stays at a small constant (one page in flight, plus the
-  crop copy or thumbnail source), independent of page count. The planner confirms the exact
-  bound during research. The same test reads the PDF back with `pikepdf` (already a dev
-  dependency) and checks that each page carries its distinct per-page content in order 1..12.
+  high-water mark of live page images stays at a small constant, independent of page count.
+  **Measured bound (research Finding 4): 2**, because the backend's loop variable still holds
+  page *k-1* while page *k* is acquired. The test asserts both `high_water <= 2` and that the
+  mark for 12 pages equals the mark for 3 — the independence from N is the actual proof, and a
+  hard `== 1` would only be reachable by adding a `del` that exists to satisfy a test.
+  `Image` defines `__eq__` and so is unhashable: use `list[weakref.ref]`, never a `WeakSet`.
+  The same test reads the PDF back with `pikepdf` and checks that each page carries its distinct
+  per-page content in order 1..12.
 
 ### Keeping pages on a mid-batch error (HARD-02, N-02)
 - **D-09: a failure after at least one page was spooled fails the job and preserves the pages.
@@ -167,14 +191,25 @@ Delivers HARD-01..HARD-05 (review findings M-08, N-02, M-12, M-13, N-04):
   - Rejected: M-12's "one long-lived executor per backend". It is still non-daemon, and one
     stuck read would block every later call.
 - **D-12: the timeout sequence is cancel, then wait, then close only if the read returned.** On
-  timeout: `dev.cancel()` from the waiting thread (the SANE standard allows asynchronous
-  `sane_cancel`; research confirms this for the `net` backend). Then wait up to a grace period,
-  a module constant `_CANCEL_GRACE_SECONDS`, injectable for tests the same way
-  `timeout_per_page` is. The planner picks a value in the region of 10 s after research. If the
+  timeout: `dev.cancel()`, which is sound cross-thread — research read `_sane.c` and confirmed
+  `sane_read`, `sane_start` and `sane_cancel` all release the GIL, while `sane_close`,
+  `sane_init` and `sane_exit` hold it (so close-while-reading is doubly unsafe). Then wait up to
+  a grace period, the module constant `_CANCEL_GRACE_SECONDS = 10.0`, injectable for tests the
+  same way `timeout_per_page` is. If the
   read returned, close normally and raise the timeout `ScanError`
   (`Page N timed out after 120s`). If it did not return, **skip `close()`**, log CRITICAL, and
   raise the timeout `ScanError`, adding that the scanner did not respond to cancel.
   `_open_device`'s `finally` must know about that state.
+  - **A page that arrives after the cancel is discarded, never spooled.** Measured on real
+    libsane: a cancelled `snap()` returns a **truncated image** rather than raising — 3779x242
+    of a full page, which would pass `_validate_page_image`. The timeout has already been
+    reported, so any late result is dropped.
+  - **On the `net` backend `sane_cancel` is itself a blocking RPC** on the control wire before
+    the local data fd closes, so calling it from the waiting thread can hang the worker. Fire
+    the cancel on its own daemon thread and let the grace bound only the reader.
+  - **A wedged `SaneDev` stays strongly referenced.** Its `dealloc` calls `sane_close` and
+    `_SaneIterator.__del__` calls `cancel`, so letting it be collected reintroduces exactly the
+    close-while-reading this decision removes.
 - **D-13: a device left mid-read wedges the backend until the read returns.** While a stuck read
   thread is alive, the next `scan_pages` / `get_capabilities` refuses at once with a `ScanError`
   telling the operator to restart saneless, and no SANE call is made. When the late read does
@@ -194,7 +229,8 @@ Delivers HARD-01..HARD-05 (review findings M-08, N-02, M-12, M-13, N-04):
 - **D-16: tests prove it with an `Event`-gated blocking fake, never a sleep.** `FakeSaneDev`
   gains a blocking-read mode gated on a `threading.Event`. It records whether `close()` or
   `sane.exit()` was called while the read was blocked, and it unblocks on `cancel()` or stays
-  blocked, per test. TEST-02 bans new `time.sleep`, and the existing `set_page_delay` sleep is
+  blocked, per test. It must be able to unblock **both** ways real hardware and the code expect:
+  by returning a truncated partial page, and by raising. TEST-02 bans new `time.sleep`, and the existing `set_page_delay` sleep is
   not extended. The in-process tests assert the ordering: cancel called, close never called
   while blocked, close called once the read returns. **Process exit is proven in a subprocess**:
   a child whose read never unblocks must exit within a bound, which is the only honest proof
@@ -254,10 +290,10 @@ Delivers HARD-01..HARD-05 (review findings M-08, N-02, M-12, M-13, N-04):
 The planner may refine these defaults, but should not reverse them without cause.
 - Module and type names (`spool.py`, `PageSink`, `PageRecord`, `SpooledPage`) and whether the
   sink is a `Protocol` or an ABC.
-- PNG compression level (D-03), measured rather than guessed.
-- The exact `_CANCEL_GRACE_SECONDS` value (D-12), and whether the result hand-off is a `queue`
-  or an `Event` plus a slot (D-11).
-- The exact live-image bound asserted in D-08, set from what the implementation genuinely needs.
+- ~~PNG compression level~~ — resolved by research: Pillow's default 6 (D-03).
+- ~~`_CANCEL_GRACE_SECONDS`~~ — resolved by research: 10.0. ~~Hand-off primitive~~ — resolved:
+  an `Event` plus a slot, prototyped and measured (D-11, D-12).
+- ~~The live-image bound~~ — resolved by research: `<= 2`, and equal for N=3 and N=12 (D-08).
 - Whether the partial-scan exception carries a structured `pages_kept` attribute as well as the
   message (the message is what is locked; Phase 30 may want the attribute).
 - How `MagicMock(spec=ScannerBackend)` call sites in `tests/test_pipeline.py` (~40) migrate to
