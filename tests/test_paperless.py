@@ -1254,6 +1254,125 @@ class TestPollTaskFailureTranslation:
 
 
 # ---------------------------------------------------------------------------
+# Metadata fetches
+# ---------------------------------------------------------------------------
+
+
+_METADATA_METHODS = [
+    pytest.param("get_tags", "tags", id="tags"),
+    pytest.param("get_correspondents", "correspondents", id="correspondents"),
+]
+
+# (script, expected message suffix or None for ``describe(cause)``, cause type)
+_METADATA_FAILURES = [
+    pytest.param(
+        _raising(httpx.ConnectError("connection refused")),
+        "connection refused",
+        httpx.ConnectError,
+        id="connect-error",
+    ),
+    pytest.param(
+        _raising(httpx.ReadTimeout("")),
+        "ReadTimeout",
+        httpx.ReadTimeout,
+        id="read-timeout-empty",
+    ),
+    pytest.param(
+        _answering(httpx.Response(500, text="boom")),
+        "500 Internal Server Error: boom",
+        httpx.HTTPStatusError,
+        id="500",
+    ),
+    pytest.param(
+        _answering(httpx.Response(403, json={"detail": "You do not have permission."})),
+        "403 Forbidden: You do not have permission.",
+        httpx.HTTPStatusError,
+        id="403",
+    ),
+    pytest.param(
+        _answering(httpx.Response(200, text="<html>login</html>")),
+        None,
+        ValueError,
+        id="non-json-200",
+    ),
+]
+
+
+def _metadata_client(handler: _CountingHandler) -> PaperlessClient:
+    """Build a client for the metadata tests on a distinct base URL."""
+    return PaperlessClient(
+        url="http://paperless.test:8000",
+        token=_MOCK_AUTH,
+        _transport=_make_transport(handler),
+    )
+
+
+class TestMetadataFetchTranslation:
+    """EXC-01 / D-11: get_tags and get_correspondents raise only PaperlessError."""
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    @pytest.mark.parametrize(("respond", "suffix", "cause_type"), _METADATA_FAILURES)
+    def test_metadata_failure_is_a_paperless_error(
+        self,
+        method: str,
+        noun: str,
+        respond: Callable[[int], httpx.Response],
+        suffix: str | None,
+        cause_type: type[Exception],
+    ) -> None:
+        """
+        Every failure names the endpoint and base URL and keeps the cause.
+
+        A status error is rendered as status, reason and the one-line body
+        rather than httpx's two-line text, so the message stays one line
+        (EXC-02); a non-JSON body ends with ``describe`` of the ValueError.
+        """
+        handler = _CountingHandler(respond)
+        client = _metadata_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                getattr(client, method)()
+        finally:
+            client.close()
+        error = exc_info.value
+        cause = error.__cause__
+        assert isinstance(cause, cause_type)
+        assert not isinstance(error, httpx.HTTPError)
+        expected_suffix = describe(cause) if suffix is None else suffix
+        assert str(error) == (
+            f"Could not fetch {noun} from Paperless at http://paperless.test:8000: "
+            f"{expected_suffix}"
+        )
+        assert "\n" not in str(error)
+        assert handler.calls == 1
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_metadata_list_response_is_returned(self, method: str, noun: str) -> None:
+        """A bare-list response is returned unchanged."""
+        items = [{"id": 1, "name": f"first {noun}"}]
+        handler = _CountingHandler(_answering(httpx.Response(200, json=items)))
+        client = _metadata_client(handler)
+        try:
+            assert getattr(client, method)() == items
+        finally:
+            client.close()
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_metadata_paginated_response_is_unwrapped(
+        self, method: str, noun: str
+    ) -> None:
+        """A paginated dict response yields its ``results``."""
+        items = [{"id": 2, "name": f"second {noun}"}]
+        payload = {"count": 1, "next": None, "previous": None, "results": items}
+        handler = _CountingHandler(_answering(httpx.Response(200, json=payload)))
+        client = _metadata_client(handler)
+        try:
+            assert getattr(client, method)() == items
+        finally:
+            client.close()
+
+
+# ---------------------------------------------------------------------------
 # Connection test
 # ---------------------------------------------------------------------------
 
