@@ -15,6 +15,12 @@ Its contract, which every test below pins down:
   the link keeps pointing at it (D-07).
 * A target the process may not write is refused before any temp file exists,
   because a rename needs only a writable directory (Pitfall 6).
+* An existing file's mode and owner survive the rewrite; ownership is copied
+  only when the process is permitted to (D-06).
+* A rename refused with EBUSY -- a config bind-mounted as a single file -- is
+  a ``ConfigError`` that tells the operator to mount the directory, and there
+  is no non-atomic fallback (D-08). A config inside a mounted *directory*, the
+  documented ``./config:/etc/saneless`` layout, is replaced normally (CFG-09).
 """
 
 from __future__ import annotations
@@ -22,12 +28,15 @@ from __future__ import annotations
 import errno
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
 from saneless.atomic_write import replace_file_atomically
+from saneless.exceptions import ConfigError
 
 _ORIGINAL = "[profiles.default]\nsource = 'Flatbed'\n"
 _NEW = "a = 1\r\n# café\n"
@@ -292,3 +301,272 @@ class TestSymlinkAndReadonly:
             _leftovers(tmp_path)
         finally:
             target.chmod(0o600)
+
+
+class TestModeAndOwner:
+    """The rewritten file keeps the original's mode and, when allowed, owner."""
+
+    @staticmethod
+    def _record_fchown_and_fchmod(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> list[tuple[str, int, int]]:
+        """Record every fchown and fchmod call in order, then perform it."""
+        calls: list[tuple[str, int, int]] = []
+        real_fchown = os.fchown
+        real_fchmod = os.fchmod
+
+        def recording_fchown(fd: int, uid: int, gid: int) -> None:
+            """Note the requested owner, then apply it."""
+            calls.append(("fchown", uid, gid))
+            real_fchown(fd, uid, gid)
+
+        def recording_fchmod(fd: int, mode: int) -> None:
+            """Note the requested mode, then apply it."""
+            calls.append(("fchmod", mode, -1))
+            real_fchmod(fd, mode)
+
+        monkeypatch.setattr(os, "fchown", recording_fchown)
+        monkeypatch.setattr(os, "fchmod", recording_fchmod)
+        return calls
+
+    def test_atomic_existing_mode_0640_is_preserved(self, tmp_path: Path) -> None:
+        """
+        A group-readable config stays group-readable.
+
+        mkstemp creates 0600; without copying the mode, a rewrite would lock
+        out a group (for example a backup user) that could read it before.
+        """
+        target = tmp_path / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        target.chmod(0o640)
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+    def test_atomic_fchown_gets_the_original_owner_before_fchmod(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Ownership is copied first, then the mode.
+
+        A host-owned config must not become root-owned after a container
+        rewrite (D-06), and chown(2) may clear set-id bits, so the mode has
+        to be applied after it (Pitfall 5).
+        """
+        target = tmp_path / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        target.chmod(0o640)
+        original = target.stat()
+        calls = self._record_fchown_and_fchmod(monkeypatch)
+
+        replace_file_atomically(target, _NEW)
+
+        assert calls == [
+            ("fchown", original.st_uid, original.st_gid),
+            ("fchmod", 0o640, -1),
+        ]
+
+    def test_atomic_fchown_permission_error_is_skipped_silently(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A process not allowed to chown still rewrites the file (D-06).
+
+        On bare metal the non-root writer already owns the file, so the
+        refused chown loses nothing and must not fail the write.
+        """
+
+        def refused_fchown(fd: int, uid: int, gid: int) -> None:
+            """Refuse the way the kernel does for a non-root caller."""
+            raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+
+        monkeypatch.setattr(os, "fchown", refused_fchown)
+        target = tmp_path / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        target.chmod(0o640)
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
+        _leftovers(tmp_path)
+
+    def test_atomic_new_file_copies_no_owner_or_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With nothing to copy from, the new file keeps mkstemp's 0600."""
+        calls = self._record_fchown_and_fchmod(monkeypatch)
+        target = tmp_path / "config.toml"
+
+        replace_file_atomically(target, _NEW)
+
+        assert calls == []
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+
+
+class TestBindMount:
+    """A single-file bind mount fails clearly (D-08); a directory mount works."""
+
+    def test_ebusy_single_file_bind_mount_is_a_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        EBUSY becomes a ConfigError naming the file and the fix.
+
+        The kernel refuses to rename over a bind-mount point. A raw OSError
+        would leave the operator guessing; a non-atomic fallback would bring
+        back the truncated-config risk this helper exists to remove.
+        """
+
+        def busy(self: Path, target: object) -> Path:
+            """Refuse the rename the way a single-file bind mount does."""
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+        monkeypatch.setattr(Path, "replace", busy)
+        target = tmp_path / "config.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+
+        with pytest.raises(ConfigError) as excinfo:
+            replace_file_atomically(target, _NEW)
+
+        message = str(excinfo.value)
+        assert str(target.resolve()) in message
+        assert "bind-mounted as a single file" in message
+        assert "Mount its directory instead" in message
+        assert "docs/how-to/deploy-docker-compose.md" in message
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
+        _leftovers(tmp_path)
+
+    def test_directory_bind_mount_layout_replaces_in_place(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The documented ``./config:/etc/saneless`` layout is rewritten normally.
+
+        The temp file is created inside the mounted directory, beside
+        ``config.toml``, and nothing else is left there afterwards (CFG-09).
+        """
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        target = config_dir / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+
+        result = replace_file_atomically(target, _NEW)
+
+        assert result == target.resolve()
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        assert sorted(entry.name for entry in config_dir.iterdir()) == ["config.toml"]
+
+
+# The real-kernel variant runs the helper inside an unprivileged user and mount
+# namespace, where a bind mount needs no root. Every argv element is a literal;
+# the per-test paths travel in the environment. It is skipped wherever user
+# namespaces are unavailable (for example a restricted CI runner); the
+# monkeypatched EBUSY test above is the requirement's evidence either way.
+_UNSHARE = Path("/usr/bin/unshare")
+_NAMESPACE_SCRIPT = """\
+import sys
+from pathlib import Path
+
+from saneless.atomic_write import replace_file_atomically
+from saneless.exceptions import ConfigError
+
+try:
+    replace_file_atomically(Path(sys.argv[1]), "new = 1\\n")
+except ConfigError as exc:
+    print(exc)
+    sys.exit(3)
+print("replaced")
+"""
+
+
+def _run_in_mount_namespace(
+    source: Path, mount_point: Path, target: Path
+) -> subprocess.CompletedProcess[str]:
+    """Bind-mount ``source`` on ``mount_point`` in a private namespace, then write."""
+    env = {
+        **os.environ,
+        "SANELESS_TEST_SOURCE": str(source),
+        "SANELESS_TEST_MOUNT_POINT": str(mount_point),
+        "SANELESS_TEST_TARGET": str(target),
+        "SANELESS_TEST_PYTHON": sys.executable,
+        "SANELESS_TEST_SCRIPT": _NAMESPACE_SCRIPT,
+    }
+    return subprocess.run(
+        [
+            "/usr/bin/unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "/bin/sh",
+            "-c",
+            'mount --bind "$SANELESS_TEST_SOURCE" "$SANELESS_TEST_MOUNT_POINT" '
+            '&& exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SCRIPT" '
+            '"$SANELESS_TEST_TARGET"',
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+@pytest.fixture
+def mount_namespace() -> None:
+    """Skip unless this host lets an unprivileged user create a mount namespace."""
+    if not _UNSHARE.is_file():
+        pytest.skip("unshare is not installed")
+    probe = subprocess.run(
+        ["/usr/bin/unshare", "--user", "--map-root-user", "--mount", "/bin/true"],
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if probe.returncode != 0:
+        pytest.skip("unprivileged user and mount namespaces are not available")
+
+
+@pytest.mark.usefixtures("mount_namespace")
+class TestRealBindMount:
+    """The kernel's own answer for both mount shapes (D-08, CFG-09)."""
+
+    def test_real_single_file_bind_mount_raises_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        """Renaming over a real single-file bind mount is EBUSY -> ConfigError."""
+        host_file = tmp_path / "host-config.toml"
+        host_file.write_text(_ORIGINAL, encoding="utf-8")
+        container_dir = tmp_path / "etc-saneless"
+        container_dir.mkdir()
+        mounted = container_dir / "config.toml"
+        mounted.write_text("", encoding="utf-8")
+
+        completed = _run_in_mount_namespace(host_file, mounted, mounted)
+
+        assert completed.returncode == 3, completed.stderr
+        assert "Mount its directory instead" in completed.stdout
+        assert host_file.read_text(encoding="utf-8") == _ORIGINAL
+        _leftovers(container_dir)
+
+    def test_real_directory_bind_mount_replaces_the_host_file(
+        self, tmp_path: Path
+    ) -> None:
+        """Through a real directory bind mount, the host's config.toml changes."""
+        host_dir = tmp_path / "config"
+        host_dir.mkdir()
+        host_file = host_dir / "config.toml"
+        host_file.write_text(_ORIGINAL, encoding="utf-8")
+        container_dir = tmp_path / "etc-saneless"
+        container_dir.mkdir()
+
+        completed = _run_in_mount_namespace(
+            host_dir, container_dir, container_dir / "config.toml"
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert "replaced" in completed.stdout
+        assert host_file.read_text(encoding="utf-8") == "new = 1\n"
+        assert sorted(entry.name for entry in host_dir.iterdir()) == ["config.toml"]
