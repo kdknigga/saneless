@@ -709,7 +709,7 @@ class TestManualDuplexPrompt:
         ],
         ids=["lost-terminal", "undecodable-input"],
     )
-    def test_a_broken_prompt_aborts_at_once_with_a_logged_traceback(
+    def test_a_broken_prompt_aborts_at_once_with_its_abort_cause_and_traceback(
         self,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
@@ -722,8 +722,10 @@ class TestManualDuplexPrompt:
         the calling thread waiting out the whole ``flip_timeout_seconds`` and
         then report that nobody confirmed the flip, which was false.  It is an
         abort, not a fourth outcome (D-09), and the traceback in the log carries
-        the real cause.  The suite's ``filterwarnings = ["error"]`` also turns a
-        prompt thread that died unhandled into a failure here.
+        the real cause.  The failure itself is kept as ``abort_cause``, so the
+        pipeline reports a broken prompt as a failure rather than as the
+        operator's cancel (D-02).  The suite's ``filterwarnings = ["error"]``
+        also turns a prompt thread that died unhandled into a failure here.
         """
 
         def broken_confirm(*_args: object, **_kwargs: object) -> bool:
@@ -740,6 +742,7 @@ class TestManualDuplexPrompt:
 
         assert outcome is FlipOutcome.ABORTED
         assert elapsed < 5
+        assert coordinator.abort_cause is failure
         records = [
             record
             for record in caplog.records
@@ -749,6 +752,84 @@ class TestManualDuplexPrompt:
         ]
         assert len(records) == 1
         assert records[0].exc_info is not None
+
+    def test_answering_no_leaves_no_abort_cause(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A no is the operator's own abort, so there is no cause to report (D-02)."""
+        monkeypatch.setattr(
+            "saneless.cli.click.confirm", lambda *_args, **_kwargs: False
+        )
+        coordinator = ClickFlipCoordinator()
+
+        outcome = coordinator.wait_for_flip(600)
+
+        assert outcome is FlipOutcome.ABORTED
+        assert coordinator.abort_cause is None
+
+    def test_eof_at_the_prompt_leaves_no_abort_cause(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl-D (``click.Abort`` from the prompt) is an operator abort (D-02)."""
+
+        def end_of_input(*_args: object, **_kwargs: object) -> bool:
+            """Fail the way click.confirm does at EOF."""
+            raise click.Abort
+
+        monkeypatch.setattr("saneless.cli.click.confirm", end_of_input)
+        coordinator = ClickFlipCoordinator()
+
+        outcome = coordinator.wait_for_flip(600)
+
+        assert outcome is FlipOutcome.ABORTED
+        assert coordinator.abort_cause is None
+
+    def test_ctrl_c_before_a_prompt_failure_leaves_no_abort_cause(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A Ctrl-C that claimed first keeps its meaning when the prompt then breaks.
+
+        The order is forced, not timed: the prompt stays blocked until
+        ``wait_for_flip`` has already returned the Ctrl-C's ``ABORTED``, and only
+        then fails.  Its offer loses, so no cause is recorded and the run is
+        still the operator's cancel -- but the failure is still logged (D-02,
+        WR-08).
+        """
+
+        def interrupted_wait(timeout: float) -> None:
+            """Raise as SIGINT would on the main thread."""
+            raise KeyboardInterrupt
+
+        release = threading.Event()
+
+        def fails_once_released(*_args: object, **_kwargs: object) -> bool:
+            """Block until the test lets go, then fail like a lost terminal."""
+            release.wait()
+            raise OSError(errno.EIO, "Input/output error")
+
+        monkeypatch.setattr("saneless.cli.click.confirm", fails_once_released)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+        coordinator = ClickFlipCoordinator()
+        monkeypatch.setattr(coordinator._slot, "wait", interrupted_wait)
+
+        try:
+            outcome = coordinator.wait_for_flip(600)
+        finally:
+            release.set()
+        for thread in threading.enumerate():
+            if thread.name == "saneless-flip-prompt":
+                thread.join(timeout=5)
+
+        assert outcome is FlipOutcome.ABORTED
+        assert coordinator.abort_cause is None
+        assert any(
+            "Flip prompt failed" in record.getMessage() and record.exc_info is not None
+            for record in caplog.records
+            if record.name == "saneless.cli"
+        )
 
     def test_the_coordinator_times_out_at_a_zero_timeout(
         self, monkeypatch: pytest.MonkeyPatch
