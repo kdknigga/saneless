@@ -19,6 +19,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SecretStr,
     ValidationError,
     field_validator,
     model_validator,
@@ -37,6 +38,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_RESOLUTION",
+    "LogLevel",
     "OutputConfig",
     "PaperlessConfig",
     "ProfileConfig",
@@ -55,6 +57,13 @@ DEFAULT_RESOLUTION = 300
 
 300 DPI is the minimum recommended by Tesseract OCR and the industry
 standard for professional document scanning. See Phase 11 research.
+"""
+
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+"""The logging level names ``output.log_level`` accepts (CFG-04, M-21).
+
+Each is a key of ``logging.getLevelNamesMapping()`` and, lower-cased, a valid
+uvicorn ``log_level``.
 """
 
 
@@ -90,7 +99,10 @@ class PaperlessConfig(BaseModel):
     """Paperless-ngx API connection settings."""
 
     url: str = ""
-    token: str = ""
+    # Masked in repr, tracebacks and model_dump (CFG-05, N-15). Unwrapped with
+    # get_secret_value only where PaperlessClient is built: cli.py scan and
+    # web/app.py create_app.
+    token: SecretStr = SecretStr("")
     consume_dir: str = ""
 
 
@@ -156,7 +168,7 @@ class OutputConfig(BaseModel):
     # changes both defaults in a single edit; no env var is consulted here.
     data_dir: str = str(Path.home() / ".local" / "state" / "saneless")
     log_file: str = str(Path.home() / ".local" / "state" / "saneless" / "saneless.log")
-    log_level: str = "INFO"
+    log_level: LogLevel = "INFO"
     log_max_bytes: int = 10_485_760
     log_backup_count: int = 5
     history_retention_days: int = 7
@@ -175,6 +187,30 @@ class OutputConfig(BaseModel):
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalise_log_level(cls, value: object) -> object:
+        """
+        Normalise a configured level name before the ``Literal`` check (CFG-04).
+
+        ``getattr(logging, name)`` used to accept any attribute name and crash
+        on an unknown one such as ``TRACE`` long after load (M-21). The name is
+        trimmed and upper-cased, and ``WARN`` is read as ``WARNING`` because
+        ``logging.getLevelNamesMapping()`` itself lists ``WARN``. Anything that
+        is not a string is returned unchanged so pydantic rejects it.
+
+        Args:
+            value: The raw ``log_level`` input.
+
+        Returns:
+            The normalised name for a string input, else the input unchanged.
+
+        """
+        if isinstance(value, str):
+            upper = value.strip().upper()
+            return "WARNING" if upper == "WARN" else upper
+        return value
 
     @property
     def db_path(self) -> Path:
