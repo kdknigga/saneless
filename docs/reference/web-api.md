@@ -98,7 +98,9 @@ A `429` or `503` is a refused attempt, not a missing one: it is recorded in job 
 
 Returns the current or most recent job status. Used by HTMX polling to update the status indicator.
 
-**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`.
+**Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`, `CANCELLED`.
+
+`DONE`, `ERROR`, `FALLBACK` and `CANCELLED` are terminal: once the job reaches one of them the partial stops polling and the Scan button is enabled again. `CANCELLED` means the operator stopped the scan on purpose, such as with Abort scan at the flip prompt. The web UI shows it as `Cancelled: <title>` in muted grey, not as an error.
 
 ---
 
@@ -158,7 +160,7 @@ While that job is still recorded `AWAITING_FLIP` and its flip wait has been answ
 
 ### `POST /api/flip/abort`
 
-Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt. Pass B never starts, nothing is uploaded, and the job ends `ERROR` with `Manual duplex scan aborted at the flip prompt`.
+Tells a manual duplex job waiting in `AWAITING_FLIP` to stop at the flip prompt. Pass B never starts, nothing is uploaded, and the job ends `CANCELLED` (not `ERROR`) with the message `Manual duplex scan cancelled at the flip prompt`. A job whose flip wait timed out still ends `ERROR`, and so does one whose flip wait was ended by the server shutting down, which is recorded with `The server restarted before this scan finished`.
 
 **Request fields (form-encoded):**
 
