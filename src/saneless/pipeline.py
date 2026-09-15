@@ -23,7 +23,9 @@ from saneless.exceptions import (
     ConfigError,
     PaperlessError,
     SanelessError,
+    ScanCancelledError,
     ScanError,
+    describe,
 )
 from saneless.pages import filter_empty_pages, generate_thumbnail
 from saneless.pdf import assemble_pdf, build_pdf_filename
@@ -976,10 +978,12 @@ def _scan_manual_duplex(
         or a _DuplexMismatch holding both passes when the counts disagree.
 
     Raises:
+        ScanCancelledError: If the operator aborts at the flip prompt.  Raised
+            before pass B starts.
         ScanError: ``No pages were scanned`` if either pass returns no pages --
             pass A before anyone is asked to flip, pass B before the count
-            comparison. Otherwise, if the operator aborts at the flip prompt,
-            or if the flip wait times out.  Both raise before pass B starts.
+            comparison. Otherwise, if the flip prompt itself failed, or if the
+            flip wait times out.  Both raise before pass B starts.
         AssertionError: If the coordinator returns a value that is not a
             FlipOutcome member.
 
@@ -1004,14 +1008,22 @@ def _scan_manual_duplex(
     outcome = flip.coordinator.wait_for_flip(flip.timeout)
     # A match with assert_never rather than an if-chain: a fourth FlipOutcome
     # member then fails ty and pyrefly at edit time instead of falling through
-    # into pass B.  These are plain ScanErrors on purpose (D-15) -- classifying
-    # an abort as a cancellation rather than a failure is Phase 28's EXC-04.
+    # into pass B.  An explicit abort -- web Abort, n, Ctrl-D, Ctrl-C -- is a
+    # cancellation, not a scanner failure (EXC-04, N-08).  A broken prompt
+    # (an ABORTED that carries an abort_cause) and a timeout are failures,
+    # because nobody chose to stop (D-02).  A shutdown-claimed abort also
+    # arrives here as ScanCancelledError; the worker records it as a restart
+    # by checking aborted_by_shutdown before anything else (WR-06).
     match outcome:
         case FlipOutcome.CONTINUED:
             pass
         case FlipOutcome.ABORTED:
-            msg = "Manual duplex scan aborted at the flip prompt"
-            raise ScanError(msg)
+            cause = flip.coordinator.abort_cause
+            if cause is not None:
+                msg = f"Flip prompt failed: {describe(cause)}"
+                raise ScanError(msg) from cause
+            msg = "Manual duplex scan cancelled at the flip prompt"
+            raise ScanCancelledError(msg)
         case FlipOutcome.TIMED_OUT:
             msg = (
                 f"Manual duplex flip wait timed out after {flip.timeout:g} "
@@ -1175,10 +1187,12 @@ def run_pipeline(
     Raises:
         ConfigError: If the profile or device is not configured, or a manual
             duplex profile is run with no flip coordinator.
+        ScanCancelledError: If the operator aborts a manual duplex scan at the
+            flip prompt.
         ScanError: If scanning fails; ``No pages were scanned`` if a scan pass
             returned no pages; ``All pages were blank`` if empty-page detection
-            removed every page; or if a manual duplex flip wait is aborted or
-            times out.
+            removed every page; or if a manual duplex flip prompt fails or its
+            wait times out.
         PaperlessError: If upload or polling fails. The message names where
             the assembled PDF was preserved, or -- if preservation failed
             too -- reports both failures.
