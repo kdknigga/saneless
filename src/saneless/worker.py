@@ -12,6 +12,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
 from .auto_profiles import (
@@ -89,6 +90,31 @@ _OWED_RETRY_DEGRADED_AFTER: Final = 3
 # appliance inside history_max_rows.  The startup prune is the lifespan's.  Not
 # configurable.  Read at call time, so tests can shorten it.
 _PRUNE_INTERVAL_SECONDS: Final = 3600.0
+
+
+@dataclass(frozen=True, slots=True)
+class _OwedWrite:
+    """
+    One terminal job-row write the worker still owes, exactly as it was meant.
+
+    The owed value is the whole ``finish_job`` call, not just an error text:
+    a success-path write that failed after Paperless accepted the document
+    must be replayed as DONE or FALLBACK with its result, never turned into an
+    ERROR that invites a duplicate scan (WR-02).  Frozen, so the flush's
+    delete-if-unchanged check compares values.
+
+    Attributes:
+        state: The terminal state to record.
+        result: What the scan produced, for a DONE or FALLBACK write.
+        error: The job-row error text, for an ERROR write.
+        category: The error's category, for an ERROR write.
+
+    """
+
+    state: JobState
+    result: JobResult | None = None
+    error: str | None = None
+    category: ErrorCategory | None = None
 
 
 class WorkerFlipCoordinator(FlipCoordinator):
@@ -255,15 +281,17 @@ class ScanWorker:
         # When the idle loop last pruned.  Starts now: the startup prune is the
         # lifespan's (26-09), so the first idle prune is an interval away.
         self._last_prune = time.monotonic()
-        # Job-row writes owed by id, with the error text and category to record:
-        # failures even the loop guard could not write, and rejected submits
-        # whose REJECTED write failed in the request (WR-01).  Every idle tick
+        # Terminal job-row writes owed by id, each kept as the write it was
+        # meant to be: the loop's own terminal writes that failed, kept with
+        # their real outcome (WR-02), failures even the loop guard could not
+        # write, and rejected submits whose REJECTED write failed in the
+        # request (WR-01).  Every idle tick
         # retries them (CR-01), and a streak of failed retries degrades the
         # worker (WR-10).  Shared by the worker thread (the guard and the
         # idle flush) and request threads (owe_rejection), so every read and
         # write goes through _unrecorded_lock.
         self._unrecorded_lock = threading.Lock()
-        self._unrecorded_failures: dict[str, tuple[str, ErrorCategory | None]] = {}
+        self._unrecorded_failures: dict[str, _OwedWrite] = {}
         # Set and cleared by the worker thread (and by mark_recovery_pending,
         # before the thread exists); read by request threads through health and
         # submit(), so an Event rather than a bare bool (D-10, D-11).
@@ -312,8 +340,9 @@ class ScanWorker:
             error: The job-row error text for the rejection.
 
         """
+        owed = _OwedWrite(JobState.ERROR, error=error, category=ErrorCategory.REJECTED)
         with self._unrecorded_lock:
-            self._unrecorded_failures[job_id] = (error, ErrorCategory.REJECTED)
+            self._unrecorded_failures[job_id] = owed
 
     def owed_rejection_ids(self) -> frozenset[str]:
         """
@@ -338,8 +367,8 @@ class ScanWorker:
         with self._unrecorded_lock:
             return frozenset(
                 job_id
-                for job_id, (_error, category) in self._unrecorded_failures.items()
-                if category is ErrorCategory.REJECTED
+                for job_id, owed in self._unrecorded_failures.items()
+                if owed.category is ErrorCategory.REJECTED
             )
 
     @property
@@ -730,9 +759,11 @@ class ScanWorker:
         Nothing ends the loop but stopping (ROBU-01, C-09).  A pipeline failure
         is recorded by ``_process_job`` itself; whatever still escapes it is a
         failure of the loop's own job store writes, which is logged, counted
-        towards degraded (D-10), and answered with one best-effort ERROR write
-        so the row does not sit active until restart (research Pitfall 6).  If
-        that write fails too, idle ticks retry it until it lands (CR-01).
+        towards degraded (D-10), and answered with one best-effort terminal
+        write so the row does not sit active until restart (research Pitfall
+        6): the terminal write the loop was making, if that is what failed
+        (WR-02), otherwise an ERROR.  If that write fails too, idle ticks retry
+        it until it lands (CR-01).
 
         Before any job, the thread generates profiles (D-14).  A job submitted
         meanwhile waits in the queue and then runs against the generated set.
@@ -800,32 +831,97 @@ class ScanWorker:
 
     def _best_effort_fail(self, job: Job, exc: Exception) -> None:
         """
-        Try once to record ``job`` as failed after a loop-level failure.
+        Try once to record how ``job`` ended after a loop-level failure.
+
+        When the failed write was the loop's own terminal write, it is already
+        owed with the outcome it meant to record, and that write is the one
+        retried: a DONE or FALLBACK whose write failed after the upload stays
+        DONE or FALLBACK, never an ERROR that invites a duplicate scan (WR-02).
+        Otherwise the job is recorded as failed with the loop failure's text.
 
         The store just raised, so this may raise too; that is only logged.
-        The failure is remembered instead, and the next idle tick retries the
-        write -- through the recovery path while degraded -- until the store
-        accepts it (research Pitfall 6, CR-01).
+        The write is remembered instead, and the next idle tick retries it --
+        through the recovery path while degraded -- until the store accepts it
+        (research Pitfall 6, CR-01).
 
         Args:
             job: The job the loop was handling.
             exc: The loop-level failure.
 
         """
-        error, category = self._failure_record(exc)
+        with self._unrecorded_lock:
+            owed = self._unrecorded_failures.get(job.id)
+        if owed is None:
+            error, category = self._failure_record(exc)
+            owed = _OwedWrite(JobState.ERROR, error=error, category=category)
         try:
-            self._job_store.finish_job(
-                job.id, JobState.ERROR, error=error, error_category=category
-            )
+            self._write_owed(job.id, owed)
         except Exception:
             logger.warning(
-                "Could not record job %s as failed; it stays active until the "
+                "Could not record job %s as %s; it stays active until the "
                 "job store recovers",
                 job.id,
+                owed.state.value.lower(),
                 exc_info=True,
             )
             with self._unrecorded_lock:
-                self._unrecorded_failures[job.id] = (error, category)
+                self._unrecorded_failures[job.id] = owed
+        else:
+            self._forget_owed(job.id, owed)
+
+    def _write_owed(self, job_id: str, owed: _OwedWrite) -> None:
+        """
+        Make one owed terminal write, exactly as it was meant.
+
+        Args:
+            job_id: The job row to write.
+            owed: The terminal write to make.
+
+        """
+        self._job_store.finish_job(
+            job_id,
+            owed.state,
+            result=owed.result,
+            error=owed.error,
+            error_category=owed.category,
+        )
+
+    def _forget_owed(self, job_id: str, owed: _OwedWrite) -> None:
+        """
+        Drop ``job_id``'s owed write once written, unless it was re-owed since.
+
+        Args:
+            job_id: The job row just written.
+            owed: The write that landed.
+
+        """
+        with self._unrecorded_lock:
+            if self._unrecorded_failures.get(job_id) == owed:
+                del self._unrecorded_failures[job_id]
+
+    def _finish_or_owe(self, job_id: str, owed: _OwedWrite) -> None:
+        """
+        Make one of the loop's own terminal writes, owing it if the store raises.
+
+        The write is owed before the exception propagates, so the guard in
+        ``_run`` retries this write -- not an ERROR built from the store's
+        exception -- and so does every idle tick after it (WR-02).
+
+        Args:
+            job_id: The job row to write.
+            owed: The terminal write to make.
+
+        Raises:
+            Exception: Whatever the store raises; it stays a loop-level
+                failure (D-10).
+
+        """
+        try:
+            self._write_owed(job_id, owed)
+        except Exception:
+            with self._unrecorded_lock:
+                self._unrecorded_failures[job_id] = owed
+            raise
 
     def _idle_housekeeping(self) -> None:
         """
@@ -886,7 +982,7 @@ class ScanWorker:
 
     def _flush_unrecorded_failures(self) -> None:
         """
-        Write the ERROR rows the loop guard could not, dropping each once written.
+        Write the terminal rows the worker still owes, dropping each once written.
 
         This runs only on an Empty tick -- from ``_idle_housekeeping`` or
         ``_try_recover`` -- so no job is current, and an owed id belongs to a
@@ -908,16 +1004,12 @@ class ScanWorker:
         with self._unrecorded_lock:
             owed_writes = list(self._unrecorded_failures.items())
         for job_id, owed in owed_writes:
-            error, category = owed
-            self._job_store.finish_job(
-                job_id, JobState.ERROR, error=error, error_category=category
-            )
-            with self._unrecorded_lock:
-                if self._unrecorded_failures.get(job_id) == owed:
-                    del self._unrecorded_failures[job_id]
+            self._write_owed(job_id, owed)
+            self._forget_owed(job_id, owed)
             logger.info(
-                "Recorded job %s as failed now that the job store accepts writes",
+                "Recorded job %s as %s now that the job store accepts writes",
                 job_id,
+                owed.state.value.lower(),
             )
 
     def _try_recover(self) -> None:
@@ -986,8 +1078,9 @@ class ScanWorker:
         this returns normally.  That includes a store write inside a pipeline
         callback, which reaches here through ``run_pipeline``.  The loop's own
         store writes -- SCANNING before the pipeline, and the terminal write of
-        either outcome -- sit outside any catch, so their failure escapes to
-        ``_run`` as a loop-level failure (D-10).
+        either outcome -- are never swallowed, so their failure escapes to
+        ``_run`` as a loop-level failure (D-10).  A failed terminal write is
+        owed first, with the outcome it meant to record (WR-02).
 
         Args:
             job: The Job to process.
@@ -1072,16 +1165,15 @@ class ScanWorker:
             # No result argument: outcome, warning and all three page counts
             # stay NULL.  NULL means "never recorded"; 0 would claim a
             # measurement a job that never reached the scanner did not make.
-            # Outside any further catch on purpose: if this write raises, the
-            # job failure could not be recorded, and that is the loop's
-            # failure (D-10).  While stopping this is the worker thread's own
-            # final write, so D-07's "no shutdown-time write" -- which is about
-            # the lifespan writing over a running thread -- holds.
-            self._job_store.finish_job(
+            # If this write raises, the job failure could not be recorded, and
+            # that is the loop's failure (D-10); the write is owed first, so
+            # the pipeline's own error is what lands later (WR-02).  While
+            # stopping this is the worker thread's own final write, so D-07's
+            # "no shutdown-time write" -- which is about the lifespan writing
+            # over a running thread -- holds.
+            self._finish_or_owe(
                 job.id,
-                JobState.ERROR,
-                error=error,
-                error_category=category,
+                _OwedWrite(JobState.ERROR, error=error, category=category),
             )
             if category is None:
                 # Only a shutdown records no category: stop() answered the
@@ -1095,15 +1187,19 @@ class ScanWorker:
         # The terminal state is derived from the outcome the pipeline returned,
         # never assumed.  The mapping below is a match with assert_never, so a
         # future third ScanOutcome member fails the type gate at edit time
-        # rather than falling silently into an else.
-        self._job_store.finish_job(
+        # rather than falling silently into an else.  The upload has already
+        # happened, so a failed write is owed with this outcome and replayed
+        # as it is, never recorded as an ERROR that invites a rescan (WR-02).
+        self._finish_or_owe(
             job.id,
-            job_state_for(result.outcome),
-            result=JobResult(
-                outcome=result.outcome,
-                warning=result.warning,
-                pages_scanned=result.pages_scanned,
-                pages_removed=result.pages_removed,
-                pages_uploaded=result.pages_uploaded,
+            _OwedWrite(
+                job_state_for(result.outcome),
+                result=JobResult(
+                    outcome=result.outcome,
+                    warning=result.warning,
+                    pages_scanned=result.pages_scanned,
+                    pages_removed=result.pages_removed,
+                    pages_uploaded=result.pages_uploaded,
+                ),
             ),
         )
