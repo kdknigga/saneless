@@ -1982,6 +1982,153 @@ class TestServeCommand:
         assert result.exit_code == 0
         assert captured["app"] is not None
 
+    @staticmethod
+    def _loopback_settings() -> Settings:
+        """Build settings that serve on 127.0.0.1, port left at its 8080 default."""
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=_TEST_TMP,
+                data_dir=_TEST_DATA,
+                log_file=_TEST_LOG,
+                web_host="127.0.0.1",
+            ),
+        )
+
+    @staticmethod
+    def _stub_create_app(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace create_app with a stub, so no test leaves a JobStore open."""
+
+        def fake_create_app(*_args: object, **_kwargs: object) -> object:
+            return object()
+
+        monkeypatch.setattr("saneless.cli.create_app", fake_create_app)
+
+    @staticmethod
+    def _uvicorn_exits(monkeypatch: pytest.MonkeyPatch, code: int | None) -> list[str]:
+        """Patch uvicorn.run to raise ``SystemExit(code)``; return its call record."""
+        calls: list[str] = []
+
+        def exiting_run(_app: object, **_kwargs: object) -> None:
+            calls.append("uvicorn.run")
+            raise SystemExit(code)
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", exiting_run)
+        return calls
+
+    def test_serve_bind_failure_exits_2_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A port that cannot be bound is a setup problem: one line, exit 2.
+
+        It used to be a ``ClickException``, exit 1, which collided with "scan
+        error" in the shared exit-code table (D-07 amendment).
+        """
+        sock = MagicMock()
+        sock.bind.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+        monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: sock)
+        self._stub_create_app(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 0)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        assert result.stderr == (
+            f"Cannot bind to 127.0.0.1:8080: [Errno {errno.EADDRINUSE}] "
+            "Address already in use\n"
+        )
+        assert runs == []
+        sock.close.assert_called_once()
+
+    def test_serve_uvicorn_startup_failure_exits_2_not_3(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A uvicorn startup failure (its own exit 3) becomes exit 2 (D-07 amendment).
+
+        Exit 3 is "Paperless error" in saneless's table, so passing uvicorn's
+        status through would send scripts and systemd after the wrong cause.
+        """
+        self._mock_socket(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 3)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1, result.stderr
+        assert "web server could not start" in lines[0]
+        assert "127.0.0.1:8080" in lines[0]
+        assert "Traceback" not in result.output
+        assert runs == ["uvicorn.run"]
+
+    @pytest.mark.parametrize("code", [0, None])
+    def test_serve_uvicorn_clean_system_exit_stays_0(
+        self, monkeypatch: pytest.MonkeyPatch, code: int | None
+    ) -> None:
+        """A ``SystemExit`` with no failure status from uvicorn still exits 0."""
+        self._mock_socket(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        self._uvicorn_exits(monkeypatch, code)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stderr == ""
+
+    def test_serve_normal_stop_exits_0_not_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Ctrl-C on ``serve`` is a normal stop, exit 0, not a cancel (D-03).
+
+        uvicorn.run catches the KeyboardInterrupt itself and returns, so the
+        stub returning is exactly what a graceful stop looks like to saneless.
+        """
+        self._mock_socket(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        calls: list[str] = []
+
+        def returning_run(_app: object, **_kwargs: object) -> None:
+            calls.append("uvicorn.run")
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", returning_run)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["uvicorn.run"]
+        assert "Cancelled" not in result.output
+
+    def test_serve_malformed_paperless_url_exits_3(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Paperless URL the client cannot parse is a Paperless error, exit 3."""
+        self._mock_socket(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 0)
+
+        def failing_create_app(*_args: object, **_kwargs: object) -> object:
+            msg = "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
+            raise PaperlessError(msg)
+
+        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 3, result.output
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1, result.stderr
+        assert lines[0].startswith(
+            "Paperless error: Paperless URL http://host:abc is not valid"
+        )
+        assert runs == []
+
 
 class TestAutoProfiles:
     """auto-profiles command tests."""
