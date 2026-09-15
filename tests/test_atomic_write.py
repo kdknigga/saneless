@@ -475,6 +475,105 @@ class TestModeAndOwner:
         assert stat.S_IMODE(target.stat().st_mode) == 0o640
         _leftovers(tmp_path)
 
+    @pytest.mark.parametrize(
+        "code", [errno.EINVAL, errno.EOPNOTSUPP, errno.EPERM], ids=errno.errorcode.get
+    )
+    def test_atomic_fchown_unsupported_is_skipped_silently(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, code: int
+    ) -> None:
+        """
+        A chown the filesystem cannot perform does not fail the write (WR-02).
+
+        In a rootless container a host uid that is not mapped shows up as the
+        overflow uid, and chown to it is EINVAL; FUSE, CIFS and vfat mounts
+        answer EOPNOTSUPP. Replacing the file still works, so it must happen.
+        """
+
+        def unsupported_fchown(fd: int, uid: int, gid: int) -> None:
+            """Refuse every ownership change with ``code``."""
+            raise OSError(code, os.strerror(code))
+
+        monkeypatch.setattr(os, "fchown", unsupported_fchown)
+        target = tmp_path / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        target.chmod(0o640)
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        assert stat.S_IMODE(target.stat().st_mode) == 0o640
+        _leftovers(tmp_path)
+
+    def test_atomic_refused_owner_change_still_keeps_the_group(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        When the owner cannot be set, the group is still copied (WR-02).
+
+        A ``root:saneless`` 0664 config rewritten by the ``saneless`` user
+        cannot keep root as owner, but the writer may set the group it is a
+        member of, and before this the group was lost too.
+        """
+        calls: list[tuple[int, int]] = []
+        real_fchown = os.fchown
+
+        def owner_refused(fd: int, uid: int, gid: int) -> None:
+            """Refuse an owner change, allow a group-only change."""
+            calls.append((uid, gid))
+            if uid != -1:
+                raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+            real_fchown(fd, uid, gid)
+
+        monkeypatch.setattr(os, "fchown", owner_refused)
+        target = tmp_path / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+        original = target.stat()
+
+        replace_file_atomically(target, _NEW)
+
+        assert calls == [
+            (original.st_uid, original.st_gid),
+            (-1, original.st_gid),
+        ]
+        assert target.stat().st_gid == original.st_gid
+
+    def test_atomic_fchmod_unsupported_does_not_fail_the_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A filesystem without Unix modes still gets the new contents (WR-02)."""
+
+        def unsupported_fchmod(fd: int, mode: int) -> None:
+            """Refuse the mode change the way such a filesystem does."""
+            raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+
+        monkeypatch.setattr(os, "fchmod", unsupported_fchmod)
+        target = tmp_path / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+
+        replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _NEW.encode("utf-8")
+        _leftovers(tmp_path)
+
+    def test_atomic_unexpected_fchown_error_still_fails_and_cleans_up(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only "not permitted / not supported" is tolerated; EIO still fails."""
+
+        def broken_fchown(fd: int, uid: int, gid: int) -> None:
+            """Fail with an I/O error, which is not a refusal."""
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+        monkeypatch.setattr(os, "fchown", broken_fchown)
+        target = tmp_path / "config.toml"
+        target.write_text(_ORIGINAL, encoding="utf-8")
+
+        with pytest.raises(OSError, match=os.strerror(errno.EIO)):
+            replace_file_atomically(target, _NEW)
+
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
+        _leftovers(tmp_path)
+
     def test_atomic_new_file_copies_no_owner_or_mode(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

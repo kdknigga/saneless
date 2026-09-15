@@ -147,7 +147,7 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 | 1 | No scanners found |
 | 2 | Configuration error: the config could not be loaded, or the config file could not be rewritten (for example `config.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
 
-Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, they are written to `./saneless.toml` in the current directory. A config file created from scratch gets mode `0600`; rewriting an existing file keeps its mode and owner.
+Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, they are written to `./saneless.toml` in the current directory. A config file created from scratch gets mode `0600`; rewriting an existing file keeps its permission bits, owner and group, each when the process is permitted to set it and the filesystem supports it.
 
 Without `--force`, a profile that already exists is left alone. With `--force`, the command merges rather than replaces: in a profile marked `auto_generated = true`, the generated keys are refreshed in place, and every other key (`default_tags`, `title`, and so on) and your comments are kept. A profile without `auto_generated = true` is never changed; it is skipped and reported. The output names the absolute path written, then prints one line for each kind of change that happened:
 
