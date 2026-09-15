@@ -43,7 +43,7 @@ PDF assembly uses `img2pdf`, which embeds scanned PIL images directly into the P
 
 The `PaperlessClient` sends the PDF via multipart POST to the paperless-ngx REST API (`/api/documents/post_document/`) with metadata including title, tags, correspondent, and creation date. After upload, it polls the task endpoint with exponential backoff until paperless-ngx reports success or failure.
 
-If a consume directory is configured, the PDF is deposited there as a fallback when the upload cannot get through: after the retries for a network error, a timeout or a server error (5xx), and at once, without retrying, for a `paperless.url` with no usable `http://` or `https://` scheme. An upload paperless-ngx rejects (a 4xx, such as an authentication failure) never falls back: the scan fails with Paperless's reason. See [How Consume Directory Fallback Works](consume-directory-fallback.md) for details.
+If a consume directory is configured, the PDF is deposited there as a fallback when the upload cannot get through: after the retries for a network error, a timeout or a server error (5xx), and at once, without retrying, for a `paperless.url` with no usable `http://` or `https://` scheme. An upload paperless-ngx rejects (a 4xx, such as an authentication failure) or redirects (a 3xx, usually a `paperless.url` pointing at the wrong address) never falls back: the scan fails with Paperless's reason or the redirect target. See [How Consume Directory Fallback Works](consume-directory-fallback.md) for details.
 
 ## Worker Thread Model
 

@@ -654,6 +654,92 @@ class TestUploadFailureTranslation:
         assert sleeps == []
         assert not consume_dir.exists()
 
+    @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
+    def test_redirect_fails_fast_naming_its_target(
+        self,
+        consume_name: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        sleeps: list[float],
+    ) -> None:
+        """
+        WR-03: a redirect is not transient, so it is never retried or copied.
+
+        A plain ``http://`` URL behind a proxy that redirects to ``https://``
+        would only be redirected again; the message names the target so the
+        operator can correct ``paperless.url``.
+        """
+        consume_dir = tmp_path / "consume"
+        target = "https://paperless:8443/api/documents/post_document/"
+        handler = _CountingHandler(
+            _answering(httpx.Response(301, headers={"location": target}))
+        )
+        client = _upload_client(
+            handler, consume_dir=str(tmp_path / consume_name) if consume_name else ""
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Redirected")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            f"Paperless redirected the upload (301 Moved Permanently) to {target}; "
+            "check paperless.url"
+        )
+        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+        assert handler.calls == 1
+        assert sleeps == []
+        assert not consume_dir.exists()
+
+    def test_non_redirect_3xx_fails_fast_by_its_status(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """A 3xx with no target is final too, reported by status and body."""
+        handler = _CountingHandler(_answering(httpx.Response(304)))
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Not modified")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Paperless did not accept the upload (304 Not Modified): "
+            "(empty response body)"
+        )
+        assert handler.calls == 1
+        assert sleeps == []
+
+    def test_retry_log_line_is_one_line_without_the_url(
+        self,
+        sample_pdf: Path,
+        sleeps: list[float],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        WR-03: the attempt log renders a 5xx as status and body, on one line.
+
+        httpx's own text for a status error spans three lines and names the
+        full request URL.
+        """
+        caplog.set_level(logging.WARNING, logger="saneless.paperless")
+        handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
+        client = _upload_client(handler, consume_dir="")
+        try:
+            with pytest.raises(PaperlessError):
+                client.upload_document(sample_pdf, title="Down")
+        finally:
+            client.close()
+        attempts = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Upload attempt")
+        ]
+        assert attempts == [
+            f"Upload attempt {n}/3 failed: 503 Service Unavailable: down"
+            for n in (1, 2, 3)
+        ]
+        assert len(sleeps) == 2
+
     def test_5xx_is_retried_then_raises(
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
