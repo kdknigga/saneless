@@ -18,7 +18,7 @@ from pathlib import Path
 
 import httpx
 
-from .exceptions import PaperlessError, PaperlessTimeoutError
+from .exceptions import PaperlessError, PaperlessTimeoutError, describe
 from .vocabulary import ConnectionStatus
 
 __all__ = ["PaperlessClient", "UploadResult"]
@@ -39,11 +39,14 @@ _API_VERSION_ACCEPT = "application/json; version=9"
 # progress, so polling it to the deadline would report a misattributed timeout.
 _TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
 
-# Upper bound on how much of a non-200 response body is interpolated into an
+# Upper bound on how much of an error response body is interpolated into an
 # error message.  That message is recorded verbatim in the job store and
-# rendered in the web status area (T-23-16), so an upstream returning a
-# multi-megabyte body or an HTML error page must not be able to flood either.
-_MAX_ERROR_BODY_CHARS = 500
+# rendered in the web status area and on the terminal (T-23-16, M-17), so an
+# upstream returning a multi-megabyte body or an HTML error page must not be
+# able to flood any of them.  The full body is logged at DEBUG instead.
+_MAX_BODY_LINE_CHARS = 200
+
+_EMPTY_BODY = "(empty response body)"
 
 _NO_FAILURE_MESSAGE = "Paperless reported a failure but supplied no message"
 
@@ -123,23 +126,97 @@ def _failure_message(task: dict[str, object]) -> str:
     return _NO_FAILURE_MESSAGE
 
 
-def _truncated_body(text: str) -> str:
+def _first_message(value: object) -> str | None:
     """
-    Return a length-bounded rendering of an upstream response body.
+    Return the first message from a DRF error value.
 
     Args:
-        text: The raw response body.
+        value: A field's error value -- a string, or a list of strings.
 
     Returns:
-        The body unchanged when short, otherwise its first
-        ``_MAX_ERROR_BODY_CHARS`` characters with an explicit marker naming
-        the full length, so a reader can tell truncation from a short body.
+        The string itself, the first string in a list, or None when the
+        value carries no usable message.
 
     """
-    if len(text) <= _MAX_ERROR_BODY_CHARS:
-        return text
-    head = text[:_MAX_ERROR_BODY_CHARS]
-    return f"{head}... [truncated, {len(text)} characters total]"
+    if isinstance(value, list) and value:
+        value = value[0]
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _json_error_text(payload: object) -> str | None:
+    """
+    Pick the one message a reader needs out of a DRF error payload.
+
+    The shapes Django REST Framework produces are, in order of preference:
+    ``{"detail": "..."}`` (a string, or a list joined with spaces), a
+    field-error dict ``{"field": ["msg", ...]}`` (including
+    ``non_field_errors``) rendered as ``field: msg`` for its first field,
+    and a bare top-level list whose first string is used.
+
+    Args:
+        payload: The decoded JSON body.
+
+    Returns:
+        The chosen text, or None when the payload matches no known shape
+        and the caller should fall back to the raw body.
+
+    """
+    text: str | None = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail:
+            text = detail
+        elif isinstance(detail, list) and detail:
+            text = " ".join(str(item) for item in detail)
+        else:
+            for key, value in payload.items():
+                message = _first_message(value)
+                if message is not None:
+                    text = f"{key}: {message}"
+                    break
+    elif isinstance(payload, list):
+        text = _first_message(payload)
+    return text
+
+
+def _render_error_body(response: httpx.Response) -> str:
+    """
+    Reduce a Paperless error response body to one bounded line.
+
+    This is the single body renderer for the client (D-09): the upload 4xx
+    and the task poll non-200 both use it.  A DRF JSON error is reduced to
+    its ``detail``, else its first field error, else the first entry of a
+    top-level list; anything else (an HTML proxy page, plain text) is used
+    as it stands.  In every case the whitespace is collapsed, so no newline,
+    tab or other whitespace control character from the upstream can forge an
+    extra CLI line (T-28-24), and the text is cut to
+    ``_MAX_BODY_LINE_CHARS`` characters plus an ellipsis, so the job store
+    and the web status area cannot be flooded (T-23-16).  The full body is
+    logged at DEBUG so it stays diagnosable.
+
+    Args:
+        response: The error response.
+
+    Returns:
+        A non-empty single line; ``(empty response body)`` when the body
+        carried nothing.
+
+    """
+    logger.debug("Paperless error body (%s): %s", response.status_code, response.text)
+    try:
+        text = _json_error_text(response.json())
+    except ValueError:
+        text = None
+    if text is None:
+        text = response.text
+    line = " ".join(text.split())
+    if not line:
+        line = _EMPTY_BODY
+    elif len(line) > _MAX_BODY_LINE_CHARS:
+        line = f"{line[:_MAX_BODY_LINE_CHARS]}…"
+    return line
 
 
 @dataclass
@@ -188,15 +265,42 @@ class PaperlessClient:
     Client for the paperless-ngx REST API.
 
     Handles document uploads with metadata, task polling with
-    exponential backoff, and connection testing. Supports retry
-    on network errors and fallback to a consume directory.
+    exponential backoff, and connection testing.  The construction and
+    upload path is a module boundary (EXC-01): whatever goes wrong there
+    leaves as a ``PaperlessError`` naming the configured base URL and the
+    original text, chained to its cause, and never carrying the token (D-08).
+
+    Upload failures fall into two groups (D-10, M-17):
+
+    * **Retried** with exponential backoff, for ``max_retries`` attempts in
+      total: every transient ``httpx.TransportError`` -- ConnectError, the
+      timeouts, ReadError, WriteError, RemoteProtocolError (a reverse proxy
+      closing the connection), ProxyError -- and any 5xx response.
+    * **Fail fast**, with no further attempt: a 4xx rejection, a URL with no
+      usable scheme (``httpx.UnsupportedProtocol``, which is a TransportError
+      but will never succeed on a retry), any other ``httpx.HTTPError``, and
+      a 200 whose body is not JSON.
+
+    When a consume directory is configured it is the fallback both for
+    exhausted retries and for ``UnsupportedProtocol``: no retry is not no
+    fallback, and a scan must never be lost.  A 4xx is final and is not
+    copied.
+
+    Accepted risk (D-10 amendment): a retry after a response that was lost
+    in transit can make paperless-ngx v3, with its default settings, store a
+    second copy of the document.  A duplicate is easy to delete; a lost scan
+    is not.
 
     Args:
         url: Base URL of the paperless-ngx instance.
-        token: API authentication token.
+        token: API authentication token.  It is sent only in the
+            ``Authorization`` header and never interpolated into a message.
         consume_dir: Optional fallback directory for PDF upload failures.
-        max_retries: Maximum number of upload retry attempts.
+        max_retries: Maximum number of upload attempts, including the first.
         _transport: Optional httpx transport for testing.
+
+    Raises:
+        PaperlessError: If ``url`` is not a valid URL (``httpx.InvalidURL``).
 
     """
 
@@ -209,8 +313,9 @@ class PaperlessClient:
         _transport: httpx.BaseTransport | None = None,
     ) -> None:
         """Initialize the paperless-ngx API client."""
+        self._base_url = url.rstrip("/")
         client_kwargs: dict = {
-            "base_url": url.rstrip("/"),
+            "base_url": self._base_url,
             "headers": {
                 "Authorization": f"Token {token}",
                 "Accept": _API_VERSION_ACCEPT,
@@ -219,7 +324,11 @@ class PaperlessClient:
         }
         if _transport is not None:
             client_kwargs["transport"] = _transport
-        self._client = httpx.Client(**client_kwargs)
+        try:
+            self._client = httpx.Client(**client_kwargs)
+        except httpx.InvalidURL as exc:
+            msg = f"Paperless URL {self._base_url} is not valid: {describe(exc)}"
+            raise PaperlessError(msg) from exc
         self._consume_dir = consume_dir
         self._max_retries = max_retries
 
@@ -235,9 +344,14 @@ class PaperlessClient:
         Upload a PDF document to paperless-ngx.
 
         Builds multipart form data with title and optional metadata.
-        Tags are submitted as repeated form fields. Retries on network
-        errors with exponential backoff; falls back to consume directory
-        if configured and all retries are exhausted.
+        Tags are submitted as repeated form fields.  Every transient
+        transport failure and every 5xx is retried with exponential backoff
+        for ``max_retries`` attempts; a 4xx, an unusable URL scheme, any
+        other httpx error and a non-JSON 200 end the attempts at once
+        (D-10, M-17).  When the attempts end without delivery -- exhausted,
+        or cut short by ``httpx.UnsupportedProtocol`` -- and a consume
+        directory is configured, the PDF is copied there instead.  See the
+        class docstring for the accepted duplicate-document risk of retrying.
 
         Args:
             pdf_path: Path to the PDF file to upload.
@@ -249,13 +363,89 @@ class PaperlessClient:
         Returns:
             An UploadResult. On success ``delivered_to_api`` is True and
             ``task_uuid`` carries the paperless-ngx task id. When the
-            retries are exhausted and a consume directory is configured,
-            ``delivered_to_api`` is False and ``consume_dir_path`` names
-            the file the PDF was copied to.
+            attempts end without delivery and a consume directory is
+            configured, ``delivered_to_api`` is False and
+            ``consume_dir_path`` names the file the PDF was copied to.
 
         Raises:
-            PaperlessError: If upload fails and no fallback is available,
-                or if the server returns a 4xx error.
+            PaperlessError: If the server rejects the upload with a 4xx
+                (``Paperless rejected the upload (<status> <reason>): <line>``);
+                if the attempts end without delivery and no consume directory
+                is configured (``failed after N attempts``, or ``Could not
+                reach Paperless`` for an unusable URL scheme); if any other
+                httpx error occurs; if a 200 body is not JSON or carries no
+                task id; or if copying into the consume directory fails.
+                Every one is chained to its cause.
+
+        """
+        data = self._form_fields(title, tags, correspondent, created)
+        last_error: httpx.HTTPError | None = None
+        fast_fail = False
+
+        # Clause order is load-bearing: HTTPStatusError and UnsupportedProtocol
+        # are caught before the TransportError clause that retries (the latter
+        # is itself a TransportError), and HTTPError comes last as the catch-all.
+        for attempt in range(self._max_retries):
+            try:
+                task_id = self._post_document(pdf_path, data)
+            except httpx.HTTPStatusError as exc:
+                if 400 <= exc.response.status_code < 500:
+                    msg = (
+                        f"Paperless rejected the upload ({exc.response.status_code} "
+                        f"{exc.response.reason_phrase}): "
+                        f"{_render_error_body(exc.response)}"
+                    )
+                    raise PaperlessError(msg) from exc
+                last_error = exc
+                self._back_off(attempt, exc)
+            except httpx.UnsupportedProtocol as exc:
+                last_error = exc
+                fast_fail = True
+                break
+            except httpx.TransportError as exc:
+                last_error = exc
+                self._back_off(attempt, exc)
+            except httpx.HTTPError as exc:
+                msg = (
+                    f"Could not upload to Paperless at {self._base_url}: "
+                    f"{describe(exc)}"
+                )
+                raise PaperlessError(msg) from exc
+            else:
+                logger.info("Upload succeeded, task ID: %s", task_id)
+                return UploadResult(delivered_to_api=True, task_uuid=task_id)
+
+        if self._consume_dir:
+            return self._fall_back_to_consume_dir(pdf_path)
+
+        reason = "no attempt was made" if last_error is None else describe(last_error)
+        if fast_fail:
+            msg = f"Could not reach Paperless at {self._base_url}: {reason}"
+        else:
+            msg = (
+                f"Upload to Paperless at {self._base_url} failed after "
+                f"{self._max_retries} attempts: {reason}"
+            )
+        raise PaperlessError(msg) from last_error
+
+    @staticmethod
+    def _form_fields(
+        title: str,
+        tags: list[int] | None,
+        correspondent: int | None,
+        created: str | None,
+    ) -> dict[str, str | list[str]]:
+        """
+        Build the multipart form fields for an upload.
+
+        Args:
+            title: Document title.
+            tags: Optional tag IDs, submitted as repeated form fields.
+            correspondent: Optional correspondent ID.
+            created: Optional creation date string.
+
+        Returns:
+            The form fields, with absent metadata left out.
 
         """
         data: dict[str, str | list[str]] = {"title": title}
@@ -265,68 +455,98 @@ class PaperlessClient:
             data["correspondent"] = str(correspondent)
         if tags:
             data["tags"] = [str(tag_id) for tag_id in tags]
+        return data
 
-        last_error: Exception | None = None
+    def _post_document(self, pdf_path: Path, data: dict[str, str | list[str]]) -> str:
+        """
+        Make one upload attempt and return the task id Paperless assigned.
 
-        for attempt in range(self._max_retries):
-            try:
-                with pdf_path.open("rb") as f:
-                    response = self._client.post(
-                        "/api/documents/post_document/",
-                        data=data,
-                        files={"document": (pdf_path.name, f, "application/pdf")},
-                    )
-                response.raise_for_status()
-                task_id = response.json()
-                if task_id is None:
-                    # A JSON null body would otherwise become the string
-                    # "None" -- truthy, not None, and polled as a real task id.
-                    msg = "Paperless accepted the upload but returned no task ID"
-                    raise PaperlessError(msg)
-                logger.info("Upload succeeded, task ID: %s", task_id)
-                return UploadResult(delivered_to_api=True, task_uuid=str(task_id))
+        Args:
+            pdf_path: Path to the PDF file to upload.
+            data: The multipart form fields.
 
-            except (httpx.ConnectError, httpx.TimeoutException) as exc:
-                last_error = exc
-                logger.warning(
-                    "Upload attempt %d/%d failed: %s",
-                    attempt + 1,
-                    self._max_retries,
-                    exc,
-                )
-                if attempt < self._max_retries - 1:
-                    time.sleep(2**attempt)
+        Returns:
+            The task id, as a string.
 
-            except httpx.HTTPStatusError as exc:
-                if 400 <= exc.response.status_code < 500:
-                    msg = (
-                        f"Paperless rejected upload: "
-                        f"{exc.response.status_code} {exc.response.text}"
-                    )
-                    raise PaperlessError(msg) from exc
-                last_error = exc
-                logger.warning(
-                    "Upload attempt %d/%d failed: %s",
-                    attempt + 1,
-                    self._max_retries,
-                    exc,
-                )
-                if attempt < self._max_retries - 1:
-                    time.sleep(2**attempt)
+        Raises:
+            PaperlessError: If a 200 body is not JSON or is a JSON null.
 
-        # All retries exhausted
-        if self._consume_dir:
-            dest_dir = Path(self._consume_dir)
+        Any ``httpx.HTTPError`` from the request or from ``raise_for_status``
+        propagates: ``upload_document`` decides which of those to retry.
+
+        """
+        with pdf_path.open("rb") as f:
+            response = self._client.post(
+                "/api/documents/post_document/",
+                data=data,
+                files={"document": (pdf_path.name, f, "application/pdf")},
+            )
+        response.raise_for_status()
+        try:
+            task_id = response.json()
+        except ValueError as exc:
+            msg = (
+                f"Paperless at {self._base_url} returned a response that is "
+                f"not JSON: {describe(exc)}"
+            )
+            raise PaperlessError(msg) from exc
+        if task_id is None:
+            # A JSON null body would otherwise become the string
+            # "None" -- truthy, not None, and polled as a real task id.
+            msg = "Paperless accepted the upload but returned no task ID"
+            raise PaperlessError(msg)
+        return str(task_id)
+
+    def _back_off(self, attempt: int, exc: httpx.HTTPError) -> None:
+        """
+        Log a failed retryable attempt and sleep before the next one.
+
+        No sleep follows the last attempt: nothing is waiting for it.
+
+        Args:
+            attempt: The zero-based attempt that just failed.
+            exc: What it failed with.
+
+        """
+        logger.warning(
+            "Upload attempt %d/%d failed: %s",
+            attempt + 1,
+            self._max_retries,
+            describe(exc),
+        )
+        if attempt < self._max_retries - 1:
+            time.sleep(2**attempt)
+
+    def _fall_back_to_consume_dir(self, pdf_path: Path) -> UploadResult:
+        """
+        Copy the PDF into the consume directory after the upload did not land.
+
+        Args:
+            pdf_path: The PDF that could not be uploaded.
+
+        Returns:
+            An UploadResult naming the file the PDF was copied to.
+
+        Raises:
+            PaperlessError: If the directory cannot be created or the copy
+                fails, chained to the OSError (EXC-01).
+
+        """
+        dest_dir = Path(self._consume_dir)
+        dest = dest_dir / pdf_path.name
+        try:
             if not dest_dir.exists():
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 logger.warning("Created consume directory %s", dest_dir)
-            dest = dest_dir / pdf_path.name
             self._deliver_to_consume_dir(pdf_path, dest_dir, dest)
-            logger.warning("All retries exhausted. Copied PDF to %s", dest)
-            return UploadResult(delivered_to_api=False, consume_dir_path=dest)
-
-        msg = f"Upload failed after {self._max_retries} retries"
-        raise PaperlessError(msg) from last_error
+        except OSError as exc:
+            msg = (
+                f"Could not copy the PDF to the consume directory {dest_dir}: "
+                f"{describe(exc)}"
+            )
+            raise PaperlessError(msg) from exc
+        logger.warning("Upload failed; copied PDF to %s", dest)
+        return UploadResult(delivered_to_api=False, consume_dir_path=dest)
 
     @staticmethod
     def _deliver_to_consume_dir(pdf_path: Path, dest_dir: Path, dest: Path) -> None:
@@ -414,8 +634,9 @@ class PaperlessClient:
         Raises:
             PaperlessError: If the task ends FAILURE or REVOKED, carrying
                 the message paperless-ngx supplied, or if any poll returns a
-                non-200 response, carrying the status code and a
-                length-bounded excerpt of the body.
+                non-200 response, carrying the status code, the reason
+                phrase and the body reduced to one bounded line by
+                ``_render_error_body`` (D-09).
             PaperlessTimeoutError: If the deadline passes before the task
                 reaches a terminal status. The message names the task id so
                 the task can be looked up in paperless-ngx directly.
@@ -431,8 +652,8 @@ class PaperlessClient:
             )
             if response.status_code != 200:
                 msg = (
-                    f"Paperless task poll failed with HTTP "
-                    f"{response.status_code}: {_truncated_body(response.text)}"
+                    f"Paperless task poll failed ({response.status_code} "
+                    f"{response.reason_phrase}): {_render_error_body(response)}"
                 )
                 raise PaperlessError(msg)
 
