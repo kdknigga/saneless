@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -43,6 +44,7 @@ from saneless.exceptions import (
 from saneless.job import JobStore
 from saneless.paperless import UploadResult
 from saneless.pipeline import PipelineEvent, PipelineRequest
+from saneless.scanner import sane_backend
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -53,7 +55,7 @@ from saneless.scanner.base import (
 from saneless.vocabulary import FlipOutcome, JobState, state_label
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
 
     from click.testing import Result
 
@@ -110,11 +112,15 @@ def _patch_cli(
         settings._config_path = Path(config_path) if config_path else None
         return settings
 
+    def _no_sane_check() -> None:
+        """Stand in for require_sane, so no CLI test imports the real python-sane."""
+
     monkeypatch.setattr("saneless.cli.load_settings", _fake_load_settings)
     monkeypatch.setattr(
         "saneless.cli.configure_logging",
         lambda *_args, **_kwargs: None,
     )
+    monkeypatch.setattr("saneless.cli.require_sane", _no_sane_check)
 
     if scanner_cls is not None:
         monkeypatch.setattr("saneless.cli.SaneBackend", scanner_cls)
@@ -1522,6 +1528,139 @@ class TestStartupConfigLog:
         assert secret not in result.stderr
 
 
+_SANE_COMMANDS = ["scan", "devices", "auto-profiles", "serve"]
+_LIBSANE_MISSING = (
+    "libsane.so.1: cannot open shared object file: No such file or directory"
+)
+
+
+def _block_sane_import(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``import sane`` raise ModuleNotFoundError, as with python-sane absent."""
+    monkeypatch.setattr(sane_backend, "sane", None)
+    monkeypatch.setitem(sys.modules, "sane", None)
+
+
+def _break_libsane(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the python-sane import fail the way a missing libsane.so does."""
+
+    def unloadable() -> None:
+        raise ImportError(_LIBSANE_MISSING)
+
+    monkeypatch.setattr(sane_backend, "_ensure_sane", unloadable)
+
+
+class TestRequireSane:
+    """
+    Every SANE command refuses at once when python-sane cannot be imported (D-05).
+
+    python-sane is a mandatory dependency, so a missing package or an
+    unloadable libsane is a setup problem: one line naming the import's reason
+    and the SANE development package to install, exit 2, before the config is
+    loaded or the scanner touched. ``jobs`` does not need a scanner and must
+    keep working, and ``--help`` never reaches a command body (CFG-10), so
+    neither imports python-sane.
+    """
+
+    @pytest.mark.parametrize("command", _SANE_COMMANDS)
+    @pytest.mark.parametrize(
+        ("break_sane", "reason"),
+        [
+            (_block_sane_import, "import of sane halted"),
+            (_break_libsane, "libsane.so.1"),
+        ],
+        ids=["module_missing", "libsane_missing"],
+    )
+    def test_python_sane_unavailable_exits_2_before_anything_else(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+        break_sane: Callable[[pytest.MonkeyPatch], None],
+        reason: str,
+    ) -> None:
+        """One install-hint line and exit 2; no config load, no scanner (D-05)."""
+        runner, settings = _patch_cli(monkeypatch)
+        calls: list[str] = []
+
+        def recording_load(*_args: object, **_kwargs: object) -> Settings:
+            calls.append("load_settings")
+            return settings
+
+        class RecordingScanner:
+            """A scanner class that only records being constructed."""
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                """Record the construction."""
+                calls.append("SaneBackend")
+
+        monkeypatch.setattr("saneless.cli.load_settings", recording_load)
+        monkeypatch.setattr("saneless.cli.SaneBackend", RecordingScanner)
+        monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+        break_sane(monkeypatch)
+
+        result = runner.invoke(cli, [command])
+
+        assert result.exit_code == 2, result.output
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1, result.stderr
+        assert "python-sane cannot be imported" in lines[0]
+        assert reason in lines[0]
+        assert "libsane-dev" in lines[0]
+        assert "sane-backends-devel" in lines[0]
+        assert "Traceback" not in result.output
+        assert calls == []
+
+    def test_jobs_needs_no_python_sane_on_a_fresh_install(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        ``jobs`` runs without python-sane and shows an empty history (D-05).
+
+        On a fresh install the data directory does not exist yet: the command
+        creates it and prints the header with no rows, exit 0.
+        """
+        data_dir = tmp_path / "new"
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(data_dir),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        monkeypatch.setattr("saneless.cli.require_sane", sane_backend.require_sane)
+        _block_sane_import(monkeypatch)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        assert len(lines) == 2, result.output
+        assert lines[0].startswith("Timestamp")
+        assert set(lines[1]) == {"-"}
+        assert data_dir.is_dir()
+
+    @pytest.mark.parametrize("command", _SANE_COMMANDS)
+    def test_help_runs_without_python_sane(
+        self, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        """``<command> --help`` exits 0 without checking for python-sane (CFG-10)."""
+        runner, _ = _patch_cli(monkeypatch)
+        calls: list[str] = []
+
+        def recording_require_sane() -> None:
+            calls.append("require_sane")
+
+        monkeypatch.setattr("saneless.cli.require_sane", recording_require_sane)
+        _block_sane_import(monkeypatch)
+
+        result = runner.invoke(cli, [command, "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert f"Usage: cli {command}" in result.output
+        assert calls == []
+        assert sys.modules.get("sane") is None
+
+
 class TestJobsCommand:
     """Jobs command tests."""
 
@@ -1842,6 +1981,153 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
         assert result.exit_code == 0
         assert captured["app"] is not None
+
+    @staticmethod
+    def _loopback_settings() -> Settings:
+        """Build settings that serve on 127.0.0.1, port left at its 8080 default."""
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=_TEST_TMP,
+                data_dir=_TEST_DATA,
+                log_file=_TEST_LOG,
+                web_host="127.0.0.1",
+            ),
+        )
+
+    @staticmethod
+    def _stub_create_app(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace create_app with a stub, so no test leaves a JobStore open."""
+
+        def fake_create_app(*_args: object, **_kwargs: object) -> object:
+            return object()
+
+        monkeypatch.setattr("saneless.cli.create_app", fake_create_app)
+
+    @staticmethod
+    def _uvicorn_exits(monkeypatch: pytest.MonkeyPatch, code: int | None) -> list[str]:
+        """Patch uvicorn.run to raise ``SystemExit(code)``; return its call record."""
+        calls: list[str] = []
+
+        def exiting_run(_app: object, **_kwargs: object) -> None:
+            calls.append("uvicorn.run")
+            raise SystemExit(code)
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", exiting_run)
+        return calls
+
+    def test_serve_bind_failure_exits_2_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A port that cannot be bound is a setup problem: one line, exit 2.
+
+        It used to be a ``ClickException``, exit 1, which collided with "scan
+        error" in the shared exit-code table (D-07 amendment).
+        """
+        sock = MagicMock()
+        sock.bind.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+        monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: sock)
+        self._stub_create_app(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 0)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        assert result.stderr == (
+            f"Cannot bind to 127.0.0.1:8080: [Errno {errno.EADDRINUSE}] "
+            "Address already in use\n"
+        )
+        assert runs == []
+        sock.close.assert_called_once()
+
+    def test_serve_uvicorn_startup_failure_exits_2_not_3(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A uvicorn startup failure (its own exit 3) becomes exit 2 (D-07 amendment).
+
+        Exit 3 is "Paperless error" in saneless's table, so passing uvicorn's
+        status through would send scripts and systemd after the wrong cause.
+        """
+        self._mock_socket(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 3)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1, result.stderr
+        assert "web server could not start" in lines[0]
+        assert "127.0.0.1:8080" in lines[0]
+        assert "Traceback" not in result.output
+        assert runs == ["uvicorn.run"]
+
+    @pytest.mark.parametrize("code", [0, None])
+    def test_serve_uvicorn_clean_system_exit_stays_0(
+        self, monkeypatch: pytest.MonkeyPatch, code: int | None
+    ) -> None:
+        """A ``SystemExit`` with no failure status from uvicorn still exits 0."""
+        self._mock_socket(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        self._uvicorn_exits(monkeypatch, code)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stderr == ""
+
+    def test_serve_normal_stop_exits_0_not_cancelled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Ctrl-C on ``serve`` is a normal stop, exit 0, not a cancel (D-03).
+
+        uvicorn.run catches the KeyboardInterrupt itself and returns, so the
+        stub returning is exactly what a graceful stop looks like to saneless.
+        """
+        self._mock_socket(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        calls: list[str] = []
+
+        def returning_run(_app: object, **_kwargs: object) -> None:
+            calls.append("uvicorn.run")
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", returning_run)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        assert calls == ["uvicorn.run"]
+        assert "Cancelled" not in result.output
+
+    def test_serve_malformed_paperless_url_exits_3(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Paperless URL the client cannot parse is a Paperless error, exit 3."""
+        self._mock_socket(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 0)
+
+        def failing_create_app(*_args: object, **_kwargs: object) -> object:
+            msg = "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
+            raise PaperlessError(msg)
+
+        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 3, result.output
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1, result.stderr
+        assert lines[0].startswith(
+            "Paperless error: Paperless URL http://host:abc is not valid"
+        )
+        assert runs == []
 
 
 class TestAutoProfiles:
