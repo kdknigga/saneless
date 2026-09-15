@@ -21,7 +21,7 @@ from .auto_profiles import (
     write_profiles_to_config,
 )
 from .config import config_search_paths
-from .exceptions import ConfigError
+from .exceptions import ConfigError, ScanCancelledError
 from .job import JobResult
 from .pipeline import (
     FlipAnswerSlot,
@@ -107,8 +107,10 @@ class _OwedWrite:
     Attributes:
         state: The terminal state to record.
         result: What the scan produced, for a DONE or FALLBACK write.
-        error: The job-row error text, for an ERROR write.
-        category: The error's category, for an ERROR write.
+        error: The job-row error text, for an ERROR write, or the cancel's
+            message, for a CANCELLED write.
+        category: The error's category, for an ERROR write.  A CANCELLED
+            write, like a shutdown's ERROR, has none.
 
     """
 
@@ -950,6 +952,11 @@ class ScanWorker:
         its own text and category.  Only a flip answer the shutdown itself
         claimed is recorded as a restart (WR-06, D-15).
 
+        ``_best_effort_fail`` records a loop-level failure through this.  A
+        pipeline exception in ``_scan_job`` does not: that path tells its three
+        endings -- shutdown, cancel and failure -- apart itself, because a
+        cancel is written CANCELLED rather than ERROR (D-01).
+
         Args:
             exc: What ended the job.
             coordinator: The job's flip coordinator, if it has one.
@@ -1226,7 +1233,9 @@ class ScanWorker:
 
         A pipeline failure is a job failure: it is recorded as ERROR here and
         this returns normally.  That includes a store write inside a pipeline
-        callback, which reaches here through ``run_pipeline``.  The loop's own
+        callback, which reaches here through ``run_pipeline``.  A cancel is
+        recorded as CANCELLED, and a flip answer claimed by shutdown as ERROR
+        with ``RESTART_REASON``; neither is a failure (D-01, D-02).  The loop's own
         store writes -- SCANNING before the pipeline, and the terminal write of
         either outcome -- are never swallowed, so their failure escapes to
         ``_run`` as a loop-level failure (D-10).  A failed terminal write is
@@ -1311,28 +1320,42 @@ class ScanWorker:
                 request,
             )
         except Exception as exc:
-            error, category = self._failure_record(exc, coordinator)
             # No result argument: outcome, warning and all three page counts
             # stay NULL.  NULL means "never recorded"; 0 would claim a
             # measurement a job that never reached the scanner did not make.
-            # If this write raises, the job failure could not be recorded, and
+            # If this write raises, the job ending could not be recorded, and
             # that is the loop's failure (D-10); the write is owed first, so
-            # the pipeline's own error is what lands later (WR-02).  While
+            # the pipeline's own ending is what lands later (WR-02).  While
             # stopping this is the worker thread's own final write, so D-07's
             # "no shutdown-time write" -- which is about the lifespan writing
             # over a running thread -- holds.
-            self._finish_or_owe(
-                job.id,
-                _OwedWrite(JobState.ERROR, error=error, category=category),
-            )
-            if category is None:
-                # Only a shutdown records no category: stop() answered the
-                # flip wait with Abort, so the operator did not end this job.
-                logger.info("Job %s ended by shutdown: %s", job.id, exc)
-            else:
-                logger.error(
-                    "Job %s failed (%s): %s", job.id, category.value.lower(), exc
+            #
+            # Three endings, three branches (D-01).  The shutdown check stays
+            # first: stop() answers the flip wait with Abort, and that Abort
+            # reaches the pipeline exactly as an operator's does, so it comes
+            # back as ScanCancelledError too (D-02, WR-06).
+            if coordinator is not None and coordinator.aborted_by_shutdown:
+                self._finish_or_owe(
+                    job.id, _OwedWrite(JobState.ERROR, error=RESTART_REASON)
                 )
+                logger.info("Job %s ended by shutdown: %s", job.id, exc)
+            elif isinstance(exc, ScanCancelledError):
+                # The operator ended the scan.  Not a failure, so no category,
+                # no ERROR line and no traceback (N-08).
+                self._finish_or_owe(
+                    job.id, _OwedWrite(JobState.CANCELLED, error=str(exc))
+                )
+                logger.info("Job %s cancelled: %s", job.id, exc)
+            else:
+                category = classify_error(exc)
+                self._finish_or_owe(
+                    job.id,
+                    _OwedWrite(JobState.ERROR, error=str(exc), category=category),
+                )
+                # Inside the except block, so the record carries the traceback
+                # the operator needs to find the cause (EXC-05).
+                kind = category.value.lower()
+                logger.exception("Job %s failed (%s): %s", job.id, kind, exc)
             return
         # The terminal state is derived from the outcome the pipeline returned,
         # never assumed.  The mapping below is a match with assert_never, so a
