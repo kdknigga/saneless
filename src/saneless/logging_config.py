@@ -45,8 +45,8 @@ def configure_logging(
     )
 
     root_logger = logging.getLogger()
-    # The name mapping rather than getattr: getattr(logging, "BASIC_FORMAT")
-    # would "resolve" to a string (CFG-04).
+    # The level-name mapping rather than an attribute lookup on the module,
+    # which would also "resolve" non-level names such as BASIC_FORMAT (CFG-04).
     root_logger.setLevel(logging.getLevelNamesMapping()[log_level.upper()])
 
     try:
