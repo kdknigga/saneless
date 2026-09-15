@@ -338,6 +338,19 @@ def test_method_not_allowed_renders_on_both_branches(client: TestClient) -> None
     _assert_json_error(client.post("/health"), rejection, 405)
 
 
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_method_not_allowed_keeps_the_allow_header(
+    client: TestClient, *, htmx: bool
+) -> None:
+    """WR-08, RFC 9110 section 15.5.6: a 405 names the methods it does allow."""
+    headers = HTMX_HEADERS if htmx else {}
+    response = client.get("/api/scan", headers=headers)
+    assert response.status_code == 405
+    allowed = {method.strip() for method in response.headers["Allow"].split(",")}
+    assert "POST" in allowed
+    assert "GET" not in allowed
+
+
 @pytest.mark.parametrize(
     ("status", "rejection"),
     [(409, RequestRejection.CLIENT_ERROR), (502, RequestRejection.INTERNAL)],
