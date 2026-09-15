@@ -3536,6 +3536,56 @@ class TestStartupProfileGeneration:
         assert str(config_file) in message
         assert "ConfigError" in message
 
+    @pytest.mark.parametrize(
+        "case",
+        [
+            (b"[profiles\n", "UnexpectedCharError"),
+            (b"\xff\xfe not utf-8\n", "UnicodeDecodeError"),
+        ],
+    )
+    def test_startup_generation_keeps_profiles_when_the_write_raises_anything_else(
+        self,
+        mock_scanner: MagicMock,
+        worker_for: Callable[[JobStore], ScanWorker],
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        case: tuple[bytes, str],
+    ) -> None:
+        """
+        WR-04, D-18: an exception outside OSError and ConfigError keeps them too.
+
+        An unparseable or non-UTF-8 file makes the write raise something other
+        than the two expected classes.  The generated profiles must still be
+        used in memory, with a WARNING that names the exception class.
+        """
+        contents, exception_name = case
+        self._mock_caps_scanner(mock_scanner)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_bytes(contents)
+
+        store = JobStore()
+        worker = worker_for(store)
+        worker._settings._config_path = config_file
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+            alive = worker.is_alive
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert alive
+        assert config_file.read_bytes() == contents
+        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        assert len(records) == 1
+        assert exception_name in records[0].getMessage()
+        assert not _worker_records(
+            caplog, logging.ERROR, "Auto-profiles: startup generation failed"
+        )
+
     def test_startup_generation_scanner_failure_keeps_the_bare_default(
         self,
         mock_scanner: MagicMock,
