@@ -40,6 +40,8 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from fastapi import FastAPI, Request
     from starlette.responses import Response
 
@@ -130,6 +132,7 @@ def render_error(
     *,
     status_code: int,
     refresh_history: bool = False,
+    extra_headers: Mapping[str, str] | None = None,
 ) -> Response:
     """
     Render an error response for either an htmx or a plain request.
@@ -139,13 +142,15 @@ def render_error(
         rejection: The vocabulary member whose message is shown.
         status_code: The HTTP status code to send.
         refresh_history: Whether the htmx body also reloads Job History.
+        extra_headers: Headers the exception carries and the response must
+            keep, such as a 405's ``Allow`` (WR-08, RFC 9110 section 15.5.6).
 
     Returns:
         The error partial retargeted to ``#status-message`` for an htmx
         request, otherwise the JSON error shape.
 
     """
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = dict(extra_headers or {})
     if status_code == _TOO_MANY_REQUESTS:
         headers["Retry-After"] = str(RETRY_AFTER_SECONDS)
     message = rejection_message(rejection)
@@ -177,10 +182,13 @@ async def _http_exception(request: Request, exc: Exception) -> Response:
             status_code=exc.status_code,
             refresh_history=exc.refresh_history,
         )
+    # The exception's own headers are kept: the router's 405 carries the
+    # ``Allow`` header RFC 9110 requires on a 405 (WR-08).
     return render_error(
         request,
         rejection_for_status(exc.status_code),
         status_code=exc.status_code,
+        extra_headers=exc.headers,
     )
 
 
