@@ -13,6 +13,7 @@ import shutil
 import socket
 import sys
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,7 @@ from .config import (
     Settings,
     load_settings,
     log_config_sources,
+    resolve_job_title,
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
 )
@@ -249,8 +251,8 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
 )
 @click.option(
     "--title",
-    required=True,
-    help="Document title.",
+    default="",
+    help="Document title (default: the profile's title, else 'Scan <time>').",
 )
 @click.pass_context
 def scan(ctx: click.Context, profile: str, title: str) -> None:
@@ -260,6 +262,11 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     if profile not in settings.profiles:
         click.echo(f"Unknown profile: {profile}", err=True)
         sys.exit(2)
+
+    # D-16: the one title rule the web form shares -- typed, else the profile's
+    # title, else "Scan <time>"; blank after stripping counts as not typed.
+    now = datetime.now(tz=UTC)
+    resolved_title = resolve_job_title(title, settings.profiles[profile], now=now)
 
     manual_duplex = settings.profiles[profile].duplex == "manual"
     # Refused here, before the backend exists, so no paper moves: from cron or a
@@ -283,14 +290,14 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     def status_callback(event: PipelineEvent) -> None:
         state = event.job_state
         if event is PipelineEvent.DONE:
-            click.echo(f"Done: {title}")
+            click.echo(f"Done: {resolved_title}")
         else:
             click.echo(progress_label(state))
 
     try:
         request = PipelineRequest(
             profile_name=profile,
-            title=title,
+            title=resolved_title,
             tags=settings.profiles[profile].default_tags or None,
             correspondent=settings.profiles[profile].default_correspondent,
             status_callback=status_callback,
