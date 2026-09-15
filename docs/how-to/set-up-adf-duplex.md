@@ -85,16 +85,16 @@ The manual duplex flow:
 
 How you confirm the flip depends on where you started the scan:
 
-- **Web UI:** a flip prompt with **Continue** and **Abort scan** buttons appears automatically once the front sides are scanned. As soon as saneless receives your click, the buttons are replaced by a short confirmation, and the status moves on once pass B starts.
+- **Web UI:** a flip prompt with **Continue** and **Abort scan** buttons appears automatically once the front sides are scanned. As soon as saneless receives your click, the buttons are replaced by a short confirmation, and the status moves on once pass B starts. **Abort scan** stops the scan before pass B and ends the job as **Cancelled**, shown in grey rather than as an error, and nothing is uploaded.
 - **CLI:** `saneless scan` asks a yes/no question and waits until you answer:
 
     ```
     Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:
     ```
 
-    Answering yes (or pressing Enter, since yes is the default) starts pass B. Answering no, pressing Ctrl-C, or closing input ends the scan with `Scan error: Manual duplex scan aborted at the flip prompt` and exit code 1. An error reading the terminal at the prompt ends the scan the same way, straight away, and the error is logged. Nothing is uploaded.
+    Answering yes (or pressing Enter, since yes is the default) starts pass B. Answering no, pressing Ctrl-C, or closing input (Ctrl-D) cancels the scan: saneless prints `Manual duplex scan cancelled at the flip prompt` and exits with exit code 130. An error reading the terminal at the prompt is a failure, not a cancel: the scan fails straight away with a `Scan error: Flip prompt failed: ...` line and exit code 1, and the error is logged. Nothing is uploaded in either case.
 
-Either way, the wait is bounded by `flip_timeout_seconds` in the `[output]` section (600 seconds by default). If nobody confirms the flip in time, the job fails with `Manual duplex flip wait timed out after 600 seconds: nobody confirmed the stack was flipped` and nothing is uploaded. See [Configuration](../reference/configuration.md#output).
+Either way, the wait is bounded by `flip_timeout_seconds` in the `[output]` section (600 seconds by default). If nobody confirms the flip in time, the job fails with `Manual duplex flip wait timed out after 600 seconds: nobody confirmed the stack was flipped` and nothing is uploaded. A timeout is a failure, not a cancel: the web job ends as failed, and `saneless scan` exits with code 1. See [Configuration](../reference/configuration.md#output).
 
 !!! warning "The CLI needs an interactive terminal for manual duplex"
     Someone has to flip the stack between the two passes, so `saneless scan` refuses a manual
