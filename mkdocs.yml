@@ -48,6 +48,7 @@ nav:
     - Set Up ADF Duplex Scanning: how-to/set-up-adf-duplex.md
     - Scanner Host Discovery (Containers): how-to/scanner-host-discovery.md
     - Use the CLI for Scripting: how-to/cli-scripting.md
+    - Troubleshoot a Failed Scan: how-to/troubleshoot-a-failed-scan.md
   - Reference:
     - CLI Commands: reference/cli-commands.md
     - Configuration (TOML): reference/configuration.md
