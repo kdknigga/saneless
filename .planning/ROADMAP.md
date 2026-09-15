@@ -460,9 +460,9 @@ Plans:
 
 **Wave 1**
 
-- [ ] 28-01-PLAN.md — PdfError, ScanCancelledError, describe(), ErrorCategory.ASSEMBLY, ExitCode, JobState.CANCELLED + status/history branches
-- [ ] 28-02-PLAN.md — TOML syntax / unreadable / non-UTF-8 config and tomlkit parse failures become ConfigError under the header
-- [ ] 28-03-PLAN.md — "No pages were scanned" precondition and "All pages were blank"
+- [x] 28-01-PLAN.md — PdfError, ScanCancelledError, describe(), ErrorCategory.ASSEMBLY, ExitCode, JobState.CANCELLED + status/history branches
+- [x] 28-02-PLAN.md — TOML syntax / unreadable / non-UTF-8 config and tomlkit parse failures become ConfigError under the header
+- [x] 28-03-PLAN.md — "No pages were scanned" precondition and "All pages were blank"
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -565,7 +565,7 @@ Plans:
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
-| 28. Exception Translation | 0/? | Not started | - |
+| 28. Exception Translation | 3/14 | In Progress|  |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
