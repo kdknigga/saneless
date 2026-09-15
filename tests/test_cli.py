@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -31,7 +32,14 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.exceptions import ConfigError, PaperlessError, ScanError
+from saneless.exceptions import (
+    ConfigError,
+    PaperlessError,
+    PdfError,
+    ScanCancelledError,
+    ScanError,
+    StorageError,
+)
 from saneless.job import JobStore
 from saneless.paperless import UploadResult
 from saneless.pipeline import PipelineEvent, PipelineRequest
@@ -329,7 +337,24 @@ class TestScanCommand:
         assert "Uploading to paperless-ngx..." in result.output
 
     def test_scan_config_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Config loading fails -> exit code 2."""
+        """Config loading raises ConfigError -> exit code 2, message as rendered."""
+        runner = CliRunner()
+
+        def bad_load(*_args: object, **_kwargs: object) -> None:
+            msg = "Configuration error in /nope.toml:\n  [output] bad config"
+            raise ConfigError(msg)
+
+        monkeypatch.setattr("saneless.cli.load_settings", bad_load)
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: None)
+
+        result = runner.invoke(cli, ["scan", "--title", "Test"])
+        assert result.exit_code == 2
+        assert result.stderr.startswith("Configuration error in /nope.toml:")
+
+    def test_scan_config_value_error_exits_5(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare ValueError while loading is not a saneless type -> exit 5 (D-06)."""
         runner = CliRunner()
 
         def bad_load(*_args: object, **_kwargs: object) -> None:
@@ -340,8 +365,9 @@ class TestScanCommand:
         monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: None)
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
-        assert result.exit_code == 2
-        assert "Configuration error" in result.output
+        assert result.exit_code == 5
+        assert result.stderr.startswith("Unexpected error (ValueError): bad config")
+        assert "Configuration error" not in result.output
 
     def test_scan_scan_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Pipeline raises ScanError -> exit code 1."""
@@ -1108,9 +1134,9 @@ class TestLazySettingsLoading:
     missing configuration. Click runs the group callback *before* a subcommand
     parses its own ``--help``, and ``ctx.resilient_parsing`` is False there
     (verified against Click 8.3), so the group callback cannot load anything;
-    each command loads on first need instead. M-21: configuring logging sits in
-    the same error handling, so an unexpected failure there is a one-line exit
-    2 too; an unwritable log file is not a failure, it falls back to stderr.
+    each command loads on first need instead. A ConfigError from loading is
+    printed by the group guard as rendered, exit 2; an unwritable log file is
+    not a failure, it falls back to stderr.
     """
 
     @pytest.mark.parametrize("command", _ALL_COMMANDS)
@@ -1977,3 +2003,477 @@ class TestTruncation:
         result = runner.invoke(cli, ["jobs"])
         assert result.exit_code == 0
         assert "\u2026" in result.output
+
+
+def _raising_scanner(exc: BaseException) -> type[ScannerBackend]:
+    """
+    Build a scanner backend class whose every device call raises ``exc``.
+
+    Every method raises, so the same class serves ``scan`` (``scan_pages``),
+    ``devices`` and ``auto-profiles`` (``get_devices``) whichever the pipeline
+    reaches first.
+
+    Args:
+        exc: The exception every call raises.
+
+    Returns:
+        A ``ScannerBackend`` subclass accepting ``host`` like ``SaneBackend``.
+
+    """
+
+    class RaisingScanner(ScannerBackend):
+        """Scanner whose every call raises the configured exception."""
+
+        def __init__(self, host: str = "") -> None:
+            """Accept host parameter for API compatibility."""
+
+        def get_devices(self) -> list[DeviceInfo]:
+            """Raise the configured exception."""
+            raise exc
+
+        def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+            """Raise the configured exception."""
+            raise exc
+
+        def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+            """Raise the configured exception."""
+            raise exc
+
+    return RaisingScanner
+
+
+def _raising_paperless(exc: Exception) -> type:
+    """
+    Build a Paperless client class whose upload raises ``exc``.
+
+    Args:
+        exc: The exception ``upload_document`` raises.
+
+    Returns:
+        A class constructed like ``PaperlessClient``.
+
+    """
+
+    class RaisingPaperless:
+        """Paperless client whose upload raises the configured exception."""
+
+        def __init__(self, *_a: object, **_kw: object) -> None:
+            """Accept and ignore all constructor arguments."""
+
+        def upload_document(self, *_a: object, **_kw: object) -> UploadResult:
+            """Raise the configured exception."""
+            raise exc
+
+        def close(self) -> None:
+            """No-op close."""
+
+    return RaisingPaperless
+
+
+def _tmp_settings(tmp_path: Path) -> Settings:
+    """
+    Build settings whose tmp, data and log paths all live under ``tmp_path``.
+
+    Args:
+        tmp_path: The test's temporary directory.
+
+    Returns:
+        Settings with a ``default`` profile and tmp_path-rooted output paths.
+
+    """
+    return _make_settings(
+        output=OutputConfig(
+            tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
+            log_file=str(tmp_path / "saneless.log"),
+        ),
+    )
+
+
+def _cli_error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """
+    Return the ERROR records ``saneless.cli`` emitted.
+
+    Args:
+        caplog: The test's log capture fixture.
+
+    Returns:
+        Every captured record from ``saneless.cli`` at ERROR or above.
+
+    """
+    return [
+        record
+        for record in caplog.records
+        if record.name == "saneless.cli" and record.levelno >= logging.ERROR
+    ]
+
+
+class TestExitCodes:
+    """
+    One guard maps every CLI failure to one message and its D-07 exit code.
+
+    EXC-02 / success criterion 2: a bad config (2), a broken scanner (1), an
+    unreachable Paperless (3) and an unassemblable PDF (4) each print one error
+    report; a job database saneless cannot use is a setup problem (2); a cancel
+    or Ctrl-C is 130; anything that is not a saneless type is 5 with its
+    traceback in the log (D-06). click's own ``--help``, usage errors and
+    ``ClickException`` keep click's behaviour (Pitfall 2).
+    """
+
+    def test_bad_config_exits_2_with_header_and_one_problem_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The loader's header plus its one problem line, exit 2 (Pitfall 8)."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        def bad_load(*_args: object, **_kwargs: object) -> Settings:
+            msg = (
+                "Configuration error in /etc/saneless/config.toml:\n"
+                "  line 12, column 5: Invalid value"
+            )
+            raise ConfigError(msg)
+
+        monkeypatch.setattr("saneless.cli.load_settings", bad_load)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 2
+        assert result.stderr.splitlines() == [
+            "Configuration error in /etc/saneless/config.toml:",
+            "  line 12, column 5: Invalid value",
+        ]
+        assert "Traceback" not in result.output
+
+    def test_broken_scanner_exits_1_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A ScanError from the scanner is one ``Scan error:`` line, exit 1."""
+        exc = ScanError(
+            "Could not open scanner epson2:libusb:001:004: Invalid argument"
+        )
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 1
+        assert result.stderr.splitlines() == [
+            "Scan error: Could not open scanner epson2:libusb:001:004: Invalid argument"
+        ]
+        assert "Traceback" not in result.output
+
+    def test_unreachable_paperless_exits_3_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A PaperlessError from the upload is one ``Paperless error:`` line, exit 3."""
+        exc = PaperlessError(
+            "Could not reach Paperless at http://paperless:8000: "
+            "[Errno 111] Connection refused"
+        )
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            paperless_cls=_raising_paperless(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 3
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            "Paperless error: Could not reach Paperless at http://paperless:8000"
+        )
+        assert "Traceback" not in result.output
+
+    def test_unassemblable_pdf_exits_4_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A PdfError from assembly is one ``PDF error:`` line, exit 4."""
+        runner, _ = _patch_cli(monkeypatch, settings=_tmp_settings(tmp_path))
+
+        def failing_assemble(*_args: object, **_kwargs: object) -> Path:
+            msg = (
+                "Could not assemble 1 page(s) into /tmp/x.pdf: No space left on device"
+            )
+            raise PdfError(msg)
+
+        monkeypatch.setattr("saneless.pipeline.assemble_pdf", failing_assemble)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 4
+        assert result.stderr.splitlines() == [
+            "PDF error: Could not assemble 1 page(s) into /tmp/x.pdf: "
+            "No space left on device"
+        ]
+        assert "Traceback" not in result.output
+
+    def test_mid_scan_config_error_exits_2_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A ConfigError raised by the scanner mid-command is exit 2, as rendered."""
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(ConfigError("No scanner found")),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 2
+        assert result.stderr.splitlines() == ["No scanner found"]
+
+    def test_scan_cancelled_exits_130_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A ScanCancelledError is a cancel, not a failure: exit 130 (D-01, D-03)."""
+        exc = ScanCancelledError("Manual duplex scan cancelled at the flip prompt")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 130
+        assert result.stderr.splitlines() == [
+            "Manual duplex scan cancelled at the flip prompt"
+        ]
+
+    @pytest.mark.parametrize("command", ["scan", "devices", "auto-profiles"])
+    def test_keyboard_interrupt_exits_130_without_aborted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+    ) -> None:
+        """
+        Ctrl-C in a command is ``Cancelled (interrupted)`` and exit 130 (D-03).
+
+        Raised only inside ``runner.invoke`` (Pitfall 5): a KeyboardInterrupt
+        escaping a test would stop the whole pytest session.
+        """
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(KeyboardInterrupt()),
+        )
+
+        result = runner.invoke(cli, [command])
+
+        assert result.exit_code == 130
+        assert result.stderr.splitlines() == ["Cancelled (interrupted)"]
+        assert "Aborted!" not in result.output
+
+    def test_unexpected_error_exits_5_naming_the_log_file(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """After logging attached a file, the line points at it and it is logged."""
+        exc = RuntimeError("kaboom")
+        settings = _tmp_settings(tmp_path)
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, scanner_cls=_raising_scanner(exc)
+        )
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: True)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 5
+        assert result.stderr.splitlines() == [
+            "Unexpected error (RuntimeError): kaboom. "
+            f"Full details in {settings.output.log_file}"
+        ]
+        records = _cli_error_records(caplog)
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is exc
+
+    def test_unexpected_error_exits_5_without_log_file_when_not_attached(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """When logging fell back to stderr, the line claims no log file (T-28-35)."""
+        exc = RuntimeError("kaboom")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: False)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 5
+        assert result.stderr.splitlines() == ["Unexpected error (RuntimeError): kaboom"]
+        assert "Full details in" not in result.output
+        records = _cli_error_records(caplog)
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is exc
+
+    def test_unexpected_error_before_logging_exits_5_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Before logging is configured nothing is logged and one line is printed."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        def exploding_load(*_args: object, **_kwargs: object) -> Settings:
+            msg = "kaboom"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("saneless.cli.load_settings", exploding_load)
+        caplog.set_level(logging.DEBUG, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 5
+        assert result.stderr.splitlines() == [
+            "Unexpected error (RuntimeError): kaboom. "
+            "Run again with -v to see the traceback"
+        ]
+        assert _cli_error_records(caplog) == []
+
+    def test_unexpected_error_before_logging_with_verbose_exits_5_with_traceback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With -v the traceback goes to stderr, followed by the bare line."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        def exploding_load(*_args: object, **_kwargs: object) -> Settings:
+            msg = "kaboom"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr("saneless.cli.load_settings", exploding_load)
+
+        result = runner.invoke(cli, ["-v", "scan"])
+
+        assert result.exit_code == 5
+        assert "Traceback" in result.stderr
+        assert (
+            result.stderr.splitlines()[-1] == "Unexpected error (RuntimeError): kaboom"
+        )
+
+    def test_job_database_not_sqlite_exits_2_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A jobs.db that is not SQLite is a setup problem: exit 2 (D-07 amendment)."""
+        settings = _tmp_settings(tmp_path)
+        settings.output.db_path.write_bytes(b"this is not a database\n" * 64)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 2
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith("Job database error: ")
+        assert str(settings.output.db_path) in lines[0]
+        assert "Unexpected error" not in result.output
+        assert "Traceback" not in result.output
+
+    def test_job_database_unsupported_schema_exits_2_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A jobs table saneless cannot migrate is exit 2, naming the database."""
+        settings = _tmp_settings(tmp_path)
+        conn = sqlite3.connect(settings.output.db_path)
+        try:
+            conn.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY)")
+            conn.commit()
+        finally:
+            conn.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 2
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert str(settings.output.db_path) in lines[0]
+        assert "unsupported schema" in lines[0]
+        assert "Unexpected error" not in result.output
+        assert "Traceback" not in result.output
+
+    def test_job_database_storage_error_is_logged_and_exits_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A StorageError is one line and exit 2, logged without a bug-report hint."""
+        exc = StorageError(f"Could not open the job database at {tmp_path}: boom")
+
+        def failing_store(*_args: object, **_kwargs: object) -> JobStore:
+            raise exc
+
+        runner, _ = _patch_cli(monkeypatch, settings=_tmp_settings(tmp_path))
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: True)
+        monkeypatch.setattr("saneless.cli.JobStore", failing_store)
+        caplog.set_level(logging.ERROR, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 2
+        assert result.stderr.splitlines() == [f"Job database error: {exc}"]
+        assert "Full details in" not in result.output
+        records = _cli_error_records(caplog)
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is exc
+
+    def test_help_exits_0_without_running_the_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``scan --help`` is click's Exit, re-raised by the guard: exit 0."""
+        runner, _ = _patch_cli(monkeypatch)
+        calls: list[str] = []
+
+        def recording_load(*_args: object, **_kwargs: object) -> Settings:
+            calls.append("load_settings")
+            return _make_settings()
+
+        monkeypatch.setattr("saneless.cli.load_settings", recording_load)
+
+        result = runner.invoke(cli, ["scan", "--help"])
+
+        assert result.exit_code == 0
+        assert "Usage: cli scan" in result.stdout
+        assert calls == []
+
+    def test_unknown_option_is_clicks_usage_error_exit_2(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unknown option stays click's usage error, not an unexpected error."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["scan", "--bogus"])
+
+        assert result.exit_code == 2
+        assert "No such option" in result.stderr
+        assert "Unexpected error" not in result.output
+
+    def test_click_exception_keeps_its_own_exit_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ClickException raised in a command is shown by click, exit 1."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        def bind_failure(*_args: object, **_kwargs: object) -> None:
+            msg = "bind"
+            raise click.ClickException(msg)
+
+        monkeypatch.setattr("saneless.cli.run_pipeline", bind_failure)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 1
+        assert result.stderr.splitlines() == ["Error: bind"]

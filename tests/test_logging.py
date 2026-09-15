@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import re
+import sys
 from typing import TYPE_CHECKING
 
 from saneless.config import OutputConfig
@@ -12,6 +13,8 @@ from saneless.logging_config import configure_logging
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import pytest
 
 
 class TestConfigureLogging:
@@ -200,6 +203,62 @@ class TestConfigureLogging:
             assert len(stream_handlers) >= 1, "Expected stderr fallback handler"
         finally:
             unwritable.chmod(0o700)
+            self._cleanup_handlers()
+
+    def test_returns_true_when_the_file_handler_attached(self, tmp_path: Path) -> None:
+        """
+        A writable log file returns True and attaches a RotatingFileHandler.
+
+        The CLI prints "Full details in <log_file>" only on True (D-06).
+        """
+        log_file = tmp_path / "logs" / "saneless.log"
+        try:
+            attached = configure_logging(str(log_file), "INFO", 1024, 1)
+            assert attached is True
+            file_handlers = [
+                h
+                for h in logging.getLogger().handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert [h.baseFilename for h in file_handlers] == [str(log_file)]
+        finally:
+            self._cleanup_handlers()
+
+    def test_returns_false_when_the_file_handler_is_not_attached(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A log path under a regular file returns False and falls back to stderr.
+
+        mkdir fails with an OSError whoever runs the test (root included), so
+        no permission trick is needed.
+        """
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("")
+        log_file = str(blocker / "logs" / "saneless.log")
+        try:
+            with caplog.at_level(logging.WARNING):
+                attached = configure_logging(log_file, "INFO", 1024, 1)
+            assert attached is False
+            root = logging.getLogger()
+            assert not [
+                h
+                for h in root.handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            assert [
+                h
+                for h in root.handlers
+                if isinstance(h, logging.StreamHandler)
+                and not isinstance(h, logging.FileHandler)
+                and h.stream is sys.stderr
+            ]
+            assert f"Cannot write to {log_file}, logging to stderr only" in (
+                caplog.messages
+            )
+        finally:
             self._cleanup_handlers()
 
     def test_default_log_file_is_xdg_compliant(self) -> None:
