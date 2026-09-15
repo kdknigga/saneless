@@ -504,7 +504,20 @@ Plans:
   4. The flatbed path enforces the same timeout and image validation as the ADF path
   5. `sane.init()` runs once per process behind a re-entry guard, `sane.exit()` runs at shutdown, and neither is reachable from a request path
 
-**Plans**: TBD
+**Plans**: 11 plans in 8 waves
+
+Plans:
+- [ ] 29-01-PLAN.md — Page spool and the PageRecord/PageSink contract (additive; tree stays green)
+- [ ] 29-02-PLAN.md — Contract switch: ScanBatch records, scan_pages(sink), close(), conftest seam
+- [ ] 29-03-PLAN.md — Records through pages.py, pdf.py and pipeline.py; spool lifetime (src green)
+- [ ] 29-04-PLAN.md — Migrate tests/test_scanner.py + the weakref memory-bound proof
+- [ ] 29-05-PLAN.md — Migrate pipeline/pdf/pages/e2e suites + the twelve-page and interleave proofs
+- [ ] 29-06-PLAN.md — Migrate the eight remaining stub scanners; close the red interval
+- [ ] 29-07-PLAN.md — Daemon-thread timeout, cancel-then-wait, wedge, flatbed, Ctrl-C, exit proof
+- [ ] 29-08-PLAN.md — Bounded PDF assembly: per-page convert plus a qpdf merge
+- [ ] 29-09-PLAN.md — Keep the pages a mid-batch failure leaves behind (HARD-02)
+- [ ] 29-10-PLAN.md — SANE init guard, shutdown at every entry point, the request-path proof
+- [ ] 29-11-PLAN.md — Documentation (D-20), the doc-truth test, and the phase gate
 
 ### Phase 30: Appliance Layer
 
