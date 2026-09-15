@@ -755,9 +755,9 @@ class PaperlessClient:
         as what it is within a second, not as a timeout several minutes
         later.
 
-        A transport error while polling (a connection refused, a reset, a
-        read timeout, a proxy closing the connection) does *not* end the
-        poll.  The upload has already been accepted, so failing the job now
+        A request-level error while polling (a connection refused, a reset,
+        a read timeout, a proxy closing the connection, a body that cannot be
+        decoded) does *not* end the poll.  The upload has already been accepted, so failing the job now
         would invite the user to scan the document again and create a
         duplicate (D-11, M-17).  The error is logged and remembered, and the
         poll backs off and asks again within the same monotonic deadline.
@@ -787,7 +787,11 @@ class PaperlessClient:
         """
         deadline = time.monotonic() + timeout
         delay = 0.5
-        last_transport_error: httpx.TransportError | None = None
+        # RequestError rather than TransportError: DecodingError (a corrupt
+        # compressed body) is a request-level failure that is not a transport
+        # one, and it must neither escape this boundary as a raw httpx type nor
+        # fail an upload Paperless already accepted (WR-05, EXC-01, D-11).
+        last_transport_error: httpx.RequestError | None = None
 
         while True:
             try:
@@ -795,7 +799,7 @@ class PaperlessClient:
                     "/api/tasks/",
                     params={"task_id": task_id},
                 )
-            except httpx.TransportError as exc:
+            except httpx.RequestError as exc:
                 last_transport_error = exc
                 logger.warning(
                     "Polling task %s failed, retrying until the deadline: %s",
