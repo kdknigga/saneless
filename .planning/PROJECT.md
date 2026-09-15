@@ -88,6 +88,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ A TDD RED commit lands with hooks enabled and no suppression, while type errors are still rejected at merge, push and CI — Phase 23.1
 - ✓ Working manual duplex: `duplex` profile field (legacy `source = "Manual Duplex"` translated with a logged warning), source passed to SANE verbatim, one strategy dispatch, a required FlipCoordinator with a bounded timeout for CLI and web, job-scoped flip answers, visible SCANNING_REVERSE (C-01, C-02, M-02, M-07) — Phase 25
 - ✓ Worker and web robustness: a guarded worker loop whose job-store faults surface as a degraded `/health` (transient faults heal; persistent ones degrade within ~15 s), visible 429 backpressure with `Retry-After`, blocking routes declared `def`, startup crash recovery, and a server-owned Scan button on vendored offline-LAN assets, with deployment and API docs updated (ROBU-01..11) — Phase 26
+- ✓ Configuration strictness: unknown keys and `SANELESS_*` variables are rejected at load with one value-free line per error that names the section, key, valid keys and the environment variable when it is the source; a missing `--config` exits 2; `~`/XDG paths; validated `log_level` with `-v` DEBUG on saneless loggers; `SecretStr` token; literal profile `title` with optional CLI `--title`; `auto-profiles --force` merges only tool-owned keys; atomic, owner/mode/CRLF-preserving config rewrites shipped with the read-write `./config:/etc/saneless` compose mount; `--help` needs no config; the loaded config source is logged at startup (CFG-01..11) — Phase 27
 
 ### Active
 
@@ -157,4 +158,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-14 — Phase 26 complete: worker and web robustness (19/19 plans, two gap-closure rounds fixed CR-01, WR-01, WR-10, WR-11, IN-08; re-verification passed 5/5; WR-02..WR-09 and IN-09 carried forward as non-blocking review findings)*
+*Last updated: 2026-09-15 — Phase 27 complete: configuration strictness (8/8 plans in 3 waves; deep review found 2 critical + 8 warning issues, all fixed with regression tests before verification; verification passed 16/16; IN-01..IN-07 info findings carried forward as non-blocking)*
