@@ -154,6 +154,24 @@ def _default_log_file() -> str:
     return str(xdg_state_home() / "saneless" / "saneless.log")
 
 
+def _expand_user(value: str) -> str:
+    """
+    Expand a leading ``~`` in a path setting (CFG-03, M-20).
+
+    Only ``~`` is expanded, by decision: ``$VAR`` is left literal, so a value
+    cannot silently pick up an unrelated environment variable (T-27-26). An
+    empty value is returned unchanged -- for ``consume_dir`` it means disabled.
+
+    Args:
+        value: The configured path string.
+
+    Returns:
+        The path with ``~`` expanded, or the empty string unchanged.
+
+    """
+    return str(Path(value).expanduser()) if value else value
+
+
 def _is_legacy_manual_duplex_source(source: str) -> bool:
     """
     Recognise the deprecated ``source = "Manual Duplex"`` config form (DPLX-02).
@@ -198,6 +216,21 @@ class PaperlessConfig(BaseModel):
     # web/app.py create_app.
     token: SecretStr = SecretStr("")
     consume_dir: str = ""
+
+    @field_validator("consume_dir", mode="after")
+    @classmethod
+    def _expand_consume_dir(cls, value: str) -> str:
+        """
+        Expand a leading ``~`` in ``consume_dir``; empty stays empty (CFG-03).
+
+        Args:
+            value: The validated ``consume_dir``.
+
+        Returns:
+            The value with ``~`` expanded; ``$VAR`` is not expanded.
+
+        """
+        return _expand_user(value)
 
 
 class ProfileConfig(BaseModel):
@@ -319,6 +352,25 @@ class OutputConfig(BaseModel):
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
+
+    @field_validator("tmp_dir", "data_dir", "log_file", mode="after")
+    @classmethod
+    def _expand_paths(cls, value: str) -> str:
+        """
+        Expand a leading ``~`` in the path settings (CFG-03, M-20).
+
+        ``~/scans`` used to be taken literally. Only ``~`` is expanded, never
+        ``$VAR``. The defaults are already absolute, so this does not run on
+        them (no ``validate_default``).
+
+        Args:
+            value: The validated path string.
+
+        Returns:
+            The value with ``~`` expanded.
+
+        """
+        return _expand_user(value)
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -939,6 +991,51 @@ def _build_settings(
     raise ConfigError(msg) from None
 
 
+def _nearest_existing_ancestor(path: Path) -> Path:
+    """
+    Find the deepest existing path among ``path`` and its ancestors (M-20).
+
+    Args:
+        path: A directory that may not exist yet.
+
+    Returns:
+        ``path`` itself if it exists, else its nearest existing ancestor, else
+        the path's anchor (``.`` for a relative path).
+
+    """
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return candidate
+    return Path(path.anchor or ".")
+
+
+def _require_writable(label: str, directory: Path) -> None:
+    """
+    Raise ConfigError unless ``directory`` could be written or created (M-20).
+
+    A missing directory is judged by its nearest existing ancestor, since that
+    is where creating it would fail -- not just by an immediate parent that
+    may not exist either.
+
+    Args:
+        label: The setting name, e.g. ``data_dir``, for the message.
+        directory: The configured directory.
+
+    Raises:
+        ConfigError: If the directory, or its nearest existing ancestor when
+            the directory is missing, is not writable.
+
+    """
+    ancestor = _nearest_existing_ancestor(directory)
+    if os.access(ancestor, os.W_OK):
+        return
+    if ancestor == directory:
+        msg = f"{label} is not writable: {directory}"
+    else:
+        msg = f"{label} parent is not writable: {ancestor}"
+    raise ConfigError(msg)
+
+
 def validate_settings_dirs(settings: Settings) -> None:
     """
     Fail fast with ConfigError if tmp_dir, data_dir or consume_dir are unwritable.
@@ -946,7 +1043,9 @@ def validate_settings_dirs(settings: Settings) -> None:
     Validates directory writability at startup so permission errors surface
     immediately rather than mid-scan, or - for data_dir - at the moment a
     failed scan needs preserving. Per D-13, raises ConfigError (not
-    ValueError) for writability failures.
+    ValueError) for writability failures. A missing directory is checked
+    against its nearest existing ancestor, so ``<unwritable>/a/b/c`` fails
+    here too (M-20).
 
     Args:
         settings: Application settings to validate.
@@ -955,35 +1054,10 @@ def validate_settings_dirs(settings: Settings) -> None:
         ConfigError: If any configured directory is not writable.
 
     """
-    tmp = Path(settings.output.tmp_dir)
-    if tmp.exists() and not os.access(tmp, os.W_OK):
-        msg = f"tmp_dir is not writable: {tmp}"
-        raise ConfigError(msg)
-    if not tmp.exists():
-        parent = tmp.parent
-        if parent.exists() and not os.access(parent, os.W_OK):
-            msg = f"tmp_dir parent is not writable: {parent}"
-            raise ConfigError(msg)
-    data = Path(settings.output.data_dir)
-    if data.exists() and not os.access(data, os.W_OK):
-        msg = f"data_dir is not writable: {data}"
-        raise ConfigError(msg)
-    if not data.exists():
-        parent = data.parent
-        if parent.exists() and not os.access(parent, os.W_OK):
-            msg = f"data_dir parent is not writable: {parent}"
-            raise ConfigError(msg)
-    consume = settings.paperless.consume_dir
-    if consume:
-        consume_path = Path(consume)
-        if consume_path.exists() and not os.access(consume_path, os.W_OK):
-            msg = f"consume_dir is not writable: {consume_path}"
-            raise ConfigError(msg)
-        if not consume_path.exists():
-            parent = consume_path.parent
-            if parent.exists() and not os.access(parent, os.W_OK):
-                msg = f"consume_dir parent is not writable: {parent}"
-                raise ConfigError(msg)
+    _require_writable("tmp_dir", Path(settings.output.tmp_dir))
+    _require_writable("data_dir", Path(settings.output.data_dir))
+    if settings.paperless.consume_dir:
+        _require_writable("consume_dir", Path(settings.paperless.consume_dir))
 
 
 def config_search_paths() -> tuple[Path, ...]:
