@@ -104,3 +104,36 @@ def test_deploy_doc_explains_missing_config_and_migration() -> None:
         if "config.toml" in line and "config/" in line and "mv" in line
     ]
     assert migration, f"{name} has no migration step moving config.toml into ./config/"
+
+
+def test_profile_howto_describes_force_as_a_merge() -> None:
+    """The profile how-to describes ``--force`` as a merge, not an overwrite."""
+    text = PROFILE_HOWTO.read_text(encoding="utf-8")
+    name = PROFILE_HOWTO.relative_to(REPO_ROOT)
+    for needle in (
+        "auto_generated",
+        "default_tags",
+        "Refreshed",
+        "Skipped (not auto-generated)",
+    ):
+        assert needle in text, f"{name} does not mention {needle!r}"
+    assert "to overwrite existing auto-generated profiles" not in text, (
+        f"{name} still describes --force as an overwrite"
+    )
+
+
+def test_profile_howto_title_is_literal() -> None:
+    """The profile ``title`` is documented as a literal default, not a template."""
+    text = PROFILE_HOWTO.read_text(encoding="utf-8")
+    name = PROFILE_HOWTO.relative_to(REPO_ROOT)
+    assert "title template" not in text.lower(), f"{name} still calls title a template"
+    assert "Scan <" in text, f"{name} does not document the 'Scan <time>' fallback"
+
+
+def test_profile_howto_unwritable_example_is_current() -> None:
+    """The unwritable-config example no longer blames the Docker Compose examples."""
+    text = PROFILE_HOWTO.read_text(encoding="utf-8")
+    assert "as in the Docker Compose examples" not in text, (
+        f"{PROFILE_HOWTO.relative_to(REPO_ROOT)} still says the compose examples "
+        "mount the config read-only"
+    )
