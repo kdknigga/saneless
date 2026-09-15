@@ -15,6 +15,10 @@ to the Phase 27 behaviour: strict keys and ``SANELESS_*`` names, XDG paths,
 validated log levels, ``-v``, the literal profile title, and the optional
 ``--title`` (CFG-01..CFG-08, CFG-10, CFG-11).
 
+The Phase 28 tests pin the exit-code tables in the scripting how-to and the CLI
+reference, and the troubleshooting how-to, to ``ExitCode``: every documented
+code is a real one, and every real one is documented (D-07, D-13).
+
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
 """
@@ -23,6 +27,8 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+
+from saneless.vocabulary import ExitCode
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
@@ -328,3 +334,222 @@ def test_scripting_exit_code_two_examples() -> None:
     section = rest.split("\n## ", 1)[0]
     for needle in ("unknown config key", "SANELESS_"):
         assert needle in section, f"{name}: exit-code section lacks {needle!r}"
+
+
+EXIT_CODES = frozenset(int(code) for code in ExitCode)
+_CODE_ROW = re.compile(r"^\| (\d+) \|", re.MULTILINE)
+_COMMAND_HEADING = re.compile(r"^## `saneless ([a-z-]+)`$", re.MULTILINE)
+
+OLD_SCRIPTING_ABORT = (
+    "aborted at the flip prompt or not confirmed within `flip_timeout_seconds` "
+    "exits with code 1"
+)
+OLD_REFERENCE_ABORT = "manual duplex aborted at the flip prompt or flip wait timed out"
+
+
+def _documented_codes(section: str) -> set[int]:
+    """Return the integer first cells of the Markdown table rows in ``section``."""
+    return {int(match) for match in _CODE_ROW.findall(section)}
+
+
+def _section(text: str, heading: str, name: Path) -> str:
+    """
+    Return the body of the ``heading`` section, up to the next ``## `` heading.
+
+    The heading must be a whole line, so ``## Exit codes`` never matches a
+    longer heading that merely starts with it.
+    """
+    match = re.search(rf"^{re.escape(heading)}$", text, re.MULTILINE)
+    assert match, f"{name} has no {heading!r} section"
+    return text[match.end() :].split("\n## ", 1)[0]
+
+
+def _command_exit_tables(text: str, name: Path) -> dict[str, str]:
+    """
+    Return each ``saneless <cmd>`` section's ``**Exit codes:**`` table text.
+
+    The table is the run of lines starting with ``|`` after the marker, so the
+    prose that follows it is never read as a row.
+    """
+    tables: dict[str, str] = {}
+    headings = list(_COMMAND_HEADING.finditer(text))
+    assert headings, f"{name} has no '## `saneless <cmd>`' sections"
+    for heading in headings:
+        section = text[heading.end() :].split("\n## ", 1)[0]
+        _, marker, rest = section.partition("**Exit codes:**")
+        assert marker, f"{name}: `saneless {heading[1]}` has no exit-code table"
+        rows: list[str] = []
+        for line in rest.strip("\n").splitlines():
+            if not line.startswith("|"):
+                break
+            rows.append(line)
+        tables[heading[1]] = "\n".join(rows)
+    return tables
+
+
+def test_scripting_exit_code_table_matches_exit_code_enum() -> None:
+    """The scripting how-to's exit-code table lists exactly the ExitCode values."""
+    text, name = _read(CLI_SCRIPTING)
+    section = _section(text, "## Exit codes", name)
+    assert _documented_codes(section) == EXIT_CODES, (
+        f"{name}: exit-code table {sorted(_documented_codes(section))} "
+        f"!= ExitCode {sorted(EXIT_CODES)}"
+    )
+
+
+def test_cli_reference_global_exit_code_table_matches_exit_code_enum() -> None:
+    """The CLI reference's global exit-code table lists exactly the ExitCode values."""
+    text, name = _read(CLI_REFERENCE)
+    section = _section(text, "## Exit codes", name)
+    assert _documented_codes(section) == EXIT_CODES, (
+        f"{name}: global exit-code table {sorted(_documented_codes(section))} "
+        f"!= ExitCode {sorted(EXIT_CODES)}"
+    )
+
+
+def test_cli_reference_command_exit_codes_are_real() -> None:
+    """
+    Every command's exit codes are real, and scan, serve and jobs list theirs.
+
+    ``serve`` has no 1 (it scans nothing itself) and no 130: its Ctrl-C is
+    uvicorn's graceful stop, exit 0 (D-07 amendment, D-03).
+    """
+    text, name = _read(CLI_REFERENCE)
+    tables = _command_exit_tables(text, name)
+    for command, table in tables.items():
+        codes = _documented_codes(table)
+        assert codes, f"{name}: `saneless {command}` exit-code table is empty"
+        assert codes <= EXIT_CODES, (
+            f"{name}: `saneless {command}` documents unknown codes "
+            f"{sorted(codes - EXIT_CODES)}"
+        )
+    assert _documented_codes(tables["scan"]) == {0, 1, 2, 3, 4, 5, 130}
+    assert _documented_codes(tables["serve"]) == {0, 2, 3, 5}
+    assert {5, 130} <= _documented_codes(tables["jobs"])
+    assert "abort" not in _table_row(tables["scan"], "1").lower(), (
+        f"{name}: scan's exit-1 row still describes a flip-prompt abort"
+    )
+
+
+def test_job_database_documented_under_exit_code_two() -> None:
+    """
+    A job database saneless cannot use is exit 2, never exit 5 (D-07 amendment).
+
+    ``StorageError`` is a setup problem; exit 5 is only for an exception that is
+    not a saneless type.
+    """
+    scripting, scripting_name = _read(CLI_SCRIPTING)
+    reference, reference_name = _read(CLI_REFERENCE)
+    tables = _command_exit_tables(reference, reference_name)
+    sections = {
+        f"{scripting_name} ## Exit codes": _section(
+            scripting, "## Exit codes", scripting_name
+        ),
+        f"{reference_name} ## Exit codes": _section(
+            reference, "## Exit codes", reference_name
+        ),
+        f"{reference_name} saneless jobs": tables["jobs"],
+        f"{reference_name} saneless serve": tables["serve"],
+    }
+    for label, section in sections.items():
+        assert "job database" in _table_row(section, "2").lower(), (
+            f"{label}: the exit-2 row does not mention the job database"
+        )
+        assert "job database" not in _table_row(section, "5").lower(), (
+            f"{label}: the exit-5 row mentions the job database"
+        )
+
+
+def test_flip_prompt_abort_documented_as_cancelled() -> None:
+    """An abort at the flip prompt is documented as exit 130, not 1 (D-02, D-03)."""
+    for path, old in (
+        (CLI_SCRIPTING, OLD_SCRIPTING_ABORT),
+        (CLI_REFERENCE, OLD_REFERENCE_ABORT),
+    ):
+        text, name = _read(path)
+        flat = " ".join(text.split())
+        assert old not in flat, f"{name} still documents the abort as exit 1"
+        sentences = re.split(r"(?<=[.!?])\s+", flat)
+        assert any("flip prompt" in s and "130" in s for s in sentences), (
+            f"{name} has no sentence saying a flip-prompt abort exits 130"
+        )
+
+
+TROUBLESHOOTING = DOCS_DIR / "how-to" / "troubleshoot-a-failed-scan.md"
+SCANNER_HOST_DISCOVERY = DOCS_DIR / "how-to" / "scanner-host-discovery.md"
+MKDOCS = REPO_ROOT / "mkdocs.yml"
+
+
+def _heading_section(text: str, word: str, name: Path) -> str:
+    """Return the body of the one ``## `` section whose heading contains ``word``."""
+    matches = [
+        match
+        for match in re.finditer(r"^## (.+)$", text, re.MULTILINE)
+        if word in match[1]
+    ]
+    assert len(matches) == 1, f"{name}: expected one '## ' heading with {word!r}"
+    return text[matches[0].end() :].split("\n## ", 1)[0]
+
+
+def _first_table(text: str) -> str:
+    """Return the first run of Markdown table lines in ``text``."""
+    rows: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break
+    return "\n".join(rows)
+
+
+def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
+    """
+    The troubleshooting how-to exists, is navigable, and covers every code (D-13).
+
+    Its opening table lists exactly the ExitCode values, it has a section for
+    each kind of failure, and the pages with their own Troubleshooting section
+    link to it. A job database problem is a setup problem (exit 2), so it is
+    described under configuration and never under unexpected errors (D-07
+    amendment). The unexpected-error section says what to attach to a bug
+    report and warns about the Paperless token in a DEBUG log (T-28-51).
+    """
+    assert TROUBLESHOOTING.is_file(), f"{TROUBLESHOOTING} does not exist"
+    text, name = _read(TROUBLESHOOTING)
+    table_codes = _documented_codes(_first_table(text))
+    assert table_codes == EXIT_CODES, (
+        f"{name}: first table {sorted(table_codes)} != ExitCode {sorted(EXIT_CODES)}"
+    )
+    nav, _ = _read(MKDOCS)
+    assert "how-to/troubleshoot-a-failed-scan.md" in nav, (
+        "mkdocs.yml nav does not list the troubleshooting how-to"
+    )
+    headings = re.findall(r"^#+ (.+)$", text, re.MULTILINE)
+    for word in (
+        "Scanner",
+        "Paperless",
+        "PDF",
+        "Configuration",
+        "python-sane",
+        "Cancelled",
+        "Unexpected",
+    ):
+        assert any(word in heading for heading in headings), (
+            f"{name} has no heading containing {word!r}"
+        )
+    unexpected = _heading_section(text, "Unexpected", name).lower()
+    for needle in ("log file", "bug", "token"):
+        assert needle in unexpected, (
+            f"{name}: the unexpected-error section does not mention {needle!r}"
+        )
+    assert "job database" not in unexpected, (
+        f"{name}: the unexpected-error section mentions the job database"
+    )
+    configuration = _heading_section(text, "Configuration", name).lower()
+    assert "job database" in configuration, (
+        f"{name}: the configuration section does not mention the job database"
+    )
+    for page in (INSTALL_BARE_METAL, SCANNER_HOST_DISCOVERY):
+        page_text, page_name = _read(page)
+        assert "troubleshoot-a-failed-scan.md" in page_text, (
+            f"{page_name} does not link to the troubleshooting how-to"
+        )
