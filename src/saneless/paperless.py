@@ -39,11 +39,14 @@ _API_VERSION_ACCEPT = "application/json; version=9"
 # progress, so polling it to the deadline would report a misattributed timeout.
 _TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
 
-# Upper bound on how much of a non-200 response body is interpolated into an
+# Upper bound on how much of an error response body is interpolated into an
 # error message.  That message is recorded verbatim in the job store and
-# rendered in the web status area (T-23-16), so an upstream returning a
-# multi-megabyte body or an HTML error page must not be able to flood either.
-_MAX_ERROR_BODY_CHARS = 500
+# rendered in the web status area and on the terminal (T-23-16, M-17), so an
+# upstream returning a multi-megabyte body or an HTML error page must not be
+# able to flood any of them.  The full body is logged at DEBUG instead.
+_MAX_BODY_LINE_CHARS = 200
+
+_EMPTY_BODY = "(empty response body)"
 
 _NO_FAILURE_MESSAGE = "Paperless reported a failure but supplied no message"
 
@@ -123,23 +126,97 @@ def _failure_message(task: dict[str, object]) -> str:
     return _NO_FAILURE_MESSAGE
 
 
-def _truncated_body(text: str) -> str:
+def _first_message(value: object) -> str | None:
     """
-    Return a length-bounded rendering of an upstream response body.
+    Return the first message from a DRF error value.
 
     Args:
-        text: The raw response body.
+        value: A field's error value -- a string, or a list of strings.
 
     Returns:
-        The body unchanged when short, otherwise its first
-        ``_MAX_ERROR_BODY_CHARS`` characters with an explicit marker naming
-        the full length, so a reader can tell truncation from a short body.
+        The string itself, the first string in a list, or None when the
+        value carries no usable message.
 
     """
-    if len(text) <= _MAX_ERROR_BODY_CHARS:
-        return text
-    head = text[:_MAX_ERROR_BODY_CHARS]
-    return f"{head}... [truncated, {len(text)} characters total]"
+    if isinstance(value, list) and value:
+        value = value[0]
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def _json_error_text(payload: object) -> str | None:
+    """
+    Pick the one message a reader needs out of a DRF error payload.
+
+    The shapes Django REST Framework produces are, in order of preference:
+    ``{"detail": "..."}`` (a string, or a list joined with spaces), a
+    field-error dict ``{"field": ["msg", ...]}`` (including
+    ``non_field_errors``) rendered as ``field: msg`` for its first field,
+    and a bare top-level list whose first string is used.
+
+    Args:
+        payload: The decoded JSON body.
+
+    Returns:
+        The chosen text, or None when the payload matches no known shape
+        and the caller should fall back to the raw body.
+
+    """
+    text: str | None = None
+    if isinstance(payload, dict):
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail:
+            text = detail
+        elif isinstance(detail, list) and detail:
+            text = " ".join(str(item) for item in detail)
+        else:
+            for key, value in payload.items():
+                message = _first_message(value)
+                if message is not None:
+                    text = f"{key}: {message}"
+                    break
+    elif isinstance(payload, list):
+        text = _first_message(payload)
+    return text
+
+
+def _render_error_body(response: httpx.Response) -> str:
+    """
+    Reduce a Paperless error response body to one bounded line.
+
+    This is the single body renderer for the client (D-09): the upload 4xx
+    and the task poll non-200 both use it.  A DRF JSON error is reduced to
+    its ``detail``, else its first field error, else the first entry of a
+    top-level list; anything else (an HTML proxy page, plain text) is used
+    as it stands.  In every case the whitespace is collapsed, so no newline,
+    tab or other whitespace control character from the upstream can forge an
+    extra CLI line (T-28-24), and the text is cut to
+    ``_MAX_BODY_LINE_CHARS`` characters plus an ellipsis, so the job store
+    and the web status area cannot be flooded (T-23-16).  The full body is
+    logged at DEBUG so it stays diagnosable.
+
+    Args:
+        response: The error response.
+
+    Returns:
+        A non-empty single line; ``(empty response body)`` when the body
+        carried nothing.
+
+    """
+    logger.debug("Paperless error body (%s): %s", response.status_code, response.text)
+    try:
+        text = _json_error_text(response.json())
+    except ValueError:
+        text = None
+    if text is None:
+        text = response.text
+    line = " ".join(text.split())
+    if not line:
+        line = _EMPTY_BODY
+    elif len(line) > _MAX_BODY_LINE_CHARS:
+        line = f"{line[:_MAX_BODY_LINE_CHARS]}…"
+    return line
 
 
 @dataclass
@@ -414,8 +491,9 @@ class PaperlessClient:
         Raises:
             PaperlessError: If the task ends FAILURE or REVOKED, carrying
                 the message paperless-ngx supplied, or if any poll returns a
-                non-200 response, carrying the status code and a
-                length-bounded excerpt of the body.
+                non-200 response, carrying the status code, the reason
+                phrase and the body reduced to one bounded line by
+                ``_render_error_body`` (D-09).
             PaperlessTimeoutError: If the deadline passes before the task
                 reaches a terminal status. The message names the task id so
                 the task can be looked up in paperless-ngx directly.
@@ -431,8 +509,8 @@ class PaperlessClient:
             )
             if response.status_code != 200:
                 msg = (
-                    f"Paperless task poll failed with HTTP "
-                    f"{response.status_code}: {_truncated_body(response.text)}"
+                    f"Paperless task poll failed ({response.status_code} "
+                    f"{response.reason_phrase}): {_render_error_body(response)}"
                 )
                 raise PaperlessError(msg)
 
