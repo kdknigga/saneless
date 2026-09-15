@@ -24,7 +24,9 @@ from .auto_profiles import (
     write_profiles_to_config,
 )
 from .config import (
+    Settings,
     load_settings,
+    log_config_sources,
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
 )
@@ -172,32 +174,71 @@ def _truncate(value: str, width: int) -> str:
     "-v",
     "--verbose",
     is_flag=True,
-    help="Enable debug output.",
+    help="Log saneless's own debug detail to the log file and stderr.",
 )
 @click.pass_context
 def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
     """Saneless -- SANE scanner to paperless-ngx bridge."""
+    # Click runs this callback before a subcommand parses its own --help, and
+    # ctx.resilient_parsing is False there, so nothing may be loaded here: a
+    # broken config would otherwise break `saneless serve --help` (CFG-10).
+    # Each command loads through _load_cli_settings instead.
     ctx.ensure_object(dict)
+    ctx.obj["config_path"] = config_path
+    ctx.obj["verbose"] = verbose
+
+
+def _load_cli_settings(ctx: click.Context) -> Settings:
+    """
+    Load and validate settings and configure logging, once per process.
+
+    Called by every command on first need rather than by the group callback,
+    so ``--help`` never touches the configuration (CFG-10). Loading, directory
+    validation and logging setup share one error handler, so a failure in any
+    of them -- including an unwritable log (M-21) -- is one message and exit 2,
+    never a traceback. ``load_settings`` and ``configure_logging`` are called by
+    their module-global names, which is where the tests patch them.
+
+    Args:
+        ctx: The command's context; its ``obj`` carries ``config_path`` and
+            ``verbose`` from the group, and caches the loaded settings.
+
+    Returns:
+        The loaded settings, the same object on every call.
+
+    """
+    cached = ctx.obj.get("settings")
+    if isinstance(cached, Settings):
+        return cached
 
     try:
-        settings = load_settings(config_path)
+        settings = load_settings(ctx.obj.get("config_path"))
         validate_settings_dirs(settings)
+        configure_logging(
+            settings.output.log_file,
+            settings.output.log_level,
+            settings.output.log_max_bytes,
+            settings.output.log_backup_count,
+            verbose=bool(ctx.obj.get("verbose")),
+        )
+    except ConfigError as exc:
+        # The loader's renderer already wrote its own "Configuration error in
+        # <file>:" header; a second prefix would double it (D-10).
+        click.echo(str(exc), err=True)
+        sys.exit(2)
     except Exception as exc:
+        # Anything else -- a TOML syntax error (still a ValueError until Phase
+        # 28), or configure_logging failing -- keeps the documented exit 2.
         click.echo(f"Configuration error: {exc}", err=True)
         sys.exit(2)
 
-    configure_logging(
-        settings.output.log_file,
-        settings.output.log_level,
-        settings.output.log_max_bytes,
-        settings.output.log_backup_count,
-        verbose=verbose,
-    )
     # WR-05: emitted only now, once the log file handler exists to receive it.
     warn_on_legacy_duplex_sources(settings)
+    # CFG-11: which file and which environment keys, names only, once.
+    log_config_sources(settings)
 
     ctx.obj["settings"] = settings
-    ctx.obj["verbose"] = verbose
+    return settings
 
 
 @cli.command()
@@ -214,7 +255,7 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
 @click.pass_context
 def scan(ctx: click.Context, profile: str, title: str) -> None:
     """Scan a document and upload to paperless-ngx."""
-    settings = ctx.obj["settings"]
+    settings = _load_cli_settings(ctx)
 
     if profile not in settings.profiles:
         click.echo(f"Unknown profile: {profile}", err=True)
@@ -325,7 +366,7 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
 @click.pass_context
 def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     """List available scanning devices."""
-    _settings = ctx.obj["settings"]
+    _settings = _load_cli_settings(ctx)
 
     if not as_json:
         click.echo("Discovering scanners...")
@@ -380,7 +421,7 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
 @click.pass_context
 def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     """List recent scan job history."""
-    settings = ctx.obj["settings"]
+    settings = _load_cli_settings(ctx)
     # sqlite3.connect does not create parent directories, so data_dir must
     # exist before JobStore opens the database. Deliberately not hidden inside
     # the db_path property: a property with a filesystem side effect surprises.
@@ -438,7 +479,7 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
 @click.pass_context
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Start the web server."""
-    settings = ctx.obj["settings"]
+    settings = _load_cli_settings(ctx)
     actual_host = host or settings.output.web_host
     actual_port = port or settings.output.web_port
 
@@ -457,6 +498,10 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
     click.echo(f"Serving on http://{actual_host}:{actual_port}")
 
+    # uvicorn follows the configured log_level, not -v: -v is saneless's own
+    # detail and must not turn on uvicorn's or httpx's debug output
+    # (orchestrator resolution 5). The validated LogLevel Literal lower-cases
+    # to a name uvicorn accepts.
     uvicorn.run(
         app,
         host=actual_host,
@@ -509,7 +554,7 @@ def _echo_write_result(
 @click.pass_context
 def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     """Generate scan profiles from scanner capabilities."""
-    settings = ctx.obj["settings"]
+    settings = _load_cli_settings(ctx)
 
     scanner = SaneBackend(host=settings.scanner.host)
     device_list = scanner.get_devices()

@@ -454,9 +454,9 @@ def _is_auto_generated(table: object) -> bool:
 #
 # ``default`` is required by ``Settings.validate_default_profile``, so pruning
 # it leaves behind a config saneless itself refuses to load. There is no way
-# back from that inside the tool: ``cli()`` loads settings before dispatching to
-# any subcommand, so not even ``auto-profiles`` could regenerate the key it just
-# deleted, and the user has to hand-edit TOML. A previous run stamps every
+# back from that inside the tool: every command loads and validates settings
+# before it runs (only ``--help`` skips that), so not even ``auto-profiles``
+# could regenerate the key it just deleted, and the user has to hand-edit TOML. A previous run stamps every
 # profile it writes with ``auto_generated = true``, ``default`` included, so
 # without this guard a single run against a scanner with no flatbed -- an
 # ordinary sheet-fed document scanner -- destroys a working installation.

@@ -43,7 +43,7 @@ from saneless.scanner.base import (
 from saneless.vocabulary import FlipOutcome, JobState, state_label
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
 # Keeps the suite out of the developer's real ~/.local/state/saneless.
@@ -950,7 +950,7 @@ class TestLegacyDuplexWarningReachesLogFile:
 
 
 @contextlib.contextmanager
-def _restored_logging() -> Iterator[None]:
+def _restored_logging() -> Generator[None]:
     """
     Undo what a real ``configure_logging`` call did to the logging tree.
 
