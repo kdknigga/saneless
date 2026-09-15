@@ -47,8 +47,10 @@ What the common cases mean:
 - **The flip wait timed out.** A manual duplex scan waited `flip_timeout_seconds` for someone to
   flip the stack and nobody answered. A timeout is a failure, not a cancel. See
   [Manual Duplex](set-up-adf-duplex.md#manual-duplex).
-- **The flip prompt failed.** The terminal broke while `saneless scan` was asking you to flip the
-  stack. The cause is logged with its traceback.
+- **The flip prompt failed.** Reading your answer failed while `saneless scan` was asking you to
+  flip the stack, for example with an I/O error or input that could not be decoded. The cause is
+  logged with its traceback. End of input is not a failure: Ctrl-D, or a terminal that closes, at
+  the prompt cancels the scan (exit 130).
 
 To check that saneless can see the scanner at all, run:
 

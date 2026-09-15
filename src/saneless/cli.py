@@ -112,11 +112,13 @@ class ClickFlipCoordinator(FlipCoordinator):
     (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
     the calling thread, where Python delivers SIGINT).  Those three are an
     operator's abort -- a cancel -- so giving up at the terminal and clicking
-    Abort in the web UI end the job the same way (D-02).  A prompt that fails
-    unexpectedly -- a lost terminal, undecodable input -- also answers
-    ``ABORTED`` at once, logged with its traceback (WR-08), but it records the
-    exception as ``abort_cause``: nobody chose to stop, so the scan is reported
-    as failed (exit 1), not cancelled.
+    Abort in the web UI end the job the same way (D-02).  End of input counts
+    as a cancel however it arrives, including a terminal that closes, since
+    ``click.confirm`` reports it as ``click.Abort`` (D-02, D-03).  A prompt
+    that fails with a read error instead -- an I/O error from the terminal,
+    undecodable input -- also answers ``ABORTED`` at once, logged with its
+    traceback (WR-08), but it records the exception as ``abort_cause``: nobody
+    chose to stop, so the scan is reported as failed (exit 1), not cancelled.
 
     Accepted cost, deliberate and not a leak: after a timeout the prompt thread
     is abandoned.  It keeps its read on stdin until the process exits, and its
