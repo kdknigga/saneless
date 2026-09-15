@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from saneless.config import (
     ProfileConfig,
     Settings,
     load_settings,
+    resolve_job_title,
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
 )
@@ -27,6 +29,7 @@ from saneless.exceptions import (
     SanelessError,
     ScanError,
 )
+from saneless.vocabulary import TITLE_MAX_LENGTH
 
 
 class TestLoadSettingsFromToml:
@@ -401,21 +404,84 @@ class TestTomlStructureErrors:
             load_settings(config_path=str(config_file))
 
     def test_title_alias_works(self, tmp_config_dir: Path) -> None:
-        """The 'title' field in [profiles.default] maps to default_title_template."""
+        """The 'title' field in [profiles.default] maps to default_title (D-15)."""
         toml_content = '[profiles.default]\ntitle = "My Doc"\n'
         config_file = tmp_config_dir / "title_alias.toml"
         config_file.write_text(toml_content)
         settings = load_settings(config_path=str(config_file))
-        assert settings.profiles["default"].default_title_template == "My Doc"
+        assert settings.profiles["default"].default_title == "My Doc"
 
     def test_title_env_var_override(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Env var SANELESS_PROFILES__DEFAULT__TITLE sets default_title_template."""
+        """Env var SANELESS_PROFILES__DEFAULT__TITLE sets default_title (D-15)."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("SANELESS_PROFILES__DEFAULT__TITLE", "EnvTitle")
         settings = load_settings()
-        assert settings.profiles["default"].default_title_template == "EnvTitle"
+        assert settings.profiles["default"].default_title == "EnvTitle"
+
+    def test_title_over_max_length_is_rejected(self) -> None:
+        """
+        A profile title longer than TITLE_MAX_LENGTH fails validation (D-15).
+
+        The route's form bound only checks a typed title, so an unbounded
+        profile title would bypass ROBU-08.
+        """
+        with pytest.raises(ValidationError, match="title"):
+            ProfileConfig(title="x" * (TITLE_MAX_LENGTH + 1))
+
+    def test_title_at_max_length_is_accepted(self) -> None:
+        """A profile title of exactly TITLE_MAX_LENGTH characters loads."""
+        title = "x" * TITLE_MAX_LENGTH
+        assert ProfileConfig(title=title).default_title == title
+
+
+class TestResolveJobTitle:
+    """
+    One title rule for every front end (D-16, M-24).
+
+    A typed title wins when it is non-blank after stripping; otherwise the
+    profile's ``title``; otherwise ``Scan <UTC YYYY-MM-DD HH:MM>``. The
+    documented ``title`` key used to do nothing.
+    """
+
+    _NOW = datetime(2026, 9, 15, 13, 5, tzinfo=UTC)
+
+    def test_title_typed_wins(self) -> None:
+        """A non-blank typed title is used over the profile's title."""
+        profile = ProfileConfig(title="Receipt")
+        assert resolve_job_title("Invoice", profile, now=self._NOW) == "Invoice"
+
+    @pytest.mark.parametrize("typed", ["", "   ", None])
+    def test_title_blank_typed_uses_profile_title(self, typed: str | None) -> None:
+        """An empty, whitespace or missing typed title falls back to the profile."""
+        profile = ProfileConfig(title="Receipt")
+        assert resolve_job_title(typed, profile, now=self._NOW) == "Receipt"
+
+    def test_title_without_profile_title_uses_timestamp(self) -> None:
+        """A profile with no title falls through to the UTC timestamp."""
+        title = resolve_job_title("", ProfileConfig(), now=self._NOW)
+        assert title == "Scan 2026-09-15 13:05"
+
+    def test_title_blank_profile_title_uses_timestamp(self) -> None:
+        """A whitespace profile title counts as blank."""
+        profile = ProfileConfig(title="  ")
+        title = resolve_job_title(None, profile, now=self._NOW)
+        assert title == "Scan 2026-09-15 13:05"
+
+    def test_title_no_profile_uses_timestamp(self) -> None:
+        """With no profile at all the timestamp is used."""
+        assert resolve_job_title(None, None, now=self._NOW) == "Scan 2026-09-15 13:05"
+
+    def test_title_timestamp_is_rendered_in_utc(self) -> None:
+        """A non-UTC aware ``now`` renders as UTC (local time is APPL-12)."""
+        plus_two = datetime(2026, 9, 15, 15, 5, tzinfo=timezone(timedelta(hours=2)))
+        assert resolve_job_title("", None, now=plus_two) == "Scan 2026-09-15 13:05"
+
+    def test_title_typed_is_returned_unstripped(self) -> None:
+        """A non-blank typed title is returned as given, matching today."""
+        typed = " Invoice "
+        assert resolve_job_title(typed, None, now=self._NOW) == typed
 
 
 class TestProfileConfigThresholds:
