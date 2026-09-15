@@ -453,6 +453,9 @@ _DUPLEX_PROFILE = "duplex"
 # sentence so a rewording of the tail does not break the ordering checks.
 _FLIP_PROMPT_FRAGMENT = "Flip the stack"
 
+# The one line an operator's abort at the flip prompt prints (D-03, N-08).
+_FLIP_CANCEL_LINE = "Manual duplex scan cancelled at the flip prompt"
+
 
 def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Settings:
     """
@@ -608,10 +611,17 @@ class TestManualDuplexPrompt:
         backs = result.output.index("Scanning reverse sides...")
         assert fronts < prompt < backs
 
-    def test_answering_no_aborts_without_scanning_backs(
+    def test_answering_no_cancels_without_scanning_backs(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Answering no fails the job at the flip prompt and uploads nothing."""
+        """
+        Answering no cancels the scan: one line, exit 130, nothing uploaded.
+
+        A no is the operator choosing to stop, so it is a cancel rather than a
+        scan error (N-08, D-02), and it exits with the shell's interrupt code
+        so a script still sees a non-zero status (D-03, D-07).  The prompt
+        itself is echoed to stdout, so the cancel line is read from stderr.
+        """
         calls: list[str] = []
         uploads: list[str] = []
         runner, _ = _patch_cli(
@@ -628,15 +638,21 @@ class TestManualDuplexPrompt:
             input="n\n",
         )
 
-        assert result.exit_code != 0
-        assert "flip prompt" in result.output
+        assert result.exit_code == 130, result.output
+        assert result.stderr.strip().splitlines()[-1] == _FLIP_CANCEL_LINE
+        assert "Scan error" not in result.output
         assert len(calls) == 1
         assert uploads == []
 
     def test_eof_at_prompt_matches_answering_no(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """EOF (as Ctrl-C) at the prompt ends the job exactly as a web Abort does."""
+        """
+        EOF (Ctrl-D) at the prompt cancels exactly as answering no does (D-03).
+
+        Both are the operator's abort, so both exit 130 with the same cancel
+        line, one scan pass and no upload -- the way a web Abort ends CANCELLED.
+        """
         outcomes: list[tuple[int, str, int, int]] = []
         for answer in ("n\n", ""):
             calls: list[str] = []
@@ -653,15 +669,97 @@ class TestManualDuplexPrompt:
                 ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Abort"],
                 input=answer,
             )
-            # Sliced from the message rather than taken by line: at EOF the
-            # prompt gets no newline, so the error shares the prompt's line.
-            error_line = result.output[result.output.index("Scan error") :]
-            error_line = error_line.splitlines()[0]
-            outcomes.append((result.exit_code, error_line, len(calls), len(uploads)))
+            last_line = result.stderr.strip().splitlines()[-1]
+            outcomes.append((result.exit_code, last_line, len(calls), len(uploads)))
 
-        answered_no, interrupted = outcomes
-        assert interrupted == answered_no
-        assert "flip prompt" in interrupted[1]
+        answered_no, end_of_input = outcomes
+        assert end_of_input == answered_no
+        assert end_of_input == (130, _FLIP_CANCEL_LINE, 1, 0)
+
+    def test_ctrl_c_at_the_prompt_cancels_with_the_cancel_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Ctrl-C at the flip prompt exits 130 with the flip cancel line (D-03).
+
+        The coordinator turns the ``KeyboardInterrupt`` into ``ABORTED``, so
+        the guard sees ``ScanCancelledError`` and prints its message -- not the
+        generic ``Cancelled (interrupted)`` of a Ctrl-C elsewhere in a command.
+        """
+
+        def interrupted_wait(_slot: object, timeout: float) -> None:
+            """Raise as SIGINT would on the main thread."""
+            raise KeyboardInterrupt
+
+        release = threading.Event()
+
+        def never_answered(*_args: object, **_kwargs: object) -> bool:
+            """Block until the test lets go, then decline."""
+            release.wait()
+            return False
+
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+        monkeypatch.setattr("saneless.cli.click.confirm", never_answered)
+        monkeypatch.setattr("saneless.cli.FlipAnswerSlot.wait", interrupted_wait)
+
+        try:
+            result = runner.invoke(
+                cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Ctrl-C"]
+            )
+        finally:
+            release.set()
+
+        assert result.exit_code == 130, result.output
+        assert result.stderr.strip().splitlines()[-1] == _FLIP_CANCEL_LINE
+        assert "Cancelled (interrupted)" not in result.output
+        assert len(calls) == 1
+        assert uploads == []
+
+    def test_a_broken_prompt_exits_1_with_the_prompt_failure(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A prompt that breaks is a scan failure, exit 1 -- not a cancel (D-02).
+
+        Nobody chose to stop, so the coordinator's ``abort_cause`` turns the
+        ``ABORTED`` into a ``ScanError`` naming what broke.
+        """
+
+        def broken_confirm(*_args: object, **_kwargs: object) -> bool:
+            """Fail the way a lost terminal does."""
+            raise OSError(errno.EIO, "Input/output error")
+
+        calls: list[str] = []
+        uploads: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_duplex_settings(tmp_path),
+            scanner_cls=_counting_scanner(calls),
+            paperless_cls=_recording_paperless(uploads),
+        )
+        self._interactive(monkeypatch)
+        monkeypatch.setattr("saneless.cli.click.confirm", broken_confirm)
+
+        result = runner.invoke(
+            cli, ["scan", "--profile", _DUPLEX_PROFILE, "--title", "Lost terminal"]
+        )
+
+        assert result.exit_code == 1, result.output
+        assert (
+            "Scan error: Flip prompt failed: [Errno 5] Input/output error"
+            in result.stderr.splitlines()
+        )
+        assert _FLIP_CANCEL_LINE not in result.output
+        assert len(calls) == 1
+        assert uploads == []
 
     def test_ctrl_c_during_the_wait_is_an_abort(
         self, monkeypatch: pytest.MonkeyPatch
@@ -904,7 +1002,8 @@ class TestManualDuplexPrompt:
         finally:
             release.set()
 
-        assert result.exit_code != 0
+        # A forgotten prompt is a failure, not a cancel: exit 1, never 130 (D-02).
+        assert result.exit_code == 1, result.output
         assert "flip wait" in result.output
         assert len(calls) == 1
         assert uploads == []

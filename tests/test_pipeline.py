@@ -21,6 +21,7 @@ from saneless.exceptions import (
     FeederEmptyError,
     PaperlessError,
     PaperlessTimeoutError,
+    ScanCancelledError,
     ScanError,
 )
 from saneless.paperless import UploadResult
@@ -576,6 +577,38 @@ class _FixedFlipCoordinator(FlipCoordinator):
         return self._outcome
 
 
+class _BrokenPromptFlipCoordinator(FlipCoordinator):
+    """A flip coordinator whose prompt broke: ``ABORTED``, with the cause kept."""
+
+    def __init__(self, cause: Exception) -> None:
+        """
+        Remember the exception the broken prompt raised.
+
+        Args:
+            cause: What the prompt failed with.
+
+        """
+        self._cause = cause
+
+    def wait_for_flip(self, timeout: float) -> FlipOutcome:
+        """
+        Answer at once, as a prompt that failed does.
+
+        Args:
+            timeout: Ignored; the answer is immediate.
+
+        Returns:
+            Always ``FlipOutcome.ABORTED``.
+
+        """
+        return FlipOutcome.ABORTED
+
+    @property
+    def abort_cause(self) -> Exception | None:
+        """The exception the broken prompt raised."""
+        return self._cause
+
+
 class TestFlipCoordinatorContract:
     """The parts of the flip contract a coordinator gets without writing them."""
 
@@ -1099,13 +1132,20 @@ class TestManualDuplex:
         assert PipelineEvent.SCANNING_REVERSE not in coordinator.events_at_wait
         assert PipelineEvent.SCANNING_REVERSE in events
 
-    def test_manual_duplex_abort_at_the_flip_prompt_raises(
+    def test_manual_duplex_abort_at_the_flip_prompt_is_a_cancel(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """ABORTED fails the run naming the flip prompt, before pass B (D-15)."""
+        """
+        An operator's ABORTED cancels the run before pass B (EXC-04, N-08).
+
+        Web Abort, n, Ctrl-D and Ctrl-C all reach the pipeline as ``ABORTED``
+        with no ``abort_cause``: someone chose to stop, so the run raises
+        ``ScanCancelledError`` -- never a ``ScanError`` -- and the worker and
+        the CLI record a cancel rather than a scanner failure (D-01, D-02).
+        """
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -1119,7 +1159,10 @@ class TestManualDuplex:
             flip_coordinator=_FixedFlipCoordinator(FlipOutcome.ABORTED),
         )
 
-        with pytest.raises(ScanError, match="flip prompt"):
+        with pytest.raises(
+            ScanCancelledError,
+            match=r"^Manual duplex scan cancelled at the flip prompt$",
+        ) as excinfo:
             run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
@@ -1127,6 +1170,49 @@ class TestManualDuplex:
                 request=request,
             )
 
+        assert not isinstance(excinfo.value, ScanError)
+        assert scanner.scan_pages.call_count == 1
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_manual_duplex_broken_prompt_abort_is_a_scan_failure_not_a_cancel(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        An ``ABORTED`` with an ``abort_cause`` fails the run, chained to the cause.
+
+        A broken terminal prompt is not anyone's choice to stop (D-02, WR-08),
+        so it raises ``ScanError`` -- exit 1 at the CLI, ERROR on the web --
+        naming what broke, with the original exception as ``__cause__``.
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        cause = OSError(5, "Input/output error")
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Broken Prompt Test",
+            flip_coordinator=_BrokenPromptFlipCoordinator(cause),
+        )
+
+        with pytest.raises(
+            ScanError, match=r"^Flip prompt failed: \[Errno 5\] Input/output error$"
+        ) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert not isinstance(excinfo.value, ScanCancelledError)
+        assert excinfo.value.__cause__ is cause
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
 

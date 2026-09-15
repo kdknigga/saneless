@@ -308,6 +308,10 @@ def _success_result() -> ScanResult:
 # timed-out job rather than as a SIGALRM traceback.
 _MOCK_FLIP_TIMEOUT = 5.0
 
+# The text a flip-prompt cancel carries into the job row (D-01): the real
+# pipeline's message for an operator's abort, so the stubs raise it verbatim.
+_CANCEL_MESSAGE = "Manual duplex scan cancelled at the flip prompt"
+
 
 def _mock_manual_duplex_pipeline(
     _scanner: object,
@@ -324,12 +328,31 @@ def _mock_manual_duplex_pipeline(
             request.status_callback(PipelineEvent.AWAITING_FLIP)
         outcome = coordinator.wait_for_flip(_MOCK_FLIP_TIMEOUT)
         if outcome is FlipOutcome.ABORTED:
-            msg = "Manual duplex scan aborted at the flip prompt"
-            raise ScanError(msg)
+            # As the real pipeline does for an operator's abort (D-02, EXC-04).
+            raise ScanCancelledError(_CANCEL_MESSAGE)
         if outcome is FlipOutcome.TIMED_OUT:
             msg = "Manual duplex flip wait timed out"
             raise ScanError(msg)
     return _success_result()
+
+
+def _assert_cancelled_at_the_flip_prompt(
+    finished: Job, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    Assert ``finished`` ended as an operator's cancel at the flip prompt.
+
+    CANCELLED with no category and the flip-prompt message (D-01), logged once
+    at INFO without a traceback (N-08).  Call only after the worker has been
+    stopped, which joins its thread, so the ending's log record exists.
+    """
+    assert finished.state is JobState.CANCELLED
+    assert finished.error_category is None
+    assert finished.error is not None
+    assert "flip prompt" in finished.error
+    cancelled = _worker_records(caplog, logging.INFO, f"Job {finished.id} cancelled")
+    assert len(cancelled) == 1
+    assert cancelled[0].exc_info is None
 
 
 def _captured_flip_coordinator(
@@ -423,13 +446,20 @@ class TestScanWorkerManualDuplex:
 
     def test_worker_abort_flip(
         self,
-        mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
+        worker_for: Callable[[JobStore], ScanWorker],
         default_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """abort_flip(job.id) answers the coordinator ABORTED; the pipeline raises."""
+        """
+        abort_flip(job.id) answers ABORTED, and the job ends CANCELLED (D-01).
+
+        The Abort button is the operator choosing to stop, so the job is a
+        cancel rather than a scanner failure (EXC-04, N-08).
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        # worker_for builds over this same fixture instance.
         default_settings.profiles["duplex"] = ProfileConfig(source="ADF Manual Duplex")
 
         monkeypatch.setattr(
@@ -439,7 +469,7 @@ class TestScanWorkerManualDuplex:
 
         store = JobStore()
         try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker = worker_for(store)
             worker.start()
 
             job = store.create_job("duplex", "Abort Test")
@@ -452,11 +482,10 @@ class TestScanWorkerManualDuplex:
             worker.stop()
 
             fetched = _get(store, job.id)
-            assert fetched.state == JobState.ERROR
-            assert fetched.error is not None
-            assert "flip prompt" in fetched.error
         finally:
             store.close()
+
+        _assert_cancelled_at_the_flip_prompt(fetched, caplog)
 
     def test_worker_stores_thumbnail(
         self,
@@ -1200,13 +1229,20 @@ class TestWorkerPassB:
         assert finished.state is JobState.DONE
         assert scanner.scan_calls == 2
 
-    def test_abort_at_the_flip_prompt_fails_the_job_before_pass_b(
+    def test_abort_at_the_flip_prompt_cancels_the_job_before_pass_b(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """An Abort at the prompt ends the job ERROR, naming the flip prompt."""
+        """
+        An Abort at the prompt ends the job CANCELLED through the real pipeline.
+
+        EXC-04, N-08: the pipeline raises ``ScanCancelledError`` for the
+        operator's Abort, and the worker records a cancel, not an ERROR (D-01).
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
         settings = _manual_duplex_settings(default_settings)
         store = JobStore()
@@ -1224,9 +1260,7 @@ class TestWorkerPassB:
             worker.stop()
             store.close()
 
-        assert finished.state is JobState.ERROR
-        assert finished.error is not None
-        assert "flip prompt" in finished.error
+        _assert_cancelled_at_the_flip_prompt(finished, caplog)
         # The abort was answered before pass B: the backs were never fed.
         assert scanner.scan_calls == 1
 
@@ -1443,7 +1477,8 @@ class TestFlipSignalsAreJobScoped:
             worker.stop()
             store.close()
 
-        assert first.state is JobState.ERROR
+        # Job 1's Abort is the operator's cancel (D-01, EXC-04).
+        assert first.state is JobState.CANCELLED
         assert first.error is not None
         assert "flip prompt" in first.error
         assert second.state is JobState.DONE
@@ -1843,6 +1878,7 @@ class TestWorkerStopAndSubmit:
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
+        caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
     ) -> None:
         """
@@ -1850,8 +1886,9 @@ class TestWorkerStopAndSubmit:
 
         Shutdown has begun, but the operator's Abort claimed the flip answer
         first, so shutdown's own Abort is dropped and the row records the
-        operator's abort rather than a server restart.
+        operator's cancel (D-01, D-02) rather than a server restart.
         """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
         scanner = _PassBGatedScanner()
         settings = _manual_duplex_settings(default_settings)
         store = JobStore()
@@ -1870,9 +1907,8 @@ class TestWorkerStopAndSubmit:
             store.close()
 
         assert operator_claimed is True
-        assert finished.state is JobState.ERROR
         assert finished.error != RESTART_REASON
-        assert finished.error_category is not None
+        _assert_cancelled_at_the_flip_prompt(finished, caplog)
 
 
 # The error text every simulated job store failure below carries.
@@ -4756,10 +4792,6 @@ class TestWorkerFinish:
             assert prune_spy.calls == []
         finally:
             store.close()
-
-
-# The text a flip-prompt cancel carries into the job row (D-01).
-_CANCEL_MESSAGE = "Manual duplex scan cancelled at the flip prompt"
 
 
 def _raising_pipeline(error: Exception) -> Callable[..., ScanResult]:
