@@ -2,18 +2,24 @@
 
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING, NoReturn
 
+import img2pdf
 import pikepdf
 import pytest
 from PIL import Image
 
 import saneless.pdf as pdf_mod
+from saneless.exceptions import PdfError
 from saneless.paper_sizes import crop_to_paper_size
 from saneless.pdf import (
     assemble_pdf,
     build_pdf_filename,
     sanitise_title_for_filename,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Hostile titles.  Every one of these reaches the sanitiser from a web form
 # body or a ``saneless scan --title`` argument, and its output is joined onto
@@ -32,6 +38,36 @@ HOSTILE_TITLES = [
 
 JOB_A = "aaaaaaaa-1111-2222-3333-444444444444"
 JOB_B = "bbbbbbbb-1111-2222-3333-444444444444"
+
+# Every error class img2pdf 0.6.3 defines.  Each is a direct ``Exception``
+# subclass with no shared base, which is why the boundary cannot catch a tuple.
+IMG2PDF_ERROR_CLASSES: list[type[Exception]] = [
+    img2pdf.AlphaChannelError,
+    img2pdf.ExifOrientationError,
+    img2pdf.ImageOpenError,
+    img2pdf.JpegColorspaceError,
+    img2pdf.NegativeDimensionError,
+    img2pdf.PdfTooLargeError,
+    img2pdf.UnsupportedColorspaceError,
+]
+
+
+def _raising(exc: BaseException) -> Callable[..., NoReturn]:
+    """
+    Build a stand-in for ``img2pdf.convert`` that raises ``exc``.
+
+    Args:
+        exc: The exception instance the stand-in raises on every call.
+
+    Returns:
+        A callable accepting any arguments that always raises ``exc``.
+
+    """
+
+    def fake_convert(*_args: object, **_kwargs: object) -> NoReturn:
+        raise exc
+
+    return fake_convert
 
 
 def _rounded_media_box(page: pikepdf.Page) -> list[int]:
@@ -120,7 +156,7 @@ class TestAssemblePdf:
         )
 
         img = Image.new("RGB", (100, 100), "white")
-        with pytest.raises(RuntimeError, match="fake img2pdf error"):
+        with pytest.raises(PdfError, match="fake img2pdf error"):
             pdf_mod.assemble_pdf([img], tmp_path, filename="boom.pdf", dpi=300)
 
         # Temp dir should still be cleaned up
@@ -136,6 +172,135 @@ class TestAssemblePdf:
         assert pdf_path.parent == tmp_path
         assert pdf_path.name == "named.pdf"
         assert pdf_path.suffix == ".pdf"
+
+
+class TestPdfBoundary:
+    """
+    ``assemble_pdf`` is a module boundary that raises only ``PdfError``.
+
+    M-17 and D-04: img2pdf raises seven unrelated error classes plus bare
+    ``Exception``, ``TypeError`` and ``ValueError``, and Pillow raises
+    ``OSError`` and ``SystemError`` while saving pages.  Each must surface as
+    ``PdfError`` carrying the original text, with the original chained on
+    ``__cause__`` (Phase 28 success criterion 1).
+    """
+
+    @pytest.mark.parametrize(
+        "error_cls",
+        IMG2PDF_ERROR_CLASSES,
+        ids=[cls.__name__ for cls in IMG2PDF_ERROR_CLASSES],
+    )
+    def test_img2pdf_error_class_becomes_pdf_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        error_cls: type[Exception],
+    ) -> None:
+        """Each img2pdf error class is translated, with the original chained."""
+        original = error_cls("boom from img2pdf")
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
+        img = Image.new("RGB", (100, 100), "white")
+
+        with pytest.raises(PdfError, match="boom from img2pdf") as excinfo:
+            assemble_pdf([img], tmp_path, "x.pdf", dpi=300)
+
+        assert excinfo.value.__cause__ is original
+        assert not isinstance(excinfo.value, error_cls)
+
+    @pytest.mark.parametrize(
+        "original",
+        [Exception("bare"), TypeError("typed"), ValueError("valued")],
+        ids=["Exception", "TypeError", "ValueError"],
+    )
+    def test_untyped_img2pdf_raise_becomes_pdf_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        original: Exception,
+    ) -> None:
+        """img2pdf's untyped raises are translated too."""
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
+        img = Image.new("RGB", (100, 100), "white")
+
+        with pytest.raises(PdfError, match=str(original)) as excinfo:
+            assemble_pdf([img], tmp_path, "x.pdf", dpi=300)
+
+        assert excinfo.value.__cause__ is original
+
+    def test_pillow_cmyk_png_save_becomes_pdf_error(self, tmp_path: Path) -> None:
+        """A real Pillow OSError saving a CMYK page is translated."""
+        img = Image.new("CMYK", (10, 10))
+
+        with pytest.raises(PdfError, match="cannot write mode CMYK as PNG") as excinfo:
+            assemble_pdf([img], tmp_path, "x.pdf", dpi=300)
+
+        assert isinstance(excinfo.value.__cause__, OSError)
+
+    def test_pillow_zero_size_save_becomes_pdf_error(self, tmp_path: Path) -> None:
+        """A real Pillow SystemError saving a 0x0 page is translated."""
+        img = Image.new("RGB", (0, 0))
+
+        with pytest.raises(PdfError) as excinfo:
+            assemble_pdf([img], tmp_path, "x.pdf", dpi=300)
+
+        assert isinstance(excinfo.value.__cause__, SystemError)
+
+    def test_convert_returning_none_becomes_pdf_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The defensive None guard raises PdfError, not RuntimeError."""
+
+        def fake_convert(*_args: object, **_kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", fake_convert)
+        img = Image.new("RGB", (100, 100), "white")
+
+        with pytest.raises(PdfError, match=r"img2pdf\.convert returned None"):
+            assemble_pdf([img], tmp_path, "x.pdf", dpi=300)
+
+    def test_message_names_page_count_and_target_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D-08: the one-line message names the page count and the PDF path."""
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(ValueError("valued")))
+        img = Image.new("RGB", (100, 100), "white")
+
+        with pytest.raises(PdfError) as excinfo:
+            assemble_pdf([img], tmp_path, "x.pdf", dpi=300)
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            f"Could not assemble 1 page(s) into {tmp_path / 'x.pdf'}: "
+        )
+        assert message.endswith("valued")
+
+    def test_empty_page_list_is_refused_before_img2pdf(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """EXC-03: an empty list never reaches img2pdf's empty-list ValueError."""
+        calls: list[object] = []
+
+        def fake_convert(*args: object, **_kwargs: object) -> bytes:
+            calls.append(args)
+            return b""
+
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", fake_convert)
+
+        with pytest.raises(PdfError, match="no pages"):
+            assemble_pdf([], tmp_path, "x.pdf", dpi=300)
+
+        assert calls == []
+
+    def test_keyboard_interrupt_is_not_translated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancel is a BaseException and passes through the boundary untouched."""
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(KeyboardInterrupt()))
+        img = Image.new("RGB", (100, 100), "white")
+
+        with pytest.raises(KeyboardInterrupt):
+            assemble_pdf([img], tmp_path, "x.pdf", dpi=300)
 
 
 class TestSanitiseTitleForFilename:
