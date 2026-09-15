@@ -1120,8 +1120,9 @@ def load_settings(config_path: str | None = None) -> Settings:
     Load settings from TOML file with env var overrides.
 
     Args:
-        config_path: Explicit path to a TOML config file. If provided,
-            loads from that path directly. Otherwise searches
+        config_path: Explicit path to a TOML config file. If not None,
+            loads from that path directly; an empty string is an error, not
+            a request to search. When None, searches
             ``config_search_paths()``.
 
     Returns:
@@ -1130,13 +1131,19 @@ def load_settings(config_path: str | None = None) -> Settings:
         a regular file, else None when no file was found.
 
     Raises:
-        ConfigError: If an explicit path cannot have its ``~`` expanded, is
-            missing or is not a regular file (CFG-02), or if the configuration
-            fails validation (D-10).
+        ConfigError: If an explicit path is empty, cannot have its ``~``
+            expanded, is missing or is not a regular file (CFG-02), or if the
+            configuration fails validation (D-10).
 
     """
     path: Path | None
-    if config_path:
+    if config_path == "":
+        # ``--config "$CFG"`` with CFG unset or empty is an explicit path that
+        # names nothing, not "no path": discovery here would load, and
+        # auto-profiles would write, whatever file happens to be found (WR-05).
+        msg = "Config file path is empty (was --config given an unset variable?)"
+        raise ConfigError(msg)
+    if config_path is not None:
         try:
             explicit = Path(config_path).expanduser()
         except RuntimeError:
