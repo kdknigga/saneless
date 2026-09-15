@@ -40,7 +40,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 25: Manual Duplex** - A `duplex` profile field, a required `FlipCoordinator` with timeout, a CLI flip prompt, and a visible reverse pass (completed 2026-09-14)
 - [x] **Phase 26: Worker and Web Robustness** - Unkillable worker, 429 backpressure, sync routes, crash recovery, server-owned Scan button, vendored front-end assets (completed 2026-09-14)
 - [x] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible (completed 2026-09-15)
-- [ ] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback
+- [x] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback (completed 2026-09-15)
 - [ ] **Phase 29: Geometry, Memory, and Timeouts** - Pages spooled to disk in explicit order, safe cancel, shared flatbed/ADF timeout, guarded `sane.init()`
 - [ ] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt
 - [ ] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/saneless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected
@@ -485,7 +485,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 28-13-PLAN.md — Exit-code tables + doc-truth tests, troubleshoot-a-failed-scan how-to, nav and cross-links
+- [x] 28-13-PLAN.md — Exit-code tables + doc-truth tests, troubleshoot-a-failed-scan how-to, nav and cross-links
 
 **Cross-cutting constraints:**
 
@@ -565,7 +565,7 @@ Plans:
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
-| 28. Exception Translation | 13/14 | In Progress|  |
+| 28. Exception Translation | 14/14 | Complete   | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
