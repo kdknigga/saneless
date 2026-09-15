@@ -35,8 +35,12 @@ class TestPageRecordContract:
             mean=255.0,
             stddev=0.0,
         )
+        # Through setattr with the name in a variable, because a plain
+        # ``record.sequence = 2`` is a static error both type checkers report,
+        # and the point of the test is the runtime refusal.
+        attribute = "sequence"
         with pytest.raises(dataclasses.FrozenInstanceError):
-            record.sequence = 2
+            setattr(record, attribute, 2)
 
     def test_sequence_is_one_based(self) -> None:
         """The first page's sequence is 1, not 0 (D-02)."""
@@ -56,8 +60,12 @@ class TestPageSinkContract:
 
     def test_is_abstract(self) -> None:
         """PageSink cannot be instantiated: it declares a contract only."""
+        # Through a ``type[PageSink]`` binding for the same reason as above:
+        # pyrefly reports the direct call statically, and this test is about
+        # what the interpreter does.
+        sink_type: type[PageSink] = PageSink
         with pytest.raises(TypeError):
-            PageSink()
+            sink_type()
 
     def test_subclass_implementing_add_is_concrete(self) -> None:
         """A subclass that implements add() can be instantiated and used."""
