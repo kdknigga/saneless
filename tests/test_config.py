@@ -69,7 +69,7 @@ class TestDefaultProfile:
     """Default profile validation."""
 
     def test_default_profile_required(self, tmp_config_dir: Path) -> None:
-        """Missing default profile raises a validation error."""
+        """Missing default profile raises a rendered ConfigError (D-10)."""
         toml_content = """\
 [scanner]
 host = "192.168.1.50"
@@ -79,8 +79,9 @@ source = "ADF"
 """
         config_file = tmp_config_dir / "no_default.toml"
         config_file.write_text(toml_content)
-        with pytest.raises(ValueError, match="default"):
+        with pytest.raises(ConfigError, match="default") as exc_info:
             load_settings(config_path=str(config_file))
+        assert "[profiles]: " in str(exc_info.value)
 
     def test_default_profile_present(self, sample_toml: Path) -> None:
         """Valid TOML includes a default profile."""
@@ -175,15 +176,12 @@ class TestLoadedConfigPath:
         settings = load_settings(str(config_file))
         assert settings.config_path == config_file
 
-    def test_missing_explicit_path_is_recorded(self, tmp_path: Path) -> None:
-        """
-        An explicit path that does not exist is still recorded as given (D-16).
-
-        Making a missing explicit path an error is CFG-02 (Phase 27).
-        """
+    def test_missing_config_explicit_path_is_an_error(self, tmp_path: Path) -> None:
+        """An explicit path that does not exist is a ConfigError naming it (CFG-02)."""
         missing = str(tmp_path / "absent.toml")
-        settings = load_settings(missing)
-        assert settings.config_path == Path(missing)
+        with pytest.raises(ConfigError, match=r"absent\.toml") as exc_info:
+            load_settings(missing)
+        assert missing in str(exc_info.value)
 
     def test_found_search_path_is_recorded(self, empty_cwd_and_home: Path) -> None:
         """The relative search entry that was found is recorded (D-16, M-04)."""
@@ -348,9 +346,9 @@ class TestLogLevelValidation:
         assert OutputConfig().log_level == "INFO"
 
     def test_log_level_env_is_validated(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """An invalid ``SANELESS_OUTPUT__LOG_LEVEL`` fails at load."""
+        """An invalid ``SANELESS_OUTPUT__LOG_LEVEL`` fails at load (D-10)."""
         monkeypatch.setenv("SANELESS_OUTPUT__LOG_LEVEL", "TRACE")
-        with pytest.raises(ValidationError, match="log_level"):
+        with pytest.raises(ConfigError, match="log_level"):
             load_settings()
 
 
@@ -434,6 +432,263 @@ class TestTomlStructureErrors:
         """A profile title of exactly TITLE_MAX_LENGTH characters loads."""
         title = "x" * TITLE_MAX_LENGTH
         assert ProfileConfig(title=title).default_title == title
+
+
+def _load_error(config_file: Path, toml_content: str) -> ConfigError:
+    """
+    Write ``toml_content`` to ``config_file`` and return the load's ConfigError.
+
+    Args:
+        config_file: Where to write the TOML.
+        toml_content: The TOML text to load.
+
+    Returns:
+        The ConfigError ``load_settings`` raised.
+
+    """
+    config_file.write_text(toml_content)
+    with pytest.raises(ConfigError) as exc_info:
+        load_settings(config_path=str(config_file))
+    return exc_info.value
+
+
+def _error_lines(err: ConfigError) -> list[str]:
+    """Return the rendered message split into lines, header first."""
+    return str(err).split("\n")
+
+
+class TestUnknownKeyRendering:
+    """
+    Every validation error is rendered by its full ``loc`` (D-10, D-11, CFG-01).
+
+    Nested models used to ignore unknown keys, so ``[paperless] tokne`` left the
+    token unset without a word (M-18). Each error is now one line under a
+    header naming the file, with a close-match suggestion and the valid keys.
+    """
+
+    def test_unknown_key_in_paperless_suggests_and_lists_valid_keys(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A typo under [paperless] names the key, the fix and the valid keys."""
+        config_file = tmp_config_dir / "tokne.toml"
+        err = _load_error(config_file, '[paperless]\ntokne = "x"\n')
+        lines = _error_lines(err)
+        assert lines[0] == f"Configuration error in {config_file}:"
+        assert (
+            "  [paperless] unknown key 'tokne' (did you mean 'token'?); "
+            "valid keys: url, token, consume_dir"
+        ) in lines
+
+    def test_profile_unknown_key_suggests_and_shows_title_alias(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A profile typo lists ``title`` (the alias), not ``default_title``."""
+        err = _load_error(
+            tmp_config_dir / "resoluton.toml",
+            "[profiles.default]\nresoluton = 600\n",
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith(
+                "  [profiles.default] unknown key 'resoluton' "
+                "(did you mean 'resolution'?); valid keys: "
+            )
+        ]
+        assert len(matching) == 1
+        valid = matching[0].split("valid keys: ", 1)[1].split(", ")
+        assert "title" in valid
+        assert "default_title" not in valid
+        assert "resolution" in valid
+
+    @pytest.mark.parametrize(
+        ("toml_content", "name"),
+        [
+            ('[paperless]\n"tok\\nne" = 1\n', "tok\\nne"),
+            ('"bad\\nsection" = 1\n', "bad\\nsection"),
+        ],
+        ids=["section-key", "top-level-name"],
+    )
+    def test_unknown_key_with_control_character_is_escaped(
+        self, tmp_config_dir: Path, toml_content: str, name: str
+    ) -> None:
+        """A quoted key holding a newline is rendered escaped (T-27-11)."""
+        err = _load_error(tmp_config_dir / "control.toml", toml_content)
+        message = str(err)
+        assert name in message
+        assert name.replace("\\n", "\n") not in message
+
+    def test_wrong_section_key_names_owning_section(self, tmp_config_dir: Path) -> None:
+        """A key that belongs to another section says where it belongs (D-11)."""
+        err = _load_error(
+            tmp_config_dir / "misplaced.toml",
+            "[paperless]\nweb_port = 9\n\n[profiles.default]\n",
+        )
+        assert "  [paperless] unknown key 'web_port'; it belongs in [output]" in (
+            _error_lines(err)
+        )
+
+    def test_wrong_section_top_level_key_names_owning_section(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A section key written at the top level says where it belongs (D-11)."""
+        err = _load_error(
+            tmp_config_dir / "top_level_key.toml",
+            "web_port = 9\n\n[profiles.default]\n",
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if "unknown key 'web_port'" in line
+            and line.endswith("it belongs in [output]")
+        ]
+        assert len(matching) == 1
+
+    def test_wrong_section_capitalised_suggests_real_section(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``[Paperless]`` is a miscased section, not a profile (M-18, D-11)."""
+        err = _load_error(
+            tmp_config_dir / "capitalised.toml",
+            '[Paperless]\nurl = "x"\n\n[profiles.default]\n',
+        )
+        message = str(err)
+        assert "did you mean [paperless]" in message
+        assert "profiles.Paperless" not in message
+
+    def test_renders_every_error_one_per_line(self, tmp_config_dir: Path) -> None:
+        """Unknown keys and type errors are all reported, one line each (D-10)."""
+        err = _load_error(
+            tmp_config_dir / "several.toml",
+            """\
+[paperless]
+tokne = "x"
+
+[output]
+web_port = "abc"
+log_level = "TRACE"
+
+[profiles.default]
+""",
+        )
+        lines = _error_lines(err)
+        body = lines[1:]
+        assert len(body) == 3
+        assert all(line.startswith("  [") for line in body)
+        assert any(
+            line.startswith("  [paperless] unknown key 'tokne'") for line in body
+        )
+        assert any(
+            line.startswith("  [output] web_port: Input should be a valid integer")
+            for line in body
+        )
+        assert any(
+            line.startswith("  [output] log_level: Input should be 'DEBUG', ")
+            for line in body
+        )
+
+    def test_renders_every_error_with_list_index(self, tmp_config_dir: Path) -> None:
+        """An integer ``loc`` element is rendered as a list index (D-10)."""
+        err = _load_error(
+            tmp_config_dir / "tags.toml",
+            '[profiles.default]\ndefault_tags = ["x"]\n',
+        )
+        assert any(
+            line.startswith("  [profiles.default] default_tags[0]: ")
+            for line in _error_lines(err)
+        )
+
+    def test_renders_every_error_header_without_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With no file loaded the header names defaults and environment (D-10)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("SANELESS_OUTPUT__WEB_PORT", "abc")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        lines = _error_lines(exc_info.value)
+        assert lines[0] == "Configuration error (defaults and environment):"
+        assert len(lines) == 2
+
+
+class TestConfigErrorsNeverEchoValues:
+    """
+    A config error never contains an input value (D-14, CFG-05).
+
+    pydantic error dicts carry ``input``, and ``str(ValidationError)`` embeds
+    it; for ``tokne = "..."`` that is the Paperless token. The chain is
+    suppressed too, because a traceback prints ``__cause__``.
+    """
+
+    @staticmethod
+    def _assert_value_absent(err: ConfigError, value: str) -> None:
+        """Assert ``value`` is in neither the message, the repr, nor the chain."""
+        assert value not in str(err)
+        assert value not in repr(err)
+        assert err.__cause__ is None
+        assert err.__suppress_context__ is True
+
+    def test_never_echoes_token_under_mistyped_key(self, tmp_config_dir: Path) -> None:
+        """A token-shaped value under ``tokne`` is absent from the error."""
+        secret = "tok-SECRET-7c2a"
+        err = _load_error(
+            tmp_config_dir / "secret_key.toml",
+            f'[paperless]\ntokne = "{secret}"\n',
+        )
+        self._assert_value_absent(err, secret)
+
+    def test_never_echoes_value_of_type_error(self, tmp_config_dir: Path) -> None:
+        """A token-shaped value that fails a type check is absent from the error."""
+        secret = "tok-SECRET-7c2a"
+        err = _load_error(
+            tmp_config_dir / "secret_type.toml",
+            f'[output]\nweb_port = "{secret}"\n',
+        )
+        assert "web_port" in str(err)
+        self._assert_value_absent(err, secret)
+
+
+class TestExplicitConfigPath:
+    """
+    An explicit ``--config`` path must be a regular file (CFG-02, M-19).
+
+    A missing path used to load defaults silently, and Docker creates a
+    directory where a single-file bind mount's source is missing.
+    """
+
+    def test_missing_config_names_the_path(self) -> None:
+        """A path that does not exist is a ConfigError naming it."""
+        with pytest.raises(ConfigError, match=r"/nope/missing\.toml"):
+            load_settings("/nope/missing.toml")
+
+    def test_missing_config_expands_tilde(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The error names the ``~``-expanded path (CFG-02, CFG-03)."""
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings("~/cfg.toml")
+        assert str(home / "cfg.toml") in str(exc_info.value)
+
+    def test_not_a_file_directory_is_rejected(self, tmp_path: Path) -> None:
+        """A directory passed as the config path is a ConfigError naming it."""
+        directory = tmp_path / "config.toml"
+        directory.mkdir()
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(str(directory))
+        assert str(directory) in str(exc_info.value)
+
+    def test_not_a_file_directory_is_skipped_by_discovery(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A directory named ``saneless.toml`` in the cwd is not "found"."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "saneless.toml").mkdir()
+        settings = load_settings()
+        assert settings.config_path is None
 
 
 class TestResolveJobTitle:
@@ -587,7 +842,7 @@ flip_timeout_seconds = 0
 """
         config_file = tmp_config_dir / "flip_timeout_zero.toml"
         config_file.write_text(toml_content)
-        with pytest.raises(ValidationError, match="flip_timeout_seconds"):
+        with pytest.raises(ConfigError, match="flip_timeout_seconds"):
             load_settings(config_path=str(config_file))
 
     def test_flip_timeout_seconds_from_toml(self, tmp_config_dir: Path) -> None:
