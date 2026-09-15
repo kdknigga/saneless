@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
-from saneless.exceptions import PaperlessError, PaperlessTimeoutError
+from saneless.exceptions import PaperlessError, PaperlessTimeoutError, describe
 from saneless.paperless import PaperlessClient, UploadResult, _render_error_body
 from saneless.vocabulary import ConnectionStatus
 
@@ -671,6 +671,29 @@ class TestUploadFailureTranslation:
         assert sleeps == [1, 2]
         assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
 
+    def test_5xx_exhausted_message_is_one_line(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """
+        EXC-02: httpx's two-line 5xx text never reaches the message.
+
+        ``str(HTTPStatusError)`` is ``Server error '503 ...' for url '...'``
+        followed by a second ``For more information check:`` line, so the
+        cause is rendered as status, reason and the one-line body instead.
+        """
+        handler = _CountingHandler(_answering(httpx.Response(503, text="down\n")))
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Down")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Upload to Paperless at http://paperless:8000 failed after 3 attempts: "
+            "503 Service Unavailable: down"
+        )
+        assert sleeps == [1, 2]
+
     def test_5xx_is_retried_then_falls_back(
         self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
     ) -> None:
@@ -1032,6 +1055,202 @@ class TestPollTask:
             assert time.monotonic() - start < 0.5
         finally:
             client.close()
+
+
+_POLL_TRANSPORT_CASES = [
+    pytest.param(httpx.ConnectError("connection refused"), id="connect-error"),
+    pytest.param(httpx.ReadTimeout(""), id="read-timeout-empty"),
+    pytest.param(
+        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        id="remote-protocol-error",
+    ),
+]
+
+_DUPLICATE_SENTENCE = (
+    "the document may already be in Paperless; check before scanning again"
+)
+
+
+def _task_answer(task: dict[str, object]) -> Callable[[int], httpx.Response]:
+    """Build a script that answers every poll with a v9 list holding ``task``."""
+    return _answering(httpx.Response(200, json=[task]))
+
+
+def _failed_poll_message(respond: Callable[[int], httpx.Response]) -> str:
+    """Poll ``t1`` against ``respond`` and return the PaperlessError text."""
+    client = _poll_client(_CountingHandler(respond))
+    try:
+        with pytest.raises(PaperlessError) as exc_info:
+            client.poll_task("t1", timeout=10)
+    finally:
+        client.close()
+    return str(exc_info.value)
+
+
+class TestPollTaskFailureTranslation:
+    """EXC-01 / D-10 / D-11 / M-17: the read side of an accepted upload."""
+
+    def test_poll_continues_through_transport_errors_to_success(
+        self, sleeps: list[float]
+    ) -> None:
+        """
+        D-11 / M-17: a network blip after the upload succeeded is not a failure.
+
+        The upload was accepted, so failing the job now invites a rescan and
+        a duplicate document.  Two ReadErrors are followed by SUCCESS, and the
+        poll backs off between them exactly as it does for a pending task.
+        """
+
+        def respond(call: int) -> httpx.Response:
+            if call <= 2:
+                msg = "reset"
+                raise httpx.ReadError(msg)
+            return httpx.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
+
+        handler = _CountingHandler(respond)
+        client = _poll_client(handler)
+        try:
+            result = client.poll_task("t1", timeout=5)
+        finally:
+            client.close()
+        assert result["status"] == "SUCCESS"
+        assert handler.calls == 3
+        assert sleeps == [0.5, 1.0]
+
+    @pytest.mark.parametrize("failure", _POLL_TRANSPORT_CASES)
+    def test_poll_deadline_after_transport_errors_names_the_last_error(
+        self, failure: httpx.TransportError, sleeps: list[float]
+    ) -> None:
+        """
+        D-11 / OUTC-07 / T-28-38: transport errors still end at the deadline.
+
+        The sleep recorder advances no time, so only the real monotonic
+        deadline can end the loop; a poll that skipped the deadline check on
+        a transport error would hang here.  The message names the task and
+        ``describe`` of the last error (the class name for an empty one).
+        """
+        handler = _CountingHandler(_raising(failure))
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=0.05)
+        finally:
+            client.close()
+        message = str(exc_info.value)
+        assert message == (
+            "Paperless task t1 did not finish within 0.05s; "
+            f"last error: {describe(failure)}"
+        )
+        assert exc_info.value.__cause__ is failure
+        assert "\n" not in message
+        # Every poll but the one that found the deadline gone was followed by
+        # a sleep: the error fell through to the backoff, not a bare `continue`.
+        assert handler.calls >= 1
+        assert len(sleeps) == handler.calls - 1
+
+    def test_poll_deadline_without_transport_error_has_no_last_error(
+        self, sleeps: list[float]
+    ) -> None:
+        """A task that simply stays PENDING keeps today's timeout message."""
+        client = _poll_client(
+            _CountingHandler(_task_answer({"task_id": "t1", "status": "PENDING"}))
+        )
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=0.05)
+        finally:
+            client.close()
+        assert str(exc_info.value) == "Paperless task t1 did not finish within 0.05s"
+        assert exc_info.value.__cause__ is None
+        assert sleeps
+
+    def test_poll_401_still_fails_at_once(self, sleeps: list[float]) -> None:
+        """OUTC-07: a non-200 is not a transport blip and ends the poll at once."""
+        handler = _CountingHandler(_answering(httpx.Response(401, text="Invalid")))
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError, match="401 Unauthorized"):
+                client.poll_task("t1", timeout=30)
+        finally:
+            client.close()
+        assert handler.calls == 1
+        assert sleeps == []
+
+    def test_poll_non_json_200_is_a_paperless_error(self, sleeps: list[float]) -> None:
+        """EXC-01: a login page served with 200 is not a raw ValueError."""
+        handler = _CountingHandler(_answering(httpx.Response(200, text="<html>")))
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(
+                PaperlessError,
+                match=(
+                    "Paperless at http://paperless:8000 returned a task response "
+                    "that is not JSON"
+                ),
+            ) as exc_info:
+                client.poll_task("t1", timeout=30)
+        finally:
+            client.close()
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert handler.calls == 1
+        assert sleeps == []
+
+    def test_duplicate_v9_failure_says_check_before_rescanning(self) -> None:
+        """D-10: the v9 duplicate text gets the check-first sentence."""
+        text = "Not consuming: It is a duplicate of document #42"
+        message = _failed_poll_message(
+            _task_answer({"task_id": "t1", "status": "FAILURE", "result": text})
+        )
+        assert (
+            message == f"Paperless task t1 ended FAILURE: {text}; {_DUPLICATE_SENTENCE}"
+        )
+
+    def test_duplicate_v2_failure_matches_case_insensitively(self) -> None:
+        """D-10: the paperless-ngx 2.x spelling capitalises "Duplicate"."""
+        text = "Not consuming scan.pdf: It is a Duplicate of Invoice (#7)."
+        message = _failed_poll_message(
+            _task_answer({"task_id": "t1", "status": "FAILURE", "result": text})
+        )
+        assert text in message
+        assert message.endswith(f"; {_DUPLICATE_SENTENCE}")
+
+    def test_duplicate_v10_result_data_without_message(self) -> None:
+        """D-10: v10 reports a duplicate only as ``result_data.duplicate_of``."""
+        payload = {
+            "count": 1,
+            "next": None,
+            "previous": None,
+            "results": [
+                {
+                    "task_id": "t1",
+                    "status": "failure",
+                    "result_data": {"duplicate_of": 42, "duplicate_in_trash": False},
+                }
+            ],
+        }
+        message = _failed_poll_message(_answering(httpx.Response(200, json=payload)))
+        assert message == (
+            "Paperless task t1 ended FAILURE: Paperless reported a failure but "
+            f"supplied no message; {_DUPLICATE_SENTENCE}"
+        )
+
+    def test_non_duplicate_failure_has_no_duplicate_sentence(self) -> None:
+        """D-10: an ordinary failure is not dressed up as a duplicate."""
+        message = _failed_poll_message(
+            _task_answer(
+                {"task_id": "t1", "status": "FAILURE", "result": "disk on fire"}
+            )
+        )
+        assert message == "Paperless task t1 ended FAILURE: disk on fire"
+
+    def test_poll_failure_text_is_one_line(self) -> None:
+        """EXC-02: a multi-line failure text from Paperless is one message line."""
+        message = _failed_poll_message(
+            _task_answer(
+                {"task_id": "t1", "status": "FAILURE", "result": "bad\nthings\r\n"}
+            )
+        )
+        assert message == "Paperless task t1 ended FAILURE: bad things"
 
 
 # ---------------------------------------------------------------------------
