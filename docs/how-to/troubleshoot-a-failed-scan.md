@@ -80,6 +80,10 @@ Other causes of exit 2, each on one line:
   server failed to start. Stop whatever holds the port or pass `--port`; when SANE failed, the line
   gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)); when the web server
   itself failed, the cause is in the log file.
+- **The working directory cannot be prepared.** The line names `tmp_dir` (in
+  [`[output]`](../reference/configuration.md#output)) and the reason: the directory was removed or
+  cannot be created, or the disk is full. Check that it exists, that saneless can write to it, and
+  that there is free space.
 - **The job database cannot be used.** The line starts with `Job database error:` and names the
   database path and the reason: the file cannot be opened or is not a SQLite database, or its jobs
   table has a shape this version of saneless does not recognise. Check that the path is right,

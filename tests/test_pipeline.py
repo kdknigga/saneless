@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import logging
 import threading
 import time
@@ -1623,6 +1624,69 @@ class TestDiskSpaceCheck:
         """Raises ScanError when free space below threshold."""
         with pytest.raises(ScanError, match="Insufficient disk space"):
             _check_disk_space(str(tmp_path), 999_999_999)
+
+    @pytest.mark.parametrize(
+        "failing_call", ["mkdir", "disk_usage", "TemporaryDirectory"]
+    )
+    def test_workspace_filesystem_failure_is_a_config_error(
+        self,
+        failing_call: str,
+        tmp_path: Path,
+        default_settings: Settings,
+        mock_paperless: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        IN-07: a tmp_dir that cannot be used is a setup error, not a bug.
+
+        Each of the three start-up calls can raise a raw OSError -- a full
+        disk, or tmp_dir removed since start-up.  Untranslated, it classified
+        UNKNOWN and the CLI called it a saneless bug (exit 5), while
+        ``validate_settings_dirs`` reports the same condition as a ConfigError
+        at start-up.  Nothing is scanned.
+        """
+        tmp_dir = tmp_path / "work"
+        default_settings.output.tmp_dir = str(tmp_dir)
+        failure = OSError(errno.ENOSPC, "No space left on device")
+        if failing_call == "mkdir":
+            (tmp_path / "blocker").write_text("")
+            tmp_dir = tmp_path / "blocker" / "work"
+            default_settings.output.tmp_dir = str(tmp_dir)
+        elif failing_call == "disk_usage":
+
+            def failing_disk_usage(*_args: object) -> object:
+                raise failure
+
+            monkeypatch.setattr(
+                "saneless.pipeline.shutil.disk_usage", failing_disk_usage
+            )
+        else:
+
+            def failing_temporary_directory(
+                *_args: object, **_kwargs: object
+            ) -> object:
+                raise failure
+
+            monkeypatch.setattr(
+                "saneless.pipeline.tempfile.TemporaryDirectory",
+                failing_temporary_directory,
+            )
+        scanner = MagicMock(spec=ScannerBackend)
+
+        with pytest.raises(ConfigError) as exc_info:
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="No room"),
+            )
+
+        message = str(exc_info.value)
+        assert message.startswith(
+            f"Could not prepare the working directory {tmp_dir}: "
+        )
+        assert isinstance(exc_info.value.__cause__, OSError)
+        scanner.scan_pages.assert_not_called()
 
 
 class TestPipelineEventEnum:
