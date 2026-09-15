@@ -5,7 +5,8 @@ The UI must work on a LAN with no internet, so htmx and Pico are served from the
 package under ``/static/vendor/`` and ``base.html`` carries a SHA-384 ``integrity``
 attribute for each. A browser refuses an asset whose bytes do not match, so these
 tests recompute every hash from the files on disk and fail before a browser ever
-sees a mismatch.
+sees a mismatch, and they compare both the files and the attributes with the
+upstream digests pinned here, so a wrong build cannot pin itself.
 
 They also hold the 23.1 Pico coupling contract: only ``pico.min.css`` 2.1.1 is
 vendored, ``pico.colors.css`` is never used, ``<html>`` carries no ``data-theme``,
@@ -30,6 +31,21 @@ APP_CSS = STATIC_DIR / "app.css"
 
 HTMX_BYTES = 51250
 PICO_BYTES = 83319
+
+# The SHA-384 SRI digests of the files as the npm registry publishes them:
+# ``dist/htmx.min.js`` in htmx.org 2.0.8 and ``css/pico.min.css`` in
+# @picocss/pico 2.1.1, computed from each tarball after checking the tarball
+# against the registry's own sha512 ``dist.integrity``.  Written here by hand,
+# never from the vendored files, so a wrong or tampered build fails even when
+# its integrity attribute was regenerated to match it (IN-04).
+UPSTREAM_SRI: dict[str, str] = {
+    "/static/vendor/htmx-2.0.8.min.js": (
+        "sha384-/TgkGk7p307TH7EXJDuUlgG3Ce1UVolAOFopFekQkkXihi5u/6OCvVKyz1W+idaz"
+    ),
+    "/static/vendor/pico-2.1.1.min.css": (
+        "sha384-L1dWfspMTHU/ApYnFiMz2QID/PlP1xCW9visvBdbEkOLkSSWsP6ZJWhPw6apiXxU"
+    ),
+}
 # One <link> for Pico, one <script> for htmx.
 PINNED_TAG_COUNT = 2
 
@@ -82,6 +98,26 @@ def test_integrity_matches_vendored_bytes() -> None:
         path = _static_path(url)
         assert path.is_file(), f"{url} does not map to a file under STATIC_DIR"
         assert sri_sha384(path.read_bytes()) == integrity, f"SRI mismatch for {url}"
+
+
+def test_vendored_files_and_integrity_match_the_upstream_builds() -> None:
+    """
+    The files and base.html's integrity both equal the published digests (IN-04).
+
+    Matching each other is not enough: a wrong build with a regenerated
+    integrity attribute would pass that check, so both are compared with the
+    upstream digests pinned by hand.
+    """
+    pinned = {
+        attrs.get("href") or attrs.get("src"): attrs.get("integrity")
+        for _tag, attrs in _tags(BASE_HTML)
+        if attrs.get("integrity") is not None
+    }
+    assert pinned == UPSTREAM_SRI
+    for url, upstream in UPSTREAM_SRI.items():
+        assert sri_sha384(_static_path(url).read_bytes()) == upstream, (
+            f"{url} is not the upstream build"
+        )
 
 
 def test_vendored_file_sizes() -> None:
