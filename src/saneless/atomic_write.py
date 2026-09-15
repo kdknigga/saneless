@@ -51,6 +51,71 @@ def _fsync_directory(directory: Path) -> None:
             os.close(fd)
 
 
+def _single_file_mount_message(target: Path) -> str:
+    """
+    Word D-08's refusal for a config mounted as a single file.
+
+    Args:
+        target: The real file that cannot be replaced.
+
+    Returns:
+        The message naming the file and the fix.
+
+    """
+    return (
+        f"Cannot replace {target}: it is bind-mounted as a single file. Mount "
+        "its directory instead (see docs/how-to/deploy-docker-compose.md)."
+    )
+
+
+def _is_read_only_mount(path: Path) -> bool:
+    """
+    Report whether ``path`` lives on a filesystem mounted read-only.
+
+    A failed ``statvfs`` answers False, so the ordinary checks that follow
+    decide what to report.
+
+    Args:
+        path: An existing file or directory.
+
+    Returns:
+        True when the mount holding ``path`` carries ``ST_RDONLY``.
+
+    """
+    try:
+        flags = os.statvfs(path).f_flag
+    except OSError:
+        return False
+    return bool(flags & os.ST_RDONLY)
+
+
+def _read_only_mount_error(target: Path) -> ConfigError | None:
+    """
+    Explain a read-only mount under an existing config file (WR-01).
+
+    ``os.access`` answers False on a read-only filesystem even for root, so
+    without this check a legacy ``:ro`` mount was reported as "Permission
+    denied" and the operator went looking at file permissions. The read-only
+    flag belongs to a mount, so a read-only file whose directory is writable
+    is itself a mount point: the single-file bind mount D-08 describes.
+
+    Args:
+        target: The real, existing file about to be replaced.
+
+    Returns:
+        The error naming the fix, or None when the file's mount is writable.
+
+    """
+    if not _is_read_only_mount(target):
+        return None
+    if not _is_read_only_mount(target.parent):
+        return ConfigError(_single_file_mount_message(target))
+    return ConfigError(
+        f"Cannot replace {target}: it is on a read-only mount. Mount its "
+        "directory read-write instead (see docs/how-to/deploy-docker-compose.md)."
+    )
+
+
 def replace_file_atomically(path: Path, text: str) -> Path:
     """
     Replace ``path``'s contents with ``text`` durably, writing through symlinks.
@@ -73,7 +138,9 @@ def replace_file_atomically(path: Path, text: str) -> Path:
       can leave a zero-length file after a crash.
     * A rename refused with EBUSY means the file is a single-file bind mount;
       that is reported as a ``ConfigError`` naming the fix, with no
-      non-atomic fallback (D-08).
+      non-atomic fallback (D-08). A read-only mount -- the legacy ``:ro``
+      single-file mount, or a read-only directory mount -- is reported the
+      same way before anything is written, rather than as EACCES (WR-01).
     * The rename is ``Path.replace``, the atomic, unconditionally
       overwriting ``rename(2)``. The ``os`` module's function of the same
       name is not called directly only because ruff's PTH105 forbids it and
@@ -91,10 +158,13 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         ``path`` is a symlink.
 
     Raises:
-        ConfigError: The file is bind-mounted as a single file (EBUSY), so it
-            cannot be replaced; the message tells the operator to mount its
-            directory instead.
-        PermissionError: The existing file is not writable by this process.
+        ConfigError: The file is bind-mounted as a single file (EBUSY, or a
+            read-only file mount), so it cannot be replaced, and the message
+            tells the operator to mount its directory instead; or the file is
+            on a read-only directory mount, and the message says to mount it
+            read-write.
+        PermissionError: The existing file, on a writable mount, is not
+            writable by this process.
         OSError: Any other filesystem failure, re-raised after the temp file
             is removed.
 
@@ -108,6 +178,8 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         original: os.stat_result | None = target.stat()
     except FileNotFoundError:
         original = None
+    if original is not None and (mount_error := _read_only_mount_error(target)):
+        raise mount_error
     if original is not None and not os.access(target, os.W_OK):
         # Pitfall 6: rename(2) needs only a writable directory, so without
         # this check a chmod 0444 config would be silently replaced. Refusing
@@ -144,12 +216,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
             # non-atomic fallback by decision: it would bring back the
             # truncated-config risk this helper exists to remove.
             if exc.errno == errno.EBUSY:
-                msg = (
-                    f"Cannot replace {target}: it is bind-mounted as a single "
-                    "file. Mount its directory instead (see "
-                    "docs/how-to/deploy-docker-compose.md)."
-                )
-                raise ConfigError(msg) from exc
+                raise ConfigError(_single_file_mount_message(target)) from exc
             raise
         replaced = True
     finally:
