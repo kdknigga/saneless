@@ -8,7 +8,7 @@ import tomllib
 from typing import TYPE_CHECKING
 
 import pytest
-from tomlkit.exceptions import ParseError
+from tomlkit.exceptions import ParseError, TOMLKitError
 
 from saneless import auto_profiles
 from saneless.auto_profiles import (
@@ -1716,7 +1716,34 @@ class TestDurableConfigWrite:
         assert message.startswith(f"Cannot update {config_file}:")
         assert "line 1, column 4" in message
         assert "Unexpected character" in message
+        # The position is given once, not again in tomlkit's own suffix (IN-03).
+        assert " col 4" not in message
         assert isinstance(caught.value.__cause__, ParseError)
+        assert config_file.read_bytes() == original
+
+    def test_toml_error_that_is_not_a_parse_error_is_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Every tomlkit error is a ConfigError, not only ``ParseError`` (IN-03).
+
+        A table redefined under a dotted header raises ``KeyAlreadyPresent``,
+        a ``TOMLKitError`` that is not a ``ParseError`` and carries no position,
+        so the message claims none.
+        """
+        config_file = tmp_path / "config.toml"
+        original = b"[a]\nb = 1\n[a.b]\nc = 1\n"
+        config_file.write_bytes(original)
+
+        with pytest.raises(ConfigError) as caught:
+            write_profiles_to_config(config_file, self._generated(), force=False)
+
+        assert str(caught.value) == (
+            f'Cannot update {config_file}: it is not valid TOML (Key "b" already '
+            "exists.)"
+        )
+        assert isinstance(caught.value.__cause__, TOMLKitError)
+        assert not isinstance(caught.value.__cause__, ParseError)
         assert config_file.read_bytes() == original
 
     def test_inline_profiles_section_stays_valid_toml(self, tmp_path: Path) -> None:
