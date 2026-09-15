@@ -18,6 +18,7 @@ import saneless.scanner.sane_backend as sane_backend_mod
 from saneless.config import ProfileConfig
 from saneless.exceptions import (
     ConfigError,
+    FeederEmptyError,
     PaperlessError,
     PaperlessTimeoutError,
     ScanError,
@@ -409,7 +410,12 @@ class TestPipelineEmptyPageFilter:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """All pages empty -> raises ScanError."""
+        """
+        A non-empty batch that detection empties says "All pages were blank".
+
+        EXC-03: the blank message is reserved for detection really removing
+        every page, so it names what happened rather than an empty scan.
+        """
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -418,7 +424,7 @@ class TestPipelineEmptyPageFilter:
         )
 
         request = PipelineRequest(profile_name="default", title="All Empty Test")
-        with pytest.raises(ScanError, match="All pages were detected as empty"):
+        with pytest.raises(ScanError, match=r"^All pages were blank$"):
             run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
@@ -568,6 +574,182 @@ class _FixedFlipCoordinator(FlipCoordinator):
         self.timeouts.append(timeout)
         self.events_at_wait = list(self._events)
         return self._outcome
+
+
+class TestZeroPages:
+    """
+    An empty batch is reported truthfully at the pipeline boundary (EXC-03, N-06).
+
+    Before this check an empty batch read "All pages were detected as empty"
+    with detection on, and leaked img2pdf's bare ``ValueError`` with it off or
+    on an empty duplex half. The SANE backend never returns an empty batch --
+    an empty feeder raises ``FeederEmptyError`` (Phase 24 D-03) -- so these
+    tests drive the pipeline's contract check with a stubbed backend.
+    """
+
+    @pytest.mark.parametrize("detection", [True, False])
+    def test_an_empty_simplex_batch_says_no_pages_were_scanned(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        *,
+        detection: bool,
+    ) -> None:
+        """
+        An empty simplex batch raises "No pages were scanned", detection on or off.
+
+        Assembly and upload are never reached, so img2pdf never sees an empty
+        list (N-06).
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].enable_empty_page_detection = detection
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch([])
+
+        request = PipelineRequest(profile_name="default", title="Zero Pages")
+        with (
+            patch("saneless.pipeline.assemble_pdf") as mock_assemble,
+            pytest.raises(ScanError, match=r"^No pages were scanned$"),
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        mock_assemble.assert_not_called()
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_an_empty_pass_a_fails_before_anyone_is_asked_to_flip(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """An empty manual-duplex pass A raises before the flip prompt (EXC-03)."""
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch([])
+
+        coordinator = _FixedFlipCoordinator(FlipOutcome.CONTINUED)
+        request = PipelineRequest(
+            profile_name="default",
+            title="Empty Pass A",
+            flip_coordinator=coordinator,
+        )
+        with pytest.raises(ScanError, match=r"^No pages were scanned$"):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert coordinator.timeouts == []
+        assert scanner.scan_pages.call_count == 1
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_an_empty_pass_b_fails_before_any_half_is_assembled(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        An empty manual-duplex pass B raises before the count comparison (EXC-03).
+
+        Without the check the counts differ and the mismatch recovery would try
+        to assemble the empty back half.
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = [
+            scan_batch([_make_content_image()]),
+            scan_batch([]),
+        ]
+
+        request = PipelineRequest(
+            profile_name="default",
+            title="Empty Pass B",
+            flip_coordinator=_FixedFlipCoordinator(FlipOutcome.CONTINUED),
+        )
+        with (
+            patch("saneless.pipeline.assemble_pdf") as mock_assemble,
+            pytest.raises(ScanError, match=r"^No pages were scanned$"),
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        assert scanner.scan_pages.call_count == 2
+        mock_assemble.assert_not_called()
+        mock_paperless.upload_document.assert_not_called()
+
+    def test_all_blank_pages_say_all_pages_were_blank(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Detection removing every page of a non-empty batch is "blank" (EXC-03)."""
+        default_settings.output.tmp_dir = str(tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.return_value = scan_batch([_make_empty_image()])
+
+        request = PipelineRequest(profile_name="default", title="All Blank")
+        with (
+            patch("saneless.pipeline.assemble_pdf") as mock_assemble,
+            pytest.raises(ScanError, match=r"^All pages were blank$"),
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        mock_assemble.assert_not_called()
+
+    def test_an_empty_feeder_keeps_its_own_message(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        ``FeederEmptyError`` propagates unchanged (Phase 24 D-03).
+
+        The zero-page check runs on a returned batch, so it can never replace
+        the backend's more specific feeder message.
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = FeederEmptyError("No paper detected in feeder")
+
+        request = PipelineRequest(profile_name="default", title="Feeder Empty")
+        with pytest.raises(FeederEmptyError, match=r"^No paper detected in feeder$"):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        mock_paperless.upload_document.assert_not_called()
 
 
 class TestManualDuplex:
