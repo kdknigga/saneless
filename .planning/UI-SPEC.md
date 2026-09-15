@@ -148,6 +148,9 @@ Color is delegated to PicoCSS v2 semantic tokens. Nearly every `app.css` colour 
 | Success semantic | `--pico-ins-color` (fallback `green`) | `rgb(29, 106, 84)` | `rgb(98, 175, 154)` | `.status-done` text: checkmark "Done" row + DONE history cell |
 | Destructive/error semantic | `--pico-del-color` (fallback `red`) | `rgb(136, 57, 53)` | `rgb(206, 126, 123)` | `.status-error` text: error alert + ERROR history cell |
 | Warning (app-owned) | `--saneless-status-fallback` | `#a16207` | `#ca8a04` | `.status-fallback` text: consume-directory fallback line + inline warning + FALLBACK history cell |
+| Neutral (cancelled) | `--pico-muted-color` | `rgb(100, 107, 121)` (`#646b79`) | `rgb(123, 132, 149)` (`#7b8495`) | `.status-cancelled` text: Cancelled status line + CANCELLED history cell |
+
+A cancel is a deliberate stop by the operator (Phase 28, EXC-04), not a failure, so `.status-cancelled` is neither red nor an alert: it reads Pico's own muted token directly, which already swaps in the light, automatic-dark and forced-dark schemes (convention rule 4), and needs no app-owned pair.
 
 ### Measured status contrast (Chromium-computed, both schemes)
 
@@ -161,6 +164,10 @@ Status text sits on the page surface in `#status-area` and on the `td` backgroun
 | `.status-done` | dark | `rgb(98, 175, 154)` | 6.94:1 | 6.59:1 | PASS |
 | `.status-error` | dark | `rgb(206, 126, 123)` | 5.89:1 | 5.60:1 | PASS |
 | `.status-fallback` | dark | `rgb(202, 138, 4)` | 6.11:1 | 5.80:1 | PASS |
+| `.status-cancelled` | light | `rgb(100, 107, 121)` | 5.36:1 | 5.36:1 | PASS |
+| `.status-cancelled` | dark | `rgb(123, 132, 149)` | 4.77:1 | 4.53:1 | PASS |
+
+The `.status-cancelled` rows, and since Phase 28 the card column for every class, are asserted in Chromium by `tests/test_browser.py::TestDarkModeEngagement::test_status_colour_meets_aa_contrast` (placements `status-area`, `history-cell` and `card`). The dark card is the tightest margin on this page (4.53:1); a Pico bump that lowers it below 4.5:1 fails that test, and the fix is an app-owned `--saneless-status-cancelled` pair per convention rules 1-3. Forced dark (`data-theme="dark"`) resolves to the same dark value and ratio.
 
 **60/30/10 compliance:** the ratio is enforced by Pico's classless defaults rather than by this project. The only app-specific colored surface is the 1px (0.0625rem, Pico 2.1.1 `--pico-border-width`) left border on `#status-area` painted with `--pico-primary` — the single accent moment on the page. (Earlier revisions of this spec said 4px; the rendered border was always 1px.) The `#status-message > p` border uses the same token but is `transparent`, so it adds no colour.
 
@@ -202,12 +209,12 @@ Inventory of every interactive/presentational component currently shipped.
 | Primary scan button | `<button type="submit" id="scan-btn">`, server-rendered from the current (else most recent run) job | `partials/scan_button.html` (the only copy of its markup), included inline by `index.html` and out-of-band (`hx-swap-oob="true"`) by `partials/status_response.html` | Every status response (scan success, status poll, flip Continue/Abort) re-renders it out of band, so the server alone decides its state. Disabled while a job is active; `aria-busy="true"` only while busy (omitted, never `"false"`, otherwise); label `Scanning\u2026` while busy, `Waiting for flip\u2026` at `AWAITING_FLIP`, else `Scan` (both use the `&#8230;` entity). Full state table under Interaction Patterns |
 | Request error message | `<div id="status-message" role="alert"></div>`, a sibling placed directly above `#status-area`, outside the form and outside the polled element; empty (no children, 0px tall) until an error lands | `index.html` + `partials/error.html` | Any 4xx/5xx from an htmx request is retargeted here and renders `<p class="status-error">\u2717 {message}</p>` (`.status-error` text, no `role="alert"` on the `<p>`). Cleared out of band only by a successful `POST /api/scan` |
 | Status area | `<div id="status-area">` polling itself `hx-get="/api/jobs/current/status" hx-trigger="every 1s"` when active | `partials/status.html` | Only polls when state is PENDING/SCANNING/AWAITING_FLIP/SCANNING_REVERSE/ASSEMBLING/UPLOADING |
-| Status states | Eleven presentations, one per row of the Status area table below: Idle/Starting/Scanning/AwaitingFlip/AwaitingFlipAnswered/ScanningReverse/Assembling/Uploading/Done/Error/Fallback | `partials/status.html` | Each uses `aria-busy="true"` on the `<p>` during non-terminal in-progress states. Fallback renders two `.status-fallback` paragraphs — the outcome line and the inline `{job.warning}` — and, unlike Error, carries no `role="alert"`: a fallback is a degradation, not a failure |
+| Status states | Twelve presentations, one per row of the Status area table below: Idle/Starting/Scanning/AwaitingFlip/AwaitingFlipAnswered/ScanningReverse/Assembling/Uploading/Done/Error/Fallback/Cancelled | `partials/status.html` | Each uses `aria-busy="true"` on the `<p>` during non-terminal in-progress states. Fallback renders two `.status-fallback` paragraphs — the outcome line and the inline `{job.warning}` — and, unlike Error, carries no `role="alert"`: a fallback is a degradation, not a failure |
 | Thumbnail preview | `<img class="thumbnail">` with base64 data URI | `partials/status.html` | alt text "First page preview" |
 | Duplex flip prompt | `.flip-prompt` with two-paragraph instructions, `.flip-illustration` SVG pair, and `<div role="group">` with Continue + Abort buttons | `partials/flip.html` | Abort uses Pico `.secondary` |
 | Flip SVGs | Inline SVGs with `aria-label`; "Long edge (correct)" shows curved arrow + checkmark, "Short edge (incorrect)" shows X mark | `partials/flip.html` | `currentColor` strokes follow theme |
 | Job history card | `<article>` with `<h2>` + `.history-table-wrap` + `<table role="grid">` | `index.html` | Card 2 |
-| Job history table | 4 columns: Time (YYYY-MM-DD HH:MM), Profile, Title, Status | `partials/history.html` | Status cell applies `.status-done` / `.status-error` / `.status-fallback` |
+| Job history table | 4 columns: Time (YYYY-MM-DD HH:MM), Profile, Title, Status | `partials/history.html` | Status cell applies `.status-done` / `.status-error` / `.status-fallback` / `.status-cancelled` |
 | Humanized state labels | Jinja filter `state_label` maps each enum value to its humanized status label; the full list is under Job history in the Copywriting Contract | `vocabulary.py:state_label`, registered as a filter in `app.py` | Presented in history Status column, and (since Phase 23) in the `saneless jobs` table |
 | Empty history | Single `<tr><td colspan="4">No scan history yet.</td></tr>` | `partials/history.html` | |
 
@@ -257,6 +264,9 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | DONE | `✓ Done: {job.title}` (U+2713) | `.status-done` |
 | ERROR | `✗ Error: {job.error}` (U+2717) | `role="alert"` + `.status-error` |
 | FALLBACK | `→ Saved to folder: {job.title}` (U+2192), then `{job.warning}` on its own line when a warning is recorded | `.status-fallback` on both paragraphs; no `role="alert"` |
+| CANCELLED | `⊘ Cancelled: {job.title}` (U+2298) | `.status-cancelled`; no `role="alert"` |
+
+**CANCELLED is a deliberate stop (EXC-04), so it is neither red nor an alert.** It is terminal: the status area stops polling, the Scan button re-enables, and the hidden history-reload div repaints the table with a `Cancelled` cell.
 
 **SCANNING_REVERSE has no distinct presentation, deliberately.** It is counted above because its copy differs, but pass B (the back sides of a manual duplex scan) renders through the same busy branch as every other in-progress state — its progress prose under `aria-busy="true"` — and `status.html` has no `SCANNING_REVERSE` branch. That is the mechanism, not an omission: the flip controls live only in the unanswered `AWAITING_FLIP` branch, so the moment the job moves to `SCANNING_REVERSE` the next poll swaps them out and a late Continue or Abort click has nothing to land on -- and a click that does reach the server for any job other than the one waiting at the flip prompt is dropped by its `job_id`. Giving pass B its own branch would break Phase 25's D-16 (the flip answer is given once and is final) by severing that link. Do not add one.
 
