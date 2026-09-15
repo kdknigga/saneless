@@ -28,7 +28,7 @@ from .config import (
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
 )
-from .exceptions import PaperlessError, ScanError
+from .exceptions import ConfigError, PaperlessError, ScanError
 from .job import JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
@@ -527,5 +527,15 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     # absolute path so the operator sees where it went (orchestrator
     # resolution 2).
     config_path = settings.config_path or Path("./saneless.toml")
-    result = write_profiles_to_config(config_path, profiles, force=force)
+    try:
+        result = write_profiles_to_config(config_path, profiles, force=force)
+    except ConfigError as exc:
+        # D-08: a single-file bind mount (EBUSY), a non-UTF-8 file, or merged
+        # text that would not parse. The message names the file and the fix;
+        # exit 2 is the documented configuration-error code, with no traceback.
+        click.echo(str(exc), err=True)
+        sys.exit(2)
+    except OSError as exc:
+        click.echo(f"Cannot write {config_path}: {exc.strerror or exc}", err=True)
+        sys.exit(2)
     _echo_write_result(result, profiles)
