@@ -475,8 +475,8 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 28-10-PLAN.md — Paperless poll survives transport errors to its deadline; duplicate hint; wrapped tag/correspondent fetches
-- [ ] 28-11-PLAN.md — Flip-prompt abort classified as cancel end to end (abort_cause, 130, web CANCELLED)
+- [x] 28-10-PLAN.md — Paperless poll survives transport errors to its deadline; duplicate hint; wrapped tag/correspondent fetches
+- [x] 28-11-PLAN.md — Flip-prompt abort classified as cancel end to end (abort_cause, 130, web CANCELLED)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -565,7 +565,7 @@ Plans:
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
-| 28. Exception Translation | 9/14 | In Progress|  |
+| 28. Exception Translation | 11/14 | In Progress|  |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
