@@ -105,6 +105,47 @@ def test_get_or_fetch_failure_is_not_cached() -> None:
     assert len(calls) == 2
 
 
+def test_invalidate_during_an_in_flight_fetch_is_not_undone() -> None:
+    """
+    A fetch that started before an invalidate does not cache its stale data.
+
+    WR-05: the refresh route invalidates and then fetches.  If an older fetch
+    was in flight, its pre-change list must not land in the cache after the
+    invalidate, or the refresh's re-check would return it.
+    """
+    cache = MetadataCache(ttl=60)
+    stale: list[dict[str, object]] = [{"id": 1, "name": "old"}]
+    fresh: list[dict[str, object]] = [{"id": 2, "name": "new"}]
+    entered = threading.Event()
+    release = threading.Event()
+    results: dict[str, list[dict[str, object]]] = {}
+
+    def slow_stale_fetch() -> list[dict[str, object]]:
+        entered.set()
+        release.wait(5)
+        return stale
+
+    def in_flight() -> None:
+        results["in_flight"] = cache.get_or_fetch("tags", slow_stale_fetch)
+
+    def refresh() -> None:
+        results["refresh"] = cache.get_or_fetch("tags", lambda: fresh)
+
+    first = threading.Thread(target=in_flight)
+    first.start()
+    assert entered.wait(5)
+    cache.invalidate("tags")
+    second = threading.Thread(target=refresh)
+    second.start()
+    release.set()
+    first.join(5)
+    second.join(5)
+
+    assert results["in_flight"] is stale
+    assert results["refresh"] is fresh
+    assert cache.get("tags") is fresh
+
+
 def test_get_or_fetch_returns_fresh_value_without_fetching() -> None:
     """A fresh value is served from cache; an expired one is refetched (ROBU-05)."""
     cache = MetadataCache(ttl=1)
