@@ -774,6 +774,15 @@ def _env_variable_for(
     ``SANELESS_OUTPUT``. Environment beats file after the sources merge, so a
     value present in ``env_data`` is the one that failed.
 
+    The environment is named only when the failing value is in ``env_data``
+    (WR-04). A key the walk does not find there came from the file, even when
+    a JSON variable such as ``SANELESS_OUTPUT`` supplied other keys of the same
+    section, so no prefix fallback is tried. The walk stops without judging at
+    a non-string element (a list index) or at a value that is not a mapping
+    (the failing value itself). When the value at ``loc`` is a mapping the
+    environment built -- ``SANELESS_PAPERLESS__URL__X`` makes ``url`` one -- a
+    variable nested beneath the path is named.
+
     Args:
         loc: The error's location.
         env_data: The environment's contribution (``_env_contribution``).
@@ -788,11 +797,23 @@ def _env_variable_for(
         if not isinstance(element, str) or not isinstance(node, dict):
             break
         if element not in node:
-            break
+            return None
         parts.append(element)
         node = cast("dict[str, object]", node)[element]
+    if not parts:
+        return None
     by_folded = {name.casefold(): name for name in os.environ}
-    for end in range(len(parts), 0, -1):
+    full = (_ENV_PREFIX + _ENV_DELIMITER.join(parts)).casefold()
+    if full in by_folded:
+        return by_folded[full]
+    if isinstance(node, dict):
+        nested = full + _ENV_DELIMITER.casefold()
+        deeper = sorted(
+            name for folded, name in by_folded.items() if folded.startswith(nested)
+        )
+        if deeper:
+            return deeper[0]
+    for end in range(len(parts) - 1, 0, -1):
         candidate = (_ENV_PREFIX + _ENV_DELIMITER.join(parts[:end])).casefold()
         if candidate in by_folded:
             return by_folded[candidate]

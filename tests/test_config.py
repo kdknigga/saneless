@@ -941,6 +941,66 @@ class TestEnvironmentAttribution:
             for line in _error_lines(err)
         )
 
+    def test_attributes_env_not_to_a_json_section_for_a_file_key(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A JSON section variable is not blamed for the file's typo (WR-04).
+
+        ``SANELESS_OUTPUT`` supplies ``web_port`` only; ``tmpdir`` is in the
+        file. The shorter-prefix fallback used to match ``SANELESS_OUTPUT``
+        even though the failing key was not in what the environment supplied.
+        """
+        monkeypatch.setenv("SANELESS_OUTPUT", '{"web_port": 1234}')
+        err = _load_error(
+            tmp_config_dir / "typo.toml",
+            '[output]\ntmpdir = "x"\n\n[profiles.default]\n',
+        )
+        assert "environment variable" not in str(err)
+        assert any(
+            line.startswith("  [output] unknown key 'tmpdir'")
+            for line in _error_lines(err)
+        )
+
+    def test_attributes_env_not_to_a_json_profiles_variable_for_a_file_key(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_PROFILES`` JSON is not blamed for a TOML profile typo."""
+        monkeypatch.setenv("SANELESS_PROFILES", '{"default": {"source": "x"}}')
+        err = _load_error(
+            tmp_config_dir / "typo.toml",
+            "[profiles.default]\nresoluton = 1\n",
+        )
+        assert "environment variable" not in str(err)
+        assert any(
+            line.startswith("  [profiles.default] unknown key 'resoluton'")
+            for line in _error_lines(err)
+        )
+
+    def test_attributes_env_json_section_value_to_its_variable(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bad value inside a JSON section variable still names that variable."""
+        monkeypatch.setenv("SANELESS_OUTPUT", '{"web_port": "abc"}')
+        err = _load_error(tmp_config_dir / "ok.toml", "[profiles.default]\n")
+        assert "web_port" in _env_line(err, "SANELESS_OUTPUT")
+
+    def test_attributes_env_deeper_variable_under_a_scalar_key(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``SANELESS_PAPERLESS__URL__X`` is named for the ``url`` error (WR-04).
+
+        The variable turns ``url`` into a mapping, so the error's ``loc`` stops
+        at ``url``; no variable is spelled exactly ``SANELESS_PAPERLESS__URL``,
+        and the file has no ``[paperless]`` section to blame instead.
+        """
+        monkeypatch.setenv("SANELESS_PAPERLESS__URL__X", "1")
+        err = _load_error(tmp_config_dir / "ok.toml", "[profiles.default]\n")
+        line = _env_line(err, "SANELESS_PAPERLESS__URL__X")
+        assert "url in [paperless]" in line
+        assert not any(line.startswith("  [paperless]") for line in _error_lines(err))
+
 
 class TestUnknownEnvironmentVariables:
     """
