@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -382,14 +383,112 @@ class TestXdgBaseDirectories:
 
 
 class TestInvalidToml:
-    """Invalid TOML handling."""
+    """
+    A config file that cannot be read or parsed is a ConfigError (D-12, EXC-01).
+
+    ``tomllib.TOMLDecodeError``, ``UnicodeDecodeError`` and ``OSError`` used to
+    escape ``load_settings`` raw, so the CLI's generic catch reported a bad file
+    as an unexpected failure (M-17). Each now becomes one line under the Phase
+    27 header, chained to its cause, and never carries file content: the
+    decode error's ``doc`` holds the whole file, token included (T-28-05).
+    """
+
+    @staticmethod
+    def _assert_token_absent(err: ConfigError, token: str) -> None:
+        """
+        Assert ``token`` is absent from the message, the repr and the cause.
+
+        Only the cause's ``str`` is checked, because that is what a traceback
+        prints for a chained exception. ``repr(UnicodeDecodeError)`` includes
+        its ``object`` bytes, so it is never rendered by the loader.
+        """
+        assert token not in str(err)
+        assert token not in repr(err)
+        assert err.__cause__ is not None
+        assert token not in str(err.__cause__)
 
     def test_invalid_toml(self, tmp_config_dir: Path) -> None:
-        """Malformed TOML raises an exception during loading."""
+        """Malformed TOML raises ConfigError, not a raw ValueError (D-12)."""
         bad_file = tmp_config_dir / "bad.toml"
         bad_file.write_text("this is not [valid toml\n===broken===")
-        with pytest.raises(ValueError, match=r"(?i)invalid|expected|toml"):
+        with pytest.raises(ConfigError):
             load_settings(config_path=str(bad_file))
+
+    def test_toml_syntax_error_names_file_line_and_column(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A syntax error is one ``line N, column M`` row under the header (D-12)."""
+        bad_file = tmp_config_dir / "syntax.toml"
+        err = _load_error(bad_file, "a = = 1\n")
+        lines = str(err).splitlines()
+        assert lines[0] == f"Configuration error in {bad_file}:"
+        assert lines[1].startswith("  line 1, column 5: ")
+        assert "Invalid value" in lines[1]
+        assert isinstance(err.__cause__, tomllib.TOMLDecodeError)
+
+    def test_toml_syntax_error_never_echoes_token(self, tmp_config_dir: Path) -> None:
+        """A token earlier in a broken file is absent from the error (T-28-05)."""
+        token = "tok-SECRET-91fe"
+        err = _load_error(
+            tmp_config_dir / "secret_syntax.toml",
+            f'[paperless]\ntoken = "{token}"\nurl = = 1\n',
+        )
+        assert "line 3, column 7" in str(err)
+        self._assert_token_absent(err, token)
+
+    def test_toml_key_with_control_character_is_escaped(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A key path holding an escape character is never rendered raw (T-28-06)."""
+        err = _load_error(
+            tmp_config_dir / "control_syntax.toml",
+            '["s\\u001b"]\n["s\\u001b"]\n',
+        )
+        message = str(err)
+        assert "\x1b" not in message
+        assert "\\x1b" in message
+        assert isinstance(err.__cause__, tomllib.TOMLDecodeError)
+
+    def test_non_utf8_config_file_is_config_error(self, tmp_config_dir: Path) -> None:
+        """A file that is not UTF-8 is one ``not valid UTF-8`` row (D-12)."""
+        bad_file = tmp_config_dir / "latin1.toml"
+        bad_file.write_bytes(b'title = "\xff"\n')
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(config_path=str(bad_file))
+        lines = str(exc_info.value).splitlines()
+        assert lines[0] == f"Configuration error in {bad_file}:"
+        assert any("not valid UTF-8" in line for line in lines[1:])
+        assert isinstance(exc_info.value.__cause__, UnicodeDecodeError)
+
+    def test_non_utf8_config_file_never_echoes_token(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A token beside the undecodable byte is absent from the error (T-28-05)."""
+        token = "tok-SECRET-91fe"
+        bad_file = tmp_config_dir / "secret_latin1.toml"
+        bad_file.write_bytes(f'[paperless]\ntoken = "{token}"\n'.encode() + b"\xff\n")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(config_path=str(bad_file))
+        self._assert_token_absent(exc_info.value, token)
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+    def test_unreadable_config_file_is_config_error(self, tmp_config_dir: Path) -> None:
+        """A file that cannot be opened is one ``cannot read the file`` row (D-12)."""
+        token = "tok-SECRET-91fe"
+        bad_file = tmp_config_dir / "unreadable.toml"
+        bad_file.write_text(f'[paperless]\ntoken = "{token}"\n')
+        bad_file.chmod(0o000)
+        try:
+            with pytest.raises(ConfigError) as exc_info:
+                load_settings(config_path=str(bad_file))
+        finally:
+            bad_file.chmod(0o600)
+        lines = str(exc_info.value).splitlines()
+        assert lines[0] == f"Configuration error in {bad_file}:"
+        assert lines[1].startswith("  cannot read the file:")
+        assert "Permission denied" in lines[1]
+        assert isinstance(exc_info.value.__cause__, PermissionError)
+        self._assert_token_absent(exc_info.value, token)
 
 
 class TestSettingsDefaults:

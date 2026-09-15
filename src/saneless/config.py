@@ -12,6 +12,7 @@ import difflib
 import logging
 import os
 import tempfile
+import tomllib
 from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
@@ -981,8 +982,9 @@ def _build_settings(
     defaults and environment when no file was loaded (D-10). Errors whose
     value came from the environment name the variable (D-12), unknown
     SANELESS_* variables are added to the same list (D-13), and invalid JSON
-    in a variable becomes a line too (Pitfall 2). A TOML syntax error is not a
-    validation error and propagates unchanged (Phase 28).
+    in a variable becomes a line too (Pitfall 2). A TOML syntax error, a file
+    that is not UTF-8 and a file that cannot be read each become one line
+    under the same header too, chained to their cause (D-12).
 
     Args:
         toml_file: The TOML file to load, or None for defaults plus environment.
@@ -996,6 +998,7 @@ def _build_settings(
     """
     lines = _unknown_env_lines(os.environ)
     settings: Settings | None = None
+    cause: Exception | None = None
     try:
         env_data = _env_contribution()
     except SettingsError as exc:
@@ -1010,6 +1013,22 @@ def _build_settings(
                 settings = Settings()
         except ValidationError as exc:
             lines.extend(_render_error_lines(exc.errors(), env_data))
+        # Only the position and the parser's own words are rendered: the
+        # decode errors' ``doc`` and ``object`` hold file content, possibly the
+        # token (T-28-05).
+        except tomllib.TOMLDecodeError as exc:
+            lines.append(
+                f"line {exc.lineno}, column {exc.colno}: {_escape_name(exc.msg)}"
+            )
+            cause = exc
+        except UnicodeDecodeError as exc:
+            lines.append(
+                f"the file is not valid UTF-8 (byte {exc.start}: {exc.reason})"
+            )
+            cause = exc
+        except OSError as exc:
+            lines.append(f"cannot read the file: {exc.strerror or type(exc).__name__}")
+            cause = exc
     if settings is not None and not lines:
         return settings
     lines.sort()
@@ -1019,9 +1038,13 @@ def _build_settings(
         else "Configuration error (defaults and environment):"
     )
     msg = "\n".join([header, *(f"  {line}" for line in lines)])
-    # from None, and raised outside the except block: a chained ValidationError
-    # would print its inputs -- possibly the token -- in any traceback
-    # (Pitfall 1, D-14).
+    # Raised outside the except block. A ValidationError stays unchained
+    # (from None): its str() embeds the inputs -- possibly the token -- and a
+    # traceback prints the chain (Pitfall 1, Phase 27 D-14). A TOMLDecodeError,
+    # UnicodeDecodeError or OSError is chained: none of their str() forms holds
+    # file content, and the cause is what tells a caller which failure it was.
+    if cause is not None:
+        raise ConfigError(msg) from cause
     raise ConfigError(msg) from None
 
 
@@ -1132,8 +1155,10 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     Raises:
         ConfigError: If an explicit path is empty, cannot have its ``~``
-            expanded, is missing or is not a regular file (CFG-02), or if the
-            configuration fails validation (D-10).
+            expanded, is missing or is not a regular file (CFG-02), if the
+            file cannot be read, is not UTF-8 or is not valid TOML (D-12,
+            chained to the OSError, UnicodeDecodeError or TOMLDecodeError),
+            or if the configuration fails validation (D-10).
 
     """
     path: Path | None

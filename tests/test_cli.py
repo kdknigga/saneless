@@ -1220,10 +1220,11 @@ class TestLazySettingsLoading:
 
     def test_toml_syntax_error_is_one_line_exit_2(self, tmp_path: Path) -> None:
         """
-        A load failure that is not a ConfigError still exits 2 without a traceback.
+        A TOML syntax error exits 2 without a traceback, under the D-10 header.
 
-        A TOML syntax error stays a plain ``TOMLDecodeError`` until Phase 28, so
-        it reaches the generic handler rather than the D-10 renderer.
+        The loader turns the ``TOMLDecodeError`` into a ConfigError naming the
+        line and column (D-12), so it reaches the ConfigError handler rather
+        than the generic one.
         """
         config_file = tmp_path / "saneless.toml"
         config_file.write_text("[output\n")
@@ -1232,7 +1233,9 @@ class TestLazySettingsLoading:
             result = CliRunner().invoke(cli, ["--config", str(config_file), "jobs"])
 
         assert result.exit_code == 2
-        assert result.output.startswith("Configuration error: ")
+        lines = result.output.splitlines()
+        assert lines[0] == f"Configuration error in {config_file}:"
+        assert lines[1].startswith("  line 1, column ")
         assert "Traceback" not in result.output
         assert isinstance(result.exception, SystemExit)
 

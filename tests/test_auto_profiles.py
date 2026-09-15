@@ -8,6 +8,7 @@ import tomllib
 from typing import TYPE_CHECKING
 
 import pytest
+from tomlkit.exceptions import ParseError
 
 from saneless import auto_profiles
 from saneless.auto_profiles import (
@@ -1694,6 +1695,28 @@ class TestDurableConfigWrite:
             write_profiles_to_config(config_file, self._generated())
 
         assert str(config_file) in str(caught.value)
+        assert config_file.read_bytes() == original
+
+    def test_invalid_toml_config_is_config_error(self, tmp_path: Path) -> None:
+        """
+        A config tomlkit cannot parse is a ConfigError, file untouched (D-12).
+
+        tomlkit's ``ParseError`` used to escape ``write_profiles_to_config`` raw
+        (M-17, EXC-01); it now names the file, line and column and is chained,
+        since tomlkit's message holds no document text.
+        """
+        config_file = tmp_path / "config.toml"
+        original = b"a = = 1\n"
+        config_file.write_bytes(original)
+
+        with pytest.raises(ConfigError) as caught:
+            write_profiles_to_config(config_file, self._generated(), force=False)
+
+        message = str(caught.value)
+        assert message.startswith(f"Cannot update {config_file}:")
+        assert "line 1, column 4" in message
+        assert "Unexpected character" in message
+        assert isinstance(caught.value.__cause__, ParseError)
         assert config_file.read_bytes() == original
 
     def test_inline_profiles_section_stays_valid_toml(self, tmp_path: Path) -> None:
