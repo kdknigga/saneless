@@ -28,9 +28,13 @@ class MetadataCache:
         """Initialize the cache with the given TTL."""
         self._ttl = ttl
         self._store: dict[str, tuple[float, list[dict[str, object]]]] = {}
-        # Guards creation of the per-key locks below, never a fetch.
+        # Guards creation of the per-key locks, the generation counters, and
+        # the store-if-unchanged check below; never a fetch.
         self._locks_guard = threading.Lock()
         self._key_locks: dict[str, threading.Lock] = {}
+        # Bumped by invalidate(), so a fetch that started before an invalidate
+        # cannot store its pre-change data after it (WR-05).
+        self._generations: dict[str, int] = {}
 
     def get(self, key: str) -> list[dict[str, object]] | None:
         """
@@ -74,6 +78,11 @@ class MetadataCache:
         A ``fetch`` that raises propagates to its caller and caches nothing,
         so the next call fetches again.
 
+        A fetch caches its result only if no :meth:`invalidate` for the key ran
+        while it was in flight.  Otherwise the refresh that invalidated would
+        find the older fetch's pre-change data on its re-check, return it, and
+        keep it cached for another TTL (WR-05).
+
         Known limitation: while Paperless is unreachable, the waiting threads
         retry the fetch one after another, each paying the connect timeout.
         A separate connect timeout and caching the unreachable outcome are
@@ -98,16 +107,24 @@ class MetadataCache:
             cached = self.get(key)
             if cached is not None:
                 return cached
+            with self._locks_guard:
+                generation = self._generations.get(key, 0)
             data = fetch()
-            self.set(key, data)
+            with self._locks_guard:
+                if self._generations.get(key, 0) == generation:
+                    self.set(key, data)
             return data
 
     def invalidate(self, key: str) -> None:
         """
         Remove a specific key from the cache.
 
+        A fetch already in flight for the key will not cache its result.
+
         Args:
             key: Cache key to invalidate.
 
         """
-        self._store.pop(key, None)
+        with self._locks_guard:
+            self._generations[key] = self._generations.get(key, 0) + 1
+            self._store.pop(key, None)
