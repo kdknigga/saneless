@@ -202,21 +202,6 @@ class TestLoadedConfigPath:
         settings = load_settings()
         assert settings.config_path is None
 
-    def test_env_var_cannot_set_config_path(
-        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """
-        SANELESS_CONFIG_PATH cannot forge the loaded path (D-16, T-26-05).
-
-        A public field would be populated from this variable and redirect
-        profile writes; the private attribute is not.
-        """
-        evil = empty_cwd_and_home / "evil.toml"
-        evil.write_text("[profiles.default]\n")
-        monkeypatch.setenv("SANELESS_CONFIG_PATH", str(evil))
-        settings = load_settings()
-        assert settings.config_path is None
-
     def test_toml_config_path_key_is_rejected(self, tmp_path: Path) -> None:
         """A top-level TOML ``config_path`` key is an unknown section (D-16)."""
         config_file = tmp_path / "forged.toml"
@@ -647,6 +632,346 @@ class TestConfigErrorsNeverEchoValues:
         )
         assert "web_port" in str(err)
         self._assert_value_absent(err, secret)
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_never_echoes_env_token_under_mistyped_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A token-shaped value in ``SANELESS_PAPERLESS__TOKNE`` is absent."""
+        secret = "tok-SECRET-9f8e"
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKNE", secret)
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert "SANELESS_PAPERLESS__TOKNE" in str(exc_info.value)
+        self._assert_value_absent(exc_info.value, secret)
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_never_echoes_invalid_json_env_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Invalid JSON for a whole section is a ConfigError, not a SettingsError.
+
+        pydantic-settings raises ``SettingsError`` before validation (Pitfall
+        2); its message names the field and source, never the value.
+        """
+        value = "notjson"
+        monkeypatch.setenv("SANELESS_PAPERLESS", value)
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert "paperless" in str(exc_info.value)
+        self._assert_value_absent(exc_info.value, value)
+
+
+@pytest.fixture
+def no_discovered_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """
+    Run in an empty CWD with HOME redirected, so no config file is discovered.
+
+    Returns:
+        The temporary directory that is now the CWD.
+
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    return tmp_path
+
+
+def _env_line(err: ConfigError, variable: str) -> str:
+    """
+    Return the single rendered line attributed to ``variable``.
+
+    Args:
+        err: The load's ConfigError.
+        variable: The environment variable name, as spelled.
+
+    Returns:
+        The one line starting with ``environment variable '<variable>': ``.
+
+    """
+    prefix = f"  environment variable {variable!r}: "
+    matching = [line for line in _error_lines(err) if line.startswith(prefix)]
+    assert len(matching) == 1, str(err)
+    return matching[0]
+
+
+class TestEnvironmentAttribution:
+    """
+    An error whose value came from a SANELESS_* variable names it (D-12).
+
+    pydantic's ``loc`` is identical for TOML and environment input, so without
+    attribution an env typo would be reported against a file that does not
+    contain it.
+    """
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_attributes_env_unknown_key_to_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unknown nested key set from the environment names the variable."""
+        monkeypatch.setenv("SANELESS_SCANNER__HOSTNAME", "x")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert _env_line(exc_info.value, "SANELESS_SCANNER__HOSTNAME") == (
+            "  environment variable 'SANELESS_SCANNER__HOSTNAME': unknown key "
+            "'hostname' in [scanner] (did you mean 'host'?); valid keys: host, device"
+        )
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_attributes_env_as_spelled_in_lower_case(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lower-case variable is named exactly as it is spelled."""
+        monkeypatch.setenv("saneless_scanner__hostname", "x")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert "unknown key 'hostname' in [scanner]" in _env_line(
+            exc_info.value, "saneless_scanner__hostname"
+        )
+
+    def test_attributes_env_type_error_over_loaded_file(
+        self, sample_toml: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a valid file loaded, an env type error names the variable."""
+        monkeypatch.setenv("SANELESS_OUTPUT__WEB_PORT", "abc")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(str(sample_toml))
+        lines = _error_lines(exc_info.value)
+        assert lines[0] == f"Configuration error in {sample_toml}:"
+        line = _env_line(exc_info.value, "SANELESS_OUTPUT__WEB_PORT")
+        assert "web_port" in line
+        assert "[output]" in line
+        assert not any(line.startswith("  [output]") for line in lines)
+
+    def test_attributes_env_not_for_the_same_error_in_toml(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """The same type error written in the file names no variable."""
+        err = _load_error(
+            tmp_config_dir / "port.toml",
+            '[output]\nweb_port = "abc"\n\n[profiles.default]\n',
+        )
+        assert "environment variable" not in str(err)
+        assert any(
+            line.startswith("  [output] web_port: ") for line in _error_lines(err)
+        )
+
+    def test_attributes_env_profile_key_to_variable(
+        self, sample_toml: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A profile typo from the environment names the variable and profile."""
+        monkeypatch.setenv("SANELESS_PROFILES__RECEIPT__RESOLUTON", "1")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(str(sample_toml))
+        line = _env_line(exc_info.value, "SANELESS_PROFILES__RECEIPT__RESOLUTON")
+        assert "unknown key 'resoluton' in [profiles.receipt]" in line
+        assert "(did you mean 'resolution'?)" in line
+
+    def test_attributes_env_not_for_differently_cased_toml_profile(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A TOML ``[profiles.Receipt]`` error is not blamed on a ``RECEIPT`` variable.
+
+        The check walks the environment's contribution, as pydantic-settings
+        built it, by the exact string elements of the error ``loc``.
+        pydantic-settings case-folds variable names, so the variable created
+        profile ``receipt``; the TOML error's ``loc`` holds ``Receipt``, which
+        is not in that contribution, and ``SANELESS_PROFILES`` itself is unset.
+        """
+        monkeypatch.setenv("SANELESS_PROFILES__RECEIPT__TITLE", "R")
+        err = _load_error(
+            tmp_config_dir / "cased_profile.toml",
+            "[profiles.default]\n\n[profiles.Receipt]\nresoluton = 1\n",
+        )
+        assert "environment variable" not in str(err)
+        assert any(
+            line.startswith("  [profiles.Receipt] unknown key 'resoluton'")
+            for line in _error_lines(err)
+        )
+
+
+class TestUnknownEnvironmentVariables:
+    """
+    A SANELESS_* variable naming no section is rejected at load (D-13).
+
+    pydantic-settings silently ignores such names, so a mistyped
+    ``SANELESS_PAPERLES__TOKEN`` left the token unset without a word.
+    """
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_unknown_env_misspelled_section_suggests_variable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A misspelled section names the variable and the corrected spelling."""
+        monkeypatch.setenv("SANELESS_PAPERLES__TOKEN", "t")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        line = _env_line(exc_info.value, "SANELESS_PAPERLES__TOKEN")
+        assert "did you mean SANELESS_PAPERLESS__TOKEN" in line
+        assert "valid sections: scanner, paperless, output, profiles" in line
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_unknown_env_single_underscore_suggests_double(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_OUTPUT_WEB_PORT`` is pointed at ``SANELESS_OUTPUT__WEB_PORT``."""
+        monkeypatch.setenv("SANELESS_OUTPUT_WEB_PORT", "9")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        line = _env_line(exc_info.value, "SANELESS_OUTPUT_WEB_PORT")
+        assert "SANELESS_OUTPUT__WEB_PORT" in line
+
+    def test_unknown_env_cannot_set_config_path(
+        self, no_discovered_config: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        SANELESS_CONFIG_PATH is rejected outright (D-13, D-16, T-26-05).
+
+        It could never forge the loaded path, which is a private attribute;
+        it is now also refused, rather than silently ignored.
+        """
+        evil = no_discovered_config / "evil.toml"
+        evil.write_text("[profiles.default]\n")
+        monkeypatch.setenv("SANELESS_CONFIG_PATH", str(evil))
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        assert "unknown section" in _env_line(exc_info.value, "SANELESS_CONFIG_PATH")
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        [
+            ("SANELESS_OUTPUT__DATA_DIR", "/var/lib/saneless"),
+            ("SANELESS_PROFILES__RECEIPT__TITLE", "R"),
+            ("SANELESS_OUTPUT", '{"web_port": 9}'),
+        ],
+    )
+    def test_unknown_env_scan_accepts_valid_names(
+        self,
+        sample_toml: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        name: str,
+        value: str,
+    ) -> None:
+        """
+        Nested, profile and JSON-valued variables are not unknown.
+
+        A file with a default profile is loaded, because a profile variable
+        alone would replace the built-in ``default`` profile.
+        """
+        monkeypatch.setenv(name, value)
+        settings = load_settings(str(sample_toml))
+        assert "default" in settings.profiles
+
+    def test_unknown_env_reported_with_toml_errors(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Unknown variables and file errors arrive together in one message."""
+        monkeypatch.setenv("SANELESS_BOGUS", "1")
+        err = _load_error(
+            tmp_config_dir / "both.toml",
+            '[paperless]\ntokne = "x"\n\n[profiles.default]\n',
+        )
+        lines = _error_lines(err)
+        assert any(
+            line.startswith("  [paperless] unknown key 'tokne'") for line in lines
+        )
+        assert "unknown section" in _env_line(err, "SANELESS_BOGUS")
+
+    def test_unknown_env_fails_an_otherwise_valid_load(
+        self, sample_toml: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A valid file does not excuse an unknown variable."""
+        monkeypatch.setenv("SANELESS_BOGUS", "1")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(str(sample_toml))
+        assert _error_lines(exc_info.value)[0] == (
+            f"Configuration error in {sample_toml}:"
+        )
+
+    def test_unknown_env_does_not_affect_direct_construction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The scan lives in the loader, not a validator (Pitfall 9, S-10)."""
+        monkeypatch.setenv("SANELESS_BOGUS", "1")
+        assert Settings().config_path is None
+
+
+class TestConfigSources:
+    """
+    The loaded file and the env-sourced key names are reported (CFG-11, U-01).
+
+    Names only, never values: the token is commonly supplied by environment.
+    """
+
+    def test_config_sources_env_sourced_keys_lists_dotted_names(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Environment contributions are flattened to sorted dotted names."""
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", "t")
+        monkeypatch.setenv("SANELESS_PAPERLESS__URL", "u")
+        monkeypatch.setenv("SANELESS_PROFILES__RECEIPT__TITLE", "R")
+        assert config_mod.env_sourced_keys() == [
+            "paperless.token",
+            "paperless.url",
+            "profiles.receipt.title",
+        ]
+
+    def test_config_sources_env_sourced_keys_empty(self) -> None:
+        """With no SANELESS_* variables the list is empty."""
+        assert config_mod.env_sourced_keys() == []
+
+    def test_config_sources_env_sourced_keys_json_section(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A JSON-valued section is reported by its leaf names."""
+        monkeypatch.setenv("SANELESS_OUTPUT", '{"web_port": 9}')
+        assert config_mod.env_sourced_keys() == ["output.web_port"]
+
+    @staticmethod
+    def _info(caplog: pytest.LogCaptureFixture) -> list[str]:
+        """Return the INFO messages saneless.config emitted."""
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.INFO and record.name == "saneless.config"
+        ]
+
+    def test_config_sources_logs_file_and_names_never_secret(
+        self,
+        sample_toml: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One INFO line names the loaded file and ``paperless.token``, not its value."""
+        secret = "tok-SECRET-51ab"
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", secret)
+        settings = load_settings(str(sample_toml))
+        with caplog.at_level(logging.INFO, logger="saneless.config"):
+            config_mod.log_config_sources(settings)
+        messages = self._info(caplog)
+        assert len(messages) == 1
+        assert str(sample_toml) in messages[0]
+        assert "paperless.token" in messages[0]
+        assert secret not in messages[0]
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_config_sources_without_file_never_logs_secret(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """With no file the line says so, and still carries no value."""
+        secret = "tok-SECRET-51ab"
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", secret)
+        settings = load_settings()
+        with caplog.at_level(logging.INFO, logger="saneless.config"):
+            config_mod.log_config_sources(settings)
+        messages = self._info(caplog)
+        assert len(messages) == 1
+        assert "no config file; defaults + environment" in messages[0]
+        assert "paperless.token" in messages[0]
+        assert secret not in messages[0]
 
 
 class TestExplicitConfigPath:
