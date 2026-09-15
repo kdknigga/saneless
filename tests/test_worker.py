@@ -1796,6 +1796,77 @@ class TestWorkerStopAndSubmit:
         assert finished.error == RESTART_REASON
         assert scanner.scan_calls == 1
 
+    def test_a_pipeline_failure_while_stopping_keeps_its_own_cause(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        WR-06, D-15: stopping alone does not make a failure a restart.
+
+        The pipeline fails with a Paperless error just as shutdown begins.
+        Shutdown did not cause it, so the row keeps the error's own text and
+        category instead of "server restarted" with no category.
+        """
+        message = "Paperless refused the upload"
+        holder: list[ScanWorker] = []
+
+        def failing_during_shutdown(*_args: object, **_kwargs: object) -> ScanResult:
+            holder[0]._stopping.set()
+            raise PaperlessError(message)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing_during_shutdown)
+        store = JobStore()
+        worker = worker_for(store)
+        holder.append(worker)
+        try:
+            worker.start()
+            job = _submit_jobs(worker, store, 1)[0]
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == message
+        assert finished.error_category == classify_error(PaperlessError(message))
+
+    def test_an_operator_abort_while_stopping_is_not_recorded_as_a_restart(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        WR-06, D-15: an Abort the operator claimed keeps its own meaning.
+
+        Shutdown has begun, but the operator's Abort claimed the flip answer
+        first, so shutdown's own Abort is dropped and the row records the
+        operator's abort rather than a server restart.
+        """
+        scanner = _PassBGatedScanner()
+        settings = _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, settings, store)
+        try:
+            worker.start()
+            job = store.create_job("duplex", "Operator Aborted")
+            worker.submit(job)
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker._stopping.set()
+            operator_claimed = worker.abort_flip(job.id)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert operator_claimed is True
+        assert finished.state is JobState.ERROR
+        assert finished.error != RESTART_REASON
+        assert finished.error_category is not None
+
 
 # The error text every simulated job store failure below carries.
 _DISK_ERROR = "disk I/O error"
