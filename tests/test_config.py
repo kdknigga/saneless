@@ -13,6 +13,7 @@ import saneless.config as config_mod
 from saneless.config import (
     DEFAULT_RESOLUTION,
     OutputConfig,
+    PaperlessConfig,
     ProfileConfig,
     Settings,
     load_settings,
@@ -37,7 +38,7 @@ class TestLoadSettingsFromToml:
         assert settings.scanner.host == "192.168.1.50"
         assert settings.paperless.url == "http://paperless:8000"
         expected_auth = "abc123"
-        assert settings.paperless.token == expected_auth
+        assert settings.paperless.token.get_secret_value() == expected_auth
 
     def test_env_var_override(
         self, sample_toml: Path, monkeypatch: pytest.MonkeyPatch
@@ -52,7 +53,7 @@ class TestLoadSettingsFromToml:
         monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", "envtoken")
         settings = load_settings()
         expected_auth = "envtoken"
-        assert settings.paperless.token == expected_auth
+        assert settings.paperless.token.get_secret_value() == expected_auth
 
     def test_nested_env_delimiter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Double underscore delimiter supports nested settings."""
@@ -267,6 +268,87 @@ class TestSettingsDefaults:
         assert settings.paperless.url == ""
         assert settings.output.tmp_dir.endswith("saneless")
         assert settings.output.log_level == "INFO"
+
+
+class TestSecretToken:
+    """
+    The Paperless token is a ``SecretStr`` (CFG-05, N-15).
+
+    A settings object is formatted in reprs, tracebacks and dumps; none of
+    those may carry the token. Only the ``PaperlessClient`` construction sites
+    unwrap it.
+    """
+
+    def test_secret_token_absent_from_repr(self) -> None:
+        """``repr(settings)`` masks the token."""
+        secret = "tok-SECRET-4b1d"
+        settings = Settings(paperless=PaperlessConfig(token=secret))
+        assert secret not in repr(settings)
+
+    def test_secret_token_absent_from_json_dump(self) -> None:
+        """``model_dump(mode="json")`` masks the token."""
+        secret = "tok-SECRET-4b1d"
+        settings = Settings(paperless=PaperlessConfig(token=secret))
+        assert secret not in str(settings.model_dump(mode="json"))
+
+    def test_secret_token_unwraps_to_the_value(self) -> None:
+        """``get_secret_value()`` still returns the configured token."""
+        secret = "tok-SECRET-4b1d"
+        settings = Settings(paperless=PaperlessConfig(token=secret))
+        assert settings.paperless.token.get_secret_value() == secret
+
+    def test_secret_token_default_is_empty(self) -> None:
+        """An unconfigured token unwraps to the empty string."""
+        assert PaperlessConfig().token.get_secret_value() == ""
+
+
+class TestLogLevelValidation:
+    """
+    ``output.log_level`` accepts only the five standard names (CFG-04, M-21).
+
+    ``getattr(logging, name)`` used to accept garbage and crash on ``TRACE``;
+    the value is now validated at load, case-insensitively, with ``warn`` read
+    as ``WARNING``.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("warn", "WARNING"),
+            (" debug ", "DEBUG"),
+            ("critical", "CRITICAL"),
+            ("Error", "ERROR"),
+            ("INFO", "INFO"),
+        ],
+    )
+    def test_log_level_is_normalised(self, raw: str, expected: str) -> None:
+        """Names are trimmed and upper-cased; ``warn`` becomes ``WARNING``."""
+        output = OutputConfig.model_validate({"log_level": raw})
+        assert output.log_level == expected
+
+    def test_log_level_unknown_name_is_rejected(self) -> None:
+        """``TRACE`` fails validation with a ``literal_error`` on log_level."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputConfig.model_validate({"log_level": "TRACE"})
+        errors = exc_info.value.errors()
+        assert [(e["type"], e["loc"]) for e in errors] == [
+            ("literal_error", ("log_level",))
+        ]
+
+    def test_log_level_non_string_is_rejected(self) -> None:
+        """A numeric level is not silently accepted."""
+        with pytest.raises(ValidationError, match="log_level"):
+            OutputConfig.model_validate({"log_level": 10})
+
+    def test_log_level_default_is_info(self) -> None:
+        """The default level is INFO."""
+        assert OutputConfig().log_level == "INFO"
+
+    def test_log_level_env_is_validated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An invalid ``SANELESS_OUTPUT__LOG_LEVEL`` fails at load."""
+        monkeypatch.setenv("SANELESS_OUTPUT__LOG_LEVEL", "TRACE")
+        with pytest.raises(ValidationError, match="log_level"):
+            load_settings()
 
 
 class TestExceptionHierarchy:
