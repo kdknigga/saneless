@@ -2697,6 +2697,70 @@ class TestOwedRejections:
         assert isinstance(owed, frozenset)
         assert after == frozenset()
 
+    def test_an_owed_rejection_is_written_as_the_worker_stops(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        IN-06: a rejection still owed at shutdown is written before the thread exits.
+
+        No idle tick can run in the test's window, so only the exit flush can
+        write it.  Unwritten, the row would come back after a restart as a
+        PENDING row recovered as "server restarted".
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
+        store = JobStore()
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = store.create_job("default", "Refused Before Shutdown")
+            worker.owe_rejection(job.id, "queue full")
+            stopped = worker.stop()
+            row = _get(store, job.id)
+            owed_after = worker.owed_rejection_ids()
+        finally:
+            worker.stop()
+            store.close()
+
+        assert stopped is True
+        assert row.state is JobState.ERROR
+        assert row.error == "queue full"
+        assert row.error_category is ErrorCategory.REJECTED
+        assert owed_after == frozenset()
+
+    def test_a_failed_exit_flush_is_logged_and_the_worker_still_stops(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """IN-06: a store that refuses the exit flush cannot hold the stop."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
+        store = JobStore()
+        finishes = _StoreFault(store.finish_job, None)
+        monkeypatch.setattr(store, "finish_job", finishes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = store.create_job("default", "Refused While Broken")
+            worker.owe_rejection(job.id, "queue full")
+            stopped = worker.stop()
+            row = _get(store, job.id)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert stopped is True
+        assert len(finishes.calls) == 1
+        assert row.state is JobState.PENDING
+        records = _worker_records(
+            caplog, logging.WARNING, "Could not write owed job records"
+        )
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+
 
 class TestOwedWriteStreak:
     """
