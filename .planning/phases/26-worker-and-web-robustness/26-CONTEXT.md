@@ -397,6 +397,12 @@ scan cancellation (HARD-03, Phase 29).
   not in ROBU-08.
 - **Configurable shutdown join, queue depth, or trusted origins.** Rejected for now as
   new config surface.
+- **A `Host` allow-list against DNS rebinding** (26-REVIEW WR-09). The D-20 guard passes a
+  rebinding page, because the attacker controls both `Origin` and `Host`. Phase 26 only
+  documents the limit and the proxy / resolver mitigations (`web-api.md` Cross-site
+  requests, `deploy-docker-compose.md` "Answering only your own hostname"). Rejecting any
+  `Host` outside a configured list would close it in saneless itself; it is new config
+  surface, so it waits for a requirement.
 - **Periodic auto-profile retry while the profile set is bare.** Rejected (D-15);
   `saneless auto-profiles` covers it.
 - Already owned elsewhere: queue position (APPL-08), flip owner token (APPL-09), stale-on-error

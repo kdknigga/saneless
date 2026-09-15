@@ -132,6 +132,29 @@ Other proxies:
 
 **What a rejection looks like.** The web UI shows "This request was blocked because it did not come from the saneless page. If saneless is behind a reverse proxy, make sure the proxy passes the original Host header." and the request gets a `403`. The saneless log records a warning beginning `Blocked cross-site POST` that names the `Origin`, `Host`, `X-Forwarded-Host` and `Sec-Fetch-Site` values it received: if `Origin` and `Host` disagree there, the proxy is rewriting `Host`.
 
+### Answering only your own hostname
+
+The cross-site check cannot stop a DNS rebinding attack, in which a hostile site makes its own hostname resolve to saneless's address (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A proxy that answers only saneless's hostname closes that gap, because a rebinding page's requests carry the hostile hostname in `Host`. With nginx, add a default server that drops every other hostname:
+
+```nginx
+server {
+    listen 80 default_server;
+    return 444;
+}
+
+server {
+    listen 80;
+    server_name scanner.home.example;
+
+    location / {
+        proxy_pass http://saneless:8080;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+A Caddy site block named after a hostname and a Traefik router with a `Host()` rule match only that hostname in the same way. This protects saneless only if browsers cannot reach it directly: do not publish its port on the host (drop `ports:` and put the proxy on the same Docker network), or bind it to an address only the proxy can reach.
+
 ## Updating
 
 Pull the latest image and recreate the container:
