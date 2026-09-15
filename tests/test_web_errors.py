@@ -23,6 +23,7 @@ import logging
 import re
 import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
     import httpx
+    from starlette.responses import Response
 
     from saneless.job import Job, JobStore
 
@@ -476,20 +478,22 @@ def test_error_logs_escape_control_characters_in_the_request_line(
     log line or rewrite what an operator reads.
     """
     request = _control_character_request()
-    with caplog.at_level(logging.INFO, logger="saneless.web.errors"):
+
+    async def call_handler() -> Response:
         if handler == "validation":
-            response = asyncio.run(
-                errors._validation_error(
-                    request,
-                    RequestValidationError(
-                        [{"loc": ("body", "n"), "type": "int_parsing"}]
-                    ),
-                )
+            return await errors._validation_error(
+                request,
+                RequestValidationError([{"loc": ("body", "n"), "type": "int_parsing"}]),
             )
-        else:
-            response = asyncio.run(
-                errors._unhandled_exception(request, RuntimeError(SECRET_MARKER))
-            )
+        return await errors._unhandled_exception(request, RuntimeError(SECRET_MARKER))
+
+    # On its own thread: a Playwright session earlier in the same run can leave
+    # an event loop running on this one, where asyncio.run refuses.
+    with (
+        caplog.at_level(logging.INFO, logger="saneless.web.errors"),
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        response = pool.submit(lambda: asyncio.run(call_handler())).result()
     assert response.status_code == (422 if handler == "validation" else 500)
     records = [r for r in caplog.records if r.name == "saneless.web.errors"]
     assert len(records) == 1
