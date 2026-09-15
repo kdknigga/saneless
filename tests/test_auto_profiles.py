@@ -11,6 +11,7 @@ import pytest
 
 from saneless import auto_profiles
 from saneless.auto_profiles import (
+    ProfileWriteResult,
     generate_profiles,
     is_bare_default,
     pick_closest_resolution,
@@ -1095,12 +1096,15 @@ auto_generated = false
         assert "adf" in parsed["profiles"]
         assert "flatbed" in parsed["profiles"]
 
-    def test_written_list_names_only_written_profiles(self, tmp_path: Path) -> None:
-        """The returned list names what was written, never what was pruned."""
+    def test_result_names_added_and_removed_profiles_apart(
+        self, tmp_path: Path
+    ) -> None:
+        """The result reports what was added and what was pruned, separately."""
         config_file = tmp_path / "config.toml"
         config_file.write_text(self._EXISTING)
-        written = write_profiles_to_config(config_file, self._generated())
-        assert set(written) == {"adf", "flatbed"}
+        result = write_profiles_to_config(config_file, self._generated())
+        assert set(result.added) == {"adf", "flatbed"}
+        assert result.removed == ("legacy-feeder",)
 
 
 class TestDefaultProfileSurvivesThePrune:
@@ -1154,6 +1158,13 @@ auto_generated = true
         parsed = tomllib.loads(self._rerun(tmp_path).read_text())
         assert "default" in parsed["profiles"]
 
+    def test_default_is_not_reported_removed(self, tmp_path: Path) -> None:
+        """Only the ordinary orphan is named under Removed, never ``default``."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(self._PREVIOUS_RUN)
+        result = write_profiles_to_config(config_file, self._feeder_only())
+        assert result.removed == ("flatbed",)
+
     def test_other_orphans_are_still_pruned(self, tmp_path: Path) -> None:
         """The guard is one name wide, not a disabling of the prune."""
         parsed = tomllib.loads(self._rerun(tmp_path).read_text())
@@ -1191,12 +1202,11 @@ class TestTomlWriting:
                 auto_generated=True,
             ),
         }
-        written = write_profiles_to_config(config_file, profiles)
+        result = write_profiles_to_config(config_file, profiles)
 
         content = config_file.read_text()
         assert "# SANE network host" in content
-        assert "flatbed" not in written or "default" in written
-        assert "default" in written
+        assert result.added == ("default",)
 
     def test_skip_existing_without_force(self, tmp_path: Path) -> None:
         """Existing profiles are not overwritten without force."""
@@ -1214,19 +1224,28 @@ class TestTomlWriting:
                 auto_generated=True,
             ),
         }
-        written = write_profiles_to_config(config_file, profiles)
+        result = write_profiles_to_config(config_file, profiles)
 
-        assert written == []
+        assert result.added == ()
+        assert result.refreshed == ()
+        assert result.skipped_not_generated == ("default",)
         content = config_file.read_text()
         assert 'source = "ADF"' in content
 
     def test_overwrite_with_force(self, tmp_path: Path) -> None:
-        """Existing profiles are overwritten with force=True."""
+        """
+        Force does not overwrite a profile saneless did not generate (D-01).
+
+        ``auto_generated = false`` marks a hand-written profile, and there is
+        no flag that hands it to the tool: it is skipped, reported, and left
+        byte for byte as the user wrote it.
+        """
         config_file = tmp_path / "config.toml"
-        config_file.write_text(
-            '[profiles.default]\nsource = "ADF"\nresolution = 600\n'
-            'mode = "Gray"\nauto_generated = false\n',
+        original = (
+            b'[profiles.default]\nsource = "ADF"\nresolution = 600\n'
+            b'mode = "Gray"\nauto_generated = false\n'
         )
+        config_file.write_bytes(original)
 
         profiles = {
             "default": ProfileConfig(
@@ -1236,11 +1255,11 @@ class TestTomlWriting:
                 auto_generated=True,
             ),
         }
-        written = write_profiles_to_config(config_file, profiles, force=True)
+        result = write_profiles_to_config(config_file, profiles, force=True)
 
-        assert "default" in written
-        content = config_file.read_text()
-        assert 'source = "Flatbed"' in content
+        assert result.skipped_not_generated == ("default",)
+        assert result.refreshed == ()
+        assert config_file.read_bytes() == original
 
     def test_writes_auto_source_mode_adf(self, tmp_path: Path) -> None:
         """Writes auto_source_mode when value is adf (non-default)."""
@@ -1299,9 +1318,188 @@ class TestTomlWriting:
                 auto_generated=True,
             ),
         }
-        written = write_profiles_to_config(config_file, profiles)
+        result = write_profiles_to_config(config_file, profiles)
 
-        assert "default" in written
+        assert result.added == ("default",)
         assert config_file.exists()
         content = config_file.read_text()
         assert 'source = "Flatbed"' in content
+
+
+class TestForceMerge:
+    """
+    ``--force`` merges generated keys instead of replacing profiles (M-09).
+
+    D-01: a profile without a truthy ``auto_generated`` is never touched, under
+    force too, and is reported. D-02: in a flagged profile the owned keys are
+    written onto the existing table, so every other key and comment survives
+    and a hand edit to an owned key is overwritten. D-03: an owned key the fresh
+    generation does not write is deleted. D-04: the outcome comes back grouped.
+    """
+
+    _DEFAULT_BLOCK = """\
+[profiles.default]
+# hand written: never regenerate this one
+source = "Flatbed"  # the one I actually use
+resolution = 600
+mode = "Gray"
+
+"""
+
+    _EXISTING = (
+        "# saneless configuration -- keep this comment\n"
+        + _DEFAULT_BLOCK
+        + """\
+[profiles.scan]
+# generated, then customised by hand
+source = "Old Source"
+resolution = 600  # hand edit
+mode = "Gray"
+duplex = "hardware"
+default_tags = [3, 7]
+title = "Scanned"
+auto_generated = true
+
+[profiles.stale]
+source = "Gone"
+resolution = 300
+mode = "Color"
+auto_generated = true
+"""
+    )
+
+    def _generated(self, *, extra: bool = False) -> dict[str, ProfileConfig]:
+        """Build the regenerated set: ``scan`` and ``default``, plus ``fresh``."""
+        profiles = {
+            "scan": ProfileConfig(
+                source="ADF", resolution=300, mode="Color", auto_generated=True
+            ),
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+        if extra:
+            profiles["fresh"] = ProfileConfig(
+                source="ADF Duplex",
+                resolution=300,
+                mode="Color",
+                auto_source_mode="adf",
+                duplex="hardware",
+                auto_generated=True,
+            )
+        return profiles
+
+    def _write(
+        self, tmp_path: Path, *, force: bool, extra: bool = False
+    ) -> tuple[Path, ProfileWriteResult]:
+        """Write the regenerated set over the fixture and return path and result."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(self._EXISTING)
+        result = write_profiles_to_config(
+            config_file, self._generated(extra=extra), force=force
+        )
+        return config_file, result
+
+    def test_force_refreshes_owned_keys_in_place(self, tmp_path: Path) -> None:
+        """D-02: owned keys take the generated values, a hand edit included."""
+        config_file, _ = self._write(tmp_path, force=True)
+        scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
+        assert scan["source"] == "ADF"
+        assert scan["resolution"] == 300
+        assert scan["mode"] == "Color"
+        assert scan["auto_generated"] is True
+
+    def test_force_deletes_a_stale_owned_key(self, tmp_path: Path) -> None:
+        """D-03: ``duplex`` is not generated for this source, so it goes."""
+        config_file, _ = self._write(tmp_path, force=True)
+        scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
+        assert "duplex" not in scan
+
+    def test_force_merge_keeps_unowned_keys_and_comments(self, tmp_path: Path) -> None:
+        """D-02: ``default_tags``, ``title`` and the table comment survive."""
+        config_file, _ = self._write(tmp_path, force=True)
+        text = config_file.read_text()
+        scan = tomllib.loads(text)["profiles"]["scan"]
+        assert scan["default_tags"] == [3, 7]
+        assert scan["title"] == "Scanned"
+        assert "# generated, then customised by hand" in text
+        assert "# saneless configuration -- keep this comment" in text
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_force_never_touches_an_unflagged_profile(
+        self, tmp_path: Path, *, force: bool
+    ) -> None:
+        """D-01: the hand-written ``default`` block is byte-for-byte unchanged."""
+        config_file, _ = self._write(tmp_path, force=force)
+        assert self._DEFAULT_BLOCK.encode() in config_file.read_bytes()
+
+    def test_force_merge_result_groups(self, tmp_path: Path) -> None:
+        """D-04: refreshed, skipped and removed names are reported apart."""
+        _, result = self._write(tmp_path, force=True)
+        assert result.added == ()
+        assert result.refreshed == ("scan",)
+        assert result.skipped_not_generated == ("default",)
+        assert result.skipped_existing == ()
+        assert result.removed == ("stale",)
+
+    def test_without_force_merge_leaves_a_flagged_profile_alone(
+        self, tmp_path: Path
+    ) -> None:
+        """Without force a flagged profile is skipped as already existing."""
+        config_file, result = self._write(tmp_path, force=False)
+        scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
+        assert scan["resolution"] == 600
+        assert scan["duplex"] == "hardware"
+        assert result.skipped_existing == ("scan",)
+        assert "default" in result.skipped_not_generated
+        assert result.refreshed == ()
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_merge_adds_a_missing_name_in_generated_key_order(
+        self, tmp_path: Path, *, force: bool
+    ) -> None:
+        """A name the file lacks is added with today's key order and flag."""
+        config_file, result = self._write(tmp_path, force=force, extra=True)
+        assert result.added == ("fresh",)
+        assert (
+            "[profiles.fresh]\n"
+            'source = "ADF Duplex"\n'
+            "resolution = 300\n"
+            'mode = "Color"\n'
+            'auto_source_mode = "adf"\n'
+            'duplex = "hardware"\n'
+            "auto_generated = true\n"
+        ) in config_file.read_text()
+
+    def test_merge_persisted_is_added_plus_refreshed(self, tmp_path: Path) -> None:
+        """``persisted`` names exactly the tables that now match the generation."""
+        _, result = self._write(tmp_path, force=True, extra=True)
+        assert result.persisted == frozenset({"fresh", "scan"})
+
+    def test_merge_result_describe_lists_groups_in_order(self, tmp_path: Path) -> None:
+        """One line per non-empty group, in a fixed order, names shown with repr."""
+        result = ProfileWriteResult(
+            path=tmp_path / "config.toml",
+            added=("a", "b"),
+            refreshed=("c",),
+            skipped_not_generated=("default",),
+            skipped_existing=("e",),
+            removed=("f",),
+        )
+        assert result.describe() == [
+            "Added: 'a', 'b'",
+            "Refreshed: 'c'",
+            "Skipped (not auto-generated): 'default' -- not created by "
+            "auto-profiles (no auto_generated = true); rename or delete it to "
+            "regenerate",
+            "Skipped (already exists; use --force to refresh): 'e'",
+            "Removed (scanner no longer offers it): 'f'",
+        ]
+
+    def test_merge_result_describe_omits_empty_groups(self, tmp_path: Path) -> None:
+        """Empty groups print nothing; an empty result describes nothing."""
+        path = tmp_path / "config.toml"
+        assert ProfileWriteResult(path=path, refreshed=("x",)).describe() == [
+            "Refreshed: 'x'"
+        ]
+        assert ProfileWriteResult(path=path).describe() == []
