@@ -4042,30 +4042,67 @@ class TestStartupProfileGeneration:
         assert "ConfigError" in message
         assert "UTF-8" in message
 
-    @pytest.mark.parametrize(
-        "case",
-        [
-            (b"[profiles\n", "UnexpectedCharError"),
-        ],
-    )
+    def test_startup_generation_invalid_toml_config_is_a_config_error(
+        self,
+        mock_scanner: MagicMock,
+        worker_for: Callable[[JobStore], ScanWorker],
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-12: an unparseable file is refused as a ConfigError and left alone."""
+        self._mock_caps_scanner(mock_scanner)
+        config_file = tmp_path / "saneless.toml"
+        contents = b"[profiles\n"
+        config_file.write_bytes(contents)
+
+        store = JobStore()
+        worker = worker_for(store)
+        worker._settings._config_path = config_file
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert config_file.read_bytes() == contents
+        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert "ConfigError" in message
+        assert "line 1, column" in message
+
     def test_startup_generation_keeps_profiles_when_the_write_raises_anything_else(
         self,
         mock_scanner: MagicMock,
         worker_for: Callable[[JobStore], ScanWorker],
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
-        case: tuple[bytes, str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """
         WR-04, D-18: an exception outside OSError and ConfigError keeps them too.
 
-        An unparseable file makes the write raise something other than the two
-        expected classes (a non-UTF-8 file is now a ConfigError, D-05).  The generated profiles must still be
-        used in memory, with a WARNING that names the exception class.
+        Neither a non-UTF-8 file (D-05) nor an unparseable one (D-12) reaches
+        this handler any more, so the write is patched to raise an unexpected
+        class. The generated profiles must still be used in memory, with a
+        WARNING that names the exception class.
         """
-        contents, exception_name = case
+        exception_name = "TypeError"
+
+        def _raise_unexpected(*_args: object, **_kwargs: object) -> None:
+            msg = "container error"
+            raise TypeError(msg)
+
+        monkeypatch.setattr(
+            "saneless.worker.write_profiles_to_config", _raise_unexpected
+        )
         self._mock_caps_scanner(mock_scanner)
         config_file = tmp_path / "saneless.toml"
+        contents = b"# mounted config\n"
         config_file.write_bytes(contents)
 
         store = JobStore()

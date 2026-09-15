@@ -840,9 +840,9 @@ class ScanWorker:
             )
             return None
         except Exception as exc:
-            # WR-04: anything else -- a tomlkit ParseError (a ValueError), a
-            # UnicodeDecodeError, a container error -- must not throw away the
-            # generated profiles either (D-18).  Unexpected, so the traceback
+            # WR-04: anything else -- a tomlkit container error, say; a parse
+            # or UTF-8 failure is already a ConfigError (D-05, D-12) -- must
+            # not throw away the generated profiles either (D-18).  Unexpected, so the traceback
             # is logged too; the exception class is named, never interpreted.
             logger.warning(
                 "Auto-profiles: could not write %s (%s); the generated "
