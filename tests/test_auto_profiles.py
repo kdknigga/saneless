@@ -1692,6 +1692,80 @@ class TestDurableConfigWrite:
         assert config_file.read_bytes() == original
         assert list(tmp_path.iterdir()) == [config_file]
 
+    @pytest.mark.parametrize("force", [False, True])
+    def test_guard_refuses_dotted_keys_that_change_meaning(
+        self, tmp_path: Path, *, force: bool
+    ) -> None:
+        """
+        Output that parses but means something else is refused (CR-02).
+
+        With top-level dotted profile keys, tomlkit moves the second dotted
+        line under the table it adds, so the dumped text is valid TOML that
+        nests ``profiles.default.auto_generated`` inside the new profile. The
+        file must be left as it was, still loadable, with no temp file behind.
+        """
+        config_file = tmp_path / "config.toml"
+        original = (
+            b'profiles.default.source = "Flatbed"\n'
+            b"profiles.default.auto_generated = true\n"
+        )
+        config_file.write_bytes(original)
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+            "adf": ProfileConfig(
+                source="ADF", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
+        with pytest.raises(ConfigError, match="refusing") as caught:
+            write_profiles_to_config(config_file, generated, force=force)
+
+        assert str(config_file) in str(caught.value)
+        assert config_file.read_bytes() == original
+        assert list(tmp_path.iterdir()) == [config_file]
+        assert load_settings(str(config_file)).profiles["default"].source == "Flatbed"
+
+    def test_guard_accepts_a_crlf_multiline_string_and_nan(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Parser differences that do not change meaning are not refused.
+
+        tomllib reads CRLF inside a multi-line string as LF while tomlkit keeps
+        it, and NaN is unequal to itself; neither may block every rewrite.
+        """
+        config_file = tmp_path / "config.toml"
+        config_file.write_bytes(
+            b'[profiles.default]\r\nsource = "Flatbed"\r\n'
+            b'title = """two\r\nlines"""\r\nnote = nan\r\n'
+        )
+
+        result = write_profiles_to_config(config_file, self._generated())
+
+        assert result.added == ("flatbed",)
+        profiles = tomllib.loads(config_file.read_bytes().decode("utf-8"))["profiles"]
+        assert profiles["default"]["title"] == "two\nlines"
+
+    def test_guard_refuses_output_that_parses_to_a_different_document(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Valid TOML whose data is not the merged document is never written."""
+        config_file = tmp_path / "config.toml"
+        original = b'[profiles.default]\nsource = "Flatbed"\n'
+        config_file.write_bytes(original)
+        monkeypatch.setattr(
+            auto_profiles.tomlkit,
+            "dumps",
+            lambda _doc: '[profiles.default]\nsource = "Other"\n',
+        )
+
+        with pytest.raises(ConfigError, match="refusing"):
+            write_profiles_to_config(config_file, self._generated())
+
+        assert config_file.read_bytes() == original
+
     def test_guard_skips_the_replace_when_nothing_changed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

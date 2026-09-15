@@ -9,6 +9,7 @@ generation logic uses pure functions for easy testing.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import tomllib
 from collections.abc import Mapping, MutableMapping
@@ -648,9 +649,48 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
     return tomlkit.parse(text), text
 
 
+# Stands in for a NaN float in ``_comparable``: NaN never equals itself, so a
+# config holding ``nan`` would otherwise fail the round-trip guard forever.
+_NAN: Final = object()
+
+
+def _comparable(value: object) -> object:
+    """
+    Normalise parsed TOML data so two parsers' readings compare equal.
+
+    tomllib reads a CRLF inside a multi-line string as LF, while tomlkit keeps
+    the CRLF, so a CRLF config holding one would never compare equal; the
+    loader sees LF either way, so the meaning is the same. NaN is mapped to a
+    sentinel because it is unequal to itself.
+
+    Args:
+        value: Data from ``tomllib.loads`` or ``TOMLDocument.unwrap``.
+
+    Returns:
+        The same data with those two differences removed.
+
+    """
+    if isinstance(value, str):
+        return value.replace("\r\n", "\n")
+    if isinstance(value, float) and math.isnan(value):
+        return _NAN
+    if isinstance(value, Mapping):
+        items = cast("Mapping[object, object]", value).items()
+        return {key: _comparable(item) for key, item in items}
+    if isinstance(value, list):
+        return [_comparable(item) for item in cast("list[object]", value)]
+    return value
+
+
 def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) -> str:
     """
-    Dump the merged document, keep its line endings, and prove it parses.
+    Dump the merged document, keep its line endings, and prove it round-trips.
+
+    Parsing is not enough: tomlkit can emit valid TOML that means something
+    else. With top-level dotted keys (``profiles.default.source = ...``) a
+    table it adds captures the dotted lines after it, so the file would parse
+    and then fail to load (CR-02). The dumped text is therefore re-parsed and
+    compared with the merged document's data.
 
     Args:
         config_path: The config file, for the error message.
@@ -661,7 +701,8 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
         The text to write.
 
     Raises:
-        ConfigError: The dumped text is not valid TOML; nothing was written.
+        ConfigError: The dumped text is not valid TOML, or it parses to data
+            other than the merged document; nothing was written.
 
     """
     new_text = tomlkit.dumps(doc)
@@ -670,14 +711,17 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
         # adds with a bare LF; normalise those so the file stays CRLF (D-05).
         new_text = re.sub(r"(?<!\r)\n", "\r\n", new_text)
     try:
-        tomllib.loads(new_text)
+        reparsed: object = _comparable(tomllib.loads(new_text))
     except tomllib.TOMLDecodeError:
+        reparsed = None
+    if reparsed is None or reparsed != _comparable(doc.unwrap()):
         # The guard: whatever shape the operator's file has, and whatever
-        # tomlkit makes of it, text that does not parse never replaces a
-        # working config.
+        # tomlkit makes of it, text that does not parse -- or that parses to
+        # something other than the merge -- never replaces a working config.
         msg = (
-            f"Cannot update {config_path}: the merged profiles do not form "
-            "valid TOML; refusing to rewrite it, so the file is left intact"
+            f"Cannot update {config_path}: the merged profiles do not "
+            "round-trip through TOML; refusing to rewrite it, so the file is "
+            "left intact"
         )
         raise ConfigError(msg) from None
     return new_text
@@ -779,9 +823,10 @@ def write_profiles_to_config(
         force: If True, refresh the owned keys of flagged profiles.
 
     The rewrite is durable (CFG-08): the file is read as UTF-8 bytes, CRLF
-    line endings are kept, the new text is re-parsed before anything is
-    replaced, and ``replace_file_atomically`` swaps it in through any symlink
-    (D-05, D-07). A merge that changes nothing does not rewrite the file.
+    line endings are kept, the new text is re-parsed and must mean exactly
+    the merged document before anything is replaced (CR-02), and
+    ``replace_file_atomically`` swaps it in through any symlink (D-05, D-07).
+    A merge that changes nothing does not rewrite the file.
 
     Args:
         config_path: Path to the TOML config file.
@@ -794,8 +839,9 @@ def write_profiles_to_config(
 
     Raises:
         ConfigError: ``[profiles]`` in the file is not a table, the file is not
-            valid UTF-8, the merged text does not parse as TOML, or the file is
-            bind-mounted as a single file (EBUSY) and cannot be replaced.
+            valid UTF-8, the merged text does not round-trip through TOML, or
+            the file is bind-mounted as a single file (EBUSY) and cannot be
+            replaced.
         OSError: Any other failure to read or replace the file, including
             ``PermissionError`` for a file this process may not write.
 
