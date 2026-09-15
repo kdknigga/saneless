@@ -159,8 +159,10 @@ class FlipCoordinator(ABC):
 
         An ``ABORTED`` answer usually means someone gave up at the prompt, and
         the pipeline reports that as a cancellation.  But a coordinator can
-        also answer ``ABORTED`` because its prompt broke -- a lost terminal,
-        undecodable input (WR-08) -- and nobody chose to stop.  Such a
+        also answer ``ABORTED`` because its prompt broke -- a read error such as
+        an I/O error or undecodable input (WR-08) -- and nobody chose to stop.
+        End of input, a closed terminal included, is not such a break: it is
+        the operator's cancel (D-02).  Such a
         coordinator returns the exception here, so the pipeline records a
         failure rather than a cancellation without a fourth ``FlipOutcome``
         member (Phase 25 D-09, D-02).
