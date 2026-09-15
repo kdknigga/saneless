@@ -43,7 +43,7 @@ from .vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from .config import ProfileConfig, Settings
     from .job import Job, JobStore
@@ -688,7 +688,12 @@ class ScanWorker:
         with self._profiles_lock:
             return self._settings.profiles.get(name)
 
-    def _set_profiles(self, profiles: Mapping[str, ProfileConfig]) -> None:
+    def _set_profiles(
+        self,
+        profiles: Mapping[str, ProfileConfig],
+        *,
+        only_if: Callable[[Settings], bool] | None = None,
+    ) -> bool:
         """
         Replace the configured profiles with a new dict, under the lock (D-19).
 
@@ -697,13 +702,25 @@ class ScanWorker:
         example -- keeps a consistent view of it, and no locked reader can
         observe a dict part-way through an update.
 
+        This is the one place the profiles are rebound: startup generation
+        swaps through it too, with its bare-default re-check as ``only_if``
+        (IN-01).
+
         Args:
             profiles: The complete new set of profiles.
+            only_if: A check on the current settings, run under the same lock
+                as the swap; when it returns ``False`` nothing is replaced.
+
+        Returns:
+            Whether the profiles were replaced.
 
         """
         replacement = dict(profiles)
         with self._profiles_lock:
+            if only_if is not None and not only_if(self._settings):
+                return False
             self._settings.profiles = replacement
+        return True
 
     def _generate_startup_profiles(self) -> None:
         """
@@ -741,13 +758,12 @@ class ScanWorker:
         if profiles is None:
             return
         written = self._persist_generated_profiles(profiles)
-        replacement = _profiles_after_persist(loaded, profiles, written)
-        with self._profiles_lock:
-            # Re-checked under the lock: only the exact bare default is ever
-            # replaced.  Rebound, never mutated, so a reader holding the old
-            # dict keeps a consistent view.
-            if is_bare_default(self._settings):
-                self._settings.profiles = replacement
+        # Re-checked under the lock: only the exact bare default is ever
+        # replaced, so a set customised meanwhile is left alone.
+        self._set_profiles(
+            _profiles_after_persist(loaded, profiles, written),
+            only_if=is_bare_default,
+        )
 
     def _read_generated_profiles(self) -> dict[str, ProfileConfig] | None:
         """
