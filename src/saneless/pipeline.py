@@ -349,6 +349,8 @@ def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
 
     Raises:
         ScanError: If free space is below the required threshold.
+        OSError: If the directory cannot be created or measured; the caller
+            translates it (IN-07).
 
     """
     path = Path(tmp_dir)
@@ -362,6 +364,39 @@ def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
             f"{min_free_mb} MB required (configure min_free_space_mb to adjust)"
         )
         raise ScanError(msg)
+
+
+def _open_workspace(tmp_dir: str, min_free_mb: int) -> tempfile.TemporaryDirectory[str]:
+    """
+    Create this run's temporary workspace under ``tmp_dir``, checking for room.
+
+    Each of the three steps can raise a raw ``OSError`` -- a full disk, or a
+    ``tmp_dir`` removed since start-up.  That is the setup problem
+    ``validate_settings_dirs`` reports at start-up, so it is a ``ConfigError``
+    here too, not an UNKNOWN error the CLI would call a saneless bug (IN-07).
+    Only the workspace's creation is guarded: an ``OSError`` from the scan run
+    inside it keeps its own translation.
+
+    Args:
+        tmp_dir: The configured directory for temporary files.
+        min_free_mb: Minimum free space required in megabytes.
+
+    Returns:
+        The created workspace, for the caller's ``with`` block to clean up.
+
+    Raises:
+        ConfigError: If ``tmp_dir`` cannot be created or measured, or the
+            workspace cannot be created in it; names ``tmp_dir``.
+        ScanError: If free space is below ``min_free_mb``.
+
+    """
+    try:
+        Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+        _check_disk_space(tmp_dir, min_free_mb)
+        return tempfile.TemporaryDirectory(dir=tmp_dir)
+    except OSError as exc:
+        msg = f"Could not prepare the working directory {tmp_dir}: {describe(exc)}"
+        raise ConfigError(msg) from exc
 
 
 def _require_pages(batch: ScanBatch) -> None:
@@ -1196,8 +1231,9 @@ def run_pipeline(
         scanned, dropped as empty, and uploaded.
 
     Raises:
-        ConfigError: If the profile or device is not configured, or a manual
-            duplex profile is run with no flip coordinator.
+        ConfigError: If the profile or device is not configured, a manual
+            duplex profile is run with no flip coordinator, or the working
+            directory under ``tmp_dir`` cannot be created or measured.
         ScanCancelledError: If the operator aborts a manual duplex scan at the
             flip prompt.
         ScanError: If scanning fails; ``No pages were scanned`` if a scan pass
@@ -1243,11 +1279,11 @@ def run_pipeline(
         paper_size=profile.paper_size,
     )
 
-    # Ensure tmp_dir exists
-    Path(settings.output.tmp_dir).mkdir(parents=True, exist_ok=True)
-    _check_disk_space(settings.output.tmp_dir, settings.output.min_free_space_mb)
+    workspace = _open_workspace(
+        settings.output.tmp_dir, settings.output.min_free_space_mb
+    )
 
-    with tempfile.TemporaryDirectory(dir=settings.output.tmp_dir) as tmp_dir:
+    with workspace as tmp_dir:
         tmp_path = Path(tmp_dir)
 
         # Step 1: Scan
