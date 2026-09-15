@@ -466,12 +466,12 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 28-04-PLAN.md — assemble_pdf boundary: every img2pdf/Pillow failure becomes PdfError
-- [ ] 28-05-PLAN.md — SANE boundary: require_sane() and every python-sane call site wrapped as ScanError
-- [ ] 28-06-PLAN.md — Paperless upload boundary: ctor InvalidURL, widened retry set, fast-fail bad URL, one body renderer
-- [ ] 28-07-PLAN.md — Worker's three job endings (shutdown, CANCELLED, failure with exc_info)
-- [ ] 28-08-PLAN.md — CANCELLED muted styling proven with Playwright; UI-SPEC rows
-- [ ] 28-09-PLAN.md — CLI guarded group: one line + D-07 exit code for every failure, exit 5 last resort, Ctrl-C 130
+- [x] 28-04-PLAN.md — assemble_pdf boundary: every img2pdf/Pillow failure becomes PdfError
+- [x] 28-05-PLAN.md — SANE boundary: require_sane() and every python-sane call site wrapped as ScanError
+- [x] 28-06-PLAN.md — Paperless upload boundary: ctor InvalidURL, widened retry set, fast-fail bad URL, one body renderer
+- [x] 28-07-PLAN.md — Worker's three job endings (shutdown, CANCELLED, failure with exc_info)
+- [x] 28-08-PLAN.md — CANCELLED muted styling proven with Playwright; UI-SPEC rows
+- [x] 28-09-PLAN.md — CLI guarded group: one line + D-07 exit code for every failure, exit 5 last resort, Ctrl-C 130
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -565,7 +565,7 @@ Plans:
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
-| 28. Exception Translation | 3/14 | In Progress|  |
+| 28. Exception Translation | 9/14 | In Progress|  |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
