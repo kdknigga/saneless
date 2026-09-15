@@ -876,6 +876,8 @@ class ScanWorker:
 
         Before any job, the thread generates profiles (D-14).  A job submitted
         meanwhile waits in the queue and then runs against the generated set.
+        After the loop, it tries once more to write whatever is still owed
+        (IN-06).
         """
         try:
             self._generate_startup_profiles()
@@ -906,6 +908,28 @@ class ScanWorker:
                 # A job whose store writes all landed breaks the run.  It does
                 # not clear degraded: only a successful idle probe does.
                 self._consecutive_loop_failures = 0
+        self._flush_before_exit()
+
+    def _flush_before_exit(self) -> None:
+        """
+        Try once to write every owed row before the thread exits (IN-06).
+
+        Owed writes live only in memory.  Left unwritten, an owed rejection
+        comes back after a restart as a PENDING row that the next startup's
+        recovery ends as "server restarted", for a scan that never started,
+        and until then it shows as the live job.  This is the worker thread's
+        own write, so the lifespan's rule against writing over a running
+        thread holds (D-07, D-09).  A failure is only logged: the next
+        startup's recovery still ends the rows (D-13).
+        """
+        try:
+            self._flush_unrecorded_failures()
+        except Exception:
+            logger.warning(
+                "Could not write owed job records before stopping; the next "
+                "startup's recovery ends those rows",
+                exc_info=True,
+            )
 
     @staticmethod
     def _failure_record(
