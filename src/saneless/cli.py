@@ -108,10 +108,13 @@ class ClickFlipCoordinator(FlipCoordinator):
 
     A yes is ``CONTINUED``; a no is ``ABORTED``; and so are EOF at the prompt
     (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
-    the calling thread, where Python delivers SIGINT), so giving up at the
-    terminal and clicking Abort in the web UI end the job the same way.  A
-    prompt that fails unexpectedly -- a lost terminal, undecodable input -- is
-    an abort too, logged with its traceback (WR-08).
+    the calling thread, where Python delivers SIGINT).  Those three are an
+    operator's abort -- a cancel -- so giving up at the terminal and clicking
+    Abort in the web UI end the job the same way (D-02).  A prompt that fails
+    unexpectedly -- a lost terminal, undecodable input -- also answers
+    ``ABORTED`` at once, logged with its traceback (WR-08), but it records the
+    exception as ``abort_cause``: nobody chose to stop, so the scan is reported
+    as failed (exit 1), not cancelled.
 
     Accepted cost, deliberate and not a leak: after a timeout the prompt thread
     is abandoned.  It keeps its read on stdin until the process exits, and its
@@ -123,8 +126,26 @@ class ClickFlipCoordinator(FlipCoordinator):
     """
 
     def __init__(self) -> None:
-        """Start unanswered."""
+        """Start unanswered, with no abort cause."""
         self._slot = FlipAnswerSlot()
+        # Held across a broken prompt's claim and its cause, so the calling
+        # thread, woken by that claim, cannot read the cause before it is set
+        # (the WorkerFlipCoordinator.abort_for_shutdown precedent, WR-06).
+        self._cause_lock = threading.Lock()
+        self._abort_cause: Exception | None = None
+
+    @property
+    def abort_cause(self) -> Exception | None:
+        """
+        The exception a broken prompt raised, if that failure claimed the answer.
+
+        Returns:
+            The prompt's exception, or ``None`` when the answer came from the
+            operator (yes, no, EOF, Ctrl-C) or from the clock.
+
+        """
+        with self._cause_lock:
+            return self._abort_cause
 
     def wait_for_flip(self, timeout: float) -> FlipOutcome:
         """
@@ -160,15 +181,21 @@ class ClickFlipCoordinator(FlipCoordinator):
         except click.Abort:
             self._slot.settle(FlipOutcome.ABORTED)
             return
-        except Exception:
+        except Exception as exc:
             # WR-08: anything else used to kill this thread silently, leaving
             # the calling thread waiting out the whole timeout and then
             # reporting that nobody confirmed the flip, which was false.  The
             # prompt broke, so the scan stops now: ABORTED rather than a fourth
-            # outcome (D-09), with the real cause in the logged traceback.
-            # Logged before the claim, so the record exists once the wait wakes.
+            # outcome (D-09), with the exception kept as abort_cause so the
+            # pipeline reports a failure, not a cancel (D-02).  The cause is
+            # set only if this claim won: a Ctrl-C or a timeout that answered
+            # first keeps its own meaning.  Logged before the claim, so the
+            # record exists once the wait wakes.
             logger.exception("Flip prompt failed; treating it as an abort")
-            self._slot.settle(FlipOutcome.ABORTED)
+            with self._cause_lock:
+                claimed = self._slot.offer(FlipOutcome.ABORTED)
+                if claimed:
+                    self._abort_cause = exc
             return
         self._slot.settle(FlipOutcome.CONTINUED if flipped else FlipOutcome.ABORTED)
 
