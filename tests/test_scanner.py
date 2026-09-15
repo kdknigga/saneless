@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import logging
 import os
+import sys
 import time
 
 import pytest
 from PIL import Image, ImageDraw
 
+import saneless.scanner as scanner_pkg
 import saneless.scanner.sane_backend as sane_backend_mod
-from saneless.exceptions import FeederEmptyError, ScanError
+from saneless.exceptions import ConfigError, FeederEmptyError, ScanError
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -397,13 +400,18 @@ class TestSaneBackendScanPages:
         # The fault is armed on the device rather than by swapping out its snap
         # method: start() is where a flatbed scan first touches the hardware,
         # and the fake raises from there with the library's own error type.
-        dev = FakeSaneDev(start_error=FakeSaneError("scan failed"))
+        # Since EXC-01 the library's error leaves the backend as a ScanError
+        # naming the device, with the original kept as its cause.
+        original = FakeSaneError("scan failed")
+        dev = FakeSaneDev(start_error=original)
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        with pytest.raises(FakeSaneError, match="scan failed"):
+        with pytest.raises(ScanError) as exc_info:
             backend.scan_pages("test:0", settings)
 
+        assert str(exc_info.value) == "Scanner error on test:0: scan failed"
+        assert exc_info.value.__cause__ is original
         assert dev.cancel_calls
         assert dev.close_calls
 
@@ -2990,3 +2998,414 @@ class TestScanBatch:
 
         assert dev.close_calls == 1
         assert len(batch.pages) == 1
+
+
+# ---------------------------------------------------------------------------
+# SANE module boundary (EXC-01)
+# ---------------------------------------------------------------------------
+
+_LIBSANE_MISSING = (
+    "libsane.so.1: cannot open shared object file: No such file or directory"
+)
+
+
+def _flatbed_settings() -> ScanSettings:
+    """
+    Build settings that take the flatbed start()/snap() path.
+
+    Returns:
+        Flatbed settings the shared fake accepts.
+
+    """
+    return ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+
+class TestSaneBoundary:
+    """
+    Every python-sane failure leaves the backend as a saneless type (EXC-01).
+
+    python-sane raises ``_sane.error``, ``RuntimeError`` and ``AttributeError``
+    with no shared base, and before Phase 28 all three escaped ``scan_pages``,
+    ``get_capabilities`` and ``get_devices`` raw, so the CLI printed a traceback
+    and the web layer classified the job as UNKNOWN (M-17).  Each call site now
+    re-raises as ``ScanError`` naming the device, and the option where there is
+    one, with the original message and ``__cause__`` kept (D-08).  A missing
+    python-sane is a setup problem, so ``require_sane()`` raises ``ConfigError``
+    with an install hint instead (D-05).
+    """
+
+    # -- require_sane (D-05) ------------------------------------------------
+
+    def test_require_sane_missing_module_raises_config_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing python-sane is a one-line ConfigError with the install hint."""
+        monkeypatch.setattr(sane_backend_mod, "sane", None)
+        monkeypatch.setitem(sys.modules, "sane", None)
+
+        with pytest.raises(ConfigError) as exc_info:
+            sane_backend_mod.require_sane()
+
+        message = str(exc_info.value)
+        assert "python-sane" in message
+        assert "import of sane halted" in message
+        assert "libsane-dev" in message
+        assert "sane-backends-devel" in message
+        assert "Install on Bare Metal" in message
+        assert "\n" not in message
+        assert isinstance(exc_info.value.__cause__, ModuleNotFoundError)
+
+    def test_require_sane_missing_shared_library_raises_config_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A plain ImportError (libsane.so missing) is translated the same way."""
+        original = ImportError(_LIBSANE_MISSING)
+
+        def _fail() -> None:
+            raise original
+
+        monkeypatch.setattr(sane_backend_mod, "_ensure_sane", _fail)
+
+        with pytest.raises(ConfigError, match=r"libsane\.so\.1") as exc_info:
+            sane_backend_mod.require_sane()
+
+        assert exc_info.value.__cause__ is original
+
+    def test_require_sane_keeps_an_already_loaded_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With sane already bound, require_sane() returns and replaces nothing."""
+        module = FakeSaneModule()
+        monkeypatch.setattr(sane_backend_mod, "sane", module)
+
+        assert sane_backend_mod.require_sane() is None
+        assert sane_backend_mod.sane is module
+
+    def test_require_sane_is_not_run_at_import(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Importing the backend does not import sane, so ``--help`` stays sane-free.
+
+        The backend is imported afresh with python-sane evicted from
+        ``sys.modules``, because another test has very likely imported it
+        already.  monkeypatch restores both entries, and the package attribute,
+        afterwards, so the rest of the session keeps the original module.
+        """
+        monkeypatch.delitem(sys.modules, "sane", raising=False)
+        monkeypatch.delitem(sys.modules, "_sane", raising=False)
+        monkeypatch.delitem(sys.modules, sane_backend_mod.__name__)
+        monkeypatch.setattr(scanner_pkg, "sane_backend", sane_backend_mod)
+
+        fresh = importlib.import_module(sane_backend_mod.__name__)
+
+        assert fresh is not sane_backend_mod
+        assert fresh.sane is None
+        assert "sane" not in sys.modules
+
+    # -- init / open / get_devices / close ----------------------------------
+
+    def test_init_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing sane.init() is a ScanError chained to the SANE error."""
+        original = FakeSaneError("Access to resource has been denied")
+        monkeypatch.setattr(
+            sane_backend_mod, "sane", FakeSaneModule(init_error=original)
+        )
+
+        with pytest.raises(
+            ScanError,
+            match=r"^Could not initialise SANE: Access to resource has been denied$",
+        ) as exc_info:
+            SaneBackend()
+
+        assert exc_info.value.__cause__ is original
+
+    def test_open_failure_in_get_capabilities_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """sane.open() failing names the device and chains the original."""
+        original = FakeSaneError("Invalid argument")
+        monkeypatch.setattr(
+            sane_backend_mod, "sane", FakeSaneModule(open_error=original)
+        )
+        backend = SaneBackend()
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_capabilities("epson2:libusb:001:004")
+
+        assert (
+            str(exc_info.value)
+            == "Could not open scanner epson2:libusb:001:004: Invalid argument"
+        )
+        assert exc_info.value.__cause__ is original
+
+    def test_open_failure_in_scan_pages_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same translation applies on the scan path."""
+        original = FakeSaneError("Invalid argument")
+        monkeypatch.setattr(
+            sane_backend_mod, "sane", FakeSaneModule(open_error=original)
+        )
+        backend = SaneBackend()
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("epson2:libusb:001:004", _flatbed_settings())
+
+        assert (
+            str(exc_info.value)
+            == "Could not open scanner epson2:libusb:001:004: Invalid argument"
+        )
+        assert exc_info.value.__cause__ is original
+
+    def test_open_failure_with_empty_message_names_the_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty SANE message falls back to the exception's class name."""
+        monkeypatch.setattr(
+            sane_backend_mod,
+            "sane",
+            FakeSaneModule(open_error=FakeSaneError("")),
+        )
+        backend = SaneBackend()
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_capabilities("test:0")
+
+        assert str(exc_info.value) == "Could not open scanner test:0: FakeSaneError"
+
+    def test_get_devices_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """sane.get_devices() failing is a ScanError chained to the original."""
+        original = FakeSaneError("Out of memory")
+        monkeypatch.setattr(
+            sane_backend_mod, "sane", FakeSaneModule(get_devices_error=original)
+        )
+        backend = SaneBackend()
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_devices()
+
+        assert str(exc_info.value) == "Could not list scanners: Out of memory"
+        assert exc_info.value.__cause__ is original
+
+    def test_close_failure_does_not_mask_the_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The scan's own error propagates; the close failure is only logged."""
+        dev = FakeSaneDev()
+        dev.fail_call("close", FakeSaneError("close failed"))
+        backend = _backend_with(dev, monkeypatch)
+        settings = ScanSettings(
+            source="NonExistentSource", resolution=300, mode="Color"
+        )
+
+        with (
+            caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"),
+            pytest.raises(ScanError, match="NonExistentSource"),
+        ):
+            backend.scan_pages("test:0", settings)
+
+        assert dev.close_calls == 1
+        records = [
+            r
+            for r in caplog.records
+            if r.name == "saneless.scanner.sane_backend"
+            and r.levelno == logging.WARNING
+            and "test:0" in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+
+    def test_close_failure_after_a_good_scan_returns_the_batch(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A close failure after a successful scan is logged and the result kept."""
+        dev = FakeSaneDev()
+        dev.fail_call("close", FakeSaneError("close failed"))
+        backend = _backend_with(dev, monkeypatch)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.scanner.sane_backend"):
+            batch = backend.scan_pages("test:0", _flatbed_settings())
+
+        assert len(batch.pages) == 1
+        records = [
+            r
+            for r in caplog.records
+            if r.name == "saneless.scanner.sane_backend"
+            and "Could not close scanner test:0" in r.getMessage()
+        ]
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+
+    # -- option assignment and read-back (D-08) -----------------------------
+
+    @pytest.mark.parametrize(
+        ("option", "settings", "error", "expected"),
+        [
+            pytest.param(
+                "source",
+                ScanSettings(source="Flatbed", resolution=300, mode="Color"),
+                FakeSaneError("Invalid argument"),
+                "Could not set source to 'Flatbed' on test:0: Invalid argument",
+                id="source-invalid-argument",
+            ),
+            pytest.param(
+                "mode",
+                ScanSettings(source="Flatbed", resolution=300, mode="Lineart"),
+                FakeSaneError("Invalid argument"),
+                "Could not set mode to 'Lineart' on test:0: Invalid argument",
+                id="mode-invalid-argument",
+            ),
+            pytest.param(
+                "mode",
+                ScanSettings(source="Flatbed", resolution=300, mode="Color"),
+                AttributeError("Inactive option: mode"),
+                "Could not set mode to 'Color' on test:0: Inactive option: mode",
+                id="mode-inactive-option",
+            ),
+            pytest.param(
+                "resolution",
+                ScanSettings(source="Flatbed", resolution=300, mode="Color"),
+                FakeSaneError("Invalid argument"),
+                "Could not set resolution to 300 on test:0: Invalid argument",
+                id="resolution-invalid-argument",
+            ),
+        ],
+    )
+    def test_option_assignment_failure_names_option_and_value(
+        self,
+        option: str,
+        settings: ScanSettings,
+        error: BaseException,
+        expected: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refused assignment names the option, the value and the device."""
+        dev = FakeSaneDev()
+        dev.fail_assignment(option, error)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", settings)
+
+        assert str(exc_info.value) == expected
+        assert exc_info.value.__cause__ is error
+        assert dev.cancel_calls
+        assert dev.close_calls
+
+    def test_resolution_read_back_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reading the resolution back after setting it is wrapped too."""
+        original = AttributeError("Inactive option: resolution")
+        dev = FakeSaneDev()
+        dev.fail_read("resolution", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == (
+            "Could not read back resolution from test:0: Inactive option: resolution"
+        )
+        assert exc_info.value.__cause__ is original
+
+    # -- get_options ---------------------------------------------------------
+
+    def test_get_options_failure_in_scan_pages_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_options() failing on the scan path names the device."""
+        original = FakeSaneError("Error during device I/O")
+        dev = FakeSaneDev()
+        dev.fail_call("get_options", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == (
+            "Could not read options from test:0: Error during device I/O"
+        )
+        assert exc_info.value.__cause__ is original
+        assert dev.close_calls
+
+    def test_get_options_failure_in_get_capabilities_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_options() failing while reading capabilities names the device."""
+        original = FakeSaneError("Error during device I/O")
+        dev = FakeSaneDev()
+        dev.fail_call("get_options", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_capabilities("test:0")
+
+        assert str(exc_info.value) == (
+            "Could not read options from test:0: Error during device I/O"
+        )
+        assert exc_info.value.__cause__ is original
+
+    # -- flatbed start / snap ------------------------------------------------
+
+    def test_flatbed_start_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A flatbed start() failure names the device and chains the original."""
+        original = FakeSaneError("Scanner cover is open")
+        dev = FakeSaneDev(start_error=original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == "Scanner error on test:0: Scanner cover is open"
+        assert exc_info.value.__cause__ is original
+        assert not isinstance(exc_info.value, FeederEmptyError)
+
+    def test_flatbed_snap_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """snap()'s RuntimeError for an empty read is a ScanError with cause."""
+        original = RuntimeError("Scanner returned no data")
+        dev = FakeSaneDev()
+        dev.fail_call("snap", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert "Scanner returned no data" in str(exc_info.value)
+        assert exc_info.value.__cause__ is original
+        assert dev.close_calls
+
+    def test_flatbed_out_of_documents_is_feeder_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one end-of-feed message maps to FeederEmptyError (Phase 24 D-03)."""
+        original = FakeSaneError(_OUT_OF_DOCUMENTS)
+        dev = FakeSaneDev(start_error=original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(FeederEmptyError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == "No paper detected in feeder"
+        assert exc_info.value.__cause__ is original
+
+    def test_adf_empty_message_fault_names_the_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A mid-batch fault with no text still says what went wrong."""
+        dev = FakeSaneDev(pages=5, start_error=FakeSaneError(""), start_error_page=1)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _feeder_settings())
+
+        assert str(exc_info.value) == "Scanner error on page 2: FakeSaneError"

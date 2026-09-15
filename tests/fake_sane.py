@@ -638,6 +638,9 @@ class FakeSaneDev:
     _page_images: list[Image.Image]
     _page_delay: float
     _source_resolution_ranges: dict[str, tuple[float, float, float]]
+    _call_errors: dict[str, BaseException]
+    _assignment_errors: dict[str, BaseException]
+    _read_errors: dict[str, BaseException]
 
     def __init__(
         self,
@@ -682,6 +685,9 @@ class FakeSaneDev:
         state["_page_images"] = []
         state["_page_delay"] = 0.0
         state["_source_resolution_ranges"] = {}
+        state["_call_errors"] = {}
+        state["_assignment_errors"] = {}
+        state["_read_errors"] = {}
         state["calls"] = []
         state["assignments"] = []
         state["cancel_calls"] = 0
@@ -698,11 +704,16 @@ class FakeSaneDev:
         Raises:
             AttributeError: For a read-only attribute, a button, a group, an
                 inactive option or one not settable by software.
+            BaseException: The error armed for ``key`` with
+                ``fail_assignment``.
 
         """
         if key in _READ_ONLY_ATTRIBUTES:
             msg = f"Read-only attribute: {key}"
             raise AttributeError(msg)
+        armed = self.__dict__.get("_assignment_errors", {}).get(key)
+        if armed is not None:
+            raise armed
         option = self.__dict__.get("opt", {}).get(key)
         if option is None:
             # The row that matters most: an unrecognised name is stored
@@ -783,6 +794,57 @@ class FakeSaneDev:
 
         """
         self.__dict__["_page_delay"] = seconds
+
+    def fail_call(self, method: str, error: BaseException) -> None:
+        """
+        Arm a device method to raise, so the backend's translation is exercised.
+
+        python-sane raises ``_sane.error``, ``RuntimeError`` or
+        ``AttributeError`` from its device methods with no shared base, and the
+        backend has to turn each into a saneless type naming the device (D-08).
+        A method rather than a constructor keyword for the usual reason:
+        ``__init__`` already carries ruff's maximum of five arguments.
+
+        ``snap`` and ``close`` record their call before raising, as they do when
+        they succeed, so a test can still assert the call pattern -- and for
+        ``close``, that the handle was released and that the close failure did
+        not mask anything.  ``get_options`` is not a recorded call at all.
+
+        Args:
+            method: The device method to fail: ``"get_options"``, ``"snap"`` or
+                ``"close"``.  A ``start()`` failure keeps its own constructor
+                keyword, because it needs a page index.
+            error: The exception that method raises.
+
+        """
+        self.__dict__["_call_errors"][method] = error
+
+    def fail_assignment(self, option: str, error: BaseException) -> None:
+        """
+        Arm one option assignment to raise, whatever the option table says.
+
+        A real device refuses an assignment for reasons the table cannot always
+        express -- ``_sane.error("Invalid argument")`` from the backend, or an
+        option that went inactive after a reload.  The backend must name the
+        option and the value when that happens (D-08).
+
+        Args:
+            option: The underscore-spelled option name, e.g. ``"mode"``.
+            error: The exception the assignment raises.  Nothing is stored.
+
+        """
+        self.__dict__["_assignment_errors"][option] = error
+
+    def fail_read(self, option: str, error: BaseException) -> None:
+        """
+        Arm one option read to raise, as a read-back of an inactive option does.
+
+        Args:
+            option: The underscore-spelled option name, e.g. ``"resolution"``.
+            error: The exception reading the option raises.
+
+        """
+        self.__dict__["_read_errors"][option] = error
 
     def report_sources(self, sources: list[str]) -> None:
         """
@@ -878,8 +940,12 @@ class FakeSaneDev:
         Raises:
             AttributeError: For a button, a group, an inactive option, or a
                 name the device does not have at all.
+            BaseException: The error armed for ``key`` with ``fail_read``.
 
         """
+        armed = self.__dict__.get("_read_errors", {}).get(key)
+        if armed is not None:
+            raise armed
         option = self.__dict__.get("opt", {}).get(key)
         if option is None:
             msg = f"No such attribute: {key}"
@@ -935,7 +1001,13 @@ class FakeSaneDev:
         Returns:
             Nine-element tuples whose names are hyphenated.
 
+        Raises:
+            BaseException: The error armed with ``fail_call("get_options", ...)``.
+
         """
+        error = self._call_errors.get("get_options")
+        if error is not None:
+            raise error
         return list(self._options)
 
     def start(self) -> None:
@@ -980,8 +1052,16 @@ class FakeSaneDev:
             position, or a generated page when the feeder was not loaded with
             exact images.
 
+        Raises:
+            BaseException: The error armed with ``fail_call("snap", ...)``,
+                raised after the call is recorded, as the real ``snap()``
+                raises ``RuntimeError("Scanner returned no data")``.
+
         """
         self.calls.append("snap")
+        error = self._call_errors.get("snap")
+        if error is not None:
+            raise error
         loaded = self._page_images
         index = self._page_index
         page = (
@@ -1010,8 +1090,18 @@ class FakeSaneDev:
         self.cancel_calls += 1
 
     def close(self) -> None:
-        """Record that the device was closed."""
+        """
+        Record that the device was closed.
+
+        Raises:
+            BaseException: The error armed with ``fail_call("close", ...)``,
+                after the call has been counted.
+
+        """
         self.close_calls += 1
+        error = self._call_errors.get("close")
+        if error is not None:
+            raise error
 
 
 class FakeSaneModule:
@@ -1027,6 +1117,9 @@ class FakeSaneModule:
         *,
         device: FakeSaneDev | None = None,
         devices: list[tuple[str, str, str, str]] | None = None,
+        init_error: BaseException | None = None,
+        open_error: BaseException | None = None,
+        get_devices_error: BaseException | None = None,
     ) -> None:
         """
         Create the module double.
@@ -1034,10 +1127,18 @@ class FakeSaneModule:
         Args:
             device: The shared device handle ``open()`` returns.
             devices: The four-element device tuples ``get_devices()`` returns.
+            init_error: An exception ``init()`` raises after counting the call,
+                as a SANE that cannot start (``_sane.error``) would.
+            open_error: An exception ``open()`` raises, as the real module does
+                with ``_sane.error("Invalid argument")`` for an unknown device.
+            get_devices_error: An exception ``get_devices()`` raises.
 
         """
         self.init_call_count = 0
         self.exit_call_count = 0
+        self._init_error = init_error
+        self._open_error = open_error
+        self._get_devices_error = get_devices_error
         self._device = FakeSaneDev() if device is None else device
         self._devices = (
             [_DEVICE_TUPLE, ("test:1", "TestVendor", "TestModel", "scanner")]
@@ -1052,8 +1153,13 @@ class FakeSaneModule:
         Returns:
             The version tuple the real ``sane.init()`` returns.
 
+        Raises:
+            BaseException: The configured ``init_error``.
+
         """
         self.init_call_count += 1
+        if self._init_error is not None:
+            raise self._init_error
         return (1, 0, 3)
 
     def get_devices(self) -> list[tuple[str, str, str, str]]:
@@ -1063,7 +1169,12 @@ class FakeSaneModule:
         Returns:
             Four-element ``(name, vendor, model, type)`` tuples.
 
+        Raises:
+            BaseException: The configured ``get_devices_error``.
+
         """
+        if self._get_devices_error is not None:
+            raise self._get_devices_error
         return list(self._devices)
 
     def open(self, device_id: str) -> FakeSaneDev:
@@ -1077,7 +1188,12 @@ class FakeSaneModule:
         Returns:
             The shared device handle.
 
+        Raises:
+            BaseException: The configured ``open_error``.
+
         """
+        if self._open_error is not None:
+            raise self._open_error
         return self._device
 
     def exit(self) -> None:
