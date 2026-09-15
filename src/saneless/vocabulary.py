@@ -472,7 +472,9 @@ def error_message(category: ErrorCategory) -> str:
             message = "Something went wrong."
         case ErrorCategory.REJECTED:
             message = (
-                "This scan was not started. Wait for the current scan to finish, "
+                # Neutral on purpose: REJECTED also covers down and degraded
+                # refusals, where no scan is running to wait for (IN-02).
+                "This scan was not started. Check that saneless is ready to scan, "
                 "then try again."
             )
         case _:
