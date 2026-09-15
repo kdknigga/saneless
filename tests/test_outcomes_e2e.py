@@ -472,7 +472,7 @@ def _pages(count: int) -> list[Image.Image]:
 
     Empty-page detection is left enabled, as it is by default in production, so
     the pages have to be genuinely non-blank or ``_drop_empty_pages`` raises
-    "All pages were detected as empty" and every case fails for the wrong
+    "All pages were blank" and every case fails for the wrong
     reason.
 
     Args:
