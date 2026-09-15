@@ -1613,7 +1613,7 @@ class TestQueryMethods:
 
             unexcluded = store.latest_run_job()
             past_one = store.latest_run_job(exclude_ids=frozenset({newest}))
-            past_two = store.latest_run_job(exclude_ids=[newest, middle])
+            past_two = store.latest_run_job(exclude_ids={newest, middle})
             past_all = store.latest_run_job(exclude_ids={older, middle, newest})
 
             assert unexcluded is not None
