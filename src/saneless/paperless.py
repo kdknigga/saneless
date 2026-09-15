@@ -534,8 +534,9 @@ class PaperlessClient:
                 if the attempts end without delivery and no consume directory
                 is configured (``failed after N attempts``, or ``Could not
                 reach Paperless`` for an unusable URL scheme); if any other
-                httpx error occurs; if a 200 body is not JSON or carries no
-                task id; or if copying into the consume directory fails.
+                httpx error occurs; if the PDF cannot be opened; if a 200 body
+                is not JSON or carries no task id; or if copying into the
+                consume directory fails.
                 Every one is chained to its cause.
 
         """
@@ -643,13 +644,25 @@ class PaperlessClient:
             The task id, as a string.
 
         Raises:
-            PaperlessError: If a 200 body is not JSON or is a JSON null.
+            PaperlessError: If the PDF cannot be opened, or a 200 body is not
+                JSON or is a JSON null.
 
         Any ``httpx.HTTPError`` from the request or from ``raise_for_status``
         propagates: ``upload_document`` decides which of those to retry.
 
         """
-        with pdf_path.open("rb") as f:
+        # Only the open is guarded: an OSError here is the PDF itself, while
+        # the request below raises httpx's own types, which upload_document
+        # sorts into retries (IN-08, EXC-01).
+        try:
+            pdf_file = pdf_path.open("rb")
+        except OSError as exc:
+            msg = (
+                f"Could not read the PDF {pdf_path} to upload it: "
+                f"{exc.strerror or describe(exc)}"
+            )
+            raise PaperlessError(msg) from exc
+        with pdf_file as f:
             response = self._client.post(
                 "/api/documents/post_document/",
                 data=data,
