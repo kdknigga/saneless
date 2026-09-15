@@ -57,7 +57,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow; `"hardware"` only records that the source scans both sides and does not change the scan |
 | `resolution` | integer | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `"Color"`, `"Gray"`, or `"Lineart"` |
-| `title` | string | `""` | Default title template for scanned documents |
+| `title` | string | `""` | Default document title, used as written when you leave the title blank in the web UI or omit `--title` on the CLI. A title you type always wins; with neither, the title is `Scan <date time>` |
 | `default_tags` | list of int | `[]` | Paperless-ngx tag IDs to apply automatically |
 | `default_correspondent` | int or null | `null` | Paperless-ngx correspondent ID |
 | `enable_empty_page_detection` | bool | `true` | Remove blank pages from scans |
@@ -142,15 +142,36 @@ If you are unsure what sources and modes your scanner supports, saneless can gen
 saneless auto-profiles
 ```
 
-Profile names come from your scanner's own source names, lowercased and reduced to letters, digits and hyphens. A scanner reporting `Flatbed` and `Automatic Document Feeder` gets profiles named `flatbed` and `automatic-document-feeder`. Use `--force` to overwrite existing auto-generated profiles:
+Profile names come from your scanner's own source names, lowercased and reduced to letters, digits and hyphens. A scanner reporting `Flatbed` and `Automatic Document Feeder` gets profiles named `flatbed` and `automatic-document-feeder`.
+
+If `auto-profiles` creates the config file from scratch, it creates it with mode `0600`, readable only by you, because the file may hold your paperless-ngx token. Rewriting an existing file keeps its mode and owner.
+
+Without `--force`, a profile that already exists is left alone. Use `--force` to refresh the profiles `auto-profiles` created earlier:
 
 ```bash
 saneless auto-profiles --force
 ```
 
+`--force` merges; it does not replace whole profiles:
+
+- It refreshes only profiles that carry `auto_generated = true`. In those, only the generated keys (`source`, `resolution`, `mode`, `auto_source_mode`, `duplex`, `auto_generated`) are rewritten in place, and a generated key the new run no longer writes is removed.
+- Everything else in the profile is kept: `default_tags`, `default_correspondent`, `title`, `paper_size`, the empty-page thresholds, and your comments.
+- A hand edit to a generated key, such as `resolution = 600`, is overwritten. To keep your edits, delete the `auto_generated` line from that profile.
+- A profile without `auto_generated = true` is never changed, even with `--force`. It is listed as `Skipped (not auto-generated)`; rename or delete it to let `auto-profiles` regenerate it.
+
+The command reports what it did, one line per kind of change, and prints only the lines that apply:
+
+```text
+Added: ...
+Refreshed: ...
+Skipped (not auto-generated): ...
+Skipped (already exists; use --force to refresh): ...
+Removed (scanner no longer offers it): ...
+```
+
 Regenerating can rename profiles, so if you pass `--profile` in a script or a cron entry, check the name still matches.
 
-`auto-profiles` always writes a `default` profile -- backed by your scanner's flatbed if it has one, and otherwise by the first source the scanner reports -- and regenerating never removes it. saneless requires that profile, and a config without it is one saneless refuses to load. Every other auto-generated profile a new run no longer produces is removed, so a rename does not leave a stale duplicate behind. Profiles you wrote yourself are never touched.
+`auto-profiles` always writes a `default` profile -- backed by your scanner's flatbed if it has one, and otherwise by the first source the scanner reports -- and regenerating never removes it. saneless requires that profile, and a config without it is one saneless refuses to load. Every other auto-generated profile a new run no longer produces is removed, so a rename does not leave a stale duplicate behind.
 
 See [CLI Commands](../reference/cli-commands.md) for full `auto-profiles` documentation.
 
@@ -162,7 +183,7 @@ Where the generated profiles go depends on the config file saneless loaded:
 
 - **A config file was loaded** (the `--config` path, or the first file found in the [search path](../reference/configuration.md#config-file-search-path)): the profiles are added to that file, as `saneless auto-profiles` would add them, and used straight away.
 - **No config file was loaded:** the profiles are used for this run only and nothing is written. The log names the locations where a config file would be picked up.
-- **The config file cannot be written** -- for example, because it is mounted read-only, as in the Docker Compose examples: the profiles are used for this run only, and a warning is logged.
+- **The config file cannot be written** -- for example, a read-only mount, or `config.toml` bind-mounted as a single file (the rename fails with EBUSY; mount its directory instead, see [Deploy with Docker Compose](deploy-docker-compose.md)): the profiles are used for this run only, and a warning is logged.
 
 Generation is tried once per start. If the scanner was not reachable, saneless keeps the bare `default` profile and logs why; connect the scanner, then restart saneless or run `saneless auto-profiles` to try again.
 
