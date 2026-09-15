@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
@@ -19,6 +20,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SecretStr,
     ValidationError,
     field_validator,
     model_validator,
@@ -31,12 +33,16 @@ from pydantic_settings import (
 )
 
 from saneless.exceptions import ConfigError
+from saneless.vocabulary import TITLE_MAX_LENGTH
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from pydantic_settings.main import InitSettingsSource
 
 __all__ = [
     "DEFAULT_RESOLUTION",
+    "LogLevel",
     "OutputConfig",
     "PaperlessConfig",
     "ProfileConfig",
@@ -44,6 +50,7 @@ __all__ = [
     "Settings",
     "config_search_paths",
     "load_settings",
+    "resolve_job_title",
     "validate_settings_dirs",
     "warn_on_legacy_duplex_sources",
 ]
@@ -55,6 +62,13 @@ DEFAULT_RESOLUTION = 300
 
 300 DPI is the minimum recommended by Tesseract OCR and the industry
 standard for professional document scanning. See Phase 11 research.
+"""
+
+LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+"""The logging level names ``output.log_level`` accepts (CFG-04, M-21).
+
+Each is a key of ``logging.getLevelNamesMapping()`` and, lower-cased, a valid
+uvicorn ``log_level``.
 """
 
 
@@ -90,7 +104,10 @@ class PaperlessConfig(BaseModel):
     """Paperless-ngx API connection settings."""
 
     url: str = ""
-    token: str = ""
+    # Masked in repr, tracebacks and model_dump (CFG-05, N-15). Unwrapped with
+    # get_secret_value only where PaperlessClient is built: cli.py scan and
+    # web/app.py create_app.
+    token: SecretStr = SecretStr("")
     consume_dir: str = ""
 
 
@@ -114,7 +131,11 @@ class ProfileConfig(BaseModel):
     paper_size: Literal["full", "a3", "a4", "a5", "letter", "legal"] = "full"
     default_tags: list[int] = []
     default_correspondent: int | None = None
-    default_title_template: str = Field(default="", alias="title")
+    # A literal title, not a template: no placeholder vocabulary (D-15). Used
+    # when a scan is submitted with a blank title (resolve_job_title, D-16).
+    # Bounded because the route's Form(max_length=...) only checks the typed
+    # title, so an unbounded profile title would bypass ROBU-08.
+    default_title: str = Field(default="", alias="title", max_length=TITLE_MAX_LENGTH)
     empty_page_mean_threshold: float = 250.0
     empty_page_stddev_threshold: float = 5.0
     enable_empty_page_detection: bool = True
@@ -146,6 +167,33 @@ class ProfileConfig(BaseModel):
         return data
 
 
+def resolve_job_title(
+    typed: str | None, profile: ProfileConfig | None, *, now: datetime
+) -> str:
+    """
+    Choose a scan job's title by the one rule every front end shares (D-16).
+
+    A typed title that is non-blank after stripping wins; otherwise the
+    profile's ``title``, when it is non-blank; otherwise ``Scan <time>``. The
+    timestamp is rendered in UTC whatever the zone of ``now`` (local time is
+    APPL-12). A chosen title is returned as given, not stripped.
+
+    Args:
+        typed: The title the operator typed, if any.
+        profile: The profile the scan uses, if known.
+        now: An aware timestamp for the fallback title.
+
+    Returns:
+        The title to give the job.
+
+    """
+    if typed is not None and typed.strip():
+        return typed
+    if profile is not None and profile.default_title.strip():
+        return profile.default_title
+    return f"Scan {now.astimezone(UTC).strftime('%Y-%m-%d %H:%M')}"
+
+
 class OutputConfig(BaseModel):
     """Output and logging configuration."""
 
@@ -156,7 +204,7 @@ class OutputConfig(BaseModel):
     # changes both defaults in a single edit; no env var is consulted here.
     data_dir: str = str(Path.home() / ".local" / "state" / "saneless")
     log_file: str = str(Path.home() / ".local" / "state" / "saneless" / "saneless.log")
-    log_level: str = "INFO"
+    log_level: LogLevel = "INFO"
     log_max_bytes: int = 10_485_760
     log_backup_count: int = 5
     history_retention_days: int = 7
@@ -175,6 +223,30 @@ class OutputConfig(BaseModel):
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalise_log_level(cls, value: object) -> object:
+        """
+        Normalise a configured level name before the ``Literal`` check (CFG-04).
+
+        ``getattr(logging, name)`` used to accept any attribute name and crash
+        on an unknown one such as ``TRACE`` long after load (M-21). The name is
+        trimmed and upper-cased, and ``WARN`` is read as ``WARNING`` because
+        ``logging.getLevelNamesMapping()`` itself lists ``WARN``. Anything that
+        is not a string is returned unchanged so pydantic rejects it.
+
+        Args:
+            value: The raw ``log_level`` input.
+
+        Returns:
+            The normalised name for a string input, else the input unchanged.
+
+        """
+        if isinstance(value, str):
+            upper = value.strip().upper()
+            return "WARNING" if upper == "WARN" else upper
+        return value
 
     @property
     def db_path(self) -> Path:

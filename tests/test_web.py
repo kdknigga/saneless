@@ -270,6 +270,68 @@ def test_scan_form_submit(client: TestClient) -> None:
     assert 'id="status-area"' in response.text
 
 
+@pytest.fixture
+def titled_client(
+    tmp_path: Path, web_scanner: StubScanner, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[TestClient]:
+    """
+    TestClient whose ``default`` profile has ``title = "Receipt"`` (D-16).
+
+    The worker's ``submit`` is stubbed to accept without running a pipeline,
+    so the created job row is what the route resolved and nothing else.
+    """
+    settings = Settings(
+        scanner=ScannerConfig(device="test:device:001"),
+        paperless=PaperlessConfig(url="http://localhost:8000"),
+        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+        profiles={"default": ProfileConfig(title="Receipt")},
+    )
+    app = create_app(settings, web_scanner)
+    app.state.paperless.get_tags = list
+    app.state.paperless.get_correspondents = list
+    monkeypatch.setattr(app.state.worker, "submit", lambda _job: SubmitResult.ACCEPTED)
+    with TestClient(app) as tc:
+        yield tc
+
+
+@pytest.mark.parametrize("typed", ["", "   "], ids=["empty", "whitespace"])
+def test_scan_blank_title_uses_profile_title(
+    titled_client: TestClient, typed: str
+) -> None:
+    """A blank typed title is replaced by the profile's title (D-16, M-24)."""
+    response = titled_client.post(
+        "/api/scan", data={"profile": "default", "title": typed}
+    )
+    assert response.status_code == 200
+    job_store: JobStore = _app(titled_client).state.job_store
+    assert job_store.list_recent(limit=1)[0].title == "Receipt"
+
+
+def test_scan_typed_title_beats_profile_title(titled_client: TestClient) -> None:
+    """A typed title is used as given over the profile's title (D-16)."""
+    response = titled_client.post(
+        "/api/scan", data={"profile": "default", "title": "Typed"}
+    )
+    assert response.status_code == 200
+    job_store: JobStore = _app(titled_client).state.job_store
+    assert job_store.list_recent(limit=1)[0].title == "Typed"
+
+
+def test_scan_title_unknown_profile_still_rejected(titled_client: TestClient) -> None:
+    """Resolving the title never masks an unknown profile (D-16, T-27-04)."""
+    job_store: JobStore = _app(titled_client).state.job_store
+    before = job_store.list_recent(limit=50)
+    response = titled_client.post(
+        "/api/scan", data={"profile": "no-such-profile", "title": ""}
+    )
+    assert response.status_code == 422
+    assert response.json() == {
+        "status": "error",
+        "detail": rejection_message(RequestRejection.UNKNOWN_PROFILE),
+    }
+    assert job_store.list_recent(limit=50) == before
+
+
 def test_status_polling(client: TestClient) -> None:
     """GET /api/jobs/current/status returns status partial (UI-02)."""
     response = client.get("/api/jobs/current/status")

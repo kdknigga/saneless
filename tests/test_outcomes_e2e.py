@@ -660,7 +660,7 @@ class TestFiveOutcomesEndToEnd:
         store = JobStore(db_path=str(settings.output.db_path))
         paperless = PaperlessClient(
             url=settings.paperless.url,
-            token=settings.paperless.token,
+            token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
             # The measured zero-sleep lever: at 1 attempt neither
             # exponential-backoff pause in upload_document is reachable, taking
@@ -731,7 +731,7 @@ class TestFlipTimeoutReleasesTheWorker:
         store = JobStore(db_path=str(settings.output.db_path))
         paperless = PaperlessClient(
             url=settings.paperless.url,
-            token=settings.paperless.token,
+            token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
             max_retries=1,
             _transport=httpx.MockTransport(_accepting_handler()),

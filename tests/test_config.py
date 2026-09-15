@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -13,9 +14,11 @@ import saneless.config as config_mod
 from saneless.config import (
     DEFAULT_RESOLUTION,
     OutputConfig,
+    PaperlessConfig,
     ProfileConfig,
     Settings,
     load_settings,
+    resolve_job_title,
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
 )
@@ -26,6 +29,7 @@ from saneless.exceptions import (
     SanelessError,
     ScanError,
 )
+from saneless.vocabulary import TITLE_MAX_LENGTH
 
 
 class TestLoadSettingsFromToml:
@@ -37,7 +41,7 @@ class TestLoadSettingsFromToml:
         assert settings.scanner.host == "192.168.1.50"
         assert settings.paperless.url == "http://paperless:8000"
         expected_auth = "abc123"
-        assert settings.paperless.token == expected_auth
+        assert settings.paperless.token.get_secret_value() == expected_auth
 
     def test_env_var_override(
         self, sample_toml: Path, monkeypatch: pytest.MonkeyPatch
@@ -52,7 +56,7 @@ class TestLoadSettingsFromToml:
         monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", "envtoken")
         settings = load_settings()
         expected_auth = "envtoken"
-        assert settings.paperless.token == expected_auth
+        assert settings.paperless.token.get_secret_value() == expected_auth
 
     def test_nested_env_delimiter(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Double underscore delimiter supports nested settings."""
@@ -269,6 +273,87 @@ class TestSettingsDefaults:
         assert settings.output.log_level == "INFO"
 
 
+class TestSecretToken:
+    """
+    The Paperless token is a ``SecretStr`` (CFG-05, N-15).
+
+    A settings object is formatted in reprs, tracebacks and dumps; none of
+    those may carry the token. Only the ``PaperlessClient`` construction sites
+    unwrap it.
+    """
+
+    def test_secret_token_absent_from_repr(self) -> None:
+        """``repr(settings)`` masks the token."""
+        secret = "tok-SECRET-4b1d"
+        settings = Settings(paperless=PaperlessConfig(token=secret))
+        assert secret not in repr(settings)
+
+    def test_secret_token_absent_from_json_dump(self) -> None:
+        """``model_dump(mode="json")`` masks the token."""
+        secret = "tok-SECRET-4b1d"
+        settings = Settings(paperless=PaperlessConfig(token=secret))
+        assert secret not in str(settings.model_dump(mode="json"))
+
+    def test_secret_token_unwraps_to_the_value(self) -> None:
+        """``get_secret_value()`` still returns the configured token."""
+        secret = "tok-SECRET-4b1d"
+        settings = Settings(paperless=PaperlessConfig(token=secret))
+        assert settings.paperless.token.get_secret_value() == secret
+
+    def test_secret_token_default_is_empty(self) -> None:
+        """An unconfigured token unwraps to the empty string."""
+        assert PaperlessConfig().token.get_secret_value() == ""
+
+
+class TestLogLevelValidation:
+    """
+    ``output.log_level`` accepts only the five standard names (CFG-04, M-21).
+
+    ``getattr(logging, name)`` used to accept garbage and crash on ``TRACE``;
+    the value is now validated at load, case-insensitively, with ``warn`` read
+    as ``WARNING``.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("warn", "WARNING"),
+            (" debug ", "DEBUG"),
+            ("critical", "CRITICAL"),
+            ("Error", "ERROR"),
+            ("INFO", "INFO"),
+        ],
+    )
+    def test_log_level_is_normalised(self, raw: str, expected: str) -> None:
+        """Names are trimmed and upper-cased; ``warn`` becomes ``WARNING``."""
+        output = OutputConfig.model_validate({"log_level": raw})
+        assert output.log_level == expected
+
+    def test_log_level_unknown_name_is_rejected(self) -> None:
+        """``TRACE`` fails validation with a ``literal_error`` on log_level."""
+        with pytest.raises(ValidationError) as exc_info:
+            OutputConfig.model_validate({"log_level": "TRACE"})
+        errors = exc_info.value.errors()
+        assert [(e["type"], e["loc"]) for e in errors] == [
+            ("literal_error", ("log_level",))
+        ]
+
+    def test_log_level_non_string_is_rejected(self) -> None:
+        """A numeric level is not silently accepted."""
+        with pytest.raises(ValidationError, match="log_level"):
+            OutputConfig.model_validate({"log_level": 10})
+
+    def test_log_level_default_is_info(self) -> None:
+        """The default level is INFO."""
+        assert OutputConfig().log_level == "INFO"
+
+    def test_log_level_env_is_validated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An invalid ``SANELESS_OUTPUT__LOG_LEVEL`` fails at load."""
+        monkeypatch.setenv("SANELESS_OUTPUT__LOG_LEVEL", "TRACE")
+        with pytest.raises(ValidationError, match="log_level"):
+            load_settings()
+
+
 class TestExceptionHierarchy:
     """Custom exception hierarchy."""
 
@@ -319,21 +404,84 @@ class TestTomlStructureErrors:
             load_settings(config_path=str(config_file))
 
     def test_title_alias_works(self, tmp_config_dir: Path) -> None:
-        """The 'title' field in [profiles.default] maps to default_title_template."""
+        """The 'title' field in [profiles.default] maps to default_title (D-15)."""
         toml_content = '[profiles.default]\ntitle = "My Doc"\n'
         config_file = tmp_config_dir / "title_alias.toml"
         config_file.write_text(toml_content)
         settings = load_settings(config_path=str(config_file))
-        assert settings.profiles["default"].default_title_template == "My Doc"
+        assert settings.profiles["default"].default_title == "My Doc"
 
     def test_title_env_var_override(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Env var SANELESS_PROFILES__DEFAULT__TITLE sets default_title_template."""
+        """Env var SANELESS_PROFILES__DEFAULT__TITLE sets default_title (D-15)."""
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("SANELESS_PROFILES__DEFAULT__TITLE", "EnvTitle")
         settings = load_settings()
-        assert settings.profiles["default"].default_title_template == "EnvTitle"
+        assert settings.profiles["default"].default_title == "EnvTitle"
+
+    def test_title_over_max_length_is_rejected(self) -> None:
+        """
+        A profile title longer than TITLE_MAX_LENGTH fails validation (D-15).
+
+        The route's form bound only checks a typed title, so an unbounded
+        profile title would bypass ROBU-08.
+        """
+        with pytest.raises(ValidationError, match="title"):
+            ProfileConfig(title="x" * (TITLE_MAX_LENGTH + 1))
+
+    def test_title_at_max_length_is_accepted(self) -> None:
+        """A profile title of exactly TITLE_MAX_LENGTH characters loads."""
+        title = "x" * TITLE_MAX_LENGTH
+        assert ProfileConfig(title=title).default_title == title
+
+
+class TestResolveJobTitle:
+    """
+    One title rule for every front end (D-16, M-24).
+
+    A typed title wins when it is non-blank after stripping; otherwise the
+    profile's ``title``; otherwise ``Scan <UTC YYYY-MM-DD HH:MM>``. The
+    documented ``title`` key used to do nothing.
+    """
+
+    _NOW = datetime(2026, 9, 15, 13, 5, tzinfo=UTC)
+
+    def test_title_typed_wins(self) -> None:
+        """A non-blank typed title is used over the profile's title."""
+        profile = ProfileConfig(title="Receipt")
+        assert resolve_job_title("Invoice", profile, now=self._NOW) == "Invoice"
+
+    @pytest.mark.parametrize("typed", ["", "   ", None])
+    def test_title_blank_typed_uses_profile_title(self, typed: str | None) -> None:
+        """An empty, whitespace or missing typed title falls back to the profile."""
+        profile = ProfileConfig(title="Receipt")
+        assert resolve_job_title(typed, profile, now=self._NOW) == "Receipt"
+
+    def test_title_without_profile_title_uses_timestamp(self) -> None:
+        """A profile with no title falls through to the UTC timestamp."""
+        title = resolve_job_title("", ProfileConfig(), now=self._NOW)
+        assert title == "Scan 2026-09-15 13:05"
+
+    def test_title_blank_profile_title_uses_timestamp(self) -> None:
+        """A whitespace profile title counts as blank."""
+        profile = ProfileConfig(title="  ")
+        title = resolve_job_title(None, profile, now=self._NOW)
+        assert title == "Scan 2026-09-15 13:05"
+
+    def test_title_no_profile_uses_timestamp(self) -> None:
+        """With no profile at all the timestamp is used."""
+        assert resolve_job_title(None, None, now=self._NOW) == "Scan 2026-09-15 13:05"
+
+    def test_title_timestamp_is_rendered_in_utc(self) -> None:
+        """A non-UTC aware ``now`` renders as UTC (local time is APPL-12)."""
+        plus_two = datetime(2026, 9, 15, 15, 5, tzinfo=timezone(timedelta(hours=2)))
+        assert resolve_job_title("", None, now=plus_two) == "Scan 2026-09-15 13:05"
+
+    def test_title_typed_is_returned_unstripped(self) -> None:
+        """A non-blank typed title is returned as given, matching today."""
+        typed = " Invoice "
+        assert resolve_job_title(typed, None, now=self._NOW) == typed
 
 
 class TestProfileConfigThresholds:

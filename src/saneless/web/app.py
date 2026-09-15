@@ -59,7 +59,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     """
     paperless = PaperlessClient(
         url=settings.paperless.url,
-        token=settings.paperless.token,
+        token=settings.paperless.token.get_secret_value(),
         consume_dir=settings.paperless.consume_dir,
     )
     Path(settings.output.tmp_dir).mkdir(parents=True, exist_ok=True)
