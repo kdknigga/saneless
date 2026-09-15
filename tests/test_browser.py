@@ -93,6 +93,9 @@ _AMBER = {"light": "rgb(161, 98, 7)", "dark": "rgb(202, 138, 4)"}
 _ERROR_RED = {"light": "rgb(136, 57, 53)", "dark": "rgb(206, 126, 123)"}
 """Pico's ``--pico-del-color`` behind ``.status-error``, per 26-UI-SPEC, as computed."""
 
+_MUTED = {"light": "rgb(100, 107, 121)", "dark": "rgb(123, 132, 149)"}
+"""Pico's ``--pico-muted-color`` (#646b79 / #7b8495) behind ``.status-cancelled``."""
+
 
 _SCAN_GATE_TIMEOUT = 30.0
 """Longest a closed gate holds ``scan_pages``, so a test that forgets it cannot hang."""
@@ -768,13 +771,16 @@ class TestServerOwnedScanButton:
 
 
 # Builds one <p> per status class, reads the colour the cascade actually
-# resolved, and removes it again. Reading all three from the same live page is
+# resolved, and removes it again. Reading all four from the same live page is
 # the only way to compare them: only one status renders at a time, so there is
-# never a moment when all three exist in the document on their own.
+# never a moment when all four exist in the document on their own.
 _PROBE_STATUS_COLOURS = """
 () => {
     const out = {};
-    for (const cls of ["status-done", "status-error", "status-fallback"]) {
+    const classes = [
+        "status-done", "status-error", "status-fallback", "status-cancelled",
+    ];
+    for (const cls of classes) {
         const probe = document.createElement("p");
         probe.className = cls;
         probe.textContent = "probe";
@@ -783,6 +789,21 @@ _PROBE_STATUS_COLOURS = """
         probe.remove();
     }
     return out;
+}
+"""
+
+# Resolves Pico's muted token the same way a status class would, through a
+# probe's `color`, so the answer is an rgb() string comparable with the probes
+# above. Reading the custom property itself returns the declared hex instead.
+_PROBE_MUTED_TOKEN = """
+() => {
+    const probe = document.createElement("p");
+    probe.style.color = "var(--pico-muted-color)";
+    probe.textContent = "probe";
+    document.body.appendChild(probe);
+    const colour = getComputedStyle(probe).color;
+    probe.remove();
+    return colour;
 }
 """
 
@@ -845,12 +866,16 @@ _PROBE_CONTEXT_CONTRAST = (
 """
     + _JS_BACKGROUND_STACK_OF
     + """
-    const probe = document.createElement(context === "status-area" ? "p" : "td");
+    const probe = document.createElement(context === "history-cell" ? "td" : "p");
     probe.className = cls;
     probe.textContent = "probe";
     let added = probe;
     if (context === "status-area") {
         document.getElementById("status-area").appendChild(probe);
+    } else if (context === "card") {
+        // The first <article> is the Scan card: the secondary surface, which
+        // is the one a status line placed inside a card would sit on.
+        document.querySelector("article").appendChild(probe);
     } else {
         const row = document.createElement("tr");
         row.appendChild(probe);
@@ -1108,7 +1133,7 @@ class TestFallbackStatusRendering:
         """
         self._goto(fallback_page, browser_server.url, scheme)
         colours = fallback_page.evaluate(_PROBE_STATUS_COLOURS)
-        assert len(set(colours.values())) == 3, colours
+        assert len(set(colours.values())) == 4, colours
 
         rendered = fallback_page.evaluate(
             "() => getComputedStyle("
@@ -1166,6 +1191,161 @@ class TestFallbackStatusRendering:
         assert cell.inner_text().strip() == "Saved to folder"
 
 
+_POLL_OBSERVATION_MS = 2500
+"""How long a terminal page is watched for status polls: two and a half 1 s ticks."""
+
+
+@pytest.mark.browser
+class TestCancelledStatusRendering:
+    """
+    The CANCELLED status render, proven in a browser (D-01, EXC-04).
+
+    A cancel is a deliberate stop, not a failure, so it must never look like
+    one: muted rather than red, and no alert. Whether the grey is really a
+    fourth colour, and whether it is legible on each surface, is a cascade
+    outcome no template assertion can see; that the state behaves as terminal
+    -- polling stops, the Scan button comes back, history repaints -- depends
+    on htmx actually running.
+    """
+
+    @pytest.fixture
+    def cancelled_page(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> Iterator[Page]:
+        """Drive the live app's current job to CANCELLED, then clear it again."""
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        job = job_store.create_job(profile="default", title="Cancelled Doc")
+        job_store.finish_job(
+            job.id,
+            JobState.CANCELLED,
+            error="Manual duplex scan cancelled at the flip prompt",
+        )
+        app.state.worker._current_job_id = job.id
+        try:
+            yield page
+        finally:
+            # Both halves, for the reason fallback_page gives: clearing only
+            # the pointer leaves this job as list_recent's most recent row, and
+            # every later "idle" page would render it.
+            app.state.worker._current_job_id = None
+            job_store.delete_job(job.id)
+
+    def _goto(self, page: Page, url: str, scheme: Literal["light", "dark"]) -> None:
+        """Load the page under an emulated OS colour-scheme preference."""
+        page.emulate_media(color_scheme=scheme)
+        page.goto(url)
+        page.wait_for_selector("#status-area .status-cancelled")
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_cancelled_copy_renders_without_an_alert(
+        self,
+        cancelled_page: Page,
+        browser_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """The status area shows the cancel line, and nothing in it is an alert."""
+        self._goto(cancelled_page, browser_server.url, scheme)
+        status = cancelled_page.locator("#status-area")
+        line = status.locator("p.status-cancelled")
+        expect(line).to_be_visible()
+        assert line.inner_text().strip() == "⊘ Cancelled: Cancelled Doc"
+        assert status.locator('[role="alert"]').count() == 0
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_cancelled_colour_is_the_muted_token_not_the_error_red(
+        self,
+        cancelled_page: Page,
+        browser_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        The cancelled line resolves to Pico's muted grey, a fourth status colour.
+
+        Four distinct colours is the proof that the grey is not the ins green,
+        the del red or the fallback amber once the cascade resolves; equality
+        with the muted token is the proof it is that token and not merely the
+        inherited body colour, which is also distinct from the other three.
+        """
+        self._goto(cancelled_page, browser_server.url, scheme)
+        colours = cancelled_page.evaluate(_PROBE_STATUS_COLOURS)
+        assert len(set(colours.values())) == 4, colours
+        assert colours["status-cancelled"] != colours["status-error"], colours
+
+        muted = cancelled_page.evaluate(_PROBE_MUTED_TOKEN)
+        assert colours["status-cancelled"] == muted, (colours, muted)
+        assert muted == _MUTED[scheme], muted
+
+        rendered = cancelled_page.evaluate(
+            "() => getComputedStyle("
+            "document.querySelector('#status-area p.status-cancelled')).color"
+        )
+        # The probe measured the class; this proves the real markup wears it.
+        assert rendered == colours["status-cancelled"]
+
+    def test_cancelled_page_is_terminal_and_stops_polling(
+        self, cancelled_page: Page, browser_server: _BrowserServer
+    ) -> None:
+        """
+        A CANCELLED current job leaves the page idle-ready (D-01: terminal).
+
+        The Scan button is enabled with no busy marker, the status area carries
+        no polling trigger, and -- the behaviour the attribute stands for -- no
+        status request goes out across more than two poll intervals.
+        """
+        polls: list[str] = []
+        cancelled_page.on(
+            "request",
+            lambda request: (
+                polls.append(request.url)
+                if "/api/jobs/current/status" in request.url
+                else None
+            ),
+        )
+        self._goto(cancelled_page, browser_server.url, "light")
+
+        scan_btn = cancelled_page.locator("#scan-btn")
+        assert scan_btn.is_enabled()
+        assert scan_btn.get_attribute("aria-busy") is None
+        assert (scan_btn.text_content() or "").strip() == "Scan"
+        assert (
+            cancelled_page.locator("#status-area").get_attribute("hx-trigger") is None
+        )
+
+        cancelled_page.wait_for_timeout(_POLL_OBSERVATION_MS)
+        assert polls == [], polls
+
+    def test_scan_button_re_enables_after_a_cancelled_swap(
+        self, cancelled_page: Page, browser_server: _BrowserServer
+    ) -> None:
+        """A cancelled swap releases a stale disabled Scan button, as FALLBACK does."""
+        self._goto(cancelled_page, browser_server.url, "light")
+        cancelled_page.evaluate("document.getElementById('scan-btn').disabled = true")
+        assert cancelled_page.locator("#scan-btn").is_disabled()
+
+        cancelled_page.evaluate(_SWAP_STATUS_AREA)
+        cancelled_page.wait_for_selector("#scan-btn:not([disabled])")
+        scan_btn = cancelled_page.locator("#scan-btn")
+        assert (scan_btn.text_content() or "").strip() == "Scan"
+        assert scan_btn.get_attribute("aria-busy") is None
+
+    def test_cancelled_swap_refreshes_the_history_table(
+        self, cancelled_page: Page, browser_server: _BrowserServer
+    ) -> None:
+        """The hidden reload div in the CANCELLED branch repaints history."""
+        self._goto(cancelled_page, browser_server.url, "light")
+        cancelled_page.evaluate(
+            "() => document.querySelectorAll('#history-body td.status-cancelled')"
+            ".forEach((cell) => cell.classList.remove('status-cancelled'))"
+        )
+        assert cancelled_page.locator("#history-body td.status-cancelled").count() == 0
+
+        cancelled_page.evaluate(_SWAP_STATUS_AREA)
+        cancelled_page.wait_for_selector("#history-body td.status-cancelled")
+        cell = cancelled_page.locator("#history-body td.status-cancelled").first
+        assert cell.inner_text().strip() == "Cancelled"
+
+
 @pytest.mark.browser
 class TestDarkModeEngagement:
     """
@@ -1211,22 +1391,32 @@ class TestDarkModeEngagement:
     # The probe context is named "placement" here because pytest-playwright
     # already owns a fixture called "context" (the browser context that "page"
     # is built from); a parameter of that name would replace it with a string.
-    @pytest.mark.parametrize("placement", ["status-area", "history-cell"])
-    @pytest.mark.parametrize("cls", ["status-done", "status-error", "status-fallback"])
+    @pytest.mark.parametrize("placement", ["status-area", "history-cell", "card"])
+    @pytest.mark.parametrize(
+        "cls",
+        ["status-done", "status-error", "status-fallback", "status-cancelled"],
+    )
     @pytest.mark.parametrize("scheme", ["light", "dark"])
     def test_status_colour_meets_aa_contrast(
         self,
         page: Page,
         browser_server_url: str,
         scheme: Literal["light", "dark"],
-        cls: Literal["status-done", "status-error", "status-fallback"],
-        placement: Literal["status-area", "history-cell"],
+        cls: Literal[
+            "status-done", "status-error", "status-fallback", "status-cancelled"
+        ],
+        placement: Literal["status-area", "history-cell", "card"],
     ) -> None:
         """
         Every status colour reaches WCAG AA where it is really shown (T2).
 
-        The fallback amber is also checked by value, so a palette drift is
-        reported by name rather than only as a ratio that happens to pass.
+        The card placement is the margin UI-SPEC records for a status line
+        inside an ``<article>``; the dark card is lighter than the dark page,
+        so it is the tighter of the two for the muted cancelled grey.
+
+        The fallback amber and the cancelled grey are also checked by value, so
+        a palette drift is reported by name rather than only as a ratio that
+        happens to pass.
         """
         self._goto(page, browser_server_url, scheme)
         probe = page.evaluate(
@@ -1238,6 +1428,29 @@ class TestDarkModeEngagement:
         assert ratio >= 4.5, (colour, background, ratio)
         if cls == "status-fallback":
             assert colour == _AMBER[scheme], (colour, background, ratio)
+        if cls == "status-cancelled":
+            assert colour == _MUTED[scheme], (colour, background, ratio)
+
+    def test_forced_dark_theme_gives_cancelled_the_dark_muted_colour(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        A forced dark theme gets Pico's dark muted grey under a light OS (D-01).
+
+        ``.status-cancelled`` reads Pico's own token rather than an app-owned
+        pair, so this is the proof that Pico's ``[data-theme="dark"]`` block
+        reaches it -- and that it still clears AA on the dark card there.
+        """
+        self._goto(page, browser_server_url, "light")
+        page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
+        colours = page.evaluate(_PROBE_STATUS_COLOURS)
+        assert colours["status-cancelled"] == _MUTED["dark"], colours
+        probe = page.evaluate(
+            _PROBE_CONTEXT_CONTRAST, {"cls": "status-cancelled", "context": "card"}
+        )
+        background = _flatten(probe["backgroundStack"])
+        ratio = _contrast_ratio(probe["colour"], background)
+        assert ratio >= 4.5, (probe, background, ratio)
 
     def test_forced_dark_theme_keeps_the_dark_amber(
         self, page: Page, browser_server_url: str
