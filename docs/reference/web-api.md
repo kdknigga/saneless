@@ -42,7 +42,7 @@ Health check for container orchestration and monitoring.
 | 503 | `{"status": "error", "detail": "job store failing"}` | Worker thread is alive but degraded: the job store is failing |
 | 503 | `{"status": "error", "detail": "worker thread is down"}` | Worker thread is not running |
 
-The worker becomes degraded after three job-store failures in a row (its own job writes or its periodic history prune), or at startup when the job store cannot be written. While degraded, new scans are refused with `503`. Degraded clears itself: while no scan is running, the worker checks the job store every 5 seconds, and the first check that succeeds returns `/health` to `200`.
+The worker becomes degraded after three job-store failures in a row (its own job writes or its periodic history prune), when a job record it could not write is still failing to write for three idle ticks in a row (about 15 seconds), or at startup when the job store cannot be written. While degraded, new scans are refused with `503`. Degraded clears itself: while no scan is running, the worker checks the job store every 5 seconds, and the first check in which the job store accepts writes again, including any job records it still owes, returns `/health` to `200`.
 
 ---
 
