@@ -104,6 +104,14 @@ def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | Non
     job that just ended".  ``JobStore.latest_run_job`` leaves those rows out;
     D-17's contract is otherwise unchanged, and history still lists them.
 
+    The fallback also skips a refused submit whose REJECTED write the request
+    could not make and owed to the worker (WR-01).  Until the worker writes it,
+    that row is PENDING with no marker and would render as "Starting scan..."
+    with the Scan button disabled, for a scan that never ran (IN-08).  The
+    accepted residual window is a poll landing during the request's own write
+    attempt, between ``create_job`` and that write or the ``owe_rejection``
+    call after it failed.
+
     Args:
         worker: The scan worker, for the id of the job in flight.
         job_store: The job store to read the job from.
@@ -117,7 +125,7 @@ def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | Non
     if worker.current_job_id:
         job = job_store.get_job(worker.current_job_id)
     if job is None:
-        job = job_store.latest_run_job()
+        job = job_store.latest_run_job(exclude_ids=worker.owed_rejection_ids())
     return job
 
 

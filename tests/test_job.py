@@ -1605,6 +1605,57 @@ class TestQueryMethods:
         finally:
             reopened.close()
 
+    def test_latest_run_job_skips_excluded_ids(self) -> None:
+        """Excluded ids are passed over, however many newer rows they cover (IN-08)."""
+        store = JobStore()
+        try:
+            older, middle, newest = _create_in_order(store, 3)
+
+            unexcluded = store.latest_run_job()
+            past_one = store.latest_run_job(exclude_ids=frozenset({newest}))
+            past_two = store.latest_run_job(exclude_ids=[newest, middle])
+            past_all = store.latest_run_job(exclude_ids={older, middle, newest})
+
+            assert unexcluded is not None
+            assert unexcluded.id == newest
+            assert past_one is not None
+            assert past_one.id == middle
+            assert past_two is not None
+            assert past_two.id == older
+            assert past_all is None
+        finally:
+            store.close()
+
+    def test_latest_run_job_exclusions_combine_with_the_rejection_skip(self) -> None:
+        """An owed rejection and a written one are both skipped (IN-08, D-06)."""
+        store = JobStore()
+        try:
+            done, owed, rejected = _create_in_order(store, 3)
+            store.finish_job(done, JobState.DONE)
+            _reject(store, rejected)
+
+            latest = store.latest_run_job(exclude_ids=frozenset({owed}))
+
+            assert latest is not None
+            assert latest.id == done
+        finally:
+            store.close()
+
+    def test_latest_run_job_ignores_excluded_ids_that_match_no_row(self) -> None:
+        """Excluding ids that match no row changes nothing (IN-08)."""
+        store = JobStore()
+        try:
+            only = _create_in_order(store, 1)[0]
+
+            latest = store.latest_run_job(
+                exclude_ids=frozenset({"no-such-id", "another-missing-id"})
+            )
+
+            assert latest is not None
+            assert latest.id == only
+        finally:
+            store.close()
+
     def test_probe_on_a_healthy_store_changes_nothing(self) -> None:
         """A probe returns None and leaves rows and user_version untouched (D-12)."""
         store = JobStore()

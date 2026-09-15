@@ -791,6 +791,65 @@ def test_a_refused_submit_whose_rejection_write_fails_is_recorded_by_the_worker(
     assert "disabled" not in button.group("attrs")
 
 
+@pytest.mark.parametrize(
+    ("result", "status", "error"),
+    [
+        (SubmitResult.QUEUE_FULL, 429, QUEUE_FULL_JOB_ERROR),
+        (SubmitResult.DOWN, 503, WORKER_DOWN_JOB_ERROR),
+        (SubmitResult.DEGRADED, 503, WORKER_DEGRADED_JOB_ERROR),
+    ],
+    ids=["queue_full", "down", "degraded"],
+)
+def test_a_refused_attempt_whose_rejection_is_still_owed_is_not_shown_as_the_live_job(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: SubmitResult,
+    status: int,
+    error: str,
+) -> None:
+    """
+    A refused attempt waiting on the worker never renders as the live job (IN-08).
+
+    When the request cannot write a refused submit's REJECTED marker it owes
+    the write to the worker (WR-01), and until an idle tick lands it the row is
+    PENDING with no marker.  D-06 says a rejected submit must not take over the
+    status area, so the status lookup skips owed rejections just as it skips
+    written ones, while D-17 still reports a job that actually ran.  The
+    ``client`` fixture's 5 s idle tick keeps the worker from writing the row
+    inside this test, and ``finish_job`` never heals anyway.
+    """
+    _refuse_submit(client, monkeypatch, result)
+    store = _job_store(client)
+    worker = _worker(client)
+
+    def always_fail(*_args: object, **_kwargs: object) -> None:
+        msg = "disk I/O error"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(store, "finish_job", always_fail)
+
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": "Refused And Still Owed"},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == status
+
+    refused = store.list_recent(limit=1)[0]
+    assert refused.state is JobState.PENDING
+    latest = store.latest_run_job()
+    assert latest is not None
+    assert latest.id == refused.id
+
+    poll = client.get("/api/jobs/current/status").text
+    assert "Ready to scan." in poll, f"refused attempt rendered as live ({error})"
+    assert "Starting scan..." not in poll
+    button = _SCAN_BUTTON_TAG.search(poll)
+    assert button is not None
+    assert "disabled" not in button.group("attrs")
+    assert refused.id in worker.owed_rejection_ids()
+
+
 # --- The client half: htmx-config meta and the #status-message slot ----------
 
 WEB_DIR = Path(__file__).parent.parent / "src" / "saneless" / "web"
