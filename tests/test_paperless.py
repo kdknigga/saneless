@@ -1459,6 +1459,34 @@ class TestPollTaskFailureTranslation:
         assert exc_info.value.__cause__ is None
         assert sleeps
 
+    def test_poll_deadline_after_a_recovered_blip_names_no_stale_error(
+        self, sleeps: list[float]
+    ) -> None:
+        """
+        IN-02: a transport error followed by answered polls is not the cause.
+
+        One blip early in a poll that then simply waited on a slow task must
+        not end with "last error: ...", which would blame the network.
+        """
+
+        def respond(call: int) -> httpx.Response:
+            if call == 1:
+                msg = "connection refused"
+                raise httpx.ConnectError(msg)
+            return httpx.Response(200, json=[{"task_id": "t1", "status": "PENDING"}])
+
+        handler = _CountingHandler(respond)
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=0.05)
+        finally:
+            client.close()
+        assert str(exc_info.value) == "Paperless task t1 did not finish within 0.05s"
+        assert exc_info.value.__cause__ is None
+        assert handler.calls >= 2
+        assert sleeps
+
     def test_poll_401_still_fails_at_once(self, sleeps: list[float]) -> None:
         """OUTC-07: a non-200 is not a transport blip and ends the poll at once."""
         handler = _CountingHandler(_answering(httpx.Response(401, text="Invalid")))

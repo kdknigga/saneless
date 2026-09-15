@@ -63,7 +63,7 @@ If no `consume_dir` is configured, the upload error propagates and the scan job 
 
 ### Network blips after the upload
 
-Once paperless-ngx has accepted the upload, saneless waits for its consumption task to finish. A network error while checking on that task does not fail the scan: saneless keeps checking until `paperless_task_timeout` expires, and only then reports a timeout, naming the last network error it saw.
+Once paperless-ngx has accepted the upload, saneless waits for its consumption task to finish. A network error while checking on that task does not fail the scan: saneless keeps checking until `paperless_task_timeout` expires, and only then reports a timeout. When the last check failed with a network error, the timeout names that error; a blip that later checks got past is not blamed.
 
 ### Duplicates
 

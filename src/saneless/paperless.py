@@ -825,8 +825,8 @@ class PaperlessClient:
             PaperlessTimeoutError: If the deadline passes before the task
                 reaches a terminal status. The message names the task id so
                 the task can be looked up in paperless-ngx directly, and,
-                when a transport error was seen, ends by naming the last one
-                and is chained to it.
+                when the last poll failed with a request error rather than
+                being answered, ends by naming that error and is chained to it.
 
         """
         deadline = time.monotonic() + timeout
@@ -851,6 +851,9 @@ class PaperlessClient:
                     describe(exc),
                 )
             else:
+                # Paperless answered, so an earlier blip is no longer the story:
+                # a timeout after this names no stale transport error (IN-02).
+                last_transport_error = None
                 task = self._finished_task(task_id, response)
                 if task is not None:
                     return task
