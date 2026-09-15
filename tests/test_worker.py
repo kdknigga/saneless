@@ -14,7 +14,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from saneless import worker as worker_module
-from saneless.auto_profiles import generate_profiles
+from saneless.auto_profiles import generate_profiles, is_bare_default
 from saneless.config import ProfileConfig, Settings, config_search_paths
 from saneless.exceptions import (
     ConfigError,
@@ -3266,6 +3266,44 @@ class TestWorkerProfileLock:
         assert default_settings.profiles is not old
         assert default_settings.profiles is not replacement
         assert old == old_snapshot
+
+    def test_profile_lock_set_profiles_honours_its_re_check(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """
+        IN-01, D-19: ``only_if`` runs under the lock and can refuse the swap.
+
+        Startup generation swaps through this helper with ``is_bare_default``,
+        so the refusal below is the production re-check.
+        """
+        generated = {
+            "default": ProfileConfig(source="ADF"),
+            "adf": ProfileConfig(source="ADF"),
+        }
+        customised = {
+            "default": ProfileConfig(),
+            "photo": ProfileConfig(source="Flatbed", resolution=600),
+        }
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            swapped_bare = worker._set_profiles(generated, only_if=is_bare_default)
+            names_after_bare = worker.profile_names()
+            worker._set_profiles(customised)
+            swapped_customised = worker._set_profiles(
+                generated, only_if=is_bare_default
+            )
+            names_after_customised = worker.profile_names()
+        finally:
+            store.close()
+
+        assert swapped_bare is True
+        assert names_after_bare == ["default", "adf"]
+        assert swapped_customised is False
+        assert names_after_customised == ["default", "photo"]
 
     def test_profile_lock_readers_never_see_a_dict_mid_update(
         self,
