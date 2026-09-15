@@ -4,8 +4,8 @@ milestone: v2.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 28 context gathered
-last_updated: "2026-09-15T18:35:32.477Z"
-last_activity: 2026-09-15 -- Phase 28 planning complete
+last_updated: "2026-09-15T18:36:36.156Z"
+last_activity: 2026-09-15 -- Phase 28 execution started
 progress:
   total_phases: 14
   completed_phases: 9
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 28 — exception translation
+**Current focus:** Phase 28 — Exception Translation
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 28
-Plan: Not started
-Status: Ready to execute
+Phase: 28 (Exception Translation) — EXECUTING
+Plan: 1 of 14
+Status: Executing Phase 28
 Progress: [████████░░] 83%
 Next: Phase 25 (Manual Duplex) — not started, no phase directory yet
-Last activity: 2026-09-15 -- Phase 28 planning complete
+Last activity: 2026-09-15 -- Phase 28 execution started
 
 ## Performance Metrics
 
