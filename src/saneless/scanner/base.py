@@ -14,11 +14,15 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from PIL import Image
 
 __all__ = [
     "DeviceCapabilities",
     "DeviceInfo",
+    "PageRecord",
+    "PageSink",
     "ScanBatch",
     "ScanSettings",
     "ScannerBackend",
@@ -228,6 +232,107 @@ class ScanBatch:
     pages: list[Image.Image]
     actual_resolution: int
     pages_rejected: int
+
+
+@dataclass(frozen=True)
+class PageRecord:
+    """
+    One acquired page, after it was written to the spool (HARD-01, D-02).
+
+    Facts, never verdicts. Every field here is something that was measured
+    while the page was in memory; nothing here is a judgement about what the
+    page means. In particular there is deliberately **no** ``is_blank`` field:
+    blank-page policy belongs to the pipeline, under the profile's toggle
+    (Phase 24 D-05), and ``pipeline._drop_empty_pages`` applies the profile's
+    ``empty_page_mean_threshold`` / ``empty_page_stddev_threshold`` to the
+    ``mean`` and ``stddev`` stored here. A verdict baked in at acquisition
+    would freeze one profile's thresholds into the record and make the toggle
+    a lie.
+
+    ``sequence`` is 1-based and is assigned at acquisition, by the sink, in the
+    order the device produced the sheets. It is the proof of document order,
+    and it exists so that order is never recovered by sorting or globbing the
+    spool directory: the two passes of a manual-duplex job spool into
+    distinguishable file names for debuggability only, and after the interleave
+    the file names no longer sort into document order at all.
+
+    ``frozen=True`` for the same reason ``ScanBatch`` is frozen: this is a
+    report of what has already happened on disk, and nothing downstream has any
+    business rewriting it afterwards. The interleave reorders records; it never
+    edits one.
+
+    Attributes:
+        sequence: The 1-based position this page had in its acquisition pass,
+            assigned when the page was spooled.
+        path: The spooled PNG this record describes. It is exactly the file
+            the PDF's page content is built from -- nothing re-encodes it.
+        size: The page's ``(width, height)`` in pixels, as the device produced
+            it and as the PNG stores it.
+        mode: The page's Pillow mode, ``"L"`` or ``"RGB"`` for a SANE snap.
+        mean: Greyscale mean luminance, measured once at spool time.
+        stddev: Greyscale standard deviation, measured once at spool time.
+
+    """
+
+    sequence: int
+    path: Path
+    size: tuple[int, int]
+    mode: str
+    mean: float
+    stddev: float
+
+
+class PageSink(ABC):
+    """
+    Where the backend puts each page it acquires (HARD-01, M-08, D-01).
+
+    The backend acquires one page, crops it if it has to, hands it here, and
+    forgets it. It never accumulates a list of images, which is the whole of
+    HARD-01's memory bound: peak memory is a property of who holds a page, not
+    of how the pages are produced. The concrete implementation is
+    pipeline-owned (``saneless.spool.SpooledPageSink``), because where a page
+    lands and what is measured about it are pipeline concerns; this module
+    declares only the shape the two sides agree on.
+
+    This is an ``ABC`` and not a ``typing.Protocol``, following the rule
+    already stated in ``pipeline.FlipCoordinator``'s docstring and observable
+    in the tree: ``Protocol`` describes shapes this project does not own
+    (``SaneDevice`` for python-sane's handle), while ``ABC`` defines seams the
+    project implements itself (``ScannerBackend``). A page sink is a seam this
+    project implements.
+
+    Two alternatives were rejected (D-01):
+
+    1. Going back to a generator. Phase 24 moved away from one because a
+       generator can only hand back images: its return value -- the resolution
+       the device settled on and the sheets it rejected -- is discarded by the
+       ``list()`` every caller wrapped it in. Streaming pages out is not worth
+       throwing those two facts away again.
+    2. A bare callback with no declared contract. The type checkers could not
+       see what it promised, so neither a wrong argument nor a wrong return
+       value would have been caught anywhere.
+    """
+
+    @abstractmethod
+    def add(self, image: Image.Image) -> PageRecord:
+        """
+        Take ownership of one acquired page and materialise it.
+
+        The sink owns the page from this call onwards: it decides where the
+        page lands, writes it, and measures it. The caller must not retain the
+        image afterwards -- a retained reference is exactly the accumulation
+        this seam exists to prevent, and it would put the memory bound back
+        where Phase 29 found it.
+
+        Args:
+            image: The page the device produced, already cropped if the
+                requested paper size required it.
+
+        Returns:
+            A PageRecord describing where the page was written and what was
+            measured about it, with the next 1-based sequence number.
+
+        """
 
 
 class ScannerBackend(ABC):
