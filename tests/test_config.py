@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import ValidationError
@@ -30,6 +33,9 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.vocabulary import TITLE_MAX_LENGTH
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 class TestLoadSettingsFromToml:
@@ -214,10 +220,10 @@ class TestLoadedConfigPath:
         assert Settings().config_path is None
 
     def test_config_search_paths_order(self) -> None:
-        """The single search list holds the three locations in order (D-16)."""
+        """The search list is cwd, then the XDG config home, then /etc (D-16)."""
         assert config_mod.config_search_paths() == (
             Path("./saneless.toml"),
-            Path.home() / ".config" / "saneless" / "config.toml",
+            config_mod.xdg_config_home() / "saneless" / "config.toml",
             Path("/etc/saneless/config.toml"),
         )
 
@@ -228,6 +234,151 @@ class TestLoadedConfigPath:
         monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
         expected = tmp_path / "elsewhere" / ".config" / "saneless" / "config.toml"
         assert config_mod.config_search_paths()[1] == expected
+
+
+@dataclass(frozen=True)
+class _XdgBase:
+    """One XDG base directory: its variable, helper, and HOME-relative fallback."""
+
+    variable: str
+    function: str
+    fallback: tuple[str, ...]
+
+    def resolve(self) -> Path:
+        """
+        Call the ``saneless.config`` helper for this base directory.
+
+        Returns:
+            The helper's result, read from the environment now.
+
+        """
+        helper: Callable[[], Path] = getattr(config_mod, self.function)
+        return helper()
+
+
+_XDG_BASES = [
+    pytest.param(
+        _XdgBase("XDG_CONFIG_HOME", "xdg_config_home", (".config",)), id="config"
+    ),
+    pytest.param(
+        _XdgBase("XDG_STATE_HOME", "xdg_state_home", (".local", "state")), id="state"
+    ),
+]
+
+
+class TestXdgBaseDirectories:
+    """
+    Config discovery and state defaults follow the XDG base directories (CFG-03).
+
+    The docs promised XDG behaviour the code did not have (M-20, doc row 27).
+    Per the basedir spec, an unset or empty ``$XDG_CONFIG_HOME`` /
+    ``$XDG_STATE_HOME`` means ``$HOME/.config`` / ``$HOME/.local/state``, and a
+    relative value is invalid and ignored. Both are read at call time, so a
+    change after import is honoured.
+    """
+
+    @pytest.fixture
+    def empty_cwd_and_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> Path:
+        """
+        Run in an empty CWD with HOME redirected into tmp_path.
+
+        ``clean_env`` has already removed any ambient XDG variables.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        return tmp_path
+
+    @pytest.mark.parametrize("base", _XDG_BASES)
+    def test_xdg_unset_falls_back_under_home(
+        self, empty_cwd_and_home: Path, base: _XdgBase
+    ) -> None:
+        """With the variable unset, the base is under the redirected HOME."""
+        assert base.variable not in os.environ
+        expected = (empty_cwd_and_home / "home").joinpath(*base.fallback)
+        assert base.resolve() == expected
+
+    @pytest.mark.parametrize("base", _XDG_BASES)
+    def test_xdg_absolute_value_is_used(
+        self,
+        empty_cwd_and_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        base: _XdgBase,
+    ) -> None:
+        """An absolute value is the base directory itself."""
+        target = empty_cwd_and_home / "xdg"
+        monkeypatch.setenv(base.variable, str(target))
+        assert base.resolve() == target
+
+    @pytest.mark.parametrize("value", ["", "relative/dir"], ids=["empty", "relative"])
+    @pytest.mark.parametrize("base", _XDG_BASES)
+    def test_xdg_empty_or_relative_value_is_ignored(
+        self,
+        empty_cwd_and_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        base: _XdgBase,
+        value: str,
+    ) -> None:
+        """An empty or relative value falls back, per the basedir spec (T-27-25)."""
+        monkeypatch.setenv(base.variable, value)
+        expected = (empty_cwd_and_home / "home").joinpath(*base.fallback)
+        assert base.resolve() == expected
+
+    def test_xdg_config_home_is_the_second_search_path(
+        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``$XDG_CONFIG_HOME/saneless/config.toml`` is searched second."""
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(empty_cwd_and_home / "xdg"))
+        expected = empty_cwd_and_home / "xdg" / "saneless" / "config.toml"
+        assert config_mod.config_search_paths()[1] == expected
+
+    def test_config_under_xdg_config_home_is_loaded(
+        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A config under ``$XDG_CONFIG_HOME`` is found and recorded (CFG-03)."""
+        xdg_dir = empty_cwd_and_home / "xdg"
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_dir))
+        config_dir = xdg_dir / "saneless"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.toml").write_text(
+            '[scanner]\nhost = "from-xdg"\n\n[profiles.default]\n'
+        )
+        settings = load_settings()
+        assert settings.scanner.host == "from-xdg"
+        assert settings.config_path == config_dir / "config.toml"
+
+    def test_xdg_state_home_set_after_import_moves_state_defaults(
+        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The state defaults are computed at instantiation, not import (Pitfall 3).
+
+        ``saneless.config`` was imported long before this test set the variable;
+        a ``Settings.output`` default built at import would still point at the
+        old location.
+        """
+        state = empty_cwd_and_home / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state))
+        settings = Settings()
+        assert settings.output.data_dir == str(state / "saneless")
+        assert settings.output.log_file == str(state / "saneless" / "saneless.log")
+        assert OutputConfig().data_dir == str(state / "saneless")
+        assert OutputConfig().log_file == str(state / "saneless" / "saneless.log")
+
+    def test_xdg_unset_home_change_after_import_moves_state_defaults(
+        self, empty_cwd_and_home: Path
+    ) -> None:
+        """With XDG unset, both state defaults follow a HOME changed after import."""
+        state = empty_cwd_and_home / "home" / ".local" / "state" / "saneless"
+        output = Settings().output
+        assert output.data_dir == str(state)
+        assert output.log_file == str(state / "saneless.log")
+
+    def test_xdg_variables_are_removed_before_each_test(self) -> None:
+        """``clean_env`` keeps developer and CI XDG variables out of the suite."""
+        assert "XDG_CONFIG_HOME" not in os.environ
+        assert "XDG_STATE_HOME" not in os.environ
 
 
 class TestInvalidToml:
@@ -1495,6 +1646,125 @@ class TestValidateSettingsDirs:
             validate_settings_dirs(settings)
         # Restore permissions for cleanup
         parent.chmod(0o755)
+
+    @pytest.mark.parametrize("label", ["tmp_dir", "data_dir", "consume_dir"])
+    def test_validate_deep_missing_dir_under_unwritable_ancestor_fails(
+        self, tmp_path: Path, label: str
+    ) -> None:
+        """
+        A deep missing directory is checked against its nearest ancestor (M-20).
+
+        Only the immediate parent used to be checked, and only when it existed,
+        so ``<unwritable>/a/b/c`` passed at startup and failed mid-scan.
+        """
+        if os.geteuid() == 0:
+            pytest.skip("root ignores directory permissions")
+        ancestor = tmp_path / "readonly"
+        ancestor.mkdir()
+        deep = str(ancestor / "a" / "b" / "c")
+        settings = Settings(
+            output=OutputConfig(
+                tmp_dir=deep if label == "tmp_dir" else str(tmp_path),
+                data_dir=deep if label == "data_dir" else str(tmp_path),
+            ),
+            paperless=PaperlessConfig(
+                consume_dir=deep if label == "consume_dir" else ""
+            ),
+            profiles={"default": ProfileConfig()},
+        )
+        ancestor.chmod(0o555)
+        try:
+            with pytest.raises(ConfigError, match="not writable") as exc_info:
+                validate_settings_dirs(settings)
+        finally:
+            ancestor.chmod(0o755)
+        message = str(exc_info.value)
+        assert message.startswith(label)
+        assert str(ancestor) in message
+
+    def test_validate_deep_missing_dirs_under_writable_ancestor_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """Missing directories whose nearest existing ancestor is writable pass."""
+        settings = Settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path / "t" / "a" / "b"),
+                data_dir=str(tmp_path / "d" / "a" / "b"),
+            ),
+            paperless=PaperlessConfig(consume_dir=str(tmp_path / "c" / "a" / "b")),
+            profiles={"default": ProfileConfig()},
+        )
+        validate_settings_dirs(settings)
+        assert not (tmp_path / "t").exists()
+
+    def test_nearest_existing_ancestor_walks_up(self, tmp_path: Path) -> None:
+        """The nearest ancestor of a missing path is its deepest existing one."""
+        assert config_mod._nearest_existing_ancestor(tmp_path / "a" / "b") == tmp_path
+        assert config_mod._nearest_existing_ancestor(tmp_path) == tmp_path
+
+
+class TestPathExpansion:
+    """
+    A leading ``~`` is expanded in every path setting (CFG-03, M-20).
+
+    ``~/scans`` in a config file used to be taken literally, creating a
+    directory named ``~`` in the working directory. By decision (Claude's
+    Discretion), only ``~`` is expanded: ``$VAR`` stays literal (T-27-26), and
+    an empty ``consume_dir`` stays empty because empty means disabled.
+    """
+
+    @pytest.fixture
+    def home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """
+        Redirect HOME into tmp_path and run in an empty CWD.
+
+        Returns:
+            The redirected home directory.
+
+        """
+        monkeypatch.chdir(tmp_path)
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        return home
+
+    def test_expanduser_output_paths(self, home: Path) -> None:
+        """``tmp_dir``, ``data_dir`` and ``log_file`` expand ``~`` under HOME."""
+        output = OutputConfig(
+            tmp_dir="~/t", data_dir="~/d", log_file="~/l/saneless.log"
+        )
+        assert output.tmp_dir == str(home / "t")
+        assert output.data_dir == str(home / "d")
+        assert output.log_file == str(home / "l" / "saneless.log")
+
+    def test_expanduser_consume_dir(self, home: Path) -> None:
+        """``consume_dir`` expands ``~`` under HOME."""
+        paperless = PaperlessConfig(consume_dir="~/consume")
+        assert paperless.consume_dir == str(home / "consume")
+
+    def test_expanduser_from_toml(self, home: Path, tmp_path: Path) -> None:
+        """A ``~`` path read from a TOML file is expanded."""
+        config_file = tmp_path / "x.toml"
+        config_file.write_text('[output]\ndata_dir = "~/state"\n\n[profiles.default]\n')
+        settings = load_settings(str(config_file))
+        assert settings.output.data_dir == str(home / "state")
+
+    def test_expanduser_from_environment(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``~`` path from a SANELESS_* variable is expanded."""
+        monkeypatch.setenv("SANELESS_OUTPUT__LOG_FILE", "~/x.log")
+        settings = load_settings()
+        assert settings.output.log_file == str(home / "x.log")
+
+    @pytest.mark.usefixtures("home")
+    def test_expanduser_leaves_empty_consume_dir_empty(self) -> None:
+        """An empty ``consume_dir`` means disabled and is not expanded."""
+        assert PaperlessConfig(consume_dir="").consume_dir == ""
+
+    @pytest.mark.usefixtures("home")
+    def test_expanduser_does_not_expand_variables(self) -> None:
+        """``$HOME`` in a path setting is kept literally (T-27-26)."""
+        assert OutputConfig(data_dir="$HOME/x").data_dir == "$HOME/x"
 
 
 class TestDataDir:

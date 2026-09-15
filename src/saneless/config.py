@@ -60,6 +60,8 @@ __all__ = [
     "resolve_job_title",
     "validate_settings_dirs",
     "warn_on_legacy_duplex_sources",
+    "xdg_config_home",
+    "xdg_state_home",
 ]
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,97 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 Each is a key of ``logging.getLevelNamesMapping()`` and, lower-cased, a valid
 uvicorn ``log_level``.
 """
+
+
+def _xdg_base(variable: str, *fallback: str) -> Path:
+    """
+    Resolve an XDG base directory from the environment at call time (CFG-03).
+
+    Per the XDG Base Directory Specification, an unset or empty variable means
+    the ``$HOME``-relative default, and a relative value is invalid and ignored
+    -- otherwise discovery would depend on the working directory (T-27-25).
+
+    Args:
+        variable: The environment variable, e.g. ``XDG_CONFIG_HOME``.
+        *fallback: The path segments of the default below ``$HOME``.
+
+    Returns:
+        The variable's value when it is a non-empty absolute path, else
+        ``$HOME`` joined with ``fallback``.
+
+    """
+    value = os.environ.get(variable, "")
+    if value and Path(value).is_absolute():
+        return Path(value)
+    return Path.home().joinpath(*fallback)
+
+
+def xdg_config_home() -> Path:
+    """
+    Return the XDG config home, ``$XDG_CONFIG_HOME`` or ``~/.config`` (CFG-03).
+
+    Read at call time, not import, so a later HOME or XDG change is honoured.
+    An empty or relative ``$XDG_CONFIG_HOME`` is ignored, per the basedir spec.
+
+    Returns:
+        The base directory user configuration files are searched under.
+
+    """
+    return _xdg_base("XDG_CONFIG_HOME", ".config")
+
+
+def xdg_state_home() -> Path:
+    """
+    Return the XDG state home, ``$XDG_STATE_HOME`` or ``~/.local/state`` (CFG-03).
+
+    Read at call time, not import, so a later HOME or XDG change is honoured.
+    An empty or relative ``$XDG_STATE_HOME`` is ignored, per the basedir spec.
+
+    Returns:
+        The base directory durable state (database, log) defaults live under.
+
+    """
+    return _xdg_base("XDG_STATE_HOME", ".local", "state")
+
+
+def _default_data_dir() -> str:
+    """
+    Compute the default ``output.data_dir``: ``$XDG_STATE_HOME/saneless``.
+
+    Returns:
+        The default durable state directory, as a string.
+
+    """
+    return str(xdg_state_home() / "saneless")
+
+
+def _default_log_file() -> str:
+    """
+    Compute the default ``output.log_file``, inside the default ``data_dir``.
+
+    Returns:
+        ``$XDG_STATE_HOME/saneless/saneless.log``, as a string.
+
+    """
+    return str(xdg_state_home() / "saneless" / "saneless.log")
+
+
+def _expand_user(value: str) -> str:
+    """
+    Expand a leading ``~`` in a path setting (CFG-03, M-20).
+
+    Only ``~`` is expanded, by decision: ``$VAR`` is left literal, so a value
+    cannot silently pick up an unrelated environment variable (T-27-26). An
+    empty value is returned unchanged -- for ``consume_dir`` it means disabled.
+
+    Args:
+        value: The configured path string.
+
+    Returns:
+        The path with ``~`` expanded, or the empty string unchanged.
+
+    """
+    return str(Path(value).expanduser()) if value else value
 
 
 def _is_legacy_manual_duplex_source(source: str) -> bool:
@@ -123,6 +216,21 @@ class PaperlessConfig(BaseModel):
     # web/app.py create_app.
     token: SecretStr = SecretStr("")
     consume_dir: str = ""
+
+    @field_validator("consume_dir", mode="after")
+    @classmethod
+    def _expand_consume_dir(cls, value: str) -> str:
+        """
+        Expand a leading ``~`` in ``consume_dir``; empty stays empty (CFG-03).
+
+        Args:
+            value: The validated ``consume_dir``.
+
+        Returns:
+            The value with ``~`` expanded; ``$VAR`` is not expanded.
+
+        """
+        return _expand_user(value)
 
 
 class ProfileConfig(BaseModel):
@@ -219,11 +327,12 @@ class OutputConfig(BaseModel):
 
     tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
     # Durable state: the job database and preserved scans. Deliberately NOT
-    # under tmp_dir, which is disposable scratch space. The hardcoded
-    # Path.home() form matches log_file below so Phase 27's XDG expansion
-    # changes both defaults in a single edit; no env var is consulted here.
-    data_dir: str = str(Path.home() / ".local" / "state" / "saneless")
-    log_file: str = str(Path.home() / ".local" / "state" / "saneless" / "saneless.log")
+    # under tmp_dir, which is disposable scratch space. Phase 23 (D-14) kept
+    # the data_dir and log_file defaults in step; both now follow
+    # $XDG_STATE_HOME (CFG-03), computed per instance rather than at import.
+    # The Dockerfile's SANELESS_OUTPUT__DATA_DIR still overrides data_dir.
+    data_dir: str = Field(default_factory=_default_data_dir)
+    log_file: str = Field(default_factory=_default_log_file)
     log_level: LogLevel = "INFO"
     log_max_bytes: int = 10_485_760
     log_backup_count: int = 5
@@ -243,6 +352,25 @@ class OutputConfig(BaseModel):
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
     web_port: int = 8080
+
+    @field_validator("tmp_dir", "data_dir", "log_file", mode="after")
+    @classmethod
+    def _expand_paths(cls, value: str) -> str:
+        """
+        Expand a leading ``~`` in the path settings (CFG-03, M-20).
+
+        ``~/scans`` used to be taken literally. Only ``~`` is expanded, never
+        ``$VAR``. The defaults are already absolute, so this does not run on
+        them (no ``validate_default``).
+
+        Args:
+            value: The validated path string.
+
+        Returns:
+            The value with ``~`` expanded.
+
+        """
+        return _expand_user(value)
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -319,9 +447,12 @@ class Settings(BaseSettings):
         extra="forbid",
     )
 
-    scanner: ScannerConfig = ScannerConfig()
-    paperless: PaperlessConfig = PaperlessConfig()
-    output: OutputConfig = OutputConfig()
+    # default_factory, not a plain instance: an ``OutputConfig()`` default is
+    # built once at import and would freeze the HOME/XDG state defaults
+    # (CFG-03, RESEARCH Pitfall 3). scanner and paperless match for consistency.
+    scanner: ScannerConfig = Field(default_factory=ScannerConfig)
+    paperless: PaperlessConfig = Field(default_factory=PaperlessConfig)
+    output: OutputConfig = Field(default_factory=OutputConfig)
     profiles: dict[str, ProfileConfig] = {"default": ProfileConfig()}
 
     # A PrivateAttr, not a field: a field would be settable from
@@ -860,6 +991,51 @@ def _build_settings(
     raise ConfigError(msg) from None
 
 
+def _nearest_existing_ancestor(path: Path) -> Path:
+    """
+    Find the deepest existing path among ``path`` and its ancestors (M-20).
+
+    Args:
+        path: A directory that may not exist yet.
+
+    Returns:
+        ``path`` itself if it exists, else its nearest existing ancestor, else
+        the path's anchor (``.`` for a relative path).
+
+    """
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return candidate
+    return Path(path.anchor or ".")
+
+
+def _require_writable(label: str, directory: Path) -> None:
+    """
+    Raise ConfigError unless ``directory`` could be written or created (M-20).
+
+    A missing directory is judged by its nearest existing ancestor, since that
+    is where creating it would fail -- not just by an immediate parent that
+    may not exist either.
+
+    Args:
+        label: The setting name, e.g. ``data_dir``, for the message.
+        directory: The configured directory.
+
+    Raises:
+        ConfigError: If the directory, or its nearest existing ancestor when
+            the directory is missing, is not writable.
+
+    """
+    ancestor = _nearest_existing_ancestor(directory)
+    if os.access(ancestor, os.W_OK):
+        return
+    if ancestor == directory:
+        msg = f"{label} is not writable: {directory}"
+    else:
+        msg = f"{label} parent is not writable: {ancestor}"
+    raise ConfigError(msg)
+
+
 def validate_settings_dirs(settings: Settings) -> None:
     """
     Fail fast with ConfigError if tmp_dir, data_dir or consume_dir are unwritable.
@@ -867,7 +1043,9 @@ def validate_settings_dirs(settings: Settings) -> None:
     Validates directory writability at startup so permission errors surface
     immediately rather than mid-scan, or - for data_dir - at the moment a
     failed scan needs preserving. Per D-13, raises ConfigError (not
-    ValueError) for writability failures.
+    ValueError) for writability failures. A missing directory is checked
+    against its nearest existing ancestor, so ``<unwritable>/a/b/c`` fails
+    here too (M-20).
 
     Args:
         settings: Application settings to validate.
@@ -876,35 +1054,10 @@ def validate_settings_dirs(settings: Settings) -> None:
         ConfigError: If any configured directory is not writable.
 
     """
-    tmp = Path(settings.output.tmp_dir)
-    if tmp.exists() and not os.access(tmp, os.W_OK):
-        msg = f"tmp_dir is not writable: {tmp}"
-        raise ConfigError(msg)
-    if not tmp.exists():
-        parent = tmp.parent
-        if parent.exists() and not os.access(parent, os.W_OK):
-            msg = f"tmp_dir parent is not writable: {parent}"
-            raise ConfigError(msg)
-    data = Path(settings.output.data_dir)
-    if data.exists() and not os.access(data, os.W_OK):
-        msg = f"data_dir is not writable: {data}"
-        raise ConfigError(msg)
-    if not data.exists():
-        parent = data.parent
-        if parent.exists() and not os.access(parent, os.W_OK):
-            msg = f"data_dir parent is not writable: {parent}"
-            raise ConfigError(msg)
-    consume = settings.paperless.consume_dir
-    if consume:
-        consume_path = Path(consume)
-        if consume_path.exists() and not os.access(consume_path, os.W_OK):
-            msg = f"consume_dir is not writable: {consume_path}"
-            raise ConfigError(msg)
-        if not consume_path.exists():
-            parent = consume_path.parent
-            if parent.exists() and not os.access(parent, os.W_OK):
-                msg = f"consume_dir parent is not writable: {parent}"
-                raise ConfigError(msg)
+    _require_writable("tmp_dir", Path(settings.output.tmp_dir))
+    _require_writable("data_dir", Path(settings.output.data_dir))
+    if settings.paperless.consume_dir:
+        _require_writable("consume_dir", Path(settings.paperless.consume_dir))
 
 
 def config_search_paths() -> tuple[Path, ...]:
@@ -912,8 +1065,10 @@ def config_search_paths() -> tuple[Path, ...]:
     List the config file locations searched when no explicit path is given.
 
     The single search list for both loading and the CLI's write target
-    (D-16). A function rather than a module constant so ``Path.home()`` is
-    read when called, not at import.
+    (D-16): ``./saneless.toml``, then ``$XDG_CONFIG_HOME/saneless/config.toml``
+    (``~/.config`` when unset, CFG-03), then ``/etc/saneless/config.toml``. A
+    function rather than a module constant so HOME and ``$XDG_CONFIG_HOME``
+    are read when called, not at import.
 
     Returns:
         The candidate paths, in search order.
@@ -921,7 +1076,7 @@ def config_search_paths() -> tuple[Path, ...]:
     """
     return (
         Path("./saneless.toml"),
-        Path.home() / ".config" / "saneless" / "config.toml",
+        xdg_config_home() / "saneless" / "config.toml",
         Path("/etc/saneless/config.toml"),
     )
 
