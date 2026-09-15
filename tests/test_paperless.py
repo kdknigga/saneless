@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from saneless.exceptions import PaperlessError, PaperlessTimeoutError
-from saneless.paperless import PaperlessClient, UploadResult
+from saneless.paperless import PaperlessClient, UploadResult, _render_error_body
 from saneless.vocabulary import ConnectionStatus
 
 if TYPE_CHECKING:
@@ -380,6 +380,92 @@ class TestUploadDocument:
 
 
 # ---------------------------------------------------------------------------
+# Error body renderer
+# ---------------------------------------------------------------------------
+
+
+_JSON_BODY_CASES = [
+    pytest.param(
+        {"detail": "Authentication credentials were not provided."},
+        "Authentication credentials were not provided.",
+        id="detail-str",
+    ),
+    pytest.param({"detail": ["a", "b"]}, "a b", id="detail-list"),
+    pytest.param(
+        {"title": ["This field may not be blank."]},
+        "title: This field may not be blank.",
+        id="field-list",
+    ),
+    pytest.param(
+        {"non_field_errors": ["Bad combo"]},
+        "non_field_errors: Bad combo",
+        id="non-field-errors",
+    ),
+    pytest.param(
+        {"title": "This field may not be blank."},
+        "title: This field may not be blank.",
+        id="field-str",
+    ),
+    pytest.param(["first", "second"], "first", id="top-level-list"),
+]
+
+
+class TestRenderErrorBody:
+    """D-09: one renderer reduces every Paperless error body to one line."""
+
+    @pytest.mark.parametrize(("payload", "expected"), _JSON_BODY_CASES)
+    def test_json_body_shapes(self, payload: object, expected: str) -> None:
+        """
+        Each DRF error shape renders as the one line a reader needs.
+
+        ``detail`` wins, then the first field error as ``field: message``,
+        then the first entry of a top-level list.
+        """
+        response = httpx.Response(400, json=payload)
+        assert _render_error_body(response) == expected
+
+    def test_html_body_is_one_bounded_line(self) -> None:
+        """
+        T-23-16 / M-17: a 5000-character HTML page cannot flood job.error.
+
+        Whitespace is collapsed so no newline survives, and the text is cut
+        to 200 characters plus an ellipsis.
+        """
+        line = "<p>502 Bad Gateway from the reverse proxy</p>\n"
+        html = (line * (5000 // len(line) + 1))[:5000]
+        response = httpx.Response(502, text=html)
+        result = _render_error_body(response)
+        assert "\n" not in result
+        assert len(result) <= 201
+        assert result.endswith("…")
+
+    def test_empty_body_says_so(self) -> None:
+        """An empty body renders as an explicit marker, never an empty string."""
+        response = httpx.Response(500, text="")
+        assert _render_error_body(response) == "(empty response body)"
+
+    def test_multiline_json_detail_body_is_collapsed(self) -> None:
+        """No path yields a newline, including JSON-derived text (T-28-24)."""
+        response = httpx.Response(400, json={"detail": "line one\nline two"})
+        assert _render_error_body(response) == "line one line two"
+
+    def test_full_body_is_logged_at_debug(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The whole body stays diagnosable, but only at DEBUG (T-28-21)."""
+        body = "<html>" + ("x" * 900) + "</html>"
+        response = httpx.Response(502, text=body)
+        with caplog.at_level(logging.DEBUG, logger="saneless.paperless"):
+            _render_error_body(response)
+        debug_messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.DEBUG and record.name == "saneless.paperless"
+        ]
+        assert any(body in message for message in debug_messages)
+
+
+# ---------------------------------------------------------------------------
 # Poll task tests
 # ---------------------------------------------------------------------------
 
@@ -502,18 +588,48 @@ class TestPollTask:
         finally:
             client.close()
 
-    def test_non_200_body_is_truncated(self) -> None:
-        """T-23-16: a huge error body cannot flood job.error or the status area."""
+    def test_non_200_body_is_rendered_as_one_line(self) -> None:
+        """
+        D-09: a poll non-200 names status, reason and the DRF detail.
+
+        The body goes through the same single renderer as the upload 4xx, so
+        a revoked token reads ``(401 Unauthorized): Invalid token.`` rather
+        than a raw JSON blob.
+        """
 
         def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(500, text="x" * 10_000)
+            return httpx.Response(401, json={"detail": "Invalid token."})
 
         client = _poll_client(handler)
         try:
             with pytest.raises(PaperlessError) as exc_info:
                 client.poll_task("t1", timeout=30)
-            assert len(str(exc_info.value)) < 1000
-            assert "truncated" in str(exc_info.value)
+            assert str(exc_info.value) == (
+                "Paperless task poll failed (401 Unauthorized): Invalid token."
+            )
+        finally:
+            client.close()
+
+    def test_non_200_html_body_cannot_flood_the_message(self) -> None:
+        """
+        T-23-16 / M-17: a 5 KB proxy error page becomes one short line.
+
+        That message is recorded in the job store and shown in the web status
+        area and on the terminal, so neither its length nor a newline may
+        come from the upstream body.
+        """
+        page = "<html>\n<body>\n" + ("<p>Bad Gateway</p>\n" * 260) + "</body></html>"
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, text=page)
+
+        client = _poll_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.poll_task("t1", timeout=30)
+            message = str(exc_info.value)
+            assert "\n" not in message
+            assert len(message) < 300
         finally:
             client.close()
 
