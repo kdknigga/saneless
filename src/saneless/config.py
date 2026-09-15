@@ -8,12 +8,13 @@ always be present in the configuration.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import tempfile
 from datetime import UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
 from pydantic import (
     BaseModel,
@@ -27,17 +28,21 @@ from pydantic import (
 )
 from pydantic_settings import (
     BaseSettings,
+    EnvSettingsSource,
     PydanticBaseSettingsSource,
     SettingsConfigDict,
     TomlConfigSettingsSource,
 )
+from pydantic_settings.exceptions import SettingsError
 
 from saneless.exceptions import ConfigError
 from saneless.vocabulary import TITLE_MAX_LENGTH
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping, Sequence
     from datetime import datetime
 
+    from pydantic_core import ErrorDetails
     from pydantic_settings.main import InitSettingsSource
 
 __all__ = [
@@ -49,7 +54,9 @@ __all__ = [
     "ScannerConfig",
     "Settings",
     "config_search_paths",
+    "env_sourced_keys",
     "load_settings",
+    "log_config_sources",
     "resolve_job_title",
     "validate_settings_dirs",
     "warn_on_legacy_duplex_sources",
@@ -96,12 +103,19 @@ def _is_legacy_manual_duplex_source(source: str) -> bool:
 class ScannerConfig(BaseModel):
     """Scanner connection settings."""
 
+    # An unknown key is an error, not silently dropped (CFG-01, M-18).
+    model_config = ConfigDict(extra="forbid")
+
     host: str = ""
     device: str = ""
 
 
 class PaperlessConfig(BaseModel):
     """Paperless-ngx API connection settings."""
+
+    # A mistyped ``tokne`` used to leave the token unset without a word
+    # (CFG-01, M-18).
+    model_config = ConfigDict(extra="forbid")
 
     url: str = ""
     # Masked in repr, tracebacks and model_dump (CFG-05, N-15). Unwrapped with
@@ -114,7 +128,10 @@ class PaperlessConfig(BaseModel):
 class ProfileConfig(BaseModel):
     """Scan profile configuration."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    # extra="forbid" (CFG-01) is safe alongside the legacy-duplex
+    # before-validator: it only ever adds ``duplex``, which is a real field.
+    # populate_by_name keeps both ``title`` and ``default_title`` accepted.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     source: str = "Flatbed"
     resolution: int = DEFAULT_RESOLUTION
@@ -197,6 +214,9 @@ def resolve_job_title(
 class OutputConfig(BaseModel):
     """Output and logging configuration."""
 
+    # An unknown key is an error, not silently dropped (CFG-01, M-18).
+    model_config = ConfigDict(extra="forbid")
+
     tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
     # Durable state: the job database and preserved scans. Deliberately NOT
     # under tmp_dir, which is disposable scratch space. The hardcoded
@@ -275,6 +295,13 @@ class OutputConfig(BaseModel):
         return Path(self.data_dir) / "failed"
 
 
+_ENV_PREFIX: Final = "SANELESS_"
+"""The environment variable prefix; the unknown-variable scan uses it too."""
+
+_ENV_DELIMITER: Final = "__"
+"""The nested delimiter in environment variable names."""
+
+
 class Settings(BaseSettings):
     """
     Application settings with TOML + env var loading.
@@ -285,8 +312,11 @@ class Settings(BaseSettings):
     """
 
     model_config = SettingsConfigDict(
-        env_prefix="SANELESS_",
-        env_nested_delimiter="__",
+        env_prefix=_ENV_PREFIX,
+        env_nested_delimiter=_ENV_DELIMITER,
+        # pydantic-settings already forbids unknown top-level names; stated
+        # explicitly so it cannot drift from the nested models (CFG-01).
+        extra="forbid",
     )
 
     scanner: ScannerConfig = ScannerConfig()
@@ -405,7 +435,361 @@ def warn_on_legacy_duplex_sources(settings: Settings) -> None:
             )
 
 
-_VALID_SECTIONS = ("scanner", "paperless", "output", "profiles")
+_SECTION_MODELS: Final[dict[str, type[BaseModel]]] = {
+    "scanner": ScannerConfig,
+    "paperless": PaperlessConfig,
+    "output": OutputConfig,
+}
+"""The plain ``Settings`` sections, each a single table of keys (D-11)."""
+
+_PROFILE_LABEL: Final = "profiles.<name>"
+"""How a key that belongs in some profile table is named in an error."""
+
+
+def _escape_name(name: str) -> str:
+    """
+    Escape the control characters in a user-controlled name, without quotes.
+
+    TOML quoted keys and profile names can hold newlines or terminal escapes;
+    ``repr`` escapes them, so an error line cannot forge further stderr or log
+    lines (T-27-11, the ``web/errors.py`` precedent).
+
+    Args:
+        name: A key, section or profile name taken from the configuration.
+
+    Returns:
+        The name as ``repr`` renders it, minus the surrounding quotes.
+
+    """
+    return repr(name)[1:-1]
+
+
+def _valid_keys(model: type[BaseModel]) -> list[str]:
+    """
+    List the keys a section accepts, as the operator writes them (D-11).
+
+    Args:
+        model: The section's model.
+
+    Returns:
+        Each field's alias where it has one (``title``), else its name.
+
+    """
+    return [field.alias or name for name, field in model.model_fields.items()]
+
+
+def _match_candidates(model: type[BaseModel]) -> list[str]:
+    """
+    List every spelling a section accepts: field names plus aliases (D-11).
+
+    Args:
+        model: The section's model.
+
+    Returns:
+        The field names followed by the aliases.
+
+    """
+    names = list(model.model_fields)
+    return names + [field.alias for field in model.model_fields.values() if field.alias]
+
+
+def _section_owning(key: str, *, exclude: type[BaseModel] | None) -> str | None:
+    """
+    Name the section a misplaced key really belongs in (D-11).
+
+    Args:
+        key: The unknown key.
+        exclude: The section model the key was found in, which cannot own it.
+
+    Returns:
+        A plain section name, ``profiles.<name>`` for a profile key, or None.
+
+    """
+    owners: list[tuple[str, type[BaseModel]]] = [
+        *_SECTION_MODELS.items(),
+        (_PROFILE_LABEL, ProfileConfig),
+    ]
+    for label, model in owners:
+        if model is not exclude and key in _match_candidates(model):
+            return label
+    return None
+
+
+def _format_loc_path(parts: Sequence[str | int]) -> str:
+    """
+    Render the key path below a section, e.g. ``default_tags[0]`` (D-10).
+
+    Args:
+        parts: The ``loc`` elements after the section (and profile name).
+
+    Returns:
+        String elements joined by ``.`` and escaped, integers as ``[i]``.
+
+    """
+    rendered = ""
+    for part in parts:
+        if isinstance(part, int):
+            rendered += f"[{part}]"
+        else:
+            escaped = _escape_name(part)
+            rendered = f"{rendered}.{escaped}" if rendered else escaped
+    return rendered
+
+
+def _describe_unknown_key(
+    label: str, key: str, model: type[BaseModel], *, variable: str | None
+) -> str:
+    """
+    Describe an unknown key inside a section or profile table (D-11, D-12).
+
+    Args:
+        label: The section label, e.g. ``paperless`` or ``profiles.default``.
+        key: The unknown key.
+        model: The model of the table the key was found in.
+        variable: The environment variable that supplied the key, if any.
+
+    Returns:
+        The error line, without indentation.
+
+    """
+    subject = (
+        f"[{label}] unknown key {key!r}"
+        if variable is None
+        else f"environment variable {variable!r}: unknown key {key!r} in [{label}]"
+    )
+    owner = _section_owning(key, exclude=model)
+    if owner is not None:
+        return f"{subject}; it belongs in [{owner}]"
+    hint = difflib.get_close_matches(key, _match_candidates(model), n=1)
+    did_you_mean = f" (did you mean {hint[0]!r}?)" if hint else ""
+    valid = ", ".join(_valid_keys(model))
+    return f"{subject}{did_you_mean}; valid keys: {valid}"
+
+
+def _describe_unknown_top_level(name: str) -> str:
+    """
+    Describe an unknown top-level name (D-11, M-18).
+
+    A miscased section (``[Paperless]``) is suggested as the real section,
+    never as ``[profiles.Paperless]``; a key of some section says where it
+    belongs; anything else is most likely a profile table written without its
+    ``profiles.`` prefix.
+
+    Args:
+        name: The unknown top-level table or key name.
+
+    Returns:
+        The error line, without indentation.
+
+    """
+    sections = list(Settings.model_fields)
+    for section in sections:
+        if name.casefold() == section:
+            return f"unknown section {name!r} (did you mean [{section}]?)"
+    owner = _section_owning(name, exclude=None)
+    if owner is not None:
+        return f"unknown key {name!r} at the top level; it belongs in [{owner}]"
+    hints = [f"[{match}]" for match in difflib.get_close_matches(name, sections, n=1)]
+    hints.append(f"[profiles.{_escape_name(name)}]")
+    return (
+        f"unknown section {name!r} (did you mean {' or '.join(hints)}?); "
+        f"valid sections: {', '.join(sections)}"
+    )
+
+
+def _env_contribution() -> dict[str, object]:
+    """
+    Return what the SANELESS_* environment contributes to the settings.
+
+    This is pydantic-settings' own prefix, delimiter, case-folding and JSON
+    logic, so error attribution (D-12) and the CFG-11 key names cannot drift
+    from what was actually loaded (RESEARCH "Don't Hand-Roll").
+
+    Returns:
+        The case-folded nested mapping the environment source produces.
+
+    Raises:
+        SettingsError: If a complex field's variable holds invalid JSON.
+
+    """
+    return EnvSettingsSource(Settings)()
+
+
+def _env_variable_for(
+    loc: tuple[str | int, ...], env_data: Mapping[str, object]
+) -> str | None:
+    """
+    Name the environment variable an error's value came from, if any (D-12).
+
+    ``env_data`` is walked by the string elements of ``loc``. Its keys are
+    already case-folded by pydantic-settings, so an error in a TOML
+    ``[profiles.Receipt]`` table is not blamed on a variable that created
+    profile ``receipt``. For the longest walked path, then each shorter
+    prefix, a variable named ``SANELESS_`` plus the path joined by ``__`` is
+    looked for, ignoring case -- a prefix covers a JSON-valued variable such as
+    ``SANELESS_OUTPUT``. Environment beats file after the sources merge, so a
+    value present in ``env_data`` is the one that failed.
+
+    Args:
+        loc: The error's location.
+        env_data: The environment's contribution (``_env_contribution``).
+
+    Returns:
+        The variable name as spelled in the environment, or None.
+
+    """
+    parts: list[str] = []
+    node: object = env_data
+    for element in loc:
+        if not isinstance(element, str) or not isinstance(node, dict):
+            break
+        if element not in node:
+            break
+        parts.append(element)
+        node = cast("dict[str, object]", node)[element]
+    by_folded = {name.casefold(): name for name in os.environ}
+    for end in range(len(parts), 0, -1):
+        candidate = (_ENV_PREFIX + _ENV_DELIMITER.join(parts[:end])).casefold()
+        if candidate in by_folded:
+            return by_folded[candidate]
+    return None
+
+
+def _render_error(
+    loc: tuple[str | int, ...],
+    error_type: str,
+    message: str,
+    env_data: Mapping[str, object],
+) -> str:
+    """
+    Render one pydantic error as a ``[section] key`` line (D-10, D-11, D-12).
+
+    Args:
+        loc: The error's location.
+        error_type: The error's pydantic type, e.g. ``extra_forbidden``.
+        message: pydantic's short ``msg``, which never contains the input.
+        env_data: The environment's contribution, for attribution.
+
+    Returns:
+        The error line, without indentation.
+
+    """
+    head = loc[0] if loc else None
+    if not isinstance(head, str) or head not in Settings.model_fields:
+        if error_type == "extra_forbidden" and len(loc) == 1:
+            return _describe_unknown_top_level(str(head))
+        return f"{_format_loc_path(loc) or '(settings)'}: {message}"
+    model: type[BaseModel] | None
+    if head == "profiles" and len(loc) > 1:
+        label = f"profiles.{_escape_name(str(loc[1]))}"
+        model, rest = ProfileConfig, loc[2:]
+    else:
+        label, model, rest = head, _SECTION_MODELS.get(head), loc[1:]
+    variable = _env_variable_for(loc, env_data)
+    if (
+        error_type == "extra_forbidden"
+        and model is not None
+        and len(rest) == 1
+        and isinstance(rest[0], str)
+    ):
+        return _describe_unknown_key(label, rest[0], model, variable=variable)
+    key_path = _format_loc_path(rest)
+    if variable is not None:
+        where = f"{key_path} in [{label}]" if key_path else f"[{label}]"
+        return f"environment variable {variable!r}: {where}: {message}"
+    return f"[{label}] {key_path}: {message}" if key_path else f"[{label}]: {message}"
+
+
+def _render_error_lines(
+    errors: Sequence[ErrorDetails], env_data: Mapping[str, object]
+) -> list[str]:
+    """
+    Render every validation error as one line, sorted for stable output (D-10).
+
+    Only ``loc``, ``type`` and ``msg`` are read. ``input`` and ``ctx`` are
+    never touched: for ``tokne = "..."`` the input is the Paperless token, and
+    ``str(ValidationError)`` embeds it (D-14, CFG-05).
+
+    Args:
+        errors: ``ValidationError.errors()``.
+        env_data: The environment's contribution, for attribution (D-12).
+
+    Returns:
+        The error lines, without indentation or header.
+
+    """
+    return sorted(
+        _render_error(err["loc"], err["type"], err["msg"], env_data) for err in errors
+    )
+
+
+def _suggest_env_name(first: str, rest: str) -> str:
+    """
+    Suggest the variable an unknown SANELESS_* name was probably meant to be.
+
+    difflib's cutoff misses the common single-underscore mistake
+    (``SANELESS_OUTPUT_WEB_PORT`` scores about 0.57 against ``output``), so a
+    first segment that starts with ``<section>_`` is checked first.
+
+    Args:
+        first: The case-folded first segment after the prefix.
+        rest: Everything after the first ``__``, as spelled.
+
+    Returns:
+        A `` (did you mean SANELESS_...?)`` hint, or an empty string.
+
+    """
+    sections = list(Settings.model_fields)
+    segments: list[str] = []
+    for section in sections:
+        if first.startswith(f"{section}_"):
+            segments = [section, first.removeprefix(f"{section}_")]
+            break
+    else:
+        match = difflib.get_close_matches(first, sections, n=1)
+        if match:
+            segments = [match[0]]
+    if not segments:
+        return ""
+    if rest:
+        segments.append(rest)
+    suggestion = (_ENV_PREFIX + _ENV_DELIMITER.join(segments)).upper()
+    return f" (did you mean {_escape_name(suggestion)}?)"
+
+
+def _unknown_env_lines(environ: Mapping[str, str]) -> list[str]:
+    """
+    Reject SANELESS_* variables whose first segment names no section (D-13).
+
+    pydantic-settings silently ignores them, so ``SANELESS_PAPERLES__TOKEN``
+    would leave the token unset without a word, and ``SANELESS_CONFIG_PATH``
+    would look as if it did something. This runs in the loader, never in a
+    ``Settings`` validator, so direct ``Settings(...)`` construction is
+    unaffected (Pitfall 9, S-10).
+
+    Args:
+        environ: The process environment.
+
+    Returns:
+        One sorted error line per unknown variable; names only, never values.
+
+    """
+    prefix = _ENV_PREFIX.casefold()
+    valid = ", ".join(Settings.model_fields)
+    lines: list[str] = []
+    for name in environ:
+        if not name.casefold().startswith(prefix):
+            continue
+        first, _, rest = name[len(prefix) :].partition(_ENV_DELIMITER)
+        first = first.casefold()
+        if first in Settings.model_fields:
+            continue
+        hint = _suggest_env_name(first, rest)
+        lines.append(
+            f"environment variable {name!r}: unknown section {first!r}{hint}; "
+            f"valid sections: {valid}"
+        )
+    return sorted(lines)
 
 
 class _SettingsFactory(Protocol):
@@ -425,31 +809,55 @@ class _SettingsFactory(Protocol):
 def _build_settings(
     toml_file: Path | None = None,
 ) -> Settings:
-    """Build Settings, converting extra-field errors to user-friendly messages."""
+    """
+    Build Settings, rendering every validation error into one ConfigError.
+
+    Each error becomes one line under a header naming the file, or naming
+    defaults and environment when no file was loaded (D-10). Errors whose
+    value came from the environment name the variable (D-12), unknown
+    SANELESS_* variables are added to the same list (D-13), and invalid JSON
+    in a variable becomes a line too (Pitfall 2). A TOML syntax error is not a
+    validation error and propagates unchanged (Phase 28).
+
+    Args:
+        toml_file: The TOML file to load, or None for defaults plus environment.
+
+    Returns:
+        The validated settings.
+
+    Raises:
+        ConfigError: If anything above failed; the message holds no input value.
+
+    """
+    lines = _unknown_env_lines(os.environ)
+    settings: Settings | None = None
     try:
-        if toml_file is not None:
-            return cast("_SettingsFactory", Settings)(_toml_file=toml_file)
-        return Settings()
-    except ValidationError as exc:
-        extra_fields: list[str] = []
-        for err in exc.errors():
-            if err["type"] == "extra_forbidden":
-                loc = err.get("loc", ())
-                if loc:
-                    extra_fields.append(str(loc[0]))
-
-        if extra_fields:
-            names = ", ".join(repr(f) for f in extra_fields)
-            valid = ", ".join(_VALID_SECTIONS)
-            hints = [f"Did you mean [profiles.{f}]?" for f in extra_fields]
-            hint_text = " ".join(hints)
-            msg = (
-                f"Unknown config section {names}. "
-                f"Valid top-level sections: {valid}. {hint_text}"
-            )
-            raise ConfigError(msg) from exc
-
-        raise
+        env_data = _env_contribution()
+    except SettingsError as exc:
+        # The message names the field and source, never the value; the
+        # exception (and its JSON-decoding cause) is not chained (T-27-13).
+        lines.append(f"environment: {_escape_name(str(exc))}")
+    else:
+        try:
+            if toml_file is not None:
+                settings = cast("_SettingsFactory", Settings)(_toml_file=toml_file)
+            else:
+                settings = Settings()
+        except ValidationError as exc:
+            lines.extend(_render_error_lines(exc.errors(), env_data))
+    if settings is not None and not lines:
+        return settings
+    lines.sort()
+    header = (
+        f"Configuration error in {toml_file}:"
+        if toml_file is not None
+        else "Configuration error (defaults and environment):"
+    )
+    msg = "\n".join([header, *(f"  {line}" for line in lines)])
+    # from None, and raised outside the except block: a chained ValidationError
+    # would print its inputs -- possibly the token -- in any traceback
+    # (Pitfall 1, D-14).
+    raise ConfigError(msg) from None
 
 
 def validate_settings_dirs(settings: Settings) -> None:
@@ -529,21 +937,89 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     Returns:
         Fully validated Settings instance carrying ``config_path``: the
-        explicit path as given, else the first search path that exists, else
-        None when no file was found.
+        explicit path with ``~`` expanded, else the first search path that is
+        a regular file, else None when no file was found.
 
     Raises:
-        ConfigError: If the TOML file has unrecognized top-level sections.
+        ConfigError: If an explicit path is missing or not a regular file
+            (CFG-02), or if the configuration fails validation (D-10).
 
     """
-    path = (
-        Path(config_path)
-        if config_path
-        else next((p for p in config_search_paths() if p.exists()), None)
-    )
+    path: Path | None
+    if config_path:
+        explicit = Path(config_path).expanduser()
+        # A directory counts as missing: Docker creates one where a
+        # single-file bind mount's source does not exist (CFG-02, M-19).
+        if not explicit.is_file():
+            msg = f"Config file not found or not a regular file: {explicit}"
+            raise ConfigError(msg)
+        path = explicit
+    else:
+        path = next((p for p in config_search_paths() if p.is_file()), None)
     # With no path, only defaults + env vars are used.
     settings = _build_settings(toml_file=path)
-    # An explicit path is recorded even if missing; CFG-02 (Phase 27) owns
-    # making that an error.
     settings._config_path = path
     return settings
+
+
+def _dotted_leaves(node: Mapping[str, object], prefix: str) -> Iterator[str]:
+    """
+    Yield the dotted names of the leaves of a nested mapping.
+
+    A non-empty mapping is descended into; anything else is a leaf. Each
+    segment is escaped, because profile names reach the log (T-27-11).
+
+    Args:
+        node: The mapping to flatten.
+        prefix: The dotted name of ``node`` itself, empty at the root.
+
+    Yields:
+        Dotted names, e.g. ``profiles.receipt.title``.
+
+    """
+    for key, value in node.items():
+        name = f"{prefix}.{_escape_name(key)}" if prefix else _escape_name(key)
+        if isinstance(value, dict) and value:
+            yield from _dotted_leaves(cast("dict[str, object]", value), name)
+        else:
+            yield name
+
+
+def env_sourced_keys() -> list[str]:
+    """
+    List the settings that SANELESS_* environment variables supply (CFG-11).
+
+    Names only, never values: the Paperless token is commonly one of them.
+    A JSON-valued section such as ``SANELESS_OUTPUT`` is reported by its
+    leaves.
+
+    Returns:
+        Sorted dotted names, e.g. ``["paperless.token", "paperless.url"]``.
+
+    """
+    return sorted(_dotted_leaves(_env_contribution(), ""))
+
+
+def log_config_sources(settings: Settings) -> None:
+    """
+    Log, once at INFO, where the configuration came from (CFG-11, U-01).
+
+    Names the loaded file, or says that only defaults and environment were
+    used, and lists the dotted names of the environment-sourced keys -- an
+    operator can then see that a stray variable overrides the file. Values are
+    never logged. Like ``warn_on_legacy_duplex_sources``, this is a function
+    the CLI calls after ``configure_logging``, not a validator: a record logged
+    during load would never reach ``log_file`` (S-10, WR-05). It runs only
+    after a successful load, so the environment is known to parse.
+
+    Args:
+        settings: The loaded settings.
+
+    """
+    source = (
+        str(settings.config_path)
+        if settings.config_path is not None
+        else "no config file; defaults + environment"
+    )
+    keys = ", ".join(env_sourced_keys()) or "(none)"
+    logger.info("Configuration: %s; from environment: %s", source, keys)
