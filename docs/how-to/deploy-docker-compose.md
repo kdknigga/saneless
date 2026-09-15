@@ -112,9 +112,7 @@ See [Environment Variables](../reference/environment-variables.md) for the full 
 
 saneless rejects state-changing requests that did not come from a saneless page (see [Cross-site requests](../reference/web-api.md#cross-site-requests)). A reverse proxy in front of saneless has to leave the browser's view of the site intact, or saneless mistakes your own scans for cross-site requests.
 
-**Behind an HTTPS proxy, nothing extra is needed.** Over HTTPS the browser sends `Sec-Fetch-Site`, and saneless decides from that header alone.
-
-**Behind a plain-HTTP proxy, the proxy must pass the original `Host` header, or set `X-Forwarded-Host`.** Without `Sec-Fetch-Site`, saneless compares the browser's `Origin` with `Host` and `X-Forwarded-Host`. nginx replaces `Host` with the upstream address by default, so tell it to pass the original:
+**Have the proxy pass the original `Host` header, or set `X-Forwarded-Host`, whatever the scheme.** When the browser sends no `Sec-Fetch-Site`, saneless compares the browser's `Origin` with `Host` and `X-Forwarded-Host`. Browsers never send `Sec-Fetch-Site` over plain HTTP, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it over HTTPS either. Behind an HTTPS proxy, current browsers do send it and saneless decides from that header alone, so HTTPS usually works without this step, but an older browser is then rejected. nginx replaces `Host` with the upstream address by default, so tell it to pass the original:
 
 ```nginx
 location / {
