@@ -741,7 +741,7 @@ class TestManualDuplexPrompt:
         """
 
         def broken_confirm(*_args: object, **_kwargs: object) -> bool:
-            """Fail the way a lost terminal does."""
+            """Fail with a read error, as an I/O error at the terminal does."""
             raise OSError(errno.EIO, "Input/output error")
 
         calls: list[str] = []
@@ -911,7 +911,7 @@ class TestManualDuplexPrompt:
         release = threading.Event()
 
         def fails_once_released(*_args: object, **_kwargs: object) -> bool:
-            """Block until the test lets go, then fail like a lost terminal."""
+            """Block until the test lets go, then fail with a terminal I/O error."""
             release.wait()
             raise OSError(errno.EIO, "Input/output error")
 

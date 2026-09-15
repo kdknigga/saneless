@@ -97,8 +97,8 @@ what each code means and what to check.
 
     Use a simplex or hardware duplex profile for automation. From a terminal, answering no,
     Ctrl-D or Ctrl-C at the flip prompt cancels the scan and exits with code 130. A flip wait
-    that is not confirmed within `flip_timeout_seconds`, or a terminal that fails while
-    prompting, fails the scan with code 1. See
+    that is not confirmed within `flip_timeout_seconds`, or a read error at the prompt (an I/O
+    error, or input that cannot be decoded), fails the scan with code 1. See
     [Set Up ADF Duplex Scanning](set-up-adf-duplex.md#manual-duplex).
 
 ## Scripting examples
