@@ -2648,6 +2648,77 @@ class TestOwedRejections:
         assert all(row.error == "queue full" for row in rows)
         assert owed_after == {}
 
+    def test_an_id_re_owed_while_its_write_is_in_flight_keeps_the_newer_write(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        IN-07: the flush drops an owed entry only if it is unchanged.
+
+        The first write for an id is held inside ``finish_job`` while the id is
+        owed again with different text.  The flush must keep the newer entry
+        rather than delete it unconditionally, and write it on a later tick.
+        """
+        first_error = "queue full"
+        second_error = "service down"
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        store = JobStore()
+        original_finish = store.finish_job
+        entered = threading.Event()
+        release = threading.Event()
+        written: list[str | None] = []
+        written_lock = threading.Lock()
+
+        def held_finish(
+            job_id: str,
+            state: JobState,
+            result: JobResult | None = None,
+            error: str | None = None,
+            error_category: ErrorCategory | None = None,
+        ) -> None:
+            with written_lock:
+                written.append(error)
+                first_call = len(written) == 1
+            if first_call:
+                entered.set()
+                release.wait(_STATE_BUDGET * 5)
+            original_finish(
+                job_id,
+                state,
+                result=result,
+                error=error,
+                error_category=error_category,
+            )
+
+        monkeypatch.setattr(store, "finish_job", held_finish)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = store.create_job("default", "Owed Twice")
+            worker.owe_rejection(job.id, first_error)
+            assert entered.wait(_STATE_BUDGET)
+            worker.owe_rejection(job.id, second_error)
+            release.set()
+            rewritten = _wait_until(
+                lambda: (
+                    _get(store, job.id).error == second_error
+                    and not worker.owed_rejection_ids()
+                ),
+                _STATE_BUDGET,
+            )
+            row = _get(store, job.id)
+            with written_lock:
+                written_before_stop = list(written)
+        finally:
+            release.set()
+            worker.stop()
+            store.close()
+
+        assert rewritten
+        assert written_before_stop[:2] == [first_error, second_error]
+        assert row.error_category is ErrorCategory.REJECTED
+
     def test_owed_rejection_ids_lists_only_rejections_still_owed(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
@@ -2843,19 +2914,23 @@ class TestOwedWriteStreak:
         assert retry_warnings[0].exc_info is not None
         assert _worker_records(caplog, logging.WARNING, "degraded")
 
+    @pytest.mark.parametrize("debt", ["guard", "rejection"])
     def test_a_worker_degraded_by_a_failed_retry_streak_recovers_once_the_owed_write_lands(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
+        debt: str,
     ) -> None:
         """
-        WR-10, D-12: a streak-degraded worker heals through probe and flush.
+        WR-10, D-12, IN-07: a streak-degraded worker heals through probe and flush.
 
+        The debt is the guard's ERROR write or a request-side REJECTED write.
         Once the store accepts writes again, the probe succeeds and the owed
-        ERROR write lands, so degraded clears, both failure counts are back to
-        zero, the stuck row carries the guard's own text, and a new scan runs.
+        write lands through the recovery path, so degraded clears, both failure
+        counts are back to zero, the stuck row carries the owed text, no
+        rejection is still listed as owed, and a new scan runs.
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
@@ -2864,20 +2939,22 @@ class TestOwedWriteStreak:
             lambda *_args, **_kwargs: _success_result(),
         )
         store = JobStore()
-        updates = _StoreFault(store.update_state, frozenset({1}))
         finishes = _StoreFault(store.finish_job, None)
         probes = _StoreFault(store.probe, frozenset())
-        monkeypatch.setattr(store, "update_state", updates)
         monkeypatch.setattr(store, "finish_job", finishes)
         monkeypatch.setattr(store, "probe", probes)
+        if debt == "guard":
+            updates = _StoreFault(store.update_state, frozenset({1}))
+            monkeypatch.setattr(store, "update_state", updates)
         worker = worker_for(store)
         try:
             worker.start()
-            first = _submit_jobs(worker, store, 1)[0]
+            first = _owe_one_write(worker, store, debt)
             degraded = _wait_until(
                 lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET
             )
             assert degraded
+            owed_while_degraded = worker.owed_rejection_ids()
             finishes.heal()
             recovered = _wait_until(
                 lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
@@ -2889,6 +2966,8 @@ class TestOwedWriteStreak:
             )
             with worker._unrecorded_lock:
                 owed_after = dict(worker._unrecorded_failures)
+            owed_rejections_after = worker.owed_rejection_ids()
+            probed = len(probes.calls)
             streak_after = worker._failed_flush_ticks
             loop_after = worker._consecutive_loop_failures
             second = _submit_jobs(worker, store, 1)[0]
@@ -2899,11 +2978,19 @@ class TestOwedWriteStreak:
 
         assert recovered
         assert drained
-        assert row.error == _DISK_ERROR
-        assert row.error_category == classify_error(
-            sqlite3.OperationalError(_DISK_ERROR)
-        )
+        # Degraded until the owed write landed, so only the probe path wrote it.
+        assert probed >= 1
+        expected = {
+            "guard": (
+                _DISK_ERROR,
+                classify_error(sqlite3.OperationalError(_DISK_ERROR)),
+                frozenset(),
+            ),
+            "rejection": ("queue full", ErrorCategory.REJECTED, frozenset({first.id})),
+        }
+        assert (row.error, row.error_category, owed_while_degraded) == expected[debt]
         assert owed_after == {}
+        assert owed_rejections_after == frozenset()
         assert streak_after == 0
         assert loop_after == 0
         assert finished.state is JobState.DONE
@@ -2988,6 +3075,25 @@ def _submit_jobs(worker: ScanWorker, store: JobStore, count: int) -> list[Job]:
     for job in jobs:
         assert worker.submit(job) is SubmitResult.ACCEPTED
     return jobs
+
+
+def _owe_one_write(worker: ScanWorker, store: JobStore, debt: str) -> Job:
+    """
+    Leave a started worker owing one job-row write of the given kind.
+
+    ``"guard"`` submits a job whose SCANNING write the caller has made fail,
+    so the guard owes its ERROR write when that fails too; ``"rejection"``
+    owes a refused submit's REJECTED write, as the scan route does.
+
+    Returns:
+        The job whose row is owed.
+
+    """
+    if debt == "guard":
+        return _submit_jobs(worker, store, 1)[0]
+    job = store.create_job("default", "Refused While Broken")
+    worker.owe_rejection(job.id, "queue full")
+    return job
 
 
 def _degrade(worker: ScanWorker, store: JobStore) -> list[Job]:
