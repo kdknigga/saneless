@@ -87,6 +87,7 @@ A user can walk up to the web UI, click Scan, and have a correctly assembled PDF
 - ✓ Web UI honours the operator's OS dark-mode preference, with every status colour at WCAG AA in both schemes — Phase 23.1
 - ✓ A TDD RED commit lands with hooks enabled and no suppression, while type errors are still rejected at merge, push and CI — Phase 23.1
 - ✓ Working manual duplex: `duplex` profile field (legacy `source = "Manual Duplex"` translated with a logged warning), source passed to SANE verbatim, one strategy dispatch, a required FlipCoordinator with a bounded timeout for CLI and web, job-scoped flip answers, visible SCANNING_REVERSE (C-01, C-02, M-02, M-07) — Phase 25
+- ✓ Worker and web robustness: a guarded worker loop whose job-store faults surface as a degraded `/health` (transient faults heal; persistent ones degrade within ~15 s), visible 429 backpressure with `Retry-After`, blocking routes declared `def`, startup crash recovery, and a server-owned Scan button on vendored offline-LAN assets, with deployment and API docs updated (ROBU-01..11) — Phase 26
 
 ### Active
 
@@ -156,4 +157,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-09-14 — Phase 25 complete: manual duplex works end to end with job-scoped flip answers; gap closure fixed CR-01 and every review finding (15/15 plans, re-verification passed 5/5)*
+*Last updated: 2026-09-14 — Phase 26 complete: worker and web robustness (19/19 plans, two gap-closure rounds fixed CR-01, WR-01, WR-10, WR-11, IN-08; re-verification passed 5/5; WR-02..WR-09 and IN-09 carried forward as non-blocking review findings)*
