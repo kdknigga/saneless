@@ -1,7 +1,8 @@
 # Saneless Docker Compose deployment example
 #
 # Configuration options:
-#   - Volume mount: bind config.toml to /etc/saneless/config.toml (read-only)
+#   - Volume mount: the ./config directory, mounted read-write at /etc/saneless,
+#     holds config.toml
 #   - Environment variables: use SANELESS_ prefix with __ nested delimiter
 #     (e.g., SANELESS_PAPERLESS__URL, SANELESS_PAPERLESS__TOKEN)
 #   - Consume directory: optionally mount a host directory for paperless-ngx
@@ -13,10 +14,14 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      # WARNING: config.toml must exist on the host before first run.
-      # Create it with at minimum: [profiles.default] and [paperless] sections.
+      # ./config holds config.toml. Mount the directory, not the file, and keep
+      # it writable: saneless rewrites profiles by writing a temp file beside
+      # config.toml and renaming it over the original, and a single-file bind
+      # mount makes that rename fail with EBUSY.
+      # If config.toml is missing, saneless starts with defaults plus
+      # environment variables and does not create the file.
       # See: https://github.com/kris-knigga/saneless#configuration
-      - ./config.toml:/etc/saneless/config.toml:ro
+      - ./config:/etc/saneless
       # Durable state: job database and preserved scans. /tmp/saneless is
       # deliberately NOT mounted -- it is disposable scratch space.
       - saneless-data:/var/lib/saneless
