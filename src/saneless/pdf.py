@@ -19,6 +19,8 @@ import img2pdf
 import PIL.Image
 from PIL import Image
 
+from saneless.exceptions import PdfError, describe
+
 # Allow high-DPI scans without triggering Pillow's decompression bomb check.
 # 600 DPI A4 color = ~34.8M pixels; 1200 DPI = ~139M pixels.
 PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
@@ -161,8 +163,21 @@ def assemble_pdf(
     at one resolution: a half-size raster becomes a half-size page rather than
     being rescaled to match its neighbours.
 
+    This function is a module boundary that raises only ``PdfError``, and the
+    caught type is ``Exception``, **deliberately**. img2pdf raises seven
+    unrelated error classes -- each a direct ``Exception`` subclass with no
+    shared base -- plus bare ``Exception``, ``TypeError`` and ``ValueError``,
+    and Pillow raises ``OSError`` and ``SystemError`` while saving a page, so
+    any tuple of types would leak whichever one was left off it. The catch is
+    narrow in *span* -- directory creation, page saves, assembly, the write and
+    the temporary directory's cleanup, nothing else -- and broad in *type*.
+    Nothing is masked: the original is always chained on ``__cause__`` and its
+    text kept in the message. ``KeyboardInterrupt`` and ``SystemExit`` derive
+    from ``BaseException`` and pass through untouched.
+
     Args:
-        images: List of PIL Image objects to include in the PDF.
+        images: List of PIL Image objects to include in the PDF. Must not be
+            empty.
         output_dir: Directory where the output PDF will be written.
         filename: File name for the PDF, including its ``.pdf`` extension.
             Must be a single path segment; :func:`build_pdf_filename`
@@ -173,30 +188,52 @@ def assemble_pdf(
     Returns:
         Path to the generated PDF file.
 
+    Raises:
+        PdfError: When ``images`` is empty, or when anything goes wrong while
+            the PDF is being assembled or written. The message names the page
+            count, the target PDF path and the original failure's text.
+
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not images:
+        # The pipeline's _require_pages already refuses an empty batch; this
+        # keeps img2pdf's "Unable to process empty list" ValueError unreachable
+        # from any caller of this public function (N-06).
+        msg = "Could not assemble a PDF: no pages were given"
+        raise PdfError(msg)
 
-    with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmp_dir:
-        image_paths: list[str] = []
-        for i, img in enumerate(images):
-            img_path = Path(tmp_dir) / f"page_{i:04d}.png"
-            img.save(str(img_path), format="PNG")
-            image_paths.append(str(img_path))
-            logger.debug("Saved page %d to %s", i, img_path)
+    pdf_path = output_dir / filename
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
-        pdf_path = output_dir / filename
-        # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
-        # default_layout_fun unpacks it, and an int silently yields wrong
-        # geometry.  Without it img2pdf lays pages out at its default_dpi of
-        # 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
-        pdf_bytes = img2pdf.convert(
-            image_paths,
-            layout_fun=img2pdf.get_fixed_dpi_layout_fun((dpi, dpi)),
+        with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmp_dir:
+            image_paths: list[str] = []
+            for i, img in enumerate(images):
+                img_path = Path(tmp_dir) / f"page_{i:04d}.png"
+                img.save(str(img_path), format="PNG")
+                image_paths.append(str(img_path))
+                logger.debug("Saved page %d to %s", i, img_path)
+
+            # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
+            # default_layout_fun unpacks it, and an int silently yields wrong
+            # geometry.  Without it img2pdf lays pages out at its default_dpi
+            # of 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
+            pdf_bytes = img2pdf.convert(
+                image_paths,
+                layout_fun=img2pdf.get_fixed_dpi_layout_fun((dpi, dpi)),
+            )
+            if pdf_bytes is None:
+                msg = "img2pdf.convert returned None"
+                raise PdfError(msg)
+            pdf_path.write_bytes(pdf_bytes)
+            logger.info("Assembled %d page(s) into %s", len(images), pdf_path)
+    except PdfError:
+        # Already the boundary's own type: wrapping it again would only
+        # repeat the message.
+        raise
+    except Exception as exc:
+        msg = (
+            f"Could not assemble {len(images)} page(s) into {pdf_path}: {describe(exc)}"
         )
-        if pdf_bytes is None:
-            msg = "img2pdf.convert returned None"
-            raise RuntimeError(msg)
-        pdf_path.write_bytes(pdf_bytes)
-        logger.info("Assembled %d page(s) into %s", len(images), pdf_path)
+        raise PdfError(msg) from exc
 
     return pdf_path
