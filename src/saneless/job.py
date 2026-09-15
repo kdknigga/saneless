@@ -30,7 +30,7 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Collection
 
 __all__ = ["ErrorCategory", "Job", "JobResult", "JobState", "JobStore"]
 
@@ -172,11 +172,13 @@ ISO-8601 strings and is correct only because every writer stamps UTC.
 """
 
 _SELECT_LATEST_RUN = (
-    f"{_SELECT_ALL} WHERE error_category IS NOT ? ORDER BY created_at DESC LIMIT 1"
+    f"{_SELECT_ALL} WHERE error_category IS NOT ? ORDER BY created_at DESC LIMIT ?"
 )
-"""Read the newest job that was not rejected at submit.
+"""Read the newest jobs that were not rejected at submit, newest first.
 
-One bound parameter, ``ErrorCategory.REJECTED.value`` at the only call site.
+Two bound parameters: ``ErrorCategory.REJECTED.value`` and the row limit, an
+integer ``latest_run_job`` derives from how many ids it excludes (IN-08).
+Neither is ever written into the statement text.
 ``IS NOT`` rather than ``!=`` because it is NULL-safe in SQLite: ``NULL != 'X'``
 is NULL and would drop the row, while ``NULL IS NOT 'X'`` is true.  Every job
 that has not failed, and every job ``fail_active_jobs`` failed on restart, has
@@ -886,7 +888,7 @@ class JobStore:
         return [self._row_to_job(row) for row in rows]
 
     @_locked
-    def latest_run_job(self) -> Job | None:
+    def latest_run_job(self, exclude_ids: Collection[str] = ()) -> Job | None:
         """
         Fetch the newest job that was not rejected at submit.
 
@@ -899,16 +901,28 @@ class JobStore:
         status area the moment the job ends (D-06).  History keeps using
         ``list_recent``, so the rejected row is still listed there.
 
+        Excluded ids are filtered in Python, never interpolated into the SQL.
+        Reading ``len(exclude_ids) + 1`` rows is enough: at most that many
+        newer rows can be skipped, so the row after them is the answer.
+
+        Args:
+            exclude_ids: Ids to treat as never run.  The web layer passes the
+                refused submits whose REJECTED write is still owed to the
+                worker, so their PENDING rows do not stand in for the job that
+                just ended (IN-08, D-06).
+
         Returns:
-            The newest job whose error category is not REJECTED, or None when
-            the store holds no such job.
+            The newest job whose error category is not REJECTED and whose id is
+            not excluded, or None when the store holds no such job.
 
         """
+        skip = frozenset(exclude_ids)
         with self._conn:
-            row = self._conn.execute(
-                _SELECT_LATEST_RUN, (ErrorCategory.REJECTED.value,)
-            ).fetchone()
-        return None if row is None else self._row_to_job(row)
+            rows = self._conn.execute(
+                _SELECT_LATEST_RUN, (ErrorCategory.REJECTED.value, len(skip) + 1)
+            ).fetchall()
+        jobs = (self._row_to_job(row) for row in rows)
+        return next((job for job in jobs if job.id not in skip), None)
 
     @_locked
     def probe(self) -> None:
