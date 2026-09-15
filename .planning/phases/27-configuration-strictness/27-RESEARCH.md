@@ -928,16 +928,21 @@ Line numbers re-verified this session. **Bold** entries are ones CONTEXT's canon
 
 Everything else was verified by a probe, a grep, or official docs in this session.
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Mode and owner of a *newly created* config file** (the CLI `auto-profiles` with no loaded config writes `./saneless.toml`)
    - What we know: D-06 covers only an existing file. mkstemp leaves `0o600`. Today's `write_text` gives `0o666 & ~umask` (usually 0644), owned by the writer.
    - What's unclear: whether a new file should be 0600 (it will hold a token) or umask-derived.
    - Recommendation: keep `0o600`. It is the safer default for a secrets-bearing file, and nothing that runs in the container creates one: the worker never creates a file (D-09 carry-forward). State it in the docs.
+   - RESOLVED: new files keep mkstemp's 0600 (orchestrator resolution 1; plan 27-02).
 2. **CLI write target in the container when no config is loaded.** The runtime image has no `WORKDIR`, so `docker exec … saneless auto-profiles` with an empty `/etc/saneless` writes `/saneless.toml` inside the container, outside any mount. CONTEXT keeps `./saneless.toml` as the target. Recommendation: leave it, but have the CLI output name the absolute resolved path (it already prints the path, so use `result.path`). The compose how-to can tell users to `touch ./config/config.toml` first. Do not change the target without a user decision.
+   - RESOLVED: target stays `./saneless.toml`; CLI prints the resolved path (orchestrator resolution 2; plan 27-04).
 3. **"Skipped" wording without `--force`** (D-04 leaves this to the planner). Recommendation: a separate group, `Skipped (already exists; use --force to refresh): …`, so the D-01 reason stays unambiguous.
+   - RESOLVED: separate `Skipped (already exists; use --force to refresh)` group (orchestrator resolution 3; plan 27-04).
 4. **DOCS-02 wording is now stale.** REQUIREMENTS DOCS-02 says README should show "the required `--title`", but D-16 makes `--title` optional. This is flagged for the Phase 31 owner, and no action is needed in this phase beyond the cli-commands synopsis.
+   - RESOLVED: deferred to the Phase 31 owner of DOCS-02 (orchestrator resolution 4).
 5. **uvicorn under `-v`.** Recommendation: uvicorn follows the configured `log_level` only.
+   - RESOLVED: uvicorn follows `log_level`, not `-v` (orchestrator resolution 5; plan 27-06).
 
 ## Environment Availability
 
