@@ -10,7 +10,7 @@ consume_dir = "/path/to/paperless/consume"
 [output]
 web_port = 8081          # change if 8080 is taken
 # tmp_dir = "/tmp/saneless"
-# log_level = "INFO"
+# log_level = "INFO"     # DEBUG, INFO, WARNING, ERROR or CRITICAL
 
 [profiles.default]
 source = "Flatbed"
@@ -18,4 +18,4 @@ resolution = 300
 mode = "color"
 # default_tags = []
 # default_correspondent = 1
-# title = ""
+# title = ""   # literal default title, used when the title is left blank

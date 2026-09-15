@@ -51,7 +51,7 @@ empty_page_stddev_threshold = 8.0
 **To be more conservative** (keep more pages): raise the mean threshold or lower the stddev threshold.
 
 !!! tip
-    If you are unsure whether detection is working correctly, run saneless with `--log-level DEBUG`. The log will show the exact mean and stddev values for each page along with the keep/discard decision.
+    If you are unsure whether detection is working correctly, run the scan with `saneless -v scan ...` (or set `log_level = "DEBUG"` under `[output]`). The log will show the exact mean and stddev values for each page along with the keep/discard decision.
 
 ## Disabling Empty Page Detection
 
