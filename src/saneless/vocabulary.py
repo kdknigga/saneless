@@ -64,6 +64,7 @@ class JobState(StrEnum):
     DONE = "DONE"
     ERROR = "ERROR"
     FALLBACK = "FALLBACK"
+    CANCELLED = "CANCELLED"
 
 
 class ErrorCategory(StrEnum):
@@ -284,7 +285,7 @@ polling it.
 """
 
 TERMINAL_STATES: frozenset[JobState] = frozenset(
-    {JobState.DONE, JobState.ERROR, JobState.FALLBACK}
+    {JobState.DONE, JobState.ERROR, JobState.FALLBACK, JobState.CANCELLED}
 )
 """Job states where the job has reached its final outcome.
 
@@ -340,6 +341,8 @@ def state_label(state: JobState) -> str:
             label = "Failed"
         case JobState.FALLBACK:
             label = "Saved to folder"
+        case JobState.CANCELLED:
+            label = "Cancelled"
         case _:
             assert_never(state)
     return label
@@ -357,9 +360,9 @@ def progress_label(state: JobState) -> str:
     the CLI printed for the second duplex pass before the state existed, so
     giving pass B its own state changed no CLI output.
 
-    ``DONE``, ``ERROR`` and ``FALLBACK`` have no progress prose in production:
-    the status partial and the CLI both branch structurally for the three
-    terminal states.  Their arms exist so the lookup is total and a future
+    ``DONE``, ``ERROR``, ``FALLBACK`` and ``CANCELLED`` have no progress prose
+    in production: the status partial and the CLI both branch structurally for
+    the four terminal states.  Their arms exist so the lookup is total and a future
     member cannot be forgotten; they have no production caller in this phase.
 
     Args:
@@ -391,6 +394,8 @@ def progress_label(state: JobState) -> str:
             label = "Failed"
         case JobState.FALLBACK:
             label = "Saved to folder"
+        case JobState.CANCELLED:
+            label = "Cancelled"
         case _:
             assert_never(state)
     return label
