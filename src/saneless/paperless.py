@@ -272,12 +272,63 @@ def _render_error_body(response: httpx.Response) -> str:
         text = None
     if text is None:
         text = response.text
+    return _bounded_line(text) or _EMPTY_BODY
+
+
+def _bounded_line(text: str) -> str:
+    """
+    Collapse ``text`` to one line and cut it to ``_MAX_BODY_LINE_CHARS``.
+
+    Text from Paperless -- an error body, a redirect target -- is recorded in
+    the job store and printed on the terminal, so no newline in it may forge
+    an extra line (T-28-24) and no length of it may flood either (T-23-16).
+
+    Args:
+        text: Upstream text of any shape.
+
+    Returns:
+        The text on one line, with an ellipsis when it was cut; empty when
+        it held nothing but whitespace.
+
+    """
     line = " ".join(text.split())
-    if not line:
-        line = _EMPTY_BODY
-    elif len(line) > _MAX_BODY_LINE_CHARS:
+    if len(line) > _MAX_BODY_LINE_CHARS:
         line = f"{line[:_MAX_BODY_LINE_CHARS]}…"
     return line
+
+
+def _not_accepted_message(response: httpx.Response) -> str:
+    """
+    Say why a non-2xx upload response that is not a server error is final.
+
+    A 4xx is Paperless rejecting the upload, with its own reason (D-09).  A
+    redirect is almost always ``paperless.url`` pointing at the wrong address
+    -- a plain ``http://`` URL behind a proxy that redirects to ``https://`` --
+    and retrying it cannot help, so it names where it was sent instead (WR-03).
+    Anything else (a 1xx, or a 3xx with no target) is reported by its status.
+
+    Args:
+        response: The upload response ``raise_for_status`` refused.
+
+    Returns:
+        A single line naming the status and what to check.
+
+    """
+    status = f"{response.status_code} {response.reason_phrase}"
+    location = _bounded_line(response.headers.get("location", ""))
+    if response.is_client_error:
+        return (
+            f"Paperless rejected the upload ({status}): {_render_error_body(response)}"
+        )
+    if response.is_redirect and location:
+        return (
+            f"Paperless redirected the upload ({status}) to {location}; "
+            "check paperless.url"
+        )
+    return (
+        f"Paperless did not accept the upload ({status}): "
+        f"{_render_error_body(response)}"
+    )
 
 
 @dataclass
@@ -337,15 +388,17 @@ class PaperlessClient:
       total: every transient ``httpx.TransportError`` -- ConnectError, the
       timeouts, ReadError, WriteError, RemoteProtocolError (a reverse proxy
       closing the connection), ProxyError -- and any 5xx response.
-    * **Fail fast**, with no further attempt: a 4xx rejection, a URL with no
+    * **Fail fast**, with no further attempt: a 4xx rejection, any other
+      non-2xx that is not a server error (a redirect, which names its target
+      so ``paperless.url`` can be corrected), a URL with no
       usable scheme (``httpx.UnsupportedProtocol``, which is a TransportError
       but will never succeed on a retry), any other ``httpx.HTTPError``, and
       a 200 whose body is not JSON.
 
     When a consume directory is configured it is the fallback both for
     exhausted retries and for ``UnsupportedProtocol``: no retry is not no
-    fallback, and a scan must never be lost.  A 4xx is final and is not
-    copied.
+    fallback, and a scan must never be lost.  A 4xx or a redirect is final
+    and is not copied.
 
     Accepted risk (D-10 amendment): a retry after a response that was lost
     in transit can make paperless-ngx v3, with its default settings, store a
@@ -407,7 +460,8 @@ class PaperlessClient:
         Builds multipart form data with title and optional metadata.
         Tags are submitted as repeated form fields.  Every transient
         transport failure and every 5xx is retried with exponential backoff
-        for ``max_retries`` attempts; a 4xx, an unusable URL scheme, any
+        for ``max_retries`` attempts; a 4xx, a redirect or any other non-2xx
+        that is not a 5xx, an unusable URL scheme, any
         other httpx error and a non-JSON 200 end the attempts at once
         (D-10, M-17).  When the attempts end without delivery -- exhausted,
         or cut short by ``httpx.UnsupportedProtocol`` -- and a consume
@@ -430,7 +484,9 @@ class PaperlessClient:
 
         Raises:
             PaperlessError: If the server rejects the upload with a 4xx
-                (``Paperless rejected the upload (<status> <reason>): <line>``);
+                (``Paperless rejected the upload (<status> <reason>): <line>``)
+                or answers with a redirect (``Paperless redirected the upload
+                (<status> <reason>) to <location>; check paperless.url``);
                 if the attempts end without delivery and no consume directory
                 is configured (``failed after N attempts``, or ``Could not
                 reach Paperless`` for an unusable URL scheme); if any other
@@ -450,12 +506,12 @@ class PaperlessClient:
             try:
                 task_id = self._post_document(pdf_path, data)
             except httpx.HTTPStatusError as exc:
-                if 400 <= exc.response.status_code < 500:
-                    msg = (
-                        f"Paperless rejected the upload ({exc.response.status_code} "
-                        f"{exc.response.reason_phrase}): "
-                        f"{_render_error_body(exc.response)}"
-                    )
+                # Only a server error is transient.  A 4xx rejection and a
+                # redirect (1xx and 3xx too: raise_for_status refuses every
+                # non-2xx) would only be answered the same way again, so they
+                # are final: no retry and no fallback (D-10, WR-03).
+                if not exc.response.is_server_error:
+                    msg = _not_accepted_message(exc.response)
                     raise PaperlessError(msg) from exc
                 last_error = exc
                 self._back_off(attempt, exc)
@@ -573,11 +629,13 @@ class PaperlessClient:
             exc: What it failed with.
 
         """
+        # _one_line_reason, not describe: httpx's text for a status error spans
+        # lines and names the full request URL (WR-03).
         logger.warning(
             "Upload attempt %d/%d failed: %s",
             attempt + 1,
             self._max_retries,
-            describe(exc),
+            _one_line_reason(exc),
         )
         if attempt < self._max_retries - 1:
             time.sleep(2**attempt)

@@ -109,6 +109,10 @@ The line starts with `Paperless error:`.
 - **Upload rejected.** paperless-ngx answered with a 4xx, such as a bad API token or a field it
   refuses. The line gives Paperless's own reason. A rejected upload is never retried and never
   falls back to the consume directory; fix what the reason names and scan again.
+- **Upload redirected.** paperless-ngx, or a proxy in front of it, answered with a redirect. The
+  line names where the upload was sent. It is not retried and never falls back; set
+  `paperless.url` to the base of that address (often the `https://` form of the same host) and
+  scan again.
 - **The document may already be in Paperless.** A retry after a lost response can reach
   paperless-ngx twice. On default paperless-ngx settings that stores a second copy you can delete;
   when paperless-ngx rejects duplicates, the failure says so. Check paperless-ngx before scanning
