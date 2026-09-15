@@ -1503,3 +1503,134 @@ auto_generated = true
             "Refreshed: 'x'"
         ]
         assert ProfileWriteResult(path=path).describe() == []
+
+
+class TestDurableConfigWrite:
+    """
+    Config rewrites are UTF-8, line-ending preserving, guarded and atomic.
+
+    CFG-08 / M-10: the old write truncated the file in place in the locale
+    encoding and translated CRLF to LF. D-05: bytes are decoded as UTF-8 and
+    the dumped text is re-parsed before ``replace_file_atomically`` swaps it
+    in. D-07: a symlinked config is written through and both paths are logged.
+    """
+
+    @staticmethod
+    def _generated() -> dict[str, ProfileConfig]:
+        """Build a one-profile generated set that the fixtures do not name."""
+        return {
+            "flatbed": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            )
+        }
+
+    def test_crlf_utf8_config_keeps_crlf_and_comment(self, tmp_path: Path) -> None:
+        """Every line ending stays CRLF, lines tomlkit adds included (D-05)."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_bytes(
+            '# café\r\n[profiles.default]\r\nsource = "Flatbed"\r\n'.encode()
+        )
+
+        write_profiles_to_config(config_file, self._generated())
+
+        data = config_file.read_bytes()
+        assert "# café\r\n".encode() in data
+        assert re.search(rb"(?<!\r)\n", data) is None
+        profiles = tomllib.loads(data.decode("utf-8"))["profiles"]
+        assert set(profiles) == {"default", "flatbed"}
+
+    def test_lf_utf8_config_stays_lf(self, tmp_path: Path) -> None:
+        """An LF file gains no carriage returns."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_bytes(b'[profiles.default]\nsource = "Flatbed"\n')
+
+        write_profiles_to_config(config_file, self._generated())
+
+        assert b"\r" not in config_file.read_bytes()
+
+    def test_non_utf8_config_is_refused_utf8(self, tmp_path: Path) -> None:
+        """Bytes that are not UTF-8 raise ConfigError and leave the file alone."""
+        config_file = tmp_path / "config.toml"
+        original = b"# caf\xe9\n"
+        config_file.write_bytes(original)
+
+        with pytest.raises(ConfigError, match="UTF-8") as caught:
+            write_profiles_to_config(config_file, self._generated())
+
+        assert str(config_file) in str(caught.value)
+        assert config_file.read_bytes() == original
+
+    def test_inline_profiles_section_stays_valid_toml(self, tmp_path: Path) -> None:
+        """A profile added to an inline ``profiles = {...}`` section re-parses."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text('profiles = { default = { source = "Flatbed" } }\n')
+
+        result = write_profiles_to_config(config_file, self._generated())
+
+        profiles = tomllib.loads(config_file.read_text())["profiles"]
+        assert profiles["default"] == {"source": "Flatbed"}
+        assert profiles["flatbed"]["resolution"] == 300
+        assert result.added == ("flatbed",)
+
+    def test_guard_refuses_output_that_does_not_parse_inline(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Invalid dumped TOML raises ConfigError; file and directory unchanged."""
+        config_file = tmp_path / "config.toml"
+        original = b'[profiles.default]\nsource = "Flatbed"\n'
+        config_file.write_bytes(original)
+        monkeypatch.setattr(auto_profiles.tomlkit, "dumps", lambda _doc: "profiles = {")
+
+        with pytest.raises(ConfigError, match="refus") as caught:
+            write_profiles_to_config(config_file, self._generated())
+
+        assert str(config_file) in str(caught.value)
+        assert config_file.read_bytes() == original
+        assert list(tmp_path.iterdir()) == [config_file]
+
+    def test_guard_skips_the_replace_when_nothing_changed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only skipped names means no rewrite, so no EBUSY noise for a no-op."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[profiles.flatbed]\nsource = "Flatbed"\nauto_generated = true\n'
+        )
+        calls: list[object] = []
+
+        def recorder(path: Path, text: str) -> Path:
+            """Record the call; a no-op merge must never reach here."""
+            calls.append((path, text))
+            return path
+
+        monkeypatch.setattr(auto_profiles, "replace_file_atomically", recorder)
+
+        result = write_profiles_to_config(config_file, self._generated())
+
+        assert result.skipped_existing == ("flatbed",)
+        assert calls == []
+
+    def test_symlink_config_is_written_through_and_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """D-07: the link survives, the real file changes, both are named."""
+        real = tmp_path / "dotfiles" / "config.toml"
+        real.parent.mkdir()
+        real.write_text('[profiles.default]\nsource = "Flatbed"\n')
+        link = tmp_path / "config.toml"
+        link.symlink_to(real)
+
+        with caplog.at_level(logging.INFO, logger="saneless.auto_profiles"):
+            result = write_profiles_to_config(link, self._generated())
+
+        assert link.is_symlink()
+        assert "flatbed" in tomllib.loads(real.read_text())["profiles"]
+        assert result.path == real.resolve()
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.auto_profiles"
+            and str(link) in record.getMessage()
+            and str(real.resolve()) in record.getMessage()
+        ]
+        assert len(messages) == 1

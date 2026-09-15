@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
+import os
 import tempfile
 import threading
 import time
@@ -1431,6 +1433,63 @@ class TestAutoProfiles:
         after = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
         assert after == before
         assert "  flatbed: source=Flatbed" not in result.output
+
+    def test_auto_profiles_ebusy_exits_2_without_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-08: a single-file bind mount prints the fix and exits 2."""
+        config_file = tmp_path / "saneless.toml"
+        self._flatbed_config(config_file, flagged=True)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        def busy(_self: Path, _target: object) -> Path:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+        monkeypatch.setattr(Path, "replace", busy)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 2
+        assert "Mount its directory instead" in result.output
+        assert isinstance(result.exception, SystemExit)
+        assert "Traceback" not in result.output
+
+    def test_auto_profiles_unwritable_file_exits_2_like_ebusy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A PermissionError from the write is a clean exit 2 naming the path."""
+        config_file = tmp_path / "saneless.toml"
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        def denied(path: Path, _text: str) -> Path:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(path))
+
+        monkeypatch.setattr("saneless.auto_profiles.replace_file_atomically", denied)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 2
+        assert str(config_file) in result.output
+        assert isinstance(result.exception, SystemExit)
+
+    def test_auto_profiles_force_in_a_config_directory_mount(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """SC3: --force refreshes a config held in a mounted directory."""
+        config_file = tmp_path / "config" / "config.toml"
+        config_file.parent.mkdir()
+        self._flatbed_config(config_file, flagged=True)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
+
+        result = runner.invoke(
+            cli, ["--config", str(config_file), "auto-profiles", "--force"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Refreshed: " in result.output
+        flatbed = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
+        assert flatbed["default_tags"] == [4]
+        assert [path.name for path in config_file.parent.iterdir()] == ["config.toml"]
 
     def test_auto_profiles_no_force_skips_existing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
