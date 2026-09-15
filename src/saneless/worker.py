@@ -191,6 +191,10 @@ class WorkerFlipCoordinator(FlipCoordinator):
         self._job_id = job_id
         self._slot = FlipAnswerSlot()
         self._armed = threading.Event()
+        # Held across a shutdown's claim and its marker, so the worker thread,
+        # woken by that claim, cannot read the marker before it is set (WR-06).
+        self._shutdown_lock = threading.Lock()
+        self._aborted_by_shutdown = False
 
     @property
     def job_id(self) -> str:
@@ -232,6 +236,32 @@ class WorkerFlipCoordinator(FlipCoordinator):
 
         """
         return self._signal(FlipOutcome.ABORTED)
+
+    def abort_for_shutdown(self) -> bool:
+        """
+        Answer the wait with Abort because the server is stopping.
+
+        Arms first, so the answer lands whether the job is at the prompt or
+        still in pass A.  Only a claim made here marks the job as ended by
+        shutdown: an operator's Abort, a Continue, or a timeout that claimed
+        first keeps its own meaning (WR-06, D-15).
+
+        Returns:
+            Whether this shutdown claimed the answer.
+
+        """
+        self.arm()
+        with self._shutdown_lock:
+            claimed = self._slot.offer(FlipOutcome.ABORTED)
+            if claimed:
+                self._aborted_by_shutdown = True
+        return claimed
+
+    @property
+    def aborted_by_shutdown(self) -> bool:
+        """Whether :meth:`abort_for_shutdown` claimed this coordinator's answer."""
+        with self._shutdown_lock:
+            return self._aborted_by_shutdown
 
     def wait_for_flip(self, timeout: float) -> FlipOutcome:
         """
@@ -458,9 +488,8 @@ class ScanWorker:
         if coordinator is not None:
             # Pre-answering Abort is exactly the shutdown intent: a job waiting
             # at the prompt aborts now, and one still in pass A aborts the
-            # moment it asks.  Arming first lets the signal land either way.
-            coordinator.arm()
-            coordinator.signal_abort()
+            # moment it asks.  Only this claim records the restart reason.
+            coordinator.abort_for_shutdown()
         if self._thread.is_alive():
             self._thread.join(timeout=STOP_JOIN_SECONDS)
         stopped = not self._thread.is_alive()
@@ -862,20 +891,29 @@ class ScanWorker:
                 # not clear degraded: only a successful idle probe does.
                 self._consecutive_loop_failures = 0
 
-    def _failure_record(self, exc: Exception) -> tuple[str, ErrorCategory | None]:
+    @staticmethod
+    def _failure_record(
+        exc: Exception, coordinator: WorkerFlipCoordinator | None = None
+    ) -> tuple[str, ErrorCategory | None]:
         """
         Choose the error text and category a failed job is recorded with.
 
+        Stopping alone is not a cause: a Paperless error, a jam or an
+        operator's Abort that happens inside the shutdown join window keeps
+        its own text and category.  Only a flip answer the shutdown itself
+        claimed is recorded as a restart (WR-06, D-15).
+
         Args:
             exc: What ended the job.
+            coordinator: The job's flip coordinator, if it has one.
 
         Returns:
-            ``RESTART_REASON`` with no category while stopping -- shutdown ended
-            the job, not the operator -- otherwise the exception's own text and
-            its classified category.
+            ``RESTART_REASON`` with no category when shutdown claimed the flip
+            answer, otherwise the exception's own text and its classified
+            category.
 
         """
-        if self._stopping.is_set():
+        if coordinator is not None and coordinator.aborted_by_shutdown:
             return RESTART_REASON, None
         return str(exc), classify_error(exc)
 
@@ -1200,7 +1238,7 @@ class ScanWorker:
                     # in pass A, found no prompt to answer, and returned to its
                     # join.  Abort now, or the wait would hold the thread for
                     # flip_timeout_seconds after shutdown began.
-                    coordinator.signal_abort()
+                    coordinator.abort_for_shutdown()
             self._job_store.update_state(_jid, state)
             persisted_state = state
 
@@ -1225,7 +1263,7 @@ class ScanWorker:
                 request,
             )
         except Exception as exc:
-            error, category = self._failure_record(exc)
+            error, category = self._failure_record(exc, coordinator)
             # No result argument: outcome, warning and all three page counts
             # stay NULL.  NULL means "never recorded"; 0 would claim a
             # measurement a job that never reached the scanner did not make.
