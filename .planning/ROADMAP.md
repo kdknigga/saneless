@@ -430,9 +430,9 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 27-03-PLAN.md — (wave 2) nested `extra="forbid"`, loc/msg error renderer with did-you-mean, env attribution, unknown `SANELESS_*` rejection, CFG-02, CFG-11 functions
-- [ ] 27-04-PLAN.md — (wave 2) `auto-profiles --force` merge with `ProfileWriteResult`, UTF-8/CRLF/tomllib-guarded atomic rewrite, EBUSY exit 2 and worker fallback
-- [ ] 27-05-PLAN.md — (wave 2) `./config:/etc/saneless` directory mount in compose and Docker docs, profile how-to merge/title text, static deployment test
+- [x] 27-03-PLAN.md — (wave 2) nested `extra="forbid"`, loc/msg error renderer with did-you-mean, env attribution, unknown `SANELESS_*` rejection, CFG-02, CFG-11 functions
+- [x] 27-04-PLAN.md — (wave 2) `auto-profiles --force` merge with `ProfileWriteResult`, UTF-8/CRLF/tomllib-guarded atomic rewrite, EBUSY exit 2 and worker fallback
+- [x] 27-05-PLAN.md — (wave 2) `./config:/etc/saneless` directory mount in compose and Docker docs, profile how-to merge/title text, static deployment test
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -529,7 +529,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
-| 27. Configuration Strictness | 2/8 | In Progress|  |
+| 27. Configuration Strictness | 5/8 | In Progress|  |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
 | 30. Appliance Layer | 0/? | Not started | - |
