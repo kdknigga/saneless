@@ -423,11 +423,19 @@ Note (added in 23.1, DARK-03 coupling): when ROBU-09 vendors Pico, follow `23.1-
 
 Plans:
 
+**Wave 1**
+
 - [ ] 27-01-PLAN.md — (wave 1) SecretStr token, validated `log_level`, literal `default_title` + shared `resolve_job_title` wired into the web route
 - [ ] 27-02-PLAN.md — (wave 1) `atomic_write.replace_file_atomically`: same-dir mkstemp, fsync, rename, mode/owner copy, symlink write-through, EBUSY -> ConfigError
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 27-03-PLAN.md — (wave 2) nested `extra="forbid"`, loc/msg error renderer with did-you-mean, env attribution, unknown `SANELESS_*` rejection, CFG-02, CFG-11 functions
 - [ ] 27-04-PLAN.md — (wave 2) `auto-profiles --force` merge with `ProfileWriteResult`, UTF-8/CRLF/tomllib-guarded atomic rewrite, EBUSY exit 2 and worker fallback
 - [ ] 27-05-PLAN.md — (wave 2) `./config:/etc/saneless` directory mount in compose and Docker docs, profile how-to merge/title text, static deployment test
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 27-06-PLAN.md — (wave 3) lazy memoised CLI settings (`--help` without config), `-v` = saneless DEBUG, CFG-11 startup line, optional `--title`
 - [ ] 27-07-PLAN.md — (wave 3) `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` at call time, `~` expansion, nearest-ancestor writability, conftest XDG hygiene
 - [ ] 27-08-PLAN.md — (wave 3) configuration/env/CLI references, scripting how-to, empty-page tip, search-path lists, TOML example, doc-truth tests
