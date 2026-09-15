@@ -1766,6 +1766,46 @@ class TestPathExpansion:
         """``$HOME`` in a path setting is kept literally (T-27-26)."""
         assert OutputConfig(data_dir="$HOME/x").data_dir == "$HOME/x"
 
+    @pytest.mark.usefixtures("home")
+    def test_unknown_user_in_a_toml_path_is_a_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        ``~nosuchuser`` names the section and key, never the value (WR-03).
+
+        ``Path.expanduser`` raises RuntimeError, which pydantic does not turn
+        into a validation error, so it used to escape the D-10 renderer as a
+        bare "Could not determine home directory." naming no file or key.
+        """
+        err = _load_error(
+            tmp_path / "x.toml",
+            '[output]\ndata_dir = "~saneless-no-such-user-xyz/state"\n\n'
+            "[profiles.default]\n",
+        )
+
+        message = str(err)
+        assert str(tmp_path / "x.toml") in message
+        assert any(
+            line.strip().startswith("[output] data_dir:") and "'~'" in line
+            for line in _error_lines(err)
+        ), message
+        assert "saneless-no-such-user-xyz" not in message
+
+    @pytest.mark.usefixtures("home")
+    def test_unknown_user_in_consume_dir_is_a_config_error(self) -> None:
+        """``consume_dir`` goes through the same expansion and the same error."""
+        with pytest.raises(ValidationError) as exc_info:
+            PaperlessConfig(consume_dir="~saneless-no-such-user-xyz/consume")
+        assert exc_info.value.errors()[0]["loc"] == ("consume_dir",)
+
+    def test_unknown_user_in_config_path_is_a_config_error(self) -> None:
+        """``--config ~nosuchuser/c.toml`` is a ConfigError naming the path."""
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings("~saneless-no-such-user-xyz/c.toml")
+        message = str(exc_info.value)
+        assert "~saneless-no-such-user-xyz/c.toml" in message
+        assert "'~'" in message
+
 
 class TestDataDir:
     """OutputConfig.data_dir and its computed db_path / failed_dir properties."""
