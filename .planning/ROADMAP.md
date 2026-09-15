@@ -507,16 +507,39 @@ Plans:
 **Plans**: 11 plans in 8 waves
 
 Plans:
+**Wave 1**
+
 - [ ] 29-01-PLAN.md — Page spool and the PageRecord/PageSink contract (additive; tree stays green)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 29-02-PLAN.md — Contract switch: ScanBatch records, scan_pages(sink), close(), conftest seam
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 29-03-PLAN.md — Records through pages.py, pdf.py and pipeline.py; spool lifetime (src green)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 29-04-PLAN.md — Migrate tests/test_scanner.py + the weakref memory-bound proof
 - [ ] 29-05-PLAN.md — Migrate pipeline/pdf/pages/e2e suites + the twelve-page and interleave proofs
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 29-06-PLAN.md — Migrate the eight remaining stub scanners; close the red interval
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 29-07-PLAN.md — Daemon-thread timeout, cancel-then-wait, wedge, flatbed, Ctrl-C, exit proof
 - [ ] 29-08-PLAN.md — Bounded PDF assembly: per-page convert plus a qpdf merge
 - [ ] 29-09-PLAN.md — Keep the pages a mid-batch failure leaves behind (HARD-02)
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
 - [ ] 29-10-PLAN.md — SANE init guard, shutdown at every entry point, the request-path proof
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
 - [ ] 29-11-PLAN.md — Documentation (D-20), the doc-truth test, and the phase gate
 
 ### Phase 30: Appliance Layer
