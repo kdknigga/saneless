@@ -9,10 +9,10 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 from PIL.ImageStat import Stat
-from saneless.spool import SpooledPageSink
 
 from saneless.exceptions import ScanError
 from saneless.scanner.base import PageRecord, PageSink
+from saneless.spool import SpooledPageSink
 
 # Larger than any disk this suite will ever run on, so the per-page check is
 # guaranteed to report a shortfall without monkeypatching shutil.
