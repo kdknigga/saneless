@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 import time
 from typing import TYPE_CHECKING
@@ -341,7 +342,7 @@ class TestUploadDocument:
             _transport=transport,
             max_retries=3,
         )
-        with pytest.raises(PaperlessError, match="retries"):
+        with pytest.raises(PaperlessError, match="attempts"):
             client.upload_document(sample_pdf, title="Fail")
         client.close()
 
@@ -377,6 +378,358 @@ class TestUploadDocument:
         # the old magic-string sentinel could not carry.
         assert result.consume_dir_path == copied[0]
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# Upload failure translation (EXC-01, D-08, D-10)
+# ---------------------------------------------------------------------------
+
+
+_TRANSIENT_TRANSPORT_CASES = [
+    pytest.param(httpx.ReadError, id="read-error"),
+    pytest.param(httpx.WriteError, id="write-error"),
+    pytest.param(httpx.RemoteProtocolError, id="remote-protocol-error"),
+    pytest.param(httpx.ConnectError, id="connect-error"),
+    pytest.param(httpx.ConnectTimeout, id="connect-timeout"),
+    pytest.param(httpx.ReadTimeout, id="read-timeout"),
+]
+
+_UNSUPPORTED_PROTOCOL_TEXT = (
+    "Request URL is missing an 'http://' or 'https://' protocol."
+)
+
+
+class _CountingHandler:
+    """A mock transport handler that counts calls and replays a script."""
+
+    def __init__(self, respond: Callable[[int], httpx.Response]) -> None:
+        """Build a handler whose n-th call (1-based) is answered by ``respond``."""
+        self.calls = 0
+        self._respond = respond
+
+    def __call__(self, _request: httpx.Request) -> httpx.Response:
+        """Count the call and answer it."""
+        self.calls += 1
+        return self._respond(self.calls)
+
+
+def _raising(exc: Exception) -> Callable[[int], httpx.Response]:
+    """Build a script that raises ``exc`` on every call."""
+
+    def respond(_call: int) -> httpx.Response:
+        raise exc
+
+    return respond
+
+
+def _answering(response: httpx.Response) -> Callable[[int], httpx.Response]:
+    """Build a script that answers every call with ``response``."""
+
+    def respond(_call: int) -> httpx.Response:
+        return response
+
+    return respond
+
+
+def _upload_client(handler: _CountingHandler, consume_dir: str = "") -> PaperlessClient:
+    """Build a three-attempt upload client wired to the counting handler."""
+    return PaperlessClient(
+        url="http://paperless:8000",
+        token=_MOCK_AUTH,
+        consume_dir=consume_dir,
+        _transport=_make_transport(handler),
+        max_retries=3,
+    )
+
+
+@pytest.fixture
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record upload backoff sleeps instead of really sleeping."""
+    recorded: list[float] = []
+    monkeypatch.setattr("saneless.paperless.time.sleep", recorded.append)
+    return recorded
+
+
+class TestPaperlessUrlValidation:
+    """D-08: a malformed paperless.url is a PaperlessError at construction."""
+
+    def test_invalid_url_raises_a_paperless_error(self) -> None:
+        """
+        ``http://host:abc`` names the URL and httpx's own text.
+
+        The token must never reach the message (T-28-20, Pitfall 1): only the
+        configured URL and the httpx text are interpolated.
+        """
+        with pytest.raises(
+            PaperlessError,
+            match=re.escape(
+                "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
+            ),
+        ) as exc_info:
+            PaperlessClient("http://host:abc", "tok-SECRET-5d1", "")
+        assert isinstance(exc_info.value.__cause__, httpx.InvalidURL)
+        assert "tok-SECRET-5d1" not in str(exc_info.value)
+
+
+class TestUploadFailureTranslation:
+    """EXC-01 / D-10 / M-17: every upload failure ends as a PaperlessError."""
+
+    @pytest.mark.parametrize("exc_type", _TRANSIENT_TRANSPORT_CASES)
+    def test_transient_transport_failure_is_retried_then_raises(
+        self,
+        exc_type: type[httpx.TransportError],
+        sample_pdf: Path,
+        sleeps: list[float],
+    ) -> None:
+        """
+        Every transient TransportError retries for max_retries attempts.
+
+        M-17: a reverse proxy closing the connection (ReadError,
+        RemoteProtocolError) used to escape raw instead of retrying.
+        """
+        failure = exc_type("upstream went away")
+        handler = _CountingHandler(_raising(failure))
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(
+                PaperlessError,
+                match=(
+                    "Upload to Paperless at http://paperless:8000 failed after "
+                    "3 attempts: upstream went away"
+                ),
+            ) as exc_info:
+                client.upload_document(sample_pdf, title="Transient")
+        finally:
+            client.close()
+        assert handler.calls == 3
+        assert exc_info.value.__cause__ is failure
+        assert sleeps == [1, 2]
+
+    @pytest.mark.parametrize("exc_type", _TRANSIENT_TRANSPORT_CASES)
+    def test_transient_transport_failure_falls_back_after_retries(
+        self,
+        exc_type: type[httpx.TransportError],
+        sample_pdf: Path,
+        tmp_path: Path,
+        sleeps: list[float],
+    ) -> None:
+        """With a consume directory the exhausted retries take the fallback."""
+        consume_dir = tmp_path / "consume"
+        handler = _CountingHandler(_raising(exc_type("upstream went away")))
+        client = _upload_client(handler, consume_dir=str(consume_dir))
+        try:
+            result = client.upload_document(sample_pdf, title="Transient")
+        finally:
+            client.close()
+        assert handler.calls == 3
+        assert result == UploadResult(
+            delivered_to_api=False, consume_dir_path=consume_dir / "test.pdf"
+        )
+        assert (consume_dir / "test.pdf").read_bytes() == sample_pdf.read_bytes()
+        assert sleeps == [1, 2]
+
+    def test_remote_protocol_error_then_success_is_delivered(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """Two dropped connections then a 200 deliver to the API on attempt 3."""
+
+        def respond(call: int) -> httpx.Response:
+            if call <= 2:
+                msg = "Server disconnected without sending a response."
+                raise httpx.RemoteProtocolError(msg)
+            return httpx.Response(200, json="task-id")
+
+        handler = _CountingHandler(respond)
+        client = _upload_client(handler)
+        try:
+            result = client.upload_document(sample_pdf, title="Flaky proxy")
+        finally:
+            client.close()
+        assert result.delivered_to_api is True
+        assert result.task_uuid == "task-id"
+        assert handler.calls == 3
+        assert sleeps == [1, 2]
+
+    def test_empty_read_timeout_names_its_class(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """An empty ``ReadTimeout("")`` still says what happened (describe rule)."""
+        handler = _CountingHandler(_raising(httpx.ReadTimeout("")))
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Silent timeout")
+        finally:
+            client.close()
+        assert str(exc_info.value).endswith(": ReadTimeout")
+        assert len(sleeps) == 2
+
+    def test_unsupported_protocol_url_fails_fast_without_fallback(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """
+        T-28-22: a scheme-less URL is never retried with backoff.
+
+        UnsupportedProtocol is a TransportError, so it must be caught before
+        the retrying clause.
+        """
+        failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
+        handler = _CountingHandler(_raising(failure))
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(
+                PaperlessError, match=re.escape(_UNSUPPORTED_PROTOCOL_TEXT)
+            ) as exc_info:
+                client.upload_document(sample_pdf, title="No scheme")
+        finally:
+            client.close()
+        assert handler.calls == 1
+        assert sleeps == []
+        assert exc_info.value.__cause__ is failure
+
+    def test_unsupported_protocol_url_still_takes_the_fallback(
+        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """D-10: no retry is not no fallback -- the scan is never lost."""
+        consume_dir = tmp_path / "consume"
+        failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
+        handler = _CountingHandler(_raising(failure))
+        client = _upload_client(handler, consume_dir=str(consume_dir))
+        try:
+            result = client.upload_document(sample_pdf, title="No scheme")
+        finally:
+            client.close()
+        assert handler.calls == 1
+        assert sleeps == []
+        assert result.delivered_to_api is False
+        assert result.consume_dir_path == consume_dir / "test.pdf"
+
+    def test_empty_url_fails_fast_through_the_real_transport(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """An empty paperless.url raises httpx's own text on the first request."""
+        client = PaperlessClient(url="", token=_MOCK_AUTH, max_retries=3)
+        try:
+            with pytest.raises(PaperlessError, match="protocol") as exc_info:
+                client.upload_document(sample_pdf, title="Empty URL")
+        finally:
+            client.close()
+        assert isinstance(exc_info.value.__cause__, httpx.UnsupportedProtocol)
+        assert sleeps == []
+
+    @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
+    def test_4xx_body_is_rendered_and_never_falls_back(
+        self,
+        consume_name: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        sleeps: list[float],
+    ) -> None:
+        """
+        D-09: a 4xx names status, reason and the first field error.
+
+        An empty ``consume_name`` runs without a consume directory; either
+        way a rejection is final and nothing is copied.
+        """
+        consume_dir = tmp_path / "consume"
+        handler = _CountingHandler(
+            _answering(
+                httpx.Response(400, json={"title": ["This field may not be blank."]})
+            )
+        )
+        client = _upload_client(
+            handler, consume_dir=str(tmp_path / consume_name) if consume_name else ""
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            "Paperless rejected the upload (400 Bad Request): "
+            "title: This field may not be blank."
+        )
+        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+        assert handler.calls == 1
+        assert sleeps == []
+        assert not consume_dir.exists()
+
+    def test_5xx_is_retried_then_raises(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """A 503 on every attempt exhausts the retries and names the status."""
+        handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(
+                PaperlessError, match=r"failed after 3 attempts: .*503"
+            ) as exc_info:
+                client.upload_document(sample_pdf, title="Down")
+        finally:
+            client.close()
+        assert handler.calls == 3
+        assert sleeps == [1, 2]
+        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+
+    def test_5xx_is_retried_then_falls_back(
+        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """A 503 on every attempt takes the fallback when one is configured."""
+        consume_dir = tmp_path / "consume"
+        handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
+        client = _upload_client(handler, consume_dir=str(consume_dir))
+        try:
+            result = client.upload_document(sample_pdf, title="Down")
+        finally:
+            client.close()
+        assert handler.calls == 3
+        assert sleeps == [1, 2]
+        assert result.consume_dir_path == consume_dir / "test.pdf"
+
+    def test_non_json_200_raises_without_retry(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """A login page served with 200 is a PaperlessError, not a raw ValueError."""
+        handler = _CountingHandler(
+            _answering(httpx.Response(200, text="<html>login</html>"))
+        )
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(
+                PaperlessError,
+                match=(
+                    "Paperless at http://paperless:8000 returned a response "
+                    "that is not JSON"
+                ),
+            ) as exc_info:
+                client.upload_document(sample_pdf, title="Login page")
+        finally:
+            client.close()
+        assert isinstance(exc_info.value.__cause__, ValueError)
+        assert handler.calls == 1
+        assert sleeps == []
+
+    def test_other_http_error_raises_at_once(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
+        """Any remaining httpx.HTTPError (TooManyRedirects) is wrapped and chained."""
+        failure = httpx.TooManyRedirects("Exceeded maximum allowed redirects.")
+        handler = _CountingHandler(_raising(failure))
+        client = _upload_client(handler)
+        try:
+            with pytest.raises(
+                PaperlessError,
+                match=re.escape(
+                    "Could not upload to Paperless at http://paperless:8000: "
+                    "Exceeded maximum allowed redirects."
+                ),
+            ) as exc_info:
+                client.upload_document(sample_pdf, title="Loop")
+        finally:
+            client.close()
+        assert exc_info.value.__cause__ is failure
+        assert handler.calls == 1
+        assert sleeps == []
 
 
 # ---------------------------------------------------------------------------
@@ -883,12 +1236,51 @@ class TestConsumeDir:
             max_retries=1,
         )
         try:
-            with pytest.raises(OSError, match="no space left"):
+            with pytest.raises(
+                PaperlessError,
+                match=(
+                    "Could not copy the PDF to the consume directory "
+                    f"{re.escape(str(consume_dir))}: no space left"
+                ),
+            ) as exc_info:
                 client.upload_document(sample_pdf, title="Doomed")
         finally:
             client.close()
 
+        assert isinstance(exc_info.value.__cause__, OSError)
         assert sorted(entry.name for entry in consume_dir.iterdir()) == []
+
+    def test_an_uncreatable_consume_dir_raises_a_paperless_error(
+        self, sample_pdf: Path, tmp_path: Path
+    ) -> None:
+        """
+        EXC-01: a consume directory that cannot be created is a PaperlessError.
+
+        A regular file sits where the directory should be, so ``mkdir`` fails
+        whatever user runs the tests (a permission-based setup would pass
+        under root).
+        """
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("occupied")
+        consume_dir = blocker / "consume"
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            consume_dir=str(consume_dir),
+            _transport=_make_transport(_always_refused),
+            max_retries=1,
+        )
+        try:
+            with pytest.raises(
+                PaperlessError,
+                match="Could not copy the PDF to the consume directory",
+            ) as exc_info:
+                client.upload_document(sample_pdf, title="Blocked")
+        finally:
+            client.close()
+
+        assert isinstance(exc_info.value.__cause__, OSError)
 
     def test_consume_dir_logs_warning_on_create(
         self, sample_pdf: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
