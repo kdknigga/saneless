@@ -706,9 +706,14 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
 
     """
     new_text = tomlkit.dumps(doc)
-    if "\r\n" in original_text:
+    crlf_count = original_text.count("\r\n")
+    if crlf_count and crlf_count == original_text.count("\n"):
         # tomlkit keeps the CRLF of the lines it parsed but ends the lines it
         # adds with a bare LF; normalise those so the file stays CRLF (D-05).
+        # Only when EVERY line ending in the original is CRLF: a file that
+        # mixes endings, or holds a bare LF inside a multi-line string, is
+        # left as tomlkit wrote it, so no LF the user wrote becomes CRLF and
+        # no string value changes (WR-08).
         new_text = re.sub(r"(?<!\r)\n", "\r\n", new_text)
     try:
         reparsed: object = _comparable(tomllib.loads(new_text))
