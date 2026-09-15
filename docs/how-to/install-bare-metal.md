@@ -57,7 +57,7 @@ You should see output listing your scanner's name, vendor, model, and type. If y
 
 ## Step 4: Create a configuration file
 
-Create `saneless.toml` in your working directory (or `~/.config/saneless/config.toml`):
+Create `saneless.toml` in your working directory (or `$XDG_CONFIG_HOME/saneless/config.toml`, default `~/.config/saneless/config.toml`):
 
 ```toml
 [paperless]

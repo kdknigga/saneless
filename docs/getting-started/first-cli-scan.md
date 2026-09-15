@@ -87,7 +87,7 @@ This is the minimum configuration needed. saneless auto-detects your scanner, so
 
     1. The path you pass with `--config /path/to/config.toml`
     2. `./saneless.toml` (current directory)
-    3. `~/.config/saneless/config.toml`
+    3. `$XDG_CONFIG_HOME/saneless/config.toml` (default `~/.config/saneless/config.toml`)
     4. `/etc/saneless/config.toml`
 
     The first file found is used. For all available configuration options, see the [Configuration reference](../reference/configuration.md).
