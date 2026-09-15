@@ -2434,6 +2434,216 @@ class TestOwedRejections:
         assert owed_after == {}
 
 
+class TestOwedWriteStreak:
+    """
+    A streak of failed owed-write retries degrades the worker.
+
+    WR-10: the idle flush retried owed job-row writes on every tick but only
+    logged a failed retry, so a job store that never healed left the stuck row
+    live and ``/health`` at 200 until an hourly prune failed.  A failed retry
+    is still not a loop-level failure (D-10), but ``_OWED_RETRY_DEGRADED_AFTER``
+    failed idle ticks in a row degrade the worker, and the probe-and-flush
+    recovery path clears it again (D-12).
+    """
+
+    @pytest.mark.parametrize("debt", ["guard", "rejection"])
+    def test_a_persistent_owed_write_fault_degrades_the_worker_in_bounded_idle_ticks(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        debt: str,
+    ) -> None:
+        """
+        WR-10, D-10: an owed write the store never accepts reaches DEGRADED.
+
+        The debt is either the guard's (a failed SCANNING write whose ERROR
+        write failed too, one loop-level failure) or a request-side rejection
+        (no loop-level failure at all).  Either way ``finish_job`` never heals,
+        so every idle retry fails, and the worker must degrade within
+        ``_OWED_RETRY_DEGRADED_AFTER`` ticks rather than hours later.
+        """
+        production_tick = worker_module._IDLE_TICK_SECONDS
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        finishes = _StoreFault(store.finish_job, None)
+        probes = _StoreFault(store.probe, frozenset())
+        monkeypatch.setattr(store, "finish_job", finishes)
+        monkeypatch.setattr(store, "probe", probes)
+        if debt == "guard":
+            update_state = _StoreFault(store.update_state, frozenset({1}))
+            monkeypatch.setattr(store, "update_state", update_state)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            if debt == "guard":
+                job = _submit_jobs(worker, store, 1)[0]
+            else:
+                job = store.create_job("default", "Refused While Broken")
+                worker.owe_rejection(job.id, "queue full")
+            degraded = _wait_until(
+                lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET
+            )
+            assert degraded
+            probed = _wait_until(lambda: len(probes.calls) >= 1, _STATE_BUDGET)
+            streak = worker._failed_flush_ticks
+            loop_failures = worker._consecutive_loop_failures
+            row = _get(store, job.id)
+            alive = worker.is_alive
+            refused = worker.submit(store.create_job("default", "While Degraded"))
+        finally:
+            worker.stop()
+            store.close()
+
+        assert probed
+        assert streak == worker_module._OWED_RETRY_DEGRADED_AFTER
+        assert worker_module._OWED_RETRY_DEGRADED_AFTER >= 2
+        assert worker_module._OWED_RETRY_DEGRADED_AFTER * production_tick <= 30.0
+        assert loop_failures == (1 if debt == "guard" else 0)
+        assert row.is_active
+        assert alive
+        assert refused is SubmitResult.DEGRADED
+        retry_warnings = _worker_records(
+            caplog, logging.WARNING, "Owed job store writes failed"
+        )
+        assert len(retry_warnings) == 1
+        assert retry_warnings[0].exc_info is not None
+        assert _worker_records(caplog, logging.WARNING, "degraded")
+
+    def test_a_worker_degraded_by_a_failed_retry_streak_recovers_once_the_owed_write_lands(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        WR-10, D-12: a streak-degraded worker heals through probe and flush.
+
+        Once the store accepts writes again, the probe succeeds and the owed
+        ERROR write lands, so degraded clears, both failure counts are back to
+        zero, the stuck row carries the guard's own text, and a new scan runs.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        updates = _StoreFault(store.update_state, frozenset({1}))
+        finishes = _StoreFault(store.finish_job, None)
+        probes = _StoreFault(store.probe, frozenset())
+        monkeypatch.setattr(store, "update_state", updates)
+        monkeypatch.setattr(store, "finish_job", finishes)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            first = _submit_jobs(worker, store, 1)[0]
+            degraded = _wait_until(
+                lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET
+            )
+            assert degraded
+            finishes.heal()
+            recovered = _wait_until(
+                lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
+            )
+            row = wait_for_state(store, first.id, JobState.ERROR, _STATE_BUDGET)
+            # The flush drops an entry just after its write lands.
+            drained = _wait_until(
+                lambda: not worker._unrecorded_failures, _STATE_BUDGET
+            )
+            with worker._unrecorded_lock:
+                owed_after = dict(worker._unrecorded_failures)
+            streak_after = worker._failed_flush_ticks
+            loop_after = worker._consecutive_loop_failures
+            second = _submit_jobs(worker, store, 1)[0]
+            finished = wait_for_state(store, second.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert recovered
+        assert drained
+        assert row.error == _DISK_ERROR
+        assert row.error_category == classify_error(
+            sqlite3.OperationalError(_DISK_ERROR)
+        )
+        assert owed_after == {}
+        assert streak_after == 0
+        assert loop_after == 0
+        assert finished.state is JobState.DONE
+        assert _worker_records(caplog, logging.INFO, "recovered")
+
+    def test_owed_write_retries_failing_fewer_ticks_than_the_streak_never_degrade(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        WR-10, D-10: a fault that heals inside the streak never degrades.
+
+        For each of two jobs the guard's ERROR write fails, then one tick fewer
+        than the streak limit of retries fail, then the next retry lands.  A
+        retry that lands resets the streak, so the two short streaks never add
+        up: no probe runs, the worker stays HEALTHY, and each streak logs its
+        first failed retry at WARNING exactly once.
+        """
+        # Mirrors _OWED_RETRY_DEGRADED_AFTER, the production streak limit.
+        threshold = 3
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        update_state = _StoreFault(store.update_state, frozenset({1, 2}))
+        # One finish call per tick while one entry is owed: the guard's write
+        # and threshold - 1 retries fail, then the next retry lands -- per job.
+        finish_job = _StoreFault(
+            store.finish_job,
+            frozenset(range(1, threshold + 1))
+            | frozenset(range(threshold + 2, 2 * threshold + 2)),
+        )
+        probes = _StoreFault(store.probe, frozenset())
+        monkeypatch.setattr(store, "update_state", update_state)
+        monkeypatch.setattr(store, "finish_job", finish_job)
+        monkeypatch.setattr(store, "probe", probes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            first = _submit_jobs(worker, store, 1)[0]
+            first_row = wait_for_state(store, first.id, JobState.ERROR, _STATE_BUDGET)
+            second = _submit_jobs(worker, store, 1)[0]
+            second_row = wait_for_state(store, second.id, JobState.ERROR, _STATE_BUDGET)
+            drained = _wait_until(
+                lambda: not worker._unrecorded_failures, _STATE_BUDGET
+            )
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert drained
+        assert first_row.error == _DISK_ERROR
+        assert second_row.error == _DISK_ERROR
+        assert probes.calls == []
+        assert health is WorkerHealth.HEALTHY
+        retry_warnings = _worker_records(
+            caplog, logging.WARNING, "Owed job store writes failed"
+        )
+        assert len(retry_warnings) == 2
+
+
 # Loop-level failures in a row that make a worker degraded (D-10).
 _DEGRADING_JOBS = 3
 
