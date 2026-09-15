@@ -303,6 +303,88 @@ class TestSymlinkAndReadonly:
             target.chmod(0o600)
 
 
+class TestReadOnlyMount:
+    """
+    A read-only mount is reported with the mount fix, not as EACCES (WR-01).
+
+    ``statvfs`` is faked here so the tests run anywhere; ``TestRealBindMount``
+    checks the kernel's own answer where user namespaces are available.
+    """
+
+    @staticmethod
+    def _fake_read_only(monkeypatch: pytest.MonkeyPatch, read_only: set[Path]) -> None:
+        """Report ``ST_RDONLY`` for exactly the paths in ``read_only``."""
+        real_statvfs = os.statvfs
+
+        def statvfs(path: str | Path) -> os.statvfs_result:
+            """Return the real result, with the read-only flag faked."""
+            result = real_statvfs(path)
+            flags = result.f_flag & ~os.ST_RDONLY
+            if Path(path) in read_only:
+                flags |= os.ST_RDONLY
+            fields = list(result)
+            fields[8] = flags
+            return os.statvfs_result(fields)
+
+        monkeypatch.setattr(os, "statvfs", statvfs)
+
+    def test_read_only_single_file_mount_is_the_d08_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A read-only file in a writable directory is its own mount: D-08."""
+        target = tmp_path / "config.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        self._fake_read_only(monkeypatch, {target.resolve()})
+        directories = _record_mkstemp(monkeypatch)
+
+        with pytest.raises(ConfigError) as excinfo:
+            replace_file_atomically(target, _NEW)
+
+        message = str(excinfo.value)
+        assert str(target.resolve()) in message
+        assert "bind-mounted as a single file" in message
+        assert "Mount its directory instead" in message
+        assert "docs/how-to/deploy-docker-compose.md" in message
+        assert "Permission denied" not in message
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
+        assert directories == [], "a temp file was created before refusing"
+
+    def test_read_only_directory_mount_is_a_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A file and its directory on one read-only mount name that mount."""
+        target = tmp_path / "config.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        self._fake_read_only(monkeypatch, {target.resolve(), tmp_path.resolve()})
+
+        with pytest.raises(ConfigError) as excinfo:
+            replace_file_atomically(target, _NEW)
+
+        message = str(excinfo.value)
+        assert str(target.resolve()) in message
+        assert "read-only mount" in message
+        assert "read-write" in message
+        assert "docs/how-to/deploy-docker-compose.md" in message
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
+
+    def test_writable_mount_read_only_file_is_still_permission_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A chmod 0444 file on a writable mount is refused as read-only."""
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses file permissions")
+        target = tmp_path / "config.toml"
+        target.write_bytes(_ORIGINAL.encode("utf-8"))
+        target.chmod(0o444)
+        self._fake_read_only(monkeypatch, set())
+
+        try:
+            with pytest.raises(PermissionError):
+                replace_file_atomically(target, _NEW)
+        finally:
+            target.chmod(0o600)
+
+
 class TestModeAndOwner:
     """The rewritten file keeps the original's mode and, when allowed, owner."""
 
@@ -483,9 +565,14 @@ print("replaced")
 
 
 def _run_in_mount_namespace(
-    source: Path, mount_point: Path, target: Path
+    source: Path, mount_point: Path, target: Path, *, read_only: bool = False
 ) -> subprocess.CompletedProcess[str]:
-    """Bind-mount ``source`` on ``mount_point`` in a private namespace, then write."""
+    """
+    Bind-mount ``source`` on ``mount_point`` in a private namespace, then write.
+
+    With ``read_only`` the bind mount is remounted read-only first, the
+    legacy ``:ro`` compose mount.
+    """
     env = {
         **os.environ,
         "SANELESS_TEST_SOURCE": str(source),
@@ -493,6 +580,7 @@ def _run_in_mount_namespace(
         "SANELESS_TEST_TARGET": str(target),
         "SANELESS_TEST_PYTHON": sys.executable,
         "SANELESS_TEST_SCRIPT": _NAMESPACE_SCRIPT,
+        "SANELESS_TEST_READ_ONLY": "1" if read_only else "",
     }
     return subprocess.run(
         [
@@ -503,6 +591,8 @@ def _run_in_mount_namespace(
             "/bin/sh",
             "-c",
             'mount --bind "$SANELESS_TEST_SOURCE" "$SANELESS_TEST_MOUNT_POINT" '
+            '&& { [ -z "$SANELESS_TEST_READ_ONLY" ] '
+            '|| mount -o remount,bind,ro "$SANELESS_TEST_MOUNT_POINT"; } '
             '&& exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SCRIPT" '
             '"$SANELESS_TEST_TARGET"',
         ],
@@ -550,6 +640,51 @@ class TestRealBindMount:
         assert "Mount its directory instead" in completed.stdout
         assert host_file.read_text(encoding="utf-8") == _ORIGINAL
         _leftovers(container_dir)
+
+    def test_real_read_only_single_file_mount_names_the_mount_fix(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A legacy ``:ro`` single-file mount gets D-08's fix, not EACCES (WR-01).
+
+        ``os.access`` answers False on a read-only filesystem even for root, so
+        without a mount check the operator was told "Permission denied" and
+        went looking at file permissions.
+        """
+        host_file = tmp_path / "host-config.toml"
+        host_file.write_text(_ORIGINAL, encoding="utf-8")
+        container_dir = tmp_path / "etc-saneless"
+        container_dir.mkdir()
+        mounted = container_dir / "config.toml"
+        mounted.write_text("", encoding="utf-8")
+
+        completed = _run_in_mount_namespace(host_file, mounted, mounted, read_only=True)
+
+        assert completed.returncode == 3, completed.stderr
+        assert "bind-mounted as a single file" in completed.stdout
+        assert "Mount its directory instead" in completed.stdout
+        assert host_file.read_text(encoding="utf-8") == _ORIGINAL
+        _leftovers(container_dir)
+
+    def test_real_read_only_directory_mount_names_the_mount_fix(
+        self, tmp_path: Path
+    ) -> None:
+        """A config in a ``:ro`` directory mount is reported as a read-only mount."""
+        host_dir = tmp_path / "config"
+        host_dir.mkdir()
+        host_file = host_dir / "config.toml"
+        host_file.write_text(_ORIGINAL, encoding="utf-8")
+        container_dir = tmp_path / "etc-saneless"
+        container_dir.mkdir()
+
+        completed = _run_in_mount_namespace(
+            host_dir, container_dir, container_dir / "config.toml", read_only=True
+        )
+
+        assert completed.returncode == 3, completed.stderr
+        assert "read-only mount" in completed.stdout
+        assert "read-write" in completed.stdout
+        assert host_file.read_text(encoding="utf-8") == _ORIGINAL
 
     def test_real_directory_bind_mount_replaces_the_host_file(
         self, tmp_path: Path

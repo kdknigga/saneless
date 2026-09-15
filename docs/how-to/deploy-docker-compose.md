@@ -172,8 +172,9 @@ docker compose up -d
 
 Earlier versions of this guide bind-mounted the host's `./config.toml` by itself,
 read-only (`:ro`), onto `/etc/saneless/config.toml`. With that mount, every profile
-write fails. A read-only mount refuses the write, and a writable single-file bind mount
-makes the rename fail with EBUSY:
+write fails. A writable single-file bind mount makes the rename fail with EBUSY, and
+saneless checks for a read-only mount before it writes anything. Either way it
+reports:
 
 ```text
 Cannot replace /etc/saneless/config.toml: it is bind-mounted as a single file. Mount its directory instead (see docs/how-to/deploy-docker-compose.md).
