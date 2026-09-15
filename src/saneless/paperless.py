@@ -862,14 +862,13 @@ class PaperlessClient:
         Returns:
             List of tag dicts with at least 'id' and 'name' keys.
 
+        Raises:
+            PaperlessError: If the request fails for any ``httpx.HTTPError``
+                (a non-2xx included) or the body is not JSON, naming the
+                endpoint and base URL and chained to the cause (D-11, EXC-01).
+
         """
-        response = self._client.get(
-            "/api/tags/",
-            params={"page_size": 1000},
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("results", []) if isinstance(data, dict) else data
+        return self._fetch_collection("/api/tags/", "tags")
 
     def get_correspondents(self) -> list[dict[str, object]]:
         """
@@ -878,13 +877,47 @@ class PaperlessClient:
         Returns:
             List of correspondent dicts with at least 'id' and 'name' keys.
 
+        Raises:
+            PaperlessError: If the request fails for any ``httpx.HTTPError``
+                (a non-2xx included) or the body is not JSON, naming the
+                endpoint and base URL and chained to the cause (D-11, EXC-01).
+
         """
-        response = self._client.get(
-            "/api/correspondents/",
-            params={"page_size": 1000},
-        )
-        response.raise_for_status()
-        data = response.json()
+        return self._fetch_collection("/api/correspondents/", "correspondents")
+
+    def _fetch_collection(self, path: str, noun: str) -> list[dict[str, object]]:
+        """
+        Fetch one metadata collection, tolerating both list response shapes.
+
+        This is a module boundary (EXC-01): no httpx type and no raw
+        ValueError leaves it.  A status error is rendered by
+        ``_one_line_reason`` as status, reason and body, so the message stays
+        one line (EXC-02).
+
+        Args:
+            path: The collection endpoint, e.g. ``/api/tags/``.
+            noun: What the collection holds, for the message.
+
+        Returns:
+            The ``results`` of a paginated response, or a bare list as is.
+
+        Raises:
+            PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
+                <reason>``, chained to the httpx error or the ValueError.
+
+        """
+        prefix = f"Could not fetch {noun} from Paperless at {self._base_url}"
+        try:
+            response = self._client.get(path, params={"page_size": 1000})
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            msg = f"{prefix}: {_one_line_reason(exc)}"
+            raise PaperlessError(msg) from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            msg = f"{prefix}: {_one_line_reason(exc)}"
+            raise PaperlessError(msg) from exc
         return data.get("results", []) if isinstance(data, dict) else data
 
     def close(self) -> None:
