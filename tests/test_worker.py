@@ -14,7 +14,11 @@ import pytest
 from PIL import Image, ImageDraw
 
 from saneless import worker as worker_module
-from saneless.auto_profiles import generate_profiles, is_bare_default
+from saneless.auto_profiles import (
+    ProfileWriteResult,
+    generate_profiles,
+    is_bare_default,
+)
 from saneless.config import ProfileConfig, Settings, config_search_paths
 from saneless.exceptions import (
     ConfigError,
@@ -3775,6 +3779,70 @@ class TestStartupProfileGeneration:
         )
         for name in set(expected) - {"default"}:
             assert worker.get_profile(name) == expected[name]
+
+    def test_startup_generation_memory_keeps_every_unpersisted_name(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        WR-03 / D-01: a name the write did not persist keeps its loaded profile.
+
+        The worker never forces, so a flagged file profile is skipped as
+        existing and an unflagged one as not generated; in both cases memory
+        must match what a restart loads, not the generated profile.
+        """
+        loaded = {"default": ProfileConfig(), "flatbed": ProfileConfig(resolution=150)}
+        generated = {
+            "default": ProfileConfig(source="ADF", auto_generated=True),
+            "flatbed": ProfileConfig(source="Flatbed", auto_generated=True),
+            "adf": ProfileConfig(source="ADF", auto_generated=True),
+        }
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            added=("adf",),
+            skipped_not_generated=("default",),
+            skipped_existing=("flatbed",),
+        )
+
+        profiles = worker_module._profiles_after_persist(loaded, generated, result)
+
+        assert profiles["default"] == loaded["default"]
+        assert profiles["flatbed"] == loaded["flatbed"]
+        assert profiles["adf"] == generated["adf"]
+
+    def test_startup_generation_logs_the_grouped_result(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-04: the startup INFO line uses the CLI's group vocabulary."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        self._mock_caps_scanner(mock_scanner)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text('[profiles.default]\nsource = "Flatbed"\n')
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: bool(_worker_records(caplog, logging.INFO, "Added: ")),
+                _STATE_BUDGET,
+            )
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        records = _worker_records(caplog, logging.INFO, "Added: ")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert str(config_file.resolve()) in message
+        assert "'flatbed'" in message
+        assert "Skipped (not auto-generated): 'default'" in message
 
     def test_startup_generation_without_a_loaded_file_writes_nothing(
         self,
