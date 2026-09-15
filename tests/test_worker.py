@@ -1804,6 +1804,11 @@ _DISK_ERROR = "disk I/O error"
 # inside a test instead of once every five seconds.
 _FAST_TICK = 0.02
 
+# An owed-write streak limit no test window can reach, for tests that
+# deliberately watch the store fail before healing it.  TestOwedWriteStreak
+# pins the real limit.
+_UNREACHABLE_STREAK = 1_000_000
+
 
 class _StoreFault:
     """
@@ -2236,11 +2241,17 @@ class TestWorkerGuard:
         CR-01, D-10, D-12: owed writes are retried on every idle tick, not probed.
 
         ``stranded`` loop-level failures stay below ``_DEGRADED_AFTER``, and the
-        guard's ERROR write for each fails too.  Failed retries are not counted,
-        so the worker stays HEALTHY and never probes; once the store accepts
-        writes, every stranded row reaches ERROR with the guard's own text.
+        guard's ERROR write for each fails too.  Failed retries are not
+        loop-level failures, and the streak limit is raised so the observation
+        window before healing cannot reach it (WR-10 is pinned by
+        ``TestOwedWriteStreak``), so the worker stays HEALTHY and never probes;
+        once the store accepts writes, every stranded row reaches ERROR with the
+        guard's own text.
         """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker._OWED_RETRY_DEGRADED_AFTER", _UNREACHABLE_STREAK
+        )
         monkeypatch.setattr(
             "saneless.worker.run_pipeline",
             lambda *_args, **_kwargs: _success_result(),
@@ -2270,7 +2281,10 @@ class TestWorkerGuard:
                 for job in jobs
             ]
             latest = store.latest_run_job()
-            owed_after = dict(worker._unrecorded_failures)
+            # The flush drops an entry just after its write lands.
+            assert _wait_until(lambda: not worker._unrecorded_failures, _STATE_BUDGET)
+            with worker._unrecorded_lock:
+                owed_after = dict(worker._unrecorded_failures)
             health_after = worker.health
         finally:
             worker.stop()
@@ -2307,7 +2321,8 @@ class TestOwedRejections:
     needs a second write, and when that write fails the row would stay PENDING
     with no REJECTED marker (D-06).  The route owes it to the worker instead,
     and the worker's idle flush -- shared with the guard's owed failures --
-    writes it on its next tick, never counting a failed retry (D-12, D-10).
+    writes it on its next tick (D-12).  A failed retry is never a loop-level
+    failure (D-10), while a streak of them degrades the worker (WR-10).
     """
 
     def test_an_owed_rejection_is_written_on_the_next_idle_tick(
@@ -2339,14 +2354,22 @@ class TestOwedRejections:
         assert health is WorkerHealth.HEALTHY
         assert probes.calls == []
 
-    def test_an_owed_rejection_retry_failure_never_counts_towards_degraded(
+    def test_a_failed_owed_rejection_retry_is_not_a_loop_level_failure(
         self,
         worker_for: Callable[[JobStore], ScanWorker],
         monkeypatch: pytest.MonkeyPatch,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """A request-side debt the store refuses is retried, never counted (D-10)."""
+        """
+        A request-side debt the store refuses is retried, never a loop failure.
+
+        It is never counted as a loop-level failure (D-10).  The streak limit is
+        raised so the three-failure window cannot degrade it.
+        """
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker._OWED_RETRY_DEGRADED_AFTER", _UNREACHABLE_STREAK
+        )
         store = JobStore()
         finishes = _StoreFault(store.finish_job, None)
         monkeypatch.setattr(store, "finish_job", finishes)
