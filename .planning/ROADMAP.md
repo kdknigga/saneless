@@ -425,8 +425,8 @@ Plans:
 
 **Wave 1**
 
-- [ ] 27-01-PLAN.md — (wave 1) SecretStr token, validated `log_level`, literal `default_title` + shared `resolve_job_title` wired into the web route
-- [ ] 27-02-PLAN.md — (wave 1) `atomic_write.replace_file_atomically`: same-dir mkstemp, fsync, rename, mode/owner copy, symlink write-through, EBUSY -> ConfigError
+- [x] 27-01-PLAN.md — (wave 1) SecretStr token, validated `log_level`, literal `default_title` + shared `resolve_job_title` wired into the web route
+- [x] 27-02-PLAN.md — (wave 1) `atomic_write.replace_file_atomically`: same-dir mkstemp, fsync, rename, mode/owner copy, symlink write-through, EBUSY -> ConfigError
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -529,7 +529,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
-| 27. Configuration Strictness | 0/? | Not started | - |
+| 27. Configuration Strictness | 2/8 | In Progress|  |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
 | 30. Appliance Layer | 0/? | Not started | - |
