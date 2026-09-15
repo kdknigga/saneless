@@ -2456,6 +2456,55 @@ class TestOwedRejections:
         assert all(row.error == "queue full" for row in rows)
         assert owed_after == {}
 
+    def test_owed_rejection_ids_lists_only_rejections_still_owed(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Only owed REJECTED writes are listed, and only until they are written.
+
+        IN-08, D-06: the status area skips these ids so a refused attempt is
+        never shown as the live job.  A failure the loop guard could not write
+        belongs to a job that ran, so it is left out and D-17 still reports
+        it.  The streak limit is raised so the failing window cannot degrade.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker._OWED_RETRY_DEGRADED_AFTER", _UNREACHABLE_STREAK
+        )
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        updates = _StoreFault(store.update_state, frozenset({1}))
+        finishes = _StoreFault(store.finish_job, None)
+        monkeypatch.setattr(store, "update_state", updates)
+        monkeypatch.setattr(store, "finish_job", finishes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            guard = _submit_jobs(worker, store, 1)[0]
+            assert _wait_until(
+                lambda: guard.id in worker._unrecorded_failures, _STATE_BUDGET
+            )
+            refused = store.create_job("default", "Refused")
+            worker.owe_rejection(refused.id, "queue full")
+            owed = worker.owed_rejection_ids()
+            finishes.heal()
+            wait_for_state(store, refused.id, JobState.ERROR, _STATE_BUDGET)
+            assert _wait_until(lambda: not worker.owed_rejection_ids(), _STATE_BUDGET)
+            after = worker.owed_rejection_ids()
+        finally:
+            worker.stop()
+            store.close()
+
+        assert owed == frozenset({refused.id})
+        assert isinstance(owed, frozenset)
+        assert after == frozenset()
+
 
 class TestOwedWriteStreak:
     """
