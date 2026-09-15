@@ -60,6 +60,8 @@ __all__ = [
     "resolve_job_title",
     "validate_settings_dirs",
     "warn_on_legacy_duplex_sources",
+    "xdg_config_home",
+    "xdg_state_home",
 ]
 
 logger = logging.getLogger(__name__)
@@ -77,6 +79,79 @@ LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 Each is a key of ``logging.getLevelNamesMapping()`` and, lower-cased, a valid
 uvicorn ``log_level``.
 """
+
+
+def _xdg_base(variable: str, *fallback: str) -> Path:
+    """
+    Resolve an XDG base directory from the environment at call time (CFG-03).
+
+    Per the XDG Base Directory Specification, an unset or empty variable means
+    the ``$HOME``-relative default, and a relative value is invalid and ignored
+    -- otherwise discovery would depend on the working directory (T-27-25).
+
+    Args:
+        variable: The environment variable, e.g. ``XDG_CONFIG_HOME``.
+        *fallback: The path segments of the default below ``$HOME``.
+
+    Returns:
+        The variable's value when it is a non-empty absolute path, else
+        ``$HOME`` joined with ``fallback``.
+
+    """
+    value = os.environ.get(variable, "")
+    if value and Path(value).is_absolute():
+        return Path(value)
+    return Path.home().joinpath(*fallback)
+
+
+def xdg_config_home() -> Path:
+    """
+    Return the XDG config home, ``$XDG_CONFIG_HOME`` or ``~/.config`` (CFG-03).
+
+    Read at call time, not import, so a later HOME or XDG change is honoured.
+    An empty or relative ``$XDG_CONFIG_HOME`` is ignored, per the basedir spec.
+
+    Returns:
+        The base directory user configuration files are searched under.
+
+    """
+    return _xdg_base("XDG_CONFIG_HOME", ".config")
+
+
+def xdg_state_home() -> Path:
+    """
+    Return the XDG state home, ``$XDG_STATE_HOME`` or ``~/.local/state`` (CFG-03).
+
+    Read at call time, not import, so a later HOME or XDG change is honoured.
+    An empty or relative ``$XDG_STATE_HOME`` is ignored, per the basedir spec.
+
+    Returns:
+        The base directory durable state (database, log) defaults live under.
+
+    """
+    return _xdg_base("XDG_STATE_HOME", ".local", "state")
+
+
+def _default_data_dir() -> str:
+    """
+    Compute the default ``output.data_dir``: ``$XDG_STATE_HOME/saneless``.
+
+    Returns:
+        The default durable state directory, as a string.
+
+    """
+    return str(xdg_state_home() / "saneless")
+
+
+def _default_log_file() -> str:
+    """
+    Compute the default ``output.log_file``, inside the default ``data_dir``.
+
+    Returns:
+        ``$XDG_STATE_HOME/saneless/saneless.log``, as a string.
+
+    """
+    return str(xdg_state_home() / "saneless" / "saneless.log")
 
 
 def _is_legacy_manual_duplex_source(source: str) -> bool:
@@ -219,11 +294,12 @@ class OutputConfig(BaseModel):
 
     tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
     # Durable state: the job database and preserved scans. Deliberately NOT
-    # under tmp_dir, which is disposable scratch space. The hardcoded
-    # Path.home() form matches log_file below so Phase 27's XDG expansion
-    # changes both defaults in a single edit; no env var is consulted here.
-    data_dir: str = str(Path.home() / ".local" / "state" / "saneless")
-    log_file: str = str(Path.home() / ".local" / "state" / "saneless" / "saneless.log")
+    # under tmp_dir, which is disposable scratch space. Phase 23 (D-14) kept
+    # the data_dir and log_file defaults in step; both now follow
+    # $XDG_STATE_HOME (CFG-03), computed per instance rather than at import.
+    # The Dockerfile's SANELESS_OUTPUT__DATA_DIR still overrides data_dir.
+    data_dir: str = Field(default_factory=_default_data_dir)
+    log_file: str = Field(default_factory=_default_log_file)
     log_level: LogLevel = "INFO"
     log_max_bytes: int = 10_485_760
     log_backup_count: int = 5
@@ -319,9 +395,12 @@ class Settings(BaseSettings):
         extra="forbid",
     )
 
-    scanner: ScannerConfig = ScannerConfig()
-    paperless: PaperlessConfig = PaperlessConfig()
-    output: OutputConfig = OutputConfig()
+    # default_factory, not a plain instance: an ``OutputConfig()`` default is
+    # built once at import and would freeze the HOME/XDG state defaults
+    # (CFG-03, RESEARCH Pitfall 3). scanner and paperless match for consistency.
+    scanner: ScannerConfig = Field(default_factory=ScannerConfig)
+    paperless: PaperlessConfig = Field(default_factory=PaperlessConfig)
+    output: OutputConfig = Field(default_factory=OutputConfig)
     profiles: dict[str, ProfileConfig] = {"default": ProfileConfig()}
 
     # A PrivateAttr, not a field: a field would be settable from
@@ -912,8 +991,10 @@ def config_search_paths() -> tuple[Path, ...]:
     List the config file locations searched when no explicit path is given.
 
     The single search list for both loading and the CLI's write target
-    (D-16). A function rather than a module constant so ``Path.home()`` is
-    read when called, not at import.
+    (D-16): ``./saneless.toml``, then ``$XDG_CONFIG_HOME/saneless/config.toml``
+    (``~/.config`` when unset, CFG-03), then ``/etc/saneless/config.toml``. A
+    function rather than a module constant so HOME and ``$XDG_CONFIG_HOME``
+    are read when called, not at import.
 
     Returns:
         The candidate paths, in search order.
@@ -921,7 +1002,7 @@ def config_search_paths() -> tuple[Path, ...]:
     """
     return (
         Path("./saneless.toml"),
-        Path.home() / ".config" / "saneless" / "config.toml",
+        xdg_config_home() / "saneless" / "config.toml",
         Path("/etc/saneless/config.toml"),
     )
 
