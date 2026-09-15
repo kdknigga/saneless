@@ -2106,6 +2106,63 @@ class TestServeCommand:
         assert calls == ["uvicorn.run"]
         assert "Cancelled" not in result.output
 
+    def test_serve_sane_init_failure_exits_2_not_1(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        SANE failing to initialise stops ``serve`` starting: exit 2, not 1 (WR-07).
+
+        ``serve`` scans nothing itself, so its setup failures share the D-07
+        amendment's "can't start, fix your setup" code.
+        """
+        self._mock_socket(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 0)
+
+        class FailingSaneBackend:
+            """A backend whose construction fails the way ``sane.init()`` does."""
+
+            def __init__(self, host: str = "") -> None:
+                msg = "Could not initialise SANE: Error during device I/O"
+                raise ScanError(msg)
+
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=self._loopback_settings(),
+            scanner_cls=FailingSaneBackend,
+        )
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        assert result.stderr.splitlines() == [
+            "The web server could not start: Could not initialise SANE: "
+            "Error during device I/O"
+        ]
+        assert runs == []
+
+    def test_serve_ctrl_c_before_the_server_starts_exits_130(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Ctrl-C during start-up, before uvicorn owns the signal, is a cancel (D-03).
+
+        Only uvicorn's own graceful stop exits 0; the reference documents both.
+        """
+        self._mock_socket(monkeypatch)
+        runs = self._uvicorn_exits(monkeypatch, 0)
+
+        def interrupted_create_app(*_args: object, **_kwargs: object) -> object:
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr("saneless.cli.create_app", interrupted_create_app)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 130, result.output
+        assert result.stderr.splitlines() == ["Cancelled (interrupted)"]
+        assert runs == []
+
     def test_serve_malformed_paperless_url_exits_3(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

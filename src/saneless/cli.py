@@ -37,6 +37,7 @@ from .exceptions import (
     ConfigError,
     SanelessError,
     ScanCancelledError,
+    ScanError,
     StorageError,
     describe,
 )
@@ -751,7 +752,14 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     actual_host = host or settings.output.web_host
     actual_port = port or settings.output.web_port
 
-    scanner = SaneBackend(host=settings.scanner.host)
+    # serve scans nothing itself, so SANE failing to initialise is a failure
+    # to start -- "can't start, fix your setup", exit 2 like a port that cannot
+    # be bound -- not exit 1, which means a scan failed (D-07 amendment, WR-07).
+    try:
+        scanner = SaneBackend(host=settings.scanner.host)
+    except ScanError as exc:
+        msg = f"The web server could not start: {exc}"
+        raise ConfigError(msg) from exc
     app = create_app(settings, scanner)
 
     # Check port availability before starting to give a clear error. A port
@@ -779,6 +787,8 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # status becomes a ConfigError, exit 2 (D-07 amendment). A clean SystemExit
     # passes through unchanged. Ctrl-C needs no handling: uvicorn.run swallows
     # KeyboardInterrupt and returns (measured), so a normal stop exits 0 (D-03).
+    # A Ctrl-C before this point -- while settings load or the app is built --
+    # is not uvicorn's to handle; it reaches the group guard, exit 130.
     try:
         uvicorn.run(
             app,

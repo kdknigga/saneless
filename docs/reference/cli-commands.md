@@ -27,7 +27,7 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | 5 | Unexpected error only: a saneless bug. The line names the exception type and the traceback is in the log file |
 | 130 | Cancelled by the operator |
 
-Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve`, where Ctrl-C is a graceful stop that exits 0. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
+Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
 
 ---
 
@@ -150,10 +150,11 @@ saneless [--config PATH] [-v] serve [--host ADDR] [--port N]
 
 | Code | Meaning |
 |------|---------|
-| 0 | Clean shutdown, including Ctrl-C |
-| 2 | Cannot start (port already in use, web server failed to start, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
+| 0 | Clean shutdown, including Ctrl-C once the web server is running |
+| 2 | Cannot start (port already in use, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
 | 3 | Malformed Paperless URL |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 130 | Cancelled (Ctrl-C before the web server has started) |
 
 ---
 
