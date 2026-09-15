@@ -775,7 +775,9 @@ def _acquire_pages(
                 # errors -- including the timeout path's -- propagate here.
                 raise
             except Exception as exc:
-                scan_error_msg = f"Scanner error on page {page_num + 1}: {exc}"
+                scan_error_msg = (
+                    f"Scanner error on page {page_num + 1}: {describe(exc)}"
+                )
                 raise ScanError(scan_error_msg) from exc
 
             page_num += 1
@@ -993,6 +995,7 @@ def _configure_device(
     effective_source: str,
     *,
     has_source_option: bool,
+    device_id: str,
 ) -> int:
     """
     Assign the scan options to the open device, source first (D-11).
@@ -1019,18 +1022,41 @@ def _configure_device(
         has_source_option: Whether the device exposes a ``source`` option at
             all.  Keyword-only, because a positional boolean is not allowed by
             this project's lint rules.
+        device_id: The SANE device name, for the error messages.
 
     Returns:
         The resolution the device actually reports, as an ``int``.  The device
         returns a float; callers downstream want whole dpi.
 
-    """
-    if has_source_option:
-        dev.source = effective_source
-    dev.mode = settings.mode
-    dev.resolution = settings.resolution
+    Raises:
+        ScanError: If the device refuses an assignment -- python-sane raises
+            ``_sane.error`` for a bad value and ``AttributeError`` for an
+            inactive option -- or the resolution cannot be read back.  The
+            message names the option, the value (``!r``, so control characters
+            are escaped) and the device, and the original is the cause (D-08).
 
-    actual_resolution = int(dev.resolution)
+    """
+    # One try per assignment, in order, so the message names the option that
+    # failed.  The order itself is the load-bearing part described above.
+    assignments: list[tuple[str, str | int]] = []
+    if has_source_option:
+        assignments.append(("source", effective_source))
+    assignments.append(("mode", settings.mode))
+    assignments.append(("resolution", settings.resolution))
+    for name, value in assignments:
+        try:
+            setattr(dev, name, value)
+        except Exception as exc:
+            set_msg = (
+                f"Could not set {name} to {value!r} on {device_id}: {describe(exc)}"
+            )
+            raise ScanError(set_msg) from exc
+
+    try:
+        actual_resolution = int(dev.resolution)
+    except Exception as exc:
+        read_msg = f"Could not read back resolution from {device_id}: {describe(exc)}"
+        raise ScanError(read_msg) from exc
     if actual_resolution != settings.resolution:
         logger.warning(
             "Scanner substituted resolution: requested %s dpi, device reports %s dpi",
@@ -1038,6 +1064,68 @@ def _configure_device(
             actual_resolution,
         )
     return actual_resolution
+
+
+def _read_options(dev: SaneDevice, device_id: str) -> list:
+    """
+    Read the device's option list, as a saneless error on failure.
+
+    Shared by ``get_capabilities`` and ``scan_pages``, so both report a failed
+    read with the same message.
+
+    Args:
+        dev: Open SANE device handle.
+        device_id: The SANE device name, for the error message.
+
+    Returns:
+        The option tuples ``get_options()`` reports.
+
+    Raises:
+        ScanError: If the device cannot report its options, naming the device
+            and chained to the original (D-08).
+
+    """
+    try:
+        return dev.get_options()
+    except Exception as exc:
+        options_msg = f"Could not read options from {device_id}: {describe(exc)}"
+        raise ScanError(options_msg) from exc
+
+
+def _snap_flatbed(dev: SaneDevice, device_id: str) -> Image.Image:
+    """
+    Acquire one flatbed page, translating python-sane's errors.
+
+    ``start()`` opens the SANE data channel and ``snap()`` drains it, so the
+    two are wrapped together and nothing else is.
+
+    The one message python-sane's own ADF iterator treats as the end of the
+    feed (``sane.py:130``) is mapped to ``FeederEmptyError`` by the same exact
+    string test, so a device routed here while reporting an empty feeder still
+    tells the operator to load paper (Phase 24 D-03).  Every other failure --
+    ``_sane.error`` from ``start()``, ``RuntimeError("Scanner returned no
+    data")`` from ``snap()`` -- is a ``ScanError`` naming the device.
+
+    Args:
+        dev: Open SANE device handle, already configured.
+        device_id: The SANE device name, for the error message.
+
+    Returns:
+        The scanned page.
+
+    Raises:
+        FeederEmptyError: If SANE reports the feeder out of documents.
+        ScanError: For any other failure, chained to the original (D-08).
+
+    """
+    try:
+        dev.start()
+        return dev.snap()
+    except Exception as exc:
+        if str(exc) == "Document feeder out of documents":
+            raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
+        snap_msg = f"Scanner error on {device_id}: {describe(exc)}"
+        raise ScanError(snap_msg) from exc
 
 
 class SaneDevice(Protocol):
@@ -1194,7 +1282,7 @@ class SaneBackend(ScannerBackend):
 
         """
         with self._open_device(device_id) as dev:
-            raw_options = dev.get_options()
+            raw_options = _read_options(dev, device_id)
             sources = _constraint(raw_options, "source").values or []
             modes = _constraint(raw_options, "mode").values or []
             resolution = _constraint(raw_options, "resolution")
@@ -1274,7 +1362,7 @@ class SaneBackend(ScannerBackend):
             # constraint from it and _set_geometry reads the scan-area options,
             # and a second get_options() call would be a second device round
             # trip for a list that cannot have changed in between.
-            raw_options = dev.get_options()
+            raw_options = _read_options(dev, device_id)
 
             # Validate source option against device capabilities
             effective_source, has_source_option = _resolve_source(
@@ -1290,6 +1378,7 @@ class SaneBackend(ScannerBackend):
                 settings,
                 effective_source,
                 has_source_option=has_source_option,
+                device_id=device_id,
             )
 
             # Constrain the scan area to the paper size, if the device reports
@@ -1328,8 +1417,7 @@ class SaneBackend(ScannerBackend):
                 # Flatbed: start() initiates the SANE data channel, then
                 # snap() drains it via sane_read() loop.  Without start()
                 # the read loop has no data source.
-                dev.start()
-                image = dev.snap()
+                image = _snap_flatbed(dev, device_id)
                 # The same two integrity checks the feeder path runs.  The
                 # reason given for omitting them here -- that the caller sees
                 # any failure as an exception -- describes the case they are
