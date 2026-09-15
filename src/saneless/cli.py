@@ -49,7 +49,7 @@ from .pipeline import (
     PipelineRequest,
     run_pipeline,
 )
-from .scanner.sane_backend import SaneBackend
+from .scanner.sane_backend import SaneBackend, require_sane
 from .vocabulary import (
     ErrorCategory,
     ExitCode,
@@ -492,6 +492,10 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
 @click.pass_context
 def scan(ctx: click.Context, profile: str, title: str) -> None:
     """Scan a document and upload to paperless-ngx."""
+    # python-sane is mandatory: a command that needs it refuses before loading
+    # config or touching the device, exit 2 through the guard (D-05). --help
+    # never reaches this body, so it needs no python-sane (CFG-10).
+    require_sane()
     settings = _load_cli_settings(ctx)
 
     if profile not in settings.profiles:
@@ -604,6 +608,10 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
 @click.pass_context
 def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     """List available scanning devices."""
+    # python-sane is mandatory: a command that needs it refuses before loading
+    # config or touching the device, exit 2 through the guard (D-05). --help
+    # never reaches this body, so it needs no python-sane (CFG-10).
+    require_sane()
     _settings = _load_cli_settings(ctx)
 
     if not as_json:
@@ -717,6 +725,10 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
 @click.pass_context
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Start the web server."""
+    # python-sane is mandatory: a command that needs it refuses before loading
+    # config or touching the device, exit 2 through the guard (D-05). --help
+    # never reaches this body, so it needs no python-sane (CFG-10).
+    require_sane()
     settings = _load_cli_settings(ctx)
     actual_host = host or settings.output.web_host
     actual_port = port or settings.output.web_port
@@ -792,6 +804,10 @@ def _echo_write_result(
 @click.pass_context
 def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     """Generate scan profiles from scanner capabilities."""
+    # python-sane is mandatory: a command that needs it refuses before loading
+    # config or touching the device, exit 2 through the guard (D-05). --help
+    # never reaches this body, so it needs no python-sane (CFG-10).
+    require_sane()
     settings = _load_cli_settings(ctx)
 
     scanner = SaneBackend(host=settings.scanner.host)
