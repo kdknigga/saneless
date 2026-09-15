@@ -130,3 +130,12 @@
 - Safe device cancel on Ctrl-C mid-read (HARD-03, Phase 29)
 - Metadata-fetch cause logging (SWP-04, Phase 32)
 - Reference catalogue of error messages (rejected)
+
+---
+
+## Post-research decisions (2026-09-15, during plan-phase)
+
+| Question | Options | Selected |
+|----------|---------|----------|
+| D-10 premise corrected: paperless-ngx v3 consumes a duplicate as a second document by default. Keep widened retry? | Keep wide retry, accept copies (Recommended) / Retry only before sending / Wide retry but no fallback after send | Keep wide retry, accept copies |
+| `serve` exit codes outside D-07 (bind failure = 1, uvicorn startup failure = 3) | Document as serve-specific (Recommended) / Remap to fit D-07 | Remap to fit D-07 (both exit 2) |

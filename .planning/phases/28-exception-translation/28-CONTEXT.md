@@ -94,7 +94,7 @@ Delivers EXC-01..EXC-05 (review findings M-17, N-06, N-08):
 - **D-04: `PdfError(SanelessError)` is a sibling of `ScanError`, with its own `ErrorCategory` and
   exit code 4.** The job record stops saying the scanner failed when the disk was full.
   `classify_error` gains the new branch (ordered `isinstance` chain, `vocabulary.py:661`) and
-  `user_message` gains the total-match entry. Everything `assemble_pdf` can raise becomes
+  `error_message` (`vocabulary.py`, referred to as the user-message map) gains the total-match entry. Everything `assemble_pdf` can raise becomes
   `PdfError` with the original message: all seven img2pdf classes (`AlphaChannelError`,
   `ExifOrientationError`, `ImageOpenError`, `JpegColorspaceError`, `NegativeDimensionError`,
   `PdfTooLargeError`, `UnsupportedColorspaceError`, verified against the installed img2pdf), its
@@ -128,6 +128,13 @@ Delivers EXC-01..EXC-05 (review findings M-17, N-06, N-08):
 
   The codes live in one place in code (the house pattern is a total enum with `match` +
   `assert_never`), not as scattered literals.
+  - **`serve` joins the same table (user decision 2026-09-15, after research).** A port-bind
+    failure (documented today as exit 1) and a uvicorn startup failure (which uvicorn exits with
+    3, colliding with "3 = Paperless error") are both caught and exit **2**, "can't start, fix
+    your setup". Every command shares one table; the `serve` exit-code docs change accordingly.
+    Ctrl-C on `serve` already exits 0 through uvicorn and needs no special case (measured).
+  - "One line" means one *message*: a configuration error keeps Phase 27's header plus one line
+    per problem (D-12), which success criterion 2 accepts.
 
 ### Wrapped message shape and retries (EXC-01)
 - **D-08: one-line messages read `<what saneless was doing, with identifiers>: <original message>`.**
@@ -152,9 +159,14 @@ Delivers EXC-01..EXC-05 (review findings M-17, N-06, N-08):
   `httpx.UnsupportedProtocol` (which *is* a `TransportError` subclass) and `httpx.InvalidURL` (which
   is not) raise a `PaperlessError` immediately. Whether that path still takes the consume-dir
   fallback is the planner's call, leaning towards yes (never lose a scan; no retry ≠ no fallback).
-  - Accepted risk: when Paperless received the upload but the response was lost, the retry's task
-    fails as Paperless's checksum **duplicate**. That failure message must say the document may
-    already be in Paperless, so the user checks before rescanning.
+  - Accepted risk (**corrected after research, re-confirmed by the user 2026-09-15**): when
+    Paperless received the upload but the response was lost, a retry can **silently create a
+    second copy** of the document. Current paperless-ngx (v3.1.3, verified in source) consumes a
+    duplicate as a new document by default and fails it as a duplicate only when
+    `CONSUMER_DELETE_DUPLICATES` is set. The user accepted the copy: a duplicate is easy to
+    delete, a lost scan is not. Where Paperless *does* report a duplicate (failure text containing
+    "duplicate of", or `duplicate_of` in `result_data`, covering v2 and v3), the failure message
+    says the document may already be in Paperless, so the user checks before rescanning.
   - The exhausted-retry message counts attempts truthfully: `Upload failed after 3 attempts`, not
     "retries" (M-17's `max_retries` → `max_attempts` naming; whether the attribute is renamed is the
     planner's call).
@@ -206,7 +218,7 @@ cause.
   If it subclasses `ScanError`, every `except ScanError` and `classify_error` must test the narrower
   class first (the `FeederEmptyError` precedent), with a test proving a cancel never exits 1 or
   records ERROR. A direct `SanelessError` subclass avoids that trap. Planner's call.
-- **Name of the PDF `ErrorCategory`** (e.g. `ASSEMBLY` or `PDF`) and its `user_message` sentence.
+- **Name of the PDF `ErrorCategory`** (e.g. `ASSEMBLY` or `PDF`) and its `error_message` sentence.
 - **Where the python-sane import check lives**: one helper shared by the four commands. It must not
   run on `--help` and must not break the lazy `_ensure_sane` (`sane_backend.py:50-56`).
 - **CANCELLED styling tokens**: a `--saneless-status-cancelled` pair or an existing muted Pico
