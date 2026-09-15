@@ -72,9 +72,10 @@ Other causes of exit 2, each on one line:
   from a terminal or scan from the web UI.
 - **No scanner found.** saneless discovered no scanner to use: `scan` with `scanner.device` empty,
   or `auto-profiles`. Set `scanner.device`, or fix discovery with `saneless devices`.
-- **`serve` cannot start.** The port is already in use, or the web server failed to start. Stop
-  whatever holds the port or pass `--port`; when the web server itself failed, the cause is in the
-  log file.
+- **`serve` cannot start.** The port is already in use, SANE could not be initialised, or the web
+  server failed to start. Stop whatever holds the port or pass `--port`; when SANE failed, the line
+  gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)); when the web server
+  itself failed, the cause is in the log file.
 - **The job database cannot be used.** The line starts with `Job database error:` and names the
   database path and the reason: the file cannot be opened or is not a SQLite database, or its jobs
   table has a shape this version of saneless does not recognise. Check that the path is right,
@@ -143,11 +144,12 @@ Exit 130 means the scan was stopped on purpose, not that something broke:
 
 - You answered no, pressed Ctrl-D or pressed Ctrl-C at the manual duplex flip prompt.
 - You pressed Ctrl-C while a one-shot command (`scan`, `devices`, `auto-profiles`, `jobs`) was
-  running.
+  running, or while `serve` was still starting up.
 
 Nothing is uploaded. In the web UI, a scan cancelled with **Abort scan** at the flip step is shown
 as Cancelled, in grey rather than as an error. A flip wait that times out is not a cancel: it
-fails with exit 1. Ctrl-C on `saneless serve` is a normal stop and exits 0.
+fails with exit 1. Ctrl-C on `saneless serve` once the web server is running is a normal stop and
+exits 0.
 
 ## Unexpected errors (exit 5)
 

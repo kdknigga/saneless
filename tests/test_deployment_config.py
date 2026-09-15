@@ -409,10 +409,15 @@ def test_cli_reference_global_exit_code_table_matches_exit_code_enum() -> None:
 
 def test_cli_reference_command_exit_codes_are_real() -> None:
     """
-    Every command's exit codes are real, and scan, serve and jobs list theirs.
+    Every command's table lists exactly the codes that command can exit with.
 
-    ``serve`` has no 1 (it scans nothing itself) and no 130: its Ctrl-C is
-    uvicorn's graceful stop, exit 0 (D-07 amendment, D-03).
+    ``serve`` has no 1: it scans nothing itself, and SANE failing to initialise
+    is a start-up failure, exit 2 (D-07 amendment, WR-07). It does have 130:
+    Ctrl-C before uvicorn has started is a cancel through the CLI guard, while
+    Ctrl-C once uvicorn is running is its graceful stop, exit 0 (D-03). No
+    command but ``scan`` builds a PDF, so only ``scan`` has 4; only ``scan``
+    and ``serve`` construct a Paperless client, so only they have 3; ``jobs``
+    never touches SANE, so it has no 1.
     """
     text, name = _read(CLI_REFERENCE)
     tables = _command_exit_tables(text, name)
@@ -424,8 +429,10 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
             f"{sorted(codes - EXIT_CODES)}"
         )
     assert _documented_codes(tables["scan"]) == {0, 1, 2, 3, 4, 5, 130}
-    assert _documented_codes(tables["serve"]) == {0, 2, 3, 5}
-    assert {5, 130} <= _documented_codes(tables["jobs"])
+    assert _documented_codes(tables["devices"]) == {0, 1, 2, 5, 130}
+    assert _documented_codes(tables["jobs"]) == {0, 2, 5, 130}
+    assert _documented_codes(tables["serve"]) == {0, 2, 3, 5, 130}
+    assert _documented_codes(tables["auto-profiles"]) == {0, 1, 2, 5, 130}
     assert "abort" not in _table_row(tables["scan"], "1").lower(), (
         f"{name}: scan's exit-1 row still describes a flip-prompt abort"
     )
