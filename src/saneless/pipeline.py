@@ -150,6 +150,29 @@ class FlipCoordinator(ABC):
 
         """
 
+    @property
+    def abort_cause(self) -> Exception | None:
+        """
+        Why the wait answered ``ABORTED``, when it was not the operator's choice.
+
+        An ``ABORTED`` answer usually means someone gave up at the prompt, and
+        the pipeline reports that as a cancellation.  But a coordinator can
+        also answer ``ABORTED`` because its prompt broke -- a lost terminal,
+        undecodable input (WR-08) -- and nobody chose to stop.  Such a
+        coordinator returns the exception here, so the pipeline records a
+        failure rather than a cancellation without a fourth ``FlipOutcome``
+        member (Phase 25 D-09, D-02).
+
+        Concrete rather than abstract, so a coordinator whose aborts are always
+        an operator's needs no change.
+
+        Returns:
+            The exception that forced the abort, or ``None`` when there was
+            none -- including whenever the answer was not ``ABORTED``.
+
+        """
+        return None
+
 
 class FlipAnswerSlot:
     """
