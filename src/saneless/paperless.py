@@ -921,9 +921,14 @@ class PaperlessClient:
             logger.info("Task %s completed: %s", task_id, status)
             return task
         if status in _TERMINAL_STATUSES:
-            failure = " ".join(_failure_message(task).split())
+            full_failure = " ".join(_failure_message(task).split())
+            # Bounded like an error body: a failure result can embed a whole
+            # OCR or consumer traceback, and this text becomes job.error and
+            # the CLI line (IN-05, T-23-16).  The duplicate check reads the
+            # whole text, so a hint past the cut is not lost.
+            failure = _bounded_line(full_failure) or _NO_FAILURE_MESSAGE
             msg = f"Paperless task {task_id} ended {status}: {failure}"
-            if _is_duplicate_failure(task, failure):
+            if _is_duplicate_failure(task, full_failure):
                 msg = f"{msg}; {_DUPLICATE_HINT}"
             raise PaperlessError(msg)
         return None
