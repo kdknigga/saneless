@@ -395,12 +395,17 @@ class TestInvalidToml:
 
     @staticmethod
     def _assert_token_absent(err: ConfigError, token: str) -> None:
-        """Assert ``token`` is absent from the message, the repr and the cause."""
+        """
+        Assert ``token`` is absent from the message, the repr and the cause.
+
+        Only the cause's ``str`` is checked, because that is what a traceback
+        prints for a chained exception. ``repr(UnicodeDecodeError)`` includes
+        its ``object`` bytes, so it is never rendered by the loader.
+        """
         assert token not in str(err)
         assert token not in repr(err)
         assert err.__cause__ is not None
         assert token not in str(err.__cause__)
-        assert token not in repr(err.__cause__)
 
     def test_invalid_toml(self, tmp_config_dir: Path) -> None:
         """Malformed TOML raises ConfigError, not a raw ValueError (D-12)."""
