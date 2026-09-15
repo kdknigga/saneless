@@ -82,17 +82,17 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 ### Worker and Web Robustness
 
-- [ ] **ROBU-01**: The worker loop survives any exception raised by the pipeline, the job store, or prune; each is logged with `exc_info` and the worker keeps serving [C-09]
-- [ ] **ROBU-02**: Submitting when the queue is full returns HTTP 429 with a `Retry-After` header and a visible message in the status area; the server never blocks the event loop on a full queue, and shutdown never blocks on the worker [C-09, doc row 23]
-- [ ] **ROBU-03**: Worker shutdown uses a stop flag with a bounded join; the worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper in the same change [C-09, N-24]
-- [ ] **ROBU-04**: After a web scan finishes (DONE, FALLBACK, or FAILED) the Scan button re-enables without a page reload; the button is server-owned via an out-of-band swap, there is no duplicate `id="scan-btn"` in the DOM, and `app.js` is deleted [C-10]
-- [ ] **ROBU-05**: All routes that do blocking I/O are plain `def` handlers; `/health` answers during a scan; the metadata cache is single-flight and profile mutation is locked so threadpool concurrency cannot race [M-01, doc row 26]
-- [ ] **ROBU-06**: At startup, jobs left in a non-terminal state are marked FAILED with a "server restarted" reason before the worker starts; at shutdown the worker stops before the store closes [M-03, doc row 33]
-- [ ] **ROBU-07**: Profiles are generated at startup (not inside the first job) using the config path that was actually loaded; `is_bare_default` recognises every shape of an untouched default profile [M-04]
-- [ ] **ROBU-08**: `POST /api/scan` rejects an unknown profile and an over-long title with 422 before creating a job; `POST /api/cache/invalidate` validates its resource name [N-20]
-- [ ] **ROBU-09**: htmx and PicoCSS are served from the package with pinned versions and SHA-384 integrity attributes; the UI works on a LAN with no internet [N-21]
-- [ ] **ROBU-10**: State-changing POST endpoints reject cross-site requests using `Sec-Fetch-Site`; the default bind address is documented [N-22]
-- [ ] **ROBU-11**: A browser test clicks Scan, waits for the terminal status, and asserts the button is enabled again, running in CI with no CDN egress [C-10, M-33]
+- [x] **ROBU-01**: The worker loop survives any exception raised by the pipeline, the job store, or prune; each is logged with `exc_info` and the worker keeps serving [C-09]
+- [x] **ROBU-02**: Submitting when the queue is full returns HTTP 429 with a `Retry-After` header and a visible message in the status area; the server never blocks the event loop on a full queue, and shutdown never blocks on the worker [C-09, doc row 23]
+- [x] **ROBU-03**: Worker shutdown uses a stop flag with a bounded join; the worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper in the same change [C-09, N-24]
+- [x] **ROBU-04**: After a web scan finishes (DONE, FALLBACK, or FAILED) the Scan button re-enables without a page reload; the button is server-owned via an out-of-band swap, there is no duplicate `id="scan-btn"` in the DOM, and `app.js` is deleted [C-10]
+- [x] **ROBU-05**: All routes that do blocking I/O are plain `def` handlers; `/health` answers during a scan; the metadata cache is single-flight and profile mutation is locked so threadpool concurrency cannot race [M-01, doc row 26]
+- [x] **ROBU-06**: At startup, jobs left in a non-terminal state are marked FAILED with a "server restarted" reason before the worker starts; at shutdown the worker stops before the store closes [M-03, doc row 33]
+- [x] **ROBU-07**: Profiles are generated at startup (not inside the first job) using the config path that was actually loaded; `is_bare_default` recognises every shape of an untouched default profile [M-04]
+- [x] **ROBU-08**: `POST /api/scan` rejects an unknown profile and an over-long title with 422 before creating a job; `POST /api/cache/invalidate` validates its resource name [N-20]
+- [x] **ROBU-09**: htmx and PicoCSS are served from the package with pinned versions and SHA-384 integrity attributes; the UI works on a LAN with no internet [N-21]
+- [x] **ROBU-10**: State-changing POST endpoints reject cross-site requests using `Sec-Fetch-Site`; the default bind address is documented [N-22]
+- [x] **ROBU-11**: A browser test clicks Scan, waits for the terminal status, and asserts the button is enabled again, running in CI with no CDN egress [C-10, M-33]
 
 ### Configuration Strictness
 
@@ -273,17 +273,17 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DPLX-05 | Phase 25 — Manual Duplex | Complete |
 | DPLX-06 | Phase 25 — Manual Duplex | Complete |
 | DPLX-07 | Phase 25 — Manual Duplex | Complete |
-| ROBU-01 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-02 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-03 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-04 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-05 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-06 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-07 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-08 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-09 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-10 | Phase 26 — Worker and Web Robustness | Pending |
-| ROBU-11 | Phase 26 — Worker and Web Robustness | Pending |
+| ROBU-01 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-02 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-03 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-04 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-05 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-06 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-07 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-08 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-09 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-10 | Phase 26 — Worker and Web Robustness | Complete |
+| ROBU-11 | Phase 26 — Worker and Web Robustness | Complete |
 | CFG-01 | Phase 27 — Configuration Strictness | Pending |
 | CFG-02 | Phase 27 — Configuration Strictness | Pending |
 | CFG-03 | Phase 27 — Configuration Strictness | Pending |
