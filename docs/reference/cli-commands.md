@@ -174,8 +174,8 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 | Code | Meaning |
 |------|---------|
 | 0 | Profiles generated successfully |
-| 1 | No scanners found |
-| 2 | Configuration error: the config could not be loaded, python-sane is not installed, or the config file could not be rewritten (for example `config.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
+| 1 | Scan error (SANE failed while listing devices, or could not open or read the scanner's capabilities) |
+| 2 | Configuration or setup error: the config could not be loaded, no scanner found, python-sane is not installed, or the config file could not be rewritten (for example `config.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 130 | Cancelled (Ctrl-C) |
 
