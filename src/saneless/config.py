@@ -8,12 +8,13 @@ always be present in the configuration.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import os
 import tempfile
 from datetime import UTC
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
 from pydantic import (
     BaseModel,
@@ -36,8 +37,10 @@ from saneless.exceptions import ConfigError
 from saneless.vocabulary import TITLE_MAX_LENGTH
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from datetime import datetime
 
+    from pydantic_core import ErrorDetails
     from pydantic_settings.main import InitSettingsSource
 
 __all__ = [
@@ -96,12 +99,19 @@ def _is_legacy_manual_duplex_source(source: str) -> bool:
 class ScannerConfig(BaseModel):
     """Scanner connection settings."""
 
+    # An unknown key is an error, not silently dropped (CFG-01, M-18).
+    model_config = ConfigDict(extra="forbid")
+
     host: str = ""
     device: str = ""
 
 
 class PaperlessConfig(BaseModel):
     """Paperless-ngx API connection settings."""
+
+    # A mistyped ``tokne`` used to leave the token unset without a word
+    # (CFG-01, M-18).
+    model_config = ConfigDict(extra="forbid")
 
     url: str = ""
     # Masked in repr, tracebacks and model_dump (CFG-05, N-15). Unwrapped with
@@ -114,7 +124,10 @@ class PaperlessConfig(BaseModel):
 class ProfileConfig(BaseModel):
     """Scan profile configuration."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    # extra="forbid" (CFG-01) is safe alongside the legacy-duplex
+    # before-validator: it only ever adds ``duplex``, which is a real field.
+    # populate_by_name keeps both ``title`` and ``default_title`` accepted.
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     source: str = "Flatbed"
     resolution: int = DEFAULT_RESOLUTION
@@ -196,6 +209,9 @@ def resolve_job_title(
 
 class OutputConfig(BaseModel):
     """Output and logging configuration."""
+
+    # An unknown key is an error, not silently dropped (CFG-01, M-18).
+    model_config = ConfigDict(extra="forbid")
 
     tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
     # Durable state: the job database and preserved scans. Deliberately NOT
@@ -287,6 +303,9 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="SANELESS_",
         env_nested_delimiter="__",
+        # pydantic-settings already forbids unknown top-level names; stated
+        # explicitly so it cannot drift from the nested models (CFG-01).
+        extra="forbid",
     )
 
     scanner: ScannerConfig = ScannerConfig()
@@ -405,7 +424,211 @@ def warn_on_legacy_duplex_sources(settings: Settings) -> None:
             )
 
 
-_VALID_SECTIONS = ("scanner", "paperless", "output", "profiles")
+_SECTION_MODELS: Final[dict[str, type[BaseModel]]] = {
+    "scanner": ScannerConfig,
+    "paperless": PaperlessConfig,
+    "output": OutputConfig,
+}
+"""The plain ``Settings`` sections, each a single table of keys (D-11)."""
+
+_PROFILE_LABEL: Final = "profiles.<name>"
+"""How a key that belongs in some profile table is named in an error."""
+
+
+def _escape_name(name: str) -> str:
+    """
+    Escape the control characters in a user-controlled name, without quotes.
+
+    TOML quoted keys and profile names can hold newlines or terminal escapes;
+    ``repr`` escapes them, so an error line cannot forge further stderr or log
+    lines (T-27-11, the ``web/errors.py`` precedent).
+
+    Args:
+        name: A key, section or profile name taken from the configuration.
+
+    Returns:
+        The name as ``repr`` renders it, minus the surrounding quotes.
+
+    """
+    return repr(name)[1:-1]
+
+
+def _valid_keys(model: type[BaseModel]) -> list[str]:
+    """
+    List the keys a section accepts, as the operator writes them (D-11).
+
+    Args:
+        model: The section's model.
+
+    Returns:
+        Each field's alias where it has one (``title``), else its name.
+
+    """
+    return [field.alias or name for name, field in model.model_fields.items()]
+
+
+def _match_candidates(model: type[BaseModel]) -> list[str]:
+    """
+    List every spelling a section accepts: field names plus aliases (D-11).
+
+    Args:
+        model: The section's model.
+
+    Returns:
+        The field names followed by the aliases.
+
+    """
+    names = list(model.model_fields)
+    return names + [field.alias for field in model.model_fields.values() if field.alias]
+
+
+def _section_owning(key: str, *, exclude: type[BaseModel] | None) -> str | None:
+    """
+    Name the section a misplaced key really belongs in (D-11).
+
+    Args:
+        key: The unknown key.
+        exclude: The section model the key was found in, which cannot own it.
+
+    Returns:
+        A plain section name, ``profiles.<name>`` for a profile key, or None.
+
+    """
+    owners: list[tuple[str, type[BaseModel]]] = [
+        *_SECTION_MODELS.items(),
+        (_PROFILE_LABEL, ProfileConfig),
+    ]
+    for label, model in owners:
+        if model is not exclude and key in _match_candidates(model):
+            return label
+    return None
+
+
+def _format_loc_path(parts: Sequence[str | int]) -> str:
+    """
+    Render the key path below a section, e.g. ``default_tags[0]`` (D-10).
+
+    Args:
+        parts: The ``loc`` elements after the section (and profile name).
+
+    Returns:
+        String elements joined by ``.`` and escaped, integers as ``[i]``.
+
+    """
+    rendered = ""
+    for part in parts:
+        if isinstance(part, int):
+            rendered += f"[{part}]"
+        else:
+            escaped = _escape_name(part)
+            rendered = f"{rendered}.{escaped}" if rendered else escaped
+    return rendered
+
+
+def _describe_unknown_key(label: str, key: str, model: type[BaseModel]) -> str:
+    """
+    Describe an unknown key inside a section or profile table (D-11).
+
+    Args:
+        label: The section label, e.g. ``paperless`` or ``profiles.default``.
+        key: The unknown key.
+        model: The model of the table the key was found in.
+
+    Returns:
+        The error line, without indentation.
+
+    """
+    owner = _section_owning(key, exclude=model)
+    if owner is not None:
+        return f"[{label}] unknown key {key!r}; it belongs in [{owner}]"
+    hint = difflib.get_close_matches(key, _match_candidates(model), n=1)
+    did_you_mean = f" (did you mean {hint[0]!r}?)" if hint else ""
+    valid = ", ".join(_valid_keys(model))
+    return f"[{label}] unknown key {key!r}{did_you_mean}; valid keys: {valid}"
+
+
+def _describe_unknown_top_level(name: str) -> str:
+    """
+    Describe an unknown top-level name (D-11, M-18).
+
+    A miscased section (``[Paperless]``) is suggested as the real section,
+    never as ``[profiles.Paperless]``; a key of some section says where it
+    belongs; anything else is most likely a profile table written without its
+    ``profiles.`` prefix.
+
+    Args:
+        name: The unknown top-level table or key name.
+
+    Returns:
+        The error line, without indentation.
+
+    """
+    sections = list(Settings.model_fields)
+    for section in sections:
+        if name.casefold() == section:
+            return f"unknown section {name!r} (did you mean [{section}]?)"
+    owner = _section_owning(name, exclude=None)
+    if owner is not None:
+        return f"unknown key {name!r} at the top level; it belongs in [{owner}]"
+    hints = [f"[{match}]" for match in difflib.get_close_matches(name, sections, n=1)]
+    hints.append(f"[profiles.{_escape_name(name)}]")
+    return (
+        f"unknown section {name!r} (did you mean {' or '.join(hints)}?); "
+        f"valid sections: {', '.join(sections)}"
+    )
+
+
+def _render_error(loc: tuple[str | int, ...], error_type: str, message: str) -> str:
+    """
+    Render one pydantic error as a ``[section] key`` line (D-10, D-11).
+
+    Args:
+        loc: The error's location.
+        error_type: The error's pydantic type, e.g. ``extra_forbidden``.
+        message: pydantic's short ``msg``, which never contains the input.
+
+    Returns:
+        The error line, without indentation.
+
+    """
+    head = loc[0] if loc else None
+    if not isinstance(head, str) or head not in Settings.model_fields:
+        if error_type == "extra_forbidden" and len(loc) == 1:
+            return _describe_unknown_top_level(str(head))
+        return f"{_format_loc_path(loc) or '(settings)'}: {message}"
+    model: type[BaseModel] | None
+    if head == "profiles" and len(loc) > 1:
+        label = f"profiles.{_escape_name(str(loc[1]))}"
+        model, rest = ProfileConfig, loc[2:]
+    else:
+        label, model, rest = head, _SECTION_MODELS.get(head), loc[1:]
+    if (
+        error_type == "extra_forbidden"
+        and model is not None
+        and len(rest) == 1
+        and isinstance(rest[0], str)
+    ):
+        return _describe_unknown_key(label, rest[0], model)
+    key_path = _format_loc_path(rest)
+    return f"[{label}] {key_path}: {message}" if key_path else f"[{label}]: {message}"
+
+
+def _render_error_lines(errors: Sequence[ErrorDetails]) -> list[str]:
+    """
+    Render every validation error as one line, sorted for stable output (D-10).
+
+    Only ``loc``, ``type`` and ``msg`` are read. ``input`` and ``ctx`` are
+    never touched: for ``tokne = "..."`` the input is the Paperless token, and
+    ``str(ValidationError)`` embeds it (D-14, CFG-05).
+
+    Args:
+        errors: ``ValidationError.errors()``.
+
+    Returns:
+        The error lines, without indentation or header.
+
+    """
+    return sorted(_render_error(err["loc"], err["type"], err["msg"]) for err in errors)
 
 
 class _SettingsFactory(Protocol):
@@ -425,31 +648,44 @@ class _SettingsFactory(Protocol):
 def _build_settings(
     toml_file: Path | None = None,
 ) -> Settings:
-    """Build Settings, converting extra-field errors to user-friendly messages."""
+    """
+    Build Settings, rendering every validation error into one ConfigError.
+
+    Each error becomes one line under a header naming the file, or naming
+    defaults and environment when no file was loaded (D-10). A TOML syntax
+    error is not a validation error and propagates unchanged (Phase 28).
+
+    Args:
+        toml_file: The TOML file to load, or None for defaults plus environment.
+
+    Returns:
+        The validated settings.
+
+    Raises:
+        ConfigError: If validation failed; the message holds no input value.
+
+    """
+    lines: list[str] = []
+    settings: Settings | None = None
     try:
         if toml_file is not None:
-            return cast("_SettingsFactory", Settings)(_toml_file=toml_file)
-        return Settings()
+            settings = cast("_SettingsFactory", Settings)(_toml_file=toml_file)
+        else:
+            settings = Settings()
     except ValidationError as exc:
-        extra_fields: list[str] = []
-        for err in exc.errors():
-            if err["type"] == "extra_forbidden":
-                loc = err.get("loc", ())
-                if loc:
-                    extra_fields.append(str(loc[0]))
-
-        if extra_fields:
-            names = ", ".join(repr(f) for f in extra_fields)
-            valid = ", ".join(_VALID_SECTIONS)
-            hints = [f"Did you mean [profiles.{f}]?" for f in extra_fields]
-            hint_text = " ".join(hints)
-            msg = (
-                f"Unknown config section {names}. "
-                f"Valid top-level sections: {valid}. {hint_text}"
-            )
-            raise ConfigError(msg) from exc
-
-        raise
+        lines.extend(_render_error_lines(exc.errors()))
+    if settings is not None and not lines:
+        return settings
+    header = (
+        f"Configuration error in {toml_file}:"
+        if toml_file is not None
+        else "Configuration error (defaults and environment):"
+    )
+    msg = "\n".join([header, *(f"  {line}" for line in lines)])
+    # from None, and raised outside the except block: a chained ValidationError
+    # would print its inputs -- possibly the token -- in any traceback
+    # (Pitfall 1, D-14).
+    raise ConfigError(msg) from None
 
 
 def validate_settings_dirs(settings: Settings) -> None:
@@ -529,21 +765,26 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     Returns:
         Fully validated Settings instance carrying ``config_path``: the
-        explicit path as given, else the first search path that exists, else
-        None when no file was found.
+        explicit path with ``~`` expanded, else the first search path that is
+        a regular file, else None when no file was found.
 
     Raises:
-        ConfigError: If the TOML file has unrecognized top-level sections.
+        ConfigError: If an explicit path is missing or not a regular file
+            (CFG-02), or if the configuration fails validation (D-10).
 
     """
-    path = (
-        Path(config_path)
-        if config_path
-        else next((p for p in config_search_paths() if p.exists()), None)
-    )
+    path: Path | None
+    if config_path:
+        explicit = Path(config_path).expanduser()
+        # A directory counts as missing: Docker creates one where a
+        # single-file bind mount's source does not exist (CFG-02, M-19).
+        if not explicit.is_file():
+            msg = f"Config file not found or not a regular file: {explicit}"
+            raise ConfigError(msg)
+        path = explicit
+    else:
+        path = next((p for p in config_search_paths() if p.is_file()), None)
     # With no path, only defaults + env vars are used.
     settings = _build_settings(toml_file=path)
-    # An explicit path is recorded even if missing; CFG-02 (Phase 27) owns
-    # making that an error.
     settings._config_path = path
     return settings
