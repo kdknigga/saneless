@@ -7,6 +7,7 @@ import logging
 import tempfile
 import threading
 import time
+import tomllib
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -1404,7 +1405,7 @@ class TestAutoProfiles:
         assert result.exit_code == 0
         assert self._group_line(result.output, "Refreshed: ") == "Refreshed: 'flatbed'"
         assert "  flatbed: source=Flatbed" in result.output
-        flatbed = tomlkit.parse(config_file.read_text())["profiles"]["flatbed"]
+        flatbed = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
         assert flatbed["source"] == "Flatbed"
         # D-02: a key the tool does not own survives the refresh.
         assert flatbed["default_tags"] == [4]
@@ -1415,8 +1416,7 @@ class TestAutoProfiles:
         """D-01: --force reports a hand-written profile and leaves it unchanged."""
         config_file = tmp_path / "saneless.toml"
         self._flatbed_config(config_file, flagged=False)
-        before = tomlkit.parse(config_file.read_text())["profiles"]["flatbed"]
-        before_values = dict(before)
+        before = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
 
         runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
 
@@ -1428,8 +1428,8 @@ class TestAutoProfiles:
         assert line.startswith("Skipped (not auto-generated): 'flatbed'")
         assert "not created by auto-profiles (no auto_generated = true)" in line
         assert "rename or delete it to regenerate" in line
-        after = tomlkit.parse(config_file.read_text())["profiles"]["flatbed"]
-        assert dict(after) == before_values
+        after = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
+        assert after == before
         assert "  flatbed: source=Flatbed" not in result.output
 
     def test_auto_profiles_no_force_skips_existing(
