@@ -78,6 +78,10 @@ See [Configure Scan Profiles](configure-scan-profiles.md) for more profile optio
 
 The SANE development headers are missing. Install the package for your distribution from the table in Step 1, then retry `pip install saneless`.
 
+**saneless says python-sane cannot be imported**
+
+`scan`, `devices`, `auto-profiles` and `serve` each exit with code 2 at once, printing one line with the reason the import failed and an install hint naming the missing SANE development package. python-sane is missing, or it cannot load the SANE library. Install the package from [Step 1](#step-1-install-sane-development-headers) and reinstall saneless. `saneless jobs` and `--help` keep working meanwhile.
+
 **"No scanners found"**
 
 - Verify your scanner is visible to SANE directly: `scanimage -L`
@@ -93,3 +97,5 @@ sudo usermod -aG scanner $USER
 ```
 
 Log out and back in for the group change to take effect.
+
+For a scan that fails after saneless is installed, start from its exit code in [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md).

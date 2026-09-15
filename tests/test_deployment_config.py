@@ -473,3 +473,83 @@ def test_flip_prompt_abort_documented_as_cancelled() -> None:
         assert any("flip prompt" in s and "130" in s for s in sentences), (
             f"{name} has no sentence saying a flip-prompt abort exits 130"
         )
+
+
+TROUBLESHOOTING = DOCS_DIR / "how-to" / "troubleshoot-a-failed-scan.md"
+SCANNER_HOST_DISCOVERY = DOCS_DIR / "how-to" / "scanner-host-discovery.md"
+MKDOCS = REPO_ROOT / "mkdocs.yml"
+
+
+def _heading_section(text: str, word: str, name: Path) -> str:
+    """Return the body of the one ``## `` section whose heading contains ``word``."""
+    matches = [
+        match
+        for match in re.finditer(r"^## (.+)$", text, re.MULTILINE)
+        if word in match[1]
+    ]
+    assert len(matches) == 1, f"{name}: expected one '## ' heading with {word!r}"
+    return text[matches[0].end() :].split("\n## ", 1)[0]
+
+
+def _first_table(text: str) -> str:
+    """Return the first run of Markdown table lines in ``text``."""
+    rows: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+        elif rows:
+            break
+    return "\n".join(rows)
+
+
+def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
+    """
+    The troubleshooting how-to exists, is navigable, and covers every code (D-13).
+
+    Its opening table lists exactly the ExitCode values, it has a section for
+    each kind of failure, and the pages with their own Troubleshooting section
+    link to it. A job database problem is a setup problem (exit 2), so it is
+    described under configuration and never under unexpected errors (D-07
+    amendment). The unexpected-error section says what to attach to a bug
+    report and warns about the Paperless token in a DEBUG log (T-28-51).
+    """
+    assert TROUBLESHOOTING.is_file(), f"{TROUBLESHOOTING} does not exist"
+    text, name = _read(TROUBLESHOOTING)
+    table_codes = _documented_codes(_first_table(text))
+    assert table_codes == EXIT_CODES, (
+        f"{name}: first table {sorted(table_codes)} != ExitCode {sorted(EXIT_CODES)}"
+    )
+    nav, _ = _read(MKDOCS)
+    assert "how-to/troubleshoot-a-failed-scan.md" in nav, (
+        "mkdocs.yml nav does not list the troubleshooting how-to"
+    )
+    headings = re.findall(r"^#+ (.+)$", text, re.MULTILINE)
+    for word in (
+        "Scanner",
+        "Paperless",
+        "PDF",
+        "Configuration",
+        "python-sane",
+        "Cancelled",
+        "Unexpected",
+    ):
+        assert any(word in heading for heading in headings), (
+            f"{name} has no heading containing {word!r}"
+        )
+    unexpected = _heading_section(text, "Unexpected", name).lower()
+    for needle in ("log file", "bug", "token"):
+        assert needle in unexpected, (
+            f"{name}: the unexpected-error section does not mention {needle!r}"
+        )
+    assert "job database" not in unexpected, (
+        f"{name}: the unexpected-error section mentions the job database"
+    )
+    configuration = _heading_section(text, "Configuration", name).lower()
+    assert "job database" in configuration, (
+        f"{name}: the configuration section does not mention the job database"
+    )
+    for page in (INSTALL_BARE_METAL, SCANNER_HOST_DISCOVERY):
+        page_text, page_name = _read(page)
+        assert "troubleshoot-a-failed-scan.md" in page_text, (
+            f"{page_name} does not link to the troubleshooting how-to"
+        )
