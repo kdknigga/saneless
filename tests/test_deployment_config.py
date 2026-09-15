@@ -122,6 +122,34 @@ def test_deploy_doc_explains_missing_config_and_migration() -> None:
     assert migration, f"{name} has no migration step moving config.toml into ./config/"
 
 
+def test_deploy_doc_says_where_auto_profiles_writes_without_config_toml() -> None:
+    """
+    With no ``config.toml``, the doc says the write lands in ``/app`` (WR-06).
+
+    The CLI writes ``./saneless.toml`` when no config file was loaded, which in
+    the image is ``/app/saneless.toml``: in the container layer, and first in
+    the search order. The how-to used to imply the write lands in ``./config``.
+    """
+    text = DEPLOY_HOWTO.read_text(encoding="utf-8")
+    name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
+    assert "/app/saneless.toml" in text, (
+        f"{name} does not say auto-profiles writes /app/saneless.toml "
+        "when config.toml is missing"
+    )
+    assert "touch config/config.toml" in text, (
+        f"{name} does not tell container users to create config/config.toml first"
+    )
+
+
+def test_cli_reference_says_where_auto_profiles_writes_in_the_image() -> None:
+    """The CLI reference names ``/app/saneless.toml`` for the image (WR-06)."""
+    text = CLI_REFERENCE.read_text(encoding="utf-8")
+    name = CLI_REFERENCE.relative_to(REPO_ROOT)
+    assert "/app/saneless.toml" in text, (
+        f"{name} does not say where the image writes with no config file loaded"
+    )
+
+
 def test_profile_howto_describes_force_as_a_merge() -> None:
     """The profile how-to describes ``--force`` as a merge, not an overwrite."""
     text = PROFILE_HOWTO.read_text(encoding="utf-8")
