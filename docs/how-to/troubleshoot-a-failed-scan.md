@@ -70,8 +70,8 @@ Other causes of exit 2, each on one line:
 - **Manual duplex without a terminal.** A profile with `duplex = "manual"` needs someone to flip
   the stack, so `saneless scan` refuses it when stdin is not a terminal (cron, a pipe, CI). Run it
   from a terminal or scan from the web UI.
-- **No scanner found.** `scanner.device` is empty and saneless discovered no scanner to use. Set
-  `scanner.device`, or fix discovery with `saneless devices`.
+- **No scanner found.** saneless discovered no scanner to use: `scan` with `scanner.device` empty,
+  or `auto-profiles`. Set `scanner.device`, or fix discovery with `saneless devices`.
 - **`serve` cannot start.** The port is already in use, or the web server failed to start. Stop
   whatever holds the port or pass `--port`; when the web server itself failed, the cause is in the
   log file.

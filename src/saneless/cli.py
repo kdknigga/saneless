@@ -849,8 +849,13 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     scanner = SaneBackend(host=settings.scanner.host)
     device_list = scanner.get_devices()
     if not device_list:
-        click.echo("No scanners found.", err=True)
-        ctx.exit(ExitCode.SCAN)
+        # A setup problem, exit 2 through the guard, exactly as `scan` reports
+        # the same finding: D-07 applies it uniformly to every command (WR-06).
+        msg = (
+            "No scanner found: auto-detection found no devices. "
+            "Check what SANE can see with `saneless devices`"
+        )
+        raise ConfigError(msg)
 
     # Use configured device or first discovered device
     device_id = settings.scanner.device or device_list[0].name

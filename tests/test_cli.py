@@ -2255,13 +2255,20 @@ class TestAutoProfiles:
         assert f"Profiles in {resolved}:" in result.output
 
     def test_auto_profiles_no_scanners(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """auto-profiles with no scanners exits with code 1."""
+        """
+        auto-profiles with no scanners is a setup error: exit 2, as on scan.
+
+        D-07 files "No scanner found" under exit 2 on every command where it
+        can occur (WR-06); ``scan`` already exits 2 for it.
+        """
         scanner_cls = self._make_auto_scanner(devices=[])
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
 
         result = runner.invoke(cli, ["auto-profiles"])
-        assert result.exit_code == 1
-        assert "No scanners found" in result.output
+        assert result.exit_code == 2
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith("No scanner found: ")
 
     def test_auto_profiles_force_flag(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

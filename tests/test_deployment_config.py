@@ -429,6 +429,14 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     assert "abort" not in _table_row(tables["scan"], "1").lower(), (
         f"{name}: scan's exit-1 row still describes a flip-prompt abort"
     )
+    # D-07: "No scanner found" is exit 2 on every command where it occurs (WR-06).
+    for command in ("scan", "auto-profiles"):
+        assert "no scanner" in _table_row(tables[command], "2").lower(), (
+            f"{name}: `saneless {command}` does not document no scanner under 2"
+        )
+        assert "no scanner" not in _table_row(tables[command], "1").lower(), (
+            f"{name}: `saneless {command}` documents no scanner under 1"
+        )
 
 
 def test_job_database_documented_under_exit_code_two() -> None:
