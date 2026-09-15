@@ -9,13 +9,14 @@ permitted is ``saneless.exceptions``, which is itself a leaf.
 
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from typing import Final, assert_never
 
 from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
     PaperlessError,
+    PdfError,
     ScanError,
 )
 
@@ -30,6 +31,7 @@ __all__ = [
     "WORKER_DOWN_JOB_ERROR",
     "ConnectionStatus",
     "ErrorCategory",
+    "ExitCode",
     "FlipOutcome",
     "JobState",
     "RequestRejection",
@@ -39,6 +41,7 @@ __all__ = [
     "classify_error",
     "connection_status_message",
     "error_message",
+    "exit_code_for",
     "flip_answer_label",
     "job_state_for",
     "progress_label",
@@ -73,6 +76,11 @@ class ErrorCategory(StrEnum):
     ``JobStore.latest_run_job`` skips it, so the status area never reports a
     rejection as the job that just ended (D-06), while the history table still
     lists the row.
+
+    ``ASSEMBLY`` means the scanned pages could not be assembled into a PDF --
+    img2pdf or Pillow refused the images, or the output directory could not be
+    written.  It is its own category so a full disk is never reported as a
+    scanner failure (D-04).
     """
 
     FEEDER = "FEEDER"
@@ -81,6 +89,31 @@ class ErrorCategory(StrEnum):
     UPLOAD = "UPLOAD"
     UNKNOWN = "UNKNOWN"
     REJECTED = "REJECTED"
+    ASSEMBLY = "ASSEMBLY"
+
+
+class ExitCode(IntEnum):
+    """
+    The process exit codes of the saneless CLI.
+
+    This is the one definition of the CLI exit codes (D-07).  The documentation
+    tables that list them are pinned to this enum by a doc-truth test, so the
+    two cannot drift apart.  Dispatch onto it is a ``match`` with
+    ``assert_never`` in ``exit_code_for``, so a new ``ErrorCategory`` member
+    fails the type gate until it is given an exit code.
+
+    ``CANCELLED`` is 130, the shell's convention for a process stopped by
+    SIGINT, because a cancel -- Ctrl-C or the operator declining the flip -- is
+    a deliberate stop and not a failure.
+    """
+
+    SUCCESS = 0
+    SCAN = 1
+    CONFIG = 2
+    PAPERLESS = 3
+    PDF = 4
+    UNEXPECTED = 5
+    CANCELLED = 130
 
 
 class ScanOutcome(StrEnum):
@@ -470,6 +503,8 @@ def error_message(category: ErrorCategory) -> str:
             message = "The document could not be sent to paperless-ngx."
         case ErrorCategory.UNKNOWN:
             message = "Something went wrong."
+        case ErrorCategory.ASSEMBLY:
+            message = "The scanned pages could not be assembled into a PDF."
         case ErrorCategory.REJECTED:
             message = (
                 # Neutral on purpose: REJECTED also covers down and degraded
@@ -658,6 +693,54 @@ def rejection_status_code(rejection: RequestRejection) -> int:
     return status_code
 
 
+def exit_code_for(category: ErrorCategory) -> ExitCode:
+    """
+    Return the CLI exit code for an error category.
+
+    Two outcomes are resolved by exception type before a caller classifies at
+    all, and so never reach this function:
+
+    * A cancel is not a category.  ``ScanCancelledError`` and
+      ``KeyboardInterrupt`` map to ``ExitCode.CANCELLED``.
+    * ``StorageError`` classifies as ``UNKNOWN``, but it is a setup problem, so
+      the CLI guard maps it to ``ExitCode.CONFIG`` (exit 2) by type (D-07
+      amendment).  The mapping is by type rather than by making
+      ``classify_error`` return ``CONFIG`` because ``ErrorCategory`` is
+      persisted on job records, and a store that cannot open is not a job's
+      configuration failure.  An ``ErrorCategory.STORAGE`` member was rejected
+      for the same reason: it would be a new persisted value no job could ever
+      carry.
+
+    ``UNKNOWN`` therefore reaches ``UNEXPECTED`` only for exceptions that are
+    not saneless types -- and for a bare ``SanelessError``, which is itself a
+    bug.
+
+    Args:
+        category: The error category to map.
+
+    Returns:
+        The exit code, e.g. ``ExitCode.PAPERLESS`` for an upload failure.
+
+    Raises:
+        AssertionError: If the value is not an ErrorCategory member.
+
+    """
+    match category:
+        case ErrorCategory.FEEDER | ErrorCategory.SCANNER:
+            exit_code = ExitCode.SCAN
+        case ErrorCategory.CONFIG:
+            exit_code = ExitCode.CONFIG
+        case ErrorCategory.UPLOAD:
+            exit_code = ExitCode.PAPERLESS
+        case ErrorCategory.ASSEMBLY:
+            exit_code = ExitCode.PDF
+        case ErrorCategory.UNKNOWN | ErrorCategory.REJECTED:
+            exit_code = ExitCode.UNEXPECTED
+        case _:
+            assert_never(category)
+    return exit_code
+
+
 def classify_error(exc: Exception) -> ErrorCategory:
     """
     Map an exception to its error category.
@@ -668,6 +751,11 @@ def classify_error(exc: Exception) -> ErrorCategory:
     exception type instead of on an enum, so ``assert_never`` does not apply
     and the trailing ``UNKNOWN`` is the correct total fallback.
 
+    ``ScanCancelledError`` is deliberately left ``UNKNOWN``: a cancel is not a
+    failure category, and callers test for it before they classify (D-01).
+    ``StorageError`` is also ``UNKNOWN``; its exit code is assigned by type, as
+    ``exit_code_for`` explains.
+
     Args:
         exc: The caught exception.
 
@@ -675,12 +763,15 @@ def classify_error(exc: Exception) -> ErrorCategory:
         The appropriate ErrorCategory value.
 
     """
+    category = ErrorCategory.UNKNOWN
     if isinstance(exc, FeederEmptyError):
-        return ErrorCategory.FEEDER
-    if isinstance(exc, ConfigError):
-        return ErrorCategory.CONFIG
-    if isinstance(exc, ScanError):
-        return ErrorCategory.SCANNER
-    if isinstance(exc, PaperlessError):
-        return ErrorCategory.UPLOAD
-    return ErrorCategory.UNKNOWN
+        category = ErrorCategory.FEEDER
+    elif isinstance(exc, ConfigError):
+        category = ErrorCategory.CONFIG
+    elif isinstance(exc, ScanError):
+        category = ErrorCategory.SCANNER
+    elif isinstance(exc, PaperlessError):
+        category = ErrorCategory.UPLOAD
+    elif isinstance(exc, PdfError):
+        category = ErrorCategory.ASSEMBLY
+    return category
