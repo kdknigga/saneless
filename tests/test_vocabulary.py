@@ -289,7 +289,7 @@ class TestErrorMessage:
     def test_rejected_error_message(self) -> None:
         """REJECTED explains that the scan never started (D-05, D-06)."""
         assert error_message(ErrorCategory.REJECTED) == (
-            "This scan was not started. Wait for the current scan to finish, "
+            "This scan was not started. Check that saneless is ready to scan, "
             "then try again."
         )
 
