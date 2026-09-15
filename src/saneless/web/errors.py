@@ -10,7 +10,10 @@ the request was aimed at (D-02, D-03); any other request gets
 429 carries ``Retry-After`` on both branches (D-04).
 
 Every message is a ``RequestRejection`` vocabulary constant.  No request input
-and no exception text reaches a response body or a log line from here.
+and no exception text reaches a response body from here.  The only request
+input a log line carries is the method and path, formatted with ``%r`` so a
+control character in them is escaped and cannot forge a log line, as in
+``cross_origin``.
 
 The catch-all handler logs the traceback with ``exc_info``.  Starlette's
 ``ServerErrorMiddleware`` re-raises after the handler's response is sent, so
@@ -196,7 +199,7 @@ async def _validation_error(request: Request, exc: Exception) -> Response:
         for error in exc.errors()
     ]
     logger.info(
-        "Rejected invalid request to %s %s: %s",
+        "Rejected invalid request to %r %r: %s",
         request.method,
         request.url.path,
         failures,
@@ -218,7 +221,7 @@ async def _validation_error(request: Request, exc: Exception) -> Response:
 async def _unhandled_exception(request: Request, exc: Exception) -> Response:
     """Log an unhandled exception's traceback and render a generic 500."""
     logger.error(
-        "Unhandled exception while handling %s %s",
+        "Unhandled exception while handling %r %r",
         request.method,
         request.url.path,
         exc_info=exc,
