@@ -1208,6 +1208,16 @@ class TestExplicitConfigPath:
             load_settings("~/cfg.toml")
         assert str(home / "cfg.toml") in str(exc_info.value)
 
+    def test_empty_config_path_is_rejected_not_discovered(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty explicit path is a ConfigError, not a discovery run (WR-05)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        (tmp_path / "saneless.toml").write_text("[profiles.default]\n")
+        with pytest.raises(ConfigError, match="empty"):
+            load_settings("")
+
     def test_not_a_file_directory_is_rejected(self, tmp_path: Path) -> None:
         """A directory passed as the config path is a ConfigError naming it."""
         directory = tmp_path / "config.toml"

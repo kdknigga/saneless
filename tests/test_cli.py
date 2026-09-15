@@ -1176,6 +1176,25 @@ class TestLazySettingsLoading:
         assert result.exit_code == 2
         assert str(missing) in result.output
 
+    def test_empty_config_path_exits_2_instead_of_discovering(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``--config ""`` is an explicit, unusable path, not "no path" (WR-05).
+
+        ``saneless --config "$CFG" ...`` with ``CFG`` unset used to load -- and
+        ``auto-profiles`` to write -- whichever file discovery found.
+        """
+        _write_real_config(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        with _restored_logging():
+            result = CliRunner().invoke(cli, ["--config", "", "jobs"])
+
+        assert result.exit_code == 2, result.output
+        assert "empty" in result.output
+        assert not (tmp_path / "logs").exists()
+
     def test_logging_setup_failure_is_a_config_error_exit_2(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
