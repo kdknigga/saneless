@@ -723,7 +723,9 @@ class TestZeroPages:
         An empty manual-duplex pass B raises before the count comparison (EXC-03).
 
         Without the check the counts differ and the mismatch recovery would try
-        to assemble the empty back half.
+        to assemble the empty back half.  The message names the pass and what
+        pass A scanned: "No pages were scanned" would be false once the fronts
+        were fed (IN-01).
         """
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].source = "ADF"
@@ -742,7 +744,13 @@ class TestZeroPages:
         )
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
-            pytest.raises(ScanError, match=r"^No pages were scanned$"),
+            pytest.raises(
+                ScanError,
+                match=(
+                    r"^No back pages were scanned in pass B "
+                    r"\(pass A scanned 1 front page\(s\)\)$"
+                ),
+            ),
         ):
             run_pipeline(
                 scanner=scanner,
