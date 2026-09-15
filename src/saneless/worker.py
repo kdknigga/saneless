@@ -45,6 +45,7 @@ from .vocabulary import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
+    from .auto_profiles import ProfileWriteResult
     from .config import ProfileConfig, Settings
     from .job import Job, JobStore
     from .paperless import PaperlessClient
@@ -120,31 +121,32 @@ class _OwedWrite:
 def _profiles_after_persist(
     loaded: Mapping[str, ProfileConfig],
     generated: Mapping[str, ProfileConfig],
-    written: list[str] | None,
+    result: ProfileWriteResult | None,
 ) -> dict[str, ProfileConfig]:
     """
     Choose the profiles to use in memory, matching what a restart will load.
 
-    ``write_profiles_to_config`` skips a name the file already defines, so a
-    file that spells out a bare ``[profiles.default]`` keeps it.  Swapping the
-    generated ``default`` into memory anyway would give this run one
-    ``default`` and every later run another (WR-03).
+    ``write_profiles_to_config`` never touches a same-name profile without
+    ``auto_generated = true`` (D-01), and the worker never forces, so a flagged
+    one is skipped too.  A file that spells out a bare ``[profiles.default]``
+    therefore keeps it.  Swapping the generated ``default`` into memory anyway
+    would give this run one ``default`` and every later run another (WR-03).
 
     Args:
         loaded: The bare default profile set the settings were loaded with.
         generated: The profiles generated from the scanner.
-        written: The names persisted to the config file, or ``None`` when
+        result: What the write did to the config file, or ``None`` when
             nothing was persisted and the generated set is for this run only.
 
     Returns:
         A new dict: the generated set when nothing was persisted, otherwise
-        each generated profile that was written, with the loaded profile kept
-        for every name the file already defined.
+        each generated profile that was persisted, with the loaded profile
+        kept for every name the write did not persist.
 
     """
-    if written is None:
+    if result is None:
         return dict(generated)
-    persisted = set(written)
+    persisted = result.persisted
     profiles: dict[str, ProfileConfig] = {}
     for name, profile in generated.items():
         if name in persisted:
@@ -758,11 +760,11 @@ class ScanWorker:
         profiles = self._read_generated_profiles()
         if profiles is None:
             return
-        written = self._persist_generated_profiles(profiles)
+        result = self._persist_generated_profiles(profiles)
         # Re-checked under the lock: only the exact bare default is ever
         # replaced, so a set customised meanwhile is left alone.
         self._set_profiles(
-            _profiles_after_persist(loaded, profiles, written),
+            _profiles_after_persist(loaded, profiles, result),
             only_if=is_bare_default,
         )
 
@@ -798,18 +800,19 @@ class ScanWorker:
 
     def _persist_generated_profiles(
         self, profiles: dict[str, ProfileConfig]
-    ) -> list[str] | None:
+    ) -> ProfileWriteResult | None:
         """
         Write generated profiles to the loaded config file, if there is one.
 
         Failure to write is logged, never raised, whatever it raises: the
         profiles are still used in memory for this run (D-17, D-18, WR-04).
+        Success is logged in the same group vocabulary the CLI prints (D-04).
 
         Args:
             profiles: The generated profiles.
 
         Returns:
-            The names written to the file, or ``None`` when nothing was
+            What the write did to the file, or ``None`` when nothing was
             persisted because no file was loaded or the write failed.
 
         """
@@ -823,7 +826,7 @@ class ScanWorker:
             )
             return None
         try:
-            written = write_profiles_to_config(config_path, profiles)
+            result = write_profiles_to_config(config_path, profiles)
         except (OSError, ConfigError) as exc:
             # The OSError text goes to the server log for the operator, never
             # into an HTTP response.
@@ -851,12 +854,11 @@ class ScanWorker:
             )
             return None
         logger.info(
-            "Auto-profiles: wrote %d profile(s) to %s: %s",
-            len(written),
-            config_path,
-            ", ".join(written) or "(none new)",
+            "Auto-profiles: %s: %s",
+            result.path,
+            "; ".join(result.describe()) or "no changes",
         )
-        return written
+        return result
 
     def _run(self) -> None:
         """
