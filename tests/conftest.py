@@ -129,10 +129,18 @@ def _suite_leaves_cwd_config_alone() -> Iterator[None]:
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Remove all SANELESS_* env vars before each test."""
+    """
+    Remove all SANELESS_* env vars and the XDG base variables before each test.
+
+    ``XDG_CONFIG_HOME`` and ``XDG_STATE_HOME`` decide config discovery and the
+    state defaults (CFG-03); a developer's or CI runner's values would otherwise
+    defeat every test that redirects HOME.
+    """
     for key in list(os.environ):
         if key.startswith("SANELESS_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
 
 
 @pytest.fixture
