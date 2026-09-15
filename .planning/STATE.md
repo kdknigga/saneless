@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 28 context gathered
-last_updated: "2026-09-15T18:36:36.156Z"
+status: ready_to_plan
+stopped_at: Phase 28 complete (14/14) — ready to discuss Phase 29
+last_updated: 2026-09-15T21:51:25.629Z
 last_activity: 2026-09-15 -- Phase 28 execution started
 progress:
   total_phases: 14
   completed_phases: 9
   total_plans: 93
-  completed_plans: 79
+  completed_plans: 93
   percent: 64
 ---
 
@@ -21,23 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 28 — Exception Translation
+**Current focus:** Phase 29 — geometry, memory, and timeouts
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 28 (Exception Translation) — EXECUTING
-Plan: 1 of 14
-Status: Executing Phase 28
+Phase: 29
+Plan: Not started
+Status: Ready to plan
 Progress: [████████░░] 83%
 Next: Phase 25 (Manual Duplex) — not started, no phase directory yet
-Last activity: 2026-09-15 -- Phase 28 execution started
+Last activity: 2026-09-15
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 54
+- Total plans completed: 68
 - Average duration: 5min
 - Total execution time: 0.27 hours
 
@@ -51,6 +51,7 @@ Last activity: 2026-09-15 -- Phase 28 execution started
 | 25 | 15 | - | - |
 | 26 | 19 | - | - |
 | 27 | 8 | - | - |
+| 28 | 14 | - | - |
 
 **Recent Trend:**
 

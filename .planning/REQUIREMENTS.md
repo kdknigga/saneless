@@ -110,11 +110,11 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 ### Exception Translation
 
-- [ ] **EXC-01**: Every SANE, httpx, img2pdf (all seven error classes), and tomllib exception is caught at its call site and re-raised as a saneless exception type with the original message; no third-party exception type escapes a module boundary [M-17]
-- [ ] **EXC-02**: The CLI catches `ConfigError`, `ScanError`, `PaperlessError`, and `PdfError` and prints a one-line message with a non-zero exit code instead of a traceback; a missing `python-sane` import produces a clear install hint [M-17]
-- [ ] **EXC-03**: A scan that produces zero pages reports "No pages were scanned" (and "All pages were blank" only when detection removed them) rather than a misleading message or a bare `ValueError` [N-06]
-- [ ] **EXC-04**: A user-initiated abort at the flip prompt is recorded as a cancelled job, not a scanner failure [N-08]
-- [ ] **EXC-05**: The worker logs every job failure with `exc_info` so the operator can find the cause [M-17]
+- [x] **EXC-01**: Every SANE, httpx, img2pdf (all seven error classes), and tomllib exception is caught at its call site and re-raised as a saneless exception type with the original message; no third-party exception type escapes a module boundary [M-17]
+- [x] **EXC-02**: The CLI catches `ConfigError`, `ScanError`, `PaperlessError`, and `PdfError` and prints a one-line message with a non-zero exit code instead of a traceback; a missing `python-sane` import produces a clear install hint [M-17]
+- [x] **EXC-03**: A scan that produces zero pages reports "No pages were scanned" (and "All pages were blank" only when detection removed them) rather than a misleading message or a bare `ValueError` [N-06]
+- [x] **EXC-04**: A user-initiated abort at the flip prompt is recorded as a cancelled job, not a scanner failure [N-08]
+- [x] **EXC-05**: The worker logs every job failure with `exc_info` so the operator can find the cause [M-17]
 
 ### Geometry, Memory, and Timeouts
 
@@ -295,11 +295,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | CFG-09 | Phase 27 — Configuration Strictness | Complete |
 | CFG-10 | Phase 27 — Configuration Strictness | Complete |
 | CFG-11 | Phase 27 — Configuration Strictness | Complete |
-| EXC-01 | Phase 28 — Exception Translation | Pending |
-| EXC-02 | Phase 28 — Exception Translation | Pending |
-| EXC-03 | Phase 28 — Exception Translation | Pending |
-| EXC-04 | Phase 28 — Exception Translation | Pending |
-| EXC-05 | Phase 28 — Exception Translation | Pending |
+| EXC-01 | Phase 28 — Exception Translation | Complete |
+| EXC-02 | Phase 28 — Exception Translation | Complete |
+| EXC-03 | Phase 28 — Exception Translation | Complete |
+| EXC-04 | Phase 28 — Exception Translation | Complete |
+| EXC-05 | Phase 28 — Exception Translation | Complete |
 | HARD-01 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
 | HARD-02 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
 | HARD-03 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
