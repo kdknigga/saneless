@@ -398,7 +398,7 @@ Plans:
 
 **Gap Wave 4** *(blocked on Gap Wave 3 completion)*
 
-- [ ] 26-19-PLAN.md — IN-08: an owed refused attempt is skipped by the status lookup (latest_run_job exclude_ids + owed_rejection_ids) (gap wave 4)
+- [x] 26-19-PLAN.md — IN-08: an owed refused attempt is skipped by the status lookup (latest_run_job exclude_ids + owed_rejection_ids) (gap wave 4)
 
 Note: htmx 2's default `responseHandling` does not swap 4xx bodies, so the 429 must be paired with an explicit `htmx-config` override or it is invisible — reintroducing the exact C-10 symptom this phase fixes. Worker tests that assumed a draining `stop()` are converted to a `wait_for_state` polling helper here, not in Phase 32.
 
@@ -509,7 +509,7 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
 | 23. Honest Outcomes and Never Lose a Scan | 9/9 | Complete   | 2026-09-11 |
 | 24. Scanner Truthfulness | 8/8 | Complete   | 2026-09-13 |
 | 25. Manual Duplex | 15/15 | Complete    | 2026-09-14 |
-| 26. Worker and Web Robustness | 18/19 | In Progress|  |
+| 26. Worker and Web Robustness | 19/19 | Complete   | 2026-09-15 |
 | 27. Configuration Strictness | 0/? | Not started | - |
 | 28. Exception Translation | 0/? | Not started | - |
 | 29. Geometry, Memory, and Timeouts | 0/? | Not started | - |
