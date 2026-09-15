@@ -2996,6 +2996,43 @@ class TestOwedWriteStreak:
         assert finished.state is JobState.DONE
         assert _worker_records(caplog, logging.INFO, "recovered")
 
+    def test_a_job_whose_writes_all_land_ends_the_owed_write_streak(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        IN-09, D-10: a cleanly recorded job breaks the streak as it breaks the run.
+
+        Idle ticks come only between jobs, so without this a streak could span
+        a job that proved the store accepts writes, and one more failed tick
+        would degrade a worker whose store is fine.  The streak is seeded one
+        short of the limit and no idle tick can run in the window, so only the
+        job itself can reset it.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 3600.0)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        worker = worker_for(store)
+        worker._failed_flush_ticks = worker_module._OWED_RETRY_DEGRADED_AFTER - 1
+        try:
+            worker.start()
+            job = _submit_jobs(worker, store, 1)[0]
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            reset = _wait_until(lambda: worker._failed_flush_ticks == 0, _STATE_BUDGET)
+            health = worker.health
+        finally:
+            worker.stop()
+            store.close()
+
+        assert finished.state is JobState.DONE
+        assert reset
+        assert health is WorkerHealth.HEALTHY
+
     def test_owed_write_retries_failing_fewer_ticks_than_the_streak_never_degrade(
         self,
         worker_for: Callable[[JobStore], ScanWorker],

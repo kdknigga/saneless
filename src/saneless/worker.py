@@ -344,8 +344,9 @@ class ScanWorker:
         self._current_job_id: str | None = None
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
-        # Idle ticks in a row whose owed-write retry raised (WR-10).  Touched
-        # only by the worker thread.
+        # Idle ticks in a row whose owed-write retry raised (WR-10), with no
+        # landed retry, recovery or cleanly recorded job in between (IN-09).
+        # Touched only by the worker thread.
         self._failed_flush_ticks = 0
         # When the idle loop last pruned.  Starts now: the startup prune is the
         # lifespan's (26-09), so the first idle prune is an interval away.
@@ -905,9 +906,13 @@ class ScanWorker:
                 self._record_loop_failure()
                 self._best_effort_fail(job, exc)
             else:
-                # A job whose store writes all landed breaks the run.  It does
-                # not clear degraded: only a successful idle probe does.
+                # A job whose store writes all landed breaks the run, and the
+                # owed-write streak too: idle ticks either side of it are not
+                # "in a row" against a store that just accepted writes
+                # (IN-09).  It does not clear degraded: only a successful idle
+                # probe does.
                 self._consecutive_loop_failures = 0
+                self._failed_flush_ticks = 0
         self._flush_before_exit()
 
     def _flush_before_exit(self) -> None:
@@ -1076,7 +1081,8 @@ class ScanWorker:
         a guard debt (D-10).  But ``_OWED_RETRY_DEGRADED_AFTER`` failed ticks in
         a row degrade the worker, so a store that is not healing reaches
         ``/health`` instead of only the logs (WR-10); a retry that lands ends
-        the streak.  The probe and the degraded clear stay the degraded
+        the streak, and so does a job whose store writes all landed (IN-09).
+        The probe and the degraded clear stay the degraded
         worker's business (D-12).  A prune failure is a loop-level failure
         (D-10), and it can never fail a job: no job is running on an idle tick
         (D-13).
