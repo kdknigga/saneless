@@ -22,6 +22,7 @@ import os
 import stat
 import tempfile
 from pathlib import Path
+from typing import Final
 
 from .exceptions import ConfigError
 
@@ -116,6 +117,73 @@ def _read_only_mount_error(target: Path) -> ConfigError | None:
     )
 
 
+# The errnos with which chown(2)/chmod(2) refuse rather than fail: not
+# permitted (EPERM, a non-root writer), an id the user namespace does not map
+# (EINVAL, the overflow uid of a rootless container), or a filesystem without
+# Unix ownership or modes (EOPNOTSUPP/ENOTSUP, some FUSE, CIFS and vfat
+# mounts). The file can still be replaced; anything else is a real failure.
+_REFUSED: Final = frozenset(
+    {errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP}
+)
+
+
+def _refused(exc: OSError) -> bool:
+    """
+    Report whether an ownership or mode change was refused, not broken.
+
+    Args:
+        exc: The error ``fchown`` or ``fchmod`` raised.
+
+    Returns:
+        True when the errno is one of ``_REFUSED``.
+
+    """
+    return exc.errno in _REFUSED
+
+
+def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
+    """
+    Give the temp file the original's owner, group and permission bits (D-06).
+
+    A host-owned config must not become root-owned after a container rewrite,
+    or the operator needs sudo to edit it. Each change is made only when the
+    process is permitted and the filesystem supports it; a refusal is skipped
+    silently (with a DEBUG line) so it never fails a write that would
+    otherwise succeed (WR-02). When the owner cannot be set, the group alone
+    is still tried: a service user rewriting a ``root:saneless`` 0664 config
+    may keep the group it belongs to. chown comes BEFORE chmod because
+    chown(2) may clear the set-id bits the mode copy would otherwise restore
+    (Pitfall 5).
+
+    Args:
+        fd: The open temp file.
+        original: The replaced file's status.
+
+    Raises:
+        OSError: A change failed for a reason other than a refusal.
+
+    """
+    try:
+        os.fchown(fd, original.st_uid, original.st_gid)
+    except OSError as exc:
+        if not _refused(exc):
+            raise
+        logger.debug("Not copying the config file's owner: %s", exc.strerror)
+        try:
+            os.fchown(fd, -1, original.st_gid)
+        except OSError as group_exc:
+            if not _refused(group_exc):
+                raise
+            logger.debug("Not copying the config file's group: %s", group_exc.strerror)
+    try:
+        os.fchmod(fd, stat.S_IMODE(original.st_mode))
+    except OSError as exc:
+        # The temp file then keeps mkstemp's 0600: narrower, never wider.
+        if not _refused(exc):
+            raise
+        logger.debug("Not copying the config file's mode: %s", exc.strerror)
+
+
 def replace_file_atomically(path: Path, text: str) -> Path:
     """
     Replace ``path``'s contents with ``text`` durably, writing through symlinks.
@@ -130,10 +198,12 @@ def replace_file_atomically(path: Path, text: str) -> Path:
       ``O_EXCL`` also mean no one can plant a symlink at the temp name.
     * The text is encoded as UTF-8 and written as bytes, so the result does
       not depend on the locale and CRLF line endings are not translated.
-    * An existing file's owner (when this process may chown) and permission
-      bits are copied onto the temp file before any content is written, so
-      the rewrite neither changes who can edit the file nor widens who can
-      read it (D-06). A new file keeps mkstemp's 0600.
+    * An existing file's owner, group and permission bits are copied onto
+      the temp file before any content is written, each when this process is
+      permitted to set it and the filesystem supports it, so the rewrite
+      neither changes who can edit the file nor widens who can read it
+      (D-06). A refused change is skipped, never a failed write (WR-02). A
+      new file keeps mkstemp's 0600.
     * The temp file is fsynced **before** the rename; renaming unsynced data
       can leave a zero-length file after a crash.
     * A rename refused with EBUSY means the file is a single-file bind mount;
@@ -194,16 +264,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     try:
         with os.fdopen(fd, "wb") as handle:
             if original is not None:
-                # D-06: a host-owned config must not become root-owned after a
-                # container rewrite, or the operator needs sudo to edit it.
-                # When chown is not permitted (non-root on bare metal, where
-                # the writer already owns the file) it is skipped silently.
-                # chown comes BEFORE chmod because chown(2) may clear the
-                # set-id bits the mode copy would otherwise restore
-                # (Pitfall 5).
-                with contextlib.suppress(PermissionError):
-                    os.fchown(handle.fileno(), original.st_uid, original.st_gid)
-                os.fchmod(handle.fileno(), stat.S_IMODE(original.st_mode))
+                _copy_owner_and_mode(handle.fileno(), original)
             # A new file keeps mkstemp's 0600: it may hold the Paperless token.
             handle.write(text.encode("utf-8"))
             handle.flush()
