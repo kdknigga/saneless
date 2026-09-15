@@ -105,7 +105,9 @@ The line starts with `Paperless error:`.
   configured, the PDF is saved there instead. Without one, the scan fails. Check that
   `paperless.url` is reachable from where saneless runs.
 - **Malformed URL.** A `paperless.url` without a usable `http://` or `https://` scheme is not
-  retried, because retrying cannot help. Fix the URL in the config.
+  retried, because retrying cannot help. With a consume directory configured the scan is still
+  saved there, so it does not fail, but every scan goes to the folder and the log says the URL
+  cannot be used. Fix the URL in the config.
 - **Upload rejected.** paperless-ngx answered with a 4xx, such as a bad API token or a field it
   refuses. The line gives Paperless's own reason. A rejected upload is never retried and never
   falls back to the consume directory; fix what the reason names and scan again.
