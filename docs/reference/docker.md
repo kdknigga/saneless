@@ -28,10 +28,12 @@ Docker's restart policies act only when a container exits, so an unhealthy conta
 
 | Mount Point | Purpose | Required |
 |-------------|---------|----------|
-| `/etc/saneless/config.toml` | Configuration file (mount read-only) | **Yes** |
+| `/etc/saneless` | Configuration directory holding `config.toml` (mount read-write; a missing `config.toml` means defaults plus environment variables) | Recommended |
 | `/var/lib/saneless` | **Durable state:** the job database (`saneless.db`) and preserved scans (`failed/`) | **Yes -- do not treat as disposable** |
 | `/tmp/saneless` | Scratch space for the scan in progress; every file in it is deleted as the scan finishes | No (ephemeral OK) |
 | `/consume` | Consume directory fallback for file-based ingestion | No (only if using fallback) |
+
+Mount the configuration *directory* (`./config:/etc/saneless`), not `config.toml` itself. saneless rewrites `config.toml` by writing a temp file beside it and renaming it over the original; over a single-file bind mount that rename fails with EBUSY, and over a read-only mount the write is refused. See [Moving from a single-file config mount](../how-to/deploy-docker-compose.md#moving-from-a-single-file-config-mount).
 
 `/var/lib/saneless` is not optional, and it is not the same kind of directory
 `/tmp/saneless` is. When a scan cannot be delivered to paperless-ngx at all --
@@ -94,7 +96,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./config.toml:/etc/saneless/config.toml:ro
+      - ./config:/etc/saneless
       - saneless-data:/var/lib/saneless
 
 volumes:
@@ -118,7 +120,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./config.toml:/etc/saneless/config.toml:ro
+      - ./config:/etc/saneless
 ```
 
 This is **not** required for network scanners. Use `SANELESS_SCANNER__HOST` instead.
@@ -134,7 +136,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./config.toml:/etc/saneless/config.toml:ro
+      - ./config:/etc/saneless
     environment:
       - SANELESS_SCANNER__HOST=192.168.1.50
 ```
@@ -152,7 +154,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./config.toml:/etc/saneless/config.toml:ro
+      - ./config:/etc/saneless
       - saneless-data:/var/lib/saneless
     environment:
       - SANELESS_PAPERLESS__URL=http://paperless:8000
