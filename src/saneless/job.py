@@ -10,6 +10,7 @@ startup the web app fails every job still in an active state through
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import logging
@@ -609,8 +610,12 @@ class JobStore:
             _migrate(self._conn, db_path)
         except Exception as exc:
             # Release the BEGIN DEFERRED the failed ladder still holds, and
-            # the file handle with it, before the caller sees the failure.
-            self._conn.rollback()
+            # the file handle with it, before the caller sees the failure.  A
+            # rollback that fails too -- a disk I/O error on the same broken
+            # file -- must not replace the migration's own error with a raw
+            # sqlite3 one, which would exit 5 instead of 2 (IN-06).
+            with contextlib.suppress(sqlite3.Error):
+                self._conn.rollback()
             self._conn.close()
             if isinstance(exc, sqlite3.Error):
                 raise _open_failure(db_path, exc) from exc

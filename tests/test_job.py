@@ -749,6 +749,49 @@ class TestMigrationLadder:
         # The file is left exactly as it was found.
         assert db_file.read_bytes() == b"this is not a database\n" * 64
 
+    def test_a_failing_rollback_does_not_mask_the_migration_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        IN-06: a rollback that fails on the same broken file is not the story.
+
+        The migration's own sqlite3 error must still be translated to a
+        StorageError (exit 2), not replaced by the rollback's raw one (exit 5).
+        """
+        real = sqlite3.connect(":memory:")
+        closed: list[bool] = []
+
+        class _BrokenFileConnection:
+            """A connection whose rollback fails, as on a disk I/O error."""
+
+            def rollback(self) -> None:
+                msg = "disk I/O error during rollback"
+                raise sqlite3.OperationalError(msg)
+
+            def close(self) -> None:
+                closed.append(True)
+                real.close()
+
+        migration_error = sqlite3.OperationalError("disk I/O error")
+
+        def failing_migrate(*_args: object, **_kwargs: object) -> None:
+            raise migration_error
+
+        monkeypatch.setattr(
+            job_module, "_open_connection", lambda _path: _BrokenFileConnection()
+        )
+        monkeypatch.setattr(job_module, "_migrate", failing_migrate)
+        db_path = str(tmp_path / "jobs.db")
+
+        with pytest.raises(StorageError) as exc_info:
+            JobStore(db_path=db_path)
+
+        assert str(exc_info.value) == (
+            f"Could not open the job database at {db_path}: disk I/O error"
+        )
+        assert exc_info.value.__cause__ is migration_error
+        assert closed == [True]
+
     def test_unusable_directory_path_is_a_storage_error(self, tmp_path: Path) -> None:
         """A path that cannot be opened as a file raises StorageError naming it."""
         with pytest.raises(StorageError) as exc_info:
