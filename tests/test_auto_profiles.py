@@ -1643,6 +1643,38 @@ class TestDurableConfigWrite:
         profiles = tomllib.loads(data.decode("utf-8"))["profiles"]
         assert set(profiles) == {"default", "flatbed"}
 
+    def test_mixed_line_endings_are_not_rewritten(self, tmp_path: Path) -> None:
+        """
+        A file mixing CRLF and LF keeps each line's ending (WR-08, D-05).
+
+        One CRLF anywhere used to turn every bare LF in the output into CRLF,
+        rewriting lines the user wrote with LF.
+        """
+        config_file = tmp_path / "config.toml"
+        original = (
+            b'[output]\r\nweb_port = 1\n\n[profiles.default]\nsource = "Flatbed"\n'
+        )
+        config_file.write_bytes(original)
+
+        write_profiles_to_config(config_file, self._generated())
+
+        data = config_file.read_bytes()
+        assert data.startswith(original)
+        assert data.count(b"\r\n") == 1
+
+    def test_bare_lf_in_a_multiline_string_is_kept(self, tmp_path: Path) -> None:
+        """A CRLF file whose multi-line string holds a bare LF keeps that value."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_bytes(
+            b'[profiles.default]\r\nsource = "Flatbed"\r\ntitle = """two\nlines"""\r\n'
+        )
+
+        write_profiles_to_config(config_file, self._generated())
+
+        data = config_file.read_bytes()
+        assert b'title = """two\nlines"""\r\n' in data
+        assert "flatbed" in tomllib.loads(data.decode("utf-8"))["profiles"]
+
     def test_lf_utf8_config_stays_lf(self, tmp_path: Path) -> None:
         """An LF file gains no carriage returns."""
         config_file = tmp_path / "config.toml"
