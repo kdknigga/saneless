@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Concatenate
 
-from saneless.exceptions import StorageError
+from saneless.exceptions import StorageError, describe
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
@@ -397,6 +397,66 @@ def _migrate(conn: sqlite3.Connection, db_path: str) -> None:
         conn.commit()
 
 
+def _open_failure(db_path: str, exc: sqlite3.Error) -> StorageError:
+    """
+    Build the StorageError for a job database that cannot be used at open time.
+
+    Args:
+        db_path: Path the connection was opened on, named in the message.
+        exc: The sqlite3 error that stopped the open.
+
+    Returns:
+        A one-line StorageError naming the path and sqlite's reason (D-08).
+        The CLI guard maps StorageError to exit 2 by type (D-07 amendment).
+
+    """
+    return StorageError(
+        f"Could not open the job database at {db_path}: {describe(exc)}"
+    )
+
+
+def _open_connection(db_path: str) -> sqlite3.Connection:
+    """
+    Open a job database connection with WAL and explicit transaction control.
+
+    A path that cannot be opened (a directory, a missing parent) fails at
+    ``connect``; a file that is not SQLite fails at the WAL pragma, the first
+    statement that reads it.  Only this open path is translated: the runtime
+    store methods keep their raw sqlite3 errors, which the web worker's
+    degraded-health handling depends on.
+
+    Args:
+        db_path: Path to the SQLite database file, or ":memory:".
+
+    Returns:
+        The open connection, outside any transaction.
+
+    Raises:
+        StorageError: If the database cannot be opened or read as SQLite.  The
+            connection, when one was opened, is closed first.
+
+    """
+    try:
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+    except sqlite3.Error as exc:
+        raise _open_failure(db_path, exc) from exc
+    try:
+        conn.row_factory = sqlite3.Row
+        # WAL has to be enabled before the connection switches to explicit
+        # transaction control: that switch opens a transaction immediately,
+        # and SQLite refuses a journal-mode change inside a transaction on a
+        # file database while silently reporting "memory" on ":memory:".
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.autocommit = False
+    except sqlite3.Error as exc:
+        conn.close()
+        raise _open_failure(db_path, exc) from exc
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 @dataclass
 class Job:
     """
@@ -534,23 +594,26 @@ class JobStore:
     """
 
     def __init__(self, db_path: str = ":memory:") -> None:
-        """Open the job store, enable WAL, and run the migration ladder."""
+        """
+        Open the job store, enable WAL, and run the migration ladder.
+
+        Raises:
+            StorageError: If the database cannot be opened or read as SQLite,
+                or its jobs table has an unsupported shape.  Every message
+                names ``db_path``.
+
+        """
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        # WAL has to be enabled before the connection switches to explicit
-        # transaction control: that switch opens a transaction immediately,
-        # and SQLite refuses a journal-mode change inside a transaction on a
-        # file database while silently reporting "memory" on ":memory:".
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.autocommit = False
+        self._conn = _open_connection(db_path)
         try:
             _migrate(self._conn, db_path)
-        except Exception:
+        except Exception as exc:
             # Release the BEGIN DEFERRED the failed ladder still holds, and
             # the file handle with it, before the caller sees the failure.
             self._conn.rollback()
             self._conn.close()
+            if isinstance(exc, sqlite3.Error):
+                raise _open_failure(db_path, exc) from exc
             raise
 
     def _row_to_job(self, row: sqlite3.Row) -> Job:
