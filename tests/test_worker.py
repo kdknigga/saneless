@@ -1945,6 +1945,41 @@ def _wait_until(predicate: Callable[[], bool], budget: float) -> bool:
     return predicate()
 
 
+# Idle ticks a test that asserts nothing happened waits for before asserting.
+_QUIET_TICKS = 10
+
+
+def _count_idle_ticks(
+    worker: ScanWorker, monkeypatch: pytest.MonkeyPatch
+) -> Callable[[], int]:
+    """
+    Count the idle ticks an unstarted worker completes once it runs.
+
+    A test that sleeps and then asserts nothing happened also passes when the
+    thread never reached its first idle tick on a slow runner (IN-03).
+    Counting completed ticks proves the window was real.
+
+    Returns:
+        A callable returning how many idle ticks have completed so far.
+
+    """
+    original = worker._idle_housekeeping
+    lock = threading.Lock()
+    completed = [0]
+
+    def counting_housekeeping() -> None:
+        original()
+        with lock:
+            completed[0] += 1
+
+    def count() -> int:
+        with lock:
+            return completed[0]
+
+    monkeypatch.setattr(worker, "_idle_housekeeping", counting_housekeeping)
+    return count
+
+
 def _worker_records(
     caplog: pytest.LogCaptureFixture, level: int, text: str
 ) -> list[logging.LogRecord]:
@@ -2196,14 +2231,17 @@ class TestWorkerGuard:
         spy = _StoreFault(store.prune, frozenset())
         monkeypatch.setattr(store, "prune", spy)
         worker = worker_for(store)
+        ticks = _count_idle_ticks(worker, monkeypatch)
         try:
             worker.start()
-            # A bounded window in which nothing may happen: ten idle ticks.
-            time.sleep(10 * _FAST_TICK)
+            # A window in which nothing may happen, measured in idle ticks the
+            # worker actually took rather than in wall time (IN-03).
+            ticked = _wait_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
         finally:
             worker.stop()
             store.close()
 
+        assert ticked
         assert spy.calls == []
 
     def test_the_guard_records_the_failure_it_could_not_hide(
@@ -3152,15 +3190,18 @@ class TestWorkerDegradedHealth:
         probes = _StoreFault(store.probe, frozenset())
         monkeypatch.setattr(store, "probe", probes)
         worker = worker_for(store)
+        ticks = _count_idle_ticks(worker, monkeypatch)
         try:
             worker.start()
-            # A bounded window in which nothing may happen: ten idle ticks.
-            time.sleep(10 * _FAST_TICK)
+            # A window in which nothing may happen, measured in idle ticks the
+            # worker actually took rather than in wall time (IN-03).
+            ticked = _wait_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
             health = worker.health
         finally:
             worker.stop()
             store.close()
 
+        assert ticked
         assert health is WorkerHealth.HEALTHY
         assert probes.calls == []
 
