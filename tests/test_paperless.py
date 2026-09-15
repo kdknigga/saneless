@@ -994,6 +994,31 @@ class TestUploadFailureTranslation:
         assert handler.calls == 1
         assert sleeps == []
 
+    def test_unreadable_pdf_is_a_paperless_error(
+        self, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """
+        IN-08: an OSError opening the PDF leaves as a PaperlessError, too.
+
+        The class promises that whatever goes wrong on the upload path is a
+        ``PaperlessError``; a PDF gone from the workspace used to escape as a
+        raw ``FileNotFoundError``, which the CLI reports as a saneless bug.
+        """
+        missing = tmp_path / "gone.pdf"
+        handler = _CountingHandler(_answering(httpx.Response(200, json="task-id")))
+        client = _upload_client(handler, consume_dir=str(tmp_path / "consume"))
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(missing, title="Gone")
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            f"Could not read the PDF {missing} to upload it: No such file or directory"
+        )
+        assert isinstance(exc_info.value.__cause__, FileNotFoundError)
+        assert handler.calls == 0
+        assert sleeps == []
+
     def test_other_http_error_raises_at_once(
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
