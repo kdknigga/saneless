@@ -133,6 +133,10 @@ Delivers EXC-01..EXC-05 (review findings M-17, N-06, N-08):
     3, colliding with "3 = Paperless error") are both caught and exit **2**, "can't start, fix
     your setup". Every command shares one table; the `serve` exit-code docs change accordingly.
     Ctrl-C on `serve` already exits 0 through uvicorn and needs no special case (measured).
+  - **`StorageError` exits 2 (user decision 2026-09-15, after plan check).** A job database
+    saneless cannot use (unreadable, or written by a newer schema) is a setup problem, not a bug:
+    one line naming the job database path and the reason, exit **2**. Exit 5 stays strictly for
+    exceptions that are not saneless types, as D-06 defines.
   - "One line" means one *message*: a configuration error keeps Phase 27's header plus one line
     per problem (D-12), which success criterion 2 accepts.
 

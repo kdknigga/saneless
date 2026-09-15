@@ -454,7 +454,42 @@ Note: CFG-08 (atomic write) and CFG-09 (mount the config directory) must ship to
   3. A scan that produces zero pages says "No pages were scanned", and says "All pages were blank" only when detection actually removed them — never a bare `ValueError`
   4. A user abort at the flip prompt is recorded as a cancelled job, not a scanner failure, and every job failure is logged with `exc_info`
 
-**Plans**: TBD
+**Plans**: 14 plans
+
+Plans:
+
+**Wave 1**
+
+- [ ] 28-01-PLAN.md — PdfError, ScanCancelledError, describe(), ErrorCategory.ASSEMBLY, ExitCode, JobState.CANCELLED + status/history branches
+- [ ] 28-02-PLAN.md — TOML syntax / unreadable / non-UTF-8 config and tomlkit parse failures become ConfigError under the header
+- [ ] 28-03-PLAN.md — "No pages were scanned" precondition and "All pages were blank"
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 28-04-PLAN.md — assemble_pdf boundary: every img2pdf/Pillow failure becomes PdfError
+- [ ] 28-05-PLAN.md — SANE boundary: require_sane() and every python-sane call site wrapped as ScanError
+- [ ] 28-06-PLAN.md — Paperless upload boundary: ctor InvalidURL, widened retry set, fast-fail bad URL, one body renderer
+- [ ] 28-07-PLAN.md — Worker's three job endings (shutdown, CANCELLED, failure with exc_info)
+- [ ] 28-08-PLAN.md — CANCELLED muted styling proven with Playwright; UI-SPEC rows
+- [ ] 28-09-PLAN.md — CLI guarded group: one line + D-07 exit code for every failure, exit 5 last resort, Ctrl-C 130
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 28-10-PLAN.md — Paperless poll survives transport errors to its deadline; duplicate hint; wrapped tag/correspondent fetches
+- [ ] 28-11-PLAN.md — Flip-prompt abort classified as cancel end to end (abort_cause, 130, web CANCELLED)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 28-12-PLAN.md — require_sane() in the four SANE commands; serve bind/startup failures exit 2
+- [ ] 28-14-PLAN.md — CANCELLED, abort, retry/fallback and zero-page wording corrected across explanation docs
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 28-13-PLAN.md — Exit-code tables + doc-truth tests, troubleshoot-a-failed-scan how-to, nav and cross-links
+
+**Cross-cutting constraints:**
+
+- `uv run mkdocs build --strict` succeeds
 
 ### Phase 29: Geometry, Memory, and Timeouts
 

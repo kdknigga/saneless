@@ -932,16 +932,20 @@ httpx rows use `httpx.MockTransport` raising `ReadError`, `WriteError`, `RemoteP
 | A2 | `setattr(dev, name, value)` on the `SaneDevice` Protocol passes ty and pyrefly | Code Examples | Fall back to three explicit try blocks |
 | A3 | The paperless-ngx version that switched duplicates to "consume by default" is some 3.x release before 3.1.3 (not pinned) | State of the Art | Wording only |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 1. **Duplicate-on-retry on current paperless-ngx (for the user).**
    - What we know: on v3.1.3, a duplicate is only rejected (FAILURE, "It is a duplicate of document #N") when `CONSUMER_DELETE_DUPLICATES` is on. By default the retried upload becomes a second, silent copy.
    - What's unclear: whether D-10's accepted risk should also be documented as "may create a duplicate document" for default v3 installs.
    - Recommendation: implement the duplicate wording for the FAILURE case as locked. Add one sentence to `consume-directory-fallback.md`/the troubleshooting page. No code change beyond D-10.
+   - **RESOLVED (user, 2026-09-15):** keep the wide retry and accept possible silent copies; see CONTEXT D-10 amendment.
 2. **`serve` exit codes that do not fit D-07.** `serve`'s port-bind failure is `ClickException` exit 1, documented at `cli-commands.md:126` as "Port bind error", but D-07 row 1 means "Scan error". Separately, `uvicorn.run` exits 3 on a lifespan startup failure, which collides with "Paperless error".
    - Recommendation: keep bind = 1 (documented meaning; this phase "only adds codes") and document it as a `serve`-specific row. For uvicorn's 3, either document it in the `serve` table ("3 also: the web server failed to start; see the log") or check `server.started` by running `uvicorn.Server` directly. Planner decides; flag it in the doc-truth test so the table is honest.
+   - **RESOLVED (user, 2026-09-15):** the recommendation above is superseded. Both the port-bind failure and uvicorn's startup failure exit **2**, and `serve` shares the one D-07 table (CONTEXT D-07 amendment).
 3. **`StorageError` exit code.** It is a saneless type, not listed in D-07, and `classify_error` gives `UNKNOWN`, so it would print "Unexpected error (StorageError)" and exit 5. Recommendation: accept 5 (a newer or foreign DB is not user-fixable config), or map it to 2 via a new branch. Low impact.
+   - **RESOLVED (user, 2026-09-15, after plan check):** `StorageError` exits **2** with one line naming the job database path and reason (CONTEXT D-07 amendment). Exit 5 stays for non-saneless exceptions only.
 4. **`__cause__` vs Phase 27's `from None` for `ConfigError`.** Criterion 1 wants `__cause__` to be the third-party exception. `TOMLDecodeError`'s `str()` holds no value, so `from exc` is safe for TOML, `OSError` and `UnicodeDecodeError`. `ValidationError` must stay `from None` (it embeds inputs). No user decision needed; state it in the plan.
+   - **RESOLVED:** handled in plan 28-02 (`from exc` for TOML/OSError/UnicodeDecodeError, `from None` for ValidationError).
 
 ## Environment Availability
 
