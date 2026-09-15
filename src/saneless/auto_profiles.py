@@ -18,12 +18,12 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 
 import tomlkit
 from pydantic import TypeAdapter, ValidationError
-from tomlkit.exceptions import ParseError
+from tomlkit.exceptions import ParseError, TOMLKitError
 from tomlkit.items import InlineTable
 
 from saneless.atomic_write import replace_file_atomically
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
-from saneless.exceptions import ConfigError
+from saneless.exceptions import ConfigError, describe
 from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
@@ -622,6 +622,10 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     return values
 
 
+_TOMLKIT_POSITION: Final = re.compile(r" at line \d+ col \d+$")
+"""The position suffix tomlkit appends to every ``ParseError`` message."""
+
+
 def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
     """
     Parse the config file for a merge, or start an empty document.
@@ -635,8 +639,8 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
 
     Raises:
         ConfigError: The file's bytes are not valid UTF-8, or the text is not
-            valid TOML; the latter names the line and column and is chained to
-            tomlkit's ``ParseError`` (D-12, M-17).
+            valid TOML; the latter names the line and column when tomlkit
+            reports one and is chained to tomlkit's error (D-12, M-17, IN-03).
 
     """
     if not config_path.exists():
@@ -651,13 +655,19 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
         raise ConfigError(msg) from None
     try:
         document = tomlkit.parse(text)
-    except ParseError as exc:
-        # tomlkit's str() is its message plus the position, never document text,
-        # so the chain cannot carry the token.
-        msg = (
-            f"Cannot update {config_path}: it is not valid TOML at line "
-            f"{exc.line}, column {exc.col} ({exc})"
-        )
+    except TOMLKitError as exc:
+        # Every tomlkit error, not only ParseError: a table redefined under a
+        # dotted header raises KeyAlreadyPresent, which is not one (IN-03).
+        # tomlkit's str() is its message plus, for a ParseError, the position --
+        # never document text, so the chain cannot carry the token. The
+        # position is rendered once, in saneless's own words, and only when
+        # tomlkit has one.
+        reason = describe(exc)
+        where = ""
+        if isinstance(exc, ParseError):
+            reason = _TOMLKIT_POSITION.sub("", reason)
+            where = f" at line {exc.line}, column {exc.col}"
+        msg = f"Cannot update {config_path}: it is not valid TOML{where} ({reason})"
         raise ConfigError(msg) from exc
     return document, text
 
