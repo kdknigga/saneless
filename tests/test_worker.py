@@ -3370,6 +3370,54 @@ class TestStartupProfileGeneration:
         on_disk = tomllib.loads(config_file.read_text())
         assert set(on_disk["profiles"]) == set(expected)
 
+    def test_startup_generation_keeps_a_default_the_file_already_defines(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        WR-03: memory keeps the ``default`` a restart will load from the file.
+
+        The file spells out a bare ``[profiles.default]``, so the write skips
+        ``default``.  Memory must keep that loaded ``default`` rather than the
+        generated one, or ``default`` would change on the next restart.
+        """
+        caps = self._mock_caps_scanner(mock_scanner)
+        expected = generate_profiles(caps)
+        assert expected["default"] != ProfileConfig()
+        config_file = tmp_path / "saneless.toml"
+        spelled_out = (
+            '[profiles.default]\nsource = "Flatbed"\nresolution = 300\nmode = "color"\n'
+        )
+        config_file.write_text(spelled_out)
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+            in_memory_default = worker.get_profile("default")
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert set(worker.profile_names()) == set(expected)
+        assert in_memory_default == ProfileConfig()
+        on_disk = tomllib.loads(config_file.read_text())
+        assert set(on_disk["profiles"]) == set(expected)
+        assert (
+            on_disk["profiles"]["default"]
+            == tomllib.loads(spelled_out)["profiles"]["default"]
+        )
+        for name in set(expected) - {"default"}:
+            assert worker.get_profile(name) == expected[name]
+
     def test_startup_generation_without_a_loaded_file_writes_nothing(
         self,
         mock_scanner: MagicMock,
