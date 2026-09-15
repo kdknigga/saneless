@@ -2169,11 +2169,94 @@ class TestWorkerGuard:
         assert spy.calls == [
             (
                 (job.id, JobState.ERROR),
-                {"error": _DISK_ERROR, "error_category": expected_category},
+                {
+                    "result": None,
+                    "error": _DISK_ERROR,
+                    "error_category": expected_category,
+                },
             )
         ]
         assert finished.state is JobState.ERROR
         assert finished.error == _DISK_ERROR
+
+    @pytest.mark.parametrize("failed_writes", [1, 2])
+    def test_a_failed_success_write_is_replayed_as_the_outcome_not_an_error(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+        failed_writes: int,
+    ) -> None:
+        """
+        WR-02: a document Paperless accepted is never recorded as an ERROR.
+
+        The terminal DONE write fails after the upload.  With one failure the
+        guard's own retry lands it; with two the guard's retry fails too and
+        an idle tick lands it.  Either way the row is DONE with the result the
+        pipeline returned, and no ERROR is ever written.
+        """
+        monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            lambda *_args, **_kwargs: _success_result(),
+        )
+        store = JobStore()
+        finishes = _StoreFault(store.finish_job, frozenset(range(1, failed_writes + 1)))
+        monkeypatch.setattr(store, "finish_job", finishes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = _submit_jobs(worker, store, 1)[0]
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            drained = _wait_until(
+                lambda: not worker._unrecorded_failures, _STATE_BUDGET
+            )
+        finally:
+            worker.stop()
+            store.close()
+
+        assert drained
+        assert finished.state is JobState.DONE
+        assert finished.outcome is ScanOutcome.SUCCESS
+        assert finished.pages_uploaded == 1
+        assert finished.error is None
+        assert finished.error_category is None
+        written_states = [args[1] for args, _kwargs in finishes.calls]
+        assert written_states == [JobState.DONE] * (failed_writes + 1)
+
+    def test_a_failed_error_write_is_replayed_with_the_pipeline_error(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        WR-02: the owed ERROR keeps the pipeline's own text and category.
+
+        The failure-path write raising must not replace the scanner's error
+        with the job store's ``disk I/O error``.
+        """
+
+        def jammed(*_args: object, **_kwargs: object) -> ScanResult:
+            msg = "Scanner jammed"
+            raise ScanError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", jammed)
+        store = JobStore()
+        finishes = _StoreFault(store.finish_job, frozenset({1}))
+        monkeypatch.setattr(store, "finish_job", finishes)
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = _submit_jobs(worker, store, 1)[0]
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == "Scanner jammed"
+        assert finished.error_category == classify_error(ScanError("Scanner jammed"))
 
     def test_a_failed_best_effort_write_is_retried_until_it_lands(
         self,
