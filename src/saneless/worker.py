@@ -74,6 +74,16 @@ _QUEUE_DEPTH: Final = 10
 # error without calling the store broken.  Not configurable.
 _DEGRADED_AFTER: Final = 3
 
+# How many idle ticks in a row the owed-write retry may fail before the worker
+# is degraded (WR-10).  Kept apart from _DEGRADED_AFTER's loop count: the guard
+# already counted the failure behind a guard debt, and a request-side
+# owe_rejection debt was never counted, so a streak of failed retries is its
+# own evidence that the store is not healing.  Three rides out a fault that
+# heals within a tick or two, and at the 5 s idle tick bounds a stuck row's
+# silent window to about 15 s.  Not configurable.  Read at call time, so tests
+# can change it.
+_OWED_RETRY_DEGRADED_AFTER: Final = 3
+
 # How often an idle worker prunes job history (D-13).  Prune left the per-job
 # path so its failure can never fail a job; hourly keeps a long-running
 # appliance inside history_max_rows.  The startup prune is the lifespan's.  Not
@@ -239,13 +249,17 @@ class ScanWorker:
         self._current_job_id: str | None = None
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
+        # Idle ticks in a row whose owed-write retry raised (WR-10).  Touched
+        # only by the worker thread.
+        self._failed_flush_ticks = 0
         # When the idle loop last pruned.  Starts now: the startup prune is the
         # lifespan's (26-09), so the first idle prune is an interval away.
         self._last_prune = time.monotonic()
         # Job-row writes owed by id, with the error text and category to record:
         # failures even the loop guard could not write, and rejected submits
         # whose REJECTED write failed in the request (WR-01).  Every idle tick
-        # retries them (CR-01).  Shared by the worker thread (the guard and the
+        # retries them (CR-01), and a streak of failed retries degrades the
+        # worker (WR-10).  Shared by the worker thread (the guard and the
         # idle flush) and request threads (owe_rejection), so every read and
         # write goes through _unrecorded_lock.
         self._unrecorded_lock = threading.Lock()
@@ -309,8 +323,9 @@ class ScanWorker:
         ``DOWN`` when the thread is not running -- not started, or stopped --
         which ``/health`` reports as "worker thread is down".  ``DEGRADED``
         when the job store has failed the loop ``_DEGRADED_AFTER`` times in a
-        row and no probe has succeeded since, reported as "job store failing".
-        Otherwise ``HEALTHY``.
+        row, or the owed-write retry has failed ``_OWED_RETRY_DEGRADED_AFTER``
+        idle ticks in a row, and no recovery has succeeded since, reported as
+        "job store failing".  Otherwise ``HEALTHY``.
         """
         if not self._thread.is_alive():
             health = WorkerHealth.DOWN
@@ -791,10 +806,13 @@ class ScanWorker:
 
         Owed writes come first and are retried on every tick, degraded or not,
         so a row the guard could not end reaches ERROR as soon as the store
-        accepts writes, without a restart or a scan (CR-01).  The probe and the
-        degraded clear stay the degraded worker's business (D-12).  A failed
-        retry is only logged: the guard already counted the failure that
-        created the debt (D-10).  A prune failure is a loop-level failure
+        accepts writes, without a restart or a scan (CR-01).  A failed retry is
+        not a loop-level failure: the guard already counted the failure behind
+        a guard debt (D-10).  But ``_OWED_RETRY_DEGRADED_AFTER`` failed ticks in
+        a row degrade the worker, so a store that is not healing reaches
+        ``/health`` instead of only the logs (WR-10); a retry that lands ends
+        the streak.  The probe and the degraded clear stay the degraded
+        worker's business (D-12).  A prune failure is a loop-level failure
         (D-10), and it can never fail a job: no job is running on an idle tick
         (D-13).
         """
@@ -804,10 +822,29 @@ class ScanWorker:
             try:
                 self._flush_unrecorded_failures()
             except Exception:
-                logger.debug(
-                    "Owed job store writes failed; retrying on the next idle tick",
-                    exc_info=True,
-                )
+                self._failed_flush_ticks += 1
+                # The first failure of a streak is worth an operator's eye; the
+                # rest of the same streak would only repeat it.
+                if self._failed_flush_ticks == 1:
+                    logger.warning(
+                        "Owed job store writes failed; retrying on the next idle tick",
+                        exc_info=True,
+                    )
+                else:
+                    logger.debug(
+                        "Owed job store writes failed; retrying on the next idle tick",
+                        exc_info=True,
+                    )
+                if self._failed_flush_ticks >= _OWED_RETRY_DEGRADED_AFTER:
+                    self._degraded.set()
+                    logger.warning(
+                        "Scan worker degraded after %d idle ticks in a row failed "
+                        "to write owed job records; rejecting scans until the "
+                        "store recovers",
+                        self._failed_flush_ticks,
+                    )
+            else:
+                self._failed_flush_ticks = 0
         if time.monotonic() - self._last_prune < _PRUNE_INTERVAL_SECONDS:
             return
         self._last_prune = time.monotonic()
@@ -870,6 +907,8 @@ class ScanWorker:
         to write, or ``RESTART_REASON`` for rows a failed startup recovery left
         behind.  Any raise leaves the worker degraded to try again next tick;
         it is not counted again, and whatever was written stays written.
+        Clearing degraded also ends any owed-write streak, so a returning fault
+        needs a fresh streak.
         """
         try:
             self._job_store.probe()
@@ -889,6 +928,7 @@ class ScanWorker:
             )
             return
         self._consecutive_loop_failures = 0
+        self._failed_flush_ticks = 0
         self._degraded.clear()
         logger.info("Scan worker recovered: the job store accepted a write")
 
