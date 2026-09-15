@@ -30,7 +30,8 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection
+    from collections.abc import Callable
+    from collections.abc import Set as AbstractSet
 
 __all__ = ["ErrorCategory", "Job", "JobResult", "JobState", "JobStore"]
 
@@ -888,7 +889,7 @@ class JobStore:
         return [self._row_to_job(row) for row in rows]
 
     @_locked
-    def latest_run_job(self, exclude_ids: Collection[str] = ()) -> Job | None:
+    def latest_run_job(self, exclude_ids: AbstractSet[str] = frozenset()) -> Job | None:
         """
         Fetch the newest job that was not rejected at submit.
 
@@ -909,7 +910,9 @@ class JobStore:
             exclude_ids: Ids to treat as never run.  The web layer passes the
                 refused submits whose REJECTED write is still owed to the
                 worker, so their PENDING rows do not stand in for the job that
-                just ended (IN-08, D-06).
+                just ended (IN-08, D-06).  A set rather than any collection:
+                a bare id string is itself a collection of strings, and would
+                silently exclude its single characters instead (IN-10).
 
         Returns:
             The newest job whose error category is not REJECTED and whose id is
