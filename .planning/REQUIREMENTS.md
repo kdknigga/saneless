@@ -96,17 +96,17 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 ### Configuration Strictness
 
-- [ ] **CFG-01**: Unknown keys inside any config section (top level, `[paperless]`, `[scanner]`, `[output]`, `[profiles.<name>]`) are rejected at load with a message naming the section, the key, and the valid keys [M-18]
-- [ ] **CFG-02**: A `--config` path that does not exist exits with code 2 and a message naming the path [M-19, doc row 14]
-- [ ] **CFG-03**: `~` is expanded in every path setting and `$XDG_CONFIG_HOME` / `$XDG_STATE_HOME` are honoured for the default config and data locations [M-20, doc row 27]
-- [ ] **CFG-04**: `log_level` accepts only valid level names, and `-v` sets the effective level to DEBUG [M-21, doc row 11, doc row 13]
-- [ ] **CFG-05**: The Paperless token is a `SecretStr`; it never appears in `repr(settings)`, logs, or error messages [N-15]
-- [ ] **CFG-06**: The documented `title` profile key sets the default job title when the user leaves the title blank [M-24, doc row 6]
-- [ ] **CFG-07**: `auto-profiles --force` merges: it replaces only the keys it generates, preserves user-added keys such as `default_tags`, and never touches a profile it did not create [M-09, doc row 8]
-- [ ] **CFG-08**: Config rewrites are atomic (temp file, fsync, rename), UTF-8 regardless of locale, and preserve file mode and comments [M-10]
-- [ ] **CFG-09**: The recommended Docker Compose and docs mount the config directory rather than the file, so atomic rewrites succeed under the documented deployment [M-30, doc row 20]
-- [ ] **CFG-10**: `saneless <subcommand> --help` works without a valid configuration file [N-25]
-- [ ] **CFG-11**: The loaded config path and which keys came from the environment are logged at INFO at startup [U-01]
+- [x] **CFG-01**: Unknown keys inside any config section (top level, `[paperless]`, `[scanner]`, `[output]`, `[profiles.<name>]`) are rejected at load with a message naming the section, the key, and the valid keys [M-18]
+- [x] **CFG-02**: A `--config` path that does not exist exits with code 2 and a message naming the path [M-19, doc row 14]
+- [x] **CFG-03**: `~` is expanded in every path setting and `$XDG_CONFIG_HOME` / `$XDG_STATE_HOME` are honoured for the default config and data locations [M-20, doc row 27]
+- [x] **CFG-04**: `log_level` accepts only valid level names, and `-v` sets the effective level to DEBUG [M-21, doc row 11, doc row 13]
+- [x] **CFG-05**: The Paperless token is a `SecretStr`; it never appears in `repr(settings)`, logs, or error messages [N-15]
+- [x] **CFG-06**: The documented `title` profile key sets the default job title when the user leaves the title blank [M-24, doc row 6]
+- [x] **CFG-07**: `auto-profiles --force` merges: it replaces only the keys it generates, preserves user-added keys such as `default_tags`, and never touches a profile it did not create [M-09, doc row 8]
+- [x] **CFG-08**: Config rewrites are atomic (temp file, fsync, rename), UTF-8 regardless of locale, and preserve file mode and comments [M-10]
+- [x] **CFG-09**: The recommended Docker Compose and docs mount the config directory rather than the file, so atomic rewrites succeed under the documented deployment [M-30, doc row 20]
+- [x] **CFG-10**: `saneless <subcommand> --help` works without a valid configuration file [N-25]
+- [x] **CFG-11**: The loaded config path and which keys came from the environment are logged at INFO at startup [U-01]
 
 ### Exception Translation
 
@@ -284,17 +284,17 @@ Which phases cover which requirements. Updated during roadmap creation.
 | ROBU-09 | Phase 26 — Worker and Web Robustness | Complete |
 | ROBU-10 | Phase 26 — Worker and Web Robustness | Complete |
 | ROBU-11 | Phase 26 — Worker and Web Robustness | Complete |
-| CFG-01 | Phase 27 — Configuration Strictness | Pending |
-| CFG-02 | Phase 27 — Configuration Strictness | Pending |
-| CFG-03 | Phase 27 — Configuration Strictness | Pending |
-| CFG-04 | Phase 27 — Configuration Strictness | Pending |
-| CFG-05 | Phase 27 — Configuration Strictness | Pending |
-| CFG-06 | Phase 27 — Configuration Strictness | Pending |
-| CFG-07 | Phase 27 — Configuration Strictness | Pending |
-| CFG-08 | Phase 27 — Configuration Strictness | Pending |
-| CFG-09 | Phase 27 — Configuration Strictness | Pending |
-| CFG-10 | Phase 27 — Configuration Strictness | Pending |
-| CFG-11 | Phase 27 — Configuration Strictness | Pending |
+| CFG-01 | Phase 27 — Configuration Strictness | Complete |
+| CFG-02 | Phase 27 — Configuration Strictness | Complete |
+| CFG-03 | Phase 27 — Configuration Strictness | Complete |
+| CFG-04 | Phase 27 — Configuration Strictness | Complete |
+| CFG-05 | Phase 27 — Configuration Strictness | Complete |
+| CFG-06 | Phase 27 — Configuration Strictness | Complete |
+| CFG-07 | Phase 27 — Configuration Strictness | Complete |
+| CFG-08 | Phase 27 — Configuration Strictness | Complete |
+| CFG-09 | Phase 27 — Configuration Strictness | Complete |
+| CFG-10 | Phase 27 — Configuration Strictness | Complete |
+| CFG-11 | Phase 27 — Configuration Strictness | Complete |
 | EXC-01 | Phase 28 — Exception Translation | Pending |
 | EXC-02 | Phase 28 — Exception Translation | Pending |
 | EXC-03 | Phase 28 — Exception Translation | Pending |
