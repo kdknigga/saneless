@@ -10,18 +10,23 @@ from __future__ import annotations
 
 import logging
 import re
+import tomllib
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal, cast
 
 import tomlkit
+from tomlkit.items import InlineTable
 
+from saneless.atomic_write import replace_file_atomically
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
 from saneless.exceptions import ConfigError
 from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from tomlkit import TOMLDocument
 
     from saneless.scanner.base import DeviceCapabilities
 
@@ -598,6 +603,69 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     return values
 
 
+def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
+    """
+    Parse the config file for a merge, or start an empty document.
+
+    Args:
+        config_path: The config file; it need not exist.
+
+    Returns:
+        The parsed document and the exact text it was parsed from (empty for
+        a file that does not exist yet).
+
+    Raises:
+        ConfigError: The file's bytes are not valid UTF-8.
+
+    """
+    if not config_path.exists():
+        return tomlkit.document(), ""
+    # D-05 / Pitfall 4: bytes decoded as UTF-8 here. Path's text-mode reader
+    # uses the locale encoding and translates CRLF to LF, silently re-encoding
+    # the file and rewriting its line endings on the way back out.
+    try:
+        text = config_path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        msg = f"{config_path} is not valid UTF-8; refusing to rewrite it"
+        raise ConfigError(msg) from None
+    return tomlkit.parse(text), text
+
+
+def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) -> str:
+    """
+    Dump the merged document, keep its line endings, and prove it parses.
+
+    Args:
+        config_path: The config file, for the error message.
+        doc: The merged document.
+        original_text: The text the document was parsed from.
+
+    Returns:
+        The text to write.
+
+    Raises:
+        ConfigError: The dumped text is not valid TOML; nothing was written.
+
+    """
+    new_text = tomlkit.dumps(doc)
+    if "\r\n" in original_text:
+        # tomlkit keeps the CRLF of the lines it parsed but ends the lines it
+        # adds with a bare LF; normalise those so the file stays CRLF (D-05).
+        new_text = re.sub(r"(?<!\r)\n", "\r\n", new_text)
+    try:
+        tomllib.loads(new_text)
+    except tomllib.TOMLDecodeError:
+        # The guard: whatever shape the operator's file has, and whatever
+        # tomlkit makes of it, text that does not parse never replaces a
+        # working config.
+        msg = (
+            f"Cannot update {config_path}: the merged profiles do not form "
+            "valid TOML; refusing to rewrite it, so the file is left intact"
+        )
+        raise ConfigError(msg) from None
+    return new_text
+
+
 _MergeOutcome = Literal[
     "added", "refreshed", "skipped_not_generated", "skipped_existing"
 ]
@@ -626,7 +694,14 @@ def _merge_profile(
     values = _generated_values(profile)
     existing = section.get(name)
     if existing is None:
-        table = tomlkit.table()
+        # A standard table inside an inline ``profiles = { ... }`` section
+        # dumps as invalid TOML (verified, tomlkit 0.14), so an inline section
+        # gets an inline table. The tomllib guard backs this up.
+        table = (
+            tomlkit.inline_table()
+            if isinstance(section, InlineTable)
+            else tomlkit.table()
+        )
         for key, value in values.items():
             table.add(key, value)
         section[name] = table
@@ -686,17 +761,29 @@ def write_profiles_to_config(
         profiles: Dictionary of profile name to ProfileConfig.
         force: If True, refresh the owned keys of flagged profiles.
 
+    The rewrite is durable (CFG-08): the file is read as UTF-8 bytes, CRLF
+    line endings are kept, the new text is re-parsed before anything is
+    replaced, and ``replace_file_atomically`` swaps it in through any symlink
+    (D-05, D-07). A merge that changes nothing does not rewrite the file.
+
+    Args:
+        config_path: Path to the TOML config file.
+        profiles: Dictionary of profile name to ProfileConfig.
+        force: If True, refresh the owned keys of flagged profiles.
+
     Returns:
-        What was added, refreshed, skipped and removed.
+        What was added, refreshed, skipped and removed, with ``path`` the real
+        file (the symlink's target when ``config_path`` is a link).
 
     Raises:
-        ConfigError: ``[profiles]`` in the file is not a table.
+        ConfigError: ``[profiles]`` in the file is not a table, the file is not
+            valid UTF-8, the merged text does not parse as TOML, or the file is
+            bind-mounted as a single file (EBUSY) and cannot be replaced.
+        OSError: Any other failure to read or replace the file, including
+            ``PermissionError`` for a file this process may not write.
 
     """
-    if config_path.exists():
-        doc = tomlkit.parse(config_path.read_text())
-    else:
-        doc = tomlkit.document()
+    doc, original_text = _read_config(config_path)
 
     if "profiles" not in doc:
         doc.add("profiles", tomlkit.table(is_super_table=True))
@@ -738,9 +825,20 @@ def write_profiles_to_config(
         outcome = _merge_profile(profiles_section, name, profile, force=force)
         outcomes[outcome].append(name)
 
-    config_path.write_text(tomlkit.dumps(doc))
+    if not (outcomes["added"] or outcomes["refreshed"] or orphans):
+        # Nothing changed, so nothing is replaced -- and a legacy single-file
+        # mount gets no EBUSY error for a run that had nothing to write.
+        target = config_path.resolve()
+    else:
+        new_text = _render_checked(config_path, doc, original_text)
+        target = replace_file_atomically(config_path, new_text)
+        if target != config_path.absolute():
+            # D-07: the operator edits the link, the write lands on the target;
+            # naming both explains which file changed.
+            logger.info("Wrote profiles to %s (symlink to %s)", config_path, target)
+
     return ProfileWriteResult(
-        path=config_path,
+        path=target,
         added=tuple(outcomes["added"]),
         refreshed=tuple(outcomes["refreshed"]),
         skipped_not_generated=tuple(outcomes["skipped_not_generated"]),
