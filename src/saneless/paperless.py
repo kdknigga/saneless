@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -275,6 +276,31 @@ def _render_error_body(response: httpx.Response) -> str:
     return _bounded_line(text) or _EMPTY_BODY
 
 
+_USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)?.*@", re.DOTALL)
+"""Everything up to the last ``@`` of a URL, keeping any ``scheme://`` prefix."""
+
+
+def _without_userinfo(url: str) -> str:
+    """
+    Remove any ``user:password@`` from a URL before it is shown anywhere.
+
+    Deliberately textual rather than parsed, so it also covers a URL httpx
+    rejects or reads differently (no scheme, a bad port), and deliberately
+    greedy: it cuts through the *last* ``@``, so a password holding a raw
+    ``@`` or ``/`` cannot leave a fragment behind.  The cost is that a base
+    URL whose path holds an ``@`` is shown shortened, which is display only;
+    a leaked credential cannot be taken back (WR-08).
+
+    Args:
+        url: A configured or upstream-supplied URL.
+
+    Returns:
+        The URL with nothing left of its userinfo.
+
+    """
+    return _USERINFO.sub(r"\1", url, count=1)
+
+
 def _bounded_line(text: str) -> str:
     """
     Collapse ``text`` to one line and cut it to ``_MAX_BODY_LINE_CHARS``.
@@ -315,7 +341,7 @@ def _not_accepted_message(response: httpx.Response) -> str:
 
     """
     status = f"{response.status_code} {response.reason_phrase}"
-    location = _bounded_line(response.headers.get("location", ""))
+    location = _bounded_line(_without_userinfo(response.headers.get("location", "")))
     if response.is_client_error:
         return (
             f"Paperless rejected the upload ({status}): {_render_error_body(response)}"
@@ -409,6 +435,9 @@ class PaperlessClient:
         url: Base URL of the paperless-ngx instance.
         token: API authentication token.  It is sent only in the
             ``Authorization`` header and never interpolated into a message.
+            Any ``user:password@`` in ``url`` is sent as Basic auth, exactly
+            as httpx would send it, and is stripped from every message and
+            log line.
         consume_dir: Optional fallback directory for PDF upload failures.
         max_retries: Maximum number of upload attempts, including the first.
         _transport: Optional httpx transport for testing.
@@ -427,9 +456,13 @@ class PaperlessClient:
         _transport: httpx.BaseTransport | None = None,
     ) -> None:
         """Initialize the paperless-ngx API client."""
-        self._base_url = url.rstrip("/")
+        base_url = url.rstrip("/")
+        # The only form of the URL any message or log line may carry: a
+        # paperless.url with user:password@ in it (Basic auth for a reverse
+        # proxy) must not put that password in job.error, on the terminal or
+        # in the log (WR-08, D-08).
+        self._display_url = _without_userinfo(base_url)
         client_kwargs: dict = {
-            "base_url": self._base_url,
             "headers": {
                 "Authorization": f"Token {token}",
                 "Accept": _API_VERSION_ACCEPT,
@@ -439,9 +472,20 @@ class PaperlessClient:
         if _transport is not None:
             client_kwargs["transport"] = _transport
         try:
+            parsed = httpx.URL(base_url)
+            if parsed.userinfo:
+                # The credentials travel as the Basic auth httpx would derive
+                # from the URL anyway, so the request is unchanged, while the
+                # base URL itself -- which httpx names in its own request log
+                # line and exception text -- no longer carries them.
+                client_kwargs["auth"] = httpx.BasicAuth(
+                    parsed.username, parsed.password
+                )
+                base_url = str(parsed.copy_with(userinfo=b"")).rstrip("/")
+            client_kwargs["base_url"] = base_url
             self._client = httpx.Client(**client_kwargs)
         except httpx.InvalidURL as exc:
-            msg = f"Paperless URL {self._base_url} is not valid: {describe(exc)}"
+            msg = f"Paperless URL {self._display_url} is not valid: {describe(exc)}"
             raise PaperlessError(msg) from exc
         self._consume_dir = consume_dir
         self._max_retries = max_retries
@@ -522,7 +566,7 @@ class PaperlessClient:
                 # (WR-04).
                 logger.warning(
                     "Paperless URL %s cannot be used (%s); not retrying",
-                    self._base_url,
+                    self._display_url,
                     _one_line_reason(exc),
                 )
                 last_error = exc
@@ -533,7 +577,7 @@ class PaperlessClient:
                 self._back_off(attempt, exc)
             except httpx.HTTPError as exc:
                 msg = (
-                    f"Could not upload to Paperless at {self._base_url}: "
+                    f"Could not upload to Paperless at {self._display_url}: "
                     f"{describe(exc)}"
                 )
                 raise PaperlessError(msg) from exc
@@ -550,10 +594,10 @@ class PaperlessClient:
             else _one_line_reason(last_error)
         )
         if fast_fail:
-            msg = f"Could not reach Paperless at {self._base_url}: {reason}"
+            msg = f"Could not reach Paperless at {self._display_url}: {reason}"
         else:
             msg = (
-                f"Upload to Paperless at {self._base_url} failed after "
+                f"Upload to Paperless at {self._display_url} failed after "
                 f"{self._max_retries} attempts: {reason}"
             )
         raise PaperlessError(msg) from last_error
@@ -616,7 +660,7 @@ class PaperlessClient:
             task_id = response.json()
         except ValueError as exc:
             msg = (
-                f"Paperless at {self._base_url} returned a response that is "
+                f"Paperless at {self._display_url} returned a response that is "
                 f"not JSON: {describe(exc)}"
             )
             raise PaperlessError(msg) from exc
@@ -861,7 +905,7 @@ class PaperlessClient:
             payload = response.json()
         except ValueError as exc:
             msg = (
-                f"Paperless at {self._base_url} returned a task response that is "
+                f"Paperless at {self._display_url} returned a task response that is "
                 f"not JSON: {_one_line_reason(exc)}"
             )
             raise PaperlessError(msg) from exc
@@ -977,7 +1021,7 @@ class PaperlessClient:
                 <reason>``, chained to the httpx error or the ValueError.
 
         """
-        prefix = f"Could not fetch {noun} from Paperless at {self._base_url}"
+        prefix = f"Could not fetch {noun} from Paperless at {self._display_url}"
         try:
             response = self._client.get(path, params={"page_size": 1000})
             response.raise_for_status()
