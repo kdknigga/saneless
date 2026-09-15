@@ -682,3 +682,60 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
         assert finished is not None
         assert finished.state is JobState.ERROR
         assert tc.get("/health").status_code == 200
+
+
+def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A job store that keeps refusing an owed write shows on ``/health``.
+
+    ROBU-01 success criterion 1, WR-10, D-10, D-12: the job's SCANNING write
+    and the guard's ERROR write fail, and every idle retry of the owed write
+    fails too.  After a short streak of failed retries the worker degrades, so
+    ``/health`` answers 503 "job store failing" and a new scan is refused with
+    503.  Once the store heals, the recovery probe and the owed write land:
+    ``/health`` is 200 again and the status poll renders ``#scan-btn`` enabled.
+    """
+    # Before the lifespan starts the worker: patched later, it would sit in a
+    # five-second queue wait before the first fast tick.
+    monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 0.02)
+    app = _make_app(tmp_path)
+    broken = threading.Event()
+    broken.set()
+
+    with TestClient(app) as tc:
+        job_store: JobStore = app.state.job_store
+        updates = _BreakableWrite(job_store.update_state, broken)
+        finishes = _BreakableWrite(job_store.finish_job, broken)
+        monkeypatch.setattr(job_store, "update_state", updates)
+        monkeypatch.setattr(job_store, "finish_job", finishes)
+
+        response = tc.post("/api/scan", data={"profile": "default"})
+        assert response.status_code == 200
+        job_id = job_store.list_recent(limit=1)[0].id
+
+        assert _poll_until(
+            lambda: tc.get("/health").status_code == 503, _OWED_WRITE_BUDGET
+        )
+        assert tc.get("/health").json() == {
+            "status": "error",
+            "detail": "job store failing",
+        }
+        refused = tc.post("/api/scan", data={"profile": "default"})
+        assert refused.status_code == 503
+
+        broken.clear()
+
+        assert _poll_until(
+            lambda: tc.get("/health").status_code == 200, _OWED_WRITE_BUDGET
+        )
+
+        def button_enabled() -> bool:
+            text = tc.get("/api/jobs/current/status").text
+            return "disabled" not in _only_scan_button(text).group("attrs")
+
+        assert _poll_until(button_enabled, _OWED_WRITE_BUDGET)
+        finished = job_store.get_job(job_id)
+        assert finished is not None
+        assert finished.state is JobState.ERROR
