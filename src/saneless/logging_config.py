@@ -24,7 +24,7 @@ def configure_logging(
     backup_count: int = 5,
     *,
     verbose: bool = False,
-) -> None:
+) -> bool:
     """
     Configure application logging with rotating file handler.
 
@@ -41,6 +41,12 @@ def configure_logging(
         backup_count: Number of rotated log files to keep.
         verbose: If True, also mirror to stderr and log saneless's own
             loggers at DEBUG.
+
+    Returns:
+        Whether log records reach ``log_file``: True when the rotating file
+        handler attached, False when logging fell back to stderr. The CLI uses
+        it so "Full details in <log_file>" is printed only when it is true
+        (D-06).
 
     """
     formatter = logging.Formatter(
@@ -61,11 +67,13 @@ def configure_logging(
         )
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
+        attached = True
     except OSError:
         stderr_handler = logging.StreamHandler(sys.stderr)
         stderr_handler.setFormatter(formatter)
         root_logger.addHandler(stderr_handler)
         root_logger.warning("Cannot write to %s, logging to stderr only", log_file)
+        attached = False
 
     if verbose:
         stderr_handler = logging.StreamHandler(sys.stderr)
@@ -78,3 +86,4 @@ def configure_logging(
     # non-verbose path makes repeated calls idempotent instead of leaking an
     # earlier call's DEBUG.
     logging.getLogger("saneless").setLevel(logging.DEBUG if verbose else logging.NOTSET)
+    return attached
