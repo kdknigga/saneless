@@ -400,13 +400,18 @@ class TestSaneBackendScanPages:
         # The fault is armed on the device rather than by swapping out its snap
         # method: start() is where a flatbed scan first touches the hardware,
         # and the fake raises from there with the library's own error type.
-        dev = FakeSaneDev(start_error=FakeSaneError("scan failed"))
+        # Since EXC-01 the library's error leaves the backend as a ScanError
+        # naming the device, with the original kept as its cause.
+        original = FakeSaneError("scan failed")
+        dev = FakeSaneDev(start_error=original)
         backend = _backend_with(dev, monkeypatch)
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
 
-        with pytest.raises(FakeSaneError, match="scan failed"):
+        with pytest.raises(ScanError) as exc_info:
             backend.scan_pages("test:0", settings)
 
+        assert str(exc_info.value) == "Scanner error on test:0: scan failed"
+        assert exc_info.value.__cause__ is original
         assert dev.cancel_calls
         assert dev.close_calls
 
@@ -3235,3 +3240,172 @@ class TestSaneBoundary:
         ]
         assert len(records) == 1
         assert records[0].exc_info is not None
+
+    # -- option assignment and read-back (D-08) -----------------------------
+
+    @pytest.mark.parametrize(
+        ("option", "settings", "error", "expected"),
+        [
+            pytest.param(
+                "source",
+                ScanSettings(source="Flatbed", resolution=300, mode="Color"),
+                FakeSaneError("Invalid argument"),
+                "Could not set source to 'Flatbed' on test:0: Invalid argument",
+                id="source-invalid-argument",
+            ),
+            pytest.param(
+                "mode",
+                ScanSettings(source="Flatbed", resolution=300, mode="Lineart"),
+                FakeSaneError("Invalid argument"),
+                "Could not set mode to 'Lineart' on test:0: Invalid argument",
+                id="mode-invalid-argument",
+            ),
+            pytest.param(
+                "mode",
+                ScanSettings(source="Flatbed", resolution=300, mode="Color"),
+                AttributeError("Inactive option: mode"),
+                "Could not set mode to 'Color' on test:0: Inactive option: mode",
+                id="mode-inactive-option",
+            ),
+            pytest.param(
+                "resolution",
+                ScanSettings(source="Flatbed", resolution=300, mode="Color"),
+                FakeSaneError("Invalid argument"),
+                "Could not set resolution to 300 on test:0: Invalid argument",
+                id="resolution-invalid-argument",
+            ),
+        ],
+    )
+    def test_option_assignment_failure_names_option_and_value(
+        self,
+        option: str,
+        settings: ScanSettings,
+        error: BaseException,
+        expected: str,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A refused assignment names the option, the value and the device."""
+        dev = FakeSaneDev()
+        dev.fail_assignment(option, error)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", settings)
+
+        assert str(exc_info.value) == expected
+        assert exc_info.value.__cause__ is error
+        assert dev.cancel_calls
+        assert dev.close_calls
+
+    def test_resolution_read_back_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reading the resolution back after setting it is wrapped too."""
+        original = AttributeError("Inactive option: resolution")
+        dev = FakeSaneDev()
+        dev.fail_read("resolution", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == (
+            "Could not read back resolution from test:0: Inactive option: resolution"
+        )
+        assert exc_info.value.__cause__ is original
+
+    # -- get_options ---------------------------------------------------------
+
+    def test_get_options_failure_in_scan_pages_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_options() failing on the scan path names the device."""
+        original = FakeSaneError("Error during device I/O")
+        dev = FakeSaneDev()
+        dev.fail_call("get_options", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == (
+            "Could not read options from test:0: Error during device I/O"
+        )
+        assert exc_info.value.__cause__ is original
+        assert dev.close_calls
+
+    def test_get_options_failure_in_get_capabilities_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """get_options() failing while reading capabilities names the device."""
+        original = FakeSaneError("Error during device I/O")
+        dev = FakeSaneDev()
+        dev.fail_call("get_options", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.get_capabilities("test:0")
+
+        assert str(exc_info.value) == (
+            "Could not read options from test:0: Error during device I/O"
+        )
+        assert exc_info.value.__cause__ is original
+
+    # -- flatbed start / snap ------------------------------------------------
+
+    def test_flatbed_start_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A flatbed start() failure names the device and chains the original."""
+        original = FakeSaneError("Scanner cover is open")
+        dev = FakeSaneDev(start_error=original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == "Scanner error on test:0: Scanner cover is open"
+        assert exc_info.value.__cause__ is original
+        assert not isinstance(exc_info.value, FeederEmptyError)
+
+    def test_flatbed_snap_failure_raises_scan_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """snap()'s RuntimeError for an empty read is a ScanError with cause."""
+        original = RuntimeError("Scanner returned no data")
+        dev = FakeSaneDev()
+        dev.fail_call("snap", original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert "Scanner returned no data" in str(exc_info.value)
+        assert exc_info.value.__cause__ is original
+        assert dev.close_calls
+
+    def test_flatbed_out_of_documents_is_feeder_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one end-of-feed message maps to FeederEmptyError (Phase 24 D-03)."""
+        original = FakeSaneError(_OUT_OF_DOCUMENTS)
+        dev = FakeSaneDev(start_error=original)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(FeederEmptyError) as exc_info:
+            backend.scan_pages("test:0", _flatbed_settings())
+
+        assert str(exc_info.value) == "No paper detected in feeder"
+        assert exc_info.value.__cause__ is original
+
+    def test_adf_empty_message_fault_names_the_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A mid-batch fault with no text still says what went wrong."""
+        dev = FakeSaneDev(pages=5, start_error=FakeSaneError(""), start_error_page=1)
+        backend = _backend_with(dev, monkeypatch)
+
+        with pytest.raises(ScanError) as exc_info:
+            backend.scan_pages("test:0", _feeder_settings())
+
+        assert str(exc_info.value) == "Scanner error on page 2: FakeSaneError"
