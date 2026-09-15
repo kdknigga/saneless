@@ -55,7 +55,7 @@ The fallback activates only when **all** of these conditions are true:
 2. All attempts are exhausted. A malformed URL is the exception: it is not retried, because retrying cannot help, but it still falls back so the scan is not lost.
 3. A `consume_dir` is configured (non-empty string).
 
-**A rejected upload never falls back.** When paperless-ngx answers with a 4xx -- a bad token, or a field it refuses, such as an invalid title -- the upload is not retried and nothing is copied to the consume directory. The scan fails at once with Paperless's reason, because the same request would only be rejected again.
+**A rejected or redirected upload never falls back.** When paperless-ngx answers with a 4xx -- a bad token, or a field it refuses, such as an invalid title -- the upload is not retried and nothing is copied to the consume directory. The scan fails at once with Paperless's reason, because the same request would only be rejected again. A redirect (a 3xx) is treated the same way: it almost always means `paperless.url` points at the wrong address, such as an `http://` URL behind a proxy that redirects to `https://`, so the scan fails at once and the error names where the upload was redirected to.
 
 If no `consume_dir` is configured, the upload error propagates and the scan job enters the ERROR state. The user sees the error in the web UI or CLI output.
 
