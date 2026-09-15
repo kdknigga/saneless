@@ -1647,6 +1647,125 @@ class TestValidateSettingsDirs:
         # Restore permissions for cleanup
         parent.chmod(0o755)
 
+    @pytest.mark.parametrize("label", ["tmp_dir", "data_dir", "consume_dir"])
+    def test_validate_deep_missing_dir_under_unwritable_ancestor_fails(
+        self, tmp_path: Path, label: str
+    ) -> None:
+        """
+        A deep missing directory is checked against its nearest ancestor (M-20).
+
+        Only the immediate parent used to be checked, and only when it existed,
+        so ``<unwritable>/a/b/c`` passed at startup and failed mid-scan.
+        """
+        if os.geteuid() == 0:
+            pytest.skip("root ignores directory permissions")
+        ancestor = tmp_path / "readonly"
+        ancestor.mkdir()
+        deep = str(ancestor / "a" / "b" / "c")
+        settings = Settings(
+            output=OutputConfig(
+                tmp_dir=deep if label == "tmp_dir" else str(tmp_path),
+                data_dir=deep if label == "data_dir" else str(tmp_path),
+            ),
+            paperless=PaperlessConfig(
+                consume_dir=deep if label == "consume_dir" else ""
+            ),
+            profiles={"default": ProfileConfig()},
+        )
+        ancestor.chmod(0o555)
+        try:
+            with pytest.raises(ConfigError, match="not writable") as exc_info:
+                validate_settings_dirs(settings)
+        finally:
+            ancestor.chmod(0o755)
+        message = str(exc_info.value)
+        assert message.startswith(label)
+        assert str(ancestor) in message
+
+    def test_validate_deep_missing_dirs_under_writable_ancestor_pass(
+        self, tmp_path: Path
+    ) -> None:
+        """Missing directories whose nearest existing ancestor is writable pass."""
+        settings = Settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path / "t" / "a" / "b"),
+                data_dir=str(tmp_path / "d" / "a" / "b"),
+            ),
+            paperless=PaperlessConfig(consume_dir=str(tmp_path / "c" / "a" / "b")),
+            profiles={"default": ProfileConfig()},
+        )
+        validate_settings_dirs(settings)
+        assert not (tmp_path / "t").exists()
+
+    def test_nearest_existing_ancestor_walks_up(self, tmp_path: Path) -> None:
+        """The nearest ancestor of a missing path is its deepest existing one."""
+        assert config_mod._nearest_existing_ancestor(tmp_path / "a" / "b") == tmp_path
+        assert config_mod._nearest_existing_ancestor(tmp_path) == tmp_path
+
+
+class TestPathExpansion:
+    """
+    A leading ``~`` is expanded in every path setting (CFG-03, M-20).
+
+    ``~/scans`` in a config file used to be taken literally, creating a
+    directory named ``~`` in the working directory. By decision (Claude's
+    Discretion), only ``~`` is expanded: ``$VAR`` stays literal (T-27-26), and
+    an empty ``consume_dir`` stays empty because empty means disabled.
+    """
+
+    @pytest.fixture
+    def home(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """
+        Redirect HOME into tmp_path and run in an empty CWD.
+
+        Returns:
+            The redirected home directory.
+
+        """
+        monkeypatch.chdir(tmp_path)
+        home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(home))
+        return home
+
+    def test_expanduser_output_paths(self, home: Path) -> None:
+        """``tmp_dir``, ``data_dir`` and ``log_file`` expand ``~`` under HOME."""
+        output = OutputConfig(
+            tmp_dir="~/t", data_dir="~/d", log_file="~/l/saneless.log"
+        )
+        assert output.tmp_dir == str(home / "t")
+        assert output.data_dir == str(home / "d")
+        assert output.log_file == str(home / "l" / "saneless.log")
+
+    def test_expanduser_consume_dir(self, home: Path) -> None:
+        """``consume_dir`` expands ``~`` under HOME."""
+        paperless = PaperlessConfig(consume_dir="~/consume")
+        assert paperless.consume_dir == str(home / "consume")
+
+    def test_expanduser_from_toml(self, home: Path, tmp_path: Path) -> None:
+        """A ``~`` path read from a TOML file is expanded."""
+        config_file = tmp_path / "x.toml"
+        config_file.write_text('[output]\ndata_dir = "~/state"\n\n[profiles.default]\n')
+        settings = load_settings(str(config_file))
+        assert settings.output.data_dir == str(home / "state")
+
+    def test_expanduser_from_environment(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``~`` path from a SANELESS_* variable is expanded."""
+        monkeypatch.setenv("SANELESS_OUTPUT__LOG_FILE", "~/x.log")
+        settings = load_settings()
+        assert settings.output.log_file == str(home / "x.log")
+
+    @pytest.mark.usefixtures("home")
+    def test_expanduser_leaves_empty_consume_dir_empty(self) -> None:
+        """An empty ``consume_dir`` means disabled and is not expanded."""
+        assert PaperlessConfig(consume_dir="").consume_dir == ""
+
+    @pytest.mark.usefixtures("home")
+    def test_expanduser_does_not_expand_variables(self) -> None:
+        """``$HOME`` in a path setting is kept literally (T-27-26)."""
+        assert OutputConfig(data_dir="$HOME/x").data_dir == "$HOME/x"
+
 
 class TestDataDir:
     """OutputConfig.data_dir and its computed db_path / failed_dir properties."""
