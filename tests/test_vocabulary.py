@@ -18,7 +18,10 @@ from saneless.exceptions import (
     FeederEmptyError,
     PaperlessError,
     PaperlessTimeoutError,
+    PdfError,
+    ScanCancelledError,
     ScanError,
+    StorageError,
 )
 from saneless.job import ErrorCategory as JobErrorCategory
 from saneless.job import Job
@@ -34,6 +37,7 @@ from saneless.vocabulary import (
     WORKER_DOWN_JOB_ERROR,
     ConnectionStatus,
     ErrorCategory,
+    ExitCode,
     FlipOutcome,
     JobState,
     RequestRejection,
@@ -43,6 +47,7 @@ from saneless.vocabulary import (
     classify_error,
     connection_status_message,
     error_message,
+    exit_code_for,
     flip_answer_label,
     job_state_for,
     progress_label,
@@ -56,16 +61,16 @@ from saneless.vocabulary import (
 class TestJobStateMembers:
     """JobState membership tests."""
 
-    def test_job_state_has_exactly_nine_members(self) -> None:
+    def test_job_state_has_exactly_ten_members(self) -> None:
         """
-        JobState declares exactly nine lifecycle members (CTR-01, DPLX-06).
+        JobState declares exactly ten lifecycle members (CTR-01, DPLX-06, D-01).
 
         A count guard, not a name list: adding a member should fail the
         parametrised completeness tests below -- which force a label and a
         classification decision -- rather than a hand-written roster that only
         records what the enum happened to contain when it was written.
         """
-        assert len(list(JobState)) == 9
+        assert len(list(JobState)) == 10
 
     @pytest.mark.parametrize("state", list(JobState))
     def test_job_state_value_equals_name(self, state: JobState) -> None:
@@ -81,8 +86,9 @@ class TestErrorCategoryMembers:
         ErrorCategory names are the documented categories (CTR-05, D-06).
 
         The documented categories include REJECTED for a submit that never
-        ran (D-06).  Compared as a set: declaration order is not part of any
-        contract, and pinning it would fail a harmless reordering.
+        ran (D-06) and ASSEMBLY for a PDF that could not be built (D-04).
+        Compared as a set: declaration order is not part of any contract, and
+        pinning it would fail a harmless reordering.
         """
         assert {category.name for category in ErrorCategory} == {
             "FEEDER",
@@ -91,6 +97,7 @@ class TestErrorCategoryMembers:
             "UPLOAD",
             "UNKNOWN",
             "REJECTED",
+            "ASSEMBLY",
         }
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
@@ -152,11 +159,23 @@ class TestStateClassifications:
         )
 
     def test_terminal_states_membership(self) -> None:
-        """TERMINAL_STATES is exactly DONE, ERROR and FALLBACK (CTR-01, OUTC-02)."""
+        """TERMINAL_STATES is DONE, ERROR, FALLBACK and CANCELLED (OUTC-02, D-01)."""
         assert (
-            frozenset({JobState.DONE, JobState.ERROR, JobState.FALLBACK})
+            frozenset(
+                {
+                    JobState.DONE,
+                    JobState.ERROR,
+                    JobState.FALLBACK,
+                    JobState.CANCELLED,
+                }
+            )
             == TERMINAL_STATES
         )
+
+    def test_cancelled_is_not_busy(self) -> None:
+        """A cancelled job is finished, so the machine is not working (D-01)."""
+        assert JobState.CANCELLED not in BUSY_STATES
+        assert JobState.CANCELLED.value == "CANCELLED"
 
     def test_busy_states_is_derived_from_active_states(self) -> None:
         """BUSY_STATES is ACTIVE_STATES minus AWAITING_FLIP (CTR-01)."""
@@ -187,6 +206,7 @@ class TestStateLabel:
             (JobState.DONE, "Complete"),
             (JobState.ERROR, "Failed"),
             (JobState.FALLBACK, "Saved to folder"),
+            (JobState.CANCELLED, "Cancelled"),
         ],
     )
     def test_state_label_strings(self, state: JobState, expected: str) -> None:
@@ -227,10 +247,11 @@ class TestProgressLabel:
         assert label != state.value
 
     def test_terminal_states_have_progress_prose_for_totality(self) -> None:
-        """The three terminal states carry prose purely to stay total (CTR-01)."""
+        """The four terminal states carry prose purely to stay total (CTR-01)."""
         assert progress_label(JobState.DONE) == "Complete"
         assert progress_label(JobState.ERROR) == "Failed"
         assert progress_label(JobState.FALLBACK) == "Saved to folder"
+        assert progress_label(JobState.CANCELLED) == "Cancelled"
 
 
 class TestFlipAnswerLabel:
@@ -285,6 +306,9 @@ class TestErrorMessage:
             "The document could not be sent to paperless-ngx."
         )
         assert error_message(ErrorCategory.UNKNOWN) == "Something went wrong."
+        assert error_message(ErrorCategory.ASSEMBLY) == (
+            "The scanned pages could not be assembled into a PDF."
+        )
 
     def test_rejected_error_message(self) -> None:
         """REJECTED explains that the scan never started (D-05, D-06)."""
@@ -750,6 +774,82 @@ class TestClassifyError:
         assert issubclass(FeederEmptyError, ScanError)
         assert classify_error(FeederEmptyError("no paper")) is ErrorCategory.FEEDER
 
+    def test_classify_error_pdf_error_is_assembly(self) -> None:
+        """PdfError classifies as ASSEMBLY, never as SCANNER (EXC-01, D-04)."""
+        assert classify_error(PdfError("disk full")) is ErrorCategory.ASSEMBLY
+
+    def test_classify_error_scan_cancelled_error_is_unknown(self) -> None:
+        """
+        ScanCancelledError has no category of its own (D-01).
+
+        A cancel is not a failure category: callers test for it before they
+        classify, so reaching ``classify_error`` with one is already a bug and
+        UNKNOWN is the honest answer.
+        """
+        assert classify_error(ScanCancelledError("stopped")) is ErrorCategory.UNKNOWN
+
+    def test_classify_error_storage_error_is_unknown(self) -> None:
+        """
+        StorageError stays UNKNOWN; its exit code 2 is assigned by type (D-07).
+
+        ``ErrorCategory`` is persisted on job records, and a job database that
+        cannot be opened is not any job's configuration failure.  The CLI guard
+        maps StorageError to ``ExitCode.CONFIG`` by exception type, so this pin
+        stops anyone "fixing" the exit code by reclassifying it.
+        """
+        assert classify_error(StorageError("bad db")) is ErrorCategory.UNKNOWN
+
+
+_EXIT_CODES_FOR_CATEGORIES: list[tuple[ErrorCategory, ExitCode]] = [
+    (ErrorCategory.FEEDER, ExitCode.SCAN),
+    (ErrorCategory.SCANNER, ExitCode.SCAN),
+    (ErrorCategory.CONFIG, ExitCode.CONFIG),
+    (ErrorCategory.UPLOAD, ExitCode.PAPERLESS),
+    (ErrorCategory.ASSEMBLY, ExitCode.PDF),
+    (ErrorCategory.UNKNOWN, ExitCode.UNEXPECTED),
+    (ErrorCategory.REJECTED, ExitCode.UNEXPECTED),
+]
+
+
+class TestExitCode:
+    """ExitCode definition and exit_code_for mapping tests."""
+
+    def test_exit_code_members_and_values(self) -> None:
+        """ExitCode is the one definition of the CLI exit codes (EXC-02, D-07)."""
+        assert {(member.name, int(member)) for member in ExitCode} == {
+            ("SUCCESS", 0),
+            ("SCAN", 1),
+            ("CONFIG", 2),
+            ("PAPERLESS", 3),
+            ("PDF", 4),
+            ("UNEXPECTED", 5),
+            ("CANCELLED", 130),
+        }
+
+    def test_exit_code_table_covers_every_category(self) -> None:
+        """The pinned mapping table names every ErrorCategory member (D-07)."""
+        assert {category for category, _ in _EXIT_CODES_FOR_CATEGORIES} == set(
+            ErrorCategory
+        )
+
+    @pytest.mark.parametrize(("category", "expected"), _EXIT_CODES_FOR_CATEGORIES)
+    def test_exit_code_for_mapping(
+        self, category: ErrorCategory, expected: ExitCode
+    ) -> None:
+        """exit_code_for returns the documented exit code per category (D-07)."""
+        assert exit_code_for(category) is expected
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_exit_code_for_is_total(self, category: ErrorCategory) -> None:
+        """Every ErrorCategory maps to an ExitCode (D-07)."""
+        assert isinstance(exit_code_for(category), ExitCode)
+
+    def test_exit_code_for_raises_on_unrecognised_value(self) -> None:
+        """exit_code_for raises on a value outside ErrorCategory (D-07)."""
+        bad = cast("ErrorCategory", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            exit_code_for(bad)
+
 
 class TestJobModuleReExports:
     """saneless.job re-export tests."""
@@ -787,6 +887,7 @@ class TestJobActivityProperties:
             (JobState.DONE, (False, False)),
             (JobState.ERROR, (False, False)),
             (JobState.FALLBACK, (False, False)),
+            (JobState.CANCELLED, (False, False)),
         ],
     )
     def test_job_reports_activity(
