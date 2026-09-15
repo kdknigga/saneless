@@ -643,13 +643,18 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
 
     ROBU-01 success criterion 1, CR-01, D-12: one loop-level failure whose
     best-effort ERROR write also failed leaves the row active and the button
-    disabled while ``/health`` stays 200.  The worker never degrades, so no
-    probe runs; the owed write must still land on an idle tick, and the next
-    status poll must render ``#scan-btn`` enabled with no restart and no scan.
+    disabled while ``/health`` stays 200.  The streak limit is raised here so
+    the worker never degrades and no probe runs; the owed write must still
+    land on an idle tick, and the next status poll must render ``#scan-btn``
+    enabled with no restart and no scan.
     """
     # Before the lifespan starts the worker: patched later, it would sit in a
     # five-second queue wait before the first fast tick.
     monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", 0.02)
+    # This test watches /health stay 200 through a failing window; the streak
+    # degrade is proven by
+    # test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_written.
+    monkeypatch.setattr("saneless.worker._OWED_RETRY_DEGRADED_AFTER", 1_000_000)
     app = _make_app(tmp_path)
     broken = threading.Event()
     broken.set()
