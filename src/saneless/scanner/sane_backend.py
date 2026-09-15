@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Any, Protocol, assert_never
 import PIL.Image
 from PIL import Image
 
-from saneless.exceptions import FeederEmptyError, ScanError
+from saneless.exceptions import ConfigError, FeederEmptyError, ScanError, describe
 from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
 from saneless.scanner.base import (
     DeviceCapabilities,
@@ -54,6 +54,42 @@ def _ensure_sane() -> None:
         import sane as _sane  # noqa: PLC0415
 
         sane = _sane
+
+
+def require_sane() -> None:
+    """
+    Import python-sane, or fail at once with an install hint.
+
+    This is the single python-sane availability check the SANE-using CLI
+    commands run first (D-05).  A failure is a setup problem, not a scan
+    problem, so it is a ``ConfigError`` and exits 2 through that category.
+
+    It is never called at import, so ``--help`` and every command that does not
+    touch a scanner stay free of the import.  python-sane is a mandatory
+    dependency, and failing loudly before any work starts beats failing
+    mid-scan with a bare ``ModuleNotFoundError``.
+
+    Both measured failure shapes are covered by one ``except ImportError``:
+    a missing package raises ``ModuleNotFoundError`` (a subclass), and a
+    missing ``libsane.so`` raises a plain ``ImportError`` naming the shared
+    object.  The import's own reason is kept in the message, because it is
+    what tells those two cases apart.
+
+    Raises:
+        ConfigError: If python-sane cannot be imported, chained to the
+            ``ImportError``.
+
+    """
+    try:
+        _ensure_sane()
+    except ImportError as exc:
+        msg = (
+            f"python-sane cannot be imported ({describe(exc)}). Install the SANE "
+            "development package (libsane-dev on Debian/Ubuntu, "
+            "sane-backends-devel on Fedora/RHEL) and reinstall saneless; see "
+            "Install on Bare Metal in the documentation"
+        )
+        raise ConfigError(msg) from exc
 
 
 # Allow high-DPI scans without triggering Pillow's decompression bomb check.
@@ -136,7 +172,7 @@ _MM_PER_INCH = 25.4
 # exact figure is not delicate.
 _AREA_TOLERANCE_MM = 1.0
 
-__all__ = ["GeometryUnit", "SaneBackend"]
+__all__ = ["GeometryUnit", "SaneBackend", "require_sane"]
 
 logger = logging.getLogger(__name__)
 
@@ -1043,8 +1079,19 @@ class SaneBackend(ScannerBackend):
     """
 
     def __init__(self, host: str = "") -> None:
-        """Initialize SANE, optionally configuring network host discovery."""
-        _ensure_sane()
+        """
+        Initialize SANE, optionally configuring network host discovery.
+
+        Args:
+            host: Colon-separated sane-net hosts, applied only when
+                ``SANE_NET_HOSTS`` is not already set.
+
+        Raises:
+            ConfigError: If python-sane cannot be imported (``require_sane``).
+            ScanError: If ``sane.init()`` fails, chained to the SANE error.
+
+        """
+        require_sane()
         # SANE_NET_HOSTS tells the sane-net backend which hosts to probe for
         # scanners.  Multiple hosts are separated by colons — see sane-net(5).
         # Only set from config when not already present in the environment
@@ -1057,7 +1104,13 @@ class SaneBackend(ScannerBackend):
                 "SANE_NET_HOSTS already set externally (%s), ignoring scanner.host config",
                 os.environ["SANE_NET_HOSTS"],
             )
-        self._sane_version = sane.init()
+        try:
+            self._sane_version = sane.init()
+        except Exception as exc:
+            # python-sane raises _sane.error, RuntimeError or AttributeError,
+            # with no shared base, so the boundary catches Exception (D-08).
+            init_msg = f"Could not initialise SANE: {describe(exc)}"
+            raise ScanError(init_msg) from exc
         logger.info("SANE initialized, version %s", self._sane_version)
 
     @contextlib.contextmanager
@@ -1074,14 +1127,28 @@ class SaneBackend(ScannerBackend):
         Yields:
             An open SANE device handle.
 
+        Raises:
+            ScanError: If the device cannot be opened, naming it and chained to
+                the SANE error.
+
         """
-        dev: SaneDevice = sane.open(device_id)
+        try:
+            dev: SaneDevice = sane.open(device_id)
+        except Exception as exc:
+            open_msg = f"Could not open scanner {device_id}: {describe(exc)}"
+            raise ScanError(open_msg) from exc
         try:
             yield dev
         finally:
             with contextlib.suppress(Exception):
                 dev.cancel()
-            dev.close()
+            try:
+                dev.close()
+            except Exception:
+                # Logged, never raised: an exception from close() here would
+                # replace the one that ended the scan, which is the error the
+                # operator needs to see (T-28-16).
+                logger.warning("Could not close scanner %s", device_id, exc_info=True)
 
     def get_devices(self) -> list[DeviceInfo]:
         """
@@ -1090,8 +1157,15 @@ class SaneBackend(ScannerBackend):
         Returns:
             List of DeviceInfo objects for each discovered device.
 
+        Raises:
+            ScanError: If SANE cannot enumerate devices, chained to its error.
+
         """
-        raw_devices = sane.get_devices()
+        try:
+            raw_devices = sane.get_devices()
+        except Exception as exc:
+            list_msg = f"Could not list scanners: {describe(exc)}"
+            raise ScanError(list_msg) from exc
         return [
             DeviceInfo(
                 name=d[0],
