@@ -756,8 +756,8 @@ class ScanWorker:
         """
         Write generated profiles to the loaded config file, if there is one.
 
-        Failure to write is logged, never raised: the profiles are still used
-        in memory for this run (D-17, D-18).
+        Failure to write is logged, never raised, whatever it raises: the
+        profiles are still used in memory for this run (D-17, D-18, WR-04).
 
         Args:
             profiles: The generated profiles.
@@ -788,6 +788,20 @@ class ScanWorker:
                 config_path,
                 type(exc).__name__,
                 exc,
+            )
+            return None
+        except Exception as exc:
+            # WR-04: anything else -- a tomlkit ParseError (a ValueError), a
+            # UnicodeDecodeError, a container error -- must not throw away the
+            # generated profiles either (D-18).  Unexpected, so the traceback
+            # is logged too; the exception class is named, never interpreted.
+            logger.warning(
+                "Auto-profiles: could not write %s (%s); the generated "
+                "profiles are used for this run only and will not survive a "
+                "restart",
+                config_path,
+                type(exc).__name__,
+                exc_info=True,
             )
             return None
         logger.info(
