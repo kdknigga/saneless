@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
 from saneless.atomic_write import replace_file_atomically
 
 _ORIGINAL = "[profiles.default]\nsource = 'Flatbed'\n"
