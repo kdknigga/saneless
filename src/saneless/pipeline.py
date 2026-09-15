@@ -337,6 +337,33 @@ def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
         raise ScanError(msg)
 
 
+def _require_pages(batch: ScanBatch) -> None:
+    """
+    Raise ScanError if a scanner pass came back with no pages at all.
+
+    This is the pipeline's own contract check against any ``ScannerBackend``
+    (EXC-03, N-06). Without it an empty batch was misreported as "all pages
+    blank" with empty-page detection on, and leaked img2pdf's bare
+    ``ValueError`` with detection off or on an empty manual-duplex half.
+
+    It never pre-empts Phase 24 D-03's truthful feeder message: the SANE
+    backend raises its own, more specific ``FeederEmptyError`` for an empty
+    feeder, or an all-unreadable ``ScanError``, before it ever returns a
+    batch. What it guarantees is that ``_drop_empty_pages`` and
+    ``assemble_pdf`` never see an empty list.
+
+    Args:
+        batch: The batch one ``scan_pages`` call returned.
+
+    Raises:
+        ScanError: If the batch carries no pages.
+
+    """
+    if not batch.pages:
+        msg = "No pages were scanned"
+        raise ScanError(msg)
+
+
 def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     """
     Log one WARNING when preserved scans have piled up in ``failed_dir``.
@@ -487,7 +514,9 @@ def _drop_empty_pages(
         list unchanged when it is off.
 
     Raises:
-        ScanError: If every page was detected as empty.
+        ScanError: If every page of a non-empty batch was detected as blank.
+            The input is never empty: ``_require_pages`` has already refused
+            an empty batch with ``No pages were scanned``.
 
     """
     if not profile.enable_empty_page_detection:
@@ -502,7 +531,7 @@ def _drop_empty_pages(
     if len(filtered) < len(images):
         logger.info("Empty page filter: %d -> %d pages", len(images), len(filtered))
     if not filtered:
-        msg = "All pages were detected as empty"
+        msg = "All pages were blank"
         raise ScanError(msg)
     return filtered
 
@@ -924,8 +953,10 @@ def _scan_manual_duplex(
         or a _DuplexMismatch holding both passes when the counts disagree.
 
     Raises:
-        ScanError: If the operator aborts at the flip prompt, or if the flip
-            wait times out.  Both raise before pass B starts.
+        ScanError: ``No pages were scanned`` if either pass returns no pages --
+            pass A before anyone is asked to flip, pass B before the count
+            comparison. Otherwise, if the operator aborts at the flip prompt,
+            or if the flip wait times out.  Both raise before pass B starts.
         AssertionError: If the coordinator returns a value that is not a
             FlipOutcome member.
 
@@ -936,6 +967,8 @@ def _scan_manual_duplex(
 
     # Pass A: scan fronts
     front_batch = scanner.scan_pages(device_id, scan_settings)
+    # Before the flip prompt, so nobody is asked to flip nothing (EXC-03).
+    _require_pages(front_batch)
     front_pages = front_batch.pages
     logger.info("Pass A: scanned %d front page(s)", len(front_pages))
 
@@ -968,6 +1001,8 @@ def _scan_manual_duplex(
     # Pass B: scan backs
     notify(PipelineEvent.SCANNING_REVERSE)
     back_batch = scanner.scan_pages(device_id, scan_settings)
+    # Before the count comparison, so no half is assembled from an empty list.
+    _require_pages(back_batch)
     back_pages = back_batch.pages
     logger.info("Pass B: scanned %d back page(s)", len(back_pages))
 
@@ -1044,8 +1079,12 @@ def _scan_simplex(
         The batch the device produced: its pages, the resolution it actually
         used, and how many fed sheets it could not read.
 
+    Raises:
+        ScanError: ``No pages were scanned`` if the backend returned no pages.
+
     """
     batch = scanner.scan_pages(device_id, scan_settings)
+    _require_pages(batch)
     logger.info("Scanned %d page(s)", len(batch.pages))
 
     # Generate thumbnail from first page
@@ -1113,8 +1152,10 @@ def run_pipeline(
     Raises:
         ConfigError: If the profile or device is not configured, or a manual
             duplex profile is run with no flip coordinator.
-        ScanError: If scanning fails, or a manual duplex flip wait is aborted
-            or times out.
+        ScanError: If scanning fails; ``No pages were scanned`` if a scan pass
+            returned no pages; ``All pages were blank`` if empty-page detection
+            removed every page; or if a manual duplex flip wait is aborted or
+            times out.
         PaperlessError: If upload or polling fails. The message names where
             the assembled PDF was preserved, or -- if preservation failed
             too -- reports both failures.

@@ -580,9 +580,9 @@ class TestZeroPages:
     """
     An empty batch is reported truthfully at the pipeline boundary (EXC-03, N-06).
 
-    Before this check an empty batch read "All pages were detected as empty"
-    with detection on, and leaked img2pdf's bare ``ValueError`` with it off or
-    on an empty duplex half. The SANE backend never returns an empty batch --
+    Before this check an empty batch was misreported as all-blank with
+    detection on, and leaked img2pdf's bare ``ValueError`` with it off or on an
+    empty duplex half. The SANE backend never returns an empty batch --
     an empty feeder raises ``FeederEmptyError`` (Phase 24 D-03) -- so these
     tests drive the pipeline's contract check with a stubbed backend.
     """
