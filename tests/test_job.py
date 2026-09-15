@@ -716,6 +716,50 @@ class TestMigrationLadder:
         assert version == 0
         assert columns == list(S2_COLUMNS)
 
+    def test_unsupported_schema_error_is_not_rewrapped(self, tmp_path: Path) -> None:
+        """The ladder's own StorageError passes through JobStore unchanged."""
+        db_path = str(tmp_path / "s2.db")
+        _build_s2_schema(db_path)
+
+        with pytest.raises(StorageError) as exc_info:
+            JobStore(db_path=db_path)
+
+        assert str(exc_info.value).startswith(f"job database at {db_path} ")
+        assert exc_info.value.__cause__ is None
+
+    def test_unusable_non_sqlite_file_is_a_storage_error(self, tmp_path: Path) -> None:
+        """
+        A file that is not SQLite raises StorageError naming the path (D-07).
+
+        sqlite3 raises ``DatabaseError: file is not a database`` at the WAL
+        pragma; the CLI guard maps StorageError to exit 2 by type, so the raw
+        sqlite3 error must not escape as an unexpected error.
+        """
+        db_file = tmp_path / "jobs.db"
+        db_file.write_bytes(b"this is not a database\n" * 64)
+
+        with pytest.raises(StorageError) as exc_info:
+            JobStore(db_path=str(db_file))
+
+        message = str(exc_info.value)
+        assert message.startswith("Could not open the job database at ")
+        assert str(db_file) in message
+        assert "\n" not in message
+        assert isinstance(exc_info.value.__cause__, sqlite3.DatabaseError)
+        # The file is left exactly as it was found.
+        assert db_file.read_bytes() == b"this is not a database\n" * 64
+
+    def test_unusable_directory_path_is_a_storage_error(self, tmp_path: Path) -> None:
+        """A path that cannot be opened as a file raises StorageError naming it."""
+        with pytest.raises(StorageError) as exc_info:
+            JobStore(db_path=str(tmp_path))
+
+        message = str(exc_info.value)
+        assert message.startswith("Could not open the job database at ")
+        assert str(tmp_path) in message
+        assert "\n" not in message
+        assert isinstance(exc_info.value.__cause__, sqlite3.Error)
+
     def test_migration_idempotent_on_reopen(self, tmp_path: Path) -> None:
         """Reopening an already-migrated database changes nothing (STOR-03)."""
         db_path = str(tmp_path / "reopen.db")
