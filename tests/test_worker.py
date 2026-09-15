@@ -3049,8 +3049,9 @@ class TestOwedWriteStreak:
         up: no probe runs, the worker stays HEALTHY, and each streak logs its
         first failed retry at WARNING exactly once.
         """
-        # Mirrors _OWED_RETRY_DEGRADED_AFTER, the production streak limit.
-        threshold = 3
+        # Read from the production streak limit, never mirrored, so the streaks
+        # below stay exactly one tick short of it if the limit changes (IN-11).
+        threshold = worker_module._OWED_RETRY_DEGRADED_AFTER
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr(
