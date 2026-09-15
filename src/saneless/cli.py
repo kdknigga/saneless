@@ -44,6 +44,8 @@ from .vocabulary import FlipOutcome, JobState, progress_label, state_label
 from .web.app import create_app
 
 if TYPE_CHECKING:
+    from .auto_profiles import ProfileWriteResult
+    from .config import ProfileConfig
     from .scanner.base import DeviceCapabilities
 
 __all__ = ["ClickFlipCoordinator", "_truncate", "cli"]
@@ -465,8 +467,45 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     )
 
 
+def _echo_write_result(
+    result: ProfileWriteResult, profiles: dict[str, ProfileConfig]
+) -> None:
+    """
+    Print what ``auto-profiles`` did to the config file, grouped by action.
+
+    The group lines come from ``ProfileWriteResult.groups``, the same
+    vocabulary the worker's startup log uses (D-04). Added and Refreshed
+    groups are followed by one detail line per profile they wrote.
+
+    Args:
+        result: What the write did.
+        profiles: The generated profiles, for the detail lines.
+
+    """
+    path = result.path.resolve()
+    groups = result.groups()
+    if not groups:
+        click.echo(f"No changes to {path}.")
+        return
+    click.echo(f"Profiles in {path}:")
+    for line, written in groups:
+        click.echo(line)
+        for name in written:
+            p = profiles[name]
+            click.echo(
+                f"  {name}: source={p.source}, resolution={p.resolution}, mode={p.mode}"
+            )
+
+
 @cli.command(name="auto-profiles")
-@click.option("--force", is_flag=True, help="Overwrite existing profiles.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help=(
+        "Refresh the generated keys of auto-generated profiles (hand-written "
+        "profiles are never touched)."
+    ),
+)
 @click.pass_context
 def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     """Generate scan profiles from scanner capabilities."""
@@ -483,18 +522,10 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     caps = scanner.get_capabilities(device_id)
     profiles = generate_profiles(caps)
 
-    # The file that was loaded (including an explicit --config), else the
-    # documented ./saneless.toml default. XDG placement is CFG-03 (Phase 27).
+    # The file that was loaded (including an explicit --config). With no loaded
+    # file the target stays ./saneless.toml, and the output names the resolved
+    # absolute path so the operator sees where it went (orchestrator
+    # resolution 2).
     config_path = settings.config_path or Path("./saneless.toml")
-    written = write_profiles_to_config(config_path, profiles, force=force)
-
-    if not written:
-        click.echo("No new profiles written (use --force to overwrite).")
-        return
-
-    click.echo(f"Generated {len(written)} profile(s) in {config_path}:")
-    for name in written:
-        p = profiles[name]
-        click.echo(
-            f"  {name}: source={p.source}, resolution={p.resolution}, mode={p.mode}"
-        )
+    result = write_profiles_to_config(config_path, profiles, force=force)
+    _echo_write_result(result, profiles)
