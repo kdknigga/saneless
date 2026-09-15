@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 
 import tomlkit
 from pydantic import TypeAdapter, ValidationError
+from tomlkit.exceptions import ParseError
 from tomlkit.items import InlineTable
 
 from saneless.atomic_write import replace_file_atomically
@@ -633,7 +634,9 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
         a file that does not exist yet).
 
     Raises:
-        ConfigError: The file's bytes are not valid UTF-8.
+        ConfigError: The file's bytes are not valid UTF-8, or the text is not
+            valid TOML; the latter names the line and column and is chained to
+            tomlkit's ``ParseError`` (D-12, M-17).
 
     """
     if not config_path.exists():
@@ -646,7 +649,17 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
     except UnicodeDecodeError:
         msg = f"{config_path} is not valid UTF-8; refusing to rewrite it"
         raise ConfigError(msg) from None
-    return tomlkit.parse(text), text
+    try:
+        document = tomlkit.parse(text)
+    except ParseError as exc:
+        # tomlkit's str() is its message plus the position, never document text,
+        # so the chain cannot carry the token.
+        msg = (
+            f"Cannot update {config_path}: it is not valid TOML at line "
+            f"{exc.line}, column {exc.col} ({exc})"
+        )
+        raise ConfigError(msg) from exc
+    return document, text
 
 
 # Stands in for a NaN float in ``_comparable``: NaN never equals itself, so a
