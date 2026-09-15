@@ -604,6 +604,34 @@ class TestUploadFailureTranslation:
         assert result.delivered_to_api is False
         assert result.consume_dir_path == consume_dir / "test.pdf"
 
+    def test_unsupported_protocol_fallback_logs_the_cause(
+        self,
+        sample_pdf: Path,
+        tmp_path: Path,
+        sleeps: list[float],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        WR-04: a fallback caused by an unusable URL says so in the log.
+
+        No attempt is logged by the backoff for it, so without this line the
+        job ends "Saved to folder" and nothing anywhere names the URL.
+        """
+        caplog.set_level(logging.WARNING, logger="saneless.paperless")
+        consume_dir = tmp_path / "consume"
+        failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
+        handler = _CountingHandler(_raising(failure))
+        client = _upload_client(handler, consume_dir=str(consume_dir))
+        try:
+            client.upload_document(sample_pdf, title="No scheme")
+        finally:
+            client.close()
+        assert sleeps == []
+        assert (
+            "Paperless URL http://paperless:8000 cannot be used "
+            f"({_UNSUPPORTED_PROTOCOL_TEXT}); not retrying"
+        ) in caplog.messages
+
     def test_empty_url_fails_fast_through_the_real_transport(
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:

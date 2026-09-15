@@ -516,6 +516,15 @@ class PaperlessClient:
                 last_error = exc
                 self._back_off(attempt, exc)
             except httpx.UnsupportedProtocol as exc:
+                # Logged here because no _back_off runs for it: with a consume
+                # directory the scan still ends FALLBACK, and this line is then
+                # the only place the operator learns the URL is the problem
+                # (WR-04).
+                logger.warning(
+                    "Paperless URL %s cannot be used (%s); not retrying",
+                    self._base_url,
+                    _one_line_reason(exc),
+                )
                 last_error = exc
                 fast_fail = True
                 break
