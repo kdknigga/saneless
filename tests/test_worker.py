@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sqlite3
 import threading
 import time
 import tomllib
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 from PIL import Image, ImageDraw
 
 from saneless import worker as worker_module
-from saneless.auto_profiles import generate_profiles, is_bare_default
+from saneless.auto_profiles import (
+    ProfileWriteResult,
+    generate_profiles,
+    is_bare_default,
+)
 from saneless.config import ProfileConfig, Settings, config_search_paths
 from saneless.exceptions import (
     ConfigError,
@@ -44,7 +50,6 @@ from tests.conftest import scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from pathlib import Path
     from unittest.mock import MagicMock
 
     from saneless.pipeline import PipelineRequest
@@ -3776,6 +3781,70 @@ class TestStartupProfileGeneration:
         for name in set(expected) - {"default"}:
             assert worker.get_profile(name) == expected[name]
 
+    def test_startup_generation_memory_keeps_every_unpersisted_name(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        WR-03 / D-01: a name the write did not persist keeps its loaded profile.
+
+        The worker never forces, so a flagged file profile is skipped as
+        existing and an unflagged one as not generated; in both cases memory
+        must match what a restart loads, not the generated profile.
+        """
+        loaded = {"default": ProfileConfig(), "flatbed": ProfileConfig(resolution=150)}
+        generated = {
+            "default": ProfileConfig(source="ADF", auto_generated=True),
+            "flatbed": ProfileConfig(source="Flatbed", auto_generated=True),
+            "adf": ProfileConfig(source="ADF", auto_generated=True),
+        }
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            added=("adf",),
+            skipped_not_generated=("default",),
+            skipped_existing=("flatbed",),
+        )
+
+        profiles = worker_module._profiles_after_persist(loaded, generated, result)
+
+        assert profiles["default"] == loaded["default"]
+        assert profiles["flatbed"] == loaded["flatbed"]
+        assert profiles["adf"] == generated["adf"]
+
+    def test_startup_generation_logs_the_grouped_result(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-04: the startup INFO line uses the CLI's group vocabulary."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        self._mock_caps_scanner(mock_scanner)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text('[profiles.default]\nsource = "Flatbed"\n')
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: bool(_worker_records(caplog, logging.INFO, "Added: ")),
+                _STATE_BUDGET,
+            )
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        records = _worker_records(caplog, logging.INFO, "Added: ")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert str(config_file.resolve()) in message
+        assert "'flatbed'" in message
+        assert "Skipped (not auto-generated): 'default'" in message
+
     def test_startup_generation_without_a_loaded_file_writes_nothing(
         self,
         mock_scanner: MagicMock,
@@ -3894,11 +3963,89 @@ class TestStartupProfileGeneration:
         assert str(config_file) in message
         assert "ConfigError" in message
 
+    def test_startup_generation_ebusy_keeps_profiles_in_memory(
+        self,
+        mock_scanner: MagicMock,
+        worker_for: Callable[[JobStore], ScanWorker],
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        D-08: a single-file bind mount is a logged ConfigError, not a lost set.
+
+        The kernel refuses to rename over a bind-mount point with EBUSY; the
+        atomic write reports it as a ConfigError, and the worker's existing
+        branch keeps the generated profiles for this run (Phase 26 D-18).
+        """
+        caps = self._mock_caps_scanner(mock_scanner)
+        expected = generate_profiles(caps)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("# mounted as a single file\n")
+
+        def busy(_self: Path, _target: object) -> Path:
+            raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
+
+        monkeypatch.setattr(Path, "replace", busy)
+
+        store = JobStore()
+        worker = worker_for(store)
+        worker._settings._config_path = config_file
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+            in_memory = worker.get_profile("flatbed")
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert in_memory == expected["flatbed"]
+        assert config_file.read_text() == "# mounted as a single file\n"
+        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        assert len(records) == 1
+        assert "ConfigError" in records[0].getMessage()
+        assert [path.name for path in tmp_path.iterdir()] == ["saneless.toml"]
+
+    def test_startup_generation_non_utf8_config_is_a_config_error_utf8(
+        self,
+        mock_scanner: MagicMock,
+        worker_for: Callable[[JobStore], ScanWorker],
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """D-05: a non-UTF-8 file is refused as a ConfigError and left alone."""
+        self._mock_caps_scanner(mock_scanner)
+        config_file = tmp_path / "saneless.toml"
+        contents = b"\xff\xfe not utf-8\n"
+        config_file.write_bytes(contents)
+
+        store = JobStore()
+        worker = worker_for(store)
+        worker._settings._config_path = config_file
+        try:
+            worker.start()
+            generated = _wait_until(
+                lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
+            )
+        finally:
+            worker.stop()
+            store.close()
+
+        assert generated
+        assert config_file.read_bytes() == contents
+        records = _worker_records(caplog, logging.WARNING, "will not survive a restart")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert "ConfigError" in message
+        assert "UTF-8" in message
+
     @pytest.mark.parametrize(
         "case",
         [
             (b"[profiles\n", "UnexpectedCharError"),
-            (b"\xff\xfe not utf-8\n", "UnicodeDecodeError"),
         ],
     )
     def test_startup_generation_keeps_profiles_when_the_write_raises_anything_else(
@@ -3912,8 +4059,8 @@ class TestStartupProfileGeneration:
         """
         WR-04, D-18: an exception outside OSError and ConfigError keeps them too.
 
-        An unparseable or non-UTF-8 file makes the write raise something other
-        than the two expected classes.  The generated profiles must still be
+        An unparseable file makes the write raise something other than the two
+        expected classes (a non-UTF-8 file is now a ConfigError, D-05).  The generated profiles must still be
         used in memory, with a WARNING that names the exception class.
         """
         contents, exception_name = case
