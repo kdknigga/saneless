@@ -6,9 +6,9 @@ If paperless-ngx is temporarily unavailable -- during maintenance, a restart, or
 
 ## The Solution
 
-When a `consume_dir` is configured and the API upload fails after all retry attempts are exhausted, saneless deposits the assembled PDF into the consume directory instead of raising an error.
+When a `consume_dir` is configured and the API upload cannot get through, saneless deposits the assembled PDF into the consume directory instead of raising an error.
 
-The pipeline retries uploads with exponential backoff (up to 3 attempts by default) before falling back. This means transient network blips are handled by retries, and only sustained outages trigger the fallback.
+The upload is attempted up to 3 times, with exponential backoff between attempts, whenever paperless-ngx cannot be reached or answers with a server error: a connection that is refused or reset, a timeout, a reverse proxy closing the connection, or a 5xx response. This means transient network blips are handled by retries, and only sustained outages trigger the fallback.
 
 ## How Paperless-ngx Picks It Up
 
@@ -51,13 +51,25 @@ volumes:
 
 The fallback activates only when **all** of these conditions are true:
 
-1. The API upload fails (connection refused, timeout, or server error).
-2. All retry attempts are exhausted.
+1. The API upload fails in one of the ways listed above -- a connection refused or reset, a timeout, a reverse proxy closing the connection, or a server error -- or `paperless.url` is malformed, with no usable `http://` or `https://` scheme.
+2. All attempts are exhausted. A malformed URL is the exception: it is not retried, because retrying cannot help, but it still falls back so the scan is not lost.
 3. A `consume_dir` is configured (non-empty string).
+
+**A rejected upload never falls back.** When paperless-ngx answers with a 4xx -- a bad token, or a field it refuses, such as an invalid title -- the upload is not retried and nothing is copied to the consume directory. The scan fails at once with Paperless's reason, because the same request would only be rejected again.
 
 If no `consume_dir` is configured, the upload error propagates and the scan job enters the ERROR state. The user sees the error in the web UI or CLI output.
 
 **The scanned document is not lost when that happens.** Before the error propagates, saneless moves the assembled PDF into `failed/` inside its data directory -- durable storage, deliberately separate from the disposable scratch directory the scan was built in -- and appends the full path of the preserved file to the job's error message. The error text shown in the web UI therefore names the file to go and find. The same preservation happens when the upload reaches paperless-ngx but the consumption task then reports a failure, and when the task has not finished before `paperless_task_timeout` expires. See [Docker volumes](../reference/docker.md#volumes) for where that directory lives in a container and how to drain it.
+
+### Network blips after the upload
+
+Once paperless-ngx has accepted the upload, saneless waits for its consumption task to finish. A network error while checking on that task does not fail the scan: saneless keeps checking until `paperless_task_timeout` expires, and only then reports a timeout, naming the last network error it saw.
+
+### Duplicates
+
+A retry can create a duplicate document. If the connection drops after paperless-ngx has received the file but before its answer reaches saneless, saneless cannot tell the upload arrived and sends it again. On default paperless-ngx settings that stores a second copy of the document, which you can delete. saneless accepts this trade: a duplicate is easy to remove, a lost scan is not.
+
+When paperless-ngx is set to reject duplicates, the second upload's task fails instead, and the failure says the document may already be in Paperless. Check paperless-ngx before scanning again.
 
 ## Limitations
 
