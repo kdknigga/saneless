@@ -980,8 +980,9 @@ def _scan_manual_duplex(
     Raises:
         ScanCancelledError: If the operator aborts at the flip prompt.  Raised
             before pass B starts.
-        ScanError: ``No pages were scanned`` if either pass returns no pages --
-            pass A before anyone is asked to flip, pass B before the count
+        ScanError: ``No pages were scanned`` if pass A returns no pages, before
+            anyone is asked to flip; ``No back pages were scanned in pass B``,
+            naming pass A's count, if pass B returns none, before the count
             comparison. Otherwise, if the flip prompt itself failed, or if the
             flip wait times out.  Both raise before pass B starts.
         AssertionError: If the coordinator returns a value that is not a
@@ -1037,7 +1038,15 @@ def _scan_manual_duplex(
     notify(PipelineEvent.SCANNING_REVERSE)
     back_batch = scanner.scan_pages(device_id, scan_settings)
     # Before the count comparison, so no half is assembled from an empty list.
-    _require_pages(back_batch)
+    # Not _require_pages: "No pages were scanned" is false once pass A fed the
+    # fronts, so the message names the pass and what pass A scanned (IN-01).
+    # The fronts are still lost here; keeping them needs Phase 29's spooling.
+    if not back_batch.pages:
+        msg = (
+            "No back pages were scanned in pass B "
+            f"(pass A scanned {len(front_pages)} front page(s))"
+        )
+        raise ScanError(msg)
     back_pages = back_batch.pages
     logger.info("Pass B: scanned %d back page(s)", len(back_pages))
 

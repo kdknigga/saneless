@@ -38,7 +38,9 @@ What the common cases mean:
 - **Every sheet fed was unreadable.** The feeder pulled paper, but the scanner returned no page
   saneless could use. Check for a jam, a misfeed or a dirty feeder, then scan again.
 - **No pages were scanned.** The scanner finished without returning any page at all. Check that
-  the profile's source matches where the paper is.
+  the profile's source matches where the paper is. In a manual duplex scan, an empty second pass
+  says so and names how many front pages the first pass scanned; reload the flipped stack and
+  scan both sides again.
 - **All pages were blank.** Pages were scanned, but empty-page detection removed every one of
   them. If the pages were not blank, make detection more conservative or turn it off; see
   [When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank).
