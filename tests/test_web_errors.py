@@ -17,6 +17,7 @@ Covers requirements: ROBU-02, ROBU-08.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -26,7 +27,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
 import pytest
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.testclient import TestClient
 from markupsafe import escape
 from PIL import Image
@@ -416,6 +418,72 @@ def test_unhandled_exception_is_500_and_logged_not_leaked(
     ]
     assert records
     assert all(r.exc_info is not None for r in records)
+
+
+# A decoded path carrying a terminal escape and a newline, as uvicorn would
+# hand it over for %1B and %0A.
+_CONTROL_PATH = "/_test/zz\x1b[2J\nFAKE LOG LINE"
+
+
+def _control_character_request() -> Request:
+    """
+    Build a request whose method and path carry control characters.
+
+    httpx strips control characters from a URL, so the scope is built directly
+    rather than sent through ``TestClient``, as the cross-origin guard's test
+    does.
+
+    Returns:
+        A plain (non-htmx) request, so rendering needs no application.
+
+    """
+    return Request(
+        {
+            "type": "http",
+            "method": "POST\x1b",
+            "scheme": "http",
+            "path": _CONTROL_PATH,
+            "raw_path": _CONTROL_PATH.encode(),
+            "root_path": "",
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "headers": [(b"host", b"testserver")],
+        }
+    )
+
+
+@pytest.mark.parametrize("handler", ["validation", "unhandled"])
+def test_error_logs_escape_control_characters_in_the_request_line(
+    caplog: pytest.LogCaptureFixture, handler: str
+) -> None:
+    """
+    WR-07: the 422 and 500 log lines escape the method and path with ``%r``.
+
+    A percent-encoded newline or terminal escape in the path must not forge a
+    log line or rewrite what an operator reads.
+    """
+    request = _control_character_request()
+    with caplog.at_level(logging.INFO, logger="saneless.web.errors"):
+        if handler == "validation":
+            response = asyncio.run(
+                errors._validation_error(
+                    request,
+                    RequestValidationError(
+                        [{"loc": ("body", "n"), "type": "int_parsing"}]
+                    ),
+                )
+            )
+        else:
+            response = asyncio.run(
+                errors._unhandled_exception(request, RuntimeError(SECRET_MARKER))
+            )
+    assert response.status_code == (422 if handler == "validation" else 500)
+    records = [r for r in caplog.records if r.name == "saneless.web.errors"]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "\\x1b" in message
+    assert "\x1b" not in message
+    assert "\n" not in message
 
 
 # --- The production scan route: 422 before any row, 429 and 503 with one ------
