@@ -144,7 +144,7 @@ saneless auto-profiles
 
 Profile names come from your scanner's own source names, lowercased and reduced to letters, digits and hyphens. A scanner reporting `Flatbed` and `Automatic Document Feeder` gets profiles named `flatbed` and `automatic-document-feeder`.
 
-If `auto-profiles` creates the config file from scratch, it creates it with mode `0600`, readable only by you, because the file may hold your paperless-ngx token. Rewriting an existing file keeps its mode and owner.
+If `auto-profiles` creates the config file from scratch, it creates it with mode `0600`, readable only by you, because the file may hold your paperless-ngx token. Rewriting an existing file keeps its permission bits, owner and group, each when saneless is permitted to set it: a non-root user cannot give the file back to another owner, but keeps the group if it belongs to it, and a filesystem without Unix permissions keeps none of them.
 
 Without `--force`, a profile that already exists is left alone. Use `--force` to refresh the profiles `auto-profiles` created earlier:
 
