@@ -149,8 +149,9 @@ Exit 5 means saneless hit an error it did not anticipate: a bug in saneless, not
 your setup. Setup problems exit 2.
 
 The line starts with `Unexpected error` and names the exception type. The full traceback is in
-the log file, which the line names. If the error happened before logging started, run the command
-again with `-v` to see the traceback on stderr.
+the log file, which the line names. If the line names no log file (the error happened before
+logging started, or the log file could not be opened), it ends with a hint instead: run the
+command again with `-v` to see the traceback on stderr.
 
 Please report it as a bug and attach the log file. Attach the log only, never your config file,
 which holds your Paperless API token. If the log was recorded with `log_level = "DEBUG"`, search it

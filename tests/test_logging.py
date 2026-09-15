@@ -17,6 +17,20 @@ if TYPE_CHECKING:
     import pytest
 
 
+def _raise_runtime_error(message: str) -> None:
+    """
+    Raise a RuntimeError carrying ``message``, so a test can log a real traceback.
+
+    Args:
+        message: The exception's message.
+
+    Raises:
+        RuntimeError: Always.
+
+    """
+    raise RuntimeError(message)
+
+
 class TestConfigureLogging:
     """Logging setup tests."""
 
@@ -258,6 +272,47 @@ class TestConfigureLogging:
             assert f"Cannot write to {log_file}, logging to stderr only" in (
                 caplog.messages
             )
+        finally:
+            self._cleanup_handlers()
+
+    def test_stderr_fallback_renders_no_traceback(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        The stderr fallback prints a failure's message, never its traceback.
+
+        stderr is the user's terminal once the log file cannot be opened, and
+        a traceback reaches it only with -v (CR-01, D-06).
+        """
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("")
+        try:
+            configure_logging(str(blocker / "logs" / "saneless.log"))
+            try:
+                _raise_runtime_error("kaboom-4c1d")
+            except RuntimeError:
+                logging.getLogger("saneless.test").exception("it failed")
+            err = capsys.readouterr().err
+            assert "it failed" in err
+            assert "Traceback" not in err
+            assert "kaboom-4c1d" not in err
+        finally:
+            self._cleanup_handlers()
+
+    def test_stderr_fallback_with_verbose_renders_the_traceback_once(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With -v the mirror handler renders the traceback, and only it does."""
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("")
+        try:
+            configure_logging(str(blocker / "logs" / "saneless.log"), verbose=True)
+            try:
+                _raise_runtime_error("kaboom-9e2a")
+            except RuntimeError:
+                logging.getLogger("saneless.test").exception("it failed")
+            err = capsys.readouterr().err
+            assert err.count("Traceback") == 1
         finally:
             self._cleanup_handlers()
 

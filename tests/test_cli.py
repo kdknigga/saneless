@@ -42,6 +42,7 @@ from saneless.exceptions import (
     StorageError,
 )
 from saneless.job import JobStore
+from saneless.logging_config import configure_logging
 from saneless.paperless import UploadResult
 from saneless.pipeline import PipelineEvent, PipelineRequest
 from saneless.scanner import sane_backend
@@ -2556,6 +2557,33 @@ def _tmp_settings(tmp_path: Path) -> Settings:
     )
 
 
+@contextlib.contextmanager
+def _restored_root_logging() -> Generator[None]:
+    """
+    Undo what a real ``configure_logging`` call does to the root logger.
+
+    Only the handlers added inside the block are removed, so pytest's own
+    capture handlers survive; a stderr handler left behind would write to the
+    runner's closed stream in every later test.
+
+    Yields:
+        Nothing; the root logger is restored on exit.
+
+    """
+    root = logging.getLogger()
+    handlers = root.handlers[:]
+    level = root.level
+    try:
+        yield
+    finally:
+        for handler in root.handlers[:]:
+            if handler not in handlers:
+                handler.close()
+                root.removeHandler(handler)
+        root.setLevel(level)
+        logging.getLogger("saneless").setLevel(logging.NOTSET)
+
+
 def _cli_error_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
     """
     Return the ERROR records ``saneless.cli`` emitted.
@@ -2766,7 +2794,12 @@ class TestExitCodes:
         tmp_path: Path,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """When logging fell back to stderr, the line claims no log file (T-28-35)."""
+        """
+        When logging fell back to stderr, the line claims no log file (T-28-35).
+
+        The fallback renders no traceback (CR-01), so the line says how to get
+        one instead.
+        """
         exc = RuntimeError("kaboom")
         runner, _ = _patch_cli(
             monkeypatch,
@@ -2779,7 +2812,10 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 5
-        assert result.stderr.splitlines() == ["Unexpected error (RuntimeError): kaboom"]
+        assert result.stderr.splitlines() == [
+            "Unexpected error (RuntimeError): kaboom. "
+            "Run again with -v to see the traceback"
+        ]
         assert "Full details in" not in result.output
         records = _cli_error_records(caplog)
         assert len(records) == 1
@@ -2821,6 +2857,85 @@ class TestExitCodes:
         monkeypatch.setattr("saneless.cli.load_settings", exploding_load)
 
         result = runner.invoke(cli, ["-v", "scan"])
+
+        assert result.exit_code == 5
+        assert "Traceback" in result.stderr
+        assert (
+            result.stderr.splitlines()[-1] == "Unexpected error (RuntimeError): kaboom"
+        )
+
+    @pytest.mark.parametrize(
+        ("exc", "code"),
+        [
+            pytest.param(RuntimeError("kaboom"), 5, id="unexpected"),
+            pytest.param(
+                ScanError("Could not open scanner test:device:001: Invalid argument"),
+                1,
+                id="classified",
+            ),
+        ],
+    )
+    def test_stderr_log_fallback_prints_no_traceback_without_verbose(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        exc: Exception,
+        code: int,
+    ) -> None:
+        """
+        An unwritable log file logs to stderr, but never a traceback (CR-01).
+
+        The real ``configure_logging`` runs, so the stderr fallback handler is
+        genuinely attached: a stub that attaches nothing cannot catch a
+        traceback printed through it (EXC-02, D-06).
+        """
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(blocker / "logs" / "saneless.log"),
+            ),
+        )
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, scanner_cls=_raising_scanner(exc)
+        )
+        monkeypatch.setattr("saneless.cli.configure_logging", configure_logging)
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == code
+        assert "Traceback" not in result.stderr
+        if code == 5:
+            assert result.stderr.splitlines()[-1] == (
+                "Unexpected error (RuntimeError): kaboom. "
+                "Run again with -v to see the traceback"
+            )
+
+    def test_stderr_log_fallback_with_verbose_prints_the_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With -v the traceback is mirrored to stderr, as D-06 promises."""
+        blocker = tmp_path / "not-a-directory"
+        blocker.write_text("")
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(blocker / "logs" / "saneless.log"),
+            ),
+        )
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=_raising_scanner(RuntimeError("kaboom")),
+        )
+        monkeypatch.setattr("saneless.cli.configure_logging", configure_logging)
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["-v", "scan"])
 
         assert result.exit_code == 5
         assert "Traceback" in result.stderr

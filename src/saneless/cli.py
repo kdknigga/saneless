@@ -223,6 +223,10 @@ one short, parenthesis-free ``except``: the multi-type spelling ruff formats to
 """
 
 
+_VERBOSE_HINT = "Run again with -v to see the traceback"
+"""The hint an unexpected error's line ends with when no traceback was kept."""
+
+
 def _logging_ready(ctx: click.Context) -> bool:
     """
     Whether ``_load_cli_settings`` has configured logging for this process.
@@ -293,13 +297,22 @@ def _log_failure(ctx: click.Context, exc: Exception) -> None:
     """
     Log a failure with its traceback, but only once logging is configured.
 
+    The message names the failure too: when the log fell back to stderr the
+    traceback is not rendered there (CR-01), and the record must still say
+    what went wrong.
+
     Args:
         ctx: The group's context.
         exc: The failure to log.
 
     """
     if _logging_ready(ctx):
-        logger.error("saneless %s failed", ctx.invoked_subcommand, exc_info=exc)
+        logger.error(
+            "saneless %s failed: %s",
+            ctx.invoked_subcommand,
+            describe(exc),
+            exc_info=exc,
+        )
 
 
 def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
@@ -309,9 +322,10 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
     Once logging is configured the traceback goes to the log, and the line
     points at the log file only when the file handler really attached
     (``configure_logging``'s return value): a stderr fallback must not be
-    called a log file. Before logging is configured nothing is logged
-    (Pitfall 3); ``-v`` prints the traceback to stderr instead, and without it
-    the line says how to get one.
+    called a log file. That fallback never renders a traceback (CR-01), so
+    without ``-v`` the line then says how to get one. Before logging is
+    configured nothing is logged (Pitfall 3); ``-v`` prints the traceback to
+    stderr instead, and without it the line says how to get one.
 
     Args:
         ctx: The group's context.
@@ -320,6 +334,7 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
     """
     obj = ctx.obj if isinstance(ctx.obj, dict) else {}
     line = _unexpected_line(exc)
+    verbose = bool(obj.get("verbose"))
     if _logging_ready(ctx):
         logger.error(
             "Unexpected error in saneless %s", ctx.invoked_subcommand, exc_info=exc
@@ -327,10 +342,12 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
         log_file = obj.get("log_file")
         if log_file:
             line = f"{line}. Full details in {log_file}"
-    elif obj.get("verbose"):
+        elif not verbose:
+            line = f"{line}. {_VERBOSE_HINT}"
+    elif verbose:
         click.echo("".join(traceback.format_exception(exc)), err=True, nl=False)
     else:
-        line = f"{line}. Run again with -v to see the traceback"
+        line = f"{line}. {_VERBOSE_HINT}"
     click.echo(line, err=True)
 
 
