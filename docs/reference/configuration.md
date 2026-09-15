@@ -8,10 +8,24 @@ Settings are loaded from the first file found, in priority order:
 
 1. `--config PATH` -- explicit CLI flag (highest priority)
 2. `./saneless.toml` -- current working directory
-3. `~/.config/saneless/config.toml` -- XDG config directory
+3. `$XDG_CONFIG_HOME/saneless/config.toml` -- XDG config directory (`~/.config/saneless/config.toml` when `XDG_CONFIG_HOME` is unset, empty or relative)
 4. `/etc/saneless/config.toml` -- system-wide (typical for Docker)
 
 If no file is found, defaults and environment variables are used.
+
+A path that is not a regular file (for example a directory) is skipped. An explicit `--config PATH` that does not exist, or is not a regular file, is an error (exit code 2). A leading `~` in `--config` is expanded to your home directory.
+
+## Validation
+
+Every section rejects keys it does not know, and so does the top level. A misspelt key is an error when the config loads, not a setting that is silently ignored. The error names the file (or the environment variable that supplied the value), the section and the key, suggests a close match when there is one, and lists the valid keys (or names the section a misplaced key belongs in). Type and value errors use the same `[section] key` form. Each problem gets its own line, and values are never printed, so a token in a mistyped key does not end up in your terminal or log. saneless then exits with code 2.
+
+```text
+Configuration error in /etc/saneless/config.toml:
+  [paperless] unknown key 'tokne' (did you mean 'token'?); valid keys: url, token, consume_dir
+  [paperless] unknown key 'web_port'; it belongs in [output]
+```
+
+Unknown `SANELESS_*` environment variables are rejected the same way; see [Environment Variables](environment-variables.md#notes).
 
 ---
 
@@ -31,19 +45,21 @@ Paperless-ngx API connection settings.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `url` | string | `""` | Paperless-ngx base URL (e.g., `http://paperless:8000`) |
-| `token` | string | `""` | API authentication token |
-| `consume_dir` | string | `""` | Fallback directory for PDF deposit when API is unavailable |
+| `token` | string | `""` | API authentication token. Never written to logs or error messages. |
+| `consume_dir` | string | `""` | Fallback directory for PDF deposit when API is unavailable. A leading `~` is expanded. |
 
 ## `[output]`
 
 Output, logging, and web server settings.
 
+In the path settings (`tmp_dir`, `data_dir`, `log_file`, and `consume_dir` under `[paperless]`), a leading `~` is expanded to your home directory. Environment variables such as `$HOME` inside a value are not expanded.
+
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `tmp_dir` | string | `"/tmp/saneless"` | Scratch space for the scan in progress; its contents are deleted as each scan finishes and nothing durable is kept here |
-| `data_dir` | string | `"~/.local/state/saneless"` | Durable state: the job database (`saneless.db`) and `failed/`, where scans that could not be delivered to paperless-ngx are preserved. Must survive restarts. The container image sets this to `/var/lib/saneless` |
-| `log_file` | string | `"~/.local/state/saneless/saneless.log"` | Log file path (XDG state directory) |
-| `log_level` | string | `"INFO"` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `tmp_dir` | string | `"/tmp/saneless"` | Scratch space for the scan in progress; its contents are deleted as each scan finishes and nothing durable is kept here. A leading `~` is expanded |
+| `data_dir` | string | `$XDG_STATE_HOME/saneless` (`~/.local/state/saneless` when `XDG_STATE_HOME` is unset) | Durable state: the job database (`saneless.db`) and `failed/`, where scans that could not be delivered to paperless-ngx are preserved. Must survive restarts. The container image sets this to `/var/lib/saneless`. A leading `~` is expanded |
+| `log_file` | string | `$XDG_STATE_HOME/saneless/saneless.log` (`~/.local/state/saneless/saneless.log` when `XDG_STATE_HOME` is unset) | Log file path. A leading `~` is expanded |
+| `log_level` | string | `"INFO"` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, case-insensitive (`warn` means `WARNING`); any other value is rejected when the config loads. `saneless -v` shows saneless's own debug detail without changing this setting |
 | `log_max_bytes` | int | `10485760` | Max log file size before rotation (10 MB) |
 | `log_backup_count` | int | `5` | Number of rotated log files to keep |
 | `history_retention_days` | int | `7` | Days to keep job history, by creation time and regardless of whether the job finished |
@@ -69,7 +85,7 @@ Scan profiles define scanner settings and default metadata. At least one profile
 | `mode` | string | `"color"` | Color mode: `Color`, `Gray`, `Lineart` |
 | `default_tags` | int[] | `[]` | Paperless-ngx tag IDs to apply automatically |
 | `default_correspondent` | int or null | `null` | Paperless-ngx correspondent ID |
-| `title` | string | `""` | Default title template |
+| `title` | string | `""` | Default document title, used as written when the title is left blank (typed title first, then this, then `Scan <date time>`) |
 | `empty_page_mean_threshold` | float | `250.0` | Mean pixel value threshold for empty page detection |
 | `empty_page_stddev_threshold` | float | `5.0` | Standard deviation threshold for empty page detection |
 | `enable_empty_page_detection` | bool | `true` | Enable automatic empty page removal |
