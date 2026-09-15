@@ -1109,7 +1109,8 @@ class TestLazySettingsLoading:
     parses its own ``--help``, and ``ctx.resilient_parsing`` is False there
     (verified against Click 8.3), so the group callback cannot load anything;
     each command loads on first need instead. M-21: configuring logging sits in
-    the same error handling, so its failure is a one-line exit 2 too.
+    the same error handling, so an unexpected failure there is a one-line exit
+    2 too; an unwritable log file is not a failure, it falls back to stderr.
     """
 
     @pytest.mark.parametrize("command", _ALL_COMMANDS)
@@ -1195,23 +1196,43 @@ class TestLazySettingsLoading:
         assert "empty" in result.output
         assert not (tmp_path / "logs").exists()
 
-    def test_logging_setup_failure_is_a_config_error_exit_2(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_unwritable_log_file_falls_back_to_stderr_and_runs(
+        self, tmp_path: Path
     ) -> None:
-        """A ``configure_logging`` failure prints one line and exits 2 (M-21)."""
-        runner, _ = _patch_cli(monkeypatch)
+        """
+        An unwritable ``log_file`` warns on stderr; the command still runs (WR-07).
 
-        def failing_logging(*_args: object, **_kwargs: object) -> None:
-            msg = "disk full"
-            raise OSError(msg)
+        The real ``configure_logging`` catches the OSError from creating the
+        log directory or opening the file and logs to stderr instead, so this
+        is neither an exit 2 nor a traceback. ``logs`` is a regular file here,
+        so the log directory cannot be created even when running as root.
+        """
+        config_file = _write_real_config(tmp_path)
+        (tmp_path / "logs").write_text("not a directory")
 
-        monkeypatch.setattr("saneless.cli.configure_logging", failing_logging)
+        with _restored_logging():
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "jobs"])
 
-        result = runner.invoke(cli, ["devices"])
+        assert result.exit_code == 0, result.output
+        assert "logging to stderr only" in result.output
+        assert str(tmp_path / "logs" / "saneless.log") in result.output
+        assert "Traceback" not in result.output
+
+    def test_toml_syntax_error_is_one_line_exit_2(self, tmp_path: Path) -> None:
+        """
+        A load failure that is not a ConfigError still exits 2 without a traceback.
+
+        A TOML syntax error stays a plain ``TOMLDecodeError`` until Phase 28, so
+        it reaches the generic handler rather than the D-10 renderer.
+        """
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("[output\n")
+
+        with _restored_logging():
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "jobs"])
 
         assert result.exit_code == 2
-        assert "Configuration error" in result.output
-        assert "disk full" in result.output
+        assert result.output.startswith("Configuration error: ")
         assert "Traceback" not in result.output
         assert isinstance(result.exception, SystemExit)
 
