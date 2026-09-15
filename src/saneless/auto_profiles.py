@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal, cast
 
 import tomlkit
+from pydantic import TypeAdapter, ValidationError
 from tomlkit.items import InlineTable
 
 from saneless.atomic_write import replace_file_atomically
@@ -429,6 +430,11 @@ def generate_profiles(
     return profiles
 
 
+# The loader's reading of ``auto_generated``: pydantic's lax ``bool``, the type
+# ``ProfileConfig.auto_generated`` declares (CR-01).
+_FLAG: Final = TypeAdapter(bool)
+
+
 def _is_auto_generated(table: object) -> bool:
     """
     Report whether a parsed profile table carries a truthy auto_generated flag.
@@ -438,16 +444,27 @@ def _is_auto_generated(table: object) -> bool:
     checkers cannot verify. Anything that is not a mapping -- a stray scalar
     under ``[profiles]`` -- answers False and is therefore never pruned.
 
+    The flag is read with the same pydantic ``bool`` the loader uses
+    (``ProfileConfig.auto_generated``), not Python truthiness: the loader reads
+    ``auto_generated = "false"`` (or ``"no"``, ``"off"``, ``"0"``) as False, so
+    the writer must call that profile hand-written too, or it would refresh or
+    prune a profile the loader says the operator owns (D-01). A value the
+    loader would reject is not the tool's either.
+
     Args:
         table: A value from the parsed ``[profiles]`` section.
 
     Returns:
-        True only for a mapping whose ``auto_generated`` value is truthy.
+        True only for a mapping whose ``auto_generated`` value validates as
+        True.
 
     """
     if not isinstance(table, Mapping):
         return False
-    return bool(table.get("auto_generated", False))
+    try:
+        return _FLAG.validate_python(table.get("auto_generated", False))
+    except ValidationError:
+        return False
 
 
 # Profile names the orphan prune must never remove, however they are flagged.

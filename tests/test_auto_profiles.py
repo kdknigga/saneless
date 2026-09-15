@@ -1505,6 +1505,110 @@ auto_generated = true
         assert ProfileWriteResult(path=path).describe() == []
 
 
+class TestOwnershipReadsTheFlagLikeTheLoader:
+    """
+    The writer decides ownership the way ``load_settings`` parses the flag.
+
+    CR-01: pydantic's lax ``bool`` reads ``"false"``, ``"no"``, ``"off"`` and
+    ``"0"`` as False, so the loader calls such a profile hand-written. Plain
+    truthiness called the same non-empty string True, and the tool refreshed
+    or pruned a profile it did not own (D-01).
+    """
+
+    _FALSY_STRINGS = ("false", "no", "off", "0", "f", "n")
+
+    @staticmethod
+    def _config(tmp_path: Path, name: str, flag: str) -> Path:
+        """Write a hand-written ``name`` profile whose flag is the string ``flag``."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[profiles.default]\nsource = "Flatbed"\n\n'
+            f'[profiles.{name}]\nsource = "mine"\nauto_generated = "{flag}"\n'
+        )
+        return config_file
+
+    @pytest.mark.parametrize("flag", _FALSY_STRINGS)
+    def test_loader_and_writer_agree_the_profile_is_hand_written(
+        self, tmp_path: Path, flag: str
+    ) -> None:
+        """The loader's reading is the one the writer must follow."""
+        config_file = self._config(tmp_path, "adf", flag)
+        settings = load_settings(str(config_file))
+        assert settings.profiles["adf"].auto_generated is False
+
+    @pytest.mark.parametrize("flag", _FALSY_STRINGS)
+    def test_force_does_not_refresh_a_string_false_profile(
+        self, tmp_path: Path, flag: str
+    ) -> None:
+        """A same-name profile flagged ``"false"`` is skipped, byte for byte."""
+        config_file = self._config(tmp_path, "adf", flag)
+        before = config_file.read_bytes()
+        generated = {
+            "adf": ProfileConfig(
+                source="ADF", resolution=300, mode="Color", auto_generated=True
+            ),
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated, force=True)
+
+        assert result.refreshed == ()
+        assert "adf" in result.skipped_not_generated
+        assert config_file.read_bytes() == before
+
+    @pytest.mark.parametrize("force", [False, True])
+    @pytest.mark.parametrize("flag", _FALSY_STRINGS)
+    def test_prune_does_not_remove_a_string_false_profile(
+        self, tmp_path: Path, flag: str, *, force: bool
+    ) -> None:
+        """An orphan flagged ``"no"`` is not the tool's, so it is not removed."""
+        config_file = self._config(tmp_path, "zzz", flag)
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated, force=force)
+
+        assert result.removed == ()
+        profiles = tomllib.loads(config_file.read_text())["profiles"]
+        assert profiles["zzz"] == {"source": "mine", "auto_generated": flag}
+
+    def test_a_string_true_flag_is_still_owned(self, tmp_path: Path) -> None:
+        """``"yes"`` loads as True, so the writer owns and prunes it too."""
+        config_file = self._config(tmp_path, "zzz", "yes")
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated)
+
+        assert result.removed == ("zzz",)
+
+    def test_an_unparseable_flag_is_not_owned(self, tmp_path: Path) -> None:
+        """A flag pydantic rejects is never read as the tool's (fail safe)."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(
+            '[profiles.default]\nsource = "Flatbed"\n\n'
+            '[profiles.zzz]\nsource = "mine"\nauto_generated = "maybe"\n'
+        )
+        generated = {
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
+        result = write_profiles_to_config(config_file, generated)
+
+        assert result.removed == ()
+        assert "zzz" in tomllib.loads(config_file.read_text())["profiles"]
+
+
 class TestDurableConfigWrite:
     """
     Config rewrites are UTF-8, line-ending preserving, guarded and atomic.
