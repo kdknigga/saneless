@@ -26,6 +26,8 @@ from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
     PaperlessError,
+    PdfError,
+    ScanCancelledError,
     ScanError,
 )
 from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
@@ -4754,3 +4756,241 @@ class TestWorkerFinish:
             assert prune_spy.calls == []
         finally:
             store.close()
+
+
+# The text a flip-prompt cancel carries into the job row (D-01).
+_CANCEL_MESSAGE = "Manual duplex scan cancelled at the flip prompt"
+
+
+def _raising_pipeline(error: Exception) -> Callable[..., ScanResult]:
+    """
+    Build a ``run_pipeline`` stand-in that raises ``error`` itself.
+
+    The very instance is raised, so a test can check a log record's
+    ``exc_info`` carries it rather than an equal copy.
+
+    Returns:
+        A callable taking ``run_pipeline``'s arguments and raising ``error``.
+
+    """
+
+    def failing(*_args: object, **_kwargs: object) -> ScanResult:
+        raise error
+
+    return failing
+
+
+def _finish_one_job(
+    worker: ScanWorker,
+    store: JobStore,
+    wait_for_state: Callable[..., Job],
+    profile: str = "default",
+) -> Job:
+    """
+    Run one job on an unstarted worker to its end, then stop and close.
+
+    ``stop()`` joins the thread, so every record the job's ending logs has been
+    emitted by the time this returns.
+
+    Returns:
+        The job row as it ended.
+
+    """
+    try:
+        worker.start()
+        job = store.create_job(profile, "Job Ending")
+        assert worker.submit(job) is SubmitResult.ACCEPTED
+        finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+    finally:
+        worker.stop()
+        store.close()
+    return finished
+
+
+class TestWorkerJobEndings:
+    """
+    A job ends by shutdown, by cancel, or by failure: three explicit branches.
+
+    D-01: a ``ScanCancelledError`` is recorded ``CANCELLED`` with its message
+    and no category.  N-08: a cancel is not a failure, so it is logged once at
+    INFO with no traceback.  EXC-05: every other failure is recorded ERROR with
+    its category and logged at ERROR with ``exc_info``, so the operator can
+    find the cause.  D-02, Phase 26 WR-06: a flip answer claimed by shutdown is
+    still a restart even though it reaches the worker as a cancel.  Phase 26
+    D-10: job endings never count toward degraded health.
+    """
+
+    def test_a_cancel_is_recorded_cancelled_without_a_category(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """D-01: a ScanCancelledError ends the job CANCELLED, not ERROR."""
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _raising_pipeline(ScanCancelledError(_CANCEL_MESSAGE)),
+        )
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.CANCELLED
+        assert finished.error == _CANCEL_MESSAGE
+        assert finished.error_category is None
+
+    def test_a_cancel_is_logged_once_at_info_without_exc_info(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """N-08: a cancel logs one INFO line, no traceback and no ERROR."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _raising_pipeline(ScanCancelledError(_CANCEL_MESSAGE)),
+        )
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        cancelled = _worker_records(
+            caplog, logging.INFO, f"Job {finished.id} cancelled"
+        )
+        assert len(cancelled) == 1
+        assert cancelled[0].exc_info is None
+        assert _worker_records(caplog, logging.ERROR, finished.id) == []
+
+    def test_a_scan_error_is_logged_with_its_exc_info(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """EXC-05: a scanner failure is ERROR, SCANNER, logged with its traceback."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        message = "Paper jam"
+        error = ScanError(message)
+        monkeypatch.setattr("saneless.worker.run_pipeline", _raising_pipeline(error))
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == message
+        assert finished.error_category is ErrorCategory.SCANNER
+        records = _worker_records(caplog, logging.ERROR, finished.id)
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is error
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            (PaperlessError, ErrorCategory.UPLOAD),
+            (ConfigError, ErrorCategory.CONFIG),
+            (PdfError, ErrorCategory.ASSEMBLY),
+            (RuntimeError, ErrorCategory.UNKNOWN),
+        ],
+        ids=lambda failure: failure[0].__name__,
+    )
+    def test_every_failure_is_logged_with_its_exc_info(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+        failure: tuple[type[Exception], ErrorCategory],
+    ) -> None:
+        """EXC-05: classified or unknown, a failure carries its traceback."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        error_type, category = failure
+        message = f"{error_type.__name__} ended the job"
+        error = error_type(message)
+        monkeypatch.setattr("saneless.worker.run_pipeline", _raising_pipeline(error))
+        store = JobStore()
+        finished = _finish_one_job(worker_for(store), store, wait_for_state)
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == message
+        assert finished.error_category is category
+        records = _worker_records(caplog, logging.ERROR, finished.id)
+        assert len(records) == 1
+        assert records[0].exc_info is not None
+        assert records[0].exc_info[1] is error
+
+    def test_a_shutdown_claimed_cancel_is_still_recorded_as_a_restart(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        D-02, Phase 26 WR-06: the shutdown check runs before the cancel check.
+
+        Shutdown's Abort reaches the pipeline exactly as an operator's does and
+        comes back as a ScanCancelledError.  The row must still say the server
+        stopped the scan, not that the operator cancelled it.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+
+        def shutdown_then_cancel(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            coordinator = request.flip_coordinator
+            assert isinstance(coordinator, WorkerFlipCoordinator)
+            assert coordinator.abort_for_shutdown()
+            raise ScanCancelledError(_CANCEL_MESSAGE)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", shutdown_then_cancel)
+        # worker_for builds over this same fixture instance, so the manual
+        # duplex profile it adds is the one the worker gets.
+        _manual_duplex_settings(default_settings)
+        store = JobStore()
+        worker = worker_for(store)
+        finished = _finish_one_job(worker, store, wait_for_state, profile="duplex")
+
+        assert finished.state is JobState.ERROR
+        assert finished.error == RESTART_REASON
+        assert finished.error_category is None
+        # Matched from the job id on: the shutdown line quotes the cancel's own
+        # message, which says "cancelled" too.
+        shutdown = f"Job {finished.id} ended by shutdown"
+        cancelled = f"Job {finished.id} cancelled"
+        assert len(_worker_records(caplog, logging.INFO, shutdown)) == 1
+        assert _worker_records(caplog, logging.INFO, cancelled) == []
+
+    def test_cancelled_jobs_never_degrade_the_worker(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """Phase 26 D-10: cancels in a row are job endings, not loop failures."""
+        monkeypatch.setattr(
+            "saneless.worker.run_pipeline",
+            _raising_pipeline(ScanCancelledError(_CANCEL_MESSAGE)),
+        )
+        store = JobStore()
+        worker = worker_for(store)
+        try:
+            worker.start()
+            jobs = _submit_jobs(worker, store, worker_module._DEGRADED_AFTER)
+            finished = [
+                wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+                for job in jobs
+            ]
+            health = worker.health
+            next_submit = worker.submit(store.create_job("default", "After Cancels"))
+        finally:
+            worker.stop()
+            store.close()
+
+        assert [job.state for job in finished] == [JobState.CANCELLED] * len(jobs)
+        assert health is WorkerHealth.HEALTHY
+        assert next_submit is SubmitResult.ACCEPTED
