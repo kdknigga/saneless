@@ -2,23 +2,27 @@
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
 import tomllib
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+import click
 import pytest
 import tomlkit
 from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
+import saneless.cli as cli_module
 from saneless.cli import ClickFlipCoordinator, _truncate, cli
 from saneless.config import (
     OutputConfig,
@@ -27,9 +31,10 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.exceptions import PaperlessError, ScanError
+from saneless.exceptions import ConfigError, PaperlessError, ScanError
 from saneless.job import JobStore
 from saneless.paperless import UploadResult
+from saneless.pipeline import PipelineEvent, PipelineRequest
 from saneless.scanner.base import (
     DeviceCapabilities,
     DeviceInfo,
@@ -38,6 +43,11 @@ from saneless.scanner.base import (
     ScanSettings,
 )
 from saneless.vocabulary import FlipOutcome, JobState, state_label
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    from click.testing import Result
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
 # Keeps the suite out of the developer's real ~/.local/state/saneless.
@@ -212,11 +222,96 @@ class TestCliHelp:
 class TestScanCommand:
     """Scan command tests."""
 
-    def test_scan_requires_title(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Scan without --title exits with non-zero code."""
+    def test_scan_without_title_falls_back_to_timestamp_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--title`` is optional; with no profile title it is ``Scan <time>``."""
         runner, _ = _patch_cli(monkeypatch)
         result = runner.invoke(cli, ["scan"])
-        assert result.exit_code != 0
+        assert result.exit_code == 0, result.output
+        assert re.search(r"Done: Scan \d{4}-\d{2}-\d{2} \d{2}:\d{2}", result.output)
+
+    @staticmethod
+    def _capture_title_run(
+        monkeypatch: pytest.MonkeyPatch, args: list[str]
+    ) -> tuple[Result, PipelineRequest | None]:
+        """
+        Run ``scan`` against a ``receipt`` profile titled "Receipt".
+
+        ``run_pipeline`` is replaced by a recorder that captures the request and
+        reports DONE through its callback, as the real pipeline does.
+
+        Args:
+            monkeypatch: The test's monkeypatch fixture.
+            args: The CLI arguments.
+
+        Returns:
+            The CliRunner result and the captured request, if the pipeline ran.
+
+        """
+        settings = _make_settings(
+            profiles={
+                "default": ProfileConfig(),
+                "receipt": ProfileConfig(title="Receipt"),
+            }
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        captured: list[PipelineRequest] = []
+
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> None:
+            captured.append(request)
+            if request.status_callback is not None:
+                request.status_callback(PipelineEvent.DONE)
+
+        monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
+        result = runner.invoke(cli, args)
+        return result, (captured[0] if captured else None)
+
+    @pytest.mark.parametrize("typed", [None, "", "   "])
+    def test_scan_blank_title_uses_the_profile_title(
+        self, monkeypatch: pytest.MonkeyPatch, typed: str | None
+    ) -> None:
+        """An omitted or blank ``--title`` resolves to the profile's title (D-16)."""
+        args = ["scan", "--profile", "receipt"]
+        if typed is not None:
+            args += ["--title", typed]
+
+        result, request = self._capture_title_run(monkeypatch, args)
+
+        assert result.exit_code == 0, result.output
+        assert request is not None
+        assert request.title == "Receipt"
+        assert "Done: Receipt" in result.output
+
+    def test_scan_typed_title_beats_the_profile_title(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A non-blank ``--title`` is kept as typed."""
+        result, request = self._capture_title_run(
+            monkeypatch, ["scan", "--profile", "receipt", "--title", "Typed"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert request is not None
+        assert request.title == "Typed"
+        assert "Done: Typed" in result.output
+
+    def test_scan_unknown_profile_exits_2_before_title_resolution(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unknown profile is still refused with exit 2 and no pipeline run."""
+        result, request = self._capture_title_run(
+            monkeypatch, ["scan", "--profile", "nope"]
+        )
+
+        assert result.exit_code == 2
+        assert "Unknown profile" in result.output
+        assert request is None
 
     def test_scan_happy_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan with --title succeeds and shows Done message."""
@@ -932,26 +1027,250 @@ class TestLegacyDuplexWarningReachesLogFile:
         config_file = tmp_path / "saneless.toml"
         config_file.write_text(tomlkit.dumps(doc))
 
-        root_logger = logging.getLogger()
-        handlers_before = list(root_logger.handlers)
-        level_before = root_logger.level
-        try:
+        with _restored_logging():
             result = CliRunner().invoke(
                 cli, ["--config", str(config_file), "jobs", "--limit", "1"]
             )
-        finally:
-            # configure_logging adds to the ROOT logger; remove what this
-            # invocation added so later tests do not write into tmp_path.
-            for handler in list(root_logger.handlers):
-                if handler not in handlers_before:
-                    root_logger.removeHandler(handler)
-                    handler.close()
-            root_logger.setLevel(level_before)
 
         assert result.exit_code == 0, result.output
         content = log_file.read_text()
         assert "'legacy'" in content
         assert 'duplex = "manual"' in content
+
+
+@contextlib.contextmanager
+def _restored_logging() -> Generator[None]:
+    """
+    Undo what a real ``configure_logging`` call did to the logging tree.
+
+    ``configure_logging`` adds handlers to the ROOT logger, sets its level, and
+    sets the ``saneless`` logger's level; remove and restore all three so later
+    tests neither write into this test's ``tmp_path`` nor inherit DEBUG.
+
+    Yields:
+        Nothing; the restore runs on exit.
+
+    """
+    root_logger = logging.getLogger()
+    handlers_before = list(root_logger.handlers)
+    level_before = root_logger.level
+    try:
+        yield
+    finally:
+        for handler in list(root_logger.handlers):
+            if handler not in handlers_before:
+                root_logger.removeHandler(handler)
+                handler.close()
+        root_logger.setLevel(level_before)
+        logging.getLogger("saneless").setLevel(logging.NOTSET)
+
+
+def _write_real_config(tmp_path: Path, paperless: dict[str, str] | None = None) -> Path:
+    """
+    Write a config whose every path lives under ``tmp_path``.
+
+    The log file sits in ``tmp_path / "logs"``, a directory that exists only if
+    something configured logging, which is what the ``--help`` tests assert
+    never happened.
+
+    Args:
+        tmp_path: The test's temporary directory.
+        paperless: Keys for a ``[paperless]`` table, possibly misspelt ones.
+
+    Returns:
+        The path of the written ``saneless.toml``.
+
+    """
+    doc = tomlkit.document()
+    if paperless is not None:
+        paperless_table = tomlkit.table()
+        for key, value in paperless.items():
+            paperless_table.add(key, value)
+        doc.add("paperless", paperless_table)
+    output = tomlkit.table()
+    output.add("tmp_dir", str(tmp_path / "tmp"))
+    output.add("data_dir", str(tmp_path / "data"))
+    output.add("log_file", str(tmp_path / "logs" / "saneless.log"))
+    doc.add("output", output)
+    config_file = tmp_path / "saneless.toml"
+    config_file.write_text(tomlkit.dumps(doc))
+    return config_file
+
+
+_ALL_COMMANDS = ["scan", "devices", "jobs", "serve", "auto-profiles"]
+
+
+class TestLazySettingsLoading:
+    """
+    Settings load lazily, once, inside the commands that need them.
+
+    CFG-10 / N-25: ``saneless <subcommand> --help`` must work with a broken or
+    missing configuration. Click runs the group callback *before* a subcommand
+    parses its own ``--help``, and ``ctx.resilient_parsing`` is False there
+    (verified against Click 8.3), so the group callback cannot load anything;
+    each command loads on first need instead. M-21: configuring logging sits in
+    the same error handling, so its failure is a one-line exit 2 too.
+    """
+
+    @pytest.mark.parametrize("command", _ALL_COMMANDS)
+    def test_subcommand_help_needs_no_config(
+        self, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        """``<command> --help`` exits 0 and neither loads nor configures logging."""
+        calls: list[str] = []
+
+        def failing_load(*_args: object, **_kwargs: object) -> Settings:
+            calls.append("load_settings")
+            msg = "Configuration error in /nope.toml:\n  [output] broken"
+            raise ConfigError(msg)
+
+        def recording_logging(*_args: object, **_kwargs: object) -> None:
+            calls.append("configure_logging")
+
+        monkeypatch.setattr("saneless.cli.load_settings", failing_load)
+        monkeypatch.setattr("saneless.cli.configure_logging", recording_logging)
+
+        result = CliRunner().invoke(cli, [command, "--help"])
+
+        assert result.exit_code == 0, result.output
+        assert f"Usage: cli {command}" in result.output
+        assert calls == []
+
+    def test_help_with_broken_real_config_creates_no_log_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """A real broken config does not stop ``serve --help`` or make a log dir."""
+        config_file = _write_real_config(tmp_path, paperless={"tokne": "x"})
+
+        with _restored_logging():
+            result = CliRunner().invoke(
+                cli, ["--config", str(config_file), "serve", "--help"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "--host" in result.output
+        assert not (tmp_path / "logs").exists()
+
+    def test_real_config_error_printed_once_with_its_own_header(
+        self, tmp_path: Path
+    ) -> None:
+        """The loader's rendered error is echoed as-is, not prefixed again (D-10)."""
+        config_file = _write_real_config(tmp_path, paperless={"tokne": "x"})
+
+        with _restored_logging():
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "jobs"])
+
+        assert result.exit_code == 2
+        assert result.output.startswith("Configuration error in")
+        assert result.output.count("Configuration error") == 1
+        assert "tokne" in result.output
+        assert not (tmp_path / "logs").exists()
+
+    def test_missing_config_exits_2_naming_the_path(self, tmp_path: Path) -> None:
+        """``--config`` to a file that does not exist exits 2 and names it (CFG-02)."""
+        missing = tmp_path / "nope.toml"
+
+        with _restored_logging():
+            result = CliRunner().invoke(cli, ["--config", str(missing), "jobs"])
+
+        assert result.exit_code == 2
+        assert str(missing) in result.output
+
+    def test_logging_setup_failure_is_a_config_error_exit_2(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``configure_logging`` failure prints one line and exits 2 (M-21)."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        def failing_logging(*_args: object, **_kwargs: object) -> None:
+            msg = "disk full"
+            raise OSError(msg)
+
+        monkeypatch.setattr("saneless.cli.configure_logging", failing_logging)
+
+        result = runner.invoke(cli, ["devices"])
+
+        assert result.exit_code == 2
+        assert "Configuration error" in result.output
+        assert "disk full" in result.output
+        assert "Traceback" not in result.output
+        assert isinstance(result.exception, SystemExit)
+
+    def test_settings_loaded_and_logging_configured_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A second request for settings reuses the first load (memoised)."""
+        settings = _make_settings()
+        counts = {"load": 0, "logging": 0}
+
+        def counting_load(*_args: object, **_kwargs: object) -> Settings:
+            counts["load"] += 1
+            return settings
+
+        def counting_logging(*_args: object, **_kwargs: object) -> None:
+            counts["logging"] += 1
+
+        monkeypatch.setattr("saneless.cli.load_settings", counting_load)
+        monkeypatch.setattr("saneless.cli.configure_logging", counting_logging)
+        ctx = click.Context(cli, obj={"config_path": None, "verbose": False})
+
+        first = cli_module._load_cli_settings(ctx)
+        second = cli_module._load_cli_settings(ctx)
+
+        assert first is settings
+        assert second is settings
+        assert counts == {"load": 1, "logging": 1}
+
+
+class TestStartupConfigLog:
+    """
+    One INFO record says where the configuration came from (CFG-11).
+
+    Names only, never values (D-14, CFG-05): a token supplied through the
+    environment, or typed under a misspelt key, never reaches a log record or
+    the terminal.
+    """
+
+    def test_config_sources_logged_once_without_values(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The record names the file and ``paperless.token``, not the token."""
+        secret = "tok-SECRET-51aa"
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", secret)
+        config_file = _write_real_config(tmp_path)
+
+        with (
+            _restored_logging(),
+            caplog.at_level(logging.INFO, logger="saneless.config"),
+        ):
+            result = CliRunner().invoke(
+                cli, ["--config", str(config_file), "jobs", "--limit", "1"]
+            )
+
+        assert result.exit_code == 0, result.output
+        messages = [record.getMessage() for record in caplog.records]
+        startup = [message for message in messages if "Configuration:" in message]
+        assert len(startup) == 1
+        assert str(config_file) in startup[0]
+        assert "paperless.token" in startup[0]
+        assert all(secret not in message for message in messages)
+        assert secret not in result.output
+        assert secret not in (tmp_path / "logs" / "saneless.log").read_text()
+
+    def test_mistyped_key_error_never_echoes_its_value(self, tmp_path: Path) -> None:
+        """A token under a misspelt key is not printed with the error (D-14)."""
+        secret = "tok-SECRET-51ab"
+        config_file = _write_real_config(tmp_path, paperless={"tokne": secret})
+
+        with _restored_logging():
+            result = CliRunner().invoke(cli, ["--config", str(config_file), "jobs"])
+
+        assert result.exit_code == 2
+        assert secret not in result.output
+        assert secret not in result.stderr
 
 
 class TestJobsCommand:
@@ -1226,6 +1545,23 @@ class TestServeCommand:
         runner, _ = _patch_cli(monkeypatch)
 
         result = runner.invoke(cli, ["serve"])
+        assert result.exit_code == 0
+        assert captured["log_level"] == "info"
+
+    def test_serve_log_level_ignores_verbose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With ``-v`` uvicorn still gets the configured level, not ``debug``.
+
+        ``-v`` is saneless's own detail; turning uvicorn up with it would drag
+        its and httpx's debug output into the log (orchestrator resolution 5).
+        """
+        self._mock_socket(monkeypatch)
+        captured = self._capture_uvicorn(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["-v", "serve"])
         assert result.exit_code == 0
         assert captured["log_level"] == "info"
 

@@ -1,8 +1,10 @@
 """
 Logging setup with RotatingFileHandler.
 
-Configures the root logger with a rotating file handler and optional
-stderr handler for verbose output.
+Configures the root logger at the configured level with a rotating file
+handler. Verbose mode also mirrors records to stderr and logs saneless's own
+loggers at DEBUG, while the root logger and third-party libraries keep the
+configured level.
 """
 
 from __future__ import annotations
@@ -34,7 +36,8 @@ def configure_logging(
         log_level: Logging level name (DEBUG, INFO, WARNING, ERROR, CRITICAL).
         max_bytes: Maximum log file size before rotation.
         backup_count: Number of rotated log files to keep.
-        verbose: If True, also add a StreamHandler writing to stderr.
+        verbose: If True, also mirror to stderr and log saneless's own
+            loggers at DEBUG.
 
     """
     formatter = logging.Formatter(
@@ -42,7 +45,9 @@ def configure_logging(
     )
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(getattr(logging, log_level.upper()))
+    # The level-name mapping rather than an attribute lookup on the module,
+    # which would also "resolve" non-level names such as BASIC_FORMAT (CFG-04).
+    root_logger.setLevel(logging.getLevelNamesMapping()[log_level.upper()])
 
     try:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
@@ -63,3 +68,10 @@ def configure_logging(
         stderr_handler = logging.StreamHandler(sys.stderr)
         stderr_handler.setFormatter(formatter)
         root_logger.addHandler(stderr_handler)
+
+    # -v is saneless's own detail. The root logger keeps the configured level so
+    # httpx, multipart and uvicorn do not flood the log -- httpx's DEBUG output
+    # can include the Paperless Authorization header (T-27-23). NOTSET on the
+    # non-verbose path makes repeated calls idempotent instead of leaking an
+    # earlier call's DEBUG.
+    logging.getLogger("saneless").setLevel(logging.DEBUG if verbose else logging.NOTSET)
