@@ -610,8 +610,8 @@ Plans:
 
 **Wave 12** *(blocked on Wave 11 completion)*
 
-- [ ] 30-17-PLAN.md — Browser verification part 1: egress gate, strip, errors, counts, timestamps
-- [ ] 30-18-PLAN.md — Compose template, reference docs and master UI-SPEC accuracy
+- [x] 30-17-PLAN.md — Browser verification part 1: egress gate, strip, errors, counts, timestamps
+- [x] 30-18-PLAN.md — Compose template, reference docs and master UI-SPEC accuracy
 
 **Wave 13** *(blocked on Wave 12 completion)*
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 16/19 | In Progress|  |
+| 30. Appliance Layer | 18/19 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
