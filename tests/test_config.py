@@ -24,6 +24,7 @@ from saneless.config import (
     PaperlessConfig,
     ProfileConfig,
     Settings,
+    WebConfig,
     is_placeholder_token,
     load_settings,
     resolve_job_title,
@@ -2222,3 +2223,91 @@ class TestProfileLabelAndDescription:
         valid = matching[0].split("valid keys: ", 1)[1].split(", ")
         assert "label" in valid
         assert "description" in valid
+
+
+class TestWebConfig:
+    """
+    The ``[web]`` section decides the scan form's shape (D-28, D-29, APPL-10).
+
+    One appliance, one configured form shape -- not a per-browser toggle. Both
+    keys default on, so an existing deployment's form is unchanged, and hiding
+    a control changes the form and never the scan.
+    """
+
+    def test_both_default_on(self) -> None:
+        """Directly constructed Settings show both optional controls."""
+        settings = Settings()
+        assert settings.web.show_tags is True
+        assert settings.web.show_correspondent is True
+
+    def test_a_config_without_a_web_table_gets_the_defaults(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A config file that predates the section loads with both defaults."""
+        config_file = tmp_config_dir / "no_web.toml"
+        config_file.write_text('[scanner]\nhost = "192.168.1.50"\n')
+        settings = load_settings(config_path=str(config_file))
+        assert settings.web.show_tags is True
+        assert settings.web.show_correspondent is True
+
+    def test_toml_turns_a_control_off(self, tmp_config_dir: Path) -> None:
+        """``[web] show_tags = false`` hides the tag control."""
+        config_file = tmp_config_dir / "web_off.toml"
+        config_file.write_text("[web]\nshow_tags = false\n")
+        settings = load_settings(config_path=str(config_file))
+        assert settings.web.show_tags is False
+        assert settings.web.show_correspondent is True
+
+    def test_env_var_turns_a_control_off(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``SANELESS_WEB__SHOW_TAGS=false`` hides the tag control."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("SANELESS_WEB__SHOW_TAGS", "false")
+        settings = load_settings()
+        assert settings.web.show_tags is False
+
+    def test_unknown_key_under_web_is_a_rendered_error(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A mistyped ``[web]`` key is a loud error, not a silent default (T-30-07).
+
+        The new section must be visible to the same unknown-key machinery that
+        renders ``[paperless] unknown key 'tokne'``.
+        """
+        err = _load_error(
+            tmp_config_dir / "web_typo.toml",
+            "[web]\nshow_tag = false\n",
+        )
+        assert (
+            "  [web] unknown key 'show_tag' (did you mean 'show_tags'?); "
+            "valid keys: show_tags, show_correspondent"
+        ) in _error_lines(err)
+
+    def test_a_web_key_written_under_the_wrong_section_says_where_it_belongs(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``show_tags`` under ``[output]`` is pointed at ``[web]``."""
+        err = _load_error(
+            tmp_config_dir / "web_misplaced.toml",
+            "[output]\nshow_tags = false\n",
+        )
+        assert "  [output] unknown key 'show_tags'; it belongs in [web]" in (
+            _error_lines(err)
+        )
+
+    def test_web_is_extra_forbid(self) -> None:
+        """WebConfig forbids unknown keys the way every other section does."""
+        assert WebConfig.model_config["extra"] == "forbid"
+
+    def test_settings_builds_web_with_a_default_factory(self) -> None:
+        """
+        ``web`` is hung with ``default_factory``, matching the other sections.
+
+        A plain instance default is built once at import; every section on
+        ``Settings`` uses a factory so none can freeze import-time state
+        (config.py's comment on ``scanner``/``paperless``/``output``).
+        """
+        field = Settings.model_fields["web"]
+        assert field.default_factory is WebConfig
