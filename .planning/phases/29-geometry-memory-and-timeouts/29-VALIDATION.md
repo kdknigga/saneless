@@ -61,9 +61,9 @@ prove; the planner maps each to the task that delivers it.
 | SC3 / D-15 | `KeyboardInterrupt` mid-read cancels, waits, closes, re-raises; CLI still exits 130 | unit | `uv run pytest tests/test_scanner.py -k keyboard_interrupt_mid_read -x` | 29-07 T3 | ❌ W0 | ⬜ pending |
 | SC4 / HARD-04 | flatbed `start()+snap()` times out with the ADF path's message shape | unit | `uv run pytest tests/test_scanner.py -k flatbed_timeout -x` | 29-07 T2 | ❌ W0 | ⬜ pending |
 | SC4 / HARD-04 | flatbed validation is fatal and shares `_validate_page_image` | unit | `uv run pytest tests/test_scanner.py -k flatbed_unreadable -x` | 29-02 T2 / 29-07 T2 | ✅ exists | ⬜ pending |
-| SC5 / HARD-05 | two `SaneBackend()` constructions → one `init`; differing hosts → WARNING naming both | unit | `uv run pytest tests/test_scanner.py -k init_once -x` | 29-10 T1 | ❌ W0 | ⬜ pending |
-| SC5 / HARD-05 | `TestClient` through startup, every route incl. scan submit + flip, shutdown: `init_call_count == 1` throughout, `exit_call_count` 0→1 only at shutdown | integration | `uv run pytest tests/test_app_lifespan.py -k sane_lifecycle -x` | 29-10 T3 | ❌ W0 | ⬜ pending |
-| SC5 / D-18 | each CLI command closes the backend on success and on error | unit | `uv run pytest tests/test_cli.py -k closes_the_backend -x` | 29-10 T2 | ❌ W0 | ⬜ pending |
+| SC5 / HARD-05 | two `SaneBackend()` constructions → one `init`; differing hosts → WARNING naming both | unit | `uv run pytest tests/test_scanner.py -k init_once -x` | 29-10 T1 | ✅ exists | ✅ passing |
+| SC5 / HARD-05 | `TestClient` through startup, every route incl. scan submit + flip, shutdown: `init_call_count == 1` throughout, `exit_call_count` 0→1 only at shutdown | integration | `uv run pytest tests/test_app_lifespan.py -k sane_lifecycle -x` | 29-10 T3 | ✅ exists | ✅ passing |
+| SC5 / D-18 | each CLI command closes the backend on success and on error | unit | `uv run pytest tests/test_cli.py -k closes_the_backend -x` | 29-10 T2 | ✅ exists | ✅ passing |
 | D-03 / D-07 | per-page disk shortfall → `ScanError` naming page and path; no raw `OSError` | unit | `uv run pytest tests/test_spool.py -x` | 29-01 T2 | ❌ W0 | ⬜ pending |
 | D-03 | `assemble_pdf` does not re-encode a second PNG per page | unit | `uv run pytest tests/test_pdf.py -k no_second_encode -x` | 29-05 T1 | ❌ W0 | ⬜ pending |
 | D-20 | the architecture page states the memory, disk and timeout rules | doc-truth | `uv run pytest tests/test_deployment_config.py -k architecture -x` | 29-11 T3 | ❌ W0 | ⬜ pending |
