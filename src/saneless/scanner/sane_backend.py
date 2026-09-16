@@ -4,7 +4,9 @@ SANE scanner backend implementation wrapping python-sane.
 This module provides the concrete SaneBackend that communicates with
 physical scanners through the SANE (Scanner Access Now Easy) library.
 Key safety measures:
-- sane.init() called exactly once at construction time (Pitfall #1)
+- sane.init() runs once per process, behind a module-level guard: the first
+  SaneBackend built initialises SANE and every later one does not, and after
+  shutdown() a later init is allowed again (Pitfall #1, HARD-05, D-17)
 - Device handles managed via context manager with cancel+close (Pitfall #4),
   skipped entirely while a read is still inside SANE (HARD-03, D-12/D-13)
 - No progress callbacks to snap() (Pitfall #2)
@@ -207,7 +209,7 @@ _MM_PER_INCH = 25.4
 # exact figure is not delicate.
 _AREA_TOLERANCE_MM = 1.0
 
-__all__ = ["GeometryUnit", "SaneBackend", "require_sane"]
+__all__ = ["GeometryUnit", "SaneBackend", "require_sane", "shutdown"]
 
 logger = logging.getLogger(__name__)
 
@@ -763,9 +765,189 @@ class _Wedge:
 _WEDGE_LOCK = threading.Lock()
 _WEDGE = _Wedge()
 
+
+@dataclass
+class _Init:
+    """
+    What the module remembers about the one ``sane_init`` of this process.
+
+    Module-level and **mutated, never rebound**, for the reason ``_Wedge``
+    gives: rebinding a module-level name needs a ``global`` statement, which
+    the ``PL`` rules in ruff's ``select`` reject, and CLAUDE.md forbids adding
+    a second suppression to say otherwise.  Keeping it beside ``_WEDGE`` also
+    keeps this module's process-global state in one place rather than two.
+
+    ``host`` is the ``host`` argument the initialising construction passed, not
+    the environment variable it may have set.  The two differ whenever
+    ``SANE_NET_HOSTS`` was already set externally, and it is the *argument*
+    that a later construction is compared against: what the comparison has to
+    catch is a second operator-configured host arriving too late to be read.
+
+    Attributes:
+        done: Whether ``sane.init()`` has returned successfully and not yet
+            been undone by ``shutdown()``.
+        host: The host argument that was in effect at that init.
+        version: Whatever ``sane.init()`` returned, kept for the log line.
+
+    """
+
+    done: bool = False
+    host: str = ""
+    version: object = None
+
+
+# Guards every read and write of _INIT.  Two threads reach it in production --
+# whichever builds the backend and whichever shuts it down -- and "look, then
+# initialise" is a check and a write that must not be split, or a racing pair
+# of constructions would each see an uninitialised SANE and call sane_init
+# twice.
+_INIT_LOCK = threading.Lock()
+_INIT = _Init()
+
 # The prefix every acquisition thread is named with, so a stuck reader is
 # identifiable in a ``faulthandler`` dump or a debugger without guessing.
 _READER_THREAD_PREFIX = "sane-read-"
+
+
+def _ensure_initialised(host: str) -> object:
+    """
+    Initialise SANE, once per process, whoever asks (HARD-05, D-17).
+
+    ``sane_init`` is a process-global call, not a per-object one, so the
+    guard is here rather than in ``SaneBackend.__init__``: three one-shot CLI
+    commands and the web server each build their own backend, and the second
+    ``sane_init`` in a process is at best wasted work.  It is a guard and not
+    a singleton deliberately -- every one of those callers keeps getting its
+    own ``SaneBackend``, which is what lets the tests and the CLI construct one
+    wherever they need it.
+
+    A later construction naming a *different* host is the case worth a WARNING
+    rather than silence.  The sane-net backend reads ``SANE_NET_HOSTS`` when it
+    is initialised and never again, so the second host is not merely redundant:
+    it does nothing at all, while the operator who configured it has every
+    reason to believe it is in effect (N-04).  Only the hostnames from the
+    operator's own configuration are named, which the existing INFO line
+    already logs; no credential is in scope here (ASVS V7).
+
+    The failure translation is ``ScanError`` because a SANE that will not start
+    is a scanning failure the caller reports, and it catches ``Exception``
+    because python-sane raises ``_sane.error``, ``RuntimeError`` or
+    ``AttributeError`` with no shared base (D-08).  A failed init records
+    nothing, so the next construction tries again rather than assuming an
+    initialised SANE that is not there.
+
+    Args:
+        host: Colon-separated sane-net hosts from the caller's configuration,
+            or the empty string when none was configured.
+
+    Returns:
+        Whatever ``sane.init()`` returned for this process.
+
+    Raises:
+        ScanError: If ``sane.init()`` fails, chained to the SANE error.
+
+    """
+    with _INIT_LOCK:
+        if _INIT.done:
+            if host and host != _INIT.host:
+                logger.warning(
+                    "SANE is already initialised with scanner host %s, so the "
+                    "host %s configured here has no effect: SANE_NET_HOSTS is "
+                    "read once, at the first initialisation of the process. "
+                    "Run one saneless per scanner host, or list both hosts "
+                    "colon-separated in one configuration",
+                    _INIT.host or "none",
+                    host,
+                )
+            return _INIT.version
+        # SANE_NET_HOSTS tells the sane-net backend which hosts to probe for
+        # scanners.  Multiple hosts are separated by colons — see sane-net(5).
+        # Only set from config when not already present in the environment
+        # (explicit env var takes priority over config file).
+        if host and "SANE_NET_HOSTS" not in os.environ:
+            os.environ["SANE_NET_HOSTS"] = host
+            logger.info("SANE net host discovery configured: %s", host)
+        elif host and "SANE_NET_HOSTS" in os.environ:
+            logger.info(
+                "SANE_NET_HOSTS already set externally (%s), ignoring scanner.host config",
+                os.environ["SANE_NET_HOSTS"],
+            )
+        try:
+            version = sane.init()
+        except Exception as exc:
+            # python-sane raises _sane.error, RuntimeError or AttributeError,
+            # with no shared base, so the boundary catches Exception (D-08).
+            init_msg = f"Could not initialise SANE: {describe(exc)}"
+            raise ScanError(init_msg) from exc
+        _INIT.done = True
+        _INIT.host = host
+        _INIT.version = version
+        logger.info("SANE initialized, version %s", version)
+        return version
+
+
+def _read_outstanding() -> bool:
+    """
+    Report whether any reader thread is still inside a SANE read.
+
+    ``_wedged_by`` answers the same question about one handle; the shutdown
+    path has no handle to ask about and needs the process-wide answer.
+
+    Returns:
+        True if a read recorded in the wedge has not come back.
+
+    """
+    with _WEDGE_LOCK:
+        return _WEDGE.stuck
+
+
+def shutdown() -> None:
+    """
+    Shut SANE down for this process, or explain why it was not (D-18).
+
+    Called at an entry point's shutdown and nowhere else: never from a request
+    path, and never through ``atexit``, which would run while a daemon reader
+    thread may still be inside ``sane_read``.  It is idempotent, so an entry
+    point that closes more than one backend calls ``sane_exit`` once.
+
+    Two conditions skip the call rather than making it, and both are logged
+    because a silently skipped shutdown is indistinguishable from one that
+    happened:
+
+    - **SANE was never initialised in this process.** There is nothing to undo,
+      and ``sane_exit`` before ``sane_init`` is undefined by the standard.
+    - **A read has not returned.** ``sane_exit`` closes every open handle by
+      specification, and ``PySane_exit`` runs holding the GIL while
+      ``sane_read`` has released it -- exactly the close-while-reading sequence
+      ``_open_device`` already refuses on one handle (D-12, D-13), applied to
+      all of them at once.  The process is ending anyway, so an un-exited SANE
+      costs nothing next to a segfault on the way out.
+
+    Nothing escapes: a failing ``sane_exit`` is logged with its traceback and
+    swallowed, because this runs while the process is on its way out and an
+    exception here would replace whatever error the operator is being shown.
+    The guard is re-armed either way, so a later ``SaneBackend`` initialises
+    rather than assuming a SANE that a failed exit may well have left broken.
+    """
+    with _INIT_LOCK:
+        if not _INIT.done:
+            logger.debug("SANE was never initialised in this process; nothing to undo")
+            return
+        if _read_outstanding():
+            logger.warning(
+                "Leaving SANE initialised: a read has not returned, and "
+                "sane_exit() closes every open handle, which SANE forbids "
+                "while one is outstanding"
+            )
+            return
+        try:
+            sane.exit()
+        except Exception:
+            logger.warning("Could not shut SANE down", exc_info=True)
+        _INIT.done = False
+        _INIT.host = ""
+        _INIT.version = None
+        logger.info("SANE shut down")
 
 
 def _page_label(page_num: int) -> str:
@@ -1683,18 +1865,26 @@ class SaneBackend(ScannerBackend):
     """
     Scanner backend wrapping python-sane.
 
-    Calls sane.init() exactly once at construction. Device handles
-    are opened via a context manager that ensures cancel() and close()
-    are called on all code paths.
+    The first backend built in a process initialises SANE, behind a
+    module-level guard; every later one reuses that initialisation, and after
+    ``shutdown()`` a later one initialises again.  A backend is otherwise an
+    ordinary object -- there is no singleton and no factory, because the three
+    one-shot CLI commands and the web server each construct their own.
+
+    Device handles are opened via a context manager that ensures cancel() and
+    close() are called on all code paths, unless a read on the handle has not
+    returned, in which case neither may be issued at all.
     """
 
     def __init__(self, host: str = "") -> None:
         """
-        Initialize SANE, optionally configuring network host discovery.
+        Join this process's SANE, initialising it if nobody has yet.
 
         Args:
-            host: Colon-separated sane-net hosts, applied only when
-                ``SANE_NET_HOSTS`` is not already set.
+            host: Colon-separated sane-net hosts, applied only at the first
+                initialisation in the process, and only when
+                ``SANE_NET_HOSTS`` is not already set.  A later, differing host
+                is reported as having no effect rather than applied.
 
         Raises:
             ConfigError: If python-sane cannot be imported (``require_sane``).
@@ -1702,26 +1892,7 @@ class SaneBackend(ScannerBackend):
 
         """
         require_sane()
-        # SANE_NET_HOSTS tells the sane-net backend which hosts to probe for
-        # scanners.  Multiple hosts are separated by colons — see sane-net(5).
-        # Only set from config when not already present in the environment
-        # (explicit env var takes priority over config file).
-        if host and "SANE_NET_HOSTS" not in os.environ:
-            os.environ["SANE_NET_HOSTS"] = host
-            logger.info("SANE net host discovery configured: %s", host)
-        elif host and "SANE_NET_HOSTS" in os.environ:
-            logger.info(
-                "SANE_NET_HOSTS already set externally (%s), ignoring scanner.host config",
-                os.environ["SANE_NET_HOSTS"],
-            )
-        try:
-            self._sane_version = sane.init()
-        except Exception as exc:
-            # python-sane raises _sane.error, RuntimeError or AttributeError,
-            # with no shared base, so the boundary catches Exception (D-08).
-            init_msg = f"Could not initialise SANE: {describe(exc)}"
-            raise ScanError(init_msg) from exc
-        logger.info("SANE initialized, version %s", self._sane_version)
+        self._sane_version = _ensure_initialised(host)
 
     @contextlib.contextmanager
     def _open_device(self, device_id: str) -> Generator[SaneDevice]:
