@@ -3136,3 +3136,197 @@ class TestManualDuplexFrontCountInChromium:
             wait_for_state(
                 job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT
             )
+
+
+# The two profiles the swap needs beyond the shared pair, plus the one that has
+# nothing to say. Amendment A-3's fallback is only observable when some profile
+# carries a human name and another does not, so both cases are configured.
+_LABELLED_PROFILE = "labelled"
+_LABELLED_NAME = "Everyday scan"
+_UNNAMED_PROFILE = "unnamed"
+_SILENT_PROFILE = "silent"
+_UNNAMED_DESCRIPTION = "Scans whatever is on the glass, once."
+
+
+def _described_profile_settings(tmp_dir: Path) -> Settings:
+    """
+    Build settings with four profiles, covering every shape the dropdown has.
+
+    ``default`` is the flatbed and ``duplex`` the feeder, both inherited from
+    the shared settings so the two sentences the swap moves between stay the
+    ones the rest of the module uses. ``labelled`` carries a human name and
+    ``unnamed`` carries none, which is the pair Amendment A-3's fallback needs
+    to be visible at all; ``silent`` carries no description, which is what the
+    ``:empty`` rule exists for.
+
+    Args:
+        tmp_dir: The directory the private server's data and log live under.
+
+    Returns:
+        The settings, with the four profiles in dropdown order.
+
+    """
+    configured = _browser_test_settings(tmp_dir)
+    return configured.model_copy(
+        update={
+            "profiles": {
+                **configured.profiles,
+                _LABELLED_PROFILE: ProfileConfig(
+                    label=_LABELLED_NAME, description=_UNNAMED_DESCRIPTION
+                ),
+                _UNNAMED_PROFILE: ProfileConfig(description=_UNNAMED_DESCRIPTION),
+                _SILENT_PROFILE: ProfileConfig(),
+            }
+        }
+    )
+
+
+@pytest.fixture
+def described_profile_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app carrying all four dropdown shapes.
+
+    The profile set is read from ``Settings`` once at startup, so a second
+    server is the only way to put a browser in front of a profile with no
+    human name or no description; the session server's pair cannot show either.
+    """
+    with _serve(_described_profile_settings(tmp_path), _BrowserTestScanner()) as server:
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.mark.browser
+class TestProfileDescriptionInChromium:
+    """
+    The dropdown explains itself live, without losing the slot (APPL-05, S4).
+
+    ``TestProfileDescriptionSwap`` above proves the swap happens and that the
+    id, the live region and the ``aria-describedby`` target survive it. What is
+    added here is the element *identity* -- an ``outerHTML`` swap would satisfy
+    every one of those assertions with a brand-new node -- and the two profile
+    shapes the session server has no example of.
+    """
+
+    def test_the_slot_that_survives_the_swap_is_the_same_node(
+        self, page: Page, described_profile_server: _BrowserServer
+    ) -> None:
+        """
+        The text changes and the element does not (P8, S4).
+
+        A witness attribute set from the test is what tells "this element was
+        updated" apart from "an identical element was put in its place". Only
+        the first keeps the node ``aria-describedby`` points at, its live region
+        and its adjacency to the control, and only ``innerHTML`` gives it.
+        """
+        page.goto(described_profile_server.url)
+        slot = page.locator("#profile-description")
+        expect(slot).to_have_text(_FLATBED_DESCRIPTION)
+        slot.evaluate("(el) => { el.dataset.witness = 'original'; }")
+
+        page.select_option("#profile-select", "duplex")
+
+        expect(slot).to_have_text(_FEEDER_DESCRIPTION)
+        expect(slot).to_have_attribute("data-witness", "original")
+        expect(page.locator("#profile-description")).to_have_count(1)
+        expect(slot).to_have_attribute("aria-live", "polite")
+        expect(page.locator("#profile-select")).to_have_attribute(
+            "aria-describedby", "profile-description"
+        )
+
+    def test_a_profile_with_no_human_name_is_offered_under_its_own_name(
+        self, page: Page, described_profile_server: _BrowserServer
+    ) -> None:
+        """
+        ``label or name``, both halves, in the rendered options (P8, A-3).
+
+        A config written before this phase carries no label until
+        ``auto-profiles --force`` has been run, and a dropdown that rendered it
+        as a blank row would be unusable. The labelled profile is asserted
+        alongside so the fallback cannot pass by never being reached.
+        """
+        page.goto(described_profile_server.url)
+
+        expect(
+            page.locator(f'#profile-select option[value="{_UNNAMED_PROFILE}"]')
+        ).to_have_text(_UNNAMED_PROFILE)
+        expect(
+            page.locator(f'#profile-select option[value="{_LABELLED_PROFILE}"]')
+        ).to_have_text(_LABELLED_NAME)
+
+    def test_a_profile_with_nothing_to_say_leaves_no_gap(
+        self, page: Page, described_profile_server: _BrowserServer
+    ) -> None:
+        """
+        An emptied slot is hidden outright, not left as a stray margin (P8).
+
+        The route answers a description-less profile with a byte-empty body so
+        ``:empty`` still matches; a single whitespace text node would be a child
+        and the rule would stop applying, leaving Pico's help-text margins
+        behind under a control with no help text.
+        """
+        page.goto(described_profile_server.url)
+        slot = page.locator("#profile-description")
+        expect(slot).to_have_text(_FLATBED_DESCRIPTION)
+
+        page.select_option("#profile-select", _SILENT_PROFILE)
+
+        # Count first: ``to_be_hidden`` is satisfied by an element that is not
+        # there at all, and a slot htmx had removed would pass it while breaking
+        # everything the id is pointed at.
+        expect(slot).to_have_count(1)
+        expect(slot).to_be_hidden()
+        expect(slot).to_have_text("")
+        assert slot.evaluate("(el) => getComputedStyle(el).display") == "none"
+
+
+_TIME_CELL_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2} (\S+)$")
+"""UI-SPEC P15's Time cell shape, with the zone token captured for reuse."""
+
+
+@pytest.mark.browser
+class TestTimestampZonesInChromium:
+    """
+    Every timestamp on the page names its zone (APPL-12, D-34, D-35).
+
+    The zone is named on every row rather than once as a column caption, so a
+    line somebody copies into a message is self-describing. Both surfaces go
+    through the same ``local_time`` filter, and this is the proof that they
+    really agree once rendered -- the zone is read off the Time cell and the
+    freshness line is required to end with that same token, so the test says
+    nothing about which zone the host happens to be in.
+    """
+
+    def test_the_time_cell_and_the_freshness_line_name_the_same_zone(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        The Time cell matches the pinned shape and the strip echoes its zone (P15).
+
+        The checks are probed before the page is opened, so the strip renders
+        its "Last checked" line in the first response and there is no swap to
+        wait on: what is under test here is the format, not the poll.
+        """
+        server = cold_strip_server
+        job_store: JobStore = server.app.state.job_store
+        job = job_store.create_job(profile="default", title="Timed Doc")
+        _probe_now(server)
+        try:
+            page.goto(server.url)
+
+            cell = page.locator("#history-body tr").first.locator("td").nth(0)
+            rendered = cell.inner_text().strip()
+            match = _TIME_CELL_PATTERN.match(rendered)
+            assert match is not None, rendered
+            zone = match.group(1)
+
+            meta = page.locator(".check-meta")
+            expect(meta).to_contain_text("Last checked")
+            freshness = meta.inner_text().strip()
+            # The token is taken from the cell rather than written down, so the
+            # test is about the two surfaces agreeing and not about the runner's
+            # own TZ.
+            assert freshness.endswith(f"{zone}."), (freshness, zone)
+        finally:
+            job_store.delete_job(job.id)
