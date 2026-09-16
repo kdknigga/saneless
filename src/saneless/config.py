@@ -48,6 +48,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_RESOLUTION",
+    "PLACEHOLDER_TOKENS",
     "LogLevel",
     "OutputConfig",
     "PaperlessConfig",
@@ -56,6 +57,7 @@ __all__ = [
     "Settings",
     "config_search_paths",
     "env_sourced_keys",
+    "is_placeholder_token",
     "load_settings",
     "log_config_sources",
     "resolve_job_title",
@@ -215,6 +217,68 @@ class ScannerConfig(BaseModel):
 
     host: str = ""
     device: str = ""
+
+
+# Every token value the project has ever shipped as a stand-in, plus the
+# obvious hand-written ones.  Compared exactly, never as substrings (D-14).
+PLACEHOLDER_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        # Shipped today at docker-compose.yml:30 and docs/reference/docker.md:178.
+        "changeme",
+        "change-me",
+        "change_me",
+        # What saneless.toml.example carries.  Pinned by
+        # TestPlaceholderToken.test_the_example_config_ships_a_token_the_predicate_refuses,
+        # which reads the file rather than hard-coding the value, so the
+        # example and this set cannot drift apart.
+        "your-api-token-here",
+        # The rest of the your-token-here family, and the bare noun.
+        "your-token-here",
+        "your_token_here",
+        "your-api-token",
+        "yourtokenhere",
+        "token",
+        "api-token",
+        "replace-me",
+        "replaceme",
+        "placeholder",
+        "xxx",
+        "todo",
+    }
+)
+"""The literal token values that mean "nobody has configured this" (APPL-07)."""
+
+
+def is_placeholder_token(value: str) -> bool:
+    """
+    Say whether a Paperless token is unset or a stand-in nobody replaced.
+
+    This is the one predicate ``doctor``, the web status strip, the scan route
+    and ``saneless scan`` share, so all four agree on whether the appliance can
+    upload (APPL-07). A value counts as a placeholder when it is empty or
+    whitespace-only, or when stripping and lower-casing it lands on a member of
+    ``PLACEHOLDER_TOKENS``.
+
+    D-14: the set is a small fixed literal set, deliberately **not** a shape
+    heuristic (no length, entropy or character-class test). Refusing a
+    legitimate token from a future paperless-ngx version is worse than missing
+    an exotic placeholder, so membership is exact and never a substring match:
+    ``changeme7f3a91`` is a real token.
+
+    ASVS V7: this function neither logs nor returns the value it is given -- it
+    returns only a ``bool``. It takes an already-unwrapped ``str``, so it adds
+    no secret-unwrapping call site to this module (CFG-05, N-15), and
+    callers must not log or render the value either.
+
+    Args:
+        value: The token as configured, already unwrapped from its SecretStr.
+
+    Returns:
+        True when the token is blank or a known placeholder literal.
+
+    """
+    normalised = value.strip().lower()
+    return not normalised or normalised in PLACEHOLDER_TOKENS
 
 
 class PaperlessConfig(BaseModel):

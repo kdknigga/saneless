@@ -2121,10 +2121,11 @@ class TestPlaceholderToken:
 
     def test_config_module_adds_no_secret_unwrap_site(self) -> None:
         """
-        The predicate does not add a ``get_secret_value`` call to config.py.
+        The predicate adds no secret-unwrapping call to ``config.py``.
 
         Only ``cli.py scan`` and ``web/app.py create_app`` unwrap the token
-        (T-30-05, N-15); config.py itself never does.
+        (T-30-05, N-15); ``config.py`` itself never does, and naming the method
+        in a comment is not a call site -- the call form is what is asserted.
         """
         source = Path(config_mod.__file__).read_text()
-        assert "get_secret_value" not in source
+        assert ".get_secret_value(" not in source
