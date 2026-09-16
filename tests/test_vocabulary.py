@@ -45,6 +45,7 @@ from saneless.vocabulary import (
     ExitCode,
     FlipOutcome,
     JobState,
+    ProfileStorage,
     RequestRejection,
     ScanOutcome,
     SubmitResult,
@@ -137,6 +138,34 @@ class TestScanOutcomeMembers:
     def test_scan_outcome_value_equals_name(self, outcome: ScanOutcome) -> None:
         """Every ScanOutcome value is identical to its member name (CTR-02)."""
         assert outcome.value == outcome.name
+
+
+class TestProfileStorage:
+    """ProfileStorage membership tests (APPL-06, Amendment A-2, D-22)."""
+
+    def test_profile_storage_member_names(self) -> None:
+        """
+        ProfileStorage names the three outcomes of the startup persist (A-2).
+
+        ``_persist_generated_profiles`` returns None for two genuinely
+        different situations -- no config file was loaded, and the file could
+        not be written -- and the status strip's Profiles row has to tell them
+        apart.  Compared as a set: declaration order is not a contract.
+        """
+        assert {member.name for member in ProfileStorage} == {
+            "PERSISTED",
+            "IN_MEMORY_NO_CONFIG_FILE",
+            "IN_MEMORY_UNWRITABLE",
+        }
+
+    @pytest.mark.parametrize("storage", list(ProfileStorage))
+    def test_profile_storage_value_equals_name(self, storage: ProfileStorage) -> None:
+        """Every ProfileStorage value is identical to its member name (A-2)."""
+        assert storage.value == storage.name
+
+    def test_profile_storage_is_a_str_enum(self) -> None:
+        """ProfileStorage compares equal to its own string, like its siblings."""
+        assert ProfileStorage.PERSISTED == "PERSISTED"
 
 
 class TestStateClassifications:
