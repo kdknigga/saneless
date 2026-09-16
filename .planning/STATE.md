@@ -224,6 +224,7 @@ Recent decisions affecting current work:
 - Phase 18 added: Automatic scanned page size detection or user-specified paper size to avoid capturing the full scanner bed
 - Phase 19 added: Write user-facing docs including a full getting started section that walks a new user through setup and first scan using the Diátaxis model
 - Phase 23.1 inserted after Phase 23: Dark Mode and the Commit Gate (URGENT)
+- Phase 33 added: Disable the OpenAPI schema and docs endpoints (API-01) — `/openapi.json` 500s today; found by Phase 29 plan 29-10's route-reachability proof, user chose to remove the endpoints rather than fix the annotations
 
 ### Pending Todos
 

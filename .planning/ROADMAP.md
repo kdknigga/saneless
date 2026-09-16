@@ -45,6 +45,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt
 - [ ] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/saneless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected
 - [ ] **Phase 32: Suite Hygiene and Minor Sweep** - Hermetic tests, no `time.sleep`, no low-value tests, and the remaining N-01..N-45 sweep
+- [ ] **Phase 33: Disable the OpenAPI Schema and Docs Endpoints** - `/openapi.json`, `/docs` and `/redoc` are gone rather than broken; nothing claims saneless serves an API schema
 
 ## Phase Details
 
@@ -589,6 +590,21 @@ Plans:
 
 **Plans**: TBD
 
+### Phase 33: Disable the OpenAPI Schema and Docs Endpoints
+
+**Goal**: A LAN-exposed saneless stops advertising an API surface it does not have -- `GET /openapi.json`, `/docs` and `/redoc` are removed rather than returning 500, the route-reachability proof stops skipping the schema path, and the decision is written down where a contributor will meet it
+**Depends on**: Nothing -- independent of Phases 30-32; sequenced last only by convention
+**Requirements**: API-01
+**Success Criteria** (what must be TRUE):
+
+  1. `GET /openapi.json`, `GET /docs` and `GET /redoc` each answer 404 on a running app -- no 500, no partial schema, no interactive shell -- proven by a test that drives all three
+  2. `_ROUTE_SKIPS` in `tests/test_app_lifespan.py` no longer carries an `/openapi.json` entry, and the every-route reachability assertion (`uncovered == set()`) still passes, so the skip is removed rather than widened
+  3. No shipped file -- docs, README, or test -- claims saneless serves an OpenAPI schema or interactive API documentation
+  4. The reason is recorded in `docs/reference/web-api.md`: this is an unauthenticated LAN appliance serving an HTMX UI, the generated schema never worked, and nothing consumes it
+  5. Phase 29's `deferred-items.md` entry is closed with a pointer to this phase, so the finding is not rediscovered a third time
+
+**Plans**: TBD
+
 ## Progress
 
 | Phase | Plans Complete | Status | Completed |
@@ -606,6 +622,7 @@ Plans:
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
+| 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
 
 ## Research Flags
 
@@ -621,7 +638,7 @@ Safe to skip research: Phase 20 (mechanical), Phase 21 (pure refactor, fully spe
 
 ## Coverage
 
-All 125 v2.0 requirements are mapped to exactly one phase. See the Traceability table in `.planning/REQUIREMENTS.md`.
+All 126 v2.0 requirements are mapped to exactly one phase. See the Traceability table in `.planning/REQUIREMENTS.md`.
 
 ---
 *Roadmap created: 2026-09-09*

@@ -188,6 +188,14 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 - [ ] **SWP-13**: Naming and template nits in N-44 are resolved, and the stale debug notes in N-45 are updated or removed [N-44, N-45]
 - [ ] **SWP-14**: The small `auto_profiles` cleanups in N-11 are applied [N-11]
 
+### API Surface
+
+Discovered during Phase 29 execution (plan 29-10's route-reachability proof), not by the
+2026-09-09 review, so it carries no `C-`/`M-`/`N-` finding ID. Evidence lives in
+`.planning/phases/29-geometry-memory-and-timeouts/deferred-items.md`.
+
+- [ ] **API-01**: saneless serves no generated API schema and no interactive API documentation. `GET /openapi.json`, `/docs` and `/redoc` return 404 rather than the 500 they return today, `tests/test_app_lifespan.py`'s `_ROUTE_SKIPS` drops its `/openapi.json` entry while the every-route assertion still passes, and `docs/reference/web-api.md` records why: this is an unauthenticated LAN appliance serving an HTMX UI, the schema never generated (route handlers annotate returns as `Response` under postponed evaluation, so pydantic refuses the forward reference), and nothing in the app, docs or tests consumes it [Phase 29 plan 29-10]
+
 ## Future Requirements
 
 Deferred from the v1.0 backlog. Tracked but not in this milestone.
@@ -354,13 +362,14 @@ Which phases cover which requirements. Updated during roadmap creation.
 | SWP-12 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | SWP-13 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | SWP-14 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
+| API-01 | Phase 33 — Disable the OpenAPI Schema and Docs Endpoints | Pending |
 
 **Coverage:**
-- v2.0 requirements: 118 total
-- Mapped to phases: 118
+- v2.0 requirements: 119 total
+- Mapped to phases: 119
 - Unmapped: 0
-- Phases: 13 (Phase 20 through Phase 32)
+- Phases: 14 (Phase 20 through Phase 33)
 
 ---
 *Requirements defined: 2026-09-09*
-*Last updated: 2026-09-09 after milestone v2.0 roadmap creation*
+*Last updated: 2026-09-16 — API-01 added with Phase 33 (found during Phase 29 execution)*
