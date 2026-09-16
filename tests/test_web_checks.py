@@ -1010,10 +1010,13 @@ class TestWhichResponsesCarryWhat:
 
     def test_the_flag_is_set_by_exactly_one_handler(self) -> None:
         """
-        ``refresh_checks=True`` appears once in the route module.
+        The flag is turned on in one place and defaulted off in one place.
 
         A second setter would be a second response re-rendering the strip, and
         the reason the flag exists at all is that only the submit has news.
+        It is a context-dict key rather than a keyword argument because
+        ``TemplateResponse`` takes its context as a mapping.
         """
         source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        assert source.count("refresh_checks=True") == 1
+        assert source.count('"refresh_checks": True') == 1
+        assert source.count('"refresh_checks": False') == 1

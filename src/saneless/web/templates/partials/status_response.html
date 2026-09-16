@@ -2,7 +2,13 @@
    and flip continue/abort.  The status area is the swap target; the Scan button
    rides along out-of-band so the server alone decides its state (ROBU-04).
    The #status-message clear is for a successful scan only: a poll or flip
-   response carrying it would erase a 429 shown mid-scan within a second (D-03). #}
+   response carrying it would erase a 429 shown mid-scan within a second (D-03).
+   The strip refresh is scan-only for exactly the same reason: the submit is the
+   one response that has news for it -- the scanner has just become busy, so
+   D-08's paused note is due immediately -- while a poll carrying it would
+   re-render five rows every second for no new information, and a flip answer
+   changes the job, not the appliance's health. #}
 {% include "partials/status.html" %}
 {% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}
 {% if clear_message %}<div id="status-message" hx-swap-oob="innerHTML"></div>{% endif %}
+{% if refresh_checks %}{% with oob = true %}{% include "partials/checks.html" %}{% endwith %}{% endif %}
