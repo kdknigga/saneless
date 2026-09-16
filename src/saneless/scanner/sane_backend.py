@@ -1980,13 +1980,31 @@ class SaneBackend(ScannerBackend):
         """
         Enumerate available scanning devices.
 
+        Refuses while a read is outstanding, exactly as ``scan_pages`` and
+        ``get_capabilities`` do (D-13). ``sane_get_devices`` is not a
+        handle-level call, but the phase's own rule is "never call another SANE
+        operation while one is outstanding", and on the ``net`` backend
+        enumeration is an RPC on the same control wire the stuck read is on.
+
+        The path is not hypothetical: ``_resolve_device`` calls this whenever
+        ``scanner.device`` is empty -- the documented auto-detection default --
+        and it does so *before* ``scan_pages``, which is to say before the
+        refusal that would otherwise have stopped the job (WR-04).
+
         Returns:
             List of DeviceInfo objects for each discovered device.
 
         Raises:
-            ScanError: If SANE cannot enumerate devices, chained to its error.
+            ScanError: If a previous read has not returned, in which case no
+                SANE call is made at all (D-13); or if SANE cannot enumerate
+                devices, chained to its error.
 
         """
+        # No device to name, because enumeration is the call that finds out
+        # which devices there are.  _refuse_if_wedged names the *wedged* device
+        # from its own record either way, so the message still says which
+        # scanner is holding things up.
+        _refuse_if_wedged("the scanners", "list")
         try:
             raw_devices = sane.get_devices()
         except Exception as exc:

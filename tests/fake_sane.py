@@ -1387,6 +1387,10 @@ class FakeSaneModule:
         """
         self.init_call_count = 0
         self.exit_call_count = 0
+        # Counted for the same reason FakeSaneDev records its own calls: the
+        # wedge refusal (D-13) has to happen *before* any SANE traffic, and
+        # "the call was never made" cannot be asserted on a return value.
+        self.get_devices_call_count = 0
         self.exit_while_blocked = False
         self._init_error = init_error
         self._open_error = open_error
@@ -1425,6 +1429,7 @@ class FakeSaneModule:
             BaseException: The configured ``get_devices_error``.
 
         """
+        self.get_devices_call_count += 1
         if self._get_devices_error is not None:
             raise self._get_devices_error
         return list(self._devices)

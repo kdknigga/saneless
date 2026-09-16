@@ -2224,30 +2224,46 @@ class TestSaneBackendCancelSequence:
     def test_a_wedged_backend_refuses_the_next_call_with_no_sane_traffic(
         self,
         sane_backend: SaneBackend,
+        fake_sane_module: FakeSaneModule,
         fake_device: FakeSaneDev,
         page_sink: SpooledPageSink,
         second_pass_sink: SpooledPageSink,
     ) -> None:
         """
-        D-13: the next scan and the next interrogation refuse, touching nothing.
+        D-13: every public entry point refuses, touching nothing.
 
         "No SANE call" is asserted as the device's own call log being
         byte-for-byte what it was, because the refusal has to happen before
         ``sane.open()``.  Refusing after opening would be the very operation
         the SANE standard forbids while a read is outstanding.
+
+        ``get_devices`` is included because it was the one entry point the
+        refusal missed, and the scan path reaches it: ``_resolve_device`` calls
+        it whenever ``scanner.device`` is empty -- the documented
+        auto-detection default -- and does so *before* ``scan_pages``, so the
+        refusal that would have stopped the job came too late.  On the ``net``
+        backend ``sane_get_devices`` is an RPC on the same control wire the
+        stuck read is on (WR-04).
         """
         self._wedge(sane_backend, fake_device, page_sink)
         calls_before = list(fake_device.calls)
+        enumerations_before = fake_sane_module.get_devices_call_count
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
 
         with pytest.raises(ScanError, match="Restart saneless"):
             sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
         with pytest.raises(ScanError, match="Restart saneless"):
             sane_backend.get_capabilities(_TEST_DEVICE)
+        with pytest.raises(ScanError, match="Restart saneless") as refusal:
+            sane_backend.get_devices()
 
         assert fake_device.calls == calls_before
+        assert fake_sane_module.get_devices_call_count == enumerations_before
         assert fake_device.close_calls == 0
         assert fake_device.cancel_calls == 1
+        # The refusal names the wedged device even though the caller had none
+        # to name: enumeration is the call that finds out which devices exist.
+        assert _TEST_DEVICE in str(refusal.value)
 
     def test_shutdown_leaves_sane_up_while_a_read_is_outstanding(
         self,
