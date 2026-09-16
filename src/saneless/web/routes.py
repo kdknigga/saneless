@@ -136,7 +136,7 @@ def _is_owner(presented: str | None, recorded: str | None) -> bool:
     return secrets.compare_digest(presented.encode(), recorded.encode())
 
 
-def _owner_answers(request: Request, job: Job | None) -> bool:
+def _owner_answers(presented: str | None, job: Job | None) -> bool:
     """
     Report whether this request may answer the named job's flip prompt (D-24).
 
@@ -146,7 +146,7 @@ def _owner_answers(request: Request, job: Job | None) -> bool:
     line any more than into the markup (T-30-59).
 
     Args:
-        request: The incoming request, for the cookie it carries.
+        presented: The token this request carries, or None.
         job: The job the answer names, or None when no such row exists.
 
     Returns:
@@ -155,7 +155,7 @@ def _owner_answers(request: Request, job: Job | None) -> bool:
     """
     if job is None:
         return False
-    matched = _is_owner(_presented_owner(request), job.owner_token)
+    matched = _is_owner(presented, job.owner_token)
     logger.debug(
         "Flip answer for job %s: owner %s",
         job.id,
@@ -399,6 +399,7 @@ def _status_context(
     claimed: tuple[str, FlipOutcome] | None = None,
     *,
     followed_job_id: str | None = None,
+    owner_token: str | None = None,
 ) -> dict[str, object]:
     """
     Build the context ``partials/status.html`` renders from.
@@ -432,6 +433,7 @@ def _status_context(
         job_store: The job store to read the job from.
         claimed: The job id and answer this request itself claimed, if any.
         followed_job_id: The job this browser submitted, if it submitted one.
+        owner_token: The owner token this request carries, if it carries one.
 
     ``refresh_checks`` is False here for every caller, and that is the whole of
     the flag's policy: ``start_scan`` sets it True on its own, so a status poll
@@ -439,10 +441,17 @@ def _status_context(
     one builder rather than at each call site is what stops a route added later
     from acquiring the behaviour by forgetting to say no.
 
+    ``is_owner`` is decided here, once, rather than at each call site, for the
+    same reason ``refresh_checks`` is: a route added later must not be able to
+    acquire or lose the gate by forgetting about it.  The partial reads the
+    flag and never the token, so the value itself has no path into the markup
+    (T-30-59).
+
     Returns:
-        The job, its flip answer, the followed job's id, the one busy line and
-        a false strip-refresh flag.  ``flip_answer`` is None unless the
-        rendered job is ``AWAITING_FLIP`` and has been answered.
+        The job, its flip answer, the followed job's id, the one busy line,
+        whether this viewer owns the job and a false strip-refresh flag.
+        ``flip_answer`` is None unless the rendered job is ``AWAITING_FLIP``
+        and has been answered.
 
     """
     followed = job_store.get_job(followed_job_id) if followed_job_id else None
@@ -461,6 +470,7 @@ def _status_context(
         "refresh_checks": False,
         "followed_job_id": followed.id if followed is not None else None,
         "busy_line": _busy_line(worker, job_store, job),
+        "is_owner": job is not None and _is_owner(owner_token, job.owner_token),
     }
 
 
@@ -485,7 +495,9 @@ def index(request: Request) -> Response:
         state.cache, state.paperless, "correspondents"
     )
 
-    status = _status_context(state.worker, state.job_store)
+    status = _status_context(
+        state.worker, state.job_store, owner_token=_presented_owner(request)
+    )
 
     jobs = state.job_store.list_recent(limit=50)
 
@@ -754,7 +766,10 @@ def start_scan(
                     # browser is handed names it and the status area keeps
                     # reporting the scan this person started (D-25).
                     **_status_context(
-                        state.worker, state.job_store, followed_job_id=job.id
+                        state.worker,
+                        state.job_store,
+                        followed_job_id=job.id,
+                        owner_token=owner,
                     ),
                     "clear_message": True,
                     "refresh_checks": True,
@@ -802,7 +817,9 @@ def current_job_status(request: Request) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        _status_context(state.worker, state.job_store),
+        _status_context(
+            state.worker, state.job_store, owner_token=_presented_owner(request)
+        ),
     )
 
 
@@ -837,7 +854,12 @@ def followed_job_status(request: Request, job_id: str) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        _status_context(state.worker, state.job_store, followed_job_id=job_id),
+        _status_context(
+            state.worker,
+            state.job_store,
+            followed_job_id=job_id,
+            owner_token=_presented_owner(request),
+        ),
     )
 
 
@@ -1026,8 +1048,9 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     (ROBU-04) and leaves ``#status-message`` alone (D-03).
     """
     state = request.app.state
+    presented = _presented_owner(request)
     claimed = False
-    if _owner_answers(request, state.job_store.get_job(job_id)):
+    if _owner_answers(presented, state.job_store.get_job(job_id)):
         claimed = state.worker.continue_flip(job_id)
     return state.templates.TemplateResponse(
         request,
@@ -1036,6 +1059,7 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
             state.worker,
             state.job_store,
             claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
+            owner_token=presented,
         ),
     )
 
@@ -1063,8 +1087,9 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     (ROBU-04) and leaves ``#status-message`` alone (D-03).
     """
     state = request.app.state
+    presented = _presented_owner(request)
     claimed = False
-    if _owner_answers(request, state.job_store.get_job(job_id)):
+    if _owner_answers(presented, state.job_store.get_job(job_id)):
         claimed = state.worker.abort_flip(job_id)
     return state.templates.TemplateResponse(
         request,
@@ -1073,5 +1098,6 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
             state.worker,
             state.job_store,
             claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+            owner_token=presented,
         ),
     )
