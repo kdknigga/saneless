@@ -63,6 +63,91 @@
     color: var(--saneless-status-fallback);
 }
 
+/* The health strip's three states. One amber serves two jobs -- a degraded
+   success and a warning check -- so it reads the same property rather than
+   owning a second one; renaming the property is not an option because the
+   vendored-asset contract pins it. The other two read Pico's own semantic
+   tokens, which already swap per scheme. */
+.check-ok {
+    color: var(--pico-ins-color, green);
+}
+
+.check-warn {
+    color: var(--saneless-status-fallback);
+}
+
+.check-fail {
+    color: var(--pico-del-color, red);
+}
+
+/* The cold-start marker, before any check has run. Muted, because "we have not
+   looked yet" is neither good news nor bad and must not read as either. */
+.check-checking {
+    color: var(--pico-muted-color);
+}
+
+/* The five rows are a list semantically -- a screen reader should hear "list
+   of 5 items" -- but Pico's default bullet and indent would fight the glyph
+   gutter, so the marker is dropped and the inset with it. */
+.check-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+/* Flex rather than a table: the message is the only part that has to wrap, and
+   at 320px it wraps onto its own line under the glyph and name instead of
+   forcing a horizontal scrollbar. Baseline alignment keeps the glyph sitting
+   on the same line as the first line of the message. */
+.check-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+
+/* A fixed 16px gutter, centred, so the four different glyph widths do not
+   shift the name column from row to row. */
+.check-glyph {
+    flex: 0 0 1rem;
+    text-align: center;
+}
+
+/* 112px is the measured width of the longest name ("Data folder") at 16px/700
+   plus breathing room, so all five messages start at the same x. It is the one
+   700-weight body text on the page. */
+.check-name {
+    flex: 0 0 7rem;
+    font-weight: 700;
+}
+
+/* The next step sits under its message rather than beside it, because the two
+   together are one sentence a household member reads top to bottom. Muted and
+   small: it is guidance, not a second verdict. */
+.check-next {
+    display: block;
+    font-size: 0.875em;
+    color: var(--pico-muted-color);
+}
+
+/* The freshness line is about the reading, not about the appliance, so it is
+   muted and set off from the rows above it. */
+.check-meta {
+    margin-top: 1rem;
+    color: var(--pico-muted-color);
+}
+
+/* Pico buttons are full width by default, which would make a secondary control
+   look like the primary Scan button; width: auto stops that. The min-height is
+   the WCAG 2.5.5 touch-target floor, stated rather than relied upon -- Pico's
+   own padding already clears it, and a future padding change must not silently
+   drop the button below 44px. */
+.check-refresh {
+    width: auto;
+    min-height: 2.75rem;
+}
+
 /* Thumbnail preview */
 .thumbnail {
     max-width: 200px;
