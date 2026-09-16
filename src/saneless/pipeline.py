@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, assert_never
+from typing import TYPE_CHECKING, Final, assert_never
 
 from saneless.exceptions import (
     ConfigError,
@@ -27,19 +27,18 @@ from saneless.exceptions import (
     ScanError,
     describe,
 )
-from saneless.pages import filter_empty_pages, generate_thumbnail
+from saneless.pages import filter_empty_pages
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.scanner.base import ScanBatch, ScanSettings
+from saneless.spool import SpooledPageSink
 from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
-    from PIL import Image
-
     from saneless.config import ProfileConfig, Settings
     from saneless.paperless import PaperlessClient
-    from saneless.scanner.base import ScannerBackend
+    from saneless.scanner.base import PageRecord, ScannerBackend
 
 __all__ = [
     "FlipAnswerSlot",
@@ -103,6 +102,24 @@ class PipelineEvent(StrEnum):
 
 
 logger = logging.getLogger(__name__)
+
+# The spool's subdirectory inside the job workspace, and the per-pass prefix
+# each acquisition pass's file names carry: ``a-0001.png`` for a simplex job or
+# a duplex job's fronts, ``b-0001.png`` for its backs (D-02).  The labels are
+# for telling two passes apart in one directory; document order comes from the
+# record list and never from these names.
+#
+# Named constants rather than literals at the call sites, for a lint reason
+# worth recording so nobody "tidies" them back: ruff's S106 reads any keyword
+# argument whose name contains "pass" as a possible hardcoded password, and
+# ``pass_label=`` does, so a string literal there fails the lint and this
+# project adds no suppressions. The constants are spelled ``_SPOOL_LABEL_*``
+# and not ``_PASS_*_LABEL`` for the sibling rule S105, which reads the same
+# substring in a variable's own name. Naming them also gives anything that
+# asserts on the convention one place to import it from.
+_SPOOL_DIR_NAME: Final = "spool"
+_SPOOL_LABEL_A: Final = "a"
+_SPOOL_LABEL_B: Final = "b"
 
 FAILED_DIR_WARN_THRESHOLD = 20
 """
@@ -561,19 +578,23 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
 
 
 def _drop_empty_pages(
-    images: list[Image.Image],
+    pages: Sequence[PageRecord],
     profile: ProfileConfig,
-) -> list[Image.Image]:
+) -> list[PageRecord]:
     """
     Drop blank pages when the profile enables empty-page detection.
 
+    Records in, records out. The judgement is made from the statistics each
+    record already carries, measured once when the page was spooled (D-06);
+    nothing here re-opens a page file, and nothing here deletes one.
+
     Args:
-        images: The scanned pages, in order.
+        pages: The scanned page records, in document order.
         profile: The profile whose toggle and thresholds apply.
 
     Returns:
-        The pages to assemble: filtered when detection is on, the input
-        list unchanged when it is off.
+        The records to assemble: filtered when detection is on, the input
+        sequence's records unchanged when it is off.
 
     Raises:
         ScanError: If every page of a non-empty batch was detected as blank.
@@ -583,15 +604,15 @@ def _drop_empty_pages(
     """
     if not profile.enable_empty_page_detection:
         logger.info("Empty page detection disabled for profile")
-        return images
+        return list(pages)
 
     filtered = filter_empty_pages(
-        images,
+        pages,
         mean_threshold=profile.empty_page_mean_threshold,
         stddev_threshold=profile.empty_page_stddev_threshold,
     )
-    if len(filtered) < len(images):
-        logger.info("Empty page filter: %d -> %d pages", len(images), len(filtered))
+    if len(filtered) < len(pages):
+        logger.info("Empty page filter: %d -> %d pages", len(pages), len(filtered))
     if not filtered:
         msg = "All pages were blank"
         raise ScanError(msg)
@@ -661,6 +682,36 @@ class _DeliveryContext:
 
 
 @dataclass(frozen=True)
+class _AcquisitionContext:
+    """
+    What one scanning pass needs to reach the device and spool what it gets.
+
+    Bundled into one record rather than passed as four more parameters, for
+    the reason ``_DeliveryContext`` already records: ``_scan_manual_duplex``
+    sits exactly on ruff's ``PLR0913`` argument limit, and CLAUDE.md forbids
+    both raising the limit and suppressing the rule. The fields also genuinely
+    travel together -- all four are fixed for the whole job, and a pass whose
+    device or spool directory differed from its sibling's would be a bug
+    rather than a feature.
+
+    Attributes:
+        device_id: The SANE device every pass of this job scans through.
+        settings: The scan settings every pass is run with.
+        spool_dir: Where each pass's sink writes its pages. It lives inside
+            the job's workspace, so the page files are deleted with it.
+        min_free_space_mb: The reserve each per-page disk check keeps free for
+            assembly -- the operator's own ``min_free_space_mb``, the same
+            value the up-front check uses (D-07).
+
+    """
+
+    device_id: str
+    settings: ScanSettings
+    spool_dir: Path
+    min_free_space_mb: int
+
+
+@dataclass(frozen=True)
 class _DuplexMismatch:
     """
     The two passes of a manual duplex run whose page counts disagreed.
@@ -671,16 +722,16 @@ class _DuplexMismatch:
     every call site remember an order.
 
     Attributes:
-        fronts: Pages produced by pass A.
-        backs: Pages produced by pass B.
+        fronts: Page records produced by pass A, in pass order.
+        backs: Page records produced by pass B, in pass order.
         dpi: The resolution the device reported actually using.
         pages_rejected: Sheets skipped across both passes for failing their
             integrity checks.
 
     """
 
-    fronts: list[Image.Image]
-    backs: list[Image.Image]
+    fronts: Sequence[PageRecord]
+    backs: Sequence[PageRecord]
     dpi: int
     pages_rejected: int
 
@@ -771,7 +822,7 @@ def _join_warnings(*parts: str | None) -> str | None:
 
 
 def _handle_duplex_mismatch(
-    passes: tuple[list[Image.Image], list[Image.Image]],
+    passes: tuple[Sequence[PageRecord], Sequence[PageRecord]],
     tmp_path: Path,
     paperless: PaperlessClient,
     request: PipelineRequest,
@@ -790,7 +841,7 @@ def _handle_duplex_mismatch(
     path exists to save.
 
     Args:
-        passes: Tuple of (front-side images, back-side images).
+        passes: Tuple of (front-side records, back-side records).
         tmp_path: Temporary directory for PDF assembly.
         paperless: Paperless-ngx client for upload.
         request: Pipeline request with title, tags, correspondent, job id and
@@ -957,21 +1008,26 @@ def _finish_duplex_mismatch(
 
 
 def _interleave_duplex(
-    fronts: list[Image.Image],
-    backs: list[Image.Image],
-) -> list[Image.Image]:
+    fronts: Sequence[PageRecord],
+    backs: Sequence[PageRecord],
+) -> list[PageRecord]:
     """
     Interleave front and back pages for manual duplex.
 
     Backs are reversed because the user flips the stack face-down,
     so the last front's back is scanned first in pass B.
 
+    Records are reordered, never files. Nothing is renamed, moved or rewritten
+    on the spool: after this runs, the ``a-`` and ``b-`` file names no longer
+    sort into document order at all, and that is precisely why document order
+    is the order of this list and never the directory's (D-02, D-04).
+
     Args:
-        fronts: Front-side pages from pass A.
-        backs: Back-side pages from pass B (in scan order).
+        fronts: Front-side records from pass A.
+        backs: Back-side records from pass B (in scan order).
 
     Returns:
-        Interleaved pages: A1, B1, A2, B2, ...
+        Interleaved records: A1, B1, A2, B2, ...
 
     Raises:
         ScanError: If front and back page counts do not match.
@@ -981,7 +1037,7 @@ def _interleave_duplex(
         msg = f"Page count mismatch: {len(fronts)} fronts, {len(backs)} backs"
         raise ScanError(msg)
     backs_reversed = list(reversed(backs))
-    result: list[Image.Image] = []
+    result: list[PageRecord] = []
     for front, back in zip(fronts, backs_reversed, strict=True):
         result.append(front)
         result.append(back)
@@ -990,8 +1046,7 @@ def _interleave_duplex(
 
 def _scan_manual_duplex(
     scanner: ScannerBackend,
-    device_id: str,
-    scan_settings: ScanSettings,
+    acquisition: _AcquisitionContext,
     request: PipelineRequest,
     flip: _FlipContext,
 ) -> ScanBatch | _DuplexMismatch:
@@ -1002,10 +1057,17 @@ def _scan_manual_duplex(
     ``flip.timeout``, so a forgotten flip prompt fails this job instead of
     parking the single worker thread forever (M-07).
 
+    Each pass gets its own sink, labelled ``a`` for the fronts and ``b`` for
+    the backs, so the two passes spool into names that can be told apart while
+    sharing one directory. That is for debuggability only: document order comes
+    from the record list, never from those names (D-02). Only pass A's sink
+    carries the thumbnail callback, so the strip shows the first front and
+    fires exactly once per job (D-05).
+
     Args:
         scanner: Scanner backend instance.
-        device_id: SANE device identifier string.
-        scan_settings: Scan settings for the scanner.
+        acquisition: The device, the scan settings and the spool this job's
+            passes use.
         request: Pipeline request with the thumbnail and status callbacks.
         flip: The flip coordinator and the timeout bounding its wait.
 
@@ -1030,17 +1092,23 @@ def _scan_manual_duplex(
     # and the caller is already handing us the request it comes from.
     notify = request.status_callback or _noop_callback
 
-    # Pass A: scan fronts
-    front_batch = scanner.scan_pages(device_id, scan_settings)
+    # Pass A: scan fronts.  The thumbnail callback rides on this sink, which
+    # fires it while pass A is still running rather than after it returns
+    # (D-05) -- the page is in memory at that moment, and re-opening a 26 MB
+    # page later to make a 300 px strip would be a second decode.
+    front_sink = SpooledPageSink(
+        directory=acquisition.spool_dir,
+        pass_label=_SPOOL_LABEL_A,
+        min_free_space_mb=acquisition.min_free_space_mb,
+        thumbnail_callback=request.thumbnail_callback,
+    )
+    front_batch = scanner.scan_pages(
+        acquisition.device_id, acquisition.settings, front_sink
+    )
     # Before the flip prompt, so nobody is asked to flip nothing (EXC-03).
     _require_pages(front_batch)
     front_pages = front_batch.pages
     logger.info("Pass A: scanned %d front page(s)", len(front_pages))
-
-    # Generate thumbnail from first page
-    if front_pages and request.thumbnail_callback:
-        thumb = generate_thumbnail(front_pages[0])
-        request.thumbnail_callback(thumb)
 
     notify(PipelineEvent.AWAITING_FLIP)
     outcome = flip.coordinator.wait_for_flip(flip.timeout)
@@ -1071,9 +1139,17 @@ def _scan_manual_duplex(
         case _:
             assert_never(outcome)
 
-    # Pass B: scan backs
+    # Pass B: scan backs.  No thumbnail callback on this sink: pass A already
+    # fired it, and the strip is meant to show the first front.
     notify(PipelineEvent.SCANNING_REVERSE)
-    back_batch = scanner.scan_pages(device_id, scan_settings)
+    back_sink = SpooledPageSink(
+        directory=acquisition.spool_dir,
+        pass_label=_SPOOL_LABEL_B,
+        min_free_space_mb=acquisition.min_free_space_mb,
+    )
+    back_batch = scanner.scan_pages(
+        acquisition.device_id, acquisition.settings, back_sink
+    )
     # Before the count comparison, so no half is assembled from an empty list.
     # Not _require_pages: "No pages were scanned" is false once pass A fed the
     # fronts, so the message names the pass and what pass A scanned (IN-01).
@@ -1100,9 +1176,11 @@ def _scan_manual_duplex(
             pages_rejected=rejected,
         )
 
-    images = _interleave_duplex(front_pages, back_pages)
-    logger.info("Interleaved %d total pages", len(images))
-    return ScanBatch(pages=images, actual_resolution=dpi, pages_rejected=rejected)
+    interleaved = _interleave_duplex(front_pages, back_pages)
+    logger.info("Interleaved %d total pages", len(interleaved))
+    return ScanBatch(
+        pages=tuple(interleaved), actual_resolution=dpi, pages_rejected=rejected
+    )
 
 
 def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
@@ -1143,36 +1221,45 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
 
 def _scan_simplex(
     scanner: ScannerBackend,
-    device_id: str,
-    scan_settings: ScanSettings,
+    acquisition: _AcquisitionContext,
     request: PipelineRequest,
 ) -> ScanBatch:
     """
     Perform a simplex / hardware duplex / flatbed scan.
 
+    The one pass spools under the ``a`` label, the same label a manual-duplex
+    job's fronts use, so a spool directory reads the same way whichever route
+    produced it.
+
+    The thumbnail is not generated here. It rides on the sink and fires while
+    the first page is being spooled, which is both cheaper -- the page is in
+    memory at that moment, rather than needing a second decode afterwards --
+    and visibly earlier, since the strip appears during acquisition instead of
+    after the last sheet (D-05).
+
     Args:
         scanner: Scanner backend instance.
-        device_id: SANE device identifier string.
-        scan_settings: Scan settings for the scanner.
+        acquisition: The device, the scan settings and the spool this job's
+            pass uses.
         request: Pipeline request with optional thumbnail callback.
 
     Returns:
-        The batch the device produced: its pages, the resolution it actually
-        used, and how many fed sheets it could not read.
+        The batch the device produced: its page records, the resolution it
+        actually used, and how many fed sheets it could not read.
 
     Raises:
         ScanError: ``No pages were scanned`` if the backend returned no pages.
 
     """
-    batch = scanner.scan_pages(device_id, scan_settings)
+    sink = SpooledPageSink(
+        directory=acquisition.spool_dir,
+        pass_label=_SPOOL_LABEL_A,
+        min_free_space_mb=acquisition.min_free_space_mb,
+        thumbnail_callback=request.thumbnail_callback,
+    )
+    batch = scanner.scan_pages(acquisition.device_id, acquisition.settings, sink)
     _require_pages(batch)
     logger.info("Scanned %d page(s)", len(batch.pages))
-
-    # Generate thumbnail from first page
-    if batch.pages and request.thumbnail_callback:
-        thumb = generate_thumbnail(batch.pages[0])
-        request.thumbnail_callback(thumb)
-
     return batch
 
 
@@ -1286,6 +1373,24 @@ def run_pipeline(
     with workspace as tmp_dir:
         tmp_path = Path(tmp_dir)
 
+        # The spool sits INSIDE the workspace, so every page file is removed
+        # with it when this block exits.  That is the same trap _preserving's
+        # docstring names: anything that has to outlive the job -- a preserved
+        # partial scan -- must be moved out before then, and a guard placed
+        # outside this block would run when the pages were already gone.
+        #
+        # A subdirectory rather than tmp_path itself, so the assembled PDF and
+        # the duplex-mismatch halves are not written among the pages.
+        spool_dir = tmp_path / _SPOOL_DIR_NAME
+        spool_dir.mkdir()
+
+        acquisition = _AcquisitionContext(
+            device_id=device_id,
+            settings=scan_settings,
+            spool_dir=spool_dir,
+            min_free_space_mb=settings.output.min_free_space_mb,
+        )
+
         # Step 1: Scan
         notify(PipelineEvent.SCANNING)
         logger.info(
@@ -1295,11 +1400,9 @@ def run_pipeline(
         )
 
         if flip is None:
-            batch = _scan_simplex(scanner, device_id, scan_settings, request)
+            batch = _scan_simplex(scanner, acquisition, request)
         else:
-            duplex_result = _scan_manual_duplex(
-                scanner, device_id, scan_settings, request, flip
-            )
+            duplex_result = _scan_manual_duplex(scanner, acquisition, request, flip)
             # A match with assert_never, not a dict or an isinstance chain, on
             # purpose: a variant missing from a dict draws no diagnostic from
             # either ty or pyrefly, while the same omission in a match is
@@ -1322,16 +1425,19 @@ def run_pipeline(
                 case _:
                     assert_never(duplex_result)
 
-        images = batch.pages
+        records = batch.pages
         actual_dpi = batch.actual_resolution
         rejected_warning = _rejected_pages_warning(batch.pages_rejected)
 
-        # Step 1.5: Strip EXIF from all images (Pitfall #5)
-        for img in images:
-            img.info.pop("exif", None)
+        # There is no per-page EXIF strip here any more, and restoring one
+        # would have nothing to act on (Pitfall #5).  The pages are files the
+        # spool wrote: the backend drops ``info["exif"]`` before handing a page
+        # over, and Pillow's PNG encoder emits an EXIF chunk only for one
+        # passed to it through ``encoderinfo``, which the spool never does.
+        # The thumbnail helper in ``pages`` still strips it for its JPEG.
 
         # Step 2: Filter empty pages (gated on profile toggle, per D-17)
-        filtered = _drop_empty_pages(images, profile)
+        filtered = _drop_empty_pages(records, profile)
 
         # Step 3: Assemble PDF
         notify(PipelineEvent.ASSEMBLING)
@@ -1389,11 +1495,11 @@ def run_pipeline(
 
         result = ScanResult(
             outcome=outcome,
-            pages_scanned=len(images),
+            pages_scanned=len(records),
             # Blank-page detection only. A sheet the scanner could not read is
             # reported through the warning instead, because Phase 30 renders
             # this number to users as pages removed for being blank.
-            pages_removed=len(images) - len(filtered),
+            pages_removed=len(records) - len(filtered),
             pages_uploaded=len(filtered),
             warning=_join_warnings(warning, rejected_warning),
         )

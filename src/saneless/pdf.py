@@ -1,25 +1,30 @@
 """
-PDF assembly via img2pdf with temporary file handling.
+PDF assembly via img2pdf, over the pages the spool already wrote.
 
-Scanned PIL Images are saved to temporary files on disk (seekable,
-required by img2pdf) and assembled into a single PDF. Temporary
-image files are cleaned up after assembly or on error via
-TemporaryDirectory context manager.
+Each acquired page is on disk as a PNG before assembly starts, written once
+by ``saneless.spool``, and that file is what img2pdf embeds -- losslessly,
+with no second encode (D-03). This module therefore creates no temporary
+image files and owns no page's lifetime: the spool lives in the job's
+workspace, and assembly only reads from it.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-import tempfile
 from datetime import UTC, datetime
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import img2pdf
 import PIL.Image
-from PIL import Image
 
 from saneless.exceptions import PdfError, describe
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
+    from saneless.scanner.base import PageRecord
 
 # Allow high-DPI scans without triggering Pillow's decompression bomb check.
 # 600 DPI A4 color = ~34.8M pixels; 1200 DPI = ~139M pixels.
@@ -126,17 +131,25 @@ def build_pdf_filename(job_id: str, title: str) -> str:
 
 
 def assemble_pdf(
-    images: list[Image.Image],
+    records: Sequence[PageRecord],
     output_dir: Path,
     filename: str,
     dpi: int,
 ) -> Path:
     """
-    Assemble PIL Images into a single PDF using img2pdf.
+    Assemble spooled pages into a single PDF using img2pdf.
 
-    Images are first saved as PNG files in a temporary directory
-    within output_dir, then passed to img2pdf for lossless PDF
-    assembly. Temp files are cleaned up automatically.
+    The pages are already files: the spool wrote each one as it was acquired,
+    and img2pdf embeds those very files. There is no longer a temporary
+    directory of re-saved copies here, because that second encode produced a
+    PNG that was byte-for-byte pointless -- the spooled one already *is* the
+    PDF's page content (D-03).
+
+    The order of ``records`` is the document order and the only source of it.
+    The spool directory is never sorted and never globbed: after a
+    manual-duplex interleave the file names do not sort into document order,
+    and a file sitting in that directory without a record does not belong in
+    this PDF (D-02).
 
     ``filename`` is **required**, with no default. Giving it one -- the single
     hardcoded name this function used to write every PDF to -- would have kept
@@ -167,17 +180,18 @@ def assemble_pdf(
     caught type is ``Exception``, **deliberately**. img2pdf raises seven
     unrelated error classes -- each a direct ``Exception`` subclass with no
     shared base -- plus bare ``Exception``, ``TypeError`` and ``ValueError``,
-    and Pillow raises ``OSError`` and ``SystemError`` while saving a page, so
+    and Pillow raises ``OSError`` and ``SystemError`` while a page is read, so
     any tuple of types would leak whichever one was left off it. The catch is
-    narrow in *span* -- directory creation, page saves, assembly, the write and
-    the temporary directory's cleanup, nothing else -- and broad in *type*.
+    narrow in *span* -- directory creation, assembly and the write, nothing
+    else -- and broad in *type*.
     Nothing is masked: the original is always chained on ``__cause__`` and its
     text kept in the message. ``KeyboardInterrupt`` and ``SystemExit`` derive
     from ``BaseException`` and pass through untouched.
 
     Args:
-        images: List of PIL Image objects to include in the PDF. Must not be
-            empty.
+        records: The spooled pages to include, in document order. Must not be
+            empty. Each record's PNG is embedded exactly as the spool wrote
+            it, losslessly and with no re-encode.
         output_dir: Directory where the output PDF will be written.
         filename: File name for the PDF, including its ``.pdf`` extension.
             Must be a single path segment; :func:`build_pdf_filename`
@@ -189,12 +203,12 @@ def assemble_pdf(
         Path to the generated PDF file.
 
     Raises:
-        PdfError: When ``images`` is empty, or when anything goes wrong while
+        PdfError: When ``records`` is empty, or when anything goes wrong while
             the PDF is being assembled or written. The message names the page
             count, the target PDF path and the original failure's text.
 
     """
-    if not images:
+    if not records:
         # The pipeline's _require_pages already refuses an empty batch; this
         # keeps img2pdf's "Unable to process empty list" ValueError unreachable
         # from any caller of this public function (N-06).
@@ -205,34 +219,30 @@ def assemble_pdf(
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmp_dir:
-            image_paths: list[str] = []
-            for i, img in enumerate(images):
-                img_path = Path(tmp_dir) / f"page_{i:04d}.png"
-                img.save(str(img_path), format="PNG")
-                image_paths.append(str(img_path))
-                logger.debug("Saved page %d to %s", i, img_path)
+        # The spooled files themselves, in the order the records are in.
+        image_paths = [str(record.path) for record in records]
 
-            # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
-            # default_layout_fun unpacks it, and an int silently yields wrong
-            # geometry.  Without it img2pdf lays pages out at its default_dpi
-            # of 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
-            pdf_bytes = img2pdf.convert(
-                image_paths,
-                layout_fun=img2pdf.get_fixed_dpi_layout_fun((dpi, dpi)),
-            )
-            if pdf_bytes is None:
-                msg = "img2pdf.convert returned None"
-                raise PdfError(msg)
-            pdf_path.write_bytes(pdf_bytes)
-            logger.info("Assembled %d page(s) into %s", len(images), pdf_path)
+        # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
+        # default_layout_fun unpacks it, and an int silently yields wrong
+        # geometry.  Without it img2pdf lays pages out at its default_dpi
+        # of 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
+        pdf_bytes = img2pdf.convert(
+            image_paths,
+            layout_fun=img2pdf.get_fixed_dpi_layout_fun((dpi, dpi)),
+        )
+        if pdf_bytes is None:
+            msg = "img2pdf.convert returned None"
+            raise PdfError(msg)
+        pdf_path.write_bytes(pdf_bytes)
+        logger.info("Assembled %d page(s) into %s", len(records), pdf_path)
     except PdfError:
         # Already the boundary's own type: wrapping it again would only
         # repeat the message.
         raise
     except Exception as exc:
         msg = (
-            f"Could not assemble {len(images)} page(s) into {pdf_path}: {describe(exc)}"
+            f"Could not assemble {len(records)} page(s) into {pdf_path}: "
+            f"{describe(exc)}"
         )
         raise PdfError(msg) from exc
 
