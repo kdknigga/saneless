@@ -43,6 +43,7 @@ from saneless.config import (
     ProfileConfig,
     ScannerConfig,
     Settings,
+    WebConfig,
 )
 from saneless.job import JobState, JobStore
 from saneless.paperless import PaperlessClient
@@ -2230,3 +2231,227 @@ class TestTagFilter:
         assert response.status_code == 200
         job_store: JobStore = _app(client).state.job_store
         assert job_store.list_recent(limit=1)[0].title == "Stray Filter"
+
+
+# The profile defaults the D-29 regression tests drive, chosen so neither can
+# be produced by accident: no fixture tag or correspondent uses these ids.
+_PROFILE_DEFAULT_TAGS = [41, 42]
+_PROFILE_DEFAULT_CORRESPONDENT = 43
+
+# The two rules UI-SPEC S6 adds to app.css, property by property. Written out
+# here rather than matched loosely, because "the tap target is 44 px" is the
+# whole of D-30 and a rule that lost one declaration would still look right.
+_TAG_OPTION_RULE = """label.tag-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    min-height: 2.75rem;
+    margin-bottom: 0;
+    cursor: pointer;
+}"""
+
+_TAG_LIST_RULE = """.tag-list {
+    max-height: 17.5rem;
+    overflow-y: auto;
+    margin-bottom: var(--pico-spacing);
+}"""
+
+# How many six-digit colour literals app.css held before this plan. A touch
+# target is a size, not a colour, so the count may not move.
+_APP_CSS_COLOURS_BEFORE_30_16 = 3
+
+
+def _simple_form_app(
+    tmp_path: Path,
+    *,
+    show_tags: bool = True,
+    show_correspondent: bool = True,
+) -> FastAPI:
+    """
+    Build an app whose scan form has the given shape, with two stub profiles.
+
+    Args:
+        tmp_path: Where the app writes its database and files.
+        show_tags: Whether the Tags fieldset is rendered at all.
+        show_correspondent: Whether the Correspondent control is rendered.
+
+    Returns:
+        The app, whose lifespan starts with its TestClient.
+
+    """
+    settings = Settings(
+        scanner=ScannerConfig(device="test:device:001"),
+        paperless=PaperlessConfig(
+            url="http://localhost:8000", token="a-real-looking-token"
+        ),
+        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+        web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
+        profiles={
+            "default": ProfileConfig(
+                default_tags=_PROFILE_DEFAULT_TAGS,
+                default_correspondent=_PROFILE_DEFAULT_CORRESPONDENT,
+            ),
+            "duplex": ProfileConfig(source="ADF Duplex"),
+        },
+    )
+    app = create_app(settings, StubScannerBackend())
+    app.state.paperless.get_tags = lambda: list(_TAG_ROWS)
+    app.state.paperless.get_correspondents = list
+    return app
+
+
+class TestSimpleForm:
+    """
+    D-28 and D-29: the owner can shrink the form without changing the scan.
+
+    Two separate claims, and the second is the one that could go wrong quietly.
+    Hiding a control changes what a household member is asked; it must not
+    change what the appliance does, so the profile's defaults still apply when
+    the control that would have overridden them is not on the page.
+    """
+
+    def test_simple_form_without_tags_renders_no_part_of_the_tag_block(
+        self, tmp_path: Path
+    ) -> None:
+        """The fieldset, the filter, its form and both help lines all go."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            page = client.get("/").text
+
+        for fragment in (
+            'id="tags-list"',
+            'id="tag-filter"',
+            'id="tag-filter-form"',
+            'id="tags-help"',
+            'aria-label="Refresh tags"',
+            'name="tags"',
+        ):
+            assert fragment not in page, fragment
+
+    def test_simple_form_without_correspondent_renders_no_part_of_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The select, its refresh button and its help line all go."""
+        with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
+            page = client.get("/").text
+
+        for fragment in (
+            'id="correspondent-select"',
+            'id="correspondent-help"',
+            'aria-label="Refresh correspondents"',
+            'name="correspondent"',
+        ):
+            assert fragment not in page, fragment
+
+    def test_simple_form_with_both_off_is_profile_title_and_scan(
+        self, tmp_path: Path
+    ) -> None:
+        """What is left is the shortest form the appliance has."""
+        with TestClient(
+            _simple_form_app(tmp_path, show_tags=False, show_correspondent=False)
+        ) as client:
+            page = client.get("/").text
+
+        assert 'name="profile"' in page
+        assert 'name="title"' in page
+        assert 'id="scan-btn"' in page
+        assert re.findall(r'<small id="([^"]+)"', page) == ["profile-description"]
+
+    def test_simple_form_keeps_every_control_when_both_are_on(
+        self, tmp_path: Path
+    ) -> None:
+        """The default shape is the full form, so an upgrade changes nothing."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        for fragment in (
+            'id="tags-list"',
+            'id="tag-filter"',
+            'id="tag-filter-form"',
+            'id="tags-help"',
+            'id="correspondent-select"',
+            'id="correspondent-help"',
+        ):
+            assert fragment in page, fragment
+
+    def test_simple_form_hides_by_absence_and_never_with_css(
+        self, tmp_path: Path
+    ) -> None:
+        """D-28: the controls are not rendered, not rendered-then-hidden."""
+        with TestClient(
+            _simple_form_app(tmp_path, show_tags=False, show_correspondent=False)
+        ) as client:
+            page = client.get("/").text
+
+        assert "display: none" not in page
+        assert "display:none" not in page
+        assert " hidden" not in page
+
+    def test_simple_form_without_tags_still_applies_the_profile_default_tags(
+        self, tmp_path: Path
+    ) -> None:
+        """D-29: hiding the control changes the form, never the scan."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
+            )
+            assert response.status_code == 200
+            job_store: JobStore = _app(client).state.job_store
+            assert job_store.list_recent(limit=1)[0].tags == _PROFILE_DEFAULT_TAGS
+
+    def test_simple_form_without_correspondent_still_applies_its_default(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of the same claim (D-29)."""
+        with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
+            )
+            assert response.status_code == 200
+            job_store: JobStore = _app(client).state.job_store
+            job = job_store.list_recent(limit=1)[0]
+            assert job.correspondent == _PROFILE_DEFAULT_CORRESPONDENT
+
+    def test_simple_form_lets_a_visible_control_override_the_default(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The fallback is a fallback, not an override.
+
+        A profile default that won over what the user ticked would be a much
+        worse bug than no default at all, so the full form is asserted too.
+        """
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Chosen", "tags": ["7"]},
+            )
+            assert response.status_code == 200
+            job_store: JobStore = _app(client).state.job_store
+            assert job_store.list_recent(limit=1)[0].tags == [7]
+
+    def test_simple_form_tag_rows_are_a_thumb_sized_tap_target(self) -> None:
+        """D-30: the label is the target and it clears 44 px at a 16 px root."""
+        css = _web_asset("static", "app.css")
+
+        assert _TAG_OPTION_RULE in css
+        assert _TAG_LIST_RULE in css
+
+    def test_simple_form_tap_target_rule_outweighs_pico_by_load_order(self) -> None:
+        """
+        The selector is `label.tag-option`, never the bare class.
+
+        Pico's own `label:has([type=checkbox])` rule carries the same weight, so
+        the tie is what makes this win -- and a tie only wins because app.css
+        loads second.
+        """
+        css = _web_asset("static", "app.css")
+
+        assert "\n.tag-option {" not in css
+        assert css.count("label.tag-option {") == 1
+
+    def test_simple_form_touch_targets_add_no_colour_to_the_stylesheet(self) -> None:
+        """A tap target is a size; the palette may not move (UI-SPEC S6)."""
+        css = _web_asset("static", "app.css")
+
+        assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOURS_BEFORE_30_16
