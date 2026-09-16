@@ -608,18 +608,26 @@ class TestPageCounts:
         assert page_counts(job) == "0 pages scanned, 0 blank removed, 0 uploaded"
 
     @pytest.mark.parametrize(
-        "missing", ["pages_scanned", "pages_removed", "pages_uploaded"]
+        ("scanned", "removed", "uploaded"),
+        [
+            (None, 2, 10),
+            (12, None, 10),
+            (12, 2, None),
+            (None, None, None),
+        ],
     )
-    def test_page_counts_is_none_when_any_count_is_null(self, missing: str) -> None:
+    def test_page_counts_is_none_when_any_count_is_null(
+        self, scanned: int | None, removed: int | None, uploaded: int | None
+    ) -> None:
         """One NULL count means nothing at all is rendered (D-32)."""
-        counts = {"pages_scanned": 12, "pages_removed": 2, "pages_uploaded": 10}
-        counts[missing] = None
         job = Job(
             id="j",
             profile="default",
             title="t",
             state=JobState.DONE,
-            **counts,
+            pages_scanned=scanned,
+            pages_removed=removed,
+            pages_uploaded=uploaded,
         )
         assert page_counts(job) is None
 
