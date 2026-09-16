@@ -1167,10 +1167,14 @@ class TestZeroPages:
         to assemble the empty back half.  The message names the pass and what
         pass A scanned: "No pages were scanned" would be false once the fronts
         were fed (IN-01).
+
+        Since plan 29-09 the fronts are preserved rather than discarded, so the
+        message carries a preservation clause after the sentence pinned here
+        and no half is *delivered* -- which is what "before any half is
+        assembled" was always guarding.  The preserved half itself is covered
+        by ``TestPassBAndFlipFailuresKeepTheFronts``.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
-        default_settings.profiles["default"].source = "ADF"
-        default_settings.profiles["default"].duplex = "manual"
+        _duplex_settings(default_settings, tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling_in_turn([_make_content_image()], [])
@@ -1178,16 +1182,14 @@ class TestZeroPages:
         request = PipelineRequest(
             profile_name="default",
             title="Empty Pass B",
+            job_id="job-empty-b",
             flip_coordinator=_FixedFlipCoordinator(FlipOutcome.CONTINUED),
         )
-        with (
-            patch("saneless.pipeline.assemble_pdf") as mock_assemble,
-            pytest.raises(
-                ScanError,
-                match=(
-                    r"^No back pages were scanned in pass B "
-                    r"\(pass A scanned 1 front page\(s\)\)$"
-                ),
+        with pytest.raises(
+            ScanError,
+            match=(
+                r"^No back pages were scanned in pass B "
+                r"\(pass A scanned 1 front page\(s\)\)\."
             ),
         ):
             run_pipeline(
@@ -1198,7 +1200,6 @@ class TestZeroPages:
             )
 
         assert scanner.scan_pages.call_count == 2
-        mock_assemble.assert_not_called()
         mock_paperless.upload_document.assert_not_called()
 
     def test_all_blank_pages_say_all_pages_were_blank(
@@ -1631,10 +1632,12 @@ class TestManualDuplex:
         A broken terminal prompt is not anyone's choice to stop (D-02, WR-08),
         so it raises ``ScanError`` -- exit 1 at the CLI, ERROR on the web --
         naming what broke, with the original exception as ``__cause__``.
+
+        Because nobody chose to stop, plan 29-09 also keeps pass A's fronts,
+        so the message continues past the sentence pinned here.  ``__cause__``
+        is still the OSError the prompt raised, not the re-raise in between.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
-        default_settings.profiles["default"].source = "ADF"
-        default_settings.profiles["default"].duplex = "manual"
+        _duplex_settings(default_settings, tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
@@ -1643,11 +1646,12 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Broken Prompt Test",
+            job_id="job-broken-prompt",
             flip_coordinator=_BrokenPromptFlipCoordinator(cause),
         )
 
         with pytest.raises(
-            ScanError, match=r"^Flip prompt failed: \[Errno 5\] Input/output error$"
+            ScanError, match=r"^Flip prompt failed: \[Errno 5\] Input/output error\."
         ) as excinfo:
             run_pipeline(
                 scanner=scanner,
@@ -1657,7 +1661,13 @@ class TestManualDuplex:
             )
 
         assert not isinstance(excinfo.value, ScanCancelledError)
-        assert excinfo.value.__cause__ is cause
+        # One link longer than it used to be, and nothing is lost: the escaping
+        # exception chains the ScanError this path built, which still chains
+        # the OSError the prompt raised.  The extra link is the preservation
+        # re-raise, which keeps the type and appends where the fronts went.
+        preserved_from = excinfo.value.__cause__
+        assert isinstance(preserved_from, ScanError)
+        assert preserved_from.__cause__ is cause
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
 
@@ -1668,10 +1678,8 @@ class TestManualDuplex:
         tmp_path: Path,
     ) -> None:
         """TIMED_OUT fails the run naming the flip wait and its timeout (DPLX-05)."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        _duplex_settings(default_settings, tmp_path)
         default_settings.output.flip_timeout_seconds = 17
-        default_settings.profiles["default"].source = "ADF"
-        default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
@@ -1679,6 +1687,7 @@ class TestManualDuplex:
         request = PipelineRequest(
             profile_name="default",
             title="Timeout Test",
+            job_id="job-flip-timeout",
             flip_coordinator=_FixedFlipCoordinator(FlipOutcome.TIMED_OUT),
         )
 
