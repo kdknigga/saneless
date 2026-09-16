@@ -2,9 +2,11 @@
 #
 # Configuration options:
 #   - Volume mount: the ./config directory, mounted read-write at /etc/saneless,
-#     holds config.toml
+#     holds config.toml. That file is the one place for the paperless-ngx
+#     token; see the environment: block below for why.
 #   - Environment variables: use SANELESS_ prefix with __ nested delimiter
-#     (e.g., SANELESS_PAPERLESS__URL, SANELESS_PAPERLESS__TOKEN)
+#     (e.g., SANELESS_PAPERLESS__URL, SANELESS_PAPERLESS__TOKEN). Anything set
+#     here overrides config.toml, which is why this file sets none of them.
 #   - Consume directory: optionally mount a host directory for paperless-ngx
 #     file-based ingestion as a fallback to API upload
 
@@ -25,9 +27,30 @@ services:
       # Durable state: job database and preserved scans. /tmp/saneless is
       # deliberately NOT mounted -- it is disposable scratch space.
       - saneless-data:/var/lib/saneless
+      # Consume-directory fallback, optional. When the paperless-ngx API cannot
+      # be reached at all, saneless drops the assembled PDF here instead of
+      # failing the scan, and paperless-ngx ingests it once it is back. Mount
+      # the directory paperless-ngx consumes (its PAPERLESS_CONSUMPTION_DIR),
+      # and set paperless.consume_dir in config.toml to the container path on
+      # the right -- the mount on its own does nothing.
+      # - /srv/paperless/consume:/consume
     environment:
-      - SANELESS_PAPERLESS__URL=http://paperless:8000
-      - SANELESS_PAPERLESS__TOKEN=changeme
+      # A container's clock reports UTC, so without this every timestamp
+      # saneless shows -- the job history, the saneless jobs table, the
+      # paperless-ngx document title -- is UTC. Set your own zone.
+      - TZ=America/Chicago
+      # The paperless-ngx connection is commented out ON PURPOSE.
+      # ./config/config.toml is the one place for the URL and the token. A
+      # variable set here OVERRIDES that file silently: saneless would use this
+      # value and ignore the token you edited into config.toml, and the status
+      # strip would stay red with nothing on screen to say why.
+      #
+      # UPGRADING: earlier versions of this file shipped these two lines live,
+      # so your own compose file probably still has them. Delete your
+      # SANELESS_PAPERLESS__TOKEN line, or your real config.toml stays
+      # overridden and the status strip stays red after you fix it.
+      # - SANELESS_PAPERLESS__URL=http://paperless:8000
+      # - SANELESS_PAPERLESS__TOKEN=<your paperless-ngx API token>
       # Uncomment to discover scanners on a remote host via SANE net backend:
       # - SANELESS_SCANNER__HOST=192.168.1.50
       # Multiple hosts use colons: SANELESS_SCANNER__HOST=192.168.1.50:192.168.1.51
