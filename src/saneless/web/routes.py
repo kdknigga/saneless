@@ -19,10 +19,12 @@ from saneless.checks import (
     CheckKey,
     run_checks,
 )
-from saneless.config import resolve_job_title
+from saneless.config import is_placeholder_token, resolve_job_title
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
+    SCAN_BLOCKED_REASON,
     TITLE_MAX_LENGTH,
+    TOKEN_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ErrorCategory,
@@ -393,13 +395,77 @@ def _busy_line(worker: ScanWorker, job_store: JobStore, job: Job | None) -> str 
     return busy_line(job.state)
 
 
+@dataclass(frozen=True, slots=True)
+class _StatusFacts:
+    """
+    The per-request facts a status render needs beyond the worker and store.
+
+    Bundled rather than passed one by one because ``_status_context`` had
+    reached ``PLR0913``'s five-parameter ceiling and this plan adds a sixth
+    fact.  A suppression is forbidden (CLAUDE.md), and ``create_job`` already
+    had to take the same route, so the frozen dataclass is the established
+    answer here.
+
+    Every field is read off the request in ``_status_facts`` and nowhere else,
+    which is what stops a route added later from acquiring or losing a fact by
+    forgetting about it -- the same discipline ``refresh_checks`` and
+    ``is_owner`` already follow.
+    """
+
+    claimed: tuple[str, FlipOutcome] | None = None
+    followed_job_id: str | None = None
+    owner_token: str | None = None
+    scan_blocked: bool = False
+
+
+def _status_facts(
+    request: Request,
+    *,
+    claimed: tuple[str, FlipOutcome] | None = None,
+    followed_job_id: str | None = None,
+) -> _StatusFacts:
+    """
+    Read every per-request status fact off the request, in one place.
+
+    ``owner_token`` and ``scan_blocked`` are both derived here rather than at
+    each call site, so a new status-rendering route cannot silently lose the
+    owner's flip prompt (D-24) or hand back an enabled Scan button on a
+    blocked appliance (D-15).  Only the two facts a route genuinely knows
+    about itself -- the answer it just claimed, and the job the browser is
+    following -- are passed in.
+
+    ``scan_blocked`` is derived from ``Settings``, which is loaded once at
+    process start, so it cannot change while the process runs: there is no live
+    flip to orchestrate and ``POST /api/checks/refresh`` deliberately carries
+    neither the button nor the reason line, because re-running the checks
+    cannot change a verdict that was never read from them (UI-SPEC S8).
+
+    This unwraps the configured token, and the value goes to the predicate and
+    nowhere else: it is never logged, rendered or echoed, and the flag that
+    reaches the template is a bool (ASVS V7, CFG-05).
+
+    Args:
+        request: The incoming request, for its cookies and the app's settings.
+        claimed: The job id and answer this request itself claimed, if any.
+        followed_job_id: The job this browser submitted, if it submitted one.
+
+    Returns:
+        The bundle ``_status_context`` reads.
+
+    """
+    settings = request.app.state.settings
+    return _StatusFacts(
+        claimed=claimed,
+        followed_job_id=followed_job_id,
+        owner_token=_presented_owner(request),
+        scan_blocked=is_placeholder_token(settings.paperless.token.get_secret_value()),
+    )
+
+
 def _status_context(
     worker: ScanWorker,
     job_store: JobStore,
-    claimed: tuple[str, FlipOutcome] | None = None,
-    *,
-    followed_job_id: str | None = None,
-    owner_token: str | None = None,
+    facts: _StatusFacts,
 ) -> dict[str, object]:
     """
     Build the context ``partials/status.html`` renders from.
@@ -431,9 +497,7 @@ def _status_context(
     Args:
         worker: The scan worker, for the job in flight and its flip answer.
         job_store: The job store to read the job from.
-        claimed: The job id and answer this request itself claimed, if any.
-        followed_job_id: The job this browser submitted, if it submitted one.
-        owner_token: The owner token this request carries, if it carries one.
+        facts: The per-request bundle ``_status_facts`` built.
 
     ``refresh_checks`` is False here for every caller, and that is the whole of
     the flag's policy: ``start_scan`` sets it True on its own, so a status poll
@@ -447,21 +511,33 @@ def _status_context(
     flag and never the token, so the value itself has no path into the markup
     (T-30-59).
 
+    ``scan_blocked`` rides along for the same reason again, and it is why every
+    out-of-band ``#scan-btn`` -- the scan submit's own response, both status
+    polls and both flip answers -- carries the blocked state: they all render
+    ``partials/scan_button.html`` from this one context, so no status response
+    can hand back an enabled button on an appliance that cannot upload
+    (UI-SPEC S8, C-10).  On a blocked appliance ``POST /api/scan`` is refused
+    before it reaches its success branch, so that one is unreachable today; it
+    is included anyway, because the property being defended is that the flag
+    lives in one partial fed from one builder, not that each caller remembered.
+
     Returns:
         The job, its flip answer, the followed job's id, the one busy line,
-        whether this viewer owns the job and a false strip-refresh flag.
-        ``flip_answer`` is None unless the rendered job is ``AWAITING_FLIP``
-        and has been answered.
+        whether this viewer owns the job, whether the Scan button is blocked
+        and a false strip-refresh flag.  ``flip_answer`` is None unless the
+        rendered job is ``AWAITING_FLIP`` and has been answered.
 
     """
-    followed = job_store.get_job(followed_job_id) if followed_job_id else None
+    followed = (
+        job_store.get_job(facts.followed_job_id) if facts.followed_job_id else None
+    )
     job = (
         followed if followed is not None else _current_or_recent_job(worker, job_store)
     )
     answer: FlipOutcome | None = None
     if job is not None and job.state is JobState.AWAITING_FLIP:
-        if claimed is not None and claimed[0] == job.id:
-            answer = claimed[1]
+        if facts.claimed is not None and facts.claimed[0] == job.id:
+            answer = facts.claimed[1]
         else:
             answer = worker.flip_answer(job.id)
     return {
@@ -470,7 +546,8 @@ def _status_context(
         "refresh_checks": False,
         "followed_job_id": followed.id if followed is not None else None,
         "busy_line": _busy_line(worker, job_store, job),
-        "is_owner": job is not None and _is_owner(owner_token, job.owner_token),
+        "is_owner": job is not None and _is_owner(facts.owner_token, job.owner_token),
+        "scan_blocked": facts.scan_blocked,
     }
 
 
@@ -495,9 +572,7 @@ def index(request: Request) -> Response:
         state.cache, state.paperless, "correspondents"
     )
 
-    status = _status_context(
-        state.worker, state.job_store, owner_token=_presented_owner(request)
-    )
+    status = _status_context(state.worker, state.job_store, _status_facts(request))
 
     jobs = state.job_store.list_recent(limit=50)
 
@@ -513,6 +588,12 @@ def index(request: Request) -> Response:
             "jobs": jobs,
             # The title input's maxlength; templates own no vocabulary (ROBU-08).
             "title_max_length": TITLE_MAX_LENGTH,
+            # The reason line's copy, which only the full page renders: it is
+            # never an out-of-band swap target, so no status response needs it
+            # and it never has to exist as an empty placeholder (UI-SPEC S8).
+            # The template reads the string and decides nothing; the flag that
+            # says whether to render it comes from the status context.
+            "scan_blocked_reason": SCAN_BLOCKED_REASON,
         },
     )
 
@@ -703,8 +784,11 @@ def start_scan(
     ``#status-message`` slot out-of-band, so an error left there by an earlier
     rejected submit disappears (D-03).  A refused submit records a
     REJECTED error row and raises: 429 with ``Retry-After`` when the queue is
-    full, 503 when the worker is down or degraded (ROBU-02, D-05, D-11).  The
-    rendered error reloads Job History only when that row was written.
+    full, 503 when the worker is down or degraded (ROBU-02, D-05, D-11), and
+    503 with its own message when the paperless-ngx API token is a placeholder
+    nobody replaced, which is the one failure certain to waste paper because
+    the pages would be scanned and then have nowhere to go (APPL-07, D-15).
+    The rendered error reloads Job History only when that row was written.
 
     Args:
         request: The incoming HTTP request.
@@ -728,6 +812,33 @@ def start_scan(
     form = _ScanForm(
         profile=profile, title=title, tags=tags, correspondent=correspondent
     )
+
+    # D-15: the route guard is the enforcement and the disabled Scan button is
+    # only a courtesy, so this refusal holds for curl, for a script, and for a
+    # browser whose ``disabled`` attribute was removed in devtools.  It is
+    # unconditional -- a configured consume directory does not buy an exception
+    # -- and it sits ahead of ``create_job`` so a scan that could never upload
+    # leaves exactly one row: the REJECTED one, which Job History shows so the
+    # attempt is visible rather than silently swallowed (Phase 26 D-05).
+    # The degraded-worker rejection is deliberately not reused here, and this
+    # comment names it in prose rather than as the symbol so a grep for that
+    # member still counts only the places that raise it: "the scan service was
+    # unavailable" is untrue when the service is fine and nobody set the token,
+    # and it would send a household member looking for a broken server.  The
+    # status is 503, matching the two existing refuse-to-start rejections, so
+    # htmx response handling and the history reload behave identically; a 4xx
+    # would imply the request was at fault, which it was not.
+    #
+    # This is the web layer's third place that unwraps the configured token,
+    # after the PaperlessClient build in ``web/app.py`` and the Paperless check
+    # in ``checks.py``.  The value goes to the predicate and nowhere else: it is
+    # never logged, rendered, echoed or put in the job row, whose text names the
+    # problem and the file to edit and never the secret (ASVS V7, CFG-05).
+    if is_placeholder_token(state.settings.paperless.token.get_secret_value()):
+        written = _record_refused_submit(
+            state.job_store, form, error=TOKEN_UNSET_JOB_ERROR
+        )
+        raise RequestRejected(RequestRejection.TOKEN_UNSET, job_id=written)
 
     unhealthy = _unhealthy_rejection(state.worker.health)
     if unhealthy is not None:
@@ -768,8 +879,14 @@ def start_scan(
                     **_status_context(
                         state.worker,
                         state.job_store,
-                        followed_job_id=job.id,
-                        owner_token=owner,
+                        replace(
+                            _status_facts(request, followed_job_id=job.id),
+                            # The token this submit is owned by, which is the
+                            # minted one when the browser presented none: the
+                            # cookie carrying it has not reached the browser
+                            # yet, so the request cannot present it.
+                            owner_token=owner,
+                        ),
                     ),
                     "clear_message": True,
                     "refresh_checks": True,
@@ -817,9 +934,7 @@ def current_job_status(request: Request) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        _status_context(
-            state.worker, state.job_store, owner_token=_presented_owner(request)
-        ),
+        _status_context(state.worker, state.job_store, _status_facts(request)),
     )
 
 
@@ -857,8 +972,7 @@ def followed_job_status(request: Request, job_id: str) -> Response:
         _status_context(
             state.worker,
             state.job_store,
-            followed_job_id=job_id,
-            owner_token=_presented_owner(request),
+            _status_facts(request, followed_job_id=job_id),
         ),
     )
 
@@ -1058,8 +1172,10 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
         _status_context(
             state.worker,
             state.job_store,
-            claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
-            owner_token=presented,
+            _status_facts(
+                request,
+                claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
+            ),
         ),
     )
 
@@ -1097,7 +1213,9 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
         _status_context(
             state.worker,
             state.job_store,
-            claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
-            owner_token=presented,
+            _status_facts(
+                request,
+                claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+            ),
         ),
     )

@@ -1957,6 +1957,183 @@ class TestPlainHttpLanOrigin:
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
 
 
+# The shipped stand-in `config.is_placeholder_token` refuses (D-14). A second
+# live server runs with it so the blocked Scan button can be looked at in a
+# real browser rather than only in rendered markup.
+_SHIPPED_PLACEHOLDER = "changeme"
+
+_BLOCKED_REASON_TEXT = (
+    "The paperless-ngx API token has not been set \N{EM DASH} see System status above."
+)
+
+_BLOCKED_REASON_SELECTOR = "#scan-blocked-reason"
+
+
+@pytest.fixture(scope="session")
+def blocked_server(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[_BrowserServer]:
+    """
+    Start a second live server whose paperless-ngx token is a placeholder.
+
+    The verdict is read from ``Settings`` once at process start, so there is no
+    runtime setter to reach for: a second server is the only honest way to put
+    a real browser in front of the blocked page (UI-SPEC S8).
+    """
+    tmp_dir = tmp_path_factory.mktemp("browser-blocked")
+    scanner = _BrowserTestScanner()
+    configured = _browser_test_settings(tmp_dir)
+    settings = configured.model_copy(
+        update={
+            "paperless": PaperlessConfig(
+                url=configured.paperless.url,
+                token=_SHIPPED_PLACEHOLDER,
+            )
+        }
+    )
+    app = create_app(settings, scanner)
+    running = _start_uvicorn(app, host="127.0.0.1")
+    yield _BrowserServer(
+        url=f"http://127.0.0.1:{running.port}", app=app, scanner=scanner
+    )
+    _stop_uvicorn(running)
+
+
+@pytest.mark.browser
+class TestBlockedScanButtonInABrowser:
+    """
+    The blocked Scan button and its reason line, in Chromium (APPL-07, D-15).
+
+    Two of these claims cannot be made from rendered markup. Whether the
+    ``disabled`` attribute survives the page's own load requests is the C-10
+    inheritance trap, which only a browser running htmx can spring; and whether
+    the reason line is actually legible is a question about computed colour on
+    the layers it really sits on.
+
+    The button is still only the courtesy: the refusal that holds is the route
+    guard, proved in tests/test_web_errors.py against a client with no button
+    at all.
+    """
+
+    def _open(
+        self,
+        page: Page,
+        blocked_server: _BrowserServer,
+        egress_allowlist: list[str],
+        scheme: Literal["light", "dark"] = "light",
+    ) -> None:
+        """Load the blocked appliance's page, after allowing its origin."""
+        egress_allowlist.append(blocked_server.url)
+        page.emulate_media(color_scheme=scheme)
+        page.goto(blocked_server.url)
+
+    def test_the_blocked_button_is_disabled_and_described_in_the_live_dom(
+        self,
+        page: Page,
+        blocked_server: _BrowserServer,
+        egress_allowlist: list[str],
+    ) -> None:
+        """One disabled button, still labelled Scan, pointing at its reason."""
+        self._open(page, blocked_server, egress_allowlist)
+
+        button = page.locator("#scan-btn")
+        expect(button).to_be_disabled()
+        assert (button.text_content() or "").strip() == "Scan"
+        assert button.get_attribute("aria-describedby") == "scan-blocked-reason"
+        assert button.get_attribute("aria-busy") is None
+        assert page.evaluate(_COUNT_ARRAY_SCAN_BUTTONS) == 1
+
+    def test_the_reason_line_is_visible_text_beneath_the_button(
+        self,
+        page: Page,
+        blocked_server: _BrowserServer,
+        egress_allowlist: list[str],
+    ) -> None:
+        """
+        The reason is on the page, not in a tooltip, and it sits below.
+
+        A disabled button cannot be focused or reliably hovered, so a ``title``
+        would be unreachable by keyboard and unreliable on touch. The geometry
+        is asserted because "beneath it" is the whole of the layout claim.
+        """
+        self._open(page, blocked_server, egress_allowlist)
+
+        reason = page.locator(_BLOCKED_REASON_SELECTOR)
+        expect(reason).to_be_visible()
+        assert (reason.text_content() or "").strip() == _BLOCKED_REASON_TEXT
+
+        button_box = page.locator("#scan-btn").bounding_box()
+        reason_box = reason.bounding_box()
+        assert button_box is not None
+        assert reason_box is not None
+        assert reason_box["y"] >= button_box["y"] + button_box["height"]
+
+    def test_the_blocked_button_survives_its_own_page_load_requests(
+        self,
+        page: Page,
+        blocked_server: _BrowserServer,
+        egress_allowlist: list[str],
+    ) -> None:
+        """
+        The load requests inside the form do not re-enable it (C-10, T-30-66).
+
+        On htmx 2.0.8 an inherited ``hx-disabled-elt`` strips ``disabled`` from
+        a server-disabled button the moment a child request finishes. With no
+        job active there is no one-second status poll to put it back, so a
+        blocked button that lost the attribute here would stay clickable --
+        which is exactly why the flag lives in the one button partial.
+        """
+        egress_allowlist.append(blocked_server.url)
+        page.add_init_script(_RECORD_LOAD_REQUESTS)
+        with (
+            page.expect_response(lambda r: "/api/tags" in r.url),
+            page.expect_response(lambda r: "/api/correspondents" in r.url),
+        ):
+            page.goto(blocked_server.url)
+        page.wait_for_function("window.__selectLoadsFinished >= 2")
+
+        # Read once, without retrying: nothing re-renders this button while no
+        # job is active, so a retrying check would only hide a sprung trap
+        # behind a timeout.
+        assert page.locator("#scan-btn").is_disabled(), (
+            "the page's own load requests re-enabled a blocked Scan button"
+        )
+        assert page.locator(_BLOCKED_REASON_SELECTOR).is_visible()
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_the_reason_line_is_the_error_red_at_aa(
+        self,
+        page: Page,
+        blocked_server: _BrowserServer,
+        egress_allowlist: list[str],
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        It borrows ``.status-error``, measured on the layers it really sits on.
+
+        No new colour is introduced, so the value is asserted rather than only
+        the ratio: a palette drift should be named here, not absorbed.
+        """
+        self._open(page, blocked_server, egress_allowlist, scheme)
+
+        reading = page.evaluate(_READ_ELEMENT_CONTRAST, _BLOCKED_REASON_SELECTOR)
+        colour = reading["colour"]
+        background = _flatten(reading["backgroundStack"])
+        ratio = _contrast_ratio(colour, background)
+
+        assert colour == _ERROR_RED[scheme], (colour, background, ratio)
+        assert ratio >= 4.5, (colour, background, ratio)
+
+    def test_a_configured_appliance_shows_no_reason_line(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> None:
+        """The courtesy is absent when there is nothing to be courteous about."""
+        page.goto(browser_server.url)
+
+        assert page.locator(_BLOCKED_REASON_SELECTOR).count() == 0
+        assert page.locator("#scan-btn").get_attribute("aria-describedby") is None
+
+
 _OWNER_COOKIE_NAME = "saneless_owner"
 
 # Playwright reports a session cookie -- one with neither Max-Age nor Expires --

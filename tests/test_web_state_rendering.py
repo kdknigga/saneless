@@ -117,9 +117,26 @@ _SCAN_BUTTON = re.compile(
 )
 
 
-def _make_app(tmp_path: Path) -> FastAPI:
+# The paperless-ngx credential a configured appliance has. Anything outside
+# `config.PLACEHOLDER_TOKENS` counts as real: the predicate is a fixed literal
+# set and never a shape heuristic (D-14).
+_REAL_CREDENTIAL = "test-token"
+
+# The shipped stand-in the predicate refuses -- docker-compose.yml and the
+# docker reference both carry it, so it is the placeholder a real installation
+# is most likely to be left with (D-14, APPL-07).
+_SHIPPED_PLACEHOLDER = "changeme"
+
+
+def _make_app(tmp_path: Path, *, credential: str = _REAL_CREDENTIAL) -> FastAPI:
     """
     Build a real app with a stub scanner and no network calls, not yet started.
+
+    Args:
+        tmp_path: The directory the app writes its database and files under.
+        credential: The paperless-ngx token this appliance is configured with.
+            The default is a real one; pass `_SHIPPED_PLACEHOLDER` for the
+            blocked-Scan-button case (UI-SPEC S8).
 
     Returns:
         The app, whose lifespan (and so its worker) starts with its TestClient.
@@ -127,7 +144,7 @@ def _make_app(tmp_path: Path) -> FastAPI:
     """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
+        paperless=PaperlessConfig(url="http://localhost:8000", token=credential),
         output=OutputConfig(
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
@@ -155,6 +172,19 @@ def _make_app(tmp_path: Path) -> FastAPI:
 def client(tmp_path: Path) -> Iterator[TestClient]:
     """TestClient over a real app with a stub scanner and no network calls."""
     with TestClient(_make_app(tmp_path)) as tc:
+        yield tc
+
+
+@pytest.fixture
+def blocked_client(tmp_path: Path) -> Iterator[TestClient]:
+    """
+    TestClient over an appliance whose paperless-ngx token is a placeholder.
+
+    The verdict is derived from `Settings`, which is read once at process
+    start, so a second app is the only honest way to drive the blocked case:
+    there is no runtime setter to reach for (UI-SPEC S8).
+    """
+    with TestClient(_make_app(tmp_path, credential=_SHIPPED_PLACEHOLDER)) as tc:
         yield tc
 
 
@@ -1517,3 +1547,419 @@ class TestOwnerGatedFlipPrompt:
         assert "hx-confirm" not in index
         assert 'hx-disinherit="hx-disabled-elt"' in form.group(0)
         assert flip.count("hx-confirm") == 1
+
+
+# --- S8: the blocked Scan button and its reason line (APPL-07, D-14, D-15) ---
+
+# The reason line's copy, verbatim from UI-SPEC S8. Pinned here as a literal so
+# a change to the constant is caught by a test and not only by a reviewer; that
+# the constant lives in Python and not in a template is asserted below.
+_BLOCKED_REASON = (
+    "The paperless-ngx API token has not been set \N{EM DASH} see System status above."
+)
+
+# The reason element, whole. `<small>` nests nothing here, so a non-greedy body
+# is exact rather than merely convenient.
+_REASON_LINE = re.compile(
+    r'<small id="scan-blocked-reason" class="status-error">(?P<text>.*?)</small>',
+    re.DOTALL,
+)
+
+# The scan form's opening tag. The whitespace after the URL is required because
+# the comment above the status card mentions `<form hx-post="/api/scan">` in
+# prose, and a looser pattern matches that instead of the element.
+_SCAN_FORM_TAG = re.compile(r'<form hx-post="/api/scan"\s+(?P<attrs>[^>]*)>')
+
+# The four attributes the scan form carries, in order. Phase 30 adds none:
+# `hx-disinherit` is the C-10 fix and `hx-disabled-elt` is what it protects, so
+# the list is asserted whole rather than by membership.
+_SCAN_FORM_ATTRS = [
+    'hx-target="#status-area"',
+    'hx-swap="outerHTML"',
+    'hx-disabled-elt="#scan-btn"',
+    'hx-disinherit="hx-disabled-elt"',
+]
+
+_DESCRIBED_BY = 'aria-describedby="scan-blocked-reason"'
+
+# The button's opening literal, which `_SCAN_BUTTON` above depends on.
+_PINNED_BUTTON_OPENING = '<button type="submit" id="scan-btn"'
+
+# The package root, for the assertions that follow the copy rather than markup.
+_SRC_DIR = _PACKAGE_DIR.parent
+
+
+def _button_partial() -> str:
+    """
+    Return the one copy of the Scan button markup.
+
+    Returns:
+        The partial's source, header comment included.
+
+    """
+    return (_TEMPLATES_DIR / "partials" / "scan_button.html").read_text(
+        encoding="utf-8"
+    )
+
+
+def _css_rule(selector: str) -> str:
+    """
+    Return the body of the one CSS rule with `selector`.
+
+    Args:
+        selector: The selector, without its opening brace.
+
+    Returns:
+        Everything between that rule's braces.
+
+    """
+    css = _APP_CSS.read_text(encoding="utf-8")
+    opening = f"{selector} {{"
+    assert css.count(opening) == 1, f"expected exactly one {selector} rule"
+    body = css[css.index(opening) + len(opening) :]
+    return body[: body.index("}")]
+
+
+def _done_job_that_is_not_current(client: TestClient, title: str) -> str:
+    """
+    Create a job already DONE, leaving the worker's current job alone.
+
+    `_job_in_state` adopts the row it makes as the worker's current job, which
+    is exactly what the two-browser cases below must not do: they need a second
+    row that ran and ended while something else is still running. The module's
+    own `_finished_job` above records page counts and is about the history
+    table, so it is not this.
+
+    Args:
+        client: The client whose app owns the store.
+        title: The title the status area will report for it.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title=title)
+    job_store.update_state(job.id, JobState.DONE)
+    return job.id
+
+
+class TestScanBlocked:
+    """
+    The placeholder token disables the Scan button and says why (UI-SPEC S8).
+
+    The button is the courtesy, never the enforcement: every test here is about
+    what a viewer is shown, and the refusal that actually holds is proved
+    against the route in tests/test_web_errors.py. Exactly one condition blocks
+    the button in this phase -- a scanner that is unreachable or a
+    paperless-ngx that is down does not, because the user is allowed to try and
+    will get a plain-language error with a next step.
+    """
+
+    def test_blocked_idle_button_is_disabled_and_still_says_scan(
+        self, blocked_client: TestClient
+    ) -> None:
+        """A blocked appliance with nothing running still offers one word."""
+        match = _only_scan_button(blocked_client.get("/").text)
+        attrs = match.group("attrs")
+
+        assert "disabled" in attrs
+        assert _DESCRIBED_BY in attrs
+        assert "aria-busy" not in attrs
+        assert match.group("text").strip() == "Scan"
+
+    @pytest.mark.parametrize("state", list(JobState))
+    def test_blocked_button_leaves_the_job_label_and_aria_busy_alone(
+        self, blocked_client: TestClient, state: JobState
+    ) -> None:
+        """
+        The flag is a second `disabled` source and touches nothing else.
+
+        Phase 26's table is re-asserted underneath it: the label and
+        `aria-busy` still come from the job, for every state.
+        """
+        _job_in_state(blocked_client, state)
+        match = _only_scan_button(blocked_client.get("/").text)
+        attrs = match.group("attrs")
+
+        assert "disabled" in attrs
+        assert _DESCRIBED_BY in attrs
+        assert ('aria-busy="true"' in attrs) is (state in BUSY_STATES)
+
+        if state is JobState.AWAITING_FLIP:
+            expected = "Waiting for flip&#8230;"
+        elif state in BUSY_STATES:
+            expected = "Scanning&#8230;"
+        else:
+            expected = "Scan"
+        assert match.group("text").strip() == expected
+
+    def test_an_unblocked_page_carries_no_describedby_and_no_reason(
+        self, client: TestClient
+    ) -> None:
+        """A configured appliance is exactly as it was before this plan."""
+        page = client.get("/").text
+        match = _only_scan_button(page)
+
+        assert _DESCRIBED_BY not in match.group("attrs")
+        assert "scan-blocked-reason" not in page
+        assert _REASON_LINE.search(page) is None
+
+    def test_blocked_reason_line_renders_the_exact_copy(
+        self, blocked_client: TestClient
+    ) -> None:
+        """The reason is S8's sentence, once, as visible text."""
+        page = blocked_client.get("/").text
+        rendered = _REASON_LINE.findall(page)
+
+        assert len(rendered) == 1
+        assert rendered[0].strip() == _BLOCKED_REASON
+
+    def test_blocked_reason_line_follows_the_button_inside_the_form(
+        self, blocked_client: TestClient
+    ) -> None:
+        """It reads directly after the control it explains, inside the form."""
+        page = blocked_client.get("/").text
+        form = page[page.index("<form hx-post=") : page.index("</form>")]
+
+        assert 'id="scan-btn"' in form
+        assert 'id="scan-blocked-reason"' in form
+        assert form.index('id="scan-btn"') < form.index('id="scan-blocked-reason"')
+
+    def test_blocked_button_stays_disabled_across_repeated_status_polls(
+        self, blocked_client: TestClient
+    ) -> None:
+        """
+        No status response can hand back an enabled button (C-10, T-30-66).
+
+        This is the regression guard for the new flag specifically: on htmx
+        2.0.8 an inherited `hx-disabled-elt` strips `disabled` from a
+        server-disabled button when a child request finishes, so the button is
+        re-rendered from server state every second. A flag expressed anywhere
+        but the one partial would be dropped by exactly these polls.
+        """
+        for _ in range(5):
+            match = _only_scan_button(
+                blocked_client.get("/api/jobs/current/status").text
+            )
+            assert "disabled" in match.group("attrs")
+            assert _DESCRIBED_BY in match.group("attrs")
+
+    def test_blocked_followed_job_poll_carries_the_blocked_button(
+        self, blocked_client: TestClient
+    ) -> None:
+        """The per-browser poll route carries it too, not just the shared one."""
+        job_id = _job_in_state(blocked_client, JobState.DONE)
+        match = _only_scan_button(blocked_client.get(f"/api/jobs/{job_id}/status").text)
+
+        assert "disabled" in match.group("attrs")
+        assert _DESCRIBED_BY in match.group("attrs")
+
+    @pytest.mark.parametrize("route", ["continue", "abort"], ids=["continue", "abort"])
+    def test_blocked_flip_responses_carry_the_blocked_button(
+        self, blocked_client: TestClient, route: str
+    ) -> None:
+        """Both flip answers re-render the button, and both keep it blocked."""
+        job_id = _job_in_state(blocked_client, JobState.AWAITING_FLIP)
+        response = blocked_client.post(f"/api/flip/{route}", data={"job_id": job_id})
+        match = _only_scan_button(response.text)
+
+        assert "disabled" in match.group("attrs")
+        assert _DESCRIBED_BY in match.group("attrs")
+
+    def test_checks_refresh_carries_no_button_and_no_blocked_reason(
+        self, blocked_client: TestClient
+    ) -> None:
+        """
+        Re-running the checks cannot change a verdict read from Settings (S8).
+
+        So the refresh response carries neither the button nor the reason:
+        re-rendering them there would be theatre, and it is why
+        `#scan-blocked-reason` is never an out-of-band swap target and never
+        has to exist as an empty placeholder.
+        """
+        text = blocked_client.post("/api/checks/refresh").text
+
+        assert 'id="scan-btn"' not in text
+        assert 'id="scan-blocked-reason"' not in text
+
+    def test_blocked_reason_is_never_an_out_of_band_target(
+        self, blocked_client: TestClient
+    ) -> None:
+        """
+        The reason element exists only on the full page and never swaps itself.
+
+        The *id* still appears in every status response, as the button's
+        `aria-describedby` value: that is the point of the attribute. What must
+        never appear is a second copy of the element, out-of-band or otherwise.
+        """
+        page = blocked_client.get("/").text
+        reason = _REASON_LINE.search(page)
+        assert reason is not None
+        assert "hx-swap-oob" not in reason.group(0)
+        assert page.count('id="scan-blocked-reason"') == 1
+
+        for path in ("/api/jobs/current/status", "/api/jobs/history", "/api/checks"):
+            text = blocked_client.get(path).text
+            assert 'id="scan-blocked-reason"' not in text
+            assert _REASON_LINE.search(text) is None
+
+    def test_the_blocked_button_keeps_its_pinned_first_two_attributes(
+        self, blocked_client: TestClient
+    ) -> None:
+        """
+        `type="submit" id="scan-btn"` stay first, in that order (ROBU-04).
+
+        The `_SCAN_BUTTON` regex in this module depends on it, and so does the
+        partial's own header comment.
+
+        Asserted against the partial's first line of markup rather than a fixed
+        number of leading lines, because the header comment above it is
+        deliberately long and is meant to grow.
+        """
+        markup = [
+            line for line in _button_partial().splitlines() if line.startswith("<")
+        ]
+        assert markup, "no markup in the button partial"
+        assert markup[0].startswith(_PINNED_BUTTON_OPENING)
+
+        page = blocked_client.get("/").text
+        assert page.count(_PINNED_BUTTON_OPENING) == 1
+        assert _only_scan_button(page).group("text").strip() == "Scan"
+
+    def test_the_scan_form_element_gains_no_attribute(self) -> None:
+        """
+        The form is byte-identical to before this plan (C-10, UI-SPEC S8).
+
+        The blocked state lives in the button partial and nowhere else, so the
+        inheritance fix and its comment are untouched.
+        """
+        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
+        match = _SCAN_FORM_TAG.search(index)
+
+        assert match is not None
+        assert match.group("attrs").split() == _SCAN_FORM_ATTRS
+
+    def test_no_template_reaches_for_aria_disabled_or_a_tooltip(self) -> None:
+        """
+        The reason is visible text, not a tooltip and not `aria-disabled` (S8).
+
+        A `disabled` button is not focusable and cannot be reliably hovered, so
+        a `title` is unreachable by keyboard and unreliable on touch. Switching
+        to `aria-disabled="true"` to make it focusable is forbidden: it would
+        break Phase 26's `disabled` contract and `hx-disabled-elt`.
+        """
+        for path in sorted(_TEMPLATES_DIR.rglob("*.html")):
+            assert "aria-disabled" not in path.read_text(encoding="utf-8"), path
+        assert "title=" not in _button_partial()
+
+    def test_the_blocked_reason_copy_lives_in_python_and_in_no_template(self) -> None:
+        """
+        The sentence is a developer constant, never composed in a template.
+
+        It names the problem and nothing else: not the token value, not the
+        paperless-ngx URL, which may carry credentials, and no exception text
+        (ASVS V7, T-30-65).
+        """
+        carrying = sorted(
+            path
+            for path in _SRC_DIR.rglob("*")
+            if path.is_file()
+            and path.suffix in {".py", ".html", ".css"}
+            and _BLOCKED_REASON in path.read_text(encoding="utf-8")
+        )
+
+        assert len(carrying) == 1, carrying
+        assert carrying[0].suffix == ".py"
+
+    def test_the_blocked_reason_rule_adds_no_colour(self) -> None:
+        """
+        The line is a block with a top margin and borrows `.status-error`.
+
+        `--pico-del-color` on the card measures 7.83:1 light and 5.60:1 dark,
+        already asserted in tests/test_browser.py. No new token, no new value.
+        """
+        rule = _css_rule("#scan-blocked-reason")
+
+        assert "display: block;" in rule
+        assert "margin-top: 0.5rem;" in rule
+        assert "color" not in rule
+        assert "#" not in rule
+
+
+class TestScanButtonFollowsTheRenderedJob:
+    """
+    The button's job-derived state describes the job the page is reporting.
+
+    D-25 made the status area follow the job *this* browser submitted, and the
+    out-of-band Scan button is rendered from the same context. A browser whose
+    own job has finished therefore sees an enabled button while somebody else's
+    job is still running, where before this phase every viewer's button was
+    disabled whenever any job was active.
+
+    That is kept deliberately, and pinned here. Keying `disabled` on a
+    different job from the one the status area reports would let the button
+    read "Scanning..." directly above "Done: ...", which is the page
+    contradicting itself -- the untruthfulness this milestone exists to remove.
+    The appliance queues, which is the premise APPL-08's queue line rests on,
+    so a browser whose scan has finished is allowed to start another and will
+    be told where it lands. The guard against over-submission is unchanged: the
+    worker's QUEUE_FULL refusal and its REJECTED row.
+    """
+
+    def test_a_finished_followed_job_leaves_the_button_enabled(
+        self, client: TestClient
+    ) -> None:
+        """A browser whose own scan is done may start another one."""
+        _job_in_state(client, JobState.SCANNING)
+        finished = _done_job_that_is_not_current(client, "Mine, Already Done")
+
+        text = client.get(f"/api/jobs/{finished}/status").text
+        match = _only_scan_button(text)
+
+        assert "Mine, Already Done" in text
+        assert "disabled" not in match.group("attrs")
+        assert match.group("text").strip() == "Scan"
+
+    def test_a_browser_that_submitted_nothing_still_sees_the_appliance_busy(
+        self, client: TestClient
+    ) -> None:
+        """The shared poll route is unchanged: it reports the running job."""
+        _job_in_state(client, JobState.SCANNING)
+        _done_job_that_is_not_current(client, "Somebody Else's, Already Done")
+
+        match = _only_scan_button(client.get("/api/jobs/current/status").text)
+
+        assert "disabled" in match.group("attrs")
+        assert match.group("text").strip() == "Scanning&#8230;"
+
+    def test_the_button_never_describes_a_job_the_status_area_is_not_showing(
+        self, client: TestClient
+    ) -> None:
+        """One response, one job: the label and the prose cannot disagree."""
+        _job_in_state(client, JobState.SCANNING)
+        finished = _done_job_that_is_not_current(client, "Mine, Already Done")
+
+        text = client.get(f"/api/jobs/{finished}/status").text
+
+        assert "Render Test" not in text
+        assert "Scanning&#8230;" not in text
+
+    def test_a_blocked_appliance_disables_even_a_finished_followed_job(
+        self, blocked_client: TestClient
+    ) -> None:
+        """
+        The placeholder flag is independent of which job is rendered.
+
+        It is the OR that makes the courtesy hold for every viewer, whatever
+        their own job did.
+        """
+        _job_in_state(blocked_client, JobState.SCANNING)
+        finished = _done_job_that_is_not_current(blocked_client, "Mine, Already Done")
+
+        match = _only_scan_button(
+            blocked_client.get(f"/api/jobs/{finished}/status").text
+        )
+
+        assert "disabled" in match.group("attrs")
+        assert _DESCRIBED_BY in match.group("attrs")
