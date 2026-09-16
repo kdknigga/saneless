@@ -12,8 +12,10 @@ patch target's dotted name does not appear below.
 
 Exactly two things are stubbed, and nothing else:
 
-* **the scanner** -- a ``MagicMock(spec=ScannerBackend)`` handing back PIL
-  images, because there is no SANE device in CI;
+* **the scanner** -- a ``MagicMock(spec=ScannerBackend)`` spooling PIL images
+  into the pipeline's own sink, because there is no SANE device in CI.  It is
+  the real ``SpooledPageSink`` that writes them and the real records that come
+  back, so the pages this module's PDFs embed are real files;
 * **the HTTP layer** -- an ``httpx.MockTransport`` passed through
   ``PaperlessClient(..., _transport=...)``, the seam ``tests/test_paperless.py``
   already uses 24 times.  It sits *below* ``httpx.Client``, so the real
@@ -72,7 +74,7 @@ from saneless.paperless import PaperlessClient
 from saneless.scanner.base import ScannerBackend
 from saneless.vocabulary import TERMINAL_STATES, JobState, ScanOutcome
 from saneless.worker import ScanWorker
-from tests.conftest import scan_batch
+from tests.conftest import spooling_in_turn
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -495,10 +497,17 @@ def _build_scanner(scan_passes: tuple[int, ...]) -> MagicMock:
     """
     Stub the scanner, and only the scanner.
 
-    ``side_effect`` is a list of iterators, one per pass, so a manual-duplex
-    run gets a different page count from each of its two ``scan_pages`` calls
-    and a simplex run gets exactly one.  A second call on a simplex case would
-    raise StopIteration rather than silently rescanning.
+    ``spooling_in_turn`` gets one page list per pass, so a manual-duplex run
+    gets a different page count from each of its two ``scan_pages`` calls and a
+    simplex run gets exactly one.  A call beyond the prepared passes raises,
+    rather than silently rescanning.
+
+    One dispatching callable, never a list of them: ``unittest.mock`` consumes
+    a list ``side_effect`` as an iterable of *results* and hands each element
+    back uncalled, so a list of functions would make ``scan_pages`` return a
+    function object.  Each call fills the sink the pipeline created inside its
+    own workspace, which is why a ready-made batch cannot be used here at all:
+    the records have to be that sink's.
 
     The flip coordination is not the scanner's job -- ``_scan_manual_duplex``
     waits on the worker's flip coordinator, and the test answers it from the
@@ -513,9 +522,9 @@ def _build_scanner(scan_passes: tuple[int, ...]) -> MagicMock:
 
     """
     scanner = MagicMock(spec=ScannerBackend)
-    scanner.scan_pages.side_effect = [
-        scan_batch(_pages(count)) for count in scan_passes
-    ]
+    scanner.scan_pages.side_effect = spooling_in_turn(
+        *(_pages(count) for count in scan_passes)
+    )
     return scanner
 
 
