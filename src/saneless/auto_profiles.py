@@ -575,7 +575,17 @@ _UNPRUNABLE = frozenset({"default"})
 # (D-03); every other key -- default_tags, title, thresholds -- is the user's.
 # A hand edit to an owned key is overwritten while the flag is set: to keep it,
 # remove ``auto_generated`` and the profile is never touched again (D-01).
+#
+# ``label`` and ``description`` come first because this tuple is the file key
+# order for a newly written table: a human opening the config should read the
+# profile's human name before the SANE source string it was derived from.
+# D-18 makes them ordinary owned keys -- ``--force`` overwrites them exactly as
+# it overwrites ``source``, ``mode`` and ``resolution``, with no special case
+# for free text. They are the first free-text keys the tool owns, so the how-to
+# spells that out in plain words next to the escape hatch.
 _OWNED_KEYS: Final = (
+    "label",
+    "description",
     "source",
     "resolution",
     "mode",
@@ -681,6 +691,7 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     Insertion order is the file's key order for a new table. Only non-default
     values of ``auto_source_mode`` and ``duplex`` are included (Phase 25 D-06),
     so a refreshed table reads the way a freshly generated one does.
+    ``label`` and ``description`` are the exception: they are always written.
 
     Args:
         profile: A generated profile.
@@ -691,6 +702,16 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
 
     """
     values: dict[str, str | int | bool] = {
+        # Deliberately unconditional, unlike auto_source_mode and duplex below,
+        # which are written only when they differ from the model default. That
+        # is what makes Phase 27 D-03's rule -- an owned key a fresh generation
+        # does not write is deleted from the table -- unreachable for these
+        # two, so a free-text field a human reads can never be silently pruned
+        # by a refresh. Derived from the source rather than copied from the
+        # model, so a refresh also corrects a profile whose stored text no
+        # longer matches the source it carries.
+        "label": _profile_label(profile.source),
+        "description": _profile_description(profile.source),
         "source": profile.source,
         "resolution": profile.resolution,
         "mode": profile.mode,

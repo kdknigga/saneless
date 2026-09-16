@@ -53,6 +53,8 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
+| `label` | string | `""` | The name shown in the web UI's profile dropdown. `auto-profiles` fills this in -- `Feeder, single-sided`, `Feeder, double-sided` or `Glass (flatbed)` -- and owns it; see [Auto-generated profiles](#auto-generated-profiles). A profile with an empty label is listed under its profile name |
+| `description` | string | `""` | The sentence shown beneath the profile dropdown, such as `Scans both sides of every page using the document feeder.`. Also filled in and owned by `auto-profiles` |
 | `source` | string | `"Flatbed"` | Paper source: `"Flatbed"`, `"ADF"`, or `"ADF Duplex"` |
 | `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow; `"hardware"` only records that the source scans both sides and does not change the scan |
 | `resolution` | integer | `300` | Scan resolution in DPI |
@@ -154,10 +156,14 @@ saneless auto-profiles --force
 
 `--force` merges; it does not replace whole profiles:
 
-- It refreshes only profiles that carry `auto_generated = true`. In those, only the generated keys (`source`, `resolution`, `mode`, `auto_source_mode`, `duplex`, `auto_generated`) are rewritten in place, and a generated key the new run no longer writes is removed.
+- It refreshes only profiles that carry `auto_generated = true`. In those, only the generated keys (`label`, `description`, `source`, `resolution`, `mode`, `auto_source_mode`, `duplex`, `auto_generated`) are rewritten in place, and a generated key the new run no longer writes is removed.
 - Everything else in the profile is kept: `default_tags`, `default_correspondent`, `title`, `paper_size`, the empty-page thresholds, and your comments.
 - A hand edit to a generated key, such as `resolution = 600`, is overwritten. To keep your edits, delete the `auto_generated` line from that profile.
 - A profile without `auto_generated = true` is never changed, even with `--force`. It is listed as `Skipped (not auto-generated)`; rename or delete it to let `auto-profiles` regenerate it.
+
+`label` and `description` are ordinary generated keys, and they are the first ones that hold text you might want to write yourself. The rule is the same for them as for `resolution`: if a profile still carries `auto_generated = true`, a name you typed by hand is replaced the next time you run `saneless auto-profiles --force`. To keep your own wording, delete the `auto_generated` line from that profile -- that hands the profile to you permanently and `auto-profiles` never touches it again.
+
+`saneless auto-profiles --force` is also how you fill in names for profiles that were generated before saneless started writing them. Startup generation only runs on a config that still holds nothing but the untouched `default` profile, so an existing config keeps its empty labels -- and lists profiles under their profile names -- until you run the command once.
 
 The command reports what it did, one line per kind of change, and prints only the lines that apply:
 
