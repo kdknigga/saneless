@@ -906,9 +906,10 @@ def shutdown() -> None:
     Shut SANE down for this process, or explain why it was not (D-18).
 
     Called at an entry point's shutdown and nowhere else: never from a request
-    path, and never through ``atexit``, which would run while a daemon reader
-    thread may still be inside ``sane_read``.  It is idempotent, so an entry
-    point that closes more than one backend calls ``sane_exit`` once.
+    path, and never from an interpreter-exit hook, which would run while a
+    daemon reader thread may still be inside ``sane_read``.  It is idempotent,
+    so an entry point that closes more than one backend calls ``sane_exit``
+    once.
 
     Two conditions skip the call rather than making it, and both are logged
     because a silently skipped shutdown is indistinguishable from one that
@@ -1893,6 +1894,25 @@ class SaneBackend(ScannerBackend):
         """
         require_sane()
         self._sane_version = _ensure_initialised(host)
+
+    def close(self) -> None:
+        """
+        Shut this process's SANE down, through the backend abstraction (D-18).
+
+        The work is ``shutdown()``'s, and it is process-level rather than
+        per-object: what is released is the one ``sane_init`` this process
+        made, not anything this instance owns.  The method exists so that an
+        entry point holding a ``ScannerBackend`` can end it without naming the
+        concrete class -- and so that a backend holding nothing process-global
+        can go on inheriting the base's no-op.
+
+        It never raises, for the reason ``_open_device``'s ``finally`` already
+        states about ``dev.close()``: this runs from a click close callback or
+        a lifespan shutdown, where an exception would replace the error the
+        operator actually needs to see.  ``shutdown()`` swallows its own, so
+        there is nothing left here to catch.
+        """
+        shutdown()
 
     @contextlib.contextmanager
     def _open_device(self, device_id: str) -> Generator[SaneDevice]:
