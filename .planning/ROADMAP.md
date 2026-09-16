@@ -602,7 +602,7 @@ Plans:
 
 **Wave 10** *(blocked on Wave 9 completion)*
 
-- [ ] 30-15-PLAN.md — Profile select with a live description and feeder-first ordering
+- [x] 30-15-PLAN.md — Profile select with a live description and feeder-first ordering
 
 **Wave 11** *(blocked on Wave 10 completion)*
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 14/19 | In Progress|  |
+| 30. Appliance Layer | 15/19 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
