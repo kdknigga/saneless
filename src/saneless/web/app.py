@@ -122,7 +122,11 @@ def _build_check_machinery(
         worker: The source of the scanner gate and the profile-write outcome.
 
     Returns:
-        The cold cache and the unstarted refresher that fills it.
+        The cold cache and the unstarted refresher that fills it.  The
+        refresher also hands the context factory back out through
+        :meth:`~saneless.web.refresher.CheckRefresher.build_context`, which is
+        how ``POST /api/checks/refresh`` probes from the same assembled
+        dependencies rather than putting them together a second time.
 
     """
     # No ttl is passed: unlike the Paperless metadata cache there is no config
