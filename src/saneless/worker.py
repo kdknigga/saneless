@@ -24,6 +24,7 @@ from .config import config_search_paths
 from .exceptions import ConfigError, ScanCancelledError
 from .job import JobResult
 from .pipeline import (
+    SCAN_LABEL_FRONT,
     FlipAnswerSlot,
     FlipCoordinator,
     PipelineEvent,
@@ -36,6 +37,7 @@ from .vocabulary import (
     ErrorCategory,
     FlipOutcome,
     JobState,
+    ProfileStorage,
     SubmitResult,
     WorkerHealth,
     classify_error,
@@ -374,6 +376,39 @@ class ScanWorker:
         self._profiles_lock = threading.Lock()
         self._flip_coordinator: WorkerFlipCoordinator | None = None
         self._current_job_id: str | None = None
+        # Pass A's page count for the job in flight, written by the pipeline's
+        # pass-count callback on the worker thread and read by request threads
+        # rendering the status area (D-33).  Its own lock rather than
+        # _profiles_lock: they guard unrelated state and sharing one would make
+        # a status render wait behind a profile swap for no reason.
+        self._front_pages_lock = threading.Lock()
+        self._front_pages: int | None = None
+        # Held for the whole of a job's pipeline call, and for the whole of the
+        # startup capability read, so nothing else can be inside SANE at the
+        # same time (D-08, research Pitfall 2).  It is needed because
+        # scanner/sane_backend.py provides no mutual exclusion of its own:
+        # _refuse_if_wedged fires on a read that is already *stuck* rather than
+        # one that is merely running, and _INIT_LOCK guards sane_init and
+        # sane_exit only.  On the net backend a status-strip probe landing
+        # mid-scan would therefore be a second RPC on the control wire the scan
+        # is using -- a lost sheet, not a slow page.
+        #
+        # The advisory alternative, "skip the scanner check while
+        # current_job_id is not None", was rejected: a reader can see None,
+        # enter get_devices(), and have a job start a microsecond later.
+        self._scanner_gate = threading.Lock()
+        # What became of the one startup persist attempt (Amendment A-2, D-22).
+        # Recorded rather than recomputed because _persist_generated_profiles
+        # returns None for two different situations -- no config file was
+        # loaded, and one was loaded and could not be written -- and the
+        # Profiles row has to tell them apart.  A fresh os.access() probe at
+        # check time cannot substitute: Phase 27 D-09's motivating failure is
+        # EBUSY on a single-file bind mount, where the directory is writable,
+        # os.access says yes, and only the rename fails.
+        #
+        # The default is an in-memory member, not PERSISTED: before any attempt
+        # nothing is on disk, and that is the one answer that could mislead.
+        self._profile_storage: ProfileStorage = ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
         # Idle ticks in a row whose owed-write retry raised (WR-10), with no
@@ -673,6 +708,72 @@ class ScanWorker:
         """ID of the currently processing job, or None."""
         return self._current_job_id
 
+    @property
+    def front_pages(self) -> int | None:
+        """
+        Pass A's page count for the job in flight, or ``None``.
+
+        It is set while the current job is in manual duplex, from the moment
+        pass A finishes, and is cleared however the job ends.  The status area
+        reads it only when the job it is rendering is in
+        ``JobState.SCANNING_REVERSE``: at any other moment the number either
+        does not exist yet or is about to be superseded by the row's own
+        ``pages_scanned``.
+
+        Deliberately not a ``Job`` column.  CONTEXT forbids a schema migration
+        in this phase, and the value would be a poor column anyway -- it is
+        meaningful for the length of one pass and meaningless the instant the
+        job ends, which is the opposite of what the job table stores.
+
+        Returns:
+            The count, or ``None`` when no manual-duplex pass A has finished.
+
+        """
+        with self._front_pages_lock:
+            return self._front_pages
+
+    @property
+    def scanner_gate(self) -> threading.Lock:
+        """
+        The lock held whenever this worker is inside SANE (D-08).
+
+        The contract for a caller is one move and one move only: probe with
+        ``acquire(blocking=False)`` and, when that fails, **skip** the scanner
+        check and report it as unknown for this cycle.  Never block on it.  A
+        background refresher that waited here would queue behind a scan that
+        can legitimately run for minutes, and would then enter SANE at some
+        arbitrary later moment with the freshness its own caller assumed long
+        gone.  A caller that succeeds owns the scanner until it releases, so it
+        must use ``with`` or an equivalent ``try``/``finally``.
+
+        Returns:
+            The gate itself, so the caller can make that non-blocking attempt.
+
+        """
+        return self._scanner_gate
+
+    @property
+    def profile_storage(self) -> ProfileStorage:
+        """
+        What became of the profiles generated at startup (Amendment A-2, D-22).
+
+        Three outcomes, kept apart because the Profiles row means to tell a
+        household member which one happened: ``PERSISTED`` (they are in the
+        config file and survive a restart), ``IN_MEMORY_NO_CONFIG_FILE``
+        (saneless has no file to save to -- expected, and nothing to
+        investigate) and ``IN_MEMORY_UNWRITABLE`` (saneless has one and could
+        not write it -- worth looking at).
+
+        A worker whose startup generation never ran, because the settings were
+        not the bare default, reports the no-config-file value: nothing was
+        written, which is exactly what that member says.
+
+        Returns:
+            The recorded outcome of the single startup persist attempt.
+
+        """
+        return self._profile_storage
+
     def profile_names(self) -> list[str]:
         """
         List the configured profile names, in configuration order.
@@ -808,12 +909,25 @@ class ScanWorker:
 
         """
         try:
-            devices = self._scanner.get_devices()
-            if not devices:
-                logger.warning("Auto-profiles: no scanners found, using bare default")
-                return None
-            device_id = self._settings.scanner.device or devices[0].name
-            caps = self._scanner.get_capabilities(device_id)
+            # Gated for the same reason _scan_job is (D-08, Pitfall 2), and it
+            # is a real second entry into SANE rather than a precaution:
+            # get_devices() is an enumeration RPC on the net backend's control
+            # wire, and get_capabilities() opens the device and reads its
+            # option list.  Held across both, because a probe slipping between
+            # them is inside SANE just as surely as one during either.
+            #
+            # No re-entrancy hazard: this runs once, as the worker thread's
+            # first act, strictly before any job -- so the gate is never
+            # already held by this thread when it arrives here.
+            with self._scanner_gate:
+                devices = self._scanner.get_devices()
+                if not devices:
+                    logger.warning(
+                        "Auto-profiles: no scanners found, using bare default"
+                    )
+                    return None
+                device_id = self._settings.scanner.device or devices[0].name
+                caps = self._scanner.get_capabilities(device_id)
             return generate_profiles(caps)
         except Exception as exc:
             # D-15: the exception class is named, never interpreted.  The old
@@ -854,6 +968,7 @@ class ScanWorker:
                 "--config or create one of %s to keep them",
                 ", ".join(str(path) for path in config_search_paths()),
             )
+            self._profile_storage = ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
             return None
         try:
             result = write_profiles_to_config(config_path, profiles)
@@ -868,6 +983,7 @@ class ScanWorker:
                 type(exc).__name__,
                 exc,
             )
+            self._profile_storage = ProfileStorage.IN_MEMORY_UNWRITABLE
             return None
         except Exception as exc:
             # WR-04: anything else -- a tomlkit container error, say; a parse
@@ -882,12 +998,17 @@ class ScanWorker:
                 type(exc).__name__,
                 exc_info=True,
             )
+            # The same outcome as the branch above, and deliberately so: two
+            # causes, one fact.  A file was loaded, and the profiles did not
+            # reach it.  The row says that; the log says why.
+            self._profile_storage = ProfileStorage.IN_MEMORY_UNWRITABLE
             return None
         logger.info(
             "Auto-profiles: %s: %s",
             result.path,
             "; ".join(result.describe()) or "no changes",
         )
+        self._profile_storage = ProfileStorage.PERSISTED
         return result
 
     def _run(self) -> None:
@@ -1255,6 +1376,11 @@ class ScanWorker:
             # the idle tick, where its failure cannot fail a job (D-13).
             self._flip_coordinator = None
             self._current_job_id = None
+            # Cleared here rather than at the start of the next job, so no
+            # observer can ever read the previous job's count against a row
+            # that has already moved on (D-33).
+            with self._front_pages_lock:
+                self._front_pages = None
 
     def _scan_job(self, job: Job) -> None:
         """
@@ -1288,6 +1414,16 @@ class ScanWorker:
 
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
             self._job_store.update_thumbnail(_jid, thumb)
+
+        # The back count is ignored on purpose.  It arrives a moment before the
+        # ScanResult that carries the run's real total, so storing it would
+        # replace the number the operator is reading with one that is about to
+        # be replaced again -- a flicker in place of information (D-33).
+        def _pass_count_cb(label: str, count: int) -> None:
+            if label != SCAN_LABEL_FRONT:
+                return
+            with self._front_pages_lock:
+                self._front_pages = count
 
         # The worker persisted SCANNING just above, before starting the
         # pipeline.  run_pipeline re-announces it as its first event; rewriting
@@ -1339,15 +1475,27 @@ class ScanWorker:
             correspondent=job.correspondent,
             status_callback=_status_cb,
             thumbnail_callback=_thumbnail_cb,
+            pass_count_callback=_pass_count_cb,
             flip_coordinator=coordinator,
         )
         try:
-            result = run_pipeline(
-                self._scanner,
-                self._paperless,
-                self._settings,
-                request,
-            )
+            # The gate covers the whole pipeline call, which is the whole of
+            # this job's contact with the scanner -- both passes, the flip wait
+            # between them, and the assembly and upload that follow.  Wrapping
+            # only the scan_pages calls would leave the flip wait ungated, and
+            # a manual-duplex job spends most of its life there with the feeder
+            # loaded and the device open (D-08).
+            #
+            # ``with`` rather than acquire/release, so every exit path -- a
+            # jam, an Abort, a shutdown, a Paperless failure -- hands the
+            # scanner back.  The release happens before the except block runs.
+            with self._scanner_gate:
+                result = run_pipeline(
+                    self._scanner,
+                    self._paperless,
+                    self._settings,
+                    request,
+                )
         except Exception as exc:
             # No result argument: outcome, warning and all three page counts
             # stay NULL.  NULL means "never recorded"; 0 would claim a
