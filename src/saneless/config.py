@@ -48,14 +48,19 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_RESOLUTION",
+    "PLACEHOLDER_TOKENS",
+    "PROFILE_DESCRIPTION_MAX_LENGTH",
+    "PROFILE_LABEL_MAX_LENGTH",
     "LogLevel",
     "OutputConfig",
     "PaperlessConfig",
     "ProfileConfig",
     "ScannerConfig",
     "Settings",
+    "WebConfig",
     "config_search_paths",
     "env_sourced_keys",
+    "is_placeholder_token",
     "load_settings",
     "log_config_sources",
     "resolve_job_title",
@@ -73,6 +78,18 @@ DEFAULT_RESOLUTION = 300
 300 DPI is the minimum recommended by Tesseract OCR and the industry
 standard for professional document scanning. See Phase 11 research.
 """
+
+# The bounds on the two generated profile text fields (D-18, APPL-05). Named
+# constants rather than inline integers, the way TITLE_MAX_LENGTH is, so the
+# schema, the generator and the tests read the same number. A label is an
+# option's text and a description is one short sentence beneath it; both are
+# rendered into HTML, so they are bounded for the same reason default_title is
+# (T-30-06, T-30-08, ROBU-08).
+PROFILE_LABEL_MAX_LENGTH: Final = 64
+"""The longest ``profiles.<name>.label`` a config may carry."""
+
+PROFILE_DESCRIPTION_MAX_LENGTH: Final = 200
+"""The longest ``profiles.<name>.description`` a config may carry."""
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 """The logging level names ``output.log_level`` accepts (CFG-04, M-21).
@@ -217,6 +234,68 @@ class ScannerConfig(BaseModel):
     device: str = ""
 
 
+# Every token value the project has ever shipped as a stand-in, plus the
+# obvious hand-written ones.  Compared exactly, never as substrings (D-14).
+PLACEHOLDER_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        # Shipped today at docker-compose.yml:30 and docs/reference/docker.md:178.
+        "changeme",
+        "change-me",
+        "change_me",
+        # What saneless.toml.example carries.  Pinned by
+        # TestPlaceholderToken.test_the_example_config_ships_a_token_the_predicate_refuses,
+        # which reads the file rather than hard-coding the value, so the
+        # example and this set cannot drift apart.
+        "your-api-token-here",
+        # The rest of the your-token-here family, and the bare noun.
+        "your-token-here",
+        "your_token_here",
+        "your-api-token",
+        "yourtokenhere",
+        "token",
+        "api-token",
+        "replace-me",
+        "replaceme",
+        "placeholder",
+        "xxx",
+        "todo",
+    }
+)
+"""The literal token values that mean "nobody has configured this" (APPL-07)."""
+
+
+def is_placeholder_token(value: str) -> bool:
+    """
+    Say whether a Paperless token is unset or a stand-in nobody replaced.
+
+    This is the one predicate ``doctor``, the web status strip, the scan route
+    and ``saneless scan`` share, so all four agree on whether the appliance can
+    upload (APPL-07). A value counts as a placeholder when it is empty or
+    whitespace-only, or when stripping and lower-casing it lands on a member of
+    ``PLACEHOLDER_TOKENS``.
+
+    D-14: the set is a small fixed literal set, deliberately **not** a shape
+    heuristic (no length, entropy or character-class test). Refusing a
+    legitimate token from a future paperless-ngx version is worse than missing
+    an exotic placeholder, so membership is exact and never a substring match:
+    ``changeme7f3a91`` is a real token.
+
+    ASVS V7: this function neither logs nor returns the value it is given -- it
+    returns only a ``bool``. It takes an already-unwrapped ``str``, so it adds
+    no secret-unwrapping call site to this module (CFG-05, N-15), and
+    callers must not log or render the value either.
+
+    Args:
+        value: The token as configured, already unwrapped from its SecretStr.
+
+    Returns:
+        True when the token is blank or a known placeholder literal.
+
+    """
+    normalised = value.strip().lower()
+    return not normalised or normalised in PLACEHOLDER_TOKENS
+
+
 class PaperlessConfig(BaseModel):
     """Paperless-ngx API connection settings."""
 
@@ -254,6 +333,28 @@ class ProfileConfig(BaseModel):
     # before-validator: it only ever adds ``duplex``, which is a real field.
     # populate_by_name keeps both ``title`` and ``default_title`` accepted.
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # The profile's human name and the sentence beneath it in the dropdown
+    # (APPL-05, UI-SPEC S4). Declared first so a human opening the file reads
+    # the human name before the machine settings.
+    #
+    # D-18: these are persisted, tool-owned keys. They join Phase 27 D-02's
+    # owned key set and behave exactly like ``source`` / ``mode`` /
+    # ``resolution``: ``saneless auto-profiles`` writes them, ``--force``
+    # overwrites them in place, and D-03's "an owned key a fresh generation
+    # does not write is deleted" applies. The operator's escape hatch is the
+    # documented one -- remove ``auto_generated`` to take the profile over.
+    #
+    # Bounded for the same reason ``default_title`` is: they are rendered into
+    # HTML, and nothing else bounds what a config file can put on the page
+    # (T-30-06, T-30-08, ROBU-08).
+    #
+    # Defaulting to ``""`` is what keeps a config written before this phase
+    # loading under ``extra="forbid"``; the dropdown renders ``label or name``
+    # (Amendment A-3) so a pre-existing generated profile is never a blank
+    # option.
+    label: str = Field(default="", max_length=PROFILE_LABEL_MAX_LENGTH)
+    description: str = Field(default="", max_length=PROFILE_DESCRIPTION_MAX_LENGTH)
 
     source: str = "Flatbed"
     resolution: int = DEFAULT_RESOLUTION
@@ -437,6 +538,33 @@ class OutputConfig(BaseModel):
         return Path(self.data_dir) / "failed"
 
 
+class WebConfig(BaseModel):
+    """Which optional controls the scan form shows."""
+
+    # An unknown key is an error, not silently dropped (CFG-01, M-18). Here it
+    # also means a mistyped key cannot quietly leave a control visible that the
+    # operator meant to hide (T-30-07).
+    model_config = ConfigDict(extra="forbid")
+
+    # D-28 and D-29 together. D-28: this is one appliance with one configured
+    # form shape, not a per-browser toggle -- the household member never sees a
+    # control the owner turned off, and the shape is testable without a
+    # browser. D-29: hiding a control changes the form and never the scan. The
+    # profile's ``default_tags`` and ``default_correspondent`` still apply,
+    # mirroring how a blank title already falls back to the profile title
+    # through ``resolve_job_title``. Both default True so an existing
+    # deployment's form is unchanged by the upgrade.
+    show_tags: bool = True
+    show_correspondent: bool = True
+
+
+# ``web_host`` and ``web_port`` are NOT here: they stay in ``[output]``
+# (config.py's OutputConfig) because moving them would be a breaking config
+# change for every deployment that sets them. So ``[web]`` currently holds only
+# the form-shape keys, and ``[output]`` holds the server's bind address -- an
+# acknowledged incoherence (RESEARCH, the [web] placement question), preferred
+# over breaking a key operators already write.
+
 _ENV_PREFIX: Final = "SANELESS_"
 """The environment variable prefix; the unknown-variable scan uses it too."""
 
@@ -467,6 +595,10 @@ class Settings(BaseSettings):
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     paperless: PaperlessConfig = Field(default_factory=PaperlessConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    # default_factory for the same reason the three above use one: a plain
+    # ``WebConfig()`` default would be built once at import, and every section
+    # on Settings uses a factory so none of them can freeze import-time state.
+    web: WebConfig = Field(default_factory=WebConfig)
     profiles: dict[str, ProfileConfig] = {"default": ProfileConfig()}
 
     # A PrivateAttr, not a field: a field would be settable from
@@ -580,10 +712,18 @@ def warn_on_legacy_duplex_sources(settings: Settings) -> None:
             )
 
 
+# Hand-maintained, and it must stay in step with ``Settings``' own fields: the
+# other readers derive from ``Settings.model_fields``, but ``_render_error``
+# looks the section's model up here, so a section missing from this mapping
+# loads fine and then renders a bare pydantic message instead of the D-11
+# "unknown key ...; valid keys: ..." line. TestEverySectionRendersUnknownKeys
+# parametrises over ``Settings``' own sections, so a section added to one and
+# not the other fails at once rather than silently losing its error line.
 _SECTION_MODELS: Final[dict[str, type[BaseModel]]] = {
     "scanner": ScannerConfig,
     "paperless": PaperlessConfig,
     "output": OutputConfig,
+    "web": WebConfig,
 }
 """The plain ``Settings`` sections, each a single table of keys (D-11)."""
 

@@ -17,10 +17,15 @@ from pydantic import ValidationError
 import saneless.config as config_mod
 from saneless.config import (
     DEFAULT_RESOLUTION,
+    PLACEHOLDER_TOKENS,
+    PROFILE_DESCRIPTION_MAX_LENGTH,
+    PROFILE_LABEL_MAX_LENGTH,
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
     Settings,
+    WebConfig,
+    is_placeholder_token,
     load_settings,
     resolve_job_title,
     validate_settings_dirs,
@@ -1119,7 +1124,7 @@ class TestUnknownEnvironmentVariables:
             load_settings()
         line = _env_line(exc_info.value, "SANELESS_PAPERLES__TOKEN")
         assert "did you mean SANELESS_PAPERLESS__TOKEN" in line
-        assert "valid sections: scanner, paperless, output, profiles" in line
+        assert "valid sections: scanner, paperless, output, web, profiles" in line
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_unknown_env_single_underscore_suggests_double(
@@ -2029,3 +2034,312 @@ class TestDataDir:
         settings = load_settings()
         assert settings.output.data_dir == str(override)
         assert settings.output.db_path == override / "saneless.db"
+
+
+class TestPlaceholderToken:
+    """
+    ``is_placeholder_token`` is an exact-match predicate, not a heuristic (D-14).
+
+    ``doctor``, the status strip, the scan route and ``saneless scan`` must all
+    agree on whether the appliance can upload, so there is one predicate. The
+    set is a small fixed literal set deliberately: refusing a legitimate token
+    from a future paperless-ngx version is worse than missing an exotic
+    placeholder (APPL-07).
+    """
+
+    @pytest.mark.parametrize("blank", ["", " ", "   ", "\t\n", "\t \n "])
+    def test_blank_is_a_placeholder(self, blank: str) -> None:
+        """An unset or whitespace-only token is a placeholder."""
+        assert is_placeholder_token(blank) is True
+
+    @pytest.mark.parametrize("token", sorted(PLACEHOLDER_TOKENS))
+    def test_every_literal_in_the_set_is_a_placeholder(self, token: str) -> None:
+        """Every member of PLACEHOLDER_TOKENS is recognised."""
+        assert is_placeholder_token(token) is True
+
+    @pytest.mark.parametrize(
+        "known",
+        [
+            "changeme",
+            "your-token-here",
+            "your-api-token-here",
+            "your_token_here",
+            "token",
+            "replace-me",
+        ],
+    )
+    def test_the_documented_literals_are_members(self, known: str) -> None:
+        """The literals the docs and compose file ship are in the set."""
+        assert known in PLACEHOLDER_TOKENS
+
+    @pytest.mark.parametrize(
+        "written",
+        ["CHANGEME", " changeme ", "ChangeMe", "\tCHANGEME\n", "YOUR-TOKEN-HERE"],
+    )
+    def test_case_and_surrounding_space_do_not_hide_a_placeholder(
+        self, written: str
+    ) -> None:
+        """Matching is case-insensitive after stripping."""
+        assert is_placeholder_token(written) is True
+
+    @pytest.mark.parametrize(
+        "real",
+        [
+            "40characterhexlookingrealapitokenvalue00",
+            "changeme7f3a91",
+            "my-changeme",
+            "notchangeme",
+            "tokenizer",
+            "your-token-here-really",
+        ],
+    )
+    def test_a_real_token_is_not_a_placeholder(self, real: str) -> None:
+        """Membership is exact: a superstring of a placeholder is a real token."""
+        assert is_placeholder_token(real) is False
+
+    def test_the_example_config_ships_a_token_the_predicate_refuses(self) -> None:
+        """
+        ``saneless.toml.example``'s token is a member, read not hard-coded.
+
+        The example and the predicate cannot drift apart: if someone edits the
+        example's placeholder, this test fails until the set is updated.
+        """
+        example = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "saneless.toml.example").read_text()
+        )
+        shipped = example["paperless"]["token"]
+        assert shipped in PLACEHOLDER_TOKENS
+        assert is_placeholder_token(shipped) is True
+
+    def test_predicate_is_annotated_to_take_a_plain_string(self) -> None:
+        """
+        The predicate takes an already-unwrapped ``str`` (CFG-05, ASVS V7).
+
+        Asserted on the annotation rather than by calling it with a
+        ``SecretStr``, because a call that type-checkers reject would need a
+        suppression to write down.
+        """
+        assert is_placeholder_token.__annotations__["value"] == "str"
+        assert is_placeholder_token.__annotations__["return"] == "bool"
+
+    def test_config_module_adds_no_secret_unwrap_site(self) -> None:
+        """
+        The predicate adds no secret-unwrapping call to ``config.py``.
+
+        Only ``cli.py scan`` and ``web/app.py create_app`` unwrap the token
+        (T-30-05, N-15); ``config.py`` itself never does, and naming the method
+        in a comment is not a call site -- the call form is what is asserted.
+        """
+        source = Path(config_mod.__file__).read_text()
+        assert ".get_secret_value(" not in source
+
+
+class TestProfileLabelAndDescription:
+    """
+    ``label`` and ``description`` are persisted, tool-owned profile keys (D-18).
+
+    ``saneless auto-profiles`` writes them and ``--force`` overwrites them in
+    place; the operator's escape hatch is removing ``auto_generated``. Both
+    default to ``""`` so a config written before this phase still loads under
+    ``extra="forbid"`` (APPL-05).
+    """
+
+    def test_both_default_to_empty(self) -> None:
+        """A profile constructed with neither key has both as ``""``."""
+        profile = ProfileConfig()
+        assert profile.label == ""
+        assert profile.description == ""
+
+    def test_both_round_trip_from_toml(self, tmp_config_dir: Path) -> None:
+        """A TOML table carrying both keys loads both values verbatim."""
+        config_file = tmp_config_dir / "labelled.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'label = "Feeder, double-sided"\n'
+            'description = "Scans both sides of every page using the feeder."\n'
+        )
+        profile = load_settings(config_path=str(config_file)).profiles["default"]
+        assert profile.label == "Feeder, double-sided"
+        assert profile.description == "Scans both sides of every page using the feeder."
+
+    def test_a_config_written_before_this_phase_still_loads(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A profile table with neither key loads under ``extra="forbid"``.
+
+        Defaulting to ``""`` is what keeps an existing deployment loading; the
+        dropdown renders ``label or name`` (Amendment A-3) so such a profile is
+        never a blank option.
+        """
+        config_file = tmp_config_dir / "pre_phase.toml"
+        config_file.write_text(
+            '[profiles.default]\nsource = "Flatbed"\n'
+            "resolution = 300\nauto_generated = true\n"
+        )
+        profile = load_settings(config_path=str(config_file)).profiles["default"]
+        assert profile.label == ""
+        assert profile.description == ""
+        assert profile.auto_generated is True
+
+    def test_label_over_max_length_is_rejected(self) -> None:
+        """An over-long label fails validation; it is rendered into HTML."""
+        with pytest.raises(ValidationError, match="label"):
+            ProfileConfig(label="x" * (PROFILE_LABEL_MAX_LENGTH + 1))
+
+    def test_label_at_max_length_is_accepted(self) -> None:
+        """A label of exactly PROFILE_LABEL_MAX_LENGTH characters loads."""
+        label = "x" * PROFILE_LABEL_MAX_LENGTH
+        assert ProfileConfig(label=label).label == label
+
+    def test_description_over_max_length_is_rejected(self) -> None:
+        """An over-long description fails validation (T-30-08, ROBU-08)."""
+        with pytest.raises(ValidationError, match="description"):
+            ProfileConfig(description="x" * (PROFILE_DESCRIPTION_MAX_LENGTH + 1))
+
+    def test_description_at_max_length_is_accepted(self) -> None:
+        """A description of exactly its cap loads."""
+        text = "x" * PROFILE_DESCRIPTION_MAX_LENGTH
+        assert ProfileConfig(description=text).description == text
+
+    def test_label_has_no_alias(self) -> None:
+        """
+        ``label`` is spelled one way; ``populate_by_name`` gives it no second name.
+
+        ``default_title`` carries the ``title`` alias, so the error machinery
+        lists aliases -- ``label`` deliberately has none to list.
+        """
+        assert ProfileConfig.model_fields["label"].alias is None
+        assert ProfileConfig.model_fields["description"].alias is None
+
+    def test_both_are_listed_as_valid_profile_keys(self, tmp_config_dir: Path) -> None:
+        """A profile typo lists ``label`` and ``description`` among valid keys."""
+        err = _load_error(
+            tmp_config_dir / "labl.toml",
+            '[profiles.default]\nlabl = "x"\n',
+        )
+        matching = [line for line in _error_lines(err) if "unknown key 'labl'" in line]
+        assert len(matching) == 1
+        valid = matching[0].split("valid keys: ", 1)[1].split(", ")
+        assert "label" in valid
+        assert "description" in valid
+
+
+class TestWebConfig:
+    """
+    The ``[web]`` section decides the scan form's shape (D-28, D-29, APPL-10).
+
+    One appliance, one configured form shape -- not a per-browser toggle. Both
+    keys default on, so an existing deployment's form is unchanged, and hiding
+    a control changes the form and never the scan.
+    """
+
+    def test_web_config_both_default_on(self) -> None:
+        """Directly constructed Settings show both optional controls."""
+        settings = Settings()
+        assert settings.web.show_tags is True
+        assert settings.web.show_correspondent is True
+
+    def test_web_config_absent_table_gets_the_defaults(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """A config file that predates the section loads with both defaults."""
+        config_file = tmp_config_dir / "no_web.toml"
+        config_file.write_text('[scanner]\nhost = "192.168.1.50"\n')
+        settings = load_settings(config_path=str(config_file))
+        assert settings.web.show_tags is True
+        assert settings.web.show_correspondent is True
+
+    def test_web_config_toml_turns_a_control_off(self, tmp_config_dir: Path) -> None:
+        """``[web] show_tags = false`` hides the tag control."""
+        config_file = tmp_config_dir / "web_off.toml"
+        config_file.write_text("[web]\nshow_tags = false\n")
+        settings = load_settings(config_path=str(config_file))
+        assert settings.web.show_tags is False
+        assert settings.web.show_correspondent is True
+
+    def test_web_config_env_var_turns_a_control_off(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``SANELESS_WEB__SHOW_TAGS=false`` hides the tag control."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("SANELESS_WEB__SHOW_TAGS", "false")
+        settings = load_settings()
+        assert settings.web.show_tags is False
+
+    def test_web_config_unknown_key_is_a_rendered_error(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A mistyped ``[web]`` key is a loud error, not a silent default (T-30-07).
+
+        The new section must be visible to the same unknown-key machinery that
+        renders ``[paperless] unknown key 'tokne'``.
+        """
+        err = _load_error(
+            tmp_config_dir / "web_typo.toml",
+            "[web]\nshow_tag = false\n",
+        )
+        assert (
+            "  [web] unknown key 'show_tag' (did you mean 'show_tags'?); "
+            "valid keys: show_tags, show_correspondent"
+        ) in _error_lines(err)
+
+    def test_web_config_key_under_wrong_section_says_where_it_belongs(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``show_tags`` under ``[output]`` is pointed at ``[web]``."""
+        err = _load_error(
+            tmp_config_dir / "web_misplaced.toml",
+            "[output]\nshow_tags = false\n",
+        )
+        assert "  [output] unknown key 'show_tags'; it belongs in [web]" in (
+            _error_lines(err)
+        )
+
+    def test_web_config_is_extra_forbid(self) -> None:
+        """WebConfig forbids unknown keys the way every other section does."""
+        assert WebConfig.model_config["extra"] == "forbid"
+
+    def test_web_config_is_built_with_a_default_factory(self) -> None:
+        """
+        ``web`` is hung with ``default_factory``, matching the other sections.
+
+        A plain instance default is built once at import; every section on
+        ``Settings`` uses a factory so none can freeze import-time state
+        (config.py's comment on ``scanner``/``paperless``/``output``).
+        """
+        field = Settings.model_fields["web"]
+        assert field.default_factory is WebConfig
+
+
+class TestEverySectionRendersUnknownKeys:
+    """
+    Every plain section renders the D-11 unknown-key line, not a bare message.
+
+    The error renderer looks a section's model up in a hand-maintained mapping,
+    while every other reader derives the section list from ``Settings``' own
+    fields. A section added to one and not the other loads fine and then falls
+    back to pydantic's bare "Extra inputs are not permitted" -- exactly the
+    silence CFG-01 exists to remove. Asserted over the sections themselves so a
+    future section cannot be added without being wired up (CFG-01, M-18).
+    """
+
+    @pytest.mark.parametrize(
+        "section", sorted(set(Settings.model_fields) - {"profiles"})
+    )
+    def test_section_names_its_valid_keys(
+        self, section: str, tmp_config_dir: Path
+    ) -> None:
+        """An unknown key names the section, the key and that section's keys."""
+        err = _load_error(
+            tmp_config_dir / f"{section}_bogus.toml",
+            f"[{section}]\nzzz_bogus_key = 1\n",
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith(f"  [{section}] unknown key 'zzz_bogus_key'")
+        ]
+        assert len(matching) == 1
+        assert "valid keys: " in matching[0]
