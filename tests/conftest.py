@@ -21,13 +21,14 @@ from saneless.config import (
 )
 from saneless.paperless import UploadResult
 from saneless.pipeline import FlipCoordinator
-from saneless.scanner.base import ScanBatch, ScannerBackend
+from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
 from saneless.vocabulary import FlipOutcome
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
     from saneless.job import Job, JobStore
+    from saneless.scanner.base import DeviceInfo, PageRecord, PageSink, ScanSettings
     from saneless.vocabulary import JobState
 
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
@@ -162,8 +163,27 @@ def default_settings() -> Settings:
     )
 
 
+def _inked_page() -> Image.Image:
+    """
+    Return a 100x100 page with a black square on it.
+
+    Inked rather than blank, because a blank page is what
+    ``pipeline._drop_empty_pages`` exists to remove: a stub handing back a
+    white rectangle makes every empty-page-detection profile delete the whole
+    scan, and the test then fails somewhere that has nothing to do with it.
+
+    Returns:
+        A fresh image; callers may spool or mutate it.
+
+    """
+    image = Image.new("RGB", (100, 100), "white")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([10, 10, 90, 90], fill="black")
+    return image
+
+
 def scan_batch(
-    pages: list[Image.Image],
+    pages: Sequence[PageRecord],
     *,
     resolution: int = 300,
     rejected: int = 0,
@@ -176,20 +196,215 @@ def scan_batch(
     ``MagicMock`` will return whatever it is given, that mismatch surfaces as a
     confusing failure deep in the pipeline rather than at the stub.
 
+    ``pages`` is the ordered ``PageRecord`` tuple a sink produced, not a list of
+    images (D-01). A test that only needs "a scan happened" should not hand-build
+    records for this: ``spooling`` runs real pages through the caller's own sink
+    and the records come back from there, so the spooled files behind them
+    actually exist.
+
     The two extra facts default to "nothing surprising happened": the device
     honoured the resolution it was asked for and rejected no sheets. A test that
     cares about either passes it explicitly.
 
     Args:
-        pages: The pages the stubbed scan produced.
+        pages: The records the stubbed scan produced, in document order.
         resolution: The resolution the device reports having actually used.
         rejected: How many fed sheets failed their integrity checks.
 
     Returns:
-        A ScanBatch carrying those pages and both facts.
+        A ScanBatch carrying those records and both facts.
 
     """
-    return ScanBatch(pages=pages, actual_resolution=resolution, pages_rejected=rejected)
+    return ScanBatch(
+        pages=tuple(pages), actual_resolution=resolution, pages_rejected=rejected
+    )
+
+
+def spooling(
+    pages: Sequence[Image.Image],
+    *,
+    resolution: int = 300,
+    rejected: int = 0,
+) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
+    """
+    Build the ``side_effect`` a stubbed ``scan_pages`` needs (D-01).
+
+    A factory returning a callable, rather than a ready-made batch for
+    ``return_value``, because the sink does not exist until the call happens:
+    it is the pipeline's, created inside the per-job workspace, and the records
+    in the batch are whatever *that* sink gives back. A batch built in advance
+    could only carry records the pipeline never made, pointing at files that
+    were never written.
+
+    The same argument ``scan_batch`` records still applies to the shape of the
+    stub itself: a ``MagicMock`` returns whatever it is given, so a stub that
+    does not model the backend surfaces as a confusing failure deep in the
+    pipeline rather than at the stub. Modelling the backend now means taking
+    the sink and filling it.
+
+    Args:
+        pages: The pages the stubbed scan hands to the sink, in order.
+        resolution: The resolution the device reports having actually used.
+        rejected: How many fed sheets failed their integrity checks.
+
+    Returns:
+        One callable with ``scan_pages``' own ``(device_id, settings, sink)``
+        shape, ready to assign to ``MagicMock.side_effect``.
+
+    """
+
+    def _spool_pages(
+        device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """Spool every page into the sink the caller supplied."""
+        records = [sink.add(page) for page in pages]
+        return scan_batch(records, resolution=resolution, rejected=rejected)
+
+    return _spool_pages
+
+
+def spooling_in_turn(
+    *page_lists: Sequence[Image.Image],
+    resolution: int = 300,
+) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
+    """
+    Build one ``side_effect`` that spools a different list per call.
+
+    For manual duplex, where pass A and pass B are two ``scan_pages`` calls on
+    the same stub and have to produce different pages.
+
+    ONE callable that counts its own calls, never a list of callables:
+    ``unittest.mock`` calls a ``side_effect`` only when the ``side_effect``
+    itself is callable, and a *list* is consumed as an iterable of results, so
+    each element is handed back as-is. A list of functions would therefore make
+    ``scan_pages`` return a function object, and the failure lands wherever the
+    pipeline first treats it as a batch (29-RESEARCH.md Pitfall 5). The
+    in-repo precedent is ``tests/test_worker.py``'s ``_PassBGatedScanner``,
+    which tracks ``scan_calls`` on itself for the same reason.
+
+    Args:
+        page_lists: One list of pages per expected call, in call order.
+        resolution: The resolution the device reports having actually used.
+
+    Returns:
+        One callable with ``scan_pages``' own ``(device_id, settings, sink)``
+        shape, ready to assign to ``MagicMock.side_effect``.
+
+    """
+    calls = 0
+
+    def _spool_next(
+        device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """Spool the list belonging to this call number."""
+        nonlocal calls
+        index = calls
+        calls += 1
+        if index >= len(page_lists):
+            msg = (
+                f"scan_pages was called {calls} time(s), but spooling_in_turn "
+                f"was given only {len(page_lists)} page list(s)"
+            )
+            raise AssertionError(msg)
+        records = [sink.add(page) for page in page_lists[index]]
+        return scan_batch(records, resolution=resolution)
+
+    return _spool_next
+
+
+def images_of(batch: ScanBatch) -> list[Image.Image]:
+    """
+    Read a batch's spooled pages back, in record order.
+
+    The pages a scan produced are files now, so an assertion about what was
+    scanned has to open them. This is the one place that happens, so an
+    existing image assertion survives the record switch by being handed
+    ``images_of(batch)`` instead of ``batch.pages`` -- a one-line change per
+    site rather than a rewrite.
+
+    Order comes from the record list and nothing else: the directory is never
+    sorted or globbed, which is the invariant HARD-01's own test attacks (D-02).
+
+    Args:
+        batch: The batch whose spooled pages to read.
+
+    Returns:
+        The pages, fully loaded so no file handle is left open, in the order
+        the records are in.
+
+    """
+    images: list[Image.Image] = []
+    for record in batch.pages:
+        image = Image.open(record.path)
+        # Forces the read now and lets Pillow close the file it opened; a
+        # lazy ImageFile would trip the suite's ResourceWarning-as-error.
+        image.load()
+        images.append(image)
+    return images
+
+
+class StubScannerBackend(ScannerBackend):
+    """
+    A concrete one-page scanner backend for tests that are not about scanning.
+
+    The seven near-identical stub classes across the web, cross-origin and
+    lifespan tests differ only in ``scan_pages``; ``get_devices`` and
+    ``get_capabilities`` are the same everywhere. They live here so a subclass
+    overrides the one method it cares about.
+
+    Subclasses the ABC rather than duck-typing it, for the reason Phase 24's
+    WR-08 measured and ``tests/test_cli.py``'s ``MockSaneBackend`` records:
+    every stub that subclassed was caught by the type checkers when its
+    contract changed, and the ones that did not were missed. This phase is
+    exactly such a contract change, which is what makes the point again.
+
+    Import it as ``from tests.conftest import StubScannerBackend``; the bare
+    ``conftest`` form raises ``ModuleNotFoundError`` under pytest 9's importlib
+    mode.
+    """
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Report no devices.
+
+        Returns:
+            An empty list.
+
+        """
+        return []
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Report a plain flatbed at one resolution.
+
+        Args:
+            device_id: Ignored; every device answers the same here.
+
+        Returns:
+            Capabilities naming one source, one resolution and one mode.
+
+        """
+        return DeviceCapabilities(
+            sources=["Flatbed"], resolutions=[300], modes=["color"]
+        )
+
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Spool exactly one inked page.
+
+        Args:
+            device_id: Ignored; this stub scans nothing real.
+            settings: Only ``resolution`` is used, and only to report it back.
+            sink: The caller's sink, which receives the one page.
+
+        Returns:
+            A batch of the single record the sink returned.
+
+        """
+        record = sink.add(_inked_page())
+        return scan_batch([record], resolution=settings.resolution)
 
 
 class AlwaysContinueFlipCoordinator(FlipCoordinator):
@@ -226,12 +441,9 @@ class AlwaysContinueFlipCoordinator(FlipCoordinator):
 
 @pytest.fixture
 def mock_scanner() -> MagicMock:
-    """Return a mock ScannerBackend returning a single image with content."""
+    """Return a mock ScannerBackend spooling a single image with content."""
     scanner = MagicMock(spec=ScannerBackend)
-    img = Image.new("RGB", (100, 100), "white")
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([10, 10, 90, 90], fill="black")
-    scanner.scan_pages.return_value = scan_batch([img])
+    scanner.scan_pages.side_effect = spooling([_inked_page()])
     return scanner
 
 
