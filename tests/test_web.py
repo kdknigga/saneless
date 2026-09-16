@@ -55,8 +55,10 @@ from saneless.vocabulary import (
     error_next_step,
     local_time,
     page_counts,
+    progress_label,
     rejection_message,
 )
+from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
@@ -1307,3 +1309,248 @@ class TestOwnerCookie:
         for body in (page.text, polled.text, answered.text):
             assert minted not in body
         assert minted not in caplog.text
+
+
+# --- The followed job and the queue line (APPL-08, D-25) ---------------------
+
+
+def _displayed(markup: str) -> str:
+    """
+    Return the markup with its HTML entities resolved, as a reader sees it.
+
+    Jinja autoescapes the whole busy line, and APPL-08's copy quotes the title
+    with apostrophes, so the sentence is spelled with entities in the markup
+    and only reads back as written once they are resolved.  Copy assertions use
+    this; escaping assertions deliberately do not, because unescaping first
+    would make them vacuous.
+
+    Args:
+        markup: The rendered response body.
+
+    Returns:
+        The same text with entities resolved.
+
+    """
+    return html.unescape(markup)
+
+
+def _running_job(client: TestClient, title: str) -> str:
+    """
+    Create a SCANNING job and make it the worker's current job.
+
+    Args:
+        client: The client whose app owns the store and worker.
+        title: The document title to give it.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title=title)
+    job_store.update_state(job.id, JobState.SCANNING)
+    _app(client).state.worker._current_job_id = job.id
+    return job.id
+
+
+def _queued_job(client: TestClient, title: str) -> str:
+    """
+    Create a job and leave it PENDING, waiting in the queue.
+
+    Args:
+        client: The client whose app owns the store.
+        title: The document title to give it.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    return job_store.create_job(profile="default", title=title).id
+
+
+class TestFollowedJob:
+    """
+    The status area follows the job this browser submitted (D-25).
+
+    A submitter who sees another household member's scan reported back at them
+    learns nothing about their own, which is the whole of APPL-08's complaint.
+    """
+
+    def test_followed_job_status_reports_that_job_not_the_running_one(
+        self, client: TestClient
+    ) -> None:
+        """The named job is rendered whatever the worker happens to be running."""
+        _running_job(client, "Someone Elses Scan")
+        job_store: JobStore = _app(client).state.job_store
+        mine = job_store.create_job(profile="default", title="My Scan")
+        job_store.finish_job(mine.id, JobState.DONE)
+
+        response = client.get(f"/api/jobs/{mine.id}/status")
+
+        assert response.status_code == 200
+        assert "Done: My Scan" in response.text
+        assert "Someone Elses Scan" not in response.text
+
+    def test_followed_job_status_falls_back_when_the_id_is_unknown(
+        self, client: TestClient
+    ) -> None:
+        """
+        A pruned job degrades to today's inference, not to a 404.
+
+        A 404 would also confirm to a caller which ids exist, which is a fact
+        the appliance has no reason to hand out (T-30-61).
+        """
+        _running_job(client, "Still Running")
+
+        followed = client.get("/api/jobs/no-such-job-at-all/status")
+        current = client.get("/api/jobs/current/status")
+
+        assert followed.status_code == 200
+        assert followed.text == current.text
+
+    def test_followed_job_poll_url_names_the_followed_job(
+        self, client: TestClient
+    ) -> None:
+        """An active followed job keeps being polled by id."""
+        job_id = _running_job(client, "Polled By Id")
+
+        response = client.get(f"/api/jobs/{job_id}/status")
+
+        assert f'hx-get="/api/jobs/{job_id}/status"' in response.text
+
+    def test_followed_job_unknown_id_polls_the_current_url(
+        self, client: TestClient
+    ) -> None:
+        """The fallback rendering polls the current-job URL, as it always did."""
+        _running_job(client, "Still Running")
+
+        response = client.get("/api/jobs/no-such-job-at-all/status")
+
+        assert 'hx-get="/api/jobs/current/status"' in response.text
+
+    def test_followed_job_id_is_baked_into_the_scan_response(
+        self, accepting_client: TestClient
+    ) -> None:
+        """POST /api/scan hands back a poll URL naming the job it created."""
+        job_id = _submit_scan(accepting_client, "Freshly Submitted")
+
+        response = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Second Submit"}
+        )
+
+        newest = _newest_job(accepting_client).id
+        assert newest != job_id
+        assert f'hx-get="/api/jobs/{newest}/status"' in response.text
+
+    def test_followed_job_current_status_route_is_unchanged(
+        self, client: TestClient
+    ) -> None:
+        """A browser that submitted nothing keeps today's route and inference."""
+        _running_job(client, "Inferred")
+
+        response = client.get("/api/jobs/current/status")
+
+        assert response.status_code == 200
+        assert 'hx-get="/api/jobs/current/status"' in response.text
+        assert "/api/jobs/current/status" in response.text
+
+
+class TestQueueLine:
+    """
+    What a queued submitter is told while they wait (APPL-08, UI-SPEC S5).
+
+    Every case renders through the existing busy branch; no new state branch is
+    added, which is what keeps the flip controls disappearing the moment a job
+    leaves AWAITING_FLIP.
+    """
+
+    def test_queue_line_names_the_running_job_and_the_count(
+        self, client: TestClient
+    ) -> None:
+        """One job ahead reads as APPL-08 writes it."""
+        _running_job(client, "Tax return")
+        _queued_job(client, "Ahead Of Me")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "Waiting for 'Tax return' to finish (1 ahead of you)" in _displayed(
+            response.text
+        )
+
+    def test_queue_line_says_next_in_line_for_zero_ahead(
+        self, client: TestClient
+    ) -> None:
+        """The last job in the queue is told it is next, not that zero wait."""
+        _running_job(client, "Tax return")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "Waiting for 'Tax return' to finish (next in line)" in _displayed(
+            response.text
+        )
+
+    def test_queue_line_never_says_zero_ahead_of_you(self, client: TestClient) -> None:
+        """
+        ``(0 ahead of you)`` is never rendered.
+
+        It is technically true and reads like a bug, which is the one thing
+        this milestone is spending itself on removing.
+        """
+        _running_job(client, "Tax return")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "0 ahead of you" not in _displayed(response.text)
+
+    def test_queue_line_is_absent_when_nothing_is_running(
+        self, client: TestClient
+    ) -> None:
+        """A PENDING job with an idle worker keeps the unchanged progress copy."""
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert progress_label(JobState.PENDING) in _displayed(response.text)
+        assert "Waiting for" not in _displayed(response.text)
+
+    def test_queue_line_escapes_the_running_title(self, client: TestClient) -> None:
+        """The title is user data and is autoescaped, never injected (T-30-62)."""
+        _running_job(client, "<script>alert(1)</script>")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "<script>alert(1)</script>" not in response.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+
+    def test_queue_line_shows_the_front_count_on_pass_b(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pass B leads with the pages already counted on pass A (APPL-03, D-33)."""
+        monkeypatch.setattr(ScanWorker, "front_pages", property(lambda _self: 12))
+        job_id = _running_job(client, "Duplex Stack")
+        job_store: JobStore = _app(client).state.job_store
+        job_store.update_state(job_id, JobState.SCANNING_REVERSE)
+
+        response = client.get(f"/api/jobs/{job_id}/status")
+
+        displayed = _displayed(response.text)
+        assert "Front: 12 pages · " in displayed
+        assert progress_label(JobState.SCANNING_REVERSE) in displayed
+
+    def test_queue_line_is_built_in_the_route_and_not_the_template(self) -> None:
+        """
+        The template renders one server-built string and composes nothing.
+
+        Templates own no vocabulary (Pattern C); a page that assembled its own
+        sentence would be a second place for the copy to drift.
+        """
+        status = (
+            Path(app_module.__file__).parent / "templates" / "partials" / "status.html"
+        ).read_text(encoding="utf-8")
+        assert "busy_line(" not in status
+        assert "progress_label" not in status
