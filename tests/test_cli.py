@@ -26,7 +26,7 @@ from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
 import saneless.cli as cli_module
-from saneless.cli import ClickFlipCoordinator, _truncate, cli
+from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -36,8 +36,10 @@ from saneless.config import (
 )
 from saneless.exceptions import (
     ConfigError,
+    FeederEmptyError,
     PaperlessError,
     PdfError,
+    SanelessError,
     ScanCancelledError,
     ScanError,
     StorageError,
@@ -53,7 +55,14 @@ from saneless.scanner.base import (
     ScanBatch,
     ScannerBackend,
 )
-from saneless.vocabulary import FlipOutcome, JobState, state_label
+from saneless.vocabulary import (
+    ErrorCategory,
+    FlipOutcome,
+    JobState,
+    error_next_step,
+    exit_code_for,
+    state_label,
+)
 from tests.conftest import StubScannerBackend, scan_batch
 
 if TYPE_CHECKING:
@@ -3455,3 +3464,170 @@ class TestEntryPointsCloseTheBackend:
 
         assert result.exit_code == 0, result.output
         assert [scanner.close_calls for scanner in built] == [0]
+
+
+# The five categories a SanelessError can carry through the guard to an exit
+# code that is not ExitCode.UNEXPECTED, each paired with an exception
+# classify_error maps to it.  UNKNOWN and REJECTED are deliberately absent:
+# both map to UNEXPECTED, which takes the _report_unexpected branch, and D-12
+# leaves that branch alone because its category is a guess.
+_ADVISED_CATEGORIES: list[tuple[ErrorCategory, type[SanelessError]]] = [
+    (ErrorCategory.FEEDER, FeederEmptyError),
+    (ErrorCategory.SCANNER, ScanError),
+    (ErrorCategory.CONFIG, ConfigError),
+    (ErrorCategory.UPLOAD, PaperlessError),
+    (ErrorCategory.ASSEMBLY, PdfError),
+]
+
+
+def _scan_raising(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> Result:
+    """
+    Run ``scan`` against a pipeline that raises ``exc``, and return the result.
+
+    The failure is raised from inside the command rather than from the settings
+    loader so it travels the whole ``_GuardedGroup.invoke`` path the advice line
+    is added to.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        exc: The exception the stub pipeline raises.
+
+    Returns:
+        The CliRunner result.
+
+    """
+    runner, _ = _patch_cli(monkeypatch)
+
+    def failing_pipeline(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    monkeypatch.setattr("saneless.cli.run_pipeline", failing_pipeline)
+    return runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+
+class TestFailureAdvice:
+    """
+    The second CLI line, ``Try: <next step>`` (APPL-04, D-12).
+
+    Phase 28's failure line is printed byte-identically and the advice follows
+    it on stderr, so a script parsing line 1 is unaffected.
+    """
+
+    def test_feeder_failure_prints_the_failure_line_then_the_advice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The UI-SPEC S2 specimen: the locked line, then ``Try: ``."""
+        exc = FeederEmptyError("the feeder is empty")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines[0] == "Scan error: the feeder is empty"
+        assert lines[1] == (
+            "Try: Load the pages squarely in the feeder, clear any jam, then "
+            "start the scan again."
+        )
+
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_the_advice_line_is_error_next_step_verbatim(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """Every advised category renders the shared vocabulary string."""
+        result = _scan_raising(monkeypatch, exc_type("boom"))
+
+        lines = result.stderr.strip().split("\n")
+        assert lines[1] == f"Try: {error_next_step(category)}"
+
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_line_one_is_byte_identical_now_that_advice_follows_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """The advice is additive: line 1 is still exactly _failure_line's."""
+        exc = exc_type("boom")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines[0] == _failure_line(exc, category)
+        assert len(lines) == 2
+
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_exit_codes_are_unchanged_by_the_advice_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """Phase 28's D-07 exit code per category still holds."""
+        result = _scan_raising(monkeypatch, exc_type("boom"))
+
+        assert result.exit_code == int(exit_code_for(category))
+
+    def test_the_advice_goes_to_stderr_not_stdout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A script redirecting stdout is unaffected by the advice line."""
+        result = _scan_raising(monkeypatch, FeederEmptyError("the feeder is empty"))
+
+        assert "Try: " in result.stderr
+        assert "Try: " not in result.stdout
+
+    def test_the_prefix_carries_no_colour_and_no_glyph(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The prefix is exactly ``Try: `` -- one space, nothing else."""
+        result = _scan_raising(monkeypatch, FeederEmptyError("the feeder is empty"))
+
+        advice = result.stderr.strip().split("\n")[1]
+        assert advice.startswith("Try: ")
+        assert "\x1b" not in advice
+
+    def test_an_unexpected_saneless_error_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare SanelessError takes _report_unexpected, which is unchanged."""
+        result = _scan_raising(monkeypatch, SanelessError("boom"))
+
+        assert result.exit_code == 5
+        assert "Try: " not in result.stderr
+
+    def test_a_non_saneless_exception_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The final except Exception arm is untouched by D-12."""
+        result = _scan_raising(monkeypatch, RuntimeError("boom"))
+
+        assert result.exit_code == 5
+        assert "Try: " not in result.stderr
+
+    def test_a_storage_error_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """StorageError has its own arm and its own line; it gains no advice."""
+        result = _scan_raising(monkeypatch, StorageError("db is unreadable"))
+
+        assert result.exit_code == 2
+        assert result.stderr.startswith("Job database error: db is unreadable")
+        assert "Try: " not in result.stderr
+
+    def test_a_cancelled_scan_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancel is not a failure, so there is nothing to advise (D-03)."""
+        result = _scan_raising(monkeypatch, ScanCancelledError("Cancelled"))
+
+        assert result.exit_code == 130
+        assert "Try: " not in result.stderr
+
+    def test_a_keyboard_interrupt_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl-C exits 130 with one line, as it did before D-12."""
+        result = _scan_raising(monkeypatch, KeyboardInterrupt())
+
+        assert result.exit_code == 130
+        assert "Try: " not in result.stderr
