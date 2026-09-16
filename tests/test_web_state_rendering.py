@@ -37,6 +37,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.job import JobResult
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import (
     ACTIVE_STATES,
@@ -48,6 +49,7 @@ from saneless.vocabulary import (
     RequestRejection,
     error_message,
     error_next_step,
+    page_counts,
     progress_label,
     rejection_message,
     state_label,
@@ -813,6 +815,278 @@ def test_fallback_warning_is_escaped_not_injected(client: TestClient) -> None:
     text = client.get("/api/jobs/current/status").text
     assert "<script>alert(1)</script>" not in text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+
+
+# A scan that produced twelve pages, discarded two as blank and sent ten on.
+_COUNTS = JobResult(
+    outcome=None,
+    warning=None,
+    pages_scanned=12,
+    pages_removed=2,
+    pages_uploaded=10,
+)
+
+# The one-page scan that measured no blanks. Its zero is a true measurement and
+# must render as 0; only a NULL suppresses the sentence (D-32, Pitfall 4).
+_ONE_PAGE = JobResult(
+    outcome=None,
+    warning=None,
+    pages_scanned=1,
+    pages_removed=0,
+    pages_uploaded=1,
+)
+
+# The six terminal cases UI-SPEC S3 enumerates, and what each records. Only the
+# first two record counts: `worker.py` leaves them NULL on error and on cancel,
+# `job.py` leaves them NULL on a refused submit, and no pre-Phase-23 row was
+# ever backfilled. Four of six is the common path, not an edge.
+_TERMINAL_CASES = [
+    pytest.param(JobState.DONE, None, _COUNTS, id="done"),
+    pytest.param(JobState.FALLBACK, None, _COUNTS, id="fallback"),
+    pytest.param(JobState.ERROR, _DEFAULT_ERROR_CATEGORY, None, id="error"),
+    pytest.param(JobState.CANCELLED, None, None, id="cancelled"),
+    pytest.param(JobState.ERROR, ErrorCategory.REJECTED, None, id="rejected"),
+    pytest.param(JobState.DONE, None, None, id="pre-phase-23"),
+]
+
+# The two branches that record counts, so the parametrised expectation is one
+# membership test rather than a second copy of the table above.
+_CASES_WITH_COUNTS = {"done", "fallback"}
+
+
+def _finished_job(
+    client: TestClient,
+    state: JobState,
+    result: JobResult | None,
+    error_category: ErrorCategory | None = None,
+) -> str:
+    """
+    Finish a job in `state`, recording `result`'s counts or leaving them NULL.
+
+    ``finish_job`` is the only writer of the count columns, and omitting the
+    result leaves all three NULL rather than zero -- which is exactly how the
+    four countless terminal cases arise in production.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title="Render Test")
+    job_store.finish_job(
+        job.id,
+        state,
+        result=result,
+        error="disk on fire",
+        error_category=error_category,
+    )
+    _adopt_as_current_job(client, job.id)
+    return job.id
+
+
+class TestPageCounts:
+    """
+    Where the page counts render, and where they deliberately do not (APPL-03).
+
+    UI-SPEC S3, D-32. Success criterion 3 means "every terminal job that
+    recorded counts": ERROR and CANCELLED rows have none by construction, and
+    D-32 accepts that, so a later reader need not chase a phantom.
+    """
+
+    @pytest.mark.parametrize(("state", "category", "result"), _TERMINAL_CASES)
+    def test_pages_render_for_exactly_the_cases_that_recorded_them(
+        self,
+        client: TestClient,
+        request: pytest.FixtureRequest,
+        state: JobState,
+        category: ErrorCategory | None,
+        result: JobResult | None,
+    ) -> None:
+        """
+        Two of the six terminal cases show counts; four show no element at all.
+
+        Not an empty paragraph and not a blank line -- nothing. A sentence
+        naming two of three counts would invite the reader to wonder about the
+        third, so one NULL suppresses the whole line.
+        """
+        case = request.node.callspec.id
+        _finished_job(client, state, result, category)
+        text = client.get("/api/jobs/current/status").text
+
+        expected = case in _CASES_WITH_COUNTS
+        assert ('<p class="page-counts">' in text) is expected
+        assert ("page-counts" in text) is expected
+
+    def test_pages_sentence_is_the_shared_filter_verbatim(
+        self, client: TestClient
+    ) -> None:
+        """The status area shows what `page_counts` built, not its own wording."""
+        _finished_job(client, JobState.DONE, _COUNTS)
+        sentence = page_counts(_COUNTS)
+        assert sentence is not None
+        text = client.get("/api/jobs/current/status").text
+        assert f'<p class="page-counts">{sentence}</p>' in text
+        assert "12 pages scanned, 2 blank removed, 10 uploaded" in text
+
+    def test_a_measured_zero_pages_renders_as_zero(self, client: TestClient) -> None:
+        """
+        A scan where nothing was blank really did remove 0 pages (D-32).
+
+        The guard is the filter returning None, never truthiness; a truthiness
+        guard anywhere on this path would delete this line.
+        """
+        _finished_job(client, JobState.DONE, _ONE_PAGE)
+        text = client.get("/api/jobs/current/status").text
+        assert (
+            '<p class="page-counts">1 page scanned, 0 blank removed, 1 uploaded</p>'
+            in text
+        )
+
+    def test_the_pages_line_follows_the_outcome_and_precedes_the_thumbnail(
+        self, client: TestClient
+    ) -> None:
+        """
+        The counts are the last paragraph of the terminal branch (UI-SPEC S3).
+
+        They are a footnote to the outcome, so they read after it -- and before
+        the preview, which is the end of the status area.
+        """
+        job_id = _finished_job(client, JobState.DONE, _COUNTS)
+        _app(client).state.job_store.update_thumbnail(job_id, "dGVzdA==")
+        text = client.get("/api/jobs/current/status").text
+
+        assert text.index('class="status-done"') < text.index('class="page-counts"')
+        assert text.index('class="page-counts"') < text.index('class="thumbnail"')
+
+    def test_the_fallback_pages_line_follows_the_warning(
+        self, client: TestClient
+    ) -> None:
+        """Under FALLBACK the counts read after the warning, not between it and the outcome."""
+        job_store: JobStore = _app(client).state.job_store
+        job = job_store.create_job(profile="default", title="Render Test")
+        job_store.finish_job(
+            job.id,
+            JobState.FALLBACK,
+            result=JobResult(
+                outcome=None,
+                warning="Metadata was not applied.",
+                pages_scanned=12,
+                pages_removed=2,
+                pages_uploaded=10,
+            ),
+        )
+        _adopt_as_current_job(client, job.id)
+        text = client.get("/api/jobs/current/status").text
+
+        assert text.index("Metadata was not applied.") < text.index(
+            'class="page-counts"'
+        )
+
+    def test_the_history_title_cell_carries_the_pages_as_a_second_line(
+        self, client: TestClient
+    ) -> None:
+        """
+        The counts are a second line in the Title cell, not a fifth column.
+
+        A span with `display: block`, so it forms its own line inside the cell
+        the mobile rule already wraps (UI-SPEC S3).
+        """
+        _finished_job(client, JobState.DONE, _COUNTS)
+        sentence = page_counts(_COUNTS)
+        assert sentence is not None
+        text = client.get("/api/jobs/history").text
+        assert f'<span class="page-counts">{sentence}</span>' in text
+
+    def test_the_history_cell_omits_the_pages_element_entirely(
+        self, client: TestClient
+    ) -> None:
+        """A row with no counts renders no span, not an empty one."""
+        _finished_job(client, JobState.CANCELLED, None)
+        text = client.get("/api/jobs/history").text
+        assert "page-counts" not in text
+
+    def test_the_history_table_still_has_four_columns(self) -> None:
+        """
+        Pitfall 11 is designed out, not guarded against (UI-SPEC S3).
+
+        A fifth column would drift against `colspan`, and would compete with
+        the Time column S7 simultaneously widens.
+        """
+        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
+        history = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
+            encoding="utf-8"
+        )
+        assert index.count("<th>") == 4
+        assert history.count('colspan="4"') == 1
+
+    def test_no_template_guards_a_page_count_with_truthiness(self) -> None:
+        """
+        The guard is the filter returning None, never a count's truthiness.
+
+        `{% if job.pages_removed %}` would silently delete a true zero, so no
+        template is allowed to write one (D-32, Pitfall 4).
+        """
+        offenders = sorted(
+            path.name
+            for path in _TEMPLATES_DIR.rglob("*.html")
+            if "if job.pages_" in path.read_text(encoding="utf-8")
+        )
+        assert offenders == []
+
+    def test_the_stylesheet_gains_one_muted_pages_rule(self) -> None:
+        """
+        One class, one rule, no new colour literal (UI-SPEC S3).
+
+        Muted rather than a status colour, because a count is a measurement and
+        not an outcome.
+        """
+        css = _APP_CSS.read_text(encoding="utf-8")
+        assert css.count(".page-counts") == 1
+        assert "display: block;" in css
+        assert "color: var(--pico-muted-color);" in css
+
+
+class TestHistoryTimeCell:
+    """The history Time cell names its zone (APPL-12, D-34, D-35, UI-SPEC S7)."""
+
+    def test_the_time_cell_names_the_zone(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A copy-pasted line is self-describing, so the zone is on every row.
+
+        `local_time` renders whatever zone the C library reports, so pinning
+        `TZ` and calling `time.tzset()` is the only way to assert a shape on a
+        host in an unknown zone; the trailing `tzset` makes the library notice
+        monkeypatch's teardown.
+        """
+        monkeypatch.setenv("TZ", "America/Chicago")
+        time.tzset()
+        try:
+            _finished_job(client, JobState.DONE, _COUNTS)
+            text = client.get("/api/jobs/history").text
+            cell = re.search(r"<tr>\s*<td>([^<]*)</td>", text)
+            assert cell is not None, "no history row rendered"
+            assert re.fullmatch(
+                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+", cell.group(1).strip()
+            )
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+
+    def test_the_time_cell_renders_through_the_shared_filter(self) -> None:
+        """
+        No `strftime` survives in the template: one function serves both surfaces.
+
+        `cli.py` imports the same object, so the web table and the CLI table
+        cannot disagree about the zone or the format without editing the one
+        implementation (UI-SPEC S7).
+        """
+        source = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
+            encoding="utf-8"
+        )
+        assert "strftime" not in source
+        assert source.count("local_time") == 1
 
 
 # How long the owed-write test waits for the worker to act.  Idle ticks run at
