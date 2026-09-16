@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
@@ -38,10 +39,10 @@ from saneless.exceptions import (
     SanelessError,
     ScanError,
 )
-from saneless.vocabulary import TITLE_MAX_LENGTH
+from saneless.vocabulary import TITLE_MAX_LENGTH, local_time
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Generator
 
 
 class TestLoadSettingsFromToml:
@@ -1341,13 +1342,38 @@ class TestExplicitConfigPath:
         assert settings.config_path is None
 
 
+@pytest.fixture
+def config_local_zone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[Callable[[str], None]]:
+    """
+    Give one test control of the process's local zone, then restore it.
+
+    Plan 30-01's ``local_zone`` technique: ``local_time`` renders whatever zone
+    the C library reports, so pinning ``TZ`` and calling ``time.tzset()`` is
+    the only way to assert an exact string on a host in an unknown zone. The
+    trailing ``tzset`` is what makes the C library notice the removal.
+
+    Yields:
+        A function that switches the process's zone for the rest of the test.
+
+    """
+
+    def _use(zone: str) -> None:
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+
+    yield _use
+    time.tzset()
+
+
 class TestResolveJobTitle:
     """
     One title rule for every front end (D-16, M-24).
 
     A typed title wins when it is non-blank after stripping; otherwise the
-    profile's ``title``; otherwise ``Scan <UTC YYYY-MM-DD HH:MM>``. The
-    documented ``title`` key used to do nothing.
+    profile's ``title``; otherwise ``Scan <local YYYY-MM-DD HH:MM ZZZ>``
+    (APPL-12). The documented ``title`` key used to do nothing.
     """
 
     _NOW = datetime(2026, 9, 15, 13, 5, tzinfo=UTC)
@@ -1363,25 +1389,60 @@ class TestResolveJobTitle:
         profile = ProfileConfig(title="Receipt")
         assert resolve_job_title(typed, profile, now=self._NOW) == "Receipt"
 
-    def test_title_without_profile_title_uses_timestamp(self) -> None:
-        """A profile with no title falls through to the UTC timestamp."""
+    def test_title_without_profile_title_uses_timestamp(
+        self, config_local_zone: Callable[[str], None]
+    ) -> None:
+        """A profile with no title falls through to the local timestamp."""
+        config_local_zone("America/Chicago")
         title = resolve_job_title("", ProfileConfig(), now=self._NOW)
-        assert title == "Scan 2026-09-15 13:05"
+        assert title == "Scan 2026-09-15 08:05 CDT"
 
-    def test_title_blank_profile_title_uses_timestamp(self) -> None:
+    def test_title_blank_profile_title_uses_timestamp(
+        self, config_local_zone: Callable[[str], None]
+    ) -> None:
         """A whitespace profile title counts as blank."""
+        config_local_zone("America/Chicago")
         profile = ProfileConfig(title="  ")
         title = resolve_job_title(None, profile, now=self._NOW)
-        assert title == "Scan 2026-09-15 13:05"
+        assert title == "Scan 2026-09-15 08:05 CDT"
 
-    def test_title_no_profile_uses_timestamp(self) -> None:
+    def test_title_no_profile_uses_timestamp(
+        self, config_local_zone: Callable[[str], None]
+    ) -> None:
         """With no profile at all the timestamp is used."""
-        assert resolve_job_title(None, None, now=self._NOW) == "Scan 2026-09-15 13:05"
+        config_local_zone("America/Chicago")
+        assert resolve_job_title(None, None, now=self._NOW) == (
+            "Scan 2026-09-15 08:05 CDT"
+        )
 
-    def test_title_timestamp_is_rendered_in_utc(self) -> None:
-        """A non-UTC aware ``now`` renders as UTC (local time is APPL-12)."""
+    def test_title_timestamp_names_utc_on_a_utc_server(
+        self, config_local_zone: Callable[[str], None]
+    ) -> None:
+        """A UTC server still gets the zone named on the title (D-35)."""
+        config_local_zone("UTC")
+        assert resolve_job_title("", None, now=self._NOW) == "Scan 2026-09-15 13:05 UTC"
+
+    def test_title_timestamp_ignores_the_zone_now_carries(
+        self, config_local_zone: Callable[[str], None]
+    ) -> None:
+        """A non-UTC aware ``now`` still renders in the server's zone (APPL-12)."""
+        config_local_zone("America/Chicago")
         plus_two = datetime(2026, 9, 15, 15, 5, tzinfo=timezone(timedelta(hours=2)))
-        assert resolve_job_title("", None, now=plus_two) == "Scan 2026-09-15 13:05"
+        assert resolve_job_title("", None, now=plus_two) == "Scan 2026-09-15 08:05 CDT"
+
+    def test_title_timestamp_uses_the_shared_formatter(
+        self, config_local_zone: Callable[[str], None]
+    ) -> None:
+        """
+        The title, the ``jobs`` table and the web history cannot disagree.
+
+        Asserted against ``local_time`` itself rather than a second copy of the
+        format string, which is the whole point of D-35.
+        """
+        config_local_zone("America/Chicago")
+        assert resolve_job_title("", None, now=self._NOW) == (
+            f"Scan {local_time(self._NOW)}"
+        )
 
     def test_title_typed_is_returned_unstripped(self) -> None:
         """A non-blank typed title is returned as given, matching today."""
