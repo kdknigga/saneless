@@ -13,7 +13,6 @@ import logging
 import os
 import tempfile
 import tomllib
-from datetime import UTC
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
@@ -37,7 +36,7 @@ from pydantic_settings import (
 from pydantic_settings.exceptions import SettingsError
 
 from saneless.exceptions import ConfigError
-from saneless.vocabulary import TITLE_MAX_LENGTH
+from saneless.vocabulary import TITLE_MAX_LENGTH, local_time
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -415,8 +414,13 @@ def resolve_job_title(
 
     A typed title that is non-blank after stripping wins; otherwise the
     profile's ``title``, when it is non-blank; otherwise ``Scan <time>``. The
-    timestamp is rendered in UTC whatever the zone of ``now`` (local time is
-    APPL-12). A chosen title is returned as given, not stripped.
+    timestamp renders in the server's local zone with the zone named, whatever
+    zone ``now`` carries (APPL-12), through ``local_time`` -- the same shared
+    function the web history table and the ``saneless jobs`` table read, so the
+    three cannot disagree about what time a scan happened. That string is
+    user-facing twice over: it becomes the paperless-ngx document title, and it
+    is the text of the History table's Title cell. A chosen title is returned
+    as given, not stripped.
 
     Args:
         typed: The title the operator typed, if any.
@@ -431,7 +435,7 @@ def resolve_job_title(
         return typed
     if profile is not None and profile.default_title.strip():
         return profile.default_title
-    return f"Scan {now.astimezone(UTC).strftime('%Y-%m-%d %H:%M')}"
+    return f"Scan {local_time(now)}"
 
 
 class OutputConfig(BaseModel):

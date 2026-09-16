@@ -48,7 +48,7 @@ saneless jobs --json --limit 5
     "profile": "default",
     "title": "Invoice March 2026",
     "state": "DONE",
-    "created_at": "2026-03-22T14:30:00",
+    "created_at": "2026-03-22T14:30:00+00:00",
     "outcome": "SUCCESS",
     "warning": null
   }
@@ -62,6 +62,8 @@ and `SCANNING_REVERSE` only occur in manual duplex jobs: the wait for the
 operator to flip the stack, and the second pass over the back sides. `CANCELLED`
 is a scan the operator stopped at the flip prompt, not a failure. The human-readable labels the table
 view prints ("Complete", "Failed", "Saved to folder", "Cancelled") never appear in `--json`.
+
+`created_at` is always a UTC ISO-8601 timestamp carrying the `+00:00` offset, whatever timezone the server is in, so a script can parse it without knowing where the appliance lives. The table `saneless jobs` prints without `--json` is the other way round: it renders the same instant in the server's local timezone with the zone named, for example `2026-03-22 09:30 CDT`. Only the table follows the server's timezone; the JSON never does.
 
 `outcome` is `"SUCCESS"`, `"FALLBACK"` or `null`, and `warning` carries a note
 about something odd that did not fail the scan, or `null`. A job whose `state`
@@ -125,7 +127,7 @@ paperless-ngx restart. Use the web server's `/health` endpoint for that.
 
 ### Basic scan with error handling
 
-`--title` may be omitted, in which case the profile's `title` (else `Scan <date time>`) is used, so a cron entry can rely on a profile title instead of building one.
+`--title` may be omitted, in which case the profile's `title` is used; with neither, the title is the scan's start time in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. So a cron entry can rely on a profile title instead of building one.
 
 ```bash
 #!/bin/bash
