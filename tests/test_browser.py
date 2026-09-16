@@ -1560,7 +1560,10 @@ _SUBMIT_UNKNOWN_PROFILE = """
 }
 """
 
-_POLL_PATH = "/api/jobs/current/status"
+# The status poll names the job this browser submitted once it has one, and
+# the current-job path only until then (D-25), so a poll is recognised by the
+# shape of its URL rather than by one literal path.
+_POLL_URL = re.compile(r"/api/jobs/[^/]+/status$")
 
 
 def _fill_queue_until_rejected(url: str) -> None:
@@ -1759,7 +1762,7 @@ class TestRequestErrorSlot:
         polls: list[str] = []
 
         def _record_poll(response: Response) -> None:
-            if response.url.endswith(_POLL_PATH):
+            if _POLL_URL.search(response.url):
                 polls.append(response.url)
 
         page.on("response", _record_poll)
@@ -1952,3 +1955,88 @@ class TestPlainHttpLanOrigin:
         assert headers.get("origin") == lan_url, headers
         expect(page.locator("#status-message")).to_be_empty()
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+
+
+_OWNER_COOKIE_NAME = "saneless_owner"
+
+# Playwright reports a session cookie -- one with neither Max-Age nor Expires --
+# with this expiry. It is the only way to tell a session cookie from a
+# persistent one through the cookie jar, and D-23 turns on the difference.
+_SESSION_COOKIE_EXPIRY = -1
+
+
+@pytest.mark.browser
+class TestOwnerCookieInABrowser:
+    """
+    The owner cookie's behaviour in Chromium, measured rather than assumed.
+
+    RESEARCH carried assumption A6: that a browser processes ``Set-Cookie`` on
+    an htmx XHR response exactly as it does on a navigation. If that were
+    false the token would never persist and the whole gate would be decorative,
+    so it is asserted here instead of reasoned about (APPL-09, D-23).
+    """
+
+    def test_scan_submit_sets_a_session_owner_cookie(
+        self, page: Page, scan_harness: _ScanHarness
+    ) -> None:
+        """A real htmx submit leaves an HttpOnly, Lax, session cookie behind."""
+        server = scan_harness.server
+        server.scanner.gate.clear()
+        page.goto(server.url)
+
+        page.locator("#scan-btn").click()
+        expect(page.locator('#status-area p[aria-busy="true"]')).to_be_visible()
+
+        minted = [
+            cookie
+            for cookie in page.context.cookies()
+            if cookie["name"] == _OWNER_COOKIE_NAME
+        ]
+        assert len(minted) == 1
+        cookie = minted[0]
+        assert cookie["httpOnly"] is True
+        assert cookie["sameSite"] == "Lax"
+        assert cookie["path"] == "/"
+        assert cookie["expires"] == _SESSION_COOKIE_EXPIRY
+        assert cookie["secure"] is False
+        # HttpOnly proved from inside the page, not from the header: this is
+        # the claim that the token cannot reach a script (T-30-59), and there
+        # is no script file that could read it in the first place.
+        assert _OWNER_COOKIE_NAME not in page.evaluate("() => document.cookie")
+
+    def test_a_non_owning_browser_gets_no_flip_buttons_in_the_dom(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> None:
+        """
+        The gate leaves the buttons out of the DOM; it does not hide them.
+
+        A CSS-hidden control is still in the page and still reachable from the
+        console, which would be an ASVS V4 failure. This asserts absence in a
+        real browser rather than absence from a string (D-24).
+        """
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        worker = app.state.worker
+        job = job_store.create_job(
+            profile="duplex",
+            title="Someone Elses Flip",
+            owner_token="a-browser-that-is-not-this-one",
+        )
+        job_store.update_state(job.id, JobState.AWAITING_FLIP)
+        coordinator = WorkerFlipCoordinator(job.id)
+        coordinator.arm()
+        worker._current_job_id = job.id
+        worker._flip_coordinator = coordinator
+        try:
+            page.goto(browser_server.url)
+
+            status = page.locator("#status-area")
+            expect(status).to_contain_text("Waiting for the stack to be flipped")
+            assert status.locator("button").count() == 0
+            assert coordinator.answer is None
+        finally:
+            # Session-scoped server and store, so the pointers are cleared and
+            # the row deleted, as the other flip browser test does.
+            worker._flip_coordinator = None
+            worker._current_job_id = None
+            job_store.delete_job(job.id)
