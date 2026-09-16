@@ -17,11 +17,43 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from saneless.pipeline import _SPOOL_LABEL_A
 from saneless.scanner.base import ScanSettings
 from saneless.scanner.sane_backend import SaneBackend
+from saneless.spool import SpooledPageSink
+from tests.conftest import images_of
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
+
+# The free-space reserve these sinks keep beyond the page being written.  Zero
+# for the same reason the in-process scanner tests use zero: these tests are
+# about libsane, not about D-07's shortfall arithmetic, and a positive reserve
+# would fail them on a CI runner with a nearly full disk.
+_NO_FREE_SPACE_RESERVE = 0
+
+
+def _page_sink_for(tmp_path: Path) -> SpooledPageSink:
+    """
+    Build a real sink spooling one pass's pages under ``tmp_path``.
+
+    ``scan_pages`` takes a sink as its third argument, so these tests supply
+    one just as the pipeline does.  It is a real ``SpooledPageSink`` and not a
+    mock: the point of driving libsane at all is that everything downstream of
+    it is real too, and a page that could not be written would otherwise still
+    pass.
+
+    Args:
+        tmp_path: The per-test temporary directory pytest removes afterwards.
+
+    Returns:
+        A sink ready to be handed to ``scan_pages``.
+
+    """
+    directory = tmp_path / "spool"
+    directory.mkdir(exist_ok=True)
+    return SpooledPageSink(directory, _SPOOL_LABEL_A, _NO_FREE_SPACE_RESERVE)
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -98,7 +130,7 @@ class TestRealSaneTestBackend:
         assert capabilities.resolution_range == (1.0, 1200.0, 1.0)
         assert capabilities.resolutions == []
 
-    def test_ten_pages_come_back_through_the_feeder(self) -> None:
+    def test_ten_pages_come_back_through_the_feeder(self, tmp_path: Path) -> None:
         """
         Ten sheets in the feeder yield ten pages.
 
@@ -111,17 +143,30 @@ class TestRealSaneTestBackend:
 
         What it proves now is that the feeder is drained end to end against
         real libsane: the long ADF source name routes to the multi-page path,
-        ten sheets are taken off it, and nothing is thrown away on the way
-        out.  The assertion is unchanged from the day it was written; only the
-        behaviour underneath it moved (D-05).
+        ten sheets are taken off it, are spooled one at a time, and nothing is
+        thrown away on the way out.  The count assertion is unchanged from the
+        day it was written; only the behaviour underneath it moved (D-05, and
+        now D-01).
+
+        Args:
+            tmp_path: Where the ten pages are spooled.
+
         """
         settings = ScanSettings(
             source="Automatic Document Feeder", resolution=75, mode="Gray"
         )
-        pages = SaneBackend().scan_pages("test:0", settings).pages
+        pages = (
+            SaneBackend().scan_pages("test:0", settings, _page_sink_for(tmp_path)).pages
+        )
         assert len(pages) == 10
+        # Order is the records' own and the files really exist -- against real
+        # libsane, not against a double (D-02).
+        assert [record.sequence for record in pages] == list(range(1, 11))
+        assert all(record.path.exists() for record in pages)
 
-    def test_every_uniformly_black_page_survives_the_scanner_layer(self) -> None:
+    def test_every_uniformly_black_page_survives_the_scanner_layer(
+        self, tmp_path: Path
+    ) -> None:
         """
         All ten pages come back, and every one of them is uniformly black.
 
@@ -132,10 +177,23 @@ class TestRealSaneTestBackend:
         judges a page by what is printed on it.  Whether a blank page is worth
         keeping is decided one layer up, under the profile's
         ``enable_empty_page_detection`` toggle, where the user can see it.
+
+        Asserted twice over, because the two say different things.  The record
+        statistics are what ``pipeline._drop_empty_pages`` will actually judge,
+        measured once at spool time; the read-back through ``images_of`` proves
+        the spooled PNG -- the file the PDF embeds -- really holds those pixels.
+
+        Args:
+            tmp_path: Where the ten pages are spooled.
+
         """
         settings = ScanSettings(
             source="Automatic Document Feeder", resolution=75, mode="Gray"
         )
-        pages = SaneBackend().scan_pages("test:0", settings).pages
-        assert len(pages) == 10
-        assert all(page.convert("L").getextrema() == (0, 0) for page in pages)
+        batch = SaneBackend().scan_pages("test:0", settings, _page_sink_for(tmp_path))
+        assert len(batch.pages) == 10
+        assert all(record.mean == 0.0 for record in batch.pages)
+        assert all(record.stddev == 0.0 for record in batch.pages)
+        assert all(
+            image.convert("L").getextrema() == (0, 0) for image in images_of(batch)
+        )
