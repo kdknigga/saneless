@@ -7,7 +7,7 @@ Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
 from __future__ import annotations
 
 import json
-from dataclasses import fields
+from dataclasses import FrozenInstanceError, fields
 from typing import cast
 
 import pytest
@@ -33,9 +33,11 @@ from saneless.vocabulary import (
     RESTART_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
+    TOKEN_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ConnectionStatus,
+    ErrorAdvice,
     ErrorCategory,
     ExitCode,
     FlipOutcome,
@@ -46,7 +48,9 @@ from saneless.vocabulary import (
     WorkerHealth,
     classify_error,
     connection_status_message,
+    error_advice,
     error_message,
+    error_next_step,
     exit_code_for,
     flip_answer_label,
     job_state_for,
@@ -281,18 +285,122 @@ class TestFlipAnswerLabel:
         assert "…" not in label
 
 
-class TestErrorMessage:
-    """error_message category-message lookup tests."""
+class TestErrorAdvice:
+    """error_advice category-to-advice lookup tests (APPL-04, D-10, D-11)."""
+
+    def test_error_advice_fields(self) -> None:
+        """ErrorAdvice carries exactly a message and a next step (APPL-04)."""
+        assert [field.name for field in fields(ErrorAdvice)] == [
+            "message",
+            "next_step",
+        ]
+
+    def test_error_advice_is_immutable(self) -> None:
+        """
+        ErrorAdvice is frozen, so a renderer cannot edit the approved copy.
+
+        The attribute name is a local rather than a literal so this exercises
+        the dataclass's own runtime guard rather than a linter's rule about
+        constant ``setattr`` targets.
+        """
+        advice = error_advice(ErrorCategory.FEEDER)
+        attribute = "message"
+        with pytest.raises(FrozenInstanceError):
+            setattr(advice, attribute, "tampered")
+
+    def test_error_advice_is_slotted(self) -> None:
+        """ErrorAdvice is slotted, so a typo cannot add a silent third field."""
+        assert not hasattr(error_advice(ErrorCategory.FEEDER), "__dict__")
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
-    def test_error_message_is_complete(self, category: ErrorCategory) -> None:
-        """Every ErrorCategory has a plain-language message (CTR-05)."""
-        message = error_message(category)
-        assert message
-        assert message != category.value
+    def test_error_advice_is_complete(self, category: ErrorCategory) -> None:
+        """Every ErrorCategory has a message and a next step (APPL-04, CTR-05)."""
+        advice = error_advice(category)
+        assert advice.message
+        assert advice.next_step
+        assert advice.message != category.value
+        assert advice.next_step != category.value
+        assert advice.message.endswith(".")
+        assert advice.next_step.endswith(".")
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_advice_accessors_agree(self, category: ErrorCategory) -> None:
+        """
+        error_message and error_next_step read the one lookup (D-10, D-11).
+
+        There is exactly one ``match`` over ErrorCategory in the module and the
+        two accessors are one-liners over it, so the pair cannot drift apart
+        the way two parallel lookups would.
+        """
+        advice = error_advice(category)
+        assert error_message(category) == advice.message
+        assert error_next_step(category) == advice.next_step
+
+    def test_error_advice_raises_on_unrecognised_value(self) -> None:
+        """error_advice raises on a value outside ErrorCategory (CTR-05)."""
+        bad = cast("ErrorCategory", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            error_advice(bad)
+
+    @pytest.mark.parametrize(
+        ("category", "expected"),
+        [
+            (
+                ErrorCategory.FEEDER,
+                "Load the pages squarely in the feeder, clear any jam, then "
+                "start the scan again.",
+            ),
+            (
+                ErrorCategory.CONFIG,
+                "Correct the saneless configuration file, then restart saneless.",
+            ),
+            (
+                ErrorCategory.SCANNER,
+                "Check the scanner is switched on and connected, then start the "
+                "scan again.",
+            ),
+            (
+                ErrorCategory.UPLOAD,
+                "Check paperless-ngx is running and the API token is correct, "
+                "then start the scan again.",
+            ),
+            (
+                ErrorCategory.ASSEMBLY,
+                "Start the scan again. If it keeps failing, check the server's "
+                "free disk space.",
+            ),
+            (
+                ErrorCategory.REJECTED,
+                "Check the system status list for anything marked Failed, then "
+                "start the scan again.",
+            ),
+            (
+                ErrorCategory.UNKNOWN,
+                "Start the scan again. If it keeps failing, check the saneless log.",
+            ),
+        ],
+    )
+    def test_error_next_step_strings(
+        self, category: ErrorCategory, expected: str
+    ) -> None:
+        """The seven next steps are the approved UI-SPEC S2 copy (APPL-04)."""
+        assert error_next_step(category) == expected
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_next_step_is_surface_neutral(self, category: ErrorCategory) -> None:
+        """
+        No next step names a surface, because both surfaces render it (D-12).
+
+        The web page has no command line and the CLI has no Scan button, so a
+        string naming either would be wrong on the other.
+        """
+        next_step = error_next_step(category).lower()
+        assert "press scan" not in next_step
+        assert "click" not in next_step
+        assert "run the command" not in next_step
 
     def test_error_message_strings(self) -> None:
-        """error_message returns developer-authored prose, not exception text (CTR-05)."""
+        """The messages are byte identical to what shipped before (APPL-04, D-10)."""
         assert error_message(ErrorCategory.FEEDER) == (
             "The document feeder is empty or jammed."
         )
@@ -316,6 +424,71 @@ class TestErrorMessage:
             "This scan was not started. Check that saneless is ready to scan, "
             "then try again."
         )
+
+
+class TestTokenUnsetRejection:
+    """RequestRejection.TOKEN_UNSET vocabulary tests (APPL-07, D-15)."""
+
+    def test_token_unset_member_exists(self) -> None:
+        """TOKEN_UNSET is a RequestRejection member of its own (D-15)."""
+        assert RequestRejection.TOKEN_UNSET.value == "TOKEN_UNSET"
+        assert RequestRejection.TOKEN_UNSET.name == "TOKEN_UNSET"
+
+    def test_token_unset_is_service_unavailable(self) -> None:
+        """An unset token refuses with 503, beside the other not-ready arms."""
+        assert rejection_status_code(RequestRejection.TOKEN_UNSET) == 503
+
+    def test_token_unset_message(self) -> None:
+        """The TOKEN_UNSET sentence is the approved UI-SPEC S8 copy (APPL-07)."""
+        assert rejection_message(RequestRejection.TOKEN_UNSET) == (
+            "The paperless-ngx API token has not been set, so the scan was not "
+            "started. Put a real API token in the saneless config file, then "
+            "restart saneless."
+        )
+
+    def test_token_unset_does_not_reuse_worker_degraded_copy(self) -> None:
+        """
+        WORKER_DEGRADED is deliberately not reused for an unset token (D-15).
+
+        "The scan service was unavailable" is untrue when the truth is that
+        nobody ever set the token, so the two carry different words.
+        """
+        assert rejection_message(RequestRejection.TOKEN_UNSET) != rejection_message(
+            RequestRejection.WORKER_DEGRADED
+        )
+        assert TOKEN_UNSET_JOB_ERROR != WORKER_DEGRADED_JOB_ERROR
+
+    def test_token_unset_job_error(self) -> None:
+        """The job-row error carries no trailing period, like its siblings (D-05)."""
+        assert TOKEN_UNSET_JOB_ERROR == (
+            "Not started: the paperless-ngx API token has not been set"
+        )
+        assert not TOKEN_UNSET_JOB_ERROR.endswith(".")
+
+
+class TestDeveloperConstantStrings:
+    """Every user-facing string in this module is a developer constant (V7)."""
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_rejection_message_carries_no_internals(
+        self, rejection: RequestRejection
+    ) -> None:
+        """No rejection message can carry input, a URL or exception text (V7)."""
+        message = rejection_message(rejection)
+        assert "{" not in message
+        assert "%s" not in message
+        assert "http" not in message.lower()
+        assert "traceback" not in message.lower()
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_advice_carries_no_internals(self, category: ErrorCategory) -> None:
+        """No ErrorAdvice field can carry input, a URL or exception text (V7)."""
+        advice = error_advice(category)
+        for text in (advice.message, advice.next_step):
+            assert "{" not in text
+            assert "%s" not in text
+            assert "http" not in text.lower()
+            assert "traceback" not in text.lower()
 
 
 class TestWorkerHealth:
