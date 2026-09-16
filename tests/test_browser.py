@@ -39,7 +39,9 @@ if TYPE_CHECKING:
 
     from fastapi import FastAPI
     from playwright.sync_api import (
+        Browser,
         BrowserContext,
+        Dialog,
         Locator,
         Page,
         Request,
@@ -3330,3 +3332,292 @@ class TestTimestampZonesInChromium:
             assert freshness.endswith(f"{zone}."), (freshness, zone)
         finally:
             job_store.delete_job(job.id)
+
+
+# ---------------------------------------------------------------------------
+# The owner gate, in two real browsers at once.
+#
+# Every other owner-gate assertion in this module is made from one browser: the
+# non-owner case is staged by writing a foreign token onto a job row, which
+# proves the server branches correctly but says nothing about the two cookie
+# jars that decision exists to tell apart. Phase 30's fifth success criterion
+# is about two people at one appliance, so it is answered here with two of them.
+# ---------------------------------------------------------------------------
+
+_FLIP_CONTROL_SELECTOR = "[hx-post^='/api/flip/']"
+"""Every control that could answer a flip prompt, matched by where it posts."""
+
+_WAITING_LINE = "Waiting for the stack to be flipped"
+"""The non-owner's locked copy at AWAITING_FLIP (UI-SPEC S5). No ellipsis."""
+
+_ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
+"""The question ``hx-confirm`` puts in the native dialog (D-27, UI-SPEC S5)."""
+
+# D-26 forbids a third way out of the flip prompt: no override, no take-over,
+# no force-continue. The absence IS the rendering, so it is asserted rather
+# than left to a reviewer's memory -- and it is asserted on the words as well
+# as on the controls, because a page offering one in prose would have smuggled
+# the same affordance past a control count.
+_NO_THIRD_WAY_OUT = re.compile(r"override|take over|force", re.IGNORECASE)
+
+_FLIP_JOB_TITLE = "Two Browsers One Stack"
+"""The title both pages must agree on, so the comparison is not vacuous."""
+
+
+@pytest.fixture
+def flip_server(
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app that can park one real manual-duplex scan at the prompt.
+
+    Private rather than the session server for two reasons: the owner token
+    minted here must not follow later tests around, and the job row left behind
+    must not appear on another test's supposedly idle page.
+
+    ``monkeypatch`` is requested by this fixture rather than by the test, the
+    ordering ``duplex_server`` established: a fixture is torn down before
+    anything it depends on, so the stubbed Paperless client is still in place
+    while ``_serve``'s shutdown finishes whatever job is left in flight.
+    """
+    with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
+        _make_paperless_deliver(server.app, monkeypatch)
+        egress_allowlist.append(server.url)
+        yield server
+
+
+def _drive_to_flip_prompt(
+    page: Page,
+    server: _BrowserServer,
+    wait_for_state: Callable[..., Job],
+    title: str,
+) -> str:
+    """
+    Submit a manual-duplex scan from ``page`` and park it at ``AWAITING_FLIP``.
+
+    The submit is a real one, so the response's ``Set-Cookie`` is what makes
+    this page's context the owner -- which is the point: a token written onto a
+    row by a test proves nothing about a browser's cookie jar.
+
+    Args:
+        page: The browser page that submits, and so becomes the owner.
+        server: The private server to submit to.
+        wait_for_state: The conftest waiter, polling the job store.
+        title: The title to submit, so both browsers can be asked to agree.
+
+    Returns:
+        The id of the job now waiting at the flip prompt.
+
+    """
+    job_store: JobStore = server.app.state.job_store
+    page.goto(server.url)
+    page.select_option("#profile-select", "duplex")
+    page.fill("#title-input", title)
+    with page.expect_response(lambda r: r.url.endswith("/api/scan")):
+        page.click("#scan-btn")
+    recent = job_store.list_recent(1)
+    assert recent, "the scan submit created no job row"
+    job_id = recent[0].id
+    wait_for_state(job_store, job_id, JobState.AWAITING_FLIP, timeout=20.0)
+    return job_id
+
+
+def _history_row_text(page: Page) -> tuple[str, str]:
+    """Return the newest history row's Title and Status cells, as rendered."""
+    cells = page.locator("#history-body tr").first.locator("td")
+    return (
+        (cells.nth(2).inner_text() or "").strip(),
+        (cells.nth(3).inner_text() or "").strip(),
+    )
+
+
+@pytest.mark.browser
+class TestTwoBrowsersOneStack:
+    """
+    One appliance, two browsers, one owner (APPL-09, D-24, D-26, success 5).
+
+    The owner gate is a statement about two cookie jars, and a cookie jar is
+    something only a browser has. Staging the non-owner by writing a foreign
+    token onto a job row -- how the rest of this module does it -- proves the
+    server branches correctly but leaves research assumption A6 untested: that
+    a browser really keeps the ``Set-Cookie`` an htmx XHR returned, really
+    sends it back on the next poll, and that a second browser really has none.
+    Two contexts is the honest sample, so this is where success criterion 5 is
+    answered.
+    """
+
+    def test_the_owner_is_offered_the_flip_and_the_second_browser_is_not(
+        self,
+        browser: Browser,
+        flip_server: _BrowserServer,
+        egress_allowlist: list[str],
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Two cookie jars, one prompt, and nothing else differs (P9, D-24, D-26).
+
+        Both contexts are built by hand, so neither inherits the overridden
+        ``context`` fixture's routing: each installs ``_make_gate`` explicitly
+        and both share one ``blocked`` list, which is the arrangement that
+        factory exists for (Pitfall 9). Without it these two pages would be the
+        only ones in the module able to reach the real internet, and nothing in
+        the suite would have said so.
+        """
+        server = flip_server
+        job_store: JobStore = server.app.state.job_store
+
+        blocked: list[str] = []
+        owner_ctx = browser.new_context()
+        viewer_ctx = browser.new_context()
+        try:
+            owner_ctx.route("**/*", _make_gate(blocked, egress_allowlist))
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist))
+            owner_page = owner_ctx.new_page()
+            viewer_page = viewer_ctx.new_page()
+
+            job_id = _drive_to_flip_prompt(
+                owner_page, server, wait_for_state, _FLIP_JOB_TITLE
+            )
+            try:
+                # Both pages are (re)loaded from the same server state, so the
+                # only thing that differs between the two requests is the
+                # cookie one of them carries. It also makes the owner's prompt
+                # a decision taken on the presented token rather than a
+                # leftover of the response that minted it, and it gives both
+                # pages the Job History the empty pre-submit table did not have.
+                owner_page.reload()
+                viewer_page.goto(server.url)
+
+                # The owner is offered both answers and nothing else.
+                owner_status = owner_page.locator("#status-area")
+                expect(
+                    owner_status.locator("button[hx-post='/api/flip/continue']")
+                ).to_have_text("Continue")
+                expect(
+                    owner_status.locator("button[hx-post='/api/flip/abort']")
+                ).to_have_text("Abort scan")
+                expect(owner_page.locator(_FLIP_CONTROL_SELECTOR)).to_have_count(2)
+
+                # The second browser is told what is happening and given
+                # nothing to press. Absence from the DOM, not a hidden control:
+                # anything merely hidden is still reachable from the console.
+                viewer_status = viewer_page.locator("#status-area")
+                expect(viewer_status).to_contain_text(_WAITING_LINE)
+                expect(viewer_page.locator(_FLIP_CONTROL_SELECTOR)).to_have_count(0)
+
+                # A6, measured rather than assumed: the owner's jar holds the
+                # cookie the scan response minted, and the second jar does not.
+                owner_cookies = [
+                    cookie
+                    for cookie in owner_ctx.cookies()
+                    if cookie["name"] == _OWNER_COOKIE_NAME
+                ]
+                assert len(owner_cookies) == 1, owner_ctx.cookies()
+                cookie = owner_cookies[0]
+                assert cookie["httpOnly"] is True
+                assert cookie["sameSite"] == "Lax"
+                # -1 is how this Playwright reports a cookie carrying neither
+                # Max-Age nor Expires, and that is the only way a session
+                # cookie is distinguishable through a cookie jar -- which is
+                # what D-23 turns on: ownership ends when the browser does.
+                assert cookie["expires"] == _SESSION_COOKIE_EXPIRY
+                assert [
+                    c for c in viewer_ctx.cookies() if c["name"] == _OWNER_COOKIE_NAME
+                ] == []
+
+                # Only the controls differ. The two status areas cannot be
+                # compared directly -- the owner's holds the prompt and the
+                # viewer's the waiting line, which is the difference under test
+                # -- so the comparison is made where both pages report the same
+                # job: the newest Job History row, title and state alike.
+                assert _history_row_text(owner_page) == _history_row_text(viewer_page)
+                assert _history_row_text(owner_page)[0].startswith(_FLIP_JOB_TITLE)
+
+                # D-26's absence guard, on both pages.
+                for reader in (owner_page, viewer_page):
+                    body = reader.locator("body").inner_text()
+                    assert _NO_THIRD_WAY_OUT.search(body) is None, body
+            finally:
+                # Answered here rather than left to the flip timeout, which is
+                # ten minutes by default: the job has to reach a terminal state
+                # before _serve shuts the app down, or the shutdown's bounded
+                # worker join is what would report this test's failure.
+                server.app.state.worker.abort_flip(job_id)
+                wait_for_state(
+                    job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT
+                )
+        finally:
+            owner_ctx.close()
+            viewer_ctx.close()
+            # One list, two contexts: this single assertion speaks for both,
+            # which is the contract _make_gate's note states.
+            assert blocked == [], f"a page tried to reach the network: {blocked}"
+
+    def test_abort_asks_first_and_does_nothing_when_the_answer_is_no(
+        self,
+        page: Page,
+        flip_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The confirm is really raised, and dismissing it aborts nothing (P10).
+
+        ``hx-confirm`` is one attribute in a template, and a template test can
+        only see that it is there. Whether a browser raises a dialog, whether
+        the question it shows is the locked copy, and above all whether a "no"
+        really stops the request are three facts about htmx and Chromium
+        together. The "no" half is asserted from a recorded request list rather
+        than from a timeout, so it says "no abort was sent" and not "none was
+        sent in the first second".
+        """
+        server = flip_server
+        job_store: JobStore = server.app.state.job_store
+
+        asked: list[str] = []
+        answer = ["dismiss"]
+        posted: list[str] = []
+
+        def _on_dialog(dialog: Dialog) -> None:
+            asked.append(dialog.message)
+            if answer[0] == "accept":
+                dialog.accept()
+            else:
+                dialog.dismiss()
+
+        def _on_request(request: Request) -> None:
+            if request.method == "POST":
+                posted.append(request.url)
+
+        page.on("dialog", _on_dialog)
+        page.on("request", _on_request)
+
+        job_id = _drive_to_flip_prompt(page, server, wait_for_state, "Abort Me")
+        abort_button = page.locator("#status-area button[hx-post='/api/flip/abort']")
+        expect(abort_button).to_be_visible()
+
+        abort_button.click()
+        assert asked == [_ABORT_CONFIRMATION], asked
+
+        # A completed status poll after the dismissal, so the claim below is
+        # "the browser had a whole round trip's worth of chance and sent
+        # nothing" rather than a read taken in the same instant as the click.
+        with page.expect_response(lambda r: _POLL_URL.search(r.url) is not None):
+            pass
+        assert [url for url in posted if url.endswith("/api/flip/abort")] == [], posted
+        unanswered = job_store.get_job(job_id)
+        assert unanswered is not None
+        assert unanswered.state is JobState.AWAITING_FLIP
+        expect(abort_button).to_be_visible()
+
+        answer[0] = "accept"
+        with page.expect_response(lambda r: r.url.endswith("/api/flip/abort")):
+            abort_button.click()
+
+        assert asked == [_ABORT_CONFIRMATION, _ABORT_CONFIRMATION], asked
+        expect(page.locator("#status-area")).to_contain_text("Aborting scan")
+        expect(page.locator("#status-area .status-cancelled")).to_be_visible(
+            timeout=15_000
+        )
+        wait_for_state(
+            job_store, job_id, JobState.CANCELLED, timeout=_JOB_FINISH_TIMEOUT
+        )
