@@ -26,6 +26,12 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+from saneless.checks import (
+    check_name,
+    check_state_class,
+    check_state_glyph,
+    check_state_label,
+)
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -41,9 +47,15 @@ from saneless.vocabulary import (
     RequestRejection,
     SubmitResult,
     WorkerHealth,
+    error_message,
+    error_next_step,
+    local_time,
+    page_counts,
     rejection_message,
 )
 from saneless.web.app import create_app
+from saneless.web.checks_cache import CheckCache
+from saneless.web.refresher import CheckRefresher
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend
 
@@ -863,3 +875,104 @@ def _raise_factory(exc_type: type[Exception], msg: str):  # noqa: ANN202 -- retu
         raise exc_type(msg)
 
     return _raise
+
+
+class TestAppComposition:
+    """
+    What ``create_app`` must have assembled before a single request arrives.
+
+    The phase's rendering and its background refresh both depend on wiring that
+    no route can compensate for: a template cannot invent a filter, and a route
+    cannot probe on its own without undoing D-04.  Every assertion here is made
+    on an app that has **not** been entered, because construction is exactly the
+    moment that must stay free of threads and probes.
+
+    Covers requirements: APPL-02, APPL-03, APPL-04, APPL-12.
+    """
+
+    @pytest.fixture
+    def unstarted_app(
+        self, test_settings: Settings, web_scanner: StubScannerBackend
+    ) -> Iterator[FastAPI]:
+        """Build the app and never enter its lifespan, closing what it opened."""
+        built = create_app(test_settings, web_scanner)
+        try:
+            yield built
+        finally:
+            built.state.paperless.close()
+            built.state.job_store.close()
+
+    def test_registers_the_eight_new_filters(self, unstarted_app: FastAPI) -> None:
+        """Every name this phase's templates reach for is registered (APPL-03)."""
+        filters = unstarted_app.state.templates.env.filters
+        expected = {
+            "check_state_class",
+            "check_state_glyph",
+            "check_state_label",
+            "check_name",
+            "error_message",
+            "error_next_step",
+            "page_counts",
+            "local_time",
+        }
+        assert expected <= set(filters)
+
+    def test_each_filter_is_the_shared_implementation(
+        self, unstarted_app: FastAPI
+    ) -> None:
+        """
+        Identity, not equivalence: one implementation serves both surfaces.
+
+        A lambda wrapper here would pass a "renders the same string" test today
+        and drift from ``saneless doctor`` the first time either side is
+        edited.  ``is`` is what makes APPL-12's "one shared place" checkable.
+        """
+        filters = unstarted_app.state.templates.env.filters
+        assert filters["check_state_class"] is check_state_class
+        assert filters["check_state_glyph"] is check_state_glyph
+        assert filters["check_state_label"] is check_state_label
+        assert filters["check_name"] is check_name
+        assert filters["error_message"] is error_message
+        assert filters["error_next_step"] is error_next_step
+        assert filters["page_counts"] is page_counts
+        assert filters["local_time"] is local_time
+
+    def test_exposes_the_cache_and_the_refresher_on_app_state(
+        self, unstarted_app: FastAPI
+    ) -> None:
+        """Routes reach both through the same channel the worker uses."""
+        assert isinstance(unstarted_app.state.checks, CheckCache)
+        assert isinstance(unstarted_app.state.refresher, CheckRefresher)
+
+    def test_the_cache_is_cold_before_the_app_is_entered(
+        self, unstarted_app: FastAPI
+    ) -> None:
+        """Construction issues no probe, so the first render says Checking (D-06)."""
+        cached = unstarted_app.state.checks.current()
+        assert cached.results is None
+        assert cached.checked_at is None
+
+    def test_the_existing_state_entries_and_filters_are_unchanged(
+        self, unstarted_app: FastAPI, test_settings: Settings
+    ) -> None:
+        """The five earlier injections and three earlier filters still hold."""
+        state = unstarted_app.state
+        assert isinstance(state.worker, ScanWorker)
+        assert isinstance(state.job_store, JobStore)
+        assert state.settings is test_settings
+        assert state.paperless is not None
+        assert state.cache is not None
+        filters = state.templates.env.filters
+        assert {"state_label", "progress_label", "flip_answer_label"} <= set(filters)
+
+    def test_building_the_app_does_not_start_the_refresher_thread(
+        self, unstarted_app: FastAPI
+    ) -> None:
+        """
+        Starting a thread belongs to the lifespan, not to the factory.
+
+        ``create_app`` is called by tests, by ``saneless doctor``'s neighbours
+        and by anything that wants to inspect routes; none of them should get a
+        probing daemon as a side effect.
+        """
+        assert unstarted_app.state.refresher._thread.is_alive() is False
