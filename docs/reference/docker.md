@@ -78,7 +78,11 @@ is an operator task.
 - To drain it: confirm the documents are in paperless-ngx, or re-ingest the PDFs
   by copying them into the paperless-ngx consume directory, then delete the
   files you have accounted for. A preserved page directory has no PDF to
-  re-ingest -- assemble or rescan it, then remove the directory.
+  re-ingest -- assemble or rescan it, then remove the directory. The PNG names
+  are the order the sheets were acquired, one pass at a time, which is document
+  order for a simplex scan but not for a manual duplex one; see
+  [what `failed/` holds](../explanation/consume-directory-fallback.md#when-it-activates)
+  before assembling a duplex job by hand.
 - Re-ingesting is safe. paperless-ngx checksums documents on consumption and
   rejects a duplicate, so dropping a preserved PDF back into the consume
   directory cannot create a second copy of a document it already holds.

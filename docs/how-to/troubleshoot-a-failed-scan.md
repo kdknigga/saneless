@@ -178,8 +178,15 @@ The line starts with `PDF error:`. saneless scanned the pages but could not writ
 The scanned pages are not lost when this fails. saneless writes each page to disk as it arrives,
 so when assembly is what failed it moves those page files into a job-keyed directory under
 `failed/` in its data directory and names that directory in the error. The pages are ordinary PNG
-files, one per sheet in the order they were scanned. Fix the cause and scan again, or assemble
-them yourself if rescanning the document is not practical.
+files, one per sheet, named `a-0001.png`, `a-0002.png`, ... in the order the first pass fed them,
+and `b-0001.png`, ... for a second pass. Fix the cause and scan again, or assemble them yourself if
+rescanning the document is not practical.
+
+**If it was a manual duplex job, the file names are not the page order.** You turned the stack over
+between the passes, so the backs came back in reverse: the document is `a-0001`, `b-000N`,
+`a-0002`, `b-000N-1`, and so on, with the *last* `b-` file behind the first `a-` file. Sorting the
+directory by name would put every front page first and every back page last, in the wrong order.
+A simplex scan has only `a-` files and sorts correctly.
 
 ## Cancelled scans (exit 130)
 
