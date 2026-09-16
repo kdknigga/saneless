@@ -32,7 +32,6 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from markupsafe import escape
-from PIL import Image
 from starlette.datastructures import Headers
 
 from saneless.config import (
@@ -42,16 +41,10 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.scanner.base import (
-    DeviceCapabilities,
-    DeviceInfo,
-    ScanBatch,
-    ScannerBackend,
-    ScanSettings,
-)
 from saneless.vocabulary import RequestRejection, rejection_message
 from saneless.web.app import create_app
 from saneless.web.cross_origin import CrossOriginGuard, is_cross_origin_request
+from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -244,30 +237,6 @@ def test_is_cross_origin_request(
 # --- The guard wired into the application (D-22, D-23) -----------------------
 
 
-class StubScanner(ScannerBackend):
-    """Minimal scanner backend for web tests that avoids ABC mock issues."""
-
-    def get_devices(self) -> list[DeviceInfo]:
-        """Return an empty device list."""
-        return []
-
-    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-        """Return default capabilities."""
-        return DeviceCapabilities(
-            sources=["Flatbed"],
-            resolutions=[300],
-            modes=["color"],
-        )
-
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-        """Return a batch holding a single white test image."""
-        return ScanBatch(
-            pages=[Image.new("RGB", (100, 100), "white")],
-            actual_resolution=settings.resolution,
-            pages_rejected=0,
-        )
-
-
 def _new_route() -> dict[str, str]:
     """Stand in for a POST route added after the guard was written."""
     return {"status": "ok"}
@@ -295,13 +264,13 @@ def test_settings(tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-def web_scanner() -> StubScanner:
-    """Return a concrete StubScanner for web tests."""
-    return StubScanner()
+def web_scanner() -> StubScannerBackend:
+    """Return the shared concrete stub backend for web tests."""
+    return StubScannerBackend()
 
 
 @pytest.fixture
-def app(test_settings: Settings, web_scanner: StubScanner) -> FastAPI:
+def app(test_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
     """Create the production FastAPI app."""
     return create_app(test_settings, web_scanner)
 

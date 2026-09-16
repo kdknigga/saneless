@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from PIL import Image
 
 from saneless.config import (
     OutputConfig,
@@ -36,13 +35,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.scanner.base import (
-    DeviceCapabilities,
-    DeviceInfo,
-    ScanBatch,
-    ScannerBackend,
-    ScanSettings,
-)
+from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
@@ -55,6 +48,7 @@ from saneless.vocabulary import (
     state_label,
 )
 from saneless.web.app import create_app
+from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -63,11 +57,24 @@ if TYPE_CHECKING:
     from saneless.job import JobStore
 
 
-class _StubScanner(ScannerBackend):
-    """Concrete scanner stub; these tests never run a scan."""
+class _StubScanner(StubScannerBackend):
+    """
+    The shared stub backend, but reporting one device instead of none.
+
+    Only ``get_devices`` differs: the profile dropdown and the worker's
+    startup profile generation (D-14) both read it, and a device list of one
+    is what these tests render against.  Capabilities and ``scan_pages`` come
+    straight from ``StubScannerBackend``; these tests never run a scan.
+    """
 
     def get_devices(self) -> list[DeviceInfo]:
-        """Return a single fake device."""
+        """
+        Report a single fake device.
+
+        Returns:
+            A one-element list naming the device the settings point at.
+
+        """
         return [
             DeviceInfo(
                 name="test:device:001",
@@ -76,20 +83,6 @@ class _StubScanner(ScannerBackend):
                 device_type="virtual",
             ),
         ]
-
-    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-        """Return default capabilities."""
-        return DeviceCapabilities(
-            sources=["Flatbed"], resolutions=[300], modes=["color"]
-        )
-
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-        """Return a batch holding a single white test image."""
-        return ScanBatch(
-            pages=[Image.new("RGB", (100, 100), "white")],
-            actual_resolution=settings.resolution,
-            pages_rejected=0,
-        )
 
 
 # The scan button, captured whole so attribute and text assertions cannot be

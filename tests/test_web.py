@@ -25,7 +25,6 @@ if TYPE_CHECKING:
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
-from PIL import Image
 
 from saneless.config import (
     OutputConfig,
@@ -35,13 +34,6 @@ from saneless.config import (
     Settings,
 )
 from saneless.job import JobState, JobStore
-from saneless.scanner.base import (
-    DeviceCapabilities,
-    DeviceInfo,
-    ScanBatch,
-    ScannerBackend,
-    ScanSettings,
-)
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     ErrorCategory,
@@ -53,6 +45,7 @@ from saneless.vocabulary import (
 )
 from saneless.web.app import create_app
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
+from tests.conftest import StubScannerBackend
 
 
 def _app(client: TestClient) -> FastAPI:
@@ -62,30 +55,6 @@ def _app(client: TestClient) -> FastAPI:
         msg = "Expected FastAPI app"
         raise TypeError(msg)
     return app
-
-
-class StubScanner(ScannerBackend):
-    """Minimal scanner backend for web tests that avoids ABC mock issues."""
-
-    def get_devices(self) -> list[DeviceInfo]:
-        """Return an empty device list."""
-        return []
-
-    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-        """Return default capabilities."""
-        return DeviceCapabilities(
-            sources=["Flatbed"],
-            resolutions=[300],
-            modes=["color"],
-        )
-
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-        """Return a batch holding a single white test image."""
-        return ScanBatch(
-            pages=[Image.new("RGB", (100, 100), "white")],
-            actual_resolution=settings.resolution,
-            pages_rejected=0,
-        )
 
 
 @pytest.fixture
@@ -110,13 +79,13 @@ def test_settings(tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-def web_scanner() -> StubScanner:
-    """Return a concrete StubScanner for web tests."""
-    return StubScanner()
+def web_scanner() -> StubScannerBackend:
+    """Return the shared concrete stub backend for web tests."""
+    return StubScannerBackend()
 
 
 @pytest.fixture
-def app(test_settings: Settings, web_scanner: StubScanner) -> FastAPI:
+def app(test_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
     """Create the FastAPI app with test settings and stub scanner."""
     return create_app(test_settings, web_scanner)
 
@@ -272,7 +241,7 @@ def test_scan_form_submit(client: TestClient) -> None:
 
 @pytest.fixture
 def titled_client(
-    tmp_path: Path, web_scanner: StubScanner, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, web_scanner: StubScannerBackend, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[TestClient]:
     """
     TestClient whose ``default`` profile has ``title = "Receipt"`` (D-16).
