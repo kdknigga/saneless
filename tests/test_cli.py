@@ -2786,7 +2786,15 @@ class TestExitCodes:
     def test_unassemblable_pdf_exits_4_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A PdfError from assembly is one ``PDF error:`` line, exit 4."""
+        """
+        A PdfError from assembly is one ``PDF error:`` line, exit 4.
+
+        Since plan 29-09 that line goes on to say where the spooled pages were
+        kept: no PDF could be built, so the page files themselves are moved
+        into a job-keyed directory under ``failed/`` (D-10).  It is still one
+        line, and still exit 4, which is what preserving the exception type
+        buys.
+        """
         runner, _ = _patch_cli(monkeypatch, settings=_tmp_settings(tmp_path))
 
         def failing_assemble(*_args: object, **_kwargs: object) -> Path:
@@ -2800,10 +2808,13 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 4
-        assert result.stderr.splitlines() == [
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith(
             "PDF error: Could not assemble 1 page(s) into /tmp/x.pdf: "
-            "No space left on device"
-        ]
+            "No space left on device."
+        )
+        assert "1 spooled page file(s) were preserved at" in lines[0]
         assert "Traceback" not in result.output
 
     def test_mid_scan_config_error_exits_2_with_one_line(
