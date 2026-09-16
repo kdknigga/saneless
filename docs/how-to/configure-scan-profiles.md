@@ -59,7 +59,7 @@ In the web UI, select the profile from the dropdown before clicking Scan.
 | `duplex` | string | `"none"` | How both sides of a sheet are scanned: `"none"`, `"hardware"` or `"manual"`. `"manual"` runs the two-pass flip workflow; `"hardware"` only records that the source scans both sides and does not change the scan |
 | `resolution` | integer | `300` | Scan resolution in DPI |
 | `mode` | string | `"color"` | Color mode: `"Color"`, `"Gray"`, or `"Lineart"` |
-| `title` | string | `""` | Default document title, used as written when you leave the title blank in the web UI or omit `--title` on the CLI. A title you type always wins; with neither, the title is `Scan <date time>` |
+| `title` | string | `""` | Default document title, used as written when you leave the title blank in the web UI or omit `--title` on the CLI. A title you type always wins; with neither, the title is `Scan <date time>`, rendered in the server's local timezone with the zone named -- for example `Scan 2026-03-22 09:30 CDT` |
 | `default_tags` | list of int | `[]` | Paperless-ngx tag IDs to apply automatically |
 | `default_correspondent` | int or null | `null` | Paperless-ngx correspondent ID |
 | `enable_empty_page_detection` | bool | `true` | Remove blank pages from scans |
