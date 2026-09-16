@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
     from saneless.job import Job
 
+import httpx
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -44,6 +45,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.job import JobState, JobStore
+from saneless.paperless import PaperlessClient
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     ErrorCategory,
@@ -1932,3 +1934,279 @@ class TestProfileSelectMarkup:
         assert response.status_code == 200
         job_store: JobStore = _app(client).state.job_store
         assert job_store.list_recent(limit=1)[0].profile == "duplex"
+
+
+# The tag rows every filter test runs against.  Three, not two: the cases need a
+# match, a non-match, and a second match whose capitalisation differs from the
+# query's -- "Recipes" against a lower-case "rec" is what makes the
+# case-insensitivity assertion mean anything at all.
+_TAG_ROWS: list[dict[str, object]] = [
+    {"id": 1, "name": "receipt"},
+    {"id": 2, "name": "invoice"},
+    {"id": 3, "name": "Recipes"},
+]
+
+# The documented cap on the tag filter is 100 characters.  The number is
+# written out here rather than imported so the two boundary tests pin it from
+# both sides: a value at the cap must be accepted and a value over it must be
+# refused, and a route that quietly moved the cap would fail one of them.
+_FILTER_AT_THE_CAP = "b" * 100
+_OVER_LONG_FILTER = "a" * 500
+
+# A filter value that would be an injected script if it were ever echoed.  It is
+# well under the cap, so it reaches the filter rather than the 422 path, which is
+# the case worth proving (T-30-74).
+_SCRIPT_FILTER = "<script>alert(1)</script>"
+
+
+class _RecordingTransport:
+    """An httpx handler that records every request and answers with no tags."""
+
+    def __init__(self) -> None:
+        """Start with an empty record."""
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Record the request and answer with an empty paperless-ngx page.
+
+        Args:
+            request: The request the client issued.
+
+        Returns:
+            A 200 carrying an empty collection page, so the client's
+            pagination loop terminates on the first page.
+
+        """
+        self.requests.append(request)
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+
+def _serve_tag_rows(client: TestClient) -> FastAPI:
+    """
+    Make `_TAG_ROWS` the tag list the app sees, cache included.
+
+    Args:
+        client: The client whose app is being wired.
+
+    Returns:
+        The app, for tests that need to reach further into its state.
+
+    """
+    app = _app(client)
+    app.state.paperless.get_tags = lambda: list(_TAG_ROWS)
+    app.state.cache.invalidate("tags")
+    return app
+
+
+def _count_upstream(app: FastAPI) -> _RecordingTransport:
+    """
+    Swap in a Paperless client whose every request is recorded, not sent.
+
+    Args:
+        app: The app whose client is replaced.
+
+    Returns:
+        The recorder the new client's transport writes to.
+
+    """
+    handler = _RecordingTransport()
+    app.state.paperless = PaperlessClient(
+        url="http://paperless.invalid:8000",
+        token="a-real-looking-token",
+        _transport=httpx.MockTransport(handler),
+    )
+    return handler
+
+
+def _checkbox(markup: str, tag_id: int) -> str:
+    """
+    Return the rendered checkbox input for one tag id, or an empty string.
+
+    Args:
+        markup: The rendered tag list.
+        tag_id: The paperless-ngx tag id to look for.
+
+    Returns:
+        The matching `<input>` tag, or `""` when the tag is not rendered.
+
+    """
+    match = re.search(
+        rf'<input type="checkbox" name="tags" value="{tag_id}"[^>]*>', markup
+    )
+    return match.group(0) if match else ""
+
+
+class TestTagFilter:
+    """
+    UI-SPEC S6: the server-side tag filter that can never drop a tick.
+
+    Two hazards are designed out rather than guarded against, and these tests
+    are what hold the design in place: a filter swap must not lose a ticked tag
+    (A-5), and the filter text must never reach paperless-ngx or the page
+    (T-30-74, T-30-75).
+    """
+
+    def test_tag_filter_absent_renders_every_tag_as_an_unchecked_checkbox(
+        self, client: TestClient
+    ) -> None:
+        """No query renders the whole list, in the wrapper the swap replaces."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags")
+
+        assert response.status_code == 200
+        assert 'id="tags-list"' in response.text
+        assert response.text.count('type="checkbox"') == 3
+        assert "checked" not in response.text
+        for name in ("receipt", "invoice", "Recipes"):
+            assert name in response.text
+
+    def test_tag_filter_narrows_the_list_case_insensitively(
+        self, client: TestClient
+    ) -> None:
+        """``rec`` matches ``receipt`` and ``Recipes`` but never ``invoice``."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec"})
+
+        assert response.status_code == 200
+        assert "receipt" in response.text
+        assert "Recipes" in response.text
+        assert "invoice" not in response.text
+
+    def test_tag_filter_renders_the_carried_selection_checked(
+        self, client: TestClient
+    ) -> None:
+        """A tag id the request carries comes back ticked (A-5)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec", "tags": [3]})
+
+        assert "checked" in _checkbox(response.text, 3)
+        assert "checked" not in _checkbox(response.text, 1)
+
+    def test_tag_filter_pins_a_selected_tag_the_filter_excludes(
+        self, client: TestClient
+    ) -> None:
+        """A tick outside the filter stays in the DOM, above the list (A-5)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec", "tags": [2, 3]})
+
+        pinned = _checkbox(response.text, 2)
+        assert "checked" in pinned
+        assert response.text.index('value="2"') < response.text.index('value="3"')
+
+    def test_tag_filter_renders_a_selected_and_matched_tag_exactly_once(
+        self, client: TestClient
+    ) -> None:
+        """A tag both ticked and matched is not rendered twice."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec", "tags": [3]})
+
+        assert response.text.count('value="3"') == 1
+
+    def test_tag_filter_never_echoes_the_query_into_the_response(
+        self, client: TestClient
+    ) -> None:
+        """The filter is a filter, never a label: it is not rendered (T-30-74)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": _SCRIPT_FILTER})
+
+        assert response.status_code == 200
+        assert _SCRIPT_FILTER not in response.text
+        assert html.escape(_SCRIPT_FILTER) not in response.text
+        assert "alert(1)" not in response.text
+
+    def test_tag_filter_accepts_a_query_at_the_documented_cap(
+        self, client: TestClient
+    ) -> None:
+        """A value exactly at the cap is filtered, not refused."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": _FILTER_AT_THE_CAP})
+
+        assert response.status_code == 200
+
+    def test_tag_filter_rejects_an_over_long_query_with_422(
+        self, client: TestClient
+    ) -> None:
+        """An unbounded filter is refused at the boundary (T-30-76)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": _OVER_LONG_FILTER})
+
+        assert response.status_code == 422
+
+    def test_tag_filter_issues_no_upstream_request_when_the_cache_is_warm(
+        self, client: TestClient
+    ) -> None:
+        """Filtering reads the cache; it is not a new fetch (T-30-75)."""
+        app = _app(client)
+        handler = _count_upstream(app)
+        app.state.cache.set("tags", list(_TAG_ROWS))
+
+        response = client.get("/api/tags", params={"q": "rec"})
+
+        assert response.status_code == 200
+        assert "receipt" in response.text
+        assert handler.requests == []
+
+    def test_tag_filter_never_forwards_the_query_to_paperless(
+        self, client: TestClient
+    ) -> None:
+        """A cold cache fetches the whole list and carries no ``q`` (T-30-75)."""
+        app = _app(client)
+        handler = _count_upstream(app)
+        app.state.cache.invalidate("tags")
+
+        response = client.get("/api/tags", params={"q": "receipt"})
+
+        assert response.status_code == 200
+        assert handler.requests
+        for request in handler.requests:
+            assert "q" not in request.url.params
+            assert "receipt" not in str(request.url)
+
+    def test_tag_filter_empty_paperless_renders_the_empty_state(
+        self, client: TestClient
+    ) -> None:
+        """No tags at all is its own sentence, not a blank box."""
+        app = _app(client)
+        app.state.paperless.get_tags = list
+        app.state.cache.invalidate("tags")
+
+        response = client.get("/api/tags")
+
+        assert "No tags in paperless-ngx yet." in response.text
+        assert "No tags match that filter." not in response.text
+
+    def test_tag_filter_matching_nothing_renders_the_no_match_state(
+        self, client: TestClient
+    ) -> None:
+        """A filter that matches nothing says so, and says something else."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "zzz"})
+
+        assert "No tags match that filter." in response.text
+        assert "No tags in paperless-ngx yet." not in response.text
+
+    def test_tag_filter_survives_a_cache_invalidate_with_the_selection(
+        self, client: TestClient
+    ) -> None:
+        """The refresh button re-renders the same wrapper, filter and ticks intact."""
+        _serve_tag_rows(client)
+
+        response = client.post(
+            "/api/cache/invalidate?resource=tags",
+            data={"q": "rec", "tags": [3]},
+        )
+
+        assert response.status_code == 200
+        assert 'id="tags-list"' in response.text
+        assert "checked" in _checkbox(response.text, 3)
+        assert "invoice" not in response.text
