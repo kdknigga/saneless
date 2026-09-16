@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
@@ -63,6 +64,104 @@ _TAGS_FORM_DEFAULT = Form(default=[])
 # TYPE_CHECKING import, because FastAPI reads it to validate the ``resource``
 # query parameter: anything else is a 422 instead of reaching the cache (N-20).
 MetadataResource = Literal["tags", "correspondents"]
+
+# The cookie naming the browser that started a scan (D-23).  Every attribute it
+# is set with is deliberate: ``HttpOnly`` so no script can read it -- there is
+# no script file in this application at all; ``SameSite=Lax`` so the browser
+# withholds it on any cross-site POST; no lifetime attribute, so it is a
+# session cookie that dies when the browser closes; and deliberately no
+# ``Secure``, because the appliance is served over plain HTTP on a LAN and that
+# flag would silently stop the cookie being sent rather than harden it.
+#
+# REQUIREMENTS' position, recorded here so a later reader does not mistake this
+# for something it is not: the token is a footgun guard for the flip prompt,
+# not an authentication mechanism.  ``CrossOriginGuard`` allows a POST that
+# carries neither ``Sec-Fetch-Site`` nor ``Origin``, so a scripted client that
+# sends a guessed cookie of its own can answer a flip.  That is accepted on a
+# trusted LAN, not overlooked.  What the token stops is the household member
+# standing at the same appliance pressing Continue on a stack they did not
+# load, which is the failure this phase exists to close.
+OWNER_COOKIE: Final = "saneless_owner"
+
+
+def _presented_owner(request: Request) -> str | None:
+    """
+    Return the owner token this request carries, or None when it carries none.
+
+    A blank or whitespace-only value counts as none.  A browser holding one has
+    no usable identity, and treating it as a token would make every such
+    browser the same owner as every other.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The token, or None.
+
+    """
+    presented = request.cookies.get(OWNER_COOKIE, "").strip()
+    return presented or None
+
+
+def _is_owner(presented: str | None, recorded: str | None) -> bool:
+    """
+    Report whether a presented token speaks for the job that recorded one.
+
+    A NULL recorded token means the job is unowned and everyone may answer it
+    (UI-SPEC S5).  Every row written before this phase has one, including a
+    manual-duplex job that was in flight across an upgrade, and a strict rule
+    would leave such a job un-continuable until the Phase 25 flip timeout fired
+    it away.  Nothing can create a NULL-token job after this phase, so the
+    exception has a closed lifetime.
+
+    The comparison goes through ``secrets.compare_digest`` so no timing
+    difference can be read off it (T-30-57).  Both sides are encoded first:
+    the presented value arrives as text out of a header and ``compare_digest``
+    refuses a non-ASCII ``str``, while it compares bytes of any two lengths
+    safely.
+
+    Args:
+        presented: The token this request carries, or None.
+        recorded: The token stored on the job row, or None when unowned.
+
+    Returns:
+        Whether this request may answer for the job.
+
+    """
+    if recorded is None:
+        return True
+    if presented is None:
+        return False
+    return secrets.compare_digest(presented.encode(), recorded.encode())
+
+
+def _owner_answers(request: Request, job: Job | None) -> bool:
+    """
+    Report whether this request may answer the named job's flip prompt (D-24).
+
+    An unknown job id answers False: there is nothing to own, and the worker
+    would have dropped the answer anyway.  The outcome is logged as a match or
+    a mismatch and never as a value -- the token is not allowed into a log
+    line any more than into the markup (T-30-59).
+
+    Args:
+        request: The incoming request, for the cookie it carries.
+        job: The job the answer names, or None when no such row exists.
+
+    Returns:
+        Whether the answer should be passed to the worker.
+
+    """
+    if job is None:
+        return False
+    matched = _is_owner(_presented_owner(request), job.owner_token)
+    logger.debug(
+        "Flip answer for job %s: owner %s",
+        job.id,
+        "matched" if matched else "did not match",
+    )
+    return matched
+
 
 # The freshness line's four UI-SPEC variants, composed here rather than in the
 # template: the strip's templates own no vocabulary, and a page that assembled
@@ -560,11 +659,18 @@ def start_scan(
         written = _record_refused_submit(state.job_store, form, error=error)
         raise RequestRejected(rejection, job_id=written)
 
+    # D-23's mint rule: a token is minted on the first submit from a browser
+    # and reused for every later job from it, so two tabs on one device do not
+    # disown each other.  It is recorded on the row either way; only a mint
+    # reaches the response as a cookie.
+    presented = _presented_owner(request)
+    owner = presented or secrets.token_urlsafe(32)
     job = state.job_store.create_job(
         profile=form.profile,
         title=form.title,
         tags=form.tags,
         correspondent=form.correspondent,
+        owner_token=owner,
     )
     # Annotated because app.state is untyped; assert_never needs the real type.
     result: SubmitResult = state.worker.submit(job)
@@ -576,7 +682,7 @@ def start_scan(
             # has just become busy, so D-08's paused note is due now rather than
             # at the end of the cache's TTL.  The strip's own context rides
             # along because the partial is rendered inside this response.
-            return state.templates.TemplateResponse(
+            response = state.templates.TemplateResponse(
                 request,
                 "partials/status_response.html",
                 {
@@ -587,6 +693,15 @@ def start_scan(
                     **_checks_context(state),
                 },
             )
+            if presented is None:
+                response.set_cookie(
+                    OWNER_COOKIE,
+                    owner,
+                    httponly=True,
+                    samesite="lax",
+                    path="/",
+                )
+            return response
         case SubmitResult.QUEUE_FULL:
             rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
         case SubmitResult.DOWN:
@@ -798,11 +913,19 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     buttons, so a claimed or repeated click never re-renders a prompt that
     looks unanswered (CR-01).
 
+    A Continue from a browser that does not hold the job's owner token is
+    dropped in exactly the same way, and for the same reason (D-24): the
+    household member who did not load the paper must not be able to start
+    pass B, and must not be shown a failure for trying either.  A job whose
+    ``owner_token`` is NULL is unowned and anyone may answer it.
+
     The response re-renders the Scan button out-of-band from server state
     (ROBU-04) and leaves ``#status-message`` alone (D-03).
     """
     state = request.app.state
-    claimed = state.worker.continue_flip(job_id)
+    claimed = False
+    if _owner_answers(request, state.job_store.get_job(job_id)):
+        claimed = state.worker.continue_flip(job_id)
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
@@ -829,11 +952,17 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     partial shows "Aborting scan..." (or the answer that won) in place of the
     buttons, so the response never invites a second click (CR-01).
 
+    An Abort from a browser that does not hold the job's owner token is
+    dropped the same way (D-24): someone else's scan is not theirs to stop.
+    A job whose ``owner_token`` is NULL is unowned and anyone may answer it.
+
     The response re-renders the Scan button out-of-band from server state
     (ROBU-04) and leaves ``#status-message`` alone (D-03).
     """
     state = request.app.state
-    claimed = state.worker.abort_flip(job_id)
+    claimed = False
+    if _owner_answers(request, state.job_store.get_job(job_id)):
+        claimed = state.worker.abort_flip(job_id)
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
