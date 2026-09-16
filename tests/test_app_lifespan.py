@@ -18,11 +18,13 @@ import logging
 import re
 import sqlite3
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.routing import Mount, Route
 
+import saneless.scanner.sane_backend as sane_backend_mod
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -31,9 +33,17 @@ from saneless.config import (
     Settings,
 )
 from saneless.job import JobStore
-from saneless.vocabulary import RESTART_REASON, JobState, WorkerHealth
+from saneless.paperless import UploadResult
+from saneless.scanner.sane_backend import SaneBackend
+from saneless.vocabulary import (
+    RESTART_REASON,
+    TERMINAL_STATES,
+    JobState,
+    WorkerHealth,
+)
 from saneless.web.app import create_app
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, wait_for_state
+from tests.fake_sane import FakeSaneModule
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -491,3 +501,134 @@ def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
         pass
     with pytest.raises(sqlite3.ProgrammingError):
         store.get_job(existing.id)
+
+
+# --- SANE is unreachable from a request path (HARD-05, D-19) -----------------
+
+# How every route the app exposes is called, so the proof below can drive all
+# of them.  A route the app serves and this map does not name fails the test
+# rather than being passed over in silence: that is what makes a route added
+# later covered on the day it lands, instead of quietly uncovered.
+_ROUTE_CALLS: dict[str, dict[str, Any]] = {
+    "/docs": {"method": "GET"},
+    "/docs/oauth2-redirect": {"method": "GET"},
+    "/redoc": {"method": "GET"},
+    "/": {"method": "GET"},
+    "/health": {"method": "GET"},
+    "/api/paperless/test": {"method": "GET"},
+    "/api/scan": {
+        "method": "POST",
+        "data": {"profile": "default", "title": "D-19 proof"},
+    },
+    "/api/jobs/current/status": {"method": "GET"},
+    "/api/tags": {"method": "GET"},
+    "/api/correspondents": {"method": "GET"},
+    "/api/cache/invalidate": {"method": "POST", "params": {"resource": "tags"}},
+    "/api/jobs/history": {"method": "GET"},
+    # Answering a prompt no job is waiting at is a real request that the route
+    # handles by design (D-16), so the flip routes need no job to be driven.
+    "/api/flip/continue": {"method": "POST", "data": {"job_id": "no-such-job"}},
+    "/api/flip/abort": {"method": "POST", "data": {"job_id": "no-such-job"}},
+}
+
+# The entries the proof does not drive, each named with its reason rather than
+# dropped, so what is covered stays auditable.
+_ROUTE_SKIPS: dict[str, str] = {
+    "/static": (
+        "a StaticFiles mount rather than an endpoint: it serves bytes off disk "
+        "through Starlette and runs no saneless code at all"
+    ),
+    "/openapi.json": (
+        "FastAPI's generated schema, which this app cannot produce: the route "
+        "handlers annotate their returns as 'Response' under postponed "
+        "evaluation, and pydantic raises rather than resolving the forward "
+        "reference. It runs no saneless handler and opens no scanner, and the "
+        "500 predates this plan; recorded in deferred-items.md"
+    ),
+}
+
+
+def test_sane_lifecycle_across_startup_every_route_and_shutdown(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    No request path reaches sane.init() or sane.exit() (HARD-05, D-19).
+
+    Asserted behaviourally rather than by searching for the names: a route
+    that constructed a backend, or a handler that shut SANE down to recover
+    from something, would move these counters while passing any grep.  The app
+    is driven over a real ``SaneBackend`` -- the only backend that touches SANE
+    at all -- so the counters are the library's own view of what happened.
+
+    ``exit_while_blocked`` ties the proof to D-12/D-13: whatever the routes did,
+    ``sane_exit`` never ran with a read outstanding.
+    """
+    fake = FakeSaneModule(
+        devices=[("test:device:001", "TestVendor", "TestModel", "scanner")]
+    )
+    monkeypatch.setattr(sane_backend_mod, "sane", fake)
+    # This process may have initialised SANE in an earlier test; the guard is
+    # process-level by design, so the proof starts by re-arming it.
+    sane_backend_mod.shutdown()
+    fake.exit_call_count = 0
+
+    scanner = SaneBackend()
+    assert fake.init_call_count == 1
+
+    app = create_app(settings, scanner)
+    app.state.paperless.get_tags = list
+    app.state.paperless.get_correspondents = list
+    app.state.paperless.test_connection = lambda: "connected"
+    app.state.paperless.upload_document = lambda *_a, **_k: UploadResult(
+        delivered_to_api=True, task_uuid="d-19-proof"
+    )
+    app.state.paperless.poll_task = lambda *_a, **_k: {"status": "SUCCESS"}
+    store: JobStore = app.state.job_store
+
+    uncovered = {
+        route.path
+        for route in app.routes
+        if isinstance(route, Route | Mount)
+        and route.path not in _ROUTE_CALLS
+        and route.path not in _ROUTE_SKIPS
+    }
+    assert uncovered == set(), (
+        f"routes {sorted(uncovered)} are neither driven nor skipped with a "
+        f"reason; add them to _ROUTE_CALLS or _ROUTE_SKIPS"
+    )
+
+    with TestClient(app) as client:
+        assert fake.init_call_count == 1
+        assert fake.exit_call_count == 0
+
+        for route in app.routes:
+            path = getattr(route, "path", "")
+            call = _ROUTE_CALLS.get(path)
+            if call is None:
+                continue
+            kwargs = dict(call)
+            method = kwargs.pop("method")
+            response = client.request(method, path, **kwargs)
+            assert response.status_code < 500, (path, response.status_code)
+            # The claim is per route, not per run: a single count at the end
+            # could not say which handler had moved it.
+            assert fake.init_call_count == 1, path
+            assert fake.exit_call_count == 0, path
+
+        # The submitted scan runs on the worker thread, so it is waited out
+        # here rather than raced with the shutdown below: a worker that had
+        # not stopped would skip the close for an honest reason and say
+        # nothing about reachability.
+        submitted = store.list_recent(limit=10)
+        assert submitted, "POST /api/scan created no job, so nothing was proven"
+        for job in submitted:
+            wait_for_state(store, job.id, TERMINAL_STATES, timeout=15.0)
+        # And the submission really did reach the scanner -- from the worker
+        # thread, which is the only place the app is allowed to touch SANE
+        # from.  Without this the counters above would also be satisfied by a
+        # scan that never started.
+        assert fake.open("test:device:001").calls
+
+    assert fake.init_call_count == 1
+    assert fake.exit_call_count == 1
+    assert fake.exit_while_blocked is False
