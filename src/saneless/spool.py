@@ -209,7 +209,17 @@ class SpooledPageSink(PageSink):
             png_path: Where it would have been written, for the message.
 
         Raises:
-            ScanError: If free space is below the page plus the reserve.
+            ScanError: If free space is below the page plus the reserve, or if
+                it could not be measured at all.  ``add``'s "no raw OSError
+                escapes this method" promise (D-07) covers the measurement as
+                well as the write: a spool directory that has been removed, or
+                whose mount went away, raises ``FileNotFoundError`` here, and
+                untranslated it escaped past ``_acquire_pages``' ``except
+                ScanError`` ladder into its generic handler -- where it came
+                out as "Scanner error on page N", blaming the scanner for a
+                disk fault -- and past the flatbed path's handler entirely,
+                because ``_snap_flatbed``'s ``sink.add`` call sits outside its
+                ``try`` (WR-11).
 
         """
         # From size and band count, never len(image.tobytes()): that copied
@@ -219,7 +229,14 @@ class SpooledPageSink(PageSink):
         decoded_bytes = image.size[0] * image.size[1] * len(image.getbands())
         page_mb = (decoded_bytes + _BYTES_PER_MB - 1) // _BYTES_PER_MB
         required_mb = page_mb + self._min_free_space_mb
-        free_mb = shutil.disk_usage(self._directory).free // _BYTES_PER_MB
+        try:
+            free_mb = shutil.disk_usage(self._directory).free // _BYTES_PER_MB
+        except OSError as exc:
+            measure_msg = (
+                f"Could not measure free space for page {sequence} in "
+                f"{self._directory}: {describe(exc)}"
+            )
+            raise ScanError(measure_msg) from exc
         if free_mb < required_mb:
             msg = (
                 f"Insufficient disk space for page {sequence}: "
