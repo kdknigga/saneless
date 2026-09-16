@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING, Literal
 from unittest.mock import MagicMock
 
 import httpx
+import pikepdf
 import pytest
 from PIL import Image, ImageDraw
 
@@ -69,10 +70,16 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.exceptions import ScanError
 from saneless.job import JobStore
 from saneless.paperless import PaperlessClient
 from saneless.scanner.base import ScannerBackend
-from saneless.vocabulary import TERMINAL_STATES, JobState, ScanOutcome
+from saneless.vocabulary import (
+    TERMINAL_STATES,
+    ErrorCategory,
+    JobState,
+    ScanOutcome,
+)
 from saneless.worker import ScanWorker
 from tests.conftest import spooling_in_turn
 
@@ -81,6 +88,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from saneless.job import Job
+    from saneless.scanner.base import PageSink, ScanBatch, ScanSettings
 
 _DOCUMENTS_PATH = "/api/documents/post_document/"
 _TASKS_PATH = "/api/tasks/"
@@ -143,6 +151,11 @@ _FLIP_TIMEOUT_BUDGET = 1
 _FAILURE_TASK = "e2e-task-failure"
 _PENDING_TASK = "e2e-task-never-finishes"
 _PAPERLESS_MESSAGE = "Document consumption failed: unsupported PDF producer"
+
+# The mid-batch fault HARD-02 is about, shaped like the SANE backend's own
+# per-page error text so the end-to-end message is the one a user would read.
+_SCANNER_MESSAGE = "Scanner error on page 4: Document feeder jammed"
+_SCANNER_FAILURE = ScanError(_SCANNER_MESSAGE)
 
 
 def _unexpected(request: httpx.Request) -> httpx.Response:
@@ -536,6 +549,36 @@ def _build_scanner(scan_passes: tuple[int, ...]) -> MagicMock:
     return scanner
 
 
+def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
+    """
+    Stub a scanner that spools ``pages`` sheets and then jams (HARD-02).
+
+    The sheets go into the pipeline's own ``SpooledPageSink``, so the files the
+    preservation guard finds are real ones written by production code -- the
+    same seam ``_build_scanner`` uses, with a raise on the end.
+
+    Args:
+        pages: How many sheets reach the spool before the fault.
+        failure: What the device raises on the next sheet.
+
+    Returns:
+        A MagicMock constrained to the ScannerBackend interface.
+
+    """
+    scanner = MagicMock(spec=ScannerBackend)
+
+    def spool_then_fail(
+        device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """Spool every sheet that made it through, then raise as SANE would."""
+        for page in _pages(pages):
+            sink.add(page)
+        raise failure
+
+    scanner.scan_pages.side_effect = spool_then_fail
+    return scanner
+
+
 def _build_settings(tmp_path: Path, case: _Case) -> Settings:
     """
     Build Settings whose directories are three separate subtrees of tmp_path.
@@ -721,6 +764,69 @@ class TestFiveOutcomesEndToEnd:
 
         _assert_persisted_row(case, finished)
         _assert_files(case, finished, settings.output.failed_dir, consume_dir)
+
+
+class TestAPartialScanSurvivesTheWorker:
+    """
+    HARD-02 end to end: a jam mid-stack keeps the sheets already fed.
+
+    The unit coverage in ``tests/test_pipeline.py`` proves the guard; this
+    exists to prove the *outcome* -- that the persisted row still ends ERROR
+    with the scanner category and a NULL outcome, exactly as a mid-batch
+    failure did before anything was preserved, and that the error a user reads
+    names the file they have to go and find (OUTC-04).
+    """
+
+    def test_partial_scan_preserved_is_recorded_on_the_job_row(
+        self,
+        tmp_path: Path,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """Three sheets fed, a jam on the fourth, through the real worker."""
+        case = next(case for case in _CASES if case.label == "success")
+        settings = _build_settings(tmp_path, case)
+        store = JobStore(db_path=str(settings.output.db_path))
+        paperless = PaperlessClient(
+            url=settings.paperless.url,
+            token=settings.paperless.token.get_secret_value(),
+            consume_dir=settings.paperless.consume_dir,
+            max_retries=1,
+            _transport=httpx.MockTransport(_accepting_handler()),
+        )
+        worker = ScanWorker(
+            _jamming_scanner(3, _SCANNER_FAILURE), paperless, settings, store
+        )
+        try:
+            worker.start()
+            job = store.create_job(_PROFILE, _TITLE)
+            worker.submit(job)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, 2.0)
+        finally:
+            worker.stop()
+            paperless.close()
+            store.close()
+
+        assert finished.state is JobState.ERROR
+        # D-01: a failure raises, so the pipeline measured nothing and the
+        # outcome and page columns stay NULL rather than claiming a count.
+        assert finished.outcome is None
+        assert (
+            finished.pages_scanned,
+            finished.pages_removed,
+            finished.pages_uploaded,
+        ) == (None, None, None)
+        # Unchanged by the new branch: still a scanner failure, so still exit 1
+        # at the CLI and still the scanner category on the row.
+        assert finished.error_category is ErrorCategory.SCANNER
+
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        with pikepdf.open(preserved[0]) as pdf:
+            assert len(pdf.pages) == 3
+        assert finished.error is not None
+        assert _SCANNER_MESSAGE in finished.error
+        assert "3 page(s)" in finished.error
+        assert preserved[0].name in finished.error
 
 
 class TestFlipTimeoutReleasesTheWorker:
