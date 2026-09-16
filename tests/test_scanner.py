@@ -8,6 +8,8 @@ import importlib
 import inspect
 import logging
 import os
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -1957,6 +1959,157 @@ class TestSaneBackendCancelSequence:
 
         assert fake_device.calls == ["start", "snap"]
         assert page_sink.records == ()
+
+    def test_keyboard_interrupt_mid_read(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        D-15: Ctrl-C during a read takes the same device-safe path, then re-raises.
+
+        This closes the "safe device cancel on Ctrl-C mid-read" Phase 28
+        deferred to this phase.  Nothing about the operator-facing behaviour
+        moves: the ``KeyboardInterrupt`` is re-raised rather than swallowed or
+        translated into a ``ScanError``, so the CLI's exit 130 and its one-line
+        message are exactly what they were (Phase 28 D-07).  What changes is
+        the state the device is left in on the way out.
+
+        The interrupt is delivered deterministically, without a sleep and
+        without polling.  ``read_started`` is set by the reader thread from
+        inside the blocked read, so by the time the signal is raised the
+        waiting thread is provably past ``reader.start()`` and inside the
+        block that handles the interrupt.
+        """
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        def interrupt_once_the_read_blocks() -> None:
+            if fake_device.read_started.wait(_READER_JOIN_SECONDS):
+                signal.raise_signal(signal.SIGINT)
+
+        interrupter = threading.Thread(
+            target=interrupt_once_the_read_blocks, name="ctrl-c", daemon=True
+        )
+
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            interrupter.start()
+            with pytest.raises(KeyboardInterrupt):
+                sane_backend._scan_adf_pages(
+                    dev, page_sink, _uncropped, timeout_per_page=5.0
+                )
+            interrupter.join(_READER_JOIN_SECONDS)
+
+            assert fake_device.cancel_calls == 1
+            assert fake_device.close_while_blocked is False
+            assert fake_device.close_calls == 0
+
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_blocked is False
+        assert page_sink.records == ()
+
+
+# The child process the exit proof runs, and the bound it is given.
+#
+# It blocks in ``os.read`` on a pipe nobody writes to.  That is the honest
+# stand-in for ``sane_read``: a real blocking syscall that releases the GIL,
+# which a ``threading.Event().wait()`` would only pretend to be -- and the
+# whole claim under test is about what the interpreter does at exit with a
+# thread parked in exactly such a call.
+#
+# Twenty seconds is not a duration the proof expects to use: a passing run
+# exits in well under a second.  It is the bound that turns the failure this
+# test exists to catch -- a process that never exits -- into a reported
+# failure instead of a hung session.  A ``TimeoutExpired`` is therefore left
+# to raise rather than caught.
+_CHILD_EXIT_SECONDS = 20.0
+_STUCK_READ_CHILD = '''\
+"""Block a daemon reader in a real syscall, then leave."""
+
+import os
+
+from saneless.exceptions import ScanError
+from saneless.scanner.sane_backend import _acquire_with_timeout
+
+
+class StuckScanner:
+    """A device whose read never returns and whose cancel changes nothing."""
+
+    def __init__(self) -> None:
+        self.cancels = 0
+        self.closes = 0
+
+    def cancel(self) -> None:
+        self.cancels += 1
+
+    def close(self) -> None:
+        self.closes += 1
+
+
+read_fd, _write_fd = os.pipe()
+device = StuckScanner()
+returned = True
+
+
+def never_returns() -> object:
+    """Block forever in a GIL-releasing syscall, as sane_read does."""
+    return os.read(read_fd, 1)
+
+
+try:
+    _acquire_with_timeout(device, never_returns, "Page 1", 0.2, 0.2)
+except ScanError as exc:
+    returned = "did not respond" not in str(exc)
+
+print(f"returned={returned} cancels={device.cancels} closes={device.closes}")
+'''
+
+
+class TestStuckReadDoesNotBlockProcessExit:
+    """
+    HARD-03's only honest proof, and the reason the executor had to go.
+
+    It cannot be made in-process: a test asserting "the interpreter would have
+    exited" is asserting about something that has not happened yet.  So a real
+    child is started, wedged in a real blocking read, and required to exit on
+    its own.
+    """
+
+    def test_process_exits(self, tmp_path: Path) -> None:
+        """
+        A child with a permanently stuck reader still exits, and exits 0.
+
+        The printed line carries the whole D-12 sequence in one assertion:
+        the read did not return, exactly one cancel was fired, and no close
+        was issued on a handle a read is still inside.
+
+        Args:
+            tmp_path: Where the child script is written.
+
+        """
+        child = tmp_path / "stuck_read.py"
+        child.write_text(_STUCK_READ_CHILD, encoding="utf-8")
+        env = {
+            **os.environ,
+            "SANELESS_TEST_PYTHON": sys.executable,
+            "SANELESS_TEST_CHILD": str(child),
+        }
+
+        # Every argv element is a literal and the per-run paths travel in the
+        # environment, quoted so they are never re-split -- the shape
+        # test_atomic_write.py established for the one other child-process
+        # test in this suite.
+        result = subprocess.run(
+            ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" "$SANELESS_TEST_CHILD"'],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CHILD_EXIT_SECONDS,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "returned=False cancels=1 closes=0" in result.stdout
 
 
 class TestSaneBackendADFCleanup:
