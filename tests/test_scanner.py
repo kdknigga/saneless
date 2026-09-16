@@ -1701,25 +1701,36 @@ class TestSaneBackendCancelSequence:
     """
 
     @pytest.fixture(autouse=True)
-    def _clear_wedge(self) -> Iterator[None]:
+    def _clear_wedge(self, fake_device: FakeSaneDev) -> Iterator[None]:
         """
-        Clear the module-level wedge record after each test in this class.
+        Release any blocked read and clear the wedge after each test here.
 
         The record is module state by design -- D-13 needs the *next*
         ``scan_pages`` on a fresh backend object to refuse -- so a test that
         wedges it deliberately has to un-wedge it, or the refusal leaks into
         every test that runs afterwards.
 
-        The device handle and its iterator are dropped with it.  A reader
-        thread still blocked at that point is a daemon, and it identifies its
-        own acquisition by the ``done`` event it was given, so a late wake-up
-        after this teardown matches nothing and does nothing.
+        The gate is opened first, and the readers joined, so the release goes
+        through the production path: the reader closes its own handle and
+        clears the record itself, exactly as it would in service.  Without
+        that, a test arming ``NEVER`` leaves a daemon parked until the fake's
+        30 s ceiling, and the *next* test's join waits the difference out.
+
+        Whatever is left afterwards is cleared outright.  A reader still
+        blocked at that point identifies its own acquisition by the ``done``
+        event it was given, so a late wake-up matches nothing and does
+        nothing.
+
+        Args:
+            fake_device: The one handle every test in this class drives.
 
         Yields:
-            None, before the record is cleared.
+            None, before the release and the clear.
 
         """
         yield
+        fake_device.release_read()
+        _join_sane_reader_threads()
         record = sane_backend_mod._WEDGE
         record.stuck = False
         record.done = None
