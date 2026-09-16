@@ -427,8 +427,18 @@ class TestScanCommand:
         assert result.exit_code == 1
         assert "Paper jam" in result.output
 
-    def test_scan_paperless_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Pipeline raises PaperlessError -> exit code 3."""
+    def test_scan_paperless_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Pipeline raises PaperlessError -> exit code 3.
+
+        The directories are repointed at ``tmp_path`` because the failed upload
+        preserves the assembled PDF: with ``_make_settings``' defaults that
+        wrote a real file into the suite's shared ``/tmp/saneless-test/data``,
+        once per run, where nothing ever removes it (WR-07's sibling leak, and
+        the one that pre-dates this phase).
+        """
 
         class FailPaperless:
             """Paperless client that always raises PaperlessError on upload."""
@@ -444,11 +454,25 @@ class TestScanCommand:
             def close(self) -> None:
                 """No-op close."""
 
-        runner, _ = _patch_cli(monkeypatch, paperless_cls=FailPaperless)
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path / "scratch"),
+                data_dir=str(tmp_path / "state"),
+                log_file=_TEST_LOG,
+            ),
+        )
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, paperless_cls=FailPaperless
+        )
 
         result = runner.invoke(cli, ["scan", "--title", "Test"])
         assert result.exit_code == 3
         assert "Server down" in result.output
+        # The scan is not lost when the upload is (OUTC-04), and this pins
+        # where it went: this test's own directory, not the shared one.
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert str(preserved[0]) in result.output
 
     def test_scan_with_profile(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Scan --profile photo -> pipeline called with profile_name='photo'."""

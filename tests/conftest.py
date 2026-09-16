@@ -129,6 +129,57 @@ def _suite_leaves_cwd_config_alone() -> Iterator[None]:
         pytest.fail(f"the test suite created or modified {path}")
 
 
+def _failed_dir_entries() -> set[str]:
+    """
+    List whatever is sitting in the suite's shared preservation directory.
+
+    Returns:
+        The entry names, or an empty set when the directory does not exist.
+
+    """
+    failed = Path(_TEST_DATA) / "failed"
+    if not failed.is_dir():
+        return set()
+    return {entry.name for entry in failed.iterdir()}
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _suite_leaves_the_shared_failed_dir_alone() -> Iterator[None]:
+    """
+    Fail the run if a test preserved a scan into the shared ``failed/`` (WR-07).
+
+    ``default_settings`` points ``data_dir`` at a process-wide
+    ``/tmp/saneless-test``, and nothing removes what lands there -- so a test
+    that triggers preservation without repointing ``data_dir`` writes a real
+    PDF, or a whole page directory, on every run, for ever.
+
+    That is not only untidy. ``_warn_if_failed_dir_growing`` starts emitting
+    its WARNING once twenty artefacts have accumulated, and it emits it inside
+    whichever unrelated test happened to trigger the next preservation --
+    several of which assert on captured log records. A leak here is therefore a
+    flake that appears weeks after the test that caused it, on a machine that
+    has run the suite often enough, and nowhere near the code to blame.
+
+    ``tests/test_pipeline.py::_isolate_dirs`` is the pattern a preserving test
+    wants: point ``tmp_dir`` and ``data_dir`` at separate subtrees of
+    ``tmp_path``.
+
+    Yields:
+        Nothing; the check runs after the last test.
+
+    """
+    before = _failed_dir_entries()
+    yield
+    leaked = sorted(_failed_dir_entries() - before)
+    if leaked:
+        pytest.fail(
+            f"the test suite preserved {len(leaked)} artefact(s) into the shared "
+            f"{Path(_TEST_DATA) / 'failed'}: {', '.join(leaked)}. Point the "
+            f"test's output.tmp_dir and output.data_dir at tmp_path, the way "
+            f"tests/test_pipeline.py::_isolate_dirs does."
+        )
+
+
 def reset_sane_process_state() -> None:
     """
     Return SANE to "never initialised, not wedged" for the next test.
