@@ -104,11 +104,18 @@ def build_pdf_filename(job_id: str, title: str) -> str:
     name never carries a dangling ``-`` before its extension.
 
     **Uniqueness comes from the job id, not from the timestamp.** The job id is
-    a uuid4; the timestamp is only there to make a directory listing sort
+    a uuid4 -- ``job.id`` from the worker, and one minted per run by ``saneless
+    scan``; the timestamp is only there to make a directory listing sort
     usefully. Two jobs submitted in the same second with the same title would
     collide on the timestamp alone, and a collision is not cosmetic here:
     ``shutil.move`` onto an explicit destination path overwrites silently, so
     two same-named PDFs preserved into ``failed/`` would destroy one scan.
+
+    Only the first ``_JOB_ID_LENGTH`` characters of the id are used, so two
+    uuid4s that agree on that prefix, in the same second, under the same title,
+    still collide. At eight hex characters that is a 1-in-4-billion coincidence
+    per same-second same-title pair, and it is the bound this guarantee really
+    carries -- not an absolute.
 
     The job id is put through the same sanitiser as the title. In production it
     is a uuid4, every character of which already survives the allow-list
@@ -117,9 +124,9 @@ def build_pdf_filename(job_id: str, title: str) -> str:
     control this function owns.
 
     Args:
-        job_id: The job's identifier, normally a uuid4. Empty only in tests,
-            where the worker that supplies ``job.id`` is not in the picture;
-            the segment is then dropped.
+        job_id: The job's identifier, a uuid4 from either entry point. Empty
+            only in tests, which construct a request without one; the segment
+            is then dropped, and with it the uniqueness this function promises.
         title: The title as typed by the operator. Wholly untrusted.
 
     Returns:
