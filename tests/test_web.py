@@ -266,10 +266,16 @@ def titled_client(
 
     The worker's ``submit`` is stubbed to accept without running a pipeline,
     so the created job row is what the route resolved and nothing else.
+
+    The token is configured because ``POST /api/scan`` now refuses outright
+    when it is a placeholder (APPL-07, D-15), and an unset one here would stop
+    these title tests at the guard instead of reaching the resolution they are
+    about.  That refusal has its own tests in tests/test_web_errors.py.
     """
+    auth = "test-token"
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000"),
+        paperless=PaperlessConfig(url="http://localhost:8000", token=auth),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         profiles={"default": ProfileConfig(title="Receipt")},
     )
