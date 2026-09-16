@@ -85,7 +85,7 @@ created: 2026-09-16
 
 ---
 
-## S1 — Status Strip (APPL-01, -02, -06, -07, -11)
+## S1 — Status Strip (APPL-01, -02, -06, -11)
 
 ### Placement
 
@@ -765,7 +765,7 @@ No new tier, no new weight. Both are inherited from the master spec.
 | Heading 2 | Pico `--pico-font-size-h2` | 700 | ~1.125 | `System status` card heading |
 | Body | 1rem (16px) | 400 | 1.5 | check messages, busy line, error sentence and next step, counts sentence, tag labels, disclosure body |
 | Body | 1rem (16px) | **700** | 1.5 | `.check-name` only — the second of the two declared weights |
-| Small | 0.875rem (0.875em) | 400 | inherited | every help `<small>`, `.check-next` |
+| Small | 0.875rem (0.875em) | 400 | inherited | every help `<small>`, `.check-next`, `#scan-blocked-reason` |
 
 `.page-counts` renders at its container's size (16px in the status area, the cell's size in the history table) and is distinguished by colour, not size. It is deliberately **not** wrapped in `<small>`: inside the table the mobile rule already drops the cell to 0.875rem, and a nested `<small>` would compound to ~12px and create a fifth size.
 
@@ -907,7 +907,7 @@ Per the project's CLAUDE.md, **no browser check may be deferred to a human**. Br
 | P6 | S3 | A `DONE` job renders `12 pages scanned, 2 blank removed, 10 uploaded` in the status area and the same line in its Title cell; a job with `NULL` counts renders **no** `.page-counts` element anywhere; a `0`-blank job renders `0 blank removed` |
 | P7 | S3 | At `SCANNING_REVERSE` with a known front count the busy line starts `Front: 12 pages · ` |
 | P8 | S4 | Changing the `<select>` swaps `#profile-description`'s text; the element itself survives (same node id, still `aria-live="polite"`, still the `aria-describedby` target); a profile with an empty label renders its **name** as the option text |
-| P9 | S5, criterion 5 | **Two `browser.new_context()` contexts, both gated.** Context A submits the scan and, at `AWAITING_FLIP`, sees `Continue` and `Abort scan`. Context B sees `Waiting for the stack to be flipped` and **zero** flip buttons. `context_a.cookies()` shows `saneless_owner` with `httpOnly: true`, `sameSite: "Lax"` and no expiry; context B has no such cookie |
+| P9 | S5, criterion 5 | **Two `browser.new_context()` contexts, both gated.** Context A submits the scan and, at `AWAITING_FLIP`, sees `Continue` and `Abort scan`. Context B sees `Waiting for the stack to be flipped` and **zero** flip buttons. `context_a.cookies()` shows `saneless_owner` with `httpOnly: true`, `sameSite: "Lax"` and no expiry; context B has no such cookie. **D-26 absence guard:** context A's flip prompt renders exactly two controls — `Continue` and `Abort scan` — and no third override, force-continue or take-over control exists in either context |
 | P10 | S5 | Clicking `Abort scan` raises a native dialog whose message equals `Abort this scan? It will stop and cannot be resumed.`; dismissing it issues **no** request; accepting it aborts |
 | P11 | S6 touch | Every `label.tag-option` has `boundingBox().height >= 44` and `width >= 44` |
 | P12 | S6, A-5 | Tick two tags, type into the filter so one of them is excluded: after the swap **both** remain checked, the excluded one is pinned above the filtered list, and submitting the form sends both ids |
