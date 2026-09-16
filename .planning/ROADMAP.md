@@ -42,7 +42,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 27: Configuration Strictness** - Unknown keys rejected with the right section named, atomic UTF-8 rewrites, XDG/`~` expansion, `SecretStr`, and the config-directory mount that makes atomic rewrite possible (completed 2026-09-15)
 - [x] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback (completed 2026-09-15)
 - [x] **Phase 29: Geometry, Memory, and Timeouts** - Pages spooled to disk in explicit order, safe cancel, shared flatbed/ADF timeout, guarded `sane.init()` (completed 2026-09-16)
-- [ ] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt
+- [x] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt (completed 2026-09-16)
 - [ ] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/saneless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected
 - [ ] **Phase 32: Suite Hygiene and Minor Sweep** - Hermetic tests, no `time.sleep`, no low-value tests, and the remaining N-01..N-45 sweep
 - [ ] **Phase 33: Disable the OpenAPI Schema and Docs Endpoints** - `/openapi.json`, `/docs` and `/redoc` are gone rather than broken; nothing claims saneless serves an API schema
@@ -615,7 +615,7 @@ Plans:
 
 **Wave 13** *(blocked on Wave 12 completion)*
 
-- [ ] 30-19-PLAN.md — Browser verification part 2: two contexts, tag picker, blocked Scan button
+- [x] 30-19-PLAN.md — Browser verification part 2: two contexts, tag picker, blocked Scan button
 
 **UI hint**: yes
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 18/19 | In Progress|  |
+| 30. Appliance Layer | 19/19 | Complete   | 2026-09-16 |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
