@@ -1194,8 +1194,11 @@ class TestOwnerCookie:
             "/api/scan", data={"profile": "duplex", "title": "Blank"}
         )
 
-        assert _owner_set_cookie(response) is not None
-        minted = accepting_client.cookies[_OWNER_COOKIE]
+        header = _owner_set_cookie(response)
+        assert header is not None
+        # The value is read out of the header rather than the jar: the jar now
+        # holds the blank cookie this test planted as well as the minted one.
+        minted = header.split(";", 1)[0].removeprefix(f"{_OWNER_COOKIE}=")
         assert minted.strip() != ""
         assert _newest_job(accepting_client).owner_token == minted
 
