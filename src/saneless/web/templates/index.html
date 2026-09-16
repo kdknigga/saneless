@@ -72,9 +72,19 @@
         </select>
         <small id="profile-description" aria-live="polite">{{ selected_description }}</small>
 
+        {# Every control below gets one line of help in plain words, each one an
+           adjacent <small> its control points at with aria-describedby: that
+           adjacency is both Pico's own help-text pattern and what makes a
+           screen reader announce the sentence with the control (UI-SPEC S6).
+           The placeholder and the help line deliberately say different things,
+           so neither is a restatement of the other.  Profile is not given one
+           here: its live description already is its help line, and a second
+           would be a second line under one control. #}
         <label for="title-input">Title</label>
         <input type="text" name="title" id="title-input" maxlength="{{ title_max_length }}"
+               aria-describedby="title-help"
                placeholder="Document title (auto-generated if empty)">
+        <small id="title-help">What this document should be called in paperless-ngx.</small>
 
         {# UI-SPEC S6.  The multi-select is gone: a checkbox list is one control
            a thumb can actually hit, and the list is now a group of controls
@@ -82,24 +92,43 @@
            label pointing at a single element.  The wrapper the refresh targets
            is rendered by the partial, because the swap is outerHTML and an
            outerHTML swap replaces the element it is aimed at.  The refresh
-           carries the current ticks with it for the same reason the filter
-           does: what the server re-renders has to include what is already
-           chosen, or refreshing would silently untick it. #}
-        <fieldset>
+           carries the current filter and the current ticks with it for the same
+           reason the filter does: what the server re-renders has to include
+           what is already chosen, or refreshing would silently untick it.
+
+           The filter box names a different form than the one it sits inside.
+           An input with a form attribute is owned by the form it names, so the
+           filter text is never submitted with a scan and pressing Enter in it
+           filters the list instead of starting one (Amendment A-6).  The
+           debounce is htmx's own: a keyup that changed the value, delayed, so
+           a household member typing three letters makes one request and not
+           three.  The include is mandatory on a GET -- htmx does not gather the
+           enclosing form for one -- and it is what carries the current ticks to
+           the server so the swap can re-render them ticked (Amendment A-5). #}
+        <fieldset aria-describedby="tags-help">
             <legend>
                 Tags
                 <button type="button"
                         hx-post="/api/cache/invalidate?resource=tags"
                         hx-target="#tags-list"
                         hx-swap="outerHTML"
-                        hx-include="#tags-list"
+                        hx-include="#tag-filter, #tags-list"
                         class="refresh-btn"
                         title="Refresh tags"
                         aria-label="Refresh tags">&#x21bb;<span class="sr-only">Refresh tags</span></button>
             </legend>
 
+            <input type="search" id="tag-filter" name="q" form="tag-filter-form"
+                   placeholder="Filter tags"
+                   aria-describedby="tag-filter-help"
+                   hx-get="/api/tags" hx-target="#tags-list" hx-swap="outerHTML"
+                   hx-trigger="keyup changed delay:300ms"
+                   hx-include="#tags-list">
+            <small id="tag-filter-help">Type to narrow the list. Ticked tags stay ticked.</small>
+
             {% include "partials/tags.html" %}
         </fieldset>
+        <small id="tags-help">Labels to file this under in paperless-ngx. Optional.</small>
 
         <label for="correspondent-select">
             Correspondent
@@ -112,12 +141,14 @@
                     aria-label="Refresh correspondents">&#x21bb;<span class="sr-only">Refresh correspondents</span></button>
         </label>
         <select name="correspondent" id="correspondent-select"
+                aria-describedby="correspondent-help"
                 hx-get="/api/correspondents" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
             <option value="">No correspondent</option>
             {% for c in correspondents %}
             <option value="{{ c.id }}">{{ c.name }}</option>
             {% endfor %}
         </select>
+        <small id="correspondent-help">Who sent this document? Optional.</small>
 
         {% include "partials/scan_button.html" %}
         {# Why the button above is greyed out, as visible text in the reading
@@ -138,6 +169,25 @@
            #}
         {% if scan_blocked %}<small id="scan-blocked-reason" class="status-error">{{ scan_blocked_reason }}</small>{% endif %}
     </form>
+
+    {# The filter box belongs to this form, not to the scan form.  An input with
+       a form attribute is owned by the form it names, so the filter text is
+       never submitted with a scan and pressing Enter in it filters the list
+       instead of starting one.  This form is empty and has no submit button;
+       htmx handles its submit event and sends the same request the debounced
+       keyup sends.
+
+       This is also the decisive advantage over the alternative, which was to
+       drop the filter field on the way out of the scan form with a parameter
+       filter on the form element.  That would have meant adding an attribute
+       to the scan form, and every attribute added there has to be added to the
+       hx-disinherit list as well or the C-10 inheritance trap re-opens.
+       Nothing is added to the scan form element at all, so the fix above stays
+       exactly as written (the attribute names are in prose here so a grep for
+       the places that set them still counts only those). #}
+    <form id="tag-filter-form" class="htmx-hidden"
+          hx-get="/api/tags" hx-target="#tags-list" hx-swap="outerHTML"
+          hx-include="#tags-list"></form>
 </article>
 
 {# --- Section 2: Request errors, then status --- #}
