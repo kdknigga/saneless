@@ -66,6 +66,7 @@ from saneless.config import (
     ProfileConfig,
     ScannerConfig,
     Settings,
+    WebConfig,
 )
 from saneless.job import JobResult
 from saneless.paperless import UploadResult
@@ -3621,3 +3622,119 @@ class TestTwoBrowsersOneStack:
         wait_for_state(
             job_store, job_id, JobState.CANCELLED, timeout=_JOB_FINISH_TIMEOUT
         )
+
+
+# ---------------------------------------------------------------------------
+# The simpler form: [web] show_tags = false (D-28, D-29).
+# ---------------------------------------------------------------------------
+
+_SIMPLE_FORM_DEFAULT_TAGS = [11, 13]
+"""The profile's own tags, which a form with no tag picker must still apply."""
+
+# Every id and hook the Tags block contributes to the page. The claim is that
+# turning the block off removes the markup rather than hiding it, so the list
+# is the whole block and not just its most visible element.
+_TAG_MARKUP_SELECTORS = (
+    "#tags-list",
+    "#tag-filter",
+    "#tag-filter-form",
+    "label.tag-option",
+    "fieldset [hx-post*='resource=tags']",
+)
+
+
+def _simple_form_settings(tmp_dir: Path) -> Settings:
+    """
+    Build settings with the Tags block off and a profile that carries its own.
+
+    The default profile's ``default_tags`` is what makes D-29 observable at
+    all: with no tag picker on the page the submit carries no ``tags`` field,
+    so whatever lands on the job row came from the profile and from nowhere
+    else.
+    """
+    configured = _browser_test_settings(tmp_dir)
+    return configured.model_copy(
+        update={
+            "web": WebConfig(show_tags=False),
+            "profiles": {
+                "default": ProfileConfig(
+                    description=_FLATBED_DESCRIPTION,
+                    default_tags=_SIMPLE_FORM_DEFAULT_TAGS,
+                ),
+                "duplex": configured.profiles["duplex"],
+            },
+        }
+    )
+
+
+@pytest.fixture
+def simple_form_server(
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app whose scan form has no Tags block.
+
+    The form shape comes from ``Settings`` and is read once per request from a
+    config the process loaded at start, so there is no runtime setter: a second
+    server is the only way to put a real browser in front of the simpler form,
+    the same reason ``blocked_server`` exists. It is private rather than
+    session-scoped because the claim is about what is absent from a whole page,
+    and it runs a real scan, which the session server's history would carry
+    into every later test.
+    """
+    with _serve(_simple_form_settings(tmp_path), _BrowserTestScanner()) as server:
+        _make_paperless_deliver(server.app, monkeypatch)
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.mark.browser
+class TestSimplerFormInChromium:
+    """
+    ``show_tags = false`` changes the form and never the scan (D-28, D-29).
+
+    Two halves, and the second is the one that could go wrong quietly. The
+    first is an absence claim about a whole rendered page, which is why this
+    class gets its own server. The second is that a household member scanning
+    from the simpler form still gets the profile's tags applied -- asserted on
+    the job row, because the page has nothing left to say about tags and a
+    markup assertion could not tell "applied" from "never asked for".
+    """
+
+    def test_the_tag_block_is_absent_and_the_profile_tags_still_apply(
+        self,
+        page: Page,
+        simple_form_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        No tag markup anywhere, and a scan still files under the profile's tags (P14).
+
+        Absent, never hidden: what is not in the markup cannot be re-shown from
+        devtools, cannot be read out by a screen reader and cannot be tabbed
+        into, which is the whole of D-28's claim. The tags on the created job
+        are then the proof of D-29 -- the submit carried no ``tags`` field at
+        all, so the two ids on the row can only have come from the profile.
+        """
+        server = simple_form_server
+        job_store: JobStore = server.app.state.job_store
+        page.goto(server.url)
+        # The form is present and usable, so the absences below are about the
+        # Tags block rather than about a page that failed to render.
+        expect(page.locator("#scan-btn")).to_be_enabled()
+
+        for selector in _TAG_MARKUP_SELECTORS:
+            expect(page.locator(selector)).to_have_count(0)
+        # The help line goes with its fieldset: an orphan sentence describing a
+        # control that is no longer there would be the tidier-looking bug.
+        expect(page.locator("#tags-help")).to_have_count(0)
+
+        with page.expect_response(lambda r: r.url.endswith("/api/scan")):
+            page.click("#scan-btn")
+        recent = job_store.list_recent(1)
+        assert recent, "the scan submit created no job row"
+        job = recent[0]
+        assert job.tags == _SIMPLE_FORM_DEFAULT_TAGS, job.tags
+
+        expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
+        wait_for_state(job_store, job.id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT)
