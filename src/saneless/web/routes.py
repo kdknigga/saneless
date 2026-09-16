@@ -417,7 +417,9 @@ def _unhealthy_rejection(
     return outcome
 
 
-def _record_refused_submit(job_store: JobStore, form: _ScanForm, *, error: str) -> bool:
+def _record_refused_submit(
+    job_store: JobStore, form: _ScanForm, *, error: str
+) -> str | None:
     """
     Record a submit refused before any job row existed, in one statement.
 
@@ -437,12 +439,13 @@ def _record_refused_submit(job_store: JobStore, form: _ScanForm, *, error: str) 
         error: The job-row error text for the rejection.
 
     Returns:
-        Whether the row was written.  ``False`` means the store refused the
-        write, so the rendered error must not reload Job History.
+        The id of the row written, or None when the store refused the write --
+        in which case the rendered error must neither reload Job History nor
+        name a row the user will not find there.
 
     """
     try:
-        job_store.create_rejected_job(
+        job = job_store.create_rejected_job(
             profile=form.profile,
             title=form.title,
             error=error,
@@ -453,13 +456,13 @@ def _record_refused_submit(job_store: JobStore, form: _ScanForm, *, error: str) 
         logger.warning(
             "Could not record the rejected scan in job history", exc_info=True
         )
-        return False
-    return True
+        return None
+    return job.id
 
 
 def _reject_created_job(
     worker: ScanWorker, job_store: JobStore, job_id: str, *, error: str
-) -> bool:
+) -> str | None:
     """
     Mark a job row the worker then refused as a REJECTED error (D-05, D-06).
 
@@ -480,8 +483,10 @@ def _reject_created_job(
         error: The job-row error text for the rejection.
 
     Returns:
-        Whether the row was written.  ``False`` means the store refused the
-        write, so the rendered error must not reload Job History yet.
+        The id of the row now recording the refusal, or None when the store
+        refused the write.  None means the row is still PENDING and owed to the
+        worker, so the rendered error must neither reload Job History yet nor
+        name a row that does not yet say it was rejected.
 
     """
     try:
@@ -498,8 +503,8 @@ def _reject_created_job(
             exc_info=True,
         )
         worker.owe_rejection(job_id, error)
-        return False
-    return True
+        return None
+    return job_id
 
 
 @router.post("/api/scan")
@@ -553,7 +558,7 @@ def start_scan(
     if unhealthy is not None:
         rejection, error = unhealthy
         written = _record_refused_submit(state.job_store, form, error=error)
-        raise RequestRejected(rejection, refresh_history=written)
+        raise RequestRejected(rejection, job_id=written)
 
     job = state.job_store.create_job(
         profile=form.profile,
@@ -594,7 +599,7 @@ def start_scan(
         case _:
             assert_never(result)
     written = _reject_created_job(state.worker, state.job_store, job.id, error=error)
-    raise RequestRejected(rejection, refresh_history=written)
+    raise RequestRejected(rejection, job_id=written)
 
 
 @router.get("/api/jobs/current/status")
