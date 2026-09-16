@@ -353,7 +353,16 @@ def test_htmx_rejection_is_the_cross_site_partial(client: TestClient) -> None:
     assert response.status_code == 403
     assert response.headers["HX-Retarget"] == "#status-message"
     message = escape(rejection_message(RequestRejection.CROSS_SITE))
-    assert response.text.strip() == f'<p class="status-error">&#10007; {message}</p>'
+    # A refused cross-site request writes no job row, so the disclosure names
+    # the status code and nothing else: it does not claim a detail it lacks
+    # (UI-SPEC S2, Phase 26 D-10).
+    assert response.text.strip() == (
+        f'<p class="status-error">&#10007; {message}</p>\n'
+        '<details class="tech-details">\n'
+        "  <summary>Technical details</summary>\n"
+        "  <p>Status: 403</p>\n"
+        "</details>"
+    )
 
 
 def test_json_rejection_is_the_error_shape(client: TestClient) -> None:
