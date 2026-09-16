@@ -26,6 +26,7 @@ from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
 import saneless.cli as cli_module
+import saneless.vocabulary as vocabulary_module
 from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
     OutputConfig,
@@ -44,7 +45,7 @@ from saneless.exceptions import (
     ScanError,
     StorageError,
 )
-from saneless.job import JobStore
+from saneless.job import Job, JobStore
 from saneless.logging_config import configure_logging
 from saneless.paperless import UploadResult
 from saneless.pipeline import PipelineEvent, PipelineRequest
@@ -61,6 +62,7 @@ from saneless.vocabulary import (
     JobState,
     error_next_step,
     exit_code_for,
+    local_time,
     state_label,
 )
 from tests.conftest import StubScannerBackend, scan_batch
@@ -3876,3 +3878,184 @@ class TestScanTokenRefusal:
             result = runner.invoke(cli, ["auto-profiles"])
 
         assert result.exit_code == 0, result.output
+
+
+@pytest.fixture
+def cli_local_zone(monkeypatch: pytest.MonkeyPatch) -> Generator[Callable[[str], None]]:
+    """
+    Give one test control of the process's local zone, then restore it.
+
+    The same technique plan 30-01's ``local_zone`` fixture uses: ``local_time``
+    renders whatever zone the C library reports, so pinning ``TZ`` and calling
+    ``time.tzset()`` is the only way to assert an exact string on a host in an
+    unknown zone. The trailing ``tzset`` is what makes the C library notice the
+    variable monkeypatch removed.
+
+    Yields:
+        A function that switches the process's zone for the rest of the test.
+
+    """
+
+    def _use(zone: str) -> None:
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+
+    yield _use
+    time.tzset()
+
+
+def _jobs_header_title_width(header: str) -> int:
+    """
+    Measure the Title column's width from a rendered ``jobs`` header.
+
+    Measured rather than recomputed from the CLI's own constants, so a test
+    that says "24 at 80 columns" is reading the output an operator sees.
+    ``Title`` is padded to its width and ``Status`` follows one space later.
+
+    Args:
+        header: The first line ``saneless jobs`` printed.
+
+    Returns:
+        The Title column's width in characters.
+
+    """
+    after_profile = cli_module._TIME_COL_WIDTH + 1 + 15 + 1
+    return header[after_profile:].index("Status") - 1
+
+
+class TestJobsTableWidth:
+    """The human ``jobs`` table renders local time and still fits (APPL-12)."""
+
+    @staticmethod
+    def _settings_for(tmp_path: Path) -> Settings:
+        """Build Settings whose data_dir -- and so db_path -- is tmp_path."""
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+
+    def _one_job(self, db_path: str) -> Job:
+        """Create one job and return it as the store recorded it."""
+        store = JobStore(db_path=db_path)
+        store.create_job(profile="default", title="Invoice")
+        recorded = store.list_recent(limit=1)[0]
+        store.close()
+        return recorded
+
+    def test_the_cli_and_the_web_share_one_formatter_object(self) -> None:
+        """D-35: cli.py imports the function, it does not re-derive the format."""
+        assert cli_module.local_time is vocabulary_module.local_time
+
+    def test_the_table_renders_local_time_with_the_zone_named(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        cli_local_zone: Callable[[str], None],
+    ) -> None:
+        """Each row's timestamp is local_time's output, seconds dropped."""
+        cli_local_zone("America/Chicago")
+        settings = self._settings_for(tmp_path)
+        job = self._one_job(str(settings.output.db_path))
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        row = result.output.strip().split("\n")[2]
+        assert row.startswith(local_time(job.created_at))
+        assert job.created_at.strftime("%Y-%m-%d %H:%M:%S") not in row
+
+    def test_the_timestamp_column_width_is_derived_not_written_down(self) -> None:
+        """A six-character zone token cannot silently truncate the column."""
+        assert len(local_time(datetime.now(tz=UTC))) <= cli_module._TIME_COL_WIDTH
+        assert cli_module._TIME_COL_WIDTH == 22
+
+    def test_the_title_column_is_24_at_80_columns(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Unchanged from before this plan: the zone token fits in the slack."""
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        self._one_job(str(settings.output.db_path))
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.strip().split("\n")
+        assert _jobs_header_title_width(lines[0]) == 24
+        assert all(len(line) <= 80 for line in lines)
+
+    def test_a_narrow_terminal_floors_the_title_column_at_15(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """40 columns still renders a table rather than raising."""
+        monkeypatch.setenv("COLUMNS", "40")
+        settings = self._settings_for(tmp_path)
+        self._one_job(str(settings.output.db_path))
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.strip().split("\n")
+        assert _jobs_header_title_width(lines[0]) == 15
+
+
+class TestJobsJsonContract:
+    """``jobs --json`` stays UTC ISO-8601: it is a machine contract (D-34)."""
+
+    @staticmethod
+    def _settings_for(tmp_path: Path) -> Settings:
+        """Build Settings whose data_dir -- and so db_path -- is tmp_path."""
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+
+    def test_created_at_is_utc_iso_8601_whatever_the_servers_zone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        cli_local_zone: Callable[[str], None],
+    ) -> None:
+        """The offset is +00:00 even on a server the table renders as CDT."""
+        cli_local_zone("America/Chicago")
+        settings = self._settings_for(tmp_path)
+        store = JobStore(db_path=str(settings.output.db_path))
+        store.create_job(profile="default", title="Invoice")
+        recorded = store.list_recent(limit=1)[0]
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        created_at = json.loads(result.output)[0]["created_at"]
+        assert created_at.endswith("+00:00")
+        assert datetime.fromisoformat(created_at) == recorded.created_at
+
+    def test_json_never_carries_the_local_rendering(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        cli_local_zone: Callable[[str], None],
+    ) -> None:
+        """Localising a machine contract would break every script silently."""
+        cli_local_zone("America/Chicago")
+        settings = self._settings_for(tmp_path)
+        job = JobStore(db_path=str(settings.output.db_path))
+        job.create_job(profile="default", title="Invoice")
+        recorded = job.list_recent(limit=1)[0]
+        job.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert local_time(recorded.created_at) not in result.output
