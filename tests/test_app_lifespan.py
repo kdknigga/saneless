@@ -741,6 +741,9 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     "/api/checks/refresh": {"method": "POST"},
     "/api/tags": {"method": "GET"},
     "/api/correspondents": {"method": "GET"},
+    # Driven with a real profile name, so the handler runs its locked lookup
+    # and renders rather than short-circuiting on the 422 an unknown name gets.
+    "/api/profiles/description": {"method": "GET", "params": {"profile": "default"}},
     "/api/cache/invalidate": {"method": "POST", "params": {"resource": "tags"}},
     "/api/jobs/history": {"method": "GET"},
     # Answering a prompt no job is waiting at is a real request that the route

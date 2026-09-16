@@ -175,6 +175,13 @@ class _BrowserServer(NamedTuple):
     scanner: _BrowserTestScanner
 
 
+# The two sentences the profile description swap moves between.  They are
+# written here rather than taken from the generator so the browser proof is
+# about the swap and not about what auto-profiles happens to produce.
+_FLATBED_DESCRIPTION = "Scans one page from the glass."
+_FEEDER_DESCRIPTION = "Scans both sides of every page using the document feeder."
+
+
 def _browser_test_settings(tmp_dir: Path) -> Settings:
     """
     Build the settings every browser test server runs with, rooted at ``tmp_dir``.
@@ -195,8 +202,14 @@ def _browser_test_settings(tmp_dir: Path) -> Settings:
             log_file=str(tmp_dir / "saneless.log"),
         ),
         profiles={
-            "default": ProfileConfig(),
-            "duplex": ProfileConfig(source="ADF Manual Duplex"),
+            # Both carry a description and neither carries a human name, so
+            # the live description swap has two distinct sentences to prove
+            # itself with while the option text stays the profile name, which
+            # is what the dropdown test above reads.
+            "default": ProfileConfig(description=_FLATBED_DESCRIPTION),
+            "duplex": ProfileConfig(
+                source="ADF Manual Duplex", description=_FEEDER_DESCRIPTION
+            ),
         },
     )
 
@@ -2217,3 +2230,52 @@ class TestOwnerCookieInABrowser:
             worker._flip_coordinator = None
             worker._current_job_id = None
             job_store.delete_job(job.id)
+
+
+@pytest.mark.browser
+class TestProfileDescriptionSwap:
+    """The sentence under the select follows the selection, live (D-20, S4)."""
+
+    def test_choosing_another_profile_swaps_the_description_in_place(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        A change on the select replaces the slot's text and nothing else.
+
+        This is the one claim the server-side tests cannot make: that htmx
+        really issues the GET on ``change``, that the select's own value rides
+        it, and that the swap lands inside the slot rather than over it.  The
+        element identity is asserted after the swap, which is what
+        ``innerHTML`` buys and ``outerHTML`` would lose along with the id
+        ``aria-describedby`` points at and the live region.
+        """
+        page.goto(browser_server_url)
+        slot = page.locator("#profile-description")
+        expect(slot).to_have_text(_FLATBED_DESCRIPTION)
+
+        page.select_option("#profile-select", "duplex")
+
+        expect(slot).to_have_text(_FEEDER_DESCRIPTION)
+        expect(page.locator("#profile-description")).to_have_count(1)
+        expect(slot).to_have_attribute("aria-live", "polite")
+        expect(page.locator("#profile-select")).to_have_attribute(
+            "aria-describedby", "profile-description"
+        )
+
+    def test_the_description_is_the_controls_only_help_line(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        One help line under Profile, and it is the live one (APPL-10).
+
+        The adjacent-sibling selector is Pico's own help-text rule, so this
+        asserts the styling hook and the "no second help line" contract at
+        once: if anything were inserted between the control and the slot, the
+        muted styling would go with it.
+        """
+        page.goto(browser_server_url)
+
+        helps = page.locator("#profile-select + small")
+
+        expect(helps).to_have_count(1)
+        expect(helps).to_have_id("profile-description")
