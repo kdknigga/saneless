@@ -59,13 +59,26 @@ is an operator task.
 - One PDF is written per unrecoverable delivery -- two for an ADF duplex scan
   whose halves were uploaded separately. Each file corresponds to a job the web
   UI shows as **Failed**, whose error message names that exact path.
-- Once the directory holds 20 or more PDFs, saneless logs a WARNING each time it
-  preserves another, naming the file count, the total size and the path. Watch
+- **Partial scans land here too.** A scanner fault part-way through a stack keeps
+  the sheets already fed, and a manual duplex job whose second pass or flip
+  failed keeps the fronts. Each is a PDF, named so you can tell it from a
+  complete one. Budget for them: a jam on a 50-sheet job writes a PDF of
+  everything up to the jam, and a rescan of the same stack writes a second,
+  complete one.
+- **A scan that could not be assembled leaves a directory, not a file.** When PDF
+  assembly itself fails, the individual page files are preserved instead, in a
+  job-keyed subdirectory holding one PNG per sheet. Those PNGs are uncompressed-
+  document-scale: roughly 13 MB per A4 300 DPI colour page, so one such
+  directory can be larger than any PDF beside it.
+- Once the directory holds 20 or more preserved scans -- counting those
+  subdirectories alongside the PDFs -- saneless logs a WARNING each time it
+  preserves another, naming the count, the total size and the path. Watch
   for it in the container log: individual failures show up as failed jobs, but
   that warning is the only signal that the directory as a whole is filling up.
 - To drain it: confirm the documents are in paperless-ngx, or re-ingest the PDFs
   by copying them into the paperless-ngx consume directory, then delete the
-  files you have accounted for.
+  files you have accounted for. A preserved page directory has no PDF to
+  re-ingest -- assemble or rescan it, then remove the directory.
 - Re-ingesting is safe. paperless-ngx checksums documents on consumption and
   rejects a duplicate, so dropping a preserved PDF back into the consume
   directory cannot create a second copy of a document it already holds.

@@ -61,6 +61,14 @@ If no `consume_dir` is configured, the upload error propagates and the scan job 
 
 **The scanned document is not lost when that happens.** Before the error propagates, saneless moves the assembled PDF into `failed/` inside its data directory -- durable storage, deliberately separate from the disposable scratch directory the scan was built in -- and appends the full path of the preserved file to the job's error message. The error text shown in the web UI therefore names the file to go and find. The same preservation happens when the upload reaches paperless-ngx but the consumption task then reports a failure, and when the task has not finished before `paperless_task_timeout` expires. See [Docker volumes](../reference/docker.md#volumes) for where that directory lives in a container and how to drain it.
 
+`failed/` is where every scan saneless could not deliver ends up, not only the ones an upload lost, so it holds three kinds of thing:
+
+- **Complete PDFs** from a scan that was assembled but could not be delivered -- the case described above.
+- **Partial PDFs** from a scan that stopped part-way. A scanner fault after some sheets had been fed keeps those sheets; a manual duplex job whose second pass or flip failed keeps the fronts. Both are PDFs, named so you can tell them apart from a complete one, and both are unfiltered -- empty page detection is not applied to them, because what the feeder actually picked up is the evidence.
+- **Directories of page files** from a scan that could not be assembled into a PDF at all. Each is named after the job and holds one PNG per sheet, in scan order.
+
+The rule is the same for all three: a failure keeps everything it can, because you cannot get the paper back without feeding it again. An operator's cancel keeps nothing, because stopping was the decision. Nothing in `failed/` is ever deleted, moved or rotated by saneless.
+
 ### Network blips after the upload
 
 Once paperless-ngx has accepted the upload, saneless waits for its consumption task to finish. A network error while checking on that task does not fail the scan: saneless keeps checking until `paperless_task_timeout` expires, and only then reports a timeout. When the last check failed with a network error, the timeout names that error; a blip that later checks got past is not blamed.
