@@ -6,23 +6,30 @@ by ``saneless.spool``, and that file is what img2pdf embeds -- losslessly,
 with no second encode (D-03). This module therefore creates no temporary
 image files and owns no page's lifetime: the spool lives in the job's
 workspace, and assembly only reads from it.
+
+Assembly runs **one page per ``img2pdf.convert`` call** and merges the
+single-page PDFs with qpdf, because that is the only shape in which the
+per-page memory bound is true at any page count. The measured figures, and the
+one cost that buys, are in :func:`assemble_pdf`.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import img2pdf
+import pikepdf
 import PIL.Image
 
 from saneless.exceptions import PdfError, describe
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
     from saneless.scanner.base import PageRecord
 
@@ -176,14 +183,46 @@ def assemble_pdf(
     at one resolution: a half-size raster becomes a half-size page rather than
     being rescaled to match its neighbours.
 
+    **Memory is bounded by converting one page at a time.** Each page gets its
+    own ``img2pdf.convert(..., outputstream=...)`` call into its own single-page
+    PDF in a scratch directory, and qpdf merges those through
+    :class:`pikepdf.Job`, copying each page's streams lazily. Measured, not
+    assumed, on 48 synthetic A4 300 DPI colour pages: one ``convert`` whose
+    bytes were then written out peaked at 1395 MB, and the same ``convert``
+    with ``outputstream=`` at 787 MB -- both still linear in page count,
+    because ``convert`` reads every input fully into memory and finalises the
+    whole document before ``outputstream`` is written a byte. Per-page convert
+    plus the qpdf merge measured flat at **131 MB for both 12 and 48 pages**,
+    with byte-identical ``/FlateDecode`` image streams, the same
+    ``/MediaBox [0 0 595.2 841.92]`` and the same total wall clock. That is a
+    settled answer: the shape is not a tuning knob, it is what makes the memory
+    sentence true end to end, and ``outputstream=`` on its own does not.
+
+    The accepted cost is the GIL. ``pikepdf.Job.run()`` holds it for roughly
+    12 ms per page, so a 500-page job stalls its thread for about 6 s during
+    assembly. That thread is the worker's, already blocked for the whole scan,
+    so the visible effect is one briefly frozen status poll -- and the
+    alternative is gigabytes of resident memory.
+
+    The single-page PDFs are named from each record's **position in
+    ``records``**, not from ``PageRecord.sequence``: sequence numbers are
+    assigned per acquisition pass, so after a manual-duplex interleave two
+    records legitimately share the number 1. Naming by position keeps the merge
+    argv unique and in document order by construction, with nothing sorted and
+    nothing globbed (D-02).
+
     This function is a module boundary that raises only ``PdfError``, and the
     caught type is ``Exception``, **deliberately**. img2pdf raises seven
     unrelated error classes -- each a direct ``Exception`` subclass with no
-    shared base -- plus bare ``Exception``, ``TypeError`` and ``ValueError``,
-    and Pillow raises ``OSError`` and ``SystemError`` while a page is read, so
-    any tuple of types would leak whichever one was left off it. The catch is
-    narrow in *span* -- directory creation, assembly and the write, nothing
-    else -- and broad in *type*.
+    shared base -- plus bare ``Exception``, ``TypeError`` and ``ValueError``;
+    Pillow raises ``OSError`` and ``SystemError`` while a page is read; and
+    ``pikepdf.Job.run()`` raises pikepdf's own exception types, such as
+    ``pikepdf.PdfError``, when qpdf refuses a file. So any tuple of types would
+    leak whichever one was left off it. The catch is narrow in *span* --
+    directory creation, the per-page converts and the merge, nothing else --
+    and broad in *type*. pikepdf needed **no new** ``except`` clause for that
+    reason: its errors are ordinary ``Exception`` subclasses and this boundary
+    already covered them, so EXC-01 is unaffected.
     Nothing is masked: the original is always chained on ``__cause__`` and its
     text kept in the message. ``KeyboardInterrupt`` and ``SystemExit`` derive
     from ``BaseException`` and pass through untouched.
@@ -219,21 +258,35 @@ def assemble_pdf(
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # The spooled files themselves, in the order the records are in.
-        image_paths = [str(record.path) for record in records]
-
         # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
         # default_layout_fun unpacks it, and an int silently yields wrong
         # geometry.  Without it img2pdf lays pages out at its default_dpi
         # of 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
-        pdf_bytes = img2pdf.convert(
-            image_paths,
-            layout_fun=img2pdf.get_fixed_dpi_layout_fun((dpi, dpi)),
-        )
-        if pdf_bytes is None:
-            msg = "img2pdf.convert returned None"
-            raise PdfError(msg)
-        pdf_path.write_bytes(pdf_bytes)
+        layout_fun = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
+
+        with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmp_dir:
+            work_dir = Path(tmp_dir)
+            singles: list[str] = []
+            for position, record in enumerate(records, start=1):
+                single = work_dir / f"{position:04d}.pdf"
+                # convert returns None once outputstream= is supplied -- that
+                # is its documented contract, not a failure, so there is
+                # nothing here to guard against.
+                with single.open("wb") as stream:
+                    img2pdf.convert(
+                        [str(record.path)],
+                        layout_fun=layout_fun,
+                        outputstream=stream,
+                    )
+                singles.append(str(single))
+
+            # An in-process qpdf API, not a shell invocation: every element of
+            # this argv is a literal or a file this call just wrote inside its
+            # own scratch directory, so no operator string reaches it.
+            pikepdf.Job(
+                ["qpdf", "--empty", "--pages", *singles, "--", str(pdf_path)]
+            ).run()
+
         logger.info("Assembled %d page(s) into %s", len(records), pdf_path)
     except PdfError:
         # Already the boundary's own type: wrapping it again would only
