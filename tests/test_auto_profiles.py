@@ -927,18 +927,20 @@ class TestProfileLabels:
         assert "both sides" in description
         assert "feeder" in description
 
+    # A marker no developer-authored constant would ever contain, appended to
+    # a name of each classified shape. Asserting on a marker rather than on
+    # the whole source name is what makes the assertion mean what it says:
+    # "Automatic" contains the literal source name "Auto" by coincidence,
+    # which proves nothing about interpolation.
+    _VENDOR_MARKER = "ZzVendorZz<script>alert(1)</script>"
+
     @pytest.mark.parametrize(
-        "source",
-        [
-            "Flatbed",
-            "ADF Front",
-            "ADF Duplex",
-            "Auto",
-            "Mystery Tray",
-            "<script>alert(1)</script> Duplex",
-        ],
+        "shape",
+        ["Flatbed", "ADF Front", "ADF Duplex", "Auto", "Mystery Tray"],
     )
-    def test_no_returned_string_contains_the_source_name(self, source: str) -> None:
+    def test_no_returned_string_carries_anything_from_the_source_name(
+        self, shape: str
+    ) -> None:
         """
         T-30-17: the vendor-controlled source name is never interpolated.
 
@@ -946,8 +948,29 @@ class TestProfileLabels:
         web UI renders. Both functions select a constant instead of building
         a string, so nothing from the device can ride along.
         """
-        assert source not in _profile_label(source)
-        assert source not in _profile_description(source)
+        source = f"{shape} {self._VENDOR_MARKER}"
+        assert self._VENDOR_MARKER not in _profile_label(source)
+        assert self._VENDOR_MARKER not in _profile_description(source)
+        assert "<" not in _profile_label(source)
+        assert "<" not in _profile_description(source)
+
+    def test_the_marker_source_names_still_reach_every_branch(self) -> None:
+        """
+        The marker does not quietly send every name down the UNKNOWN arm.
+
+        Without this the interpolation test above would pass on a single
+        branch and claim to have covered five.
+        """
+        marked = {
+            classify_source(f"{shape} {self._VENDOR_MARKER}")
+            for shape in ("Flatbed", "ADF Front", "ADF Duplex", "Mystery Tray")
+        }
+        assert marked == {
+            SourceKind.FLATBED,
+            SourceKind.FEEDER,
+            SourceKind.FEEDER_DUPLEX,
+            SourceKind.UNKNOWN,
+        }
 
     def test_generated_profiles_carry_the_derived_label_and_description(self) -> None:
         """``generate_profiles`` sets both fields on every profile it builds."""

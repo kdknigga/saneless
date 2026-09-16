@@ -14,7 +14,7 @@ import re
 import tomllib
 from collections.abc import Mapping, MutableMapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Final, Literal, assert_never, cast
 
 import tomlkit
 from pydantic import TypeAdapter, ValidationError
@@ -313,9 +313,10 @@ def _duplex(source: str) -> Literal["none", "hardware"]:
     evidence for it and those profiles are always written by hand.
 
     Nothing reads ``"hardware"`` (D-05). It records operator intent and makes a
-    generated profile self-describing, and Phase 30's APPL-05 -- generated
-    ``label`` / ``description`` such as "Feeder, double-sided" -- is its
-    eventual reader. ``config.py`` states the same fact; it is repeated here
+    generated profile self-describing. Its readers are ``_profile_label`` and
+    ``_profile_description`` below, which turn a FEEDER_DUPLEX source into the
+    double-sided feeder wording the scan page shows (Phase 30, APPL-05).
+    ``config.py`` states the same fact; it is repeated here
     because this is where the value is produced, and a reader here will ask
     what consumes it.
 
@@ -335,6 +336,86 @@ def _duplex(source: str) -> Literal["none", "hardware"]:
     if classify_source(source) is SourceKind.FEEDER_DUPLEX:
         return "hardware"
     return "none"
+
+
+def _profile_label(source: str) -> str:
+    """
+    Return the short human name a generated profile carries.
+
+    D-19: the text is derived from what the code already knows -- the
+    ``SourceKind`` the one classification rule reports -- so there is no new
+    probe of the device and no new config key to fill in. The three feeder and
+    glass forms are the ones D-19 names verbatim; ``Auto`` and an unrecognised
+    name get their own so that no profile is ever offered under a blank name.
+
+    Every returned string is a developer-authored constant. The SANE source
+    name is never interpolated into it, so a vendor-chosen source string
+    cannot ride this path into the config file the scan page renders.
+
+    Args:
+        source: The SANE source name the profile will carry.
+
+    Returns:
+        A name short enough for a dropdown option, within
+        ``PROFILE_LABEL_MAX_LENGTH``.
+
+    Raises:
+        AssertionError: If the classifier returns a value that is not a
+            SourceKind member.
+
+    """
+    kind = classify_source(source)
+    match kind:
+        case SourceKind.FEEDER:
+            label = "Feeder, single-sided"
+        case SourceKind.FEEDER_DUPLEX:
+            label = "Feeder, double-sided"
+        case SourceKind.FLATBED:
+            label = "Glass (flatbed)"
+        case SourceKind.AUTO:
+            label = "Automatic"
+        case SourceKind.UNKNOWN:
+            label = "Scanner source"
+        case _:
+            assert_never(kind)
+    return label
+
+
+def _profile_description(source: str) -> str:
+    """
+    Return the one-sentence explanation a generated profile carries.
+
+    The sentence beneath the profile dropdown. Like ``_profile_label`` it is
+    derived under D-19 from the ``SourceKind`` alone: no new probe, no new
+    config key, and the SANE source name is never interpolated into the
+    result, so every string here is a developer-authored constant.
+
+    Args:
+        source: The SANE source name the profile will carry.
+
+    Returns:
+        One plain sentence, within ``PROFILE_DESCRIPTION_MAX_LENGTH``.
+
+    Raises:
+        AssertionError: If the classifier returns a value that is not a
+            SourceKind member.
+
+    """
+    kind = classify_source(source)
+    match kind:
+        case SourceKind.FEEDER:
+            description = "Scans one side of every page using the document feeder."
+        case SourceKind.FEEDER_DUPLEX:
+            description = "Scans both sides of every page using the document feeder."
+        case SourceKind.FLATBED:
+            description = "Scans one page at a time from the glass."
+        case SourceKind.AUTO:
+            description = "Lets the scanner choose where the page comes from."
+        case SourceKind.UNKNOWN:
+            description = "Uses the scanner source this profile names."
+        case _:
+            assert_never(kind)
+    return description
 
 
 def generate_profiles(
@@ -411,6 +492,8 @@ def generate_profiles(
             auto_generated=True,
             auto_source_mode=_auto_source_mode(source, has_flatbed=has_flatbed),
             duplex=_duplex(source),
+            label=_profile_label(source),
+            description=_profile_description(source),
         )
 
     if default_source is not None:
@@ -427,6 +510,10 @@ def generate_profiles(
             # Mirrors the loop for the same reason: the default duplicates a
             # source profile and must not claim a different duplex strategy.
             duplex=_duplex(default_source),
+            # Mirrors the loop again: the human text describes the source, so
+            # the default must read the way the profile it copies reads.
+            label=_profile_label(default_source),
+            description=_profile_description(default_source),
         )
 
     return profiles
