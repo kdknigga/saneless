@@ -3188,3 +3188,187 @@ class TestExitCodes:
 
         assert result.exit_code == 1
         assert result.stderr.splitlines() == ["Error: bind"]
+
+
+class _ClosingScanner(StubScannerBackend):
+    """
+    A CLI scanner stub that counts the closes its entry point gives it.
+
+    It reports one device and a usable capability set, so ``devices`` and
+    ``auto-profiles`` have real work to finish before the close is due.
+    """
+
+    def __init__(self, host: str = "") -> None:
+        """Accept the host like SaneBackend, and start with no close."""
+        self.host = host
+        self.close_calls = 0
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """Report the one device these tests need."""
+        return [DeviceInfo("test:device", "Test", "Scanner", "scanner")]
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """Report enough for auto-profiles to generate something."""
+        return DeviceCapabilities(
+            sources=["Flatbed", "ADF"],
+            resolutions=[150, 300, 600],
+            modes=["Color", "Gray"],
+        )
+
+    def close(self) -> None:
+        """Count the close the entry point owes this backend."""
+        self.close_calls += 1
+
+
+def _closing_scanner() -> tuple[type[_ClosingScanner], list[_ClosingScanner]]:
+    """
+    Build a one-test backend class that records every construction.
+
+    The list is what the assertions read: "closed exactly once" is a claim
+    about the backend the command actually built, and a class attribute shared
+    across tests could not say which construction it belonged to.
+
+    Returns:
+        The class to patch into the CLI, and the list its instances land in.
+
+    """
+    built: list[_ClosingScanner] = []
+
+    class _Recorded(_ClosingScanner):
+        """The class the command under test constructs."""
+
+        def __init__(self, host: str = "") -> None:
+            """Record this construction, then behave like the base."""
+            super().__init__(host)
+            built.append(self)
+
+    return _Recorded, built
+
+
+class TestEntryPointsCloseTheBackend:
+    """
+    Each one-shot command shuts SANE down when it ends (HARD-05, D-18).
+
+    ``sane_init`` is process-global, so somebody has to undo it, and the one
+    place that knows the process is ending is the entry point that started it.
+    The close is owed on the error paths as much as on the success ones: a
+    command that exits 1 has finished with the scanner exactly as much as one
+    that exits 0.
+
+    ``serve`` is the exception and is asserted as one: its backend is handed to
+    ``create_app`` and outlives the command body, so the lifespan closes it.
+    """
+
+    def test_scan_closes_the_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A completed scan leaves no initialised SANE behind."""
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 0, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    def test_scan_closes_the_backend_when_the_pipeline_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The close happens before the guard prints the error and exits 1."""
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        def failing_pipeline(*_args: object, **_kwargs: object) -> None:
+            msg = "Scanner error on test:device: jammed"
+            raise ScanError(msg)
+
+        monkeypatch.setattr("saneless.cli.run_pipeline", failing_pipeline)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 1, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    def test_devices_closes_the_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Listing devices is the shortest command, and still owes the close."""
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["devices"])
+
+        assert result.exit_code == 0, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    def test_devices_closes_the_backend_when_enumeration_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A SANE failure mid-command does not cost the process its close."""
+        scanner_cls, built = _closing_scanner()
+
+        def busy_bus(_self: _ClosingScanner) -> list[DeviceInfo]:
+            """Fail as ``sane.get_devices()`` does when the bus is busy."""
+            msg = "Could not list scanners: Device busy"
+            raise ScanError(msg)
+
+        monkeypatch.setattr(scanner_cls, "get_devices", busy_bus)
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["devices"])
+
+        assert result.exit_code == 1, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    def test_auto_profiles_closes_the_backend(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A successful profile generation closes the backend it queried."""
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+        config_file = tmp_path / "saneless.toml"
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    def test_auto_profiles_closes_the_backend_on_the_early_config_exit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A ``ctx.exit()`` taken mid-command is not a way to skip the close.
+
+        An unwritable config file ends ``auto-profiles`` through
+        ``ctx.exit(ExitCode.CONFIG)`` rather than by returning or raising, and
+        that is the path most likely to be forgotten.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+
+        def unwritable(*_args: object, **_kwargs: object) -> None:
+            raise OSError(errno.EACCES, "Permission denied")
+
+        monkeypatch.setattr("saneless.cli.write_profiles_to_config", unwritable)
+        config_file = tmp_path / "saneless.toml"
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 2, result.output
+        assert [scanner.close_calls for scanner in built] == [1]
+
+    def test_serve_leaves_the_backend_for_the_lifespan_to_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``serve`` hands its backend to the app, which outlives the command body.
+
+        Closing it here would shut SANE down before the first request, so this
+        one command deliberately does not, and the lifespan does it instead.
+        """
+        scanner_cls, built = _closing_scanner()
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
+        monkeypatch.setattr("saneless.cli.create_app", lambda *_args: object())
+        monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_k: MagicMock())
+        monkeypatch.setattr("saneless.cli.uvicorn.run", lambda *_a, **_k: None)
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        assert [scanner.close_calls for scanner in built] == [0]
