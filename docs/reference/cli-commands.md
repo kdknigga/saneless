@@ -1,6 +1,6 @@
 # CLI Commands
 
-saneless provides five commands for scanning, device discovery, job history, web serving, and automatic profile generation.
+saneless provides six commands for scanning, device discovery, job history, web serving, automatic profile generation, and a readiness check.
 
 ## Global Options
 
@@ -130,6 +130,56 @@ saneless [--config PATH] [-v] jobs [--json] [--limit N]
 | 130 | Cancelled (Ctrl-C) |
 
 `jobs` does not need python-sane, and on a fresh install it creates the data directory and prints an empty history.
+
+---
+
+## `saneless doctor`
+
+Check that saneless is ready to scan, printing one line per health check.
+
+```
+saneless [--config PATH] [-v] doctor
+```
+
+`doctor` takes no options of its own. It runs the same five checks the web UI's system status list shows, in the same order and with the same wording, so the command and the page cannot disagree about whether the appliance is healthy.
+
+| Check | What it looks at |
+|-------|------------------|
+| Scanner | Whether scanner support is installed and a device answers. A configured sane-net host has its saned port probed first, so an unplugged network scanner is reported in about two seconds rather than two minutes |
+| Paperless | Whether the API token has been set to something real, and whether paperless-ngx accepts it. A placeholder token is reported without sending a request |
+| Profiles | Whether any scan profiles are configured, whether they were saved to a config file, and whether the generated ones have names yet |
+| Fallback | Whether a fallback folder is configured for when paperless-ngx is down, and whether saneless can write to it |
+| Data folder | Whether the folder holding the job database will take a write |
+
+**Example output:**
+
+```text
+[ OK ] Scanner     Canon MF740C Series is ready.
+[ OK ] Paperless   Connected to paperless-ngx.
+[ OK ] Profiles    4 scan profiles configured.
+[WARN] Fallback    Not configured; scans cannot be kept if paperless-ngx is down.
+                   Set a fallback folder in the saneless config so scans are kept when paperless-ngx is down.
+[ OK ] Data folder The data folder is writable.
+```
+
+Every `[WARN]` and `[FAIL]` row is followed by an indented next step. An `[ OK ]` row has nothing to do about it and prints no second line.
+
+**Exit codes:**
+
+| Code | Meaning |
+|------|---------|
+| 0 | Every check came out OK or a warning |
+| 2 | At least one check failed (scanner support not installed, no scanner reachable, an unset or rejected API token, no scan profiles, or a folder saneless cannot write to), or the configuration could not be loaded |
+| 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 130 | Cancelled (Ctrl-C) |
+
+**A warning does not fail the command.** An appliance that scans and files correctly is not broken because it could be tidier, and a health gate that goes red for tidiness is one people learn to ignore. Only a failure exits non-zero, so `if saneless doctor; then ...` means "everything that stops scanning or filing is fine".
+
+Unlike `scan`, `devices`, `serve` and `auto-profiles`, `doctor` does **not** refuse to run when python-sane is missing. That machine is exactly the one whose owner needs a diagnosis, so the missing scanner support becomes one failed row among five and the other four checks still report.
+
+`doctor` has no `--json` mode: it prints a table for a person to read, and scripts should gate on the exit code.
+
+The container `HEALTHCHECK` deliberately keeps calling `/health` instead of this command. `doctor` does network I/O — it probes the scanner and talks to paperless-ngx — so wiring it to the healthcheck would mark the container unhealthy during a routine paperless-ngx restart, and restart saneless for a fault that is not saneless's.
 
 ---
 
