@@ -2423,6 +2423,62 @@ class TestSaneBackendCancelSequence:
         assert fake_device.close_while_blocked is False
         assert page_sink.records == ()
 
+    def test_an_interrupt_before_the_reader_starts_wedges_nothing(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        WR-05: Ctrl-C landing before the thread exists must not cancel or wedge.
+
+        ``reader.start()`` sits inside the guarded block so that an interrupt
+        arriving once the thread exists cannot abandon it uncancelled.  The
+        other end of that window is the expensive one: with no reader, the D-12
+        tail fired ``dev.cancel()`` on a handle holding no read, waited out the
+        whole grace on an event nothing would ever set, and then recorded a
+        wedge that could never be cleared -- ``_release_wedge`` runs only from a
+        reader's ``finally``, and there is no reader.  Every later scan would
+        have refused and ``shutdown()`` would have skipped ``sane.exit()`` for
+        the rest of the process.
+
+        Only the *reader* thread is interrupted, so the cancel thread would
+        start normally if the handler reached for it; ``cancel_calls`` is
+        therefore a real assertion and not one the stub satisfies by accident.
+        The elapsed bound is what pins "did not wait out the grace".
+        """
+        reader_prefix = sane_backend_mod._READER_THREAD_PREFIX
+
+        class _InterruptTheReaderBeforeItStarts(threading.Thread):
+            """A Thread whose reader never gets as far as running."""
+
+            def start(self) -> None:
+                """Raise instead of starting, but only for the reader."""
+                if self.name.startswith(reader_prefix):
+                    raise KeyboardInterrupt
+                super().start()
+
+        monkeypatch.setattr(
+            sane_backend_mod.threading, "Thread", _InterruptTheReaderBeforeItStarts
+        )
+        grace = 5.0
+
+        # The assertions are inside the device context because _open_device's
+        # own finally issues a routine cancel() on the clean path, which would
+        # make cancel_calls 1 for a reason that has nothing to do with this.
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            began = time.monotonic()
+            with pytest.raises(KeyboardInterrupt):
+                sane_backend_mod._acquire_with_timeout(
+                    dev, fake_device.snap, sane_backend_mod._page_label(0), 5.0, grace
+                )
+            elapsed = time.monotonic() - began
+
+            assert fake_device.cancel_calls == 0
+            assert sane_backend_mod._WEDGE.stuck is False
+
+        assert elapsed < grace
+
 
 # The child process the exit proof runs, and the bound it is given.
 #

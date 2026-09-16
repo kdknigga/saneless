@@ -1255,9 +1255,24 @@ def _acquire_with_timeout(
 
     A ``KeyboardInterrupt`` arriving while this waits takes the identical path
     and is then re-raised, so Ctrl-C during a read leaves the device in the
-    same state a timeout does (D-15).  ``reader.start()`` is inside the guarded
-    block so there is no window in which the interrupt could land after the
-    thread exists but before the handler could cancel it.
+    same state a timeout does (D-15).
+
+    ``reader.start()`` is inside the guarded block, so an interrupt landing
+    once the thread exists cannot abandon it with no cancel ever fired.  The
+    handler then asks whether there *is* a reader before running the D-12 tail,
+    because the other end of that window is real too and worse: an interrupt
+    arriving before the thread was created would otherwise fire ``dev.cancel()``
+    on a handle with no read in progress, block for the whole grace on an event
+    nothing will ever set, and then mark a wedge that nothing could ever clear
+    -- ``_release_wedge`` is only called from a reader's ``finally``, and there
+    would be no reader.  Every later ``scan_pages`` and ``get_capabilities``
+    would refuse and ``shutdown()`` would permanently skip ``sane.exit()``
+    (WR-05).
+
+    ``started`` and ``is_alive()`` are both consulted because they answer for
+    different halves of that window: the flag for an interrupt after
+    ``start()`` returned, and the liveness check for one that landed inside it,
+    after the thread had already been handed to the OS.
 
     The reader catches ``BaseException`` and stores it: nothing may reach
     ``threading.excepthook``, where an unhandled thread exception becomes a
@@ -1298,11 +1313,14 @@ def _acquire_with_timeout(
     reader = threading.Thread(
         target=read, name=f"{_READER_THREAD_PREFIX}{page_label}", daemon=True
     )
+    started = False
     try:
         reader.start()
+        started = True
         finished = done.wait(timeout)
     except KeyboardInterrupt:
-        _settle_or_wedge(dev, done, grace, page_label)
+        if started or reader.is_alive():
+            _settle_or_wedge(dev, done, grace, page_label)
         raise
     if finished:
         if slot.error is not None:
