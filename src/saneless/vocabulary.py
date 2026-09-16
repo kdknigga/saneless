@@ -33,6 +33,7 @@ __all__ = [
     "LOCAL_TIME_FORMAT",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
+    "SCAN_BLOCKED_REASON",
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
     "TOKEN_UNSET_JOB_ERROR",
@@ -373,6 +374,21 @@ _UNSET_CREDENTIAL_JOB_ERROR = (
     "Not started: the paperless-ngx API token has not been set"
 )
 TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
+
+# Why the Scan button is greyed out, rendered as a line beneath it (UI-SPEC
+# S8).  It deliberately does not repeat the fix: the status strip's Paperless
+# row, a few centimetres above on the same page, already carries "Put a real
+# API token in the saneless config file, then restart saneless." as its next
+# step.  Three surfaces name the same problem in the same words; only one owns
+# the remedy.
+#
+# Like every other string here it is a developer constant: it names the problem
+# and nothing else -- never the token value and never the paperless-ngx URL,
+# which may carry ``user:pass@`` credentials (ASVS V7).  The em dash is the
+# same one ``web/routes.py``'s paused-checks prefix already uses.
+SCAN_BLOCKED_REASON: Final = (
+    "The paperless-ngx API token has not been set — see System status above."
+)
 
 # What startup recovery passes to ``JobStore.fail_active_jobs`` for a job the
 # previous process left in flight (D-13), and what a flip wait aborted by
