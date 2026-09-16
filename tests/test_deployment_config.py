@@ -22,6 +22,15 @@ code is a real one, and every real one is documented (D-07, D-13).
 The Phase 29 test pins the architecture page's "Memory, disk and timeouts"
 subsection, and the absence of the two claims that phase falsified (D-20).
 
+The Phase 30 tests hold the shipped compose template to D-17 -- the paperless
+connection is commented out, because a live line there silently overrides
+``./config/config.toml`` -- and to APPL-11's consume-directory mount and
+APPL-12's ``TZ``. They also pin the ``kris-knigga`` occurrence count, so this
+phase provably does not perform Phase 31's DLVR-01 rename, and derive the
+documentation's expectations from the source: the route decorators, the
+``WebConfig`` fields and the ``RequestRejection`` members, so a future addition
+cannot ship undocumented (APPL-05, APPL-07, APPL-10, APPL-11, APPL-12).
+
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
 """
@@ -31,6 +40,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from saneless.config import is_placeholder_token
 from saneless.vocabulary import ExitCode
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -756,4 +766,189 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
     )
     assert "lossless" in lowered, (
         f"{name} no longer says the PNG-to-PDF embed is lossless"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 30: the shipped deployment template (D-17, APPL-07, APPL-11, APPL-12)
+# ---------------------------------------------------------------------------
+
+# The number of ``kris-knigga`` strings in ``docker-compose.yml`` before this
+# phase: the image reference and the ``#configuration`` anchor link. Renaming
+# them is DLVR-01 in Phase 31, deliberately NOT this phase's work. Pinning the
+# count proves Phase 30 left those lines alone -- if this fires because the
+# rename really happened, the fix is to update this constant in that phase, not
+# to weaken the assertion (T-30-88).
+COMPOSE_KRIS_KNIGGA_COUNT = 2
+
+# Every environment variable that carries the paperless-ngx connection. A live
+# line here silently overrides ``./config/config.toml`` -- the U-01 finding.
+OVERRIDING_ENV_KEYS = ("SANELESS_PAPERLESS__URL", "SANELESS_PAPERLESS__TOKEN")
+
+_TOKEN_ASSIGNMENT = re.compile(r"SANELESS_PAPERLESS__TOKEN=(\S*)")
+
+CONSUME_MOUNT_SUBSTRING = ":/consume"
+
+
+def _is_comment(line: str) -> bool:
+    """Say whether a YAML (or fenced-YAML) line is commented out."""
+    return line.lstrip().startswith("#")
+
+
+def _numbered(path: Path) -> list[tuple[int, str]]:
+    """Return ``(line number, line)`` pairs for a file, 1-based."""
+    return list(enumerate(path.read_text(encoding="utf-8").splitlines(), start=1))
+
+
+def _comment_lines_above(lines: list[tuple[int, str]], index: int) -> int:
+    """Count the unbroken run of comment lines immediately above ``index``."""
+    count = 0
+    for _, line in reversed(lines[:index]):
+        if not _is_comment(line):
+            break
+        count += 1
+    return count
+
+
+def test_compose_ships_no_live_paperless_environment_line() -> None:
+    """No live ``environment:`` line sets the paperless URL or token (D-17)."""
+    offenders = [
+        f"{COMPOSE.name}:{number}: {line.strip()}"
+        for number, line in _numbered(COMPOSE)
+        if not _is_comment(line)
+        if any(f"{key}=" in line for key in OVERRIDING_ENV_KEYS)
+    ]
+    assert not offenders, (
+        "the shipped compose template still sets the paperless connection in "
+        "its environment: block, which silently overrides "
+        "./config/config.toml (D-17, U-01):\n" + "\n".join(offenders)
+    )
+
+
+def test_compose_says_the_environment_block_overrides_the_config_file() -> None:
+    """The commented block explains the override and the upgrade action."""
+    text = COMPOSE.read_text(encoding="utf-8").lower()
+    for needle in ("override", "config.toml"):
+        assert needle in text, (
+            f"{COMPOSE.name} does not say that an environment line "
+            f"{needle}s the config file (D-17)"
+        )
+    assert "delete" in text or "remove" in text, (
+        f"{COMPOSE.name} does not tell an operator who copied an earlier "
+        "version to remove their own token line, so their real config.toml "
+        "stays overridden and the status strip stays red"
+    )
+
+
+def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> None:
+    """The consume-directory mount is present with two lines of why (APPL-11)."""
+    lines = _numbered(COMPOSE)
+    mounts = [
+        index
+        for index, (_, line) in enumerate(lines)
+        if CONSUME_MOUNT_SUBSTRING in line
+    ]
+    assert len(mounts) == 1, (
+        f"{COMPOSE.name}: expected exactly one consume-directory bind mount "
+        f"line containing {CONSUME_MOUNT_SUBSTRING!r}, found {len(mounts)}"
+    )
+    explanation = _comment_lines_above(lines, mounts[0])
+    assert explanation >= 2, (
+        f"{COMPOSE.name}: the consume-directory mount has {explanation} "
+        "comment lines above it; APPL-11 asks for a two-line explanation"
+    )
+    text = COMPOSE.read_text(encoding="utf-8").lower()
+    assert "consume_dir" in text, (
+        f"{COMPOSE.name} does not say that paperless.consume_dir must name the "
+        "same path, so an operator who uncomments the mount gets nothing"
+    )
+
+
+def test_compose_sets_the_timezone_with_an_explanation() -> None:
+    """The compose template sets ``TZ`` and says why (APPL-12, Pitfall 10)."""
+    lines = _numbered(COMPOSE)
+    settings = [index for index, (_, line) in enumerate(lines) if "TZ=" in line]
+    assert len(settings) == 1, (
+        f"{COMPOSE.name}: expected exactly one TZ line, found {len(settings)}"
+    )
+    index = settings[0]
+    assert not _is_comment(lines[index][1]), (
+        f"{COMPOSE.name}: the TZ line is commented out, so the shipped "
+        "template still reports UTC for every timestamp saneless displays"
+    )
+    assert _comment_lines_above(lines, index) >= 1, (
+        f"{COMPOSE.name}: the TZ line has no comment above it explaining that "
+        "a container reports UTC by default"
+    )
+    assert "utc" in COMPOSE.read_text(encoding="utf-8").lower(), (
+        f"{COMPOSE.name} does not mention UTC, so the TZ line reads as noise"
+    )
+
+
+def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
+    """
+    No live ``SANELESS_PAPERLESS__TOKEN=`` example is a detected placeholder.
+
+    ``changeme`` used to be the shipped value in both the compose template and
+    the Docker reference. This release detects it, shows the status strip red
+    and refuses scans (APPL-07, D-14), so presenting it as a working example
+    hands the reader a deployment that cannot scan. The expectation is derived
+    from ``is_placeholder_token`` rather than a hard-coded word list, so
+    widening that set cannot leave a stale example behind (T-30-86).
+    """
+    offenders: list[str] = []
+    for path in (COMPOSE, DOCKER_REFERENCE, DEPLOY_HOWTO):
+        for number, line in _numbered(path):
+            if _is_comment(line):
+                continue
+            match = _TOKEN_ASSIGNMENT.search(line)
+            if match is not None and is_placeholder_token(match.group(1)):
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
+                )
+    assert not offenders, (
+        "a shipped example sets the paperless token to a value this release "
+        "detects as a placeholder and refuses scans for:\n" + "\n".join(offenders)
+    )
+
+
+def test_phase_30_does_not_perform_the_dlvr_01_rename() -> None:
+    """``kris-knigga`` appears in the compose template exactly as often as before."""
+    count = COMPOSE.read_text(encoding="utf-8").count("kris-knigga")
+    assert count == COMPOSE_KRIS_KNIGGA_COUNT, (
+        f"{COMPOSE.name} has {count} 'kris-knigga' strings, expected "
+        f"{COMPOSE_KRIS_KNIGGA_COUNT}. Renaming them is DLVR-01 in Phase 31; "
+        "Phase 30 must leave the image reference and its link alone (T-30-88)"
+    )
+
+
+def test_deploy_howto_tells_existing_operators_to_remove_their_token_line() -> None:
+    """The compose how-to states the upgrade action and its consequence."""
+    text, name = _read(DEPLOY_HOWTO)
+    lowered = text.lower()
+    assert "SANELESS_PAPERLESS__TOKEN" in text, (
+        f"{name} no longer names the variable an existing operator has to remove"
+    )
+    for needle in ("override", "config.toml"):
+        assert needle in lowered, (
+            f"{name} does not explain that an environment line {needle}s the "
+            "config file (D-17)"
+        )
+    assert "red" in lowered, (
+        f"{name} does not state the consequence -- the status strip stays red "
+        "-- for an operator who leaves their own token line in place"
+    )
+
+
+def test_docker_reference_documents_the_consume_mount_and_the_timezone() -> None:
+    """The Docker reference documents ``/consume``, ``TZ`` and placeholder refusal."""
+    text, name = _read(DOCKER_REFERENCE)
+    assert "/consume" in text, f"{name} does not document the consume mount"
+    assert "`TZ`" in text, (
+        f"{name} does not document TZ, which is what makes every displayed "
+        "timestamp local rather than UTC (APPL-12)"
+    )
+    assert "placeholder" in text.lower(), (
+        f"{name} does not explain that placeholder token values are detected "
+        "and refuse scans (APPL-07)"
     )
