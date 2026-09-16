@@ -1260,3 +1260,260 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
         finished = job_store.get_job(job_id)
         assert finished is not None
         assert finished.state is JobState.ERROR
+
+
+# --- The owner-gated flip prompt (APPL-09, D-24, D-26, D-27) ----------------
+
+# The cookie's wire name, spelled out rather than imported: a test that imported
+# the constant would still pass if the name changed under every browser that
+# already holds one.
+_OWNER_COOKIE = "saneless_owner"
+
+# The token these tests write straight onto the row.  The mint itself is pinned
+# in tests/test_web.py; what is under test here is the rendering, so the row is
+# staged directly and the value only has to be distinctive.
+_OWNING_BROWSER = "the-browser-that-submitted-this-stack"
+
+# A base64 payload that is not a real JPEG.  Nothing decodes it: it exists so
+# both renderings carry an identical `<img>` for the identical-content
+# assertion to have something after the flip block to compare.
+_THUMBNAIL = "c3RhbmQtaW4="
+
+# The exact confirmation D-27 locks: one question, one consequence, and no
+# claim about the pages already scanned, which is a promise this contract
+# cannot verify.
+_ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
+
+# The copy a viewer who did not submit the job sees in place of the buttons.
+_NON_OWNER_LINE = "Waiting for the stack to be flipped"
+
+_STATUS_OPEN = re.compile(r'<div id="status-area"[^>]*>', re.DOTALL)
+# The real element, not the prose reference to it in the comment above the
+# status card: the element carries at least one further attribute, so it is
+# the only one of the two whose open tag has whitespace after the URL.
+_SCAN_FORM = re.compile(r'<form hx-post="/api/scan"\s+[^>]*>', re.DOTALL)
+_THUMBNAIL_START = '<img src="data:image/jpeg;base64,'
+
+# Any control that would let a second browser seize an answered-for job.  D-26
+# says the absence of one IS the rendering, so it is asserted like any other
+# contract rather than left to a reviewer's memory.
+_SEIZE_CONTROL = re.compile(r"override|take[ -]over|force", re.IGNORECASE)
+
+
+def _flip_job(client: TestClient, owner: str | None) -> str:
+    """
+    Stage an AWAITING_FLIP job with a thumbnail and the given owner token.
+
+    Args:
+        client: The client whose app owns the store and worker.
+        owner: The token to record, or None for a pre-upgrade unowned row.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(
+        profile="default", title="Flip Render", owner_token=owner
+    )
+    job_store.update_state(job.id, JobState.AWAITING_FLIP)
+    job_store.update_thumbnail(job.id, _THUMBNAIL)
+    _adopt_as_current_job(client, job.id)
+    return job.id
+
+
+def _as_browser(client: TestClient, token: str | None) -> str:
+    """
+    Fetch the status area as a browser carrying `token`, and return the markup.
+
+    The cookie is set as a header rather than through the client's jar so one
+    client can stand in for two browsers without the jar carrying state from
+    one request into the next.
+
+    Args:
+        client: The client to request through.
+        token: The owner token to present, or None to present none.
+
+    Returns:
+        The rendered response body.
+
+    """
+    headers = {} if token is None else {"Cookie": f"{_OWNER_COOKIE}={token}"}
+    response = client.get("/api/jobs/current/status", headers=headers)
+    assert response.status_code == 200
+    return response.text
+
+
+def _around_the_flip_block(markup: str) -> tuple[str, str]:
+    """
+    Split the markup into what precedes and what follows the flip branch.
+
+    The branch's output is the only thing the owner gate may change, so
+    everything on either side of it -- the status area's opening tag with its
+    poll attributes, the thumbnail, and the out-of-band Scan button -- must be
+    identical for both viewers.
+
+    Args:
+        markup: The rendered response body.
+
+    Returns:
+        The status area's opening tag, and everything from the thumbnail on.
+
+    """
+    opening = _STATUS_OPEN.search(markup)
+    assert opening is not None
+    thumbnail_at = markup.index(_THUMBNAIL_START)
+    return opening.group(0), markup[thumbnail_at:]
+
+
+class TestOwnerGatedFlipPrompt:
+    """
+    Who sees the Continue and Abort buttons, and what everyone else sees.
+
+    APPL-09 and D-24: the token gates those two buttons and nothing else.  The
+    gate is server-side -- the buttons are not rendered for a non-owner, never
+    hidden with CSS, which would be an ASVS V4 failure.
+    """
+
+    def test_owner_sees_the_flip_prompt_with_both_buttons(
+        self, client: TestClient
+    ) -> None:
+        """The browser that submitted the stack gets the prompt (APPL-09)."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, _OWNING_BROWSER)
+
+        assert "flip the stack over the long edge" in markup.lower()
+        assert markup.count('hx-post="/api/flip/') == 2
+        assert ">Continue<" in markup
+        assert ">Abort scan<" in markup
+        assert _NON_OWNER_LINE not in markup
+
+    def test_non_owner_sees_the_waiting_line_and_no_flip_controls(
+        self, client: TestClient
+    ) -> None:
+        """
+        A second viewer gets the waiting copy and zero controls (D-24).
+
+        Zero controls, not hidden ones: the gate is decided on the server and
+        the markup never carries a button the viewer is not allowed to press.
+        """
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, None)
+
+        assert f'<p aria-busy="true">{_NON_OWNER_LINE}</p>' in markup
+        assert markup.count('hx-post="/api/flip/') == 0
+        assert "Continue" not in markup
+        assert "Abort scan" not in markup
+
+    def test_a_different_owner_token_is_also_a_non_owner(
+        self, client: TestClient
+    ) -> None:
+        """A wrong token is no better than no token at all."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, "some-other-browsers-token")
+
+        assert f'<p aria-busy="true">{_NON_OWNER_LINE}</p>' in markup
+        assert markup.count('hx-post="/api/flip/') == 0
+
+    def test_owner_and_non_owner_see_identical_markup_around_the_flip_block(
+        self, client: TestClient
+    ) -> None:
+        """Only the flip block differs: state, poll, thumbnail and button match."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        owner = _as_browser(client, _OWNING_BROWSER)
+        other = _as_browser(client, None)
+
+        assert _around_the_flip_block(owner) == _around_the_flip_block(other)
+
+    def test_unowned_flip_job_renders_the_prompt_for_everyone(
+        self, client: TestClient
+    ) -> None:
+        """
+        A NULL owner token means unowned, so the prompt renders for all.
+
+        This is the manual-duplex job that was already in flight when the
+        appliance was upgraded; a strict rule would leave it un-continuable.
+        """
+        _flip_job(client, None)
+
+        markup = _as_browser(client, None)
+
+        assert markup.count('hx-post="/api/flip/') == 2
+        assert _NON_OWNER_LINE not in markup
+
+    def test_owner_flip_prompt_offers_no_way_to_seize_another_job(
+        self, client: TestClient
+    ) -> None:
+        """
+        There are exactly two controls and no third one (D-26).
+
+        A human who closed the tab is the same case as a human who walked
+        away, and the bounded Phase 25 flip timeout already resolves both.  The
+        absence of a third control is the decision, so it is asserted.
+        """
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, _OWNING_BROWSER)
+
+        assert markup.count("<button") == markup.count('hx-post="/api/flip/') + 1
+        assert _SEIZE_CONTROL.search(markup) is None
+
+    def test_non_owner_flip_rendering_offers_nothing_to_seize_with_either(
+        self, client: TestClient
+    ) -> None:
+        """The waiting viewer is offered no control of any kind (D-26)."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, None)
+
+        assert _SEIZE_CONTROL.search(markup) is None
+
+    def test_non_owner_flip_line_carries_no_trailing_ellipsis(
+        self, client: TestClient
+    ) -> None:
+        """
+        The locked copy ends without one, against the usual in-progress style.
+
+        The user wrote this string twice; D-24 treats it as locked copy and
+        this test records the style exception rather than letting a later
+        tidy-up "fix" it.
+        """
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, None)
+
+        assert f"{_NON_OWNER_LINE}</p>" in markup
+        assert f"{_NON_OWNER_LINE}..." not in markup
+        assert f"{_NON_OWNER_LINE}&#8230;" not in markup
+
+    def test_flip_abort_button_carries_the_exact_confirmation(
+        self, client: TestClient
+    ) -> None:
+        """Abort asks first, in D-27's exact words (APPL-09)."""
+        _flip_job(client, _OWNING_BROWSER)
+
+        markup = _as_browser(client, _OWNING_BROWSER)
+
+        assert f'hx-confirm="{_ABORT_CONFIRMATION}"' in markup
+        assert markup.count("hx-confirm") == 1
+
+    def test_flip_confirmation_is_on_the_button_not_the_scan_form(self) -> None:
+        """
+        The scan form is untouched, so the C-10 inheritance fix still holds.
+
+        Putting the confirmation on the form would make every child request
+        confirm, and would need the form's inheritance list extended -- the
+        exact landmine Phase 26 spent a regression test on.
+        """
+        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
+        flip = (_TEMPLATES_DIR / "partials" / "flip.html").read_text(encoding="utf-8")
+
+        form = _SCAN_FORM.search(index)
+        assert form is not None
+        assert "hx-confirm" not in index
+        assert 'hx-disinherit="hx-disabled-elt"' in form.group(0)
+        assert flip.count("hx-confirm") == 1
