@@ -266,6 +266,35 @@ details.tech-details > summary {
     display: none;
 }
 
+/* Tag picker: the label is the tap target, so the whole row toggles the box.
+   Pico shrinks a checkbox label to the width of its text and draws the box at
+   1.25em, which is far under what a thumb needs, so the app owns both. The
+   selector is label.tag-option, not .tag-option: Pico's own
+   label:has([type=checkbox]) rule has the same weight, and app.css loads
+   second, so a tie is what makes this win.
+
+   Two limits are deliberate. The checkbox glyph itself is not resized: Pico's
+   20px box inside a 44px label is the standard accessible pattern and keeps
+   the checked-state styling Pico owns. And the .refresh-btn glyphs stay at
+   their existing inline size, which meets WCAG 2.5.8's 24x24 -- they are
+   maintenance controls, not scan-flow controls, and a household member
+   standing at the scanner taps a tag, not a refresh arrow. */
+label.tag-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    min-height: 2.75rem;
+    margin-bottom: 0;
+    cursor: pointer;
+}
+
+.tag-list {
+    max-height: 17.5rem;
+    overflow-y: auto;
+    margin-bottom: var(--pico-spacing);
+}
+
 /* htmx trigger elements that should not be visible */
 .htmx-hidden {
     display: none;

@@ -774,6 +774,15 @@ def index(request: Request) -> Response:
             # The template reads the string and decides nothing; the flag that
             # says whether to render it comes from the status context.
             "scan_blocked_reason": SCAN_BLOCKED_REASON,
+            # Which optional controls this appliance's form carries (D-28).  A
+            # configured key and not a per-browser toggle: one appliance, one
+            # form shape, and the template renders the controls or leaves them
+            # out of the markup entirely rather than hiding them with CSS.
+            # Turning one off changes the form and never the scan (D-29) --
+            # ``start_scan`` falls back to the profile's defaults for exactly
+            # the control that is no longer on the page.
+            "show_tags": state.settings.web.show_tags,
+            "show_correspondent": state.settings.web.show_correspondent,
         },
     )
 
@@ -989,6 +998,17 @@ def start_scan(
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
     title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
+    # D-29.  Hiding a control changes the form, never the scan: with
+    # ``[web] show_tags`` or ``show_correspondent`` off, the submit carries
+    # nothing for that field and the profile's own default is what applies,
+    # exactly as a blank title already falls back to the profile's title on the
+    # line above.  It is a fallback and not an override -- a submit that names
+    # tags or a correspondent keeps them -- so an operator who turns a control
+    # off gets the profile's answer rather than none at all, and the CLI, which
+    # has always applied these defaults, stops being the odd one out.
+    tags = tags or found.default_tags
+    if correspondent is None:
+        correspondent = found.default_correspondent
     form = _ScanForm(
         profile=profile, title=title, tags=tags, correspondent=correspondent
     )
