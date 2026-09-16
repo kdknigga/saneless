@@ -257,6 +257,15 @@ details.tech-details > summary {
     margin-top: 0.5rem;
 }
 
+/* A profile with no description would otherwise leave Pico's help-text
+   margins behind as a stray gap. The route answers with a byte-empty body for
+   exactly this reason: a single whitespace text node is a child, and :empty
+   would stop matching. The rule hides an element and introduces no colour
+   value of its own (UI-SPEC S4). */
+#profile-description:empty {
+    display: none;
+}
+
 /* htmx trigger elements that should not be visible */
 .htmx-hidden {
     display: none;
