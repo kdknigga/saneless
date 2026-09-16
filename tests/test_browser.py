@@ -70,10 +70,13 @@ from saneless.paperless import UploadResult
 from saneless.scanner.base import DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     TERMINAL_STATES,
+    ErrorCategory,
     FlipOutcome,
     JobState,
     ScanOutcome,
     WorkerHealth,
+    error_message,
+    error_next_step,
 )
 from saneless.web.app import create_app
 from saneless.worker import WorkerFlipCoordinator
@@ -2831,3 +2834,305 @@ class TestStatusStripInChromium:
         finally:
             worker._current_job_id = None
             job_store.delete_job(job.id)
+
+
+# The counts UI-SPEC S3 pins, for the three cases that behave differently: a
+# measured set, a measured zero in the middle clause, and never-recorded.
+_MEASURED_COUNTS = "12 pages scanned, 2 blank removed, 10 uploaded"
+_ZERO_BLANK_COUNTS = "12 pages scanned, 0 blank removed, 12 uploaded"
+
+# The category this phase's error rendering is read through. UPLOAD is chosen
+# over UNKNOWN on purpose: UNKNOWN's next step ends "check the saneless log",
+# and a test whose own fixture data contains the word the D-13 assertion is
+# hunting for would be arguing with itself.
+_ERROR_CATEGORY = ErrorCategory.UPLOAD
+
+_ERROR_DETAIL = "connect to paperless-ngx failed: [Errno 111] Connection refused"
+"""The specific message the disclosure must still carry, relocated but not removed."""
+
+
+@pytest.fixture
+def empty_history_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app whose job history starts empty.
+
+    Two of the assertions below are about what is *absent* from the whole page:
+    a job with NULL counts renders no ``.page-counts`` element anywhere, and an
+    ERROR page carries no log-file path anywhere. Neither claim means anything
+    against the session server, whose store and whose configured log path are
+    shared with every other test in this module.
+    """
+    with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.mark.browser
+class TestErrorRenderingInChromium:
+    """
+    The plain-language failure, read from a rendered page (APPL-04, D-13).
+
+    What a screen reader is handed is a property of the DOM and not of the
+    template text: whether the next step falls inside the alert, and whether
+    "Technical details" falls outside it, are both facts about the elements the
+    browser built. So is whether the disclosure is really closed on arrival,
+    and whether the page a whole LAN can read names a host filesystem path.
+    """
+
+    def test_one_alert_carries_the_sentence_and_the_next_step_and_no_log_path(
+        self, page: Page, empty_history_server: _BrowserServer
+    ) -> None:
+        """
+        One alert, the details outside it and shut, and no path anywhere (P5).
+
+        The count of one is the point of the wrapping ``<div role="alert">``:
+        the sentence and the next step are announced together, once, and the
+        disclosure is not announced with them. The closed state matters because
+        an ``open`` disclosure would put the raw exception in front of a
+        household member as though it were the message.
+        """
+        server = empty_history_server
+        job_store: JobStore = server.app.state.job_store
+        worker = server.app.state.worker
+        job = job_store.create_job(profile="default", title="Broken Doc")
+        job_store.finish_job(
+            job.id,
+            JobState.ERROR,
+            error=_ERROR_DETAIL,
+            error_category=_ERROR_CATEGORY,
+        )
+        worker._current_job_id = job.id
+        try:
+            page.goto(server.url)
+
+            alert = page.locator('#status-area [role="alert"]')
+            expect(alert).to_have_count(1)
+            expect(alert).to_contain_text(error_message(_ERROR_CATEGORY))
+            expect(alert).to_contain_text(error_next_step(_ERROR_CATEGORY))
+
+            details = page.locator("#status-area details.tech-details")
+            expect(details).to_have_count(1)
+            assert details.get_attribute("open") is None
+            # Outside the alert, not merely after it: a disclosure nested in the
+            # live region would be read out with the failure.
+            expect(page.locator('[role="alert"] details.tech-details')).to_have_count(0)
+
+            details.locator("summary").click()
+            expect(details).to_contain_text(_ERROR_DETAIL)
+            expect(details).to_contain_text(f"Category: {_ERROR_CATEGORY.value}")
+            expect(details).to_contain_text(f"Job: {job.id}")
+
+            source = page.content()
+            log_file = server.app.state.settings.output.log_file
+            assert log_file not in source, log_file
+            # Not just this deployment's path: any filename that looks like a
+            # log would be a host filesystem detail on a page the whole LAN can
+            # read, so the substring is what is refused (D-13).
+            assert ".log" not in source
+        finally:
+            worker._current_job_id = None
+            job_store.delete_job(job.id)
+
+
+@pytest.mark.browser
+class TestPageCountsInChromium:
+    """
+    The counts footnote, in both places it renders (APPL-03, D-32).
+
+    One class and one rule serve the status area and the Title cell alike, and
+    the guard for both is the filter returning None rather than a count's own
+    truthiness. The failure mode that matters -- a measured zero rendered as
+    nothing, or a never-recorded count rendered as zero -- is a rendering
+    outcome, so it is read off the page rather than off the filter.
+    """
+
+    @pytest.mark.parametrize(
+        ("counts", "expected"),
+        [
+            ((12, 2, 10), _MEASURED_COUNTS),
+            ((12, 0, 12), _ZERO_BLANK_COUNTS),
+            ((None, None, None), None),
+        ],
+        ids=["measured", "measured-zero", "never-recorded"],
+    )
+    def test_a_done_job_renders_its_counts_in_both_places_or_not_at_all(
+        self,
+        page: Page,
+        empty_history_server: _BrowserServer,
+        counts: tuple[int | None, int | None, int | None],
+        expected: str | None,
+    ) -> None:
+        """
+        Measured counts render twice; never-recorded ones render nowhere (P6).
+
+        The three cases are separate page loads on a server with an empty
+        history precisely so the negative case can be stated at full strength:
+        not "this row has no counts" but "this page has no ``.page-counts``
+        element at all". Sharing one page between the cases would have made the
+        other two rows answer for the third.
+        """
+        server = empty_history_server
+        job_store: JobStore = server.app.state.job_store
+        worker = server.app.state.worker
+        scanned, removed, uploaded = counts
+        job = job_store.create_job(profile="default", title="Counted Doc")
+        job_store.finish_job(
+            job.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=None,
+                pages_scanned=scanned,
+                pages_removed=removed,
+                pages_uploaded=uploaded,
+            ),
+        )
+        worker._current_job_id = job.id
+        try:
+            page.goto(server.url)
+            expect(page.locator("#status-area .status-done")).to_be_visible()
+
+            if expected is None:
+                expect(page.locator(".page-counts")).to_have_count(0)
+                return
+
+            expect(page.locator("#status-area .page-counts")).to_have_text(expected)
+            title_cell = page.locator("#history-body tr").first.locator("td").nth(2)
+            expect(title_cell.locator(".page-counts")).to_have_text(expected)
+        finally:
+            worker._current_job_id = None
+            job_store.delete_job(job.id)
+
+
+_FRONT_PAGES = 12
+"""How many sheets pass A produces, so the busy line has UI-SPEC P7's number."""
+
+_FRONT_COUNT_PREFIX = f"Front: {_FRONT_PAGES} pages \N{MIDDLE DOT} "
+"""The opening UI-SPEC P7 pins, separator included."""
+
+
+class _ManualDuplexScanner(_BrowserTestScanner):
+    """
+    A stub whose passes produce a known number of sheets, gated on pass B.
+
+    ``_BrowserTestScanner`` spools one page per pass, which would pin the front
+    count at 1 and leave the singular branch of the busy line as the only thing
+    a browser could ever be shown. Twelve is the number UI-SPEC P7 writes, and
+    it arrives by the real route: pass A returns twelve records, the pipeline
+    counts them and hands the count to the worker through the pass-count
+    callback, before it announces AWAITING_FLIP (D-33).
+
+    Only pass B waits on the inherited gate, so the job parks in
+    SCANNING_REVERSE for exactly as long as the assertions need.
+    """
+
+    def __init__(self, pages_per_pass: int) -> None:
+        """Create the stub with its gate open and no passes run yet."""
+        super().__init__()
+        self._pages_per_pass = pages_per_pass
+        self._passes = 0
+
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Spool a pass, waiting on the gate for the second one only.
+
+        Args:
+            device_id: Ignored; this stub scans nothing real.
+            settings: Only ``resolution`` is used, and only to report it back.
+            sink: The pipeline's own sink, which receives each page.
+
+        Returns:
+            A batch of this pass's records.
+
+        """
+        self._passes += 1
+        if self._passes > 1:
+            self.gate.wait(timeout=_SCAN_GATE_TIMEOUT)
+        return _spool_pages(sink, self._pages_per_pass, settings.resolution)
+
+
+@pytest.fixture
+def duplex_server(
+    tmp_path: Path, egress_allowlist: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app that can run one real manual-duplex scan.
+
+    ``monkeypatch`` is requested by this fixture rather than by the test so the
+    ordering is guaranteed: a fixture is torn down before anything it depends
+    on, so the stubbed Paperless client is still in place when ``_serve``'s
+    shutdown finishes whatever job is left in flight. Requested by the test
+    instead, it could be restored first and the shutdown would then spend its
+    bounded join inside upload retries.
+    """
+    scanner = _ManualDuplexScanner(_FRONT_PAGES)
+    with _serve(_browser_test_settings(tmp_path), scanner) as server:
+        _make_paperless_deliver(server.app, monkeypatch)
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.mark.browser
+class TestManualDuplexFrontCountInChromium:
+    """
+    The front count leads the busy line at SCANNING_REVERSE (APPL-03, D-33).
+
+    The number exists only between the end of pass A and the end of the job,
+    and it lives on the worker rather than in a job column, so the only way to
+    see it rendered is to park a real scan in the reverse pass and look. That
+    is what this does: a real submit, a real flip click, and the pipeline's own
+    pass-count callback carrying the number.
+    """
+
+    def test_the_busy_line_leads_with_the_front_count(
+        self,
+        page: Page,
+        duplex_server: _BrowserServer,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        At ``SCANNING_REVERSE`` the busy line opens ``Front: 12 pages ·`` (P7).
+
+        ``startswith`` rather than a containment check: the count leads the
+        line, because it is the thing the operator standing at the feeder wants
+        first, and a version that merely mentioned it somewhere would satisfy a
+        containment assertion while failing the contract.
+        """
+        server = duplex_server
+        job_store: JobStore = server.app.state.job_store
+        # Closed before the submit, so pass B is already held by the time the
+        # flip is answered and the job cannot run past the state under test.
+        server.scanner.gate.clear()
+
+        page.goto(server.url)
+        page.select_option("#profile-select", "duplex")
+        with page.expect_response(lambda r: r.url.endswith("/api/scan")):
+            page.click("#scan-btn")
+        recent = job_store.list_recent(1)
+        assert recent, "the scan submit created no job row"
+        job_id = recent[0].id
+
+        try:
+            wait_for_state(job_store, job_id, JobState.AWAITING_FLIP, timeout=20.0)
+            continue_button = page.locator(
+                "#status-area button[hx-post='/api/flip/continue']"
+            )
+            expect(continue_button).to_be_visible()
+            continue_button.click()
+            wait_for_state(job_store, job_id, JobState.SCANNING_REVERSE, timeout=20.0)
+
+            busy = page.locator("#status-area p[aria-busy='true']")
+            expect(busy).to_contain_text(_FRONT_COUNT_PREFIX.strip())
+            assert busy.inner_text().startswith(_FRONT_COUNT_PREFIX), busy.inner_text()
+        finally:
+            # Released here and not left to the fixture: the job has to reach a
+            # terminal state before the server shuts down, or the shutdown's
+            # bounded worker join is what reports this test's failure.
+            server.scanner.gate.set()
+            wait_for_state(
+                job_store, job_id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT
+            )
