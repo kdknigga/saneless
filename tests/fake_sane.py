@@ -55,6 +55,7 @@ purpose rather than discovered there.
 from __future__ import annotations
 
 import time
+import weakref
 from typing import TYPE_CHECKING, Any
 
 from PIL import Image, ImageDraw
@@ -628,6 +629,8 @@ class FakeSaneDev:
     assignments: list[str]
     cancel_calls: int
     close_calls: int
+    issued_pages: list[weakref.ref[Image.Image]]
+    high_water_live_pages: int
     _options: list[tuple]
     _values: dict[str, Any]
     _pages: int
@@ -692,6 +695,8 @@ class FakeSaneDev:
         state["assignments"] = []
         state["cancel_calls"] = 0
         state["close_calls"] = 0
+        state["issued_pages"] = []
+        state["high_water_live_pages"] = 0
 
     def __setattr__(self, key: str, value: object) -> None:
         """
@@ -794,6 +799,43 @@ class FakeSaneDev:
 
         """
         self.__dict__["_page_delay"] = seconds
+
+    def live_page_images(self) -> int:
+        """
+        Count the page images this device handed out that are still alive.
+
+        This is HARD-01's proof instrument (D-08).  Every page ``snap()``
+        returns is recorded in ``issued_pages`` as a ``weakref.ref``, and this
+        method calls each one: a reference whose referent has been collected
+        answers ``None``, so what is counted is exactly the pages something
+        else is still holding.
+
+        Two measured facts decided the mechanism, and neither is a style
+        preference (29-RESEARCH.md Finding 4 and Pitfall 6):
+
+        1. ``weakref``'s hash-based *set* container cannot hold Pillow images.
+           ``Image`` defines ``__eq__`` without ``__hash__``, so it is
+           unhashable and building one raises
+           ``TypeError: unhashable type: 'Image'``.  A plain list of
+           ``weakref.ref`` is used instead, and must stay one -- do not
+           "tidy" it into a set.
+        2. ``tracemalloc`` cannot see the memory in question.  A 26 MB Pillow
+           image adds **460 bytes** to the traced total, because its pixels are
+           malloc'd in C rather than allocated by the Python allocator.  RSS is
+           the other obvious instrument and is far too noisy for CI.
+
+        What this counter does *not* see is worth stating, so nobody reads the
+        number as an allocation ceiling: ``snap()`` itself transiently holds
+        three references to a page, and ``crop`` and ``convert("L")`` each
+        produce one more decoded image downstream.  The real decoded ceiling is
+        therefore roughly two to three pages -- but it is **constant in N**,
+        and that constancy is the claim HARD-01 actually defends.
+
+        Returns:
+            How many issued page images have not yet been collected.
+
+        """
+        return sum(1 for reference in self.issued_pages if reference() is not None)
 
     def fail_call(self, method: str, error: BaseException) -> None:
         """
@@ -1070,6 +1112,16 @@ class FakeSaneDev:
             else _page_image(index, self._page_size)
         )
         self._page_index += 1
+        # Sampled here, immediately before the page leaves the device, so the
+        # page about to be returned is itself counted.  That is deliberate: it
+        # is what makes 2 the honest high-water mark, because the backend's
+        # loop variable still references page k-1 at the moment page k is
+        # handed over (D-08).  See live_page_images() for why a weakref list
+        # and not a weak-reference set, and why not tracemalloc.
+        self.issued_pages.append(weakref.ref(page))
+        live = self.live_page_images()
+        if live > self.high_water_live_pages:
+            self.__dict__["high_water_live_pages"] = live
         return page
 
     def multi_scan(self) -> Iterator[Image.Image]:
