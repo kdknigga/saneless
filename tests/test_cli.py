@@ -231,6 +231,29 @@ def _patch_cli(
     return CliRunner(), settings
 
 
+def _failure_lines(result: Result) -> list[str]:
+    """
+    Return a classified failure's stderr with the D-12 advice line removed.
+
+    Every ``SanelessError`` the guard classifies to a code other than
+    ``UNEXPECTED`` now prints two things: Phase 28's locked failure line and
+    the category's ``Try: `` next step (APPL-04, D-12). The tests below were
+    written when there was only the first, and each still means "one failure
+    line and no traceback" -- so the advice line is *asserted* and stripped in
+    one place rather than each assertion being loosened to a substring check.
+
+    Args:
+        result: The CliRunner result of a command that failed.
+
+    Returns:
+        The stderr lines before the advice line.
+
+    """
+    lines = result.stderr.splitlines()
+    assert lines[-1].startswith("Try: "), result.stderr
+    return lines[:-1]
+
+
 class TestCliHelp:
     """CLI help text tests."""
 
@@ -1727,7 +1750,7 @@ class TestRequireSane:
         result = runner.invoke(cli, [command])
 
         assert result.exit_code == 2, result.output
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert "python-sane cannot be imported" in lines[0]
         assert reason in lines[0]
@@ -2161,10 +2184,10 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
-        assert result.stderr == (
+        assert _failure_lines(result) == [
             f"Cannot bind to 127.0.0.1:8080: [Errno {errno.EADDRINUSE}] "
-            "Address already in use\n"
-        )
+            "Address already in use"
+        ]
         assert runs == []
         sock.close.assert_called_once()
 
@@ -2185,7 +2208,7 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert "web server could not start" in lines[0]
         assert "127.0.0.1:8080" in lines[0]
@@ -2260,7 +2283,7 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
-        assert result.stderr.splitlines() == [
+        assert _failure_lines(result) == [
             "The web server could not start: Could not initialise SANE: "
             "Error during device I/O"
         ]
@@ -2306,7 +2329,7 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 3, result.output
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert lines[0].startswith(
             "Paperless error: Paperless URL http://host:abc is not valid"
@@ -2449,7 +2472,7 @@ class TestAutoProfiles:
 
         result = runner.invoke(cli, ["auto-profiles"])
         assert result.exit_code == 2
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith("No scanner found: ")
 
@@ -2824,7 +2847,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 2
-        assert result.stderr.splitlines() == [
+        assert _failure_lines(result) == [
             "Configuration error in /etc/saneless/config.toml:",
             "  line 12, column 5: Invalid value",
         ]
@@ -2846,7 +2869,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 1
-        assert result.stderr.splitlines() == [
+        assert _failure_lines(result) == [
             "Scan error: Could not open scanner epson2:libusb:001:004: Invalid argument"
         ]
         assert "Traceback" not in result.output
@@ -2868,7 +2891,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 3
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith(
             "Paperless error: Could not reach Paperless at http://paperless:8000"
@@ -2900,7 +2923,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 4
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith(
             "PDF error: Could not assemble 1 page(s) into /tmp/x.pdf: "
@@ -2922,7 +2945,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 2
-        assert result.stderr.splitlines() == ["No scanner found"]
+        assert _failure_lines(result) == ["No scanner found"]
 
     def test_scan_cancelled_exits_130_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

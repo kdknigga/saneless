@@ -69,6 +69,7 @@ from .vocabulary import (
     JobState,
     ProfileStorage,
     classify_error,
+    error_next_step,
     exit_code_for,
     progress_label,
     state_label,
@@ -426,7 +427,17 @@ class _GuardedGroup(click.Group):
                 _report_unexpected(ctx, exc)
             else:
                 _log_failure(ctx, exc)
+                # D-12: two lines, and the first one is not ours to change.
+                # Line 1 is Phase 28 D-08's locked shape, printed unchanged, so
+                # a script parsing it and the doc-truth message-shape tests that
+                # pin it are both unaffected. Line 2 is the same
+                # error_next_step string the web error page renders -- which is
+                # why the copy is surface-neutral and never says "press Scan" or
+                # "run the command" (D-10, D-11). The UNEXPECTED branch above
+                # gets no advice: its category is a guess about an exception
+                # saneless did not raise.
                 click.echo(_failure_line(exc, category), err=True)
+                click.echo(f"Try: {error_next_step(category)}", err=True)
             ctx.exit(code)
         except Exception as exc:
             _report_unexpected(ctx, exc)
