@@ -1,106 +1,258 @@
-"""Tests for page processing utilities: empty page detection and thumbnail generation."""
+"""
+Tests for page processing utilities: empty page detection and thumbnails.
+
+``is_empty_page`` no longer takes a page. It takes the greyscale mean and
+standard deviation the spool measured once, while the page was in memory at
+write time (D-06), so most of these tests hand it the two numbers directly:
+building an image purely to produce a mean and a stddev modelled nothing that
+the production code does any more.
+
+One class deliberately does keep a real page in the picture --
+``TestStatisticsComeFromASpooledPage`` runs pages through a real
+``SpooledPageSink`` -- so the numbers the rest of the file passes as literals
+are still proven to be the numbers a real page produces.
+"""
+
+from __future__ import annotations
 
 import base64
 import io
+from typing import TYPE_CHECKING
 
+import pytest
 from PIL import Image, ImageDraw
 
 from saneless.pages import filter_empty_pages, generate_thumbnail, is_empty_page
+from saneless.pipeline import _SPOOL_LABEL_A
+from saneless.spool import SpooledPageSink
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from pathlib import Path
+
+    from saneless.scanner.base import PageRecord
+
+# The reserve the spool keeps free beyond each page. One megabyte is the
+# smallest honest value: these pages are a few tens of kilobytes, so the check
+# passes anywhere the test suite can run at all, and it is still a real check
+# rather than a disabled one.
+_TEST_RESERVE_MB = 1
+
+
+def _spool(directory: Path, pages: Sequence[Image.Image]) -> list[PageRecord]:
+    """
+    Spool pages through a real sink and hand back the records it made.
+
+    A real ``SpooledPageSink`` rather than hand-built records: the point of
+    every test that calls this is that the statistics on a record were measured
+    from an actual page written to an actual file, not typed in by a test.
+
+    Args:
+        directory: Where the pages land. Must already exist.
+        pages: The pages to spool, in order.
+
+    Returns:
+        One record per page, in the order they were added.
+
+    """
+    sink = SpooledPageSink(directory, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
+    return [sink.add(page) for page in pages]
+
+
+def _white_page() -> Image.Image:
+    """
+    Return a page with nothing on it.
+
+    Returns:
+        A 200x300 pure white RGB image.
+
+    """
+    return Image.new("RGB", (200, 300), "white")
+
+
+def _inked_page() -> Image.Image:
+    """
+    Return a page with a large black rectangle on it.
+
+    Returns:
+        A 200x300 RGB image no threshold pair calls blank.
+
+    """
+    page = Image.new("RGB", (200, 300), "white")
+    draw = ImageDraw.Draw(page)
+    draw.rectangle([20, 20, 180, 280], fill="black")
+    return page
 
 
 class TestEmptyPageDetection:
-    """Tests for is_empty_page dual-threshold detection."""
+    """
+    Tests for ``is_empty_page``'s dual-threshold rule over stored statistics.
+
+    The rule is ``mean > mean_threshold and stddev < stddev_threshold``: an
+    AND, with both comparisons strict. Neither the thresholds nor the
+    strictness changed when the page stopped arriving here (D-06), so these
+    cases assert exactly what they asserted when each one converted an image
+    first.
+    """
 
     def test_pure_white_is_empty(self) -> None:
-        """Pure white image (mean=255, stddev=0) is detected as empty."""
-        img = Image.new("RGB", (200, 300), "white")
-        assert is_empty_page(img) is True
+        """A pure white page measures mean 255, stddev 0, and is empty."""
+        assert is_empty_page(255.0, 0.0) is True
 
-    def test_nearly_white_is_empty(self, empty_page_image: Image.Image) -> None:
-        """Nearly-white image (253,253,253) is detected as empty."""
-        assert is_empty_page(empty_page_image) is True
+    def test_nearly_white_is_empty(self) -> None:
+        """A (253,253,253) page measures mean 253, stddev 0, and is empty."""
+        assert is_empty_page(253.0, 0.0) is True
 
-    def test_dark_content_is_not_empty(self, content_page_image: Image.Image) -> None:
-        """Image with dark content (low mean) is not empty."""
-        assert is_empty_page(content_page_image) is False
+    def test_dark_content_is_not_empty(self) -> None:
+        """A low mean fails the first condition however flat the page is."""
+        assert is_empty_page(120.0, 1.0) is False
 
     def test_text_like_content_not_empty(self) -> None:
-        """Image with text-like content (high stddev) is not empty."""
-        img = Image.new("RGB", (200, 300), "white")
-        draw = ImageDraw.Draw(img)
-        # Draw scattered dark lines to create high stddev
-        for y in range(0, 300, 10):
-            draw.line([(0, y), (200, y)], fill="black", width=2)
-        assert is_empty_page(img) is False
+        """Scattered ink raises the stddev, which fails the second condition."""
+        assert is_empty_page(252.0, 40.0) is False
+
+    def test_mean_exactly_at_the_threshold_is_not_empty(self) -> None:
+        """The mean comparison is strictly greater-than, and stays so."""
+        assert is_empty_page(250.0, 0.0) is False
+
+    def test_stddev_exactly_at_the_threshold_is_not_empty(self) -> None:
+        """The stddev comparison is strictly less-than, and stays so."""
+        assert is_empty_page(255.0, 5.0) is False
+
+    def test_both_conditions_are_required(self) -> None:
+        """Bright-but-noisy and flat-but-dark are both kept: the rule is an AND."""
+        assert is_empty_page(255.0, 6.0) is False
+        assert is_empty_page(249.0, 0.0) is False
 
     def test_custom_thresholds_stricter(self) -> None:
-        """Custom stricter thresholds reject a nearly-white image."""
-        # This image has mean ~253, stddev ~0 in grayscale
-        img = Image.new("RGB", (200, 300), (253, 253, 253))
-        # Default thresholds: empty
-        assert is_empty_page(img) is True
-        # Stricter mean threshold (254): now mean=253 is NOT above 254
-        assert is_empty_page(img, mean_threshold=254.0) is False
+        """A stricter mean threshold rejects a page the default calls blank."""
+        # mean 253, stddev 0 -- what a (253,253,253) page measures.
+        assert is_empty_page(253.0, 0.0) is True
+        # Stricter mean threshold (254): now mean=253 is NOT above 254.
+        assert is_empty_page(253.0, 0.0, mean_threshold=254.0) is False
 
     def test_custom_thresholds_looser(self) -> None:
-        """Custom looser thresholds accept a lightly-shaded image."""
-        # Image with some light gray -- mean ~200
-        img = Image.new("RGB", (200, 300), (200, 200, 200))
-        # Default: not empty (mean 200 < 250)
-        assert is_empty_page(img) is False
-        # Looser: mean_threshold=190
-        assert is_empty_page(img, mean_threshold=190.0) is True
+        """A looser mean threshold accepts a lightly-shaded page as blank."""
+        # mean 200, stddev 0 -- what a (200,200,200) page measures.
+        assert is_empty_page(200.0, 0.0) is False
+        assert is_empty_page(200.0, 0.0, mean_threshold=190.0) is True
+
+
+class TestStatisticsComeFromASpooledPage:
+    """
+    The literals the rest of this file passes are what a real page measures.
+
+    ``is_empty_page`` is only as honest as the two numbers handed to it, and
+    those numbers are produced in exactly one place: ``SpooledPageSink.add``,
+    while the page is still decoded (D-06). These cases keep that end of the
+    contract under test, so the measurement and the judgement cannot drift
+    apart unnoticed.
+    """
+
+    def test_a_blank_page_records_the_statistics_the_thresholds_expect(
+        self, tmp_path: Path
+    ) -> None:
+        """A spooled white page really does record mean 255 and stddev 0."""
+        (record,) = _spool(tmp_path, [_white_page()])
+
+        assert record.mean == pytest.approx(255.0)
+        assert record.stddev == pytest.approx(0.0)
+        assert is_empty_page(record.mean, record.stddev) is True
+
+    def test_an_inked_page_records_statistics_no_threshold_pair_calls_blank(
+        self, tmp_path: Path
+    ) -> None:
+        """A spooled inked page records a low mean and a high stddev."""
+        (record,) = _spool(tmp_path, [_inked_page()])
+
+        assert record.mean < 250.0
+        assert record.stddev > 5.0
+        assert is_empty_page(record.mean, record.stddev) is False
+
+    def test_the_record_measures_the_file_that_was_written(
+        self, tmp_path: Path
+    ) -> None:
+        """The page behind the numbers exists on disk and is the one judged."""
+        (record,) = _spool(tmp_path, [_white_page()])
+
+        assert record.path.exists()
+        assert record.sequence == 1
+        assert record.size == (200, 300)
 
 
 class TestFilterEmptyPages:
-    """Tests for filter_empty_pages list filtering."""
+    """
+    ``filter_empty_pages`` filters the record list, never the directory.
 
-    def test_filters_empty_from_mixed(
-        self, content_page_image: Image.Image, empty_page_image: Image.Image
-    ) -> None:
-        """Mixed list of content and empty pages returns only content pages."""
-        pages = [
-            content_page_image,
-            empty_page_image,
-            content_page_image.copy(),
-            empty_page_image.copy(),
-            content_page_image.copy(),
-        ]
-        result = filter_empty_pages(pages)
-        assert len(result) == 3
+    A discarded page is simply not referenced by the result: nothing is
+    unlinked, and the survivors keep both their relative order and the
+    ``sequence`` numbers naming the sheets the device fed.
+    """
 
-    def test_all_empty_returns_empty_list(self) -> None:
-        """All-empty page list returns empty list."""
-        pages = [
-            Image.new("RGB", (200, 300), "white"),
-            Image.new("RGB", (200, 300), (254, 254, 254)),
-        ]
-        result = filter_empty_pages(pages)
-        assert result == []
+    def test_filters_empty_from_mixed(self, tmp_path: Path) -> None:
+        """A mixed run returns only the inked records, in document order."""
+        records = _spool(
+            tmp_path,
+            [
+                _inked_page(),
+                _white_page(),
+                _inked_page(),
+                _white_page(),
+                _inked_page(),
+            ],
+        )
 
-    def test_no_empty_returns_all(self, content_page_image: Image.Image) -> None:
-        """No empty pages returns all pages."""
-        pages = [
-            content_page_image,
-            content_page_image.copy(),
-            content_page_image.copy(),
+        result = filter_empty_pages(records)
+
+        assert result == [records[0], records[2], records[4]]
+        assert [record.sequence for record in result] == [1, 3, 5]
+
+    def test_all_empty_returns_empty_list(self, tmp_path: Path) -> None:
+        """An all-blank run returns an empty list rather than raising."""
+        records = _spool(
+            tmp_path,
+            [_white_page(), Image.new("RGB", (200, 300), (254, 254, 254))],
+        )
+
+        assert filter_empty_pages(records) == []
+
+    def test_no_empty_returns_all(self, tmp_path: Path) -> None:
+        """A run with nothing blank in it returns every record untouched."""
+        records = _spool(tmp_path, [_inked_page(), _inked_page(), _inked_page()])
+
+        assert filter_empty_pages(records) == records
+
+    def test_nothing_is_unlinked_from_the_spool(self, tmp_path: Path) -> None:
+        """Every spooled file survives, including the pages that were dropped."""
+        records = _spool(tmp_path, [_inked_page(), _white_page()])
+
+        filter_empty_pages(records)
+
+        assert sorted(path.name for path in tmp_path.iterdir()) == [
+            "a-0001.png",
+            "a-0002.png",
         ]
-        result = filter_empty_pages(pages)
-        assert len(result) == 3
+
+    def test_profile_thresholds_reach_the_rule(self, tmp_path: Path) -> None:
+        """A looser mean threshold drops a page the default keeps."""
+        records = _spool(tmp_path, [Image.new("RGB", (200, 300), (200, 200, 200))])
+
+        assert filter_empty_pages(records) == records
+        assert filter_empty_pages(records, mean_threshold=190.0) == []
 
 
 class TestThumbnailGeneration:
-    """Tests for generate_thumbnail."""
+    """Tests for generate_thumbnail, which still takes a page image."""
 
-    def test_returns_nonempty_base64(self, content_page_image: Image.Image) -> None:
+    def test_returns_nonempty_base64(self) -> None:
         """generate_thumbnail returns a non-empty base64 string."""
-        result = generate_thumbnail(content_page_image)
+        result = generate_thumbnail(_inked_page())
         assert isinstance(result, str)
         assert len(result) > 0
 
-    def test_decodes_to_valid_jpeg(self, content_page_image: Image.Image) -> None:
+    def test_decodes_to_valid_jpeg(self) -> None:
         """Base64 output decodes to valid JPEG image data."""
-        result = generate_thumbnail(content_page_image)
+        result = generate_thumbnail(_inked_page())
         raw = base64.b64decode(result)
         img = Image.open(io.BytesIO(raw))
         assert img.format == "JPEG"
