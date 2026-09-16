@@ -957,6 +957,30 @@ class JobStore:
             rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
         return [self._row_to_job(row) for row in rows]
 
+    def _pending_jobs(self) -> list[Job]:
+        """
+        Read the queue oldest-first, without taking the lock.
+
+        The shared body of :meth:`list_pending` and :meth:`queue_position`.
+        Private and unlocked deliberately: both public callers already carry
+        ``@_locked``, and a public method may not call another public one --
+        ``sqlite3`` connection context managers do not nest, so an inner ``with
+        self._conn:`` commits the outer method's transaction early.  Factoring
+        the query here, rather than letting ``queue_position`` write a second
+        ``ORDER BY``, is what makes it impossible for a job's position and the
+        list it is a position into to disagree.
+
+        Returns:
+            List of Job instances awaiting a scanner, ordered by creation time
+            ascending.
+
+        """
+        with self._conn:
+            rows = self._conn.execute(
+                _LIST_PENDING, (JobState.PENDING.value,)
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
     @_locked
     def list_pending(self) -> list[Job]:
         """
@@ -969,20 +993,58 @@ class JobStore:
         variable-length ``IN`` ``fail_active_jobs`` needs -- but the state value
         is still bound rather than written into the statement text.
 
-        This method has NO production caller in this phase.  Showing a job its
-        position in the queue is APPL-08, which belongs to Phase 30; until then
-        its tests are its only consumer.
+        No production caller wants this list *as* a list.  What production
+        wants from the ordering is one job's place in it, which
+        :meth:`queue_position` reports for the status area's "N ahead of you"
+        line (APPL-08).  Both methods read it through ``_pending_jobs``, so
+        this method is the ordering's public shape and its tests are the
+        ordering's proof.
 
         Returns:
             List of Job instances awaiting a scanner, ordered by creation time
             ascending.
 
         """
-        with self._conn:
-            rows = self._conn.execute(
-                _LIST_PENDING, (JobState.PENDING.value,)
-            ).fetchall()
-        return [self._row_to_job(row) for row in rows]
+        return self._pending_jobs()
+
+    @_locked
+    def queue_position(self, job_id: str) -> int | None:
+        """
+        Count the queued jobs ahead of one job.
+
+        Zero-based: the job at the head of the queue has nothing ahead of it
+        and answers ``0``.  The UI adds nothing to the number -- it renders
+        ``(next in line)`` for ``0`` rather than ``(0 ahead of you)``, which is
+        technically true and reads like a bug -- and ``(N ahead of you)`` for
+        anything higher (UI-SPEC S5, APPL-08).
+
+        ``None`` means the job is not waiting.  A job that has left ``PENDING``
+        and an id no row carries both answer ``None``, because both mean the
+        same thing to the status area: there is no queue line to render.
+
+        Walks :meth:`list_pending`'s ordering through the shared
+        ``_pending_jobs`` query rather than asking the database for a rank.  A
+        second ``ORDER BY`` -- or a ``COUNT(*)`` over a hand-written predicate
+        -- would be a second definition of "ahead", and two definitions that
+        agree today drift tomorrow.  The queue is bounded by the submission
+        cap, so reading it is cheaper than keeping the two in step by hand.
+
+        Args:
+            job_id: The job to locate in the queue.
+
+        Returns:
+            The zero-based number of pending jobs ahead of job_id, or None when
+            that job is not pending.
+
+        """
+        return next(
+            (
+                position
+                for position, job in enumerate(self._pending_jobs())
+                if job.id == job_id
+            ),
+            None,
+        )
 
     @_locked
     def latest_run_job(self, exclude_ids: AbstractSet[str] = frozenset()) -> Job | None:
