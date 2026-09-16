@@ -2434,3 +2434,26 @@ class TestTagFilterInChromium:
 
         expect(page.locator("label.tag-option")).to_have_count(2)
         assert posted == [], posted
+
+    def test_every_tag_row_clears_the_touch_target_floor(
+        self, page: Page, tagged_server: _BrowserServer
+    ) -> None:
+        """
+        Every row is at least 44 px tall and spans the list (D-30, WCAG 2.5.5).
+
+        Measured in the browser, because this is a cascade outcome and not a
+        stylesheet fact: Pico shrinks a checkbox label to the width of its text
+        through `label:has([type=checkbox])`, a rule of exactly the same weight
+        as the app's own, so what decides it is that app.css loads second. A
+        source assertion on the rule would pass with that order reversed.
+        """
+        self._load_tags(page, tagged_server.url)
+        list_box = page.locator("#tags-list").bounding_box()
+        assert list_box is not None
+
+        rows = page.locator("label.tag-option")
+        for index in range(rows.count()):
+            box = rows.nth(index).bounding_box()
+            assert box is not None, index
+            assert box["height"] >= 44, box
+            assert box["width"] >= list_box["width"] - 2, (box, list_box)
