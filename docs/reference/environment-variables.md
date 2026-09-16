@@ -58,11 +58,30 @@ Settings are resolved in this order (highest to lowest priority):
 
 `SANELESS_OUTPUT__MIN_FREE_SPACE_MB` is the free disk space saneless keeps in reserve for assembling the PDF. It is checked twice: once before a scan starts, and again before each page is written to disk, against that page's size *plus* this reserve. A scan that runs out of room fails naming the page number and the path, and the pages already scanned are preserved. See [`[output]`](configuration.md#output) for every field in this section.
 
+### Web
+
+| Variable | Config Path | Type | Example |
+|----------|-------------|------|---------|
+| `SANELESS_WEB__SHOW_TAGS` | `web.show_tags` | bool | `false` |
+| `SANELESS_WEB__SHOW_CORRESPONDENT` | `web.show_correspondent` | bool | `false` |
+
+Both default to `true`. Setting one to `false` hides that control on the scan form; the profile's `default_tags` and `default_correspondent` still apply, so hiding a control changes the form and never the scan. The web server's bind address is **not** in this section: it is `SANELESS_OUTPUT__WEB_HOST` and `SANELESS_OUTPUT__WEB_PORT` above. See [`[web]`](configuration.md#web).
+
+### Not a saneless variable: `TZ`
+
+| Variable | Type | Example |
+|----------|------|---------|
+| `TZ` | string | `America/Chicago` |
+
+`TZ` is the standard POSIX/container timezone variable, not a `SANELESS_` setting, and saneless never reads it directly -- Python's own local-time conversion does. It matters because saneless renders every user-facing timestamp in the server's local zone with the zone named: the web UI's job history and status area, the `saneless jobs` table, the status strip's `Last checked` line, and the `Scan <date time>` title a document gets in paperless-ngx when no title was given.
+
+A container's clock reports UTC unless `TZ` is set, so **without it every one of those timestamps is UTC**, including the document title that ends up in paperless-ngx. Set it in your compose file's `environment:` block. A bare-metal install normally inherits the host's zone and needs nothing.
+
 ## Notes
 
 - **Profile fields** use `SANELESS_PROFILES__<NAME>__<FIELD>`, for example `SANELESS_PROFILES__RECEIPT__TITLE=Receipt` for `title` in `[profiles.receipt]`. Variable names are case-insensitive, and profile names are lower-cased. A `default` profile must still exist: with no config file, set at least one `SANELESS_PROFILES__DEFAULT__<FIELD>` too, or loading fails.
 
-- **Unknown variables are rejected.** A `SANELESS_` variable whose first segment after the prefix is not `SCANNER`, `PAPERLESS`, `OUTPUT` or `PROFILES` stops saneless at startup with exit code 2. The error names the variable and suggests a fix: `SANELESS_PAPERLES__TOKEN` suggests `SANELESS_PAPERLESS__TOKEN`, and a single underscore such as `SANELESS_OUTPUT_WEB_PORT` suggests `SANELESS_OUTPUT__WEB_PORT`. An unknown field in a known section, such as `SANELESS_SCANNER__HOSTNAME`, is reported naming the variable, the same way as an unknown key in the TOML file (see [Validation](configuration.md#validation)). Values are never printed.
+- **Unknown variables are rejected.** A `SANELESS_` variable whose first segment after the prefix is not `SCANNER`, `PAPERLESS`, `OUTPUT`, `WEB` or `PROFILES` stops saneless at startup with exit code 2. The error names the variable and suggests a fix: `SANELESS_PAPERLES__TOKEN` suggests `SANELESS_PAPERLESS__TOKEN`, and a single underscore such as `SANELESS_OUTPUT_WEB_PORT` suggests `SANELESS_OUTPUT__WEB_PORT`. An unknown field in a known section, such as `SANELESS_SCANNER__HOSTNAME`, is reported naming the variable, the same way as an unknown key in the TOML file (see [Validation](configuration.md#validation)). Values are never printed.
 
 - **saneless logs where its settings came from.** At startup it writes one INFO line naming the config file it loaded (or saying there was none) and the dotted names of the settings that came from environment variables, for example `paperless.url, paperless.token`. Names only, never values.
 
