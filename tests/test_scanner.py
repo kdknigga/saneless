@@ -5,9 +5,11 @@ from __future__ import annotations
 import dataclasses
 import gc
 import importlib
+import inspect
 import logging
 import os
 import sys
+import threading
 import time
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -36,10 +38,12 @@ from tests.fake_sane import (
     FakeSaneDev,
     FakeSaneError,
     FakeSaneModule,
+    ReadBlockMode,
     build_option_table,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -331,6 +335,31 @@ def _page_sink_for(tmp_path: Path, label: str = _SPOOL_LABEL_A) -> SpooledPageSi
     directory = tmp_path / f"spool-{label}"
     directory.mkdir(exist_ok=True)
     return SpooledPageSink(directory, label, _NO_FREE_SPACE_RESERVE)
+
+
+# The prefix every acquisition thread the backend starts is named with, and the
+# bound a test waits for one under.
+#
+# Joining by name is how a test observes a daemon reader finishing without
+# polling and without a sleep: ``Thread.join(timeout)`` returns the instant the
+# thread ends.  The bound exists only so a genuinely stuck reader fails the
+# assertion that follows rather than hanging the run; five seconds is well
+# inside pytest-timeout's sixty.
+_READER_THREAD_PREFIX = "sane-read-"
+_READER_JOIN_SECONDS = 5.0
+
+
+def _join_sane_reader_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
+    """
+    Wait for every acquisition thread the backend started to finish.
+
+    Args:
+        timeout: The bound each join waits under.
+
+    """
+    for thread in threading.enumerate():
+        if thread.name.startswith(_READER_THREAD_PREFIX):
+            thread.join(timeout)
 
 
 def _uncropped(image: Image.Image) -> Image.Image:
@@ -1652,6 +1681,281 @@ class TestSaneBackendPerPageTimeout:
         )
         assert len(records) == 3
         assert [record.sequence for record in records] == [1, 2, 3]
+
+
+class TestSaneBackendCancelSequence:
+    """
+    HARD-03 and HARD-04: cancel, wait, then close only if the read returned.
+
+    Every test here arms the shared fake's Event-gated read, so nothing waits
+    out a sleep: the block is ended by setting an ``Event``, and the only
+    bounded waits are the backend's own timeout and grace (TEST-02, D-16).
+
+    The ordering these tests assert is not a refinement.  ``sane_close`` runs
+    holding the GIL while ``sane_read`` has released it, so a close racing a
+    blocked read is the one sequence python-sane cannot survive -- which is
+    why "was close called while the read was still blocked" is asserted
+    directly rather than inferred from a call count.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_wedge(self) -> Iterator[None]:
+        """
+        Clear the module-level wedge record after each test in this class.
+
+        The record is module state by design -- D-13 needs the *next*
+        ``scan_pages`` on a fresh backend object to refuse -- so a test that
+        wedges it deliberately has to un-wedge it, or the refusal leaks into
+        every test that runs afterwards.
+
+        The device handle and its iterator are dropped with it.  A reader
+        thread still blocked at that point is a daemon, and it identifies its
+        own acquisition by the ``done`` event it was given, so a late wake-up
+        after this teardown matches nothing and does nothing.
+
+        Yields:
+            None, before the record is cleared.
+
+        """
+        yield
+        record = sane_backend_mod._WEDGE
+        record.stuck = False
+        record.done = None
+        record.device = None
+        record.iterator = None
+        record.device_id = ""
+        record.page_label = ""
+
+    @staticmethod
+    def _wedge(
+        backend: SaneBackend, device: FakeSaneDev, sink: SpooledPageSink
+    ) -> None:
+        """
+        Leave the backend wedged by a read that does not answer the cancel.
+
+        Args:
+            backend: The backend to wedge.
+            device: The shared fake, armed here rather than by the caller so
+                that every wedge in this class is built the same way.
+            sink: Where the (never arriving) page would have gone.
+
+        """
+        device.block_read(ReadBlockMode.NEVER)
+        with (
+            pytest.raises(ScanError, match="timed out"),
+            backend._open_device(_TEST_DEVICE) as dev,
+        ):
+            backend._scan_adf_pages(
+                dev, sink, _uncropped, timeout_per_page=0.05, grace=0.05
+            )
+
+    def test_close_not_called_while_blocked(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        The cancel goes out first and the close waits for the read to return.
+
+        Asserted inside the device context and then again outside it, because
+        the two say different things: inside, that nothing closed the handle
+        while the read was still in SANE; outside, that the handle really was
+        released once the read came back.  A single count at the end could not
+        tell "closed after" from "closed during".
+        """
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            with pytest.raises(ScanError, match="timed out"):
+                sane_backend._scan_adf_pages(
+                    dev, page_sink, _uncropped, timeout_per_page=0.05
+                )
+            assert fake_device.cancel_calls == 1
+            assert fake_device.close_while_blocked is False
+            assert fake_device.close_calls == 0
+
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_blocked is False
+
+    def test_did_not_respond_to_cancel(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A scanner that never answers the cancel is reported, not closed.
+
+        The grace is injected the same way ``timeout_per_page`` is, so the
+        test does not wait out the module's real ten seconds.
+        """
+        fake_device.block_read(ReadBlockMode.NEVER)
+
+        with (
+            caplog.at_level(logging.CRITICAL),
+            pytest.raises(ScanError) as raised,
+            sane_backend._open_device(_TEST_DEVICE) as dev,
+        ):
+            sane_backend._scan_adf_pages(
+                dev, page_sink, _uncropped, timeout_per_page=0.05, grace=0.05
+            )
+
+        message = str(raised.value)
+        assert "timed out" in message
+        assert "did not respond" in message
+        assert fake_device.close_calls == 0
+        assert fake_device.close_while_blocked is False
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.CRITICAL
+        ]
+
+    def test_post_cancel_page_discarded(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The truncated page a cancelled read returns never reaches the sink.
+
+        This is the case a "use it if it arrived after all" shortcut gets
+        wrong.  Measured on real libsane, a cancelled ``snap()`` returns a
+        truncated image rather than raising, and that image clears
+        ``_validate_page_image``: spooling it would put one more page in the
+        PDF than the error message claims (Pitfall 1, D-12).
+        """
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        with (
+            pytest.raises(ScanError, match="timed out"),
+            sane_backend._open_device(_TEST_DEVICE) as dev,
+        ):
+            sane_backend._scan_adf_pages(
+                dev, page_sink, _uncropped, timeout_per_page=0.05
+            )
+
+        assert page_sink.records == ()
+        # Asserted on the directory as well as on the sink, because "the sink
+        # was never called" and "no page file exists" are different claims and
+        # a partial PDF is built from the second one.
+        assert list((tmp_path / f"spool-{_SPOOL_LABEL_A}").iterdir()) == []
+
+    def test_a_wedged_backend_refuses_the_next_call_with_no_sane_traffic(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+    ) -> None:
+        """
+        D-13: the next scan and the next interrogation refuse, touching nothing.
+
+        "No SANE call" is asserted as the device's own call log being
+        byte-for-byte what it was, because the refusal has to happen before
+        ``sane.open()``.  Refusing after opening would be the very operation
+        the SANE standard forbids while a read is outstanding.
+        """
+        self._wedge(sane_backend, fake_device, page_sink)
+        calls_before = list(fake_device.calls)
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
+
+        with pytest.raises(ScanError, match="Restart saneless"):
+            sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
+        with pytest.raises(ScanError, match="Restart saneless"):
+            sane_backend.get_capabilities(_TEST_DEVICE)
+
+        assert fake_device.calls == calls_before
+        assert fake_device.close_calls == 0
+        assert fake_device.cancel_calls == 1
+
+    def test_the_wedge_clears_when_the_late_read_finally_returns(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+    ) -> None:
+        """
+        A transient hang recovers without a restart, and the reader closes.
+
+        The handle is closed by the reader thread itself, because it is the
+        only thread that knows the read is over -- the thread that gave up on
+        it has long since raised.  Joining that thread is a bounded wait on a
+        real event, not a sleep: it ends the instant the reader returns.
+        """
+        self._wedge(sane_backend, fake_device, page_sink)
+
+        fake_device.release_read()
+        _join_sane_reader_threads()
+
+        assert fake_device.close_calls == 1
+        assert fake_device.close_while_blocked is False
+
+        settings = ScanSettings(source="ADF", resolution=300, mode="Color")
+        batch = sane_backend.scan_pages(_TEST_DEVICE, settings, second_pass_sink)
+        assert batch.pages
+
+    def test_flatbed_timeout_matches_the_adf_message_shape(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        HARD-04: one flatbed sheet is bounded exactly as one fed sheet is.
+
+        The default is asserted alongside the behaviour because D-14's claim
+        is not merely "the flatbed times out" but "with the same constant, and
+        no new config key".  A second timeout that happened to be equal today
+        would satisfy the first half and quietly drift apart later.
+        """
+        assert (
+            inspect.signature(sane_backend_mod._snap_flatbed)
+            .parameters["timeout"]
+            .default
+            == sane_backend_mod._DEFAULT_PAGE_TIMEOUT_SECONDS
+        )
+        fake_device.block_read(ReadBlockMode.PARTIAL)
+
+        with (
+            pytest.raises(ScanError, match="timed out"),
+            sane_backend._open_device(_TEST_DEVICE) as dev,
+        ):
+            sane_backend_mod._snap_flatbed(
+                dev, _TEST_DEVICE, page_sink, _uncropped, timeout=0.05
+            )
+
+        assert fake_device.cancel_calls == 1
+        assert fake_device.close_while_blocked is False
+        assert page_sink.records == ()
+
+    def test_flatbed_unreadable_sheet_is_fatal_not_skipped(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+    ) -> None:
+        """
+        HARD-04's other half: the shared validation, fatal on the platen.
+
+        A fed sheet that fails the same two checks is skipped and counted,
+        because there is a next sheet to carry on to.  A flatbed exposes one
+        sheet at a time, so there is nothing to carry on to and the scan ends
+        -- which is why the call log must show exactly one attempt.
+        """
+        fake_device.load_feeder([Image.new("RGB", (10, 10), "white")])
+        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
+
+        with pytest.raises(ScanError, match="unreadable"):
+            sane_backend.scan_pages(_TEST_DEVICE, settings, page_sink)
+
+        assert fake_device.calls == ["start", "snap"]
+        assert page_sink.records == ()
 
 
 class TestSaneBackendADFCleanup:
