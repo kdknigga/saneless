@@ -530,7 +530,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 29-07-PLAN.md — Daemon-thread timeout, cancel-then-wait, wedge, flatbed, Ctrl-C, exit proof
+- [x] 29-07-PLAN.md — Daemon-thread timeout, cancel-then-wait, wedge, flatbed, Ctrl-C, exit proof
 - [x] 29-08-PLAN.md — Bounded PDF assembly: per-page convert plus a qpdf merge
 - [x] 29-09-PLAN.md — Keep the pages a mid-batch failure leaves behind (HARD-02)
 
@@ -602,7 +602,7 @@ Plans:
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
-| 29. Geometry, Memory, and Timeouts | 8/11 | In Progress|  |
+| 29. Geometry, Memory, and Timeouts | 9/11 | In Progress|  |
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
