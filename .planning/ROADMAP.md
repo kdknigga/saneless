@@ -586,7 +586,7 @@ Plans:
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
-- [ ] 30-11-PLAN.md — Status strip: routes, partials, cold-start poll, paused during scan
+- [x] 30-11-PLAN.md — Status strip: routes, partials, cold-start poll, paused during scan
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 10/19 | In Progress|  |
+| 30. Appliance Layer | 11/19 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
