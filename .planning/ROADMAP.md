@@ -536,7 +536,7 @@ Plans:
 
 **Wave 7** *(blocked on Wave 6 completion)*
 
-- [ ] 29-10-PLAN.md — SANE init guard, shutdown at every entry point, the request-path proof
+- [x] 29-10-PLAN.md — SANE init guard, shutdown at every entry point, the request-path proof
 
 **Wave 8** *(blocked on Wave 7 completion)*
 
@@ -602,7 +602,7 @@ Plans:
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
-| 29. Geometry, Memory, and Timeouts | 9/11 | In Progress|  |
+| 29. Geometry, Memory, and Timeouts | 10/11 | In Progress|  |
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
