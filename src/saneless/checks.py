@@ -27,12 +27,27 @@ from __future__ import annotations
 
 import logging
 import socket
+import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import TYPE_CHECKING, Final, assert_never
+
+import httpx
+
+from saneless.config import is_placeholder_token
+from saneless.vocabulary import (
+    ConnectionStatus,
+    ProfileStorage,
+    connection_status_message,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+
+    from saneless.config import Settings
+    from saneless.paperless import PaperlessClient
+    from saneless.scanner.base import DeviceInfo, ScannerBackend
 
 __all__ = [
     "CHECKING_GLYPH",
@@ -41,6 +56,7 @@ __all__ = [
     "PROBE_CONNECT_SECONDS",
     "PROBE_READ_SECONDS",
     "SANED_PORT",
+    "CheckContext",
     "CheckKey",
     "CheckResult",
     "CheckState",
@@ -48,6 +64,7 @@ __all__ = [
     "check_state_class",
     "check_state_glyph",
     "check_state_label",
+    "run_checks",
     "worst_state",
 ]
 
@@ -78,6 +95,17 @@ SANED_PORT: Final = 6566
 CHECKING_GLYPH: Final = "·"
 CHECKING_STATE_CLASS: Final = "check-checking"
 CHECKING_MESSAGE: Final = "Checking…"
+
+# How much of a device's own description a row will print.  Nothing else bounds
+# what a scanner can call itself, and the row is rendered into HTML next to
+# four others whose width is fixed (ROBU-08).
+_DEVICE_LABEL_MAX_LENGTH: Final = 60
+
+# The row a check that raised is rendered as.  Developer constants, because the
+# exception that produced them is exactly the thing that must not reach the
+# page.
+_CHECK_FAILED_MESSAGE: Final = "This check could not be completed."
+_CHECK_FAILED_NEXT_STEP: Final = "Restart saneless, then press Check again."
 
 
 class CheckState(StrEnum):
@@ -166,6 +194,49 @@ class CheckResult:
     message: str
     next_step: str = ""
     skipped: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CheckContext:
+    """
+    Everything the five checks need, handed in rather than reached for.
+
+    Every dependency is injected because the two surfaces build them
+    differently, and neither may be the one this module knows about (D-02).
+    The web app has a worker, a long-lived Paperless client and a scanner
+    backend it opened at startup; ``saneless doctor`` has none of those and
+    builds what it needs for one command.
+
+    ``scanner=None`` is how "python-sane is not installed on this machine" is
+    represented.  That is what lets ``doctor`` report all five rows on such a
+    machine instead of refusing at ``require_sane()`` and reporting none
+    (Amendment A-1) -- the thing an operator most needs a diagnostic for is the
+    machine where the diagnostic would otherwise not run.
+
+    ``paperless=None`` means no usable client could be built at all, which
+    ``PaperlessClient.__init__`` only refuses for a URL httpx will not parse.
+
+    ``profile_storage`` is the outcome the worker recorded when it wrote the
+    generated profiles, not something re-derived here.  ``doctor`` derives its
+    own from whether a config file was loaded.  It has to be a record rather
+    than a fresh probe, because the two in-memory cases are indistinguishable
+    afterwards and the read-only one is the only one worth acting on (D-22).
+
+    Attributes:
+        settings: The loaded configuration.
+        scanner: The scanner backend, or None when there is no SANE support.
+        paperless: The Paperless client, or None when none could be built.
+        profile_storage: What the profile write actually did.
+        skip_scanner: True while a scan is running, which pauses the scanner
+            check without touching the backend (D-08).
+
+    """
+
+    settings: Settings
+    scanner: ScannerBackend | None
+    paperless: PaperlessClient | None
+    profile_storage: ProfileStorage
+    skip_scanner: bool = False
 
 
 def check_name(key: CheckKey) -> str:
@@ -427,3 +498,479 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
         # caller renders is where an operator is told about it.
         logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
         return False
+
+
+def _directory_accepts_a_write(path: Path) -> bool:
+    """
+    Say whether a directory will actually take a file, by putting one there.
+
+    This writes and removes a temporary file rather than asking
+    ``os.access``.  ``os.access`` answers a question about the directory's mode
+    bits, and the failure Phase 27 D-09 was written for is not a mode bit: a
+    single-file bind mount where the directory is writable, ``os.access`` says
+    yes, and only the operation itself fails with EBUSY.  A check that asks a
+    different question to the one the appliance will ask at scan time is a
+    check that can be green while scanning is broken.
+
+    Args:
+        path: The directory to probe.
+
+    Returns:
+        True when a file was created and removed, False on any OSError --
+        missing, not a directory, read-only, out of space or busy.
+
+    """
+    try:
+        with tempfile.NamedTemporaryFile(dir=path, prefix=".saneless-check-"):
+            return True
+    except OSError as exc:
+        logger.debug("directory did not accept a write: %s", type(exc).__name__)
+        return False
+
+
+def _device_label(device: DeviceInfo) -> str:
+    """
+    Describe a device in the words on its lid, never by its SANE identifier.
+
+    ``DeviceInfo.name`` is the SANE device id, and for the ``net`` backend it
+    is ``net:<host>:<backend>:...`` -- a LAN address.  Putting it in a row
+    would publish that address to everyone who can load the index page, which
+    is the same reason the fallback row omits the folder path (ASVS V7).
+    ``vendor`` and ``model`` are what the device calls itself and what is
+    printed on its lid, so they are what a household member can match against
+    the machine in front of them.
+
+    Args:
+        device: The device the backend reported.
+
+    Returns:
+        A bounded description, or the empty string when the backend reported
+        no vendor and no model.
+
+    """
+    label = " ".join(f"{device.vendor} {device.model}".split())
+    if len(label) > _DEVICE_LABEL_MAX_LENGTH:
+        label = label[: _DEVICE_LABEL_MAX_LENGTH - 1].rstrip() + "…"
+    return label
+
+
+def _scanner_unreachable() -> CheckResult:
+    """
+    Build the "the scanner is not answering" row.
+
+    Returns:
+        The UI-SPEC S1 not-reachable row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.FAIL,
+        message="Not reachable.",
+        next_step=(
+            "Check the scanner is switched on and connected, then press Check again."
+        ),
+    )
+
+
+def _scanner_skipped() -> CheckResult:
+    """
+    Build the row shown while a scan is running (D-08).
+
+    The state is ``OK`` rather than ``WARN`` or ``FAIL``.  "We did not look" is
+    a fact about the probe, not a verdict about the appliance, and a scan in
+    flight is direct evidence the scanner was working moments ago; a scripted
+    health gate must not go red for the duration of every scan.  The
+    ``skipped`` flag, not the state, is what the two surfaces render.
+
+    Returns:
+        The UI-SPEC S1 skipped row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.OK,
+        message="Not checked while a scan is running.",
+        skipped=True,
+    )
+
+
+def _check_scanner(context: CheckContext) -> CheckResult:
+    """
+    Report whether a scanner is there to scan with.
+
+    The order is deliberate.  A machine with no python-sane is its own row
+    (Amendment A-1) and is decided without touching anything.  A configured
+    sane-net host is then pre-probed, and every configured entry refusing a TCP
+    connection ends the check right there: ``get_devices()`` would spend about
+    two minutes reaching the same conclusion inside a C call nothing can
+    interrupt (T-30-22).  Only when there is no host to probe, or one of them
+    answered, is the backend entered at all -- which is also the fallback that
+    cannot produce a false red row, because a setting this module cannot parse
+    into an entry leaves the check behaving exactly as it did before the probe
+    existed.
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        Exactly one result for ``CheckKey.SCANNER``.
+
+    """
+    scanner = context.scanner
+    if scanner is None:
+        return CheckResult(
+            key=CheckKey.SCANNER,
+            state=CheckState.FAIL,
+            message="Scanner support is not installed on this machine.",
+            next_step="Install saneless with scanner support, then restart it.",
+        )
+    entries = _saned_hosts(context.settings.scanner.host)
+    if entries and not any(
+        _saned_reachable(host, port, PROBE_CONNECT_SECONDS) for host, port in entries
+    ):
+        return _scanner_unreachable()
+    try:
+        devices = scanner.get_devices()
+    except Exception as exc:
+        # The backend raises ScanError, but python-sane underneath it raises
+        # _sane.error, RuntimeError or AttributeError with no shared base
+        # (sane_backend.py D-08), so the boundary catches Exception.  The type
+        # name is logged; nothing from the exception reaches the row.
+        logger.warning("Scanner enumeration failed: %s", type(exc).__name__)
+        return _scanner_unreachable()
+    if not devices:
+        return _scanner_unreachable()
+    label = _device_label(devices[0])
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.OK,
+        message=f"{label} is ready." if label else "Ready.",
+    )
+
+
+def _paperless_next_step(status: ConnectionStatus) -> str:
+    """
+    Return what to do about one connection outcome.
+
+    The sentences are UI-SPEC S1's, and they pair with the messages
+    ``connection_status_message`` already owns -- this module authors the
+    remedy, never the diagnosis, so the two surfaces cannot disagree about
+    what happened even if they disagreed about what to do.
+
+    Args:
+        status: The connection-test outcome.
+
+    Returns:
+        A next step, or the empty string when there is nothing to do.
+
+    Raises:
+        AssertionError: If the value is not a ConnectionStatus member.
+
+    """
+    match status:
+        case ConnectionStatus.CONNECTED:
+            next_step = ""
+        case ConnectionStatus.TOKEN_REJECTED:
+            next_step = (
+                "Check the API token in the saneless config file, "
+                "then restart saneless."
+            )
+        case ConnectionStatus.NOT_FOUND:
+            next_step = "Check the paperless-ngx address in the saneless config file."
+        case ConnectionStatus.SERVER_ERROR:
+            next_step = "Check paperless-ngx is healthy, then press Check again."
+        case ConnectionStatus.UNREACHABLE:
+            next_step = (
+                "Check paperless-ngx is running and on the network, "
+                "then press Check again."
+            )
+        case _:
+            assert_never(status)
+    return next_step
+
+
+def _check_paperless(context: CheckContext) -> CheckResult:
+    """
+    Report whether scans can be filed, without spending thirty seconds on it.
+
+    The token is examined first and the probe is skipped entirely when it is a
+    placeholder (D-14): an unset token cannot succeed, so a request would only
+    tell paperless-ngx about it.  ``is_placeholder_token`` is the one predicate
+    ``doctor``, this check, the scan route and ``saneless scan`` share, so all
+    four agree on whether the appliance can upload (APPL-07).
+
+    A ``None`` client means one could not be constructed, and the only way
+    ``PaperlessClient.__init__`` refuses is a URL httpx will not parse -- which
+    is the "not found at that URL" row, not a sixth sentence.
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        Exactly one result for ``CheckKey.PAPERLESS``.
+
+    """
+    if is_placeholder_token(context.settings.paperless.token.get_secret_value()):
+        return CheckResult(
+            key=CheckKey.PAPERLESS,
+            state=CheckState.FAIL,
+            message="The paperless-ngx API token has not been set.",
+            next_step=(
+                "Put a real API token in the saneless config file, "
+                "then restart saneless."
+            ),
+        )
+    client = context.paperless
+    if client is None:
+        status = ConnectionStatus.NOT_FOUND
+    else:
+        status = client.test_connection(
+            timeout=httpx.Timeout(PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS)
+        )
+    state = CheckState.OK if status is ConnectionStatus.CONNECTED else CheckState.FAIL
+    return CheckResult(
+        key=CheckKey.PAPERLESS,
+        state=state,
+        message=connection_status_message(status),
+        next_step=_paperless_next_step(status),
+    )
+
+
+def _check_profiles(context: CheckContext) -> CheckResult:
+    """
+    Report whether there are scan profiles and whether they will survive a restart.
+
+    Exactly one result comes out, and the precedence is fixed: no profiles at
+    all (red) beats a read-only config location (amber) beats no config file at
+    all (amber) beats a generated profile with no name (amber) beats the count.
+    The two amber rows are deliberately different sentences, because "saneless
+    has no file to save to" and "saneless has one and cannot write it" are
+    different facts and only the second is worth investigating (D-22,
+    Amendment A-2).
+
+    The storage outcome is recorded by the worker rather than recomputed here.
+    A fresh ``os.access`` probe cannot substitute for it: Phase 27 D-09's
+    motivating failure is a bind mount where the directory is writable and only
+    the rename fails.
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        Exactly one result for ``CheckKey.PROFILES``.
+
+    Raises:
+        AssertionError: If the storage outcome is not a ProfileStorage member.
+
+    """
+    profiles = context.settings.profiles
+    if not profiles:
+        return CheckResult(
+            key=CheckKey.PROFILES,
+            state=CheckState.FAIL,
+            message="No scan profiles are configured.",
+            next_step='Run "saneless auto-profiles" to create them.',
+        )
+    match context.profile_storage:
+        case ProfileStorage.IN_MEMORY_UNWRITABLE:
+            return CheckResult(
+                key=CheckKey.PROFILES,
+                state=CheckState.WARN,
+                # One literal, deliberately over the 88-column guide (E501 is
+                # off in this project): D-22 pins this sentence verbatim, and a
+                # grep for it has to find it on one line.
+                message="Generated in memory — the config location is read-only, so they are lost on restart.",
+                next_step=(
+                    "Make the saneless config directory writable, "
+                    "then restart saneless."
+                ),
+            )
+        case ProfileStorage.IN_MEMORY_NO_CONFIG_FILE:
+            return CheckResult(
+                key=CheckKey.PROFILES,
+                state=CheckState.WARN,
+                # One literal for the same reason as the sibling row above.
+                message="Generated in memory — no configuration file is in use, so they are lost on restart.",
+                next_step="Create a saneless config file so the profiles are saved.",
+            )
+        case ProfileStorage.PERSISTED:
+            # Saved to the config file and will survive a restart, so the only
+            # question left is whether they have names.
+            pass
+        case _:
+            assert_never(context.profile_storage)
+    if any(
+        profile.auto_generated and not profile.label for profile in profiles.values()
+    ):
+        return CheckResult(
+            key=CheckKey.PROFILES,
+            state=CheckState.WARN,
+            message="Some profiles have no name yet.",
+            next_step='Run "saneless auto-profiles --force" to name them.',
+        )
+    count = len(profiles)
+    noun = "profile" if count == 1 else "profiles"
+    return CheckResult(
+        key=CheckKey.PROFILES,
+        state=CheckState.OK,
+        message=f"{count} scan {noun} configured.",
+    )
+
+
+def _check_fallback(context: CheckContext) -> CheckResult:
+    """
+    Report whether a scan has somewhere to go when paperless-ngx is down.
+
+    An unset fallback folder is amber and never red (APPL-11, D-22).  The
+    appliance scans and files perfectly without one; what it cannot do is
+    survive paperless-ngx being down, and a red row for a deployment that works
+    is a row people learn to ignore.
+
+    The configured path is not in either sentence.  It is a host filesystem
+    path on a LAN-visible page, omitted for the same reason D-13 omits the log
+    path (T-30-21).
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        Exactly one result for ``CheckKey.FALLBACK``.
+
+    """
+    consume_dir = context.settings.paperless.consume_dir
+    if not consume_dir:
+        return CheckResult(
+            key=CheckKey.FALLBACK,
+            state=CheckState.WARN,
+            message="Not configured; scans cannot be kept if paperless-ngx is down.",
+            next_step=(
+                "Set a fallback folder in the saneless config so scans are kept "
+                "when paperless-ngx is down."
+            ),
+        )
+    if _directory_accepts_a_write(Path(consume_dir)):
+        return CheckResult(
+            key=CheckKey.FALLBACK,
+            state=CheckState.OK,
+            message="A folder is set up to keep scans if paperless-ngx is down.",
+        )
+    return CheckResult(
+        key=CheckKey.FALLBACK,
+        state=CheckState.FAIL,
+        message="The fallback folder cannot be written to.",
+        next_step="Check the folder exists and saneless can write to it.",
+    )
+
+
+def _check_data_dir(context: CheckContext) -> CheckResult:
+    """
+    Report whether the folder holding the job database will take a write.
+
+    Unlike the fallback folder this one is not optional: the job store and the
+    preserved scans live in it, so a data folder that refuses a write is red.
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        Exactly one result for ``CheckKey.DATA_DIR``.
+
+    """
+    if _directory_accepts_a_write(Path(context.settings.output.data_dir)):
+        return CheckResult(
+            key=CheckKey.DATA_DIR,
+            state=CheckState.OK,
+            message="The data folder is writable.",
+        )
+    return CheckResult(
+        key=CheckKey.DATA_DIR,
+        state=CheckState.FAIL,
+        message="The data folder cannot be written to.",
+        next_step=(
+            "Check the folder exists and saneless can write to it, "
+            "then restart saneless."
+        ),
+    )
+
+
+def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
+    """
+    Run the one check a key names.
+
+    A total ``match`` rather than a dict of functions: a sixth ``CheckKey``
+    member stops this function type-checking until somebody decides what it
+    does, which a dict lookup with a fallback would not.
+
+    Args:
+        key: The check to run.
+        context: The injected dependencies and configuration.
+
+    Returns:
+        That check's single result.
+
+    Raises:
+        AssertionError: If the value is not a CheckKey member.
+
+    """
+    match key:
+        case CheckKey.SCANNER:
+            result = _check_scanner(context)
+        case CheckKey.PAPERLESS:
+            result = _check_paperless(context)
+        case CheckKey.PROFILES:
+            result = _check_profiles(context)
+        case CheckKey.FALLBACK:
+            result = _check_fallback(context)
+        case CheckKey.DATA_DIR:
+            result = _check_data_dir(context)
+        case _:
+            assert_never(key)
+    return result
+
+
+def run_checks(context: CheckContext) -> tuple[CheckResult, ...]:
+    """
+    Run every check once, in member order, and never raise.
+
+    This is the function both surfaces call, and the tuple it returns is the
+    whole of what either of them may show (D-02).  It iterates ``CheckKey``, so
+    a check that exists for ``saneless doctor`` and not for the status strip is
+    not something either surface is able to express.
+
+    ``skip_scanner`` is honoured here rather than inside the scanner check, and
+    it returns the paused row without entering the backend at all.  That is
+    correctness, not politeness: nothing in ``sane_backend.py`` mutually
+    excludes two SANE calls, so a status probe landing on the device mid-scan
+    is a second caller into the same C library (Pitfall 2).  The caller derives
+    the flag from the worker's scanner gate.
+
+    A check that raises is caught and rendered as a red row with a
+    developer-constant message.  A registry that could raise would take the
+    whole strip down and with it the four checks that were fine, and the
+    exception text is exactly the thing that must not reach a LAN-visible page.
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        One result per ``CheckKey`` member, in member order.
+
+    """
+    results: list[CheckResult] = []
+    for key in CheckKey:
+        if key is CheckKey.SCANNER and context.skip_scanner:
+            results.append(_scanner_skipped())
+            continue
+        try:
+            results.append(_dispatch(key, context))
+        except Exception as exc:
+            logger.warning("Check %s raised %s", key.value, type(exc).__name__)
+            results.append(
+                CheckResult(
+                    key=key,
+                    state=CheckState.FAIL,
+                    message=_CHECK_FAILED_MESSAGE,
+                    next_step=_CHECK_FAILED_NEXT_STEP,
+                )
+            )
+    return tuple(results)

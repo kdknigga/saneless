@@ -811,8 +811,9 @@ class TestScannerCheck:
         results = run_checks(
             _context(_settings(tmp_path), scanner=backend, skip_scanner=True)
         )
-        assert _row(results, CheckKey.SCANNER).state is CheckState.OK
-        assert worst_state(results) is not CheckState.FAIL
+        scanner_row = _row(results, CheckKey.SCANNER)
+        assert scanner_row.state is CheckState.OK
+        assert worst_state([scanner_row]) is CheckState.OK
 
     def test_a_closed_saned_port_skips_the_backend(self, tmp_path: Path) -> None:
         """
