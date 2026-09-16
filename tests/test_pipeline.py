@@ -1757,7 +1757,7 @@ class TestManualDuplexPassCounts:
 
         assert request.pass_count_callback is None
 
-    def test_front_count_arrives_before_scanning_reverse(
+    def test_pass_count_front_arrives_before_scanning_reverse(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
@@ -1799,7 +1799,7 @@ class TestManualDuplexPassCounts:
         assert seen.index((SCAN_LABEL_FRONT, len(fronts))) < reverse
         assert seen.index((SCAN_LABEL_BACK, len(backs))) > reverse
 
-    def test_status_callback_still_receives_a_bare_event(
+    def test_status_callback_beside_pass_count_takes_a_bare_event(
         self,
         mock_paperless: MagicMock,
         default_settings: Settings,
