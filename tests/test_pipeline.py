@@ -34,6 +34,8 @@ from saneless.pipeline import (
     _SPOOL_LABEL_A,
     _SPOOL_LABEL_B,
     FAILED_DIR_WARN_THRESHOLD,
+    SCAN_LABEL_BACK,
+    SCAN_LABEL_FRONT,
     FlipAnswerSlot,
     FlipCoordinator,
     PipelineEvent,
@@ -1705,6 +1707,177 @@ class TestManualDuplex:
         assert "17" in str(excinfo.value)
         assert scanner.scan_pages.call_count == 1
         mock_paperless.upload_document.assert_not_called()
+
+
+class TestManualDuplexPassCounts:
+    """
+    ``pass_count_callback`` carries each pass's page count out mid-run (A-4).
+
+    ``status_callback`` is ``Callable[[PipelineEvent], None]`` and carries no
+    payload, so ``SCANNING_REVERSE`` cannot tell an observer how many fronts
+    pass A produced.  This channel does, and it does it *before* the reverse
+    event so a status render triggered by that event already has the number.
+    """
+
+    @staticmethod
+    def _duplex_request(
+        default_settings: Settings,
+        tmp_path: Path,
+        status_callback: Callable[[PipelineEvent], None] | None = None,
+        pass_count_callback: Callable[[str, int], None] | None = None,
+    ) -> PipelineRequest:
+        """
+        Build a manual-duplex request over isolated directories.
+
+        Args:
+            default_settings: The fixture settings, mutated in place.
+            tmp_path: pytest's per-test temporary directory.
+            status_callback: The request's status observer, if any.
+            pass_count_callback: The request's pass-count observer, if any.
+
+        Returns:
+            A request whose profile is manual duplex and whose flip always
+            continues.
+
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        return PipelineRequest(
+            profile_name="default",
+            title="Pass Count Test",
+            status_callback=status_callback,
+            pass_count_callback=pass_count_callback,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
+        )
+
+    def test_pass_count_callback_defaults_to_none(self) -> None:
+        """A request built without one behaves exactly as it did before."""
+        request = PipelineRequest(profile_name="default", title="No Counts")
+
+        assert request.pass_count_callback is None
+
+    def test_front_count_arrives_before_scanning_reverse(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The front count is announced, then SCANNING_REVERSE, then the back count.
+
+        One recording list for both channels, because the ordering between them
+        is the whole point: a count that arrived after the event would be too
+        late for the render the event triggers.
+        """
+        fronts = [_make_content_image(c) for c in ["red", "green", "blue"]]
+        backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(fronts, backs)
+
+        seen: list[tuple[str, object]] = []
+        request = self._duplex_request(
+            default_settings,
+            tmp_path,
+            status_callback=lambda event: seen.append(("event", event)),
+            pass_count_callback=lambda label, count: seen.append((label, count)),
+        )
+
+        run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=request,
+        )
+
+        counts = [entry for entry in seen if entry[0] != "event"]
+        assert counts == [
+            (SCAN_LABEL_FRONT, len(fronts)),
+            (SCAN_LABEL_BACK, len(backs)),
+        ]
+        reverse = seen.index(("event", PipelineEvent.SCANNING_REVERSE))
+        assert seen.index((SCAN_LABEL_FRONT, len(fronts))) < reverse
+        assert seen.index((SCAN_LABEL_BACK, len(backs))) > reverse
+
+    def test_status_callback_still_receives_a_bare_event(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The status channel's signature is unchanged: one argument, an enum.
+
+        A callback declared with a single parameter would raise ``TypeError``
+        if the pipeline had started passing a payload alongside the event.
+        """
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image("red")], [_make_content_image("blue")]
+        )
+        events: list[PipelineEvent] = []
+        request = self._duplex_request(
+            default_settings, tmp_path, status_callback=events.append
+        )
+
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=request,
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert PipelineEvent.SCANNING_REVERSE in events
+        assert all(isinstance(event, PipelineEvent) for event in events)
+
+    def test_a_raising_pass_count_callback_does_not_fail_the_scan(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        An observer that raises is an observer's problem, not the scan's.
+
+        Unlike the thumbnail, the count is a transient display detail: the same
+        number arrives again in ``ScanResult.pages_scanned`` moments later, so
+        losing it costs nothing and failing the run over it would throw away
+        pages that were successfully fed.
+        """
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image("red")], [_make_content_image("blue")]
+        )
+
+        def exploding(label: str, count: int) -> None:
+            """
+            Raise whatever an observer might raise.
+
+            Args:
+                label: Ignored.
+                count: Ignored.
+
+            Raises:
+                RuntimeError: Always.
+
+            """
+            msg = f"observer refused {label}={count}"
+            raise RuntimeError(msg)
+
+        request = self._duplex_request(
+            default_settings, tmp_path, pass_count_callback=exploding
+        )
+
+        result = run_pipeline(
+            scanner=scanner,
+            paperless=mock_paperless,
+            settings=default_settings,
+            request=request,
+        )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_scanned == 2
 
 
 def _two_pass_scanner() -> MagicMock:
