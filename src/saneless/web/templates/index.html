@@ -104,7 +104,18 @@
            a household member typing three letters makes one request and not
            three.  The include is mandatory on a GET -- htmx does not gather the
            enclosing form for one -- and it is what carries the current ticks to
-           the server so the swap can re-render them ticked (Amendment A-5). #}
+           the server so the swap can re-render them ticked (Amendment A-5).
+
+           The whole block is behind a config key (D-28): one appliance, one
+           form shape, not a per-browser toggle a household member could switch
+           by accident.  The controls are ABSENT from the rendered page when it
+           is off, never present and hidden with a stylesheet -- what is not in
+           the markup cannot be re-shown in devtools, cannot be read by a screen
+           reader and cannot be tabbed into.  Turning the block off changes the
+           form and never the scan (D-29): the profile's default tags still
+           apply, exactly as a blank title already falls back to the profile's
+           title through resolve_job_title. #}
+        {% if show_tags %}
         <fieldset aria-describedby="tags-help">
             <legend>
                 Tags
@@ -129,7 +140,12 @@
             {% include "partials/tags.html" %}
         </fieldset>
         <small id="tags-help">Labels to file this under in paperless-ngx. Optional.</small>
+        {% endif %}
 
+        {# The same two rules as the Tags block above, for the same reasons:
+           absent rather than hidden, and the profile's default correspondent
+           still applies when this control is not on the page. #}
+        {% if show_correspondent %}
         <label for="correspondent-select">
             Correspondent
             <button type="button"
@@ -149,6 +165,7 @@
             {% endfor %}
         </select>
         <small id="correspondent-help">Who sent this document? Optional.</small>
+        {% endif %}
 
         {% include "partials/scan_button.html" %}
         {# Why the button above is greyed out, as visible text in the reading
@@ -184,10 +201,16 @@
        hx-disinherit list as well or the C-10 inheritance trap re-opens.
        Nothing is added to the scan form element at all, so the fix above stays
        exactly as written (the attribute names are in prose here so a grep for
-       the places that set them still counts only those). #}
+       the places that set them still counts only those).
+
+       It goes with the fieldset above when the Tags block is off: a form whose
+       only member is an input that is no longer rendered has nothing left to
+       own. #}
+    {% if show_tags %}
     <form id="tag-filter-form" class="htmx-hidden"
           hx-get="/api/tags" hx-target="#tags-list" hx-swap="outerHTML"
           hx-include="#tags-list"></form>
+    {% endif %}
 </article>
 
 {# --- Section 2: Request errors, then status --- #}

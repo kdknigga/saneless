@@ -2355,7 +2355,12 @@ class TestSimpleForm:
         assert 'name="profile"' in page
         assert 'name="title"' in page
         assert 'id="scan-btn"' in page
-        assert re.findall(r'<small id="([^"]+)"', page) == ["profile-description"]
+        # Profile and Title keep their help lines; the two that went with the
+        # hidden controls are the only ones that leave.
+        assert re.findall(r'<small id="([^"]+)"', page) == [
+            "profile-description",
+            "title-help",
+        ]
 
     def test_simple_form_keeps_every_control_when_both_are_on(
         self, tmp_path: Path
