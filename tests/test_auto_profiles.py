@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import re
 import tomllib
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from tomlkit.exceptions import ParseError, TOMLKitError
@@ -13,6 +14,8 @@ from tomlkit.exceptions import ParseError, TOMLKitError
 from saneless import auto_profiles
 from saneless.auto_profiles import (
     ProfileWriteResult,
+    _profile_description,
+    _profile_label,
     generate_profiles,
     is_bare_default,
     pick_closest_resolution,
@@ -22,16 +25,18 @@ from saneless.auto_profiles import (
 )
 from saneless.config import (
     DEFAULT_RESOLUTION,
+    PROFILE_DESCRIPTION_MAX_LENGTH,
+    PROFILE_LABEL_MAX_LENGTH,
     ProfileConfig,
     Settings,
     load_settings,
 )
 from saneless.exceptions import ConfigError
-from saneless.scanner.base import DeviceCapabilities
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
+from saneless.scanner.base import (
+    DeviceCapabilities,
+    SourceKind,
+    classify_source,
+)
 
 _SLUG_INPUTS = [
     "Flatbed",
@@ -838,6 +843,162 @@ class TestGenerateProfilesDuplex:
         assert all(profile.duplex != "manual" for profile in settings.profiles.values())
 
 
+class TestProfileLabels:
+    """
+    Generated profiles carry human text derived from the classifier (D-19).
+
+    The label and the description come from ``classify_source`` and nothing
+    else: no new probe, no new config key, and no vendor string. Every
+    returned value is a developer-authored constant, which is what keeps a
+    SANE source name from reaching the scan page through this path (T-30-17).
+    """
+
+    # One representative SANE source name per SourceKind. Parametrising over
+    # ``list(SourceKind)`` rather than over this mapping's keys is deliberate:
+    # a new member added to the enum fails here with a KeyError instead of
+    # being silently skipped.
+    _SAMPLE: ClassVar[dict[SourceKind, str]] = {
+        SourceKind.FLATBED: "Flatbed",
+        SourceKind.FEEDER: "ADF Front",
+        SourceKind.FEEDER_DUPLEX: "ADF Duplex",
+        SourceKind.AUTO: "Auto",
+        SourceKind.UNKNOWN: "Mystery Tray",
+    }
+
+    @pytest.mark.parametrize("kind", list(SourceKind))
+    def test_sample_source_names_classify_as_the_kind_they_stand_for(
+        self, kind: SourceKind
+    ) -> None:
+        """The mapping this class parametrises over is itself correct."""
+        assert classify_source(self._SAMPLE[kind]) is kind
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ("ADF Front", "Feeder, single-sided"),
+            ("ADF Duplex", "Feeder, double-sided"),
+            ("Flatbed", "Glass (flatbed)"),
+        ],
+    )
+    def test_label_uses_the_three_d19_forms_verbatim(
+        self, source: str, expected: str
+    ) -> None:
+        """D-19 names these three strings exactly; they are locked copy."""
+        assert _profile_label(source) == expected
+
+    @pytest.mark.parametrize("source", ["Auto", "Some Unknown Source"])
+    def test_label_is_never_empty_for_an_unclassified_source(self, source: str) -> None:
+        """An Auto or unrecognised source still gets a name a human can read."""
+        assert _profile_label(source).strip()
+
+    @pytest.mark.parametrize("kind", list(SourceKind))
+    def test_label_is_non_empty_and_within_the_config_cap(
+        self, kind: SourceKind
+    ) -> None:
+        """Generation can never produce a label its own schema would reject."""
+        label = _profile_label(self._SAMPLE[kind])
+        assert label.strip()
+        assert len(label) <= PROFILE_LABEL_MAX_LENGTH
+
+    @pytest.mark.parametrize("kind", list(SourceKind))
+    def test_description_is_a_non_empty_sentence_within_the_config_cap(
+        self, kind: SourceKind
+    ) -> None:
+        """Every kind gets one plain sentence that fits the field's cap."""
+        description = _profile_description(self._SAMPLE[kind])
+        assert description.strip()
+        assert description.endswith(".")
+        assert len(description) <= PROFILE_DESCRIPTION_MAX_LENGTH
+
+    def test_every_source_kind_gets_a_distinct_label_and_description(self) -> None:
+        """No two kinds share text; the dropdown can tell them apart."""
+        kinds = list(SourceKind)
+        labels = {_profile_label(self._SAMPLE[kind]) for kind in kinds}
+        descriptions = {_profile_description(self._SAMPLE[kind]) for kind in kinds}
+        assert len(labels) == len(kinds)
+        assert len(descriptions) == len(kinds)
+
+    def test_duplex_feeder_description_names_both_sides_and_the_feeder(self) -> None:
+        """The FEEDER_DUPLEX sentence says both sides and says feeder."""
+        description = _profile_description("ADF Duplex").lower()
+        assert "both sides" in description
+        assert "feeder" in description
+
+    # A marker no developer-authored constant would ever contain, appended to
+    # a name of each classified shape. Asserting on a marker rather than on
+    # the whole source name is what makes the assertion mean what it says:
+    # "Automatic" contains the literal source name "Auto" by coincidence,
+    # which proves nothing about interpolation.
+    _VENDOR_MARKER = "ZzVendorZz<script>alert(1)</script>"
+
+    @pytest.mark.parametrize(
+        "shape",
+        ["Flatbed", "ADF Front", "ADF Duplex", "Auto", "Mystery Tray"],
+    )
+    def test_no_returned_string_carries_anything_from_the_source_name(
+        self, shape: str
+    ) -> None:
+        """
+        T-30-17: the vendor-controlled source name is never interpolated.
+
+        A source name is device-controlled input that ends up in a file the
+        web UI renders. Both functions select a constant instead of building
+        a string, so nothing from the device can ride along.
+        """
+        source = f"{shape} {self._VENDOR_MARKER}"
+        assert self._VENDOR_MARKER not in _profile_label(source)
+        assert self._VENDOR_MARKER not in _profile_description(source)
+        assert "<" not in _profile_label(source)
+        assert "<" not in _profile_description(source)
+
+    def test_the_marker_source_names_still_reach_every_branch(self) -> None:
+        """
+        The marker does not quietly send every name down the UNKNOWN arm.
+
+        Without this the interpolation test above would pass on a single
+        branch and claim to have covered five.
+        """
+        marked = {
+            classify_source(f"{shape} {self._VENDOR_MARKER}")
+            for shape in ("Flatbed", "ADF Front", "ADF Duplex", "Mystery Tray")
+        }
+        assert marked == {
+            SourceKind.FLATBED,
+            SourceKind.FEEDER,
+            SourceKind.FEEDER_DUPLEX,
+            SourceKind.UNKNOWN,
+        }
+
+    def test_generated_profiles_carry_the_derived_label_and_description(self) -> None:
+        """``generate_profiles`` sets both fields on every profile it builds."""
+        caps = DeviceCapabilities(
+            sources=["Flatbed", "ADF Front", "ADF Duplex"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["flatbed"].label == "Glass (flatbed)"
+        assert profiles["adf-front"].label == "Feeder, single-sided"
+        assert profiles["adf-duplex"].label == "Feeder, double-sided"
+        for slug, profile in profiles.items():
+            assert profile.label == _profile_label(profile.source), slug
+            assert profile.description == _profile_description(profile.source), slug
+
+    def test_the_default_profile_carries_the_text_of_the_source_it_copies(
+        self,
+    ) -> None:
+        """The default duplicates a source, so it must duplicate its wording."""
+        caps = DeviceCapabilities(
+            sources=["ADF Duplex", "ADF Front"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["default"].source == "ADF Duplex"
+        assert profiles["default"].label == "Feeder, double-sided"
+        assert profiles["default"].description == _profile_description("ADF Duplex")
+
+
 class TestGenerateProfilesSlugCollision:
     """Two names that normalise alike both survive, with a tie-break (Q5)."""
 
@@ -1459,11 +1620,19 @@ auto_generated = true
     def test_merge_adds_a_missing_name_in_generated_key_order(
         self, tmp_path: Path, *, force: bool
     ) -> None:
-        """A name the file lacks is added with today's key order and flag."""
+        """
+        A name the file lacks is added with today's key order and flag.
+
+        The human name leads the table, which is why _OWNED_KEYS puts it
+        first: this is the order a reader opening the config meets.
+        """
         config_file, result = self._write(tmp_path, force=force, extra=True)
         assert result.added == ("fresh",)
         assert (
             "[profiles.fresh]\n"
+            'label = "Feeder, double-sided"\n'
+            "description = "
+            '"Scans both sides of every page using the document feeder."\n'
             'source = "ADF Duplex"\n'
             "resolution = 300\n"
             'mode = "Color"\n'
@@ -1504,6 +1673,208 @@ auto_generated = true
             "Refreshed: 'x'"
         ]
         assert ProfileWriteResult(path=path).describe() == []
+
+
+class TestLabelAndDescriptionAreOwnedKeys:
+    """
+    ``label`` and ``description`` behave exactly like every other owned key.
+
+    D-18 chose one consistent ownership rule over a special case for free
+    text: ``--force`` overwrites both in place on a flagged profile, and a
+    profile without ``auto_generated`` is never touched. The fixture is the
+    same shape ``TestForceMerge`` uses, so the comment and ``default_tags``
+    preservation assertions are the ones that file already trusts.
+    """
+
+    _EXISTING = """\
+# saneless configuration -- keep this comment
+[profiles.scan]
+# generated, then customised by hand
+label = "My own name for this"
+description = "My own sentence."
+source = "Old Source"
+resolution = 600
+mode = "Gray"
+default_tags = [3, 7]
+title = "Scanned"
+auto_generated = true
+
+[profiles.handwritten]
+source = "Flatbed"
+resolution = 600
+mode = "Gray"
+
+[profiles.default]
+source = "Flatbed"
+resolution = 300
+mode = "Color"
+auto_generated = true
+"""
+
+    @staticmethod
+    def _generated() -> dict[str, ProfileConfig]:
+        """Build a fresh generation for ``scan``, ``handwritten`` and ``default``."""
+        return generate_profiles(
+            DeviceCapabilities(
+                sources=["Flatbed", "ADF Duplex"],
+                resolutions=[300],
+                modes=["Color"],
+            )
+        ) | {
+            "scan": ProfileConfig(
+                source="ADF Front",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+            ),
+            "handwritten": ProfileConfig(
+                source="ADF Front",
+                resolution=300,
+                mode="Color",
+                auto_generated=True,
+            ),
+        }
+
+    def _write(self, tmp_path: Path, *, force: bool) -> Path:
+        """Write the regenerated set over the fixture and return the path."""
+        config_file = tmp_path / "config.toml"
+        config_file.write_text(self._EXISTING)
+        write_profiles_to_config(config_file, self._generated(), force=force)
+        return config_file
+
+    def test_label_and_description_lead_the_owned_key_tuple(self) -> None:
+        """
+        The tuple order is the file key order, so the human name comes first.
+
+        A reader opening a freshly written config meets the label before the
+        SANE source string.
+        """
+        assert auto_profiles._OWNED_KEYS[:2] == ("label", "description")
+        assert set(auto_profiles._OWNED_KEYS) >= {
+            "label",
+            "description",
+            "source",
+            "resolution",
+            "mode",
+            "auto_generated",
+        }
+
+    @pytest.mark.parametrize(
+        "source", ["Flatbed", "ADF Front", "ADF Duplex", "Auto", "Mystery Tray"]
+    )
+    def test_generated_values_always_emits_both_keys(self, source: str) -> None:
+        """
+        Emission is unconditional, unlike auto_source_mode and duplex.
+
+        This is what makes Phase 27 D-03's delete branch unreachable for the
+        two free-text keys.
+        """
+        values = auto_profiles._generated_values(
+            ProfileConfig(
+                source=source, resolution=300, mode="Color", auto_generated=True
+            )
+        )
+        assert values["label"] == _profile_label(source)
+        assert values["description"] == _profile_description(source)
+        assert list(values)[:2] == ["label", "description"]
+
+    def test_force_overwrites_a_hand_typed_label_and_description(
+        self, tmp_path: Path
+    ) -> None:
+        """D-18: free text is owned text while the flag is set."""
+        config_file = self._write(tmp_path, force=True)
+        scan = tomllib.loads(config_file.read_text())["profiles"]["scan"]
+        assert scan["label"] == "Feeder, single-sided"
+        assert scan["description"] == _profile_description("ADF Front")
+
+    def test_force_refresh_keeps_unowned_keys_and_comments(
+        self, tmp_path: Path
+    ) -> None:
+        """Overwriting the two new keys costs nothing else in the table."""
+        config_file = self._write(tmp_path, force=True)
+        text = config_file.read_text()
+        scan = tomllib.loads(text)["profiles"]["scan"]
+        assert scan["default_tags"] == [3, 7]
+        assert scan["title"] == "Scanned"
+        assert "# generated, then customised by hand" in text
+        assert "# saneless configuration -- keep this comment" in text
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_a_profile_without_the_flag_never_gains_a_label(
+        self, tmp_path: Path, *, force: bool
+    ) -> None:
+        """D-01: an unflagged profile's absent label stays absent."""
+        config_file = self._write(tmp_path, force=force)
+        handwritten = tomllib.loads(config_file.read_text())["profiles"]["handwritten"]
+        assert "label" not in handwritten
+        assert "description" not in handwritten
+
+    def test_the_delete_branch_never_fires_for_the_two_free_text_keys(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A table that had both keys still has both after a refresh.
+
+        Phase 27 D-03 deletes an owned key a fresh generation does not write.
+        Unconditional emission is what keeps a free-text field from being
+        silently pruned; this asserts the consequence rather than the cause.
+        """
+        config_file = self._write(tmp_path, force=True)
+        profiles = tomllib.loads(config_file.read_text())["profiles"]
+        assert "label" in profiles["scan"]
+        assert "description" in profiles["scan"]
+        assert "label" in profiles["default"]
+        assert "description" in profiles["default"]
+
+    def test_a_refreshed_config_reloads_with_the_generated_text(
+        self, tmp_path: Path
+    ) -> None:
+        """The written values survive a real load, caps and all."""
+        config_file = self._write(tmp_path, force=True)
+        settings = load_settings(str(config_file))
+        assert settings.profiles["scan"].label == "Feeder, single-sided"
+        assert settings.profiles["default"].label == "Glass (flatbed)"
+
+
+class TestScanProfileHowToDocumentsOwnership:
+    """
+    The how-to says in plain words what ``--force`` does to a typed label.
+
+    D-18's overwrite rule makes ``label`` the first free-text casualty, so
+    the escape hatch has to be stated next to the rule and not only implied
+    by the owned-key list (30-RESEARCH §7, Amendment A-3).
+    """
+
+    @staticmethod
+    def _guide() -> str:
+        """Read the how-to guide from the repository."""
+        return (
+            Path(__file__).resolve().parents[1]
+            / "docs"
+            / "how-to"
+            / "configure-scan-profiles.md"
+        ).read_text()
+
+    @pytest.mark.parametrize("key", ["label", "description"])
+    def test_guide_documents_both_new_keys(self, key: str) -> None:
+        """Each key appears as a field the guide describes."""
+        assert f"`{key}`" in self._guide()
+
+    def test_guide_names_the_force_command_and_the_escape_hatch(self) -> None:
+        """The overwrite rule and the way out are both stated."""
+        guide = self._guide()
+        assert "auto-profiles --force" in guide
+        assert "auto_generated" in guide
+
+    def test_owned_key_list_in_the_guide_names_every_owned_key(self) -> None:
+        """
+        The verbatim owned-key list does not drift from ``_OWNED_KEYS``.
+
+        The list is prose, so nothing but a test keeps it honest.
+        """
+        guide = self._guide()
+        for key in auto_profiles._OWNED_KEYS:
+            assert f"`{key}`" in guide, key
 
 
 class TestOwnershipReadsTheFlagLikeTheLoader:
