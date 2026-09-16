@@ -27,6 +27,8 @@ from saneless.exceptions import (
 )
 from saneless.paperless import UploadResult
 from saneless.pipeline import (
+    _SPOOL_LABEL_A,
+    _SPOOL_LABEL_B,
     FAILED_DIR_WARN_THRESHOLD,
     FlipAnswerSlot,
     FlipCoordinator,
@@ -40,6 +42,7 @@ from saneless.pipeline import (
 )
 from saneless.scanner.base import DeviceInfo, ScannerBackend
 from saneless.scanner.sane_backend import SaneBackend
+from saneless.spool import SpooledPageSink
 from saneless.vocabulary import (
     ErrorCategory,
     FlipOutcome,
@@ -47,13 +50,18 @@ from saneless.vocabulary import (
     ScanOutcome,
     classify_error,
 )
-from tests.conftest import AlwaysContinueFlipCoordinator, scan_batch
+from tests.conftest import (
+    AlwaysContinueFlipCoordinator,
+    spooling,
+    spooling_in_turn,
+)
 from tests.fake_sane import FakeSaneDev, FakeSaneModule
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
     from saneless.config import Settings
+    from saneless.scanner.base import PageRecord, PageSink, ScanBatch, ScanSettings
 
 
 class TestRunPipeline:
@@ -243,17 +251,213 @@ def _make_empty_image() -> Image.Image:
     return Image.new("RGB", (200, 300), (254, 254, 254))
 
 
-class TestInterleave:
-    """Unit tests for _interleave_duplex."""
+# The reserve the spool keeps free beyond each page, in megabytes.  One is the
+# smallest honest value: these pages are tens of kilobytes, so the per-page
+# check passes anywhere the suite can run and is still a real check.
+_TEST_RESERVE_MB = 1
 
-    def test_interleave_basic(self) -> None:
+
+def _distinct_page(index: int) -> Image.Image:
+    """
+    Draw a page no other page of the same job can be mistaken for.
+
+    The index is drawn as a run of marks along the top edge, so two pages
+    differ in their **pixels** -- and therefore in their spooled PNG bytes and
+    in the stream the PDF embeds -- rather than only in a file name.  A test
+    that reads a PDF back to prove page order needs exactly that: content it
+    can tell apart without trusting the thing under test.
+
+    The body rectangle keeps every page far from the blank-page thresholds, so
+    empty-page detection never removes one by accident.
+
+    Args:
+        index: The 0-based page number.  Up to 28 pages fit across the top
+            edge, which is more than any test here scans.
+
+    Returns:
+        A 120x160 RGB page carrying that index.
+
+    """
+    page = Image.new("RGB", (120, 160), "white")
+    draw = ImageDraw.Draw(page)
+    draw.rectangle((10, 30, 110, 150), fill="black")
+    for mark in range(index + 1):
+        left = 2 + mark * 4
+        draw.rectangle((left, 2, left + 2, 8), fill="black")
+    return page
+
+
+def _spool_pass(
+    directory: Path, label: str, pages: Sequence[Image.Image]
+) -> list[PageRecord]:
+    """
+    Spool one acquisition pass into ``directory`` and return its records.
+
+    A real ``SpooledPageSink``, so the records name files that exist and carry
+    statistics measured from real pixels.  The label is the pipeline's own
+    constant, not a re-spelled ``"a"`` or ``"b"``, so the naming convention has
+    one definition.
+
+    Args:
+        directory: The shared spool directory.  Must already exist.
+        label: ``_SPOOL_LABEL_A`` for a simplex pass or a duplex job's fronts,
+            ``_SPOOL_LABEL_B`` for its backs.
+        pages: The pages this pass feeds, in acquisition order.
+
+    Returns:
+        One record per page, in acquisition order.
+
+    """
+    sink = SpooledPageSink(directory, label, _TEST_RESERVE_MB)
+    return [sink.add(page) for page in pages]
+
+
+def _duplex_spool(
+    tmp_path: Path, fronts: int, backs: int
+) -> tuple[Path, list[PageRecord], list[PageRecord]]:
+    """
+    Spool a manual-duplex job's two passes into one shared spool directory.
+
+    Exactly as the pipeline does it: two sinks over the same directory, ``a-``
+    for the fronts and ``b-`` for the backs, so the file names really do sort
+    into all-fronts-then-all-backs while the document order is the interleave.
+
+    Args:
+        tmp_path: pytest's per-test directory; the spool is created under it.
+        fronts: How many pages pass A feeds.
+        backs: How many pages pass B feeds.
+
+    Returns:
+        ``(spool directory, front records, back records)``.  Every page carries
+        distinct content, across both passes.
+
+    """
+    spool_dir = tmp_path / "spool"
+    spool_dir.mkdir()
+    front_records = _spool_pass(
+        spool_dir, _SPOOL_LABEL_A, [_distinct_page(index) for index in range(fronts)]
+    )
+    back_records = _spool_pass(
+        spool_dir,
+        _SPOOL_LABEL_B,
+        [_distinct_page(fronts + index) for index in range(backs)],
+    )
+    return spool_dir, front_records, back_records
+
+
+def _keep_everything(
+    pages: Sequence[PageRecord], **_thresholds: float
+) -> list[PageRecord]:
+    """
+    Stand in for ``filter_empty_pages``, keeping every record it is given.
+
+    A ``return_value`` cannot be used for this any more: the records the
+    pipeline goes on to assemble have to be the ones its own sink produced, and
+    a list built in the test would point at files nobody wrote.
+
+    Args:
+        pages: Whatever the pipeline passed.
+        _thresholds: The profile thresholds, ignored here and asserted on
+            through the mock's call args.
+
+    Returns:
+        The same records, in the same order.
+
+    """
+    return list(pages)
+
+
+def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[..., Path]:
+    """
+    Build a stand-in for ``assemble_pdf`` that opens each page as it is called.
+
+    The spooled pages live inside the job's workspace, a ``TemporaryDirectory``
+    that is gone by the time ``run_pipeline`` returns, so an assertion about
+    what is *in* a page has to take its copy while the job is still running.
+
+    Args:
+        pdf_path: The path the stand-in reports having written.  It is created,
+            because a failing delivery's preservation guard moves it.
+        seen: Filled with the pages, fully loaded, in record order.
+
+    Returns:
+        A callable with ``assemble_pdf``'s own shape, ready for ``side_effect``.
+
+    """
+
+    def _assemble(
+        records: Sequence[PageRecord],
+        output_dir: Path,
+        *,
+        filename: str,
+        dpi: int,
+    ) -> Path:
+        """Open every spooled page, then report the PDF path."""
+        for record in records:
+            page = Image.open(record.path)
+            # Forces the read now and lets Pillow close the file it opened; a
+            # lazy ImageFile would trip the suite's ResourceWarning-as-error.
+            page.load()
+            seen.append(page)
+        pdf_path.write_bytes(b"%PDF-fake")
+        return pdf_path
+
+    return _assemble
+
+
+def _spooling_at_each_resolution(
+    *passes: tuple[Sequence[Image.Image], int],
+) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
+    """
+    Build one ``side_effect`` reporting a different resolution per call.
+
+    ``spooling_in_turn`` carries one resolution for the whole job, which is
+    right for every manual-duplex case except the one that exists precisely
+    because the device changed its mind between the two passes.
+
+    ONE callable that counts its own calls, never a list of callables:
+    ``unittest.mock`` consumes a list ``side_effect`` as an iterable of
+    *results* and hands each element back uncalled, so a list of functions
+    would make ``scan_pages`` return a function object.
+
+    Args:
+        passes: One ``(pages, resolution)`` pair per expected call, in order.
+
+    Returns:
+        A callable with ``scan_pages``' own shape, for ``MagicMock.side_effect``.
+
+    """
+    calls = 0
+
+    def _spool_next(
+        device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """Spool this call's pages at this call's reported resolution."""
+        nonlocal calls
+        index = calls
+        calls += 1
+        if index >= len(passes):
+            msg = (
+                f"scan_pages was called {calls} time(s), but only "
+                f"{len(passes)} pass(es) were prepared"
+            )
+            raise AssertionError(msg)
+        pages, resolution = passes[index]
+        return spooling(pages, resolution=resolution)(device_id, settings, sink)
+
+    return _spool_next
+
+
+class TestInterleave:
+    """Unit tests for _interleave_duplex, over spooled page records."""
+
+    def test_interleave_basic(self, tmp_path: Path) -> None:
         """Interleave 3 fronts + 3 backs correctly reverses backs."""
-        fronts = [Image.new("RGB", (10, 10), c) for c in ["red", "green", "blue"]]
-        backs = [Image.new("RGB", (10, 10), c) for c in ["cyan", "magenta", "yellow"]]
+        _, fronts, backs = _duplex_spool(tmp_path, 3, 3)
         result = _interleave_duplex(fronts, backs)
         assert len(result) == 6
-        # Backs are reversed: yellow, magenta, cyan
-        # Result: red, yellow, green, magenta, blue, cyan
+        # Backs are reversed: the last sheet fed in pass B is page 2.
+        # Result: front1, back3, front2, back2, front3, back1
         assert result[0] is fronts[0]
         assert result[1] is backs[2]  # reversed
         assert result[2] is fronts[1]
@@ -261,19 +465,17 @@ class TestInterleave:
         assert result[4] is fronts[2]
         assert result[5] is backs[0]  # reversed
 
-    def test_interleave_single_page(self) -> None:
+    def test_interleave_single_page(self, tmp_path: Path) -> None:
         """Single front + single back works."""
-        f = [Image.new("RGB", (10, 10), "red")]
-        b = [Image.new("RGB", (10, 10), "blue")]
-        result = _interleave_duplex(f, b)
+        _, fronts, backs = _duplex_spool(tmp_path, 1, 1)
+        result = _interleave_duplex(fronts, backs)
         assert len(result) == 2
-        assert result[0] is f[0]
-        assert result[1] is b[0]
+        assert result[0] is fronts[0]
+        assert result[1] is backs[0]
 
-    def test_interleave_count_mismatch_raises(self) -> None:
+    def test_interleave_count_mismatch_raises(self, tmp_path: Path) -> None:
         """Mismatched front/back counts raise ScanError."""
-        fronts = [Image.new("RGB", (10, 10)) for _ in range(3)]
-        backs = [Image.new("RGB", (10, 10)) for _ in range(2)]
+        _, fronts, backs = _duplex_spool(tmp_path, 3, 2)
         with pytest.raises(ScanError, match="Page count mismatch: 3 fronts, 2 backs"):
             _interleave_duplex(fronts, backs)
 
@@ -291,7 +493,7 @@ class TestPipelineThumbnail:
         """Flatbed scan calls thumbnail_callback with non-empty base64 string."""
         default_settings.output.tmp_dir = str(tmp_path)
         # Use a content image so it doesn't get filtered as empty
-        mock_scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        mock_scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -320,7 +522,7 @@ class TestPipelineThumbnail:
     ) -> None:
         """Pipeline works without thumbnail_callback."""
         default_settings.output.tmp_dir = str(tmp_path)
-        mock_scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        mock_scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         request = PipelineRequest(
             profile_name="default",
@@ -358,7 +560,7 @@ class TestPipelineEmptyPageFilter:
         ]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(all_pages)
+        scanner.scan_pages.side_effect = spooling(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Filter Test")
 
@@ -373,9 +575,9 @@ class TestPipelineEmptyPageFilter:
                 request=request,
             )
 
-            # assemble_pdf should receive only the 3 content pages
-            called_images = mock_assemble.call_args[0][0]
-            assert len(called_images) == 3
+            # assemble_pdf should receive only the 3 content page records
+            called_records = mock_assemble.call_args[0][0]
+            assert len(called_records) == 3
 
     def test_custom_thresholds_from_profile(
         self,
@@ -389,12 +591,15 @@ class TestPipelineEmptyPageFilter:
         default_settings.profiles["default"].empty_page_stddev_threshold = 10.0
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         request = PipelineRequest(profile_name="default", title="Threshold Test")
 
         with patch("saneless.pipeline.filter_empty_pages", wraps=None) as mock_filter:
-            mock_filter.return_value = [_make_content_image()]
+            # A side_effect, not a return_value: what comes back has to be the
+            # records the pipeline's own sink produced, because assembly reads
+            # their files.
+            mock_filter.side_effect = _keep_everything
             run_pipeline(
                 scanner=scanner,
                 paperless=mock_paperless,
@@ -421,7 +626,7 @@ class TestPipelineEmptyPageFilter:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(
+        scanner.scan_pages.side_effect = spooling(
             [_make_empty_image(), _make_empty_image()]
         )
 
@@ -665,7 +870,7 @@ class TestZeroPages:
         default_settings.profiles["default"].enable_empty_page_detection = detection
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([])
+        scanner.scan_pages.side_effect = spooling([])
 
         request = PipelineRequest(profile_name="default", title="Zero Pages")
         with (
@@ -694,7 +899,7 @@ class TestZeroPages:
         default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([])
+        scanner.scan_pages.side_effect = spooling([])
 
         coordinator = _FixedFlipCoordinator(FlipOutcome.CONTINUED)
         request = PipelineRequest(
@@ -733,10 +938,7 @@ class TestZeroPages:
         default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [
-            scan_batch([_make_content_image()]),
-            scan_batch([]),
-        ]
+        scanner.scan_pages.side_effect = spooling_in_turn([_make_content_image()], [])
 
         request = PipelineRequest(
             profile_name="default",
@@ -774,7 +976,7 @@ class TestZeroPages:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([_make_empty_image()])
+        scanner.scan_pages.side_effect = spooling([_make_empty_image()])
 
         request = PipelineRequest(profile_name="default", title="All Blank")
         with (
@@ -837,7 +1039,7 @@ class TestManualDuplex:
         backs = [_make_content_image(c) for c in ["cyan", "magenta", "yellow"]]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
+        scanner.scan_pages.side_effect = spooling_in_turn(fronts, backs)
 
         request = PipelineRequest(
             profile_name="default",
@@ -856,8 +1058,8 @@ class TestManualDuplex:
                 request=request,
             )
 
-            called_images = mock_assemble.call_args[0][0]
-            assert len(called_images) == 6
+            called_records = mock_assemble.call_args[0][0]
+            assert len(called_records) == 6
 
     def test_duplex_mismatch_saves_partial_pdfs(
         self,
@@ -874,7 +1076,7 @@ class TestManualDuplex:
         backs = [_make_content_image() for _ in range(2)]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
+        scanner.scan_pages.side_effect = spooling_in_turn(fronts, backs)
 
         request = PipelineRequest(
             profile_name="default",
@@ -927,10 +1129,10 @@ class TestManualDuplex:
         )
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [
-            scan_batch([_make_content_image() for _ in range(3)]),
-            scan_batch([_make_content_image() for _ in range(2)]),
-        ]
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image() for _ in range(3)],
+            [_make_content_image() for _ in range(2)],
+        )
 
         result = run_pipeline(
             scanner=scanner,
@@ -967,10 +1169,10 @@ class TestManualDuplex:
         ]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [
-            scan_batch([_make_content_image() for _ in range(3)]),
-            scan_batch([_make_content_image() for _ in range(2)]),
-        ]
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image() for _ in range(3)],
+            [_make_content_image() for _ in range(2)],
+        )
 
         result = run_pipeline(
             scanner=scanner,
@@ -1000,7 +1202,7 @@ class TestManualDuplex:
         backs = [_make_content_image("green"), _make_content_image("yellow")]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
+        scanner.scan_pages.side_effect = spooling_in_turn(fronts, backs)
 
         request = PipelineRequest(
             profile_name="default",
@@ -1039,7 +1241,7 @@ class TestManualDuplex:
         backs = [_make_empty_image(), _make_content_image("green")]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
+        scanner.scan_pages.side_effect = spooling_in_turn(fronts, backs)
 
         request = PipelineRequest(
             profile_name="default",
@@ -1059,8 +1261,8 @@ class TestManualDuplex:
             )
 
             # 4 interleaved - 1 empty = 3 pages
-            called_images = mock_assemble.call_args[0][0]
-            assert len(called_images) == 3
+            called_records = mock_assemble.call_args[0][0]
+            assert len(called_records) == 3
 
     def test_manual_duplex_thumbnail_from_first_page(
         self,
@@ -1077,7 +1279,7 @@ class TestManualDuplex:
         backs = [_make_content_image()]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [scan_batch(fronts), scan_batch(backs)]
+        scanner.scan_pages.side_effect = spooling_in_turn(fronts, backs)
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -1115,10 +1317,9 @@ class TestManualDuplex:
         default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [
-            scan_batch([_make_content_image()]),
-            scan_batch([_make_content_image()]),
-        ]
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image()], [_make_content_image()]
+        )
 
         events: list[PipelineEvent] = []
         coordinator = _FixedFlipCoordinator(FlipOutcome.CONTINUED, events)
@@ -1160,7 +1361,7 @@ class TestManualDuplex:
         default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         request = PipelineRequest(
             profile_name="default",
@@ -1201,7 +1402,7 @@ class TestManualDuplex:
         default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
         cause = OSError(5, "Input/output error")
 
         request = PipelineRequest(
@@ -1238,7 +1439,7 @@ class TestManualDuplex:
         default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         request = PipelineRequest(
             profile_name="default",
@@ -1263,7 +1464,7 @@ def _two_pass_scanner() -> MagicMock:
     """
     Build a scanner mock whose ``scan_pages`` calls can be counted.
 
-    It has two batches queued, so a simplex run makes one call and a manual
+    It has two page lists queued, so a simplex run makes one call and a manual
     duplex run makes two. ``get_devices`` reports one device, so an
     auto-detecting run can proceed if nothing stops it first.
     """
@@ -1271,10 +1472,9 @@ def _two_pass_scanner() -> MagicMock:
     scanner.get_devices.return_value = [
         DeviceInfo(name="test:auto:001", vendor="V", model="M", device_type="t"),
     ]
-    scanner.scan_pages.side_effect = [
-        scan_batch([_make_content_image("red")]),
-        scan_batch([_make_content_image("blue")]),
-    ]
+    scanner.scan_pages.side_effect = spooling_in_turn(
+        [_make_content_image("red")], [_make_content_image("blue")]
+    )
     return scanner
 
 
@@ -1506,7 +1706,7 @@ class TestManualDuplexOverTheSharedFake:
 
 
 class TestExifStripped:
-    """EXIF stripping before PDF assembly."""
+    """No EXIF reaches the PDF, now that the page reaches it as a file."""
 
     def test_exif_stripped_before_pdf(
         self,
@@ -1514,20 +1714,32 @@ class TestExifStripped:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Images passed to assemble_pdf have no 'exif' key in .info."""
+        """
+        A page arriving with EXIF is spooled without it (Pitfall #5).
+
+        The pipeline no longer strips EXIF page by page, and restoring that
+        loop would have nothing to act on: what reaches ``assemble_pdf`` is a
+        record naming a PNG, and Pillow's PNG encoder emits an EXIF chunk only
+        for one handed to it through ``encoderinfo``, which the spool never
+        does.  The property the deleted loop protected is therefore still true,
+        and this asserts it where it is now decided -- on the spooled file the
+        PDF embeds, read while that file still exists.
+        """
         default_settings.output.tmp_dir = str(tmp_path)
 
         img = _make_content_image()
         img.info["exif"] = b"fake-exif-data"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([img])
+        scanner.scan_pages.side_effect = spooling([img])
 
+        spooled: list[Image.Image] = []
         request = PipelineRequest(profile_name="default", title="EXIF Test")
 
         with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
-            mock_assemble.return_value = tmp_path / "output.pdf"
-            (tmp_path / "output.pdf").write_bytes(b"%PDF-fake")
+            mock_assemble.side_effect = _reading_the_pages(
+                tmp_path / "output.pdf", spooled
+            )
 
             run_pipeline(
                 scanner=scanner,
@@ -1536,9 +1748,9 @@ class TestExifStripped:
                 request=request,
             )
 
-            called_images = mock_assemble.call_args[0][0]
-            for img in called_images:
-                assert "exif" not in img.info
+        assert len(spooled) == 1
+        for page in spooled:
+            assert "exif" not in page.info
 
 
 class TestEmptyPageDetectionToggle:
@@ -1550,17 +1762,17 @@ class TestEmptyPageDetectionToggle:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """When enable_empty_page_detection=False, all images kept (none filtered)."""
+        """When enable_empty_page_detection=False, every page is kept."""
         default_settings.output.tmp_dir = str(tmp_path)
         default_settings.profiles["default"].enable_empty_page_detection = False
 
-        # Use images that would normally be filtered as empty
+        # Use pages that would normally be filtered as empty
         empty_pages = [_make_empty_image(), _make_empty_image()]
         content_page = _make_content_image()
         all_pages = [content_page, *empty_pages]
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(all_pages)
+        scanner.scan_pages.side_effect = spooling(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Toggle Test")
 
@@ -1575,9 +1787,9 @@ class TestEmptyPageDetectionToggle:
                 request=request,
             )
 
-            # All 3 images should be kept since detection is disabled
-            called_images = mock_assemble.call_args[0][0]
-            assert len(called_images) == 3
+            # All 3 pages should be kept since detection is disabled
+            called_records = mock_assemble.call_args[0][0]
+            assert len(called_records) == 3
 
 
 class TestFlatbedStillWorks:
@@ -1593,7 +1805,7 @@ class TestFlatbedStillWorks:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+        scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         thumb_results: list[str] = []
         request = PipelineRequest(
@@ -1771,7 +1983,7 @@ class TestScanResultContract:
             _make_content_image("red"),
         ]
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(all_pages)
+        scanner.scan_pages.side_effect = spooling(all_pages)
 
         request = PipelineRequest(profile_name="default", title="Counts Test")
 
@@ -1805,7 +2017,7 @@ class TestScanResultContract:
 
         all_pages = [_make_content_image(), _make_empty_image(), _make_empty_image()]
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(all_pages)
+        scanner.scan_pages.side_effect = spooling(all_pages)
 
         request = PipelineRequest(profile_name="default", title="No Filter Test")
 
@@ -1883,9 +2095,9 @@ def _isolate_dirs(settings: Settings, tmp_path: Path) -> Path:
 
 
 def _one_page_scanner() -> MagicMock:
-    """Return a scanner backend yielding a single page with content."""
+    """Return a scanner backend spooling a single page with content."""
     scanner = MagicMock(spec=ScannerBackend)
-    scanner.scan_pages.return_value = scan_batch([_make_content_image()])
+    scanner.scan_pages.side_effect = spooling([_make_content_image()])
     return scanner
 
 
@@ -2199,7 +2411,14 @@ class TestPreservation:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """D-07: assemble_pdf already deleted every page PNG before returning."""
+        """
+        Only the PDF is preserved: the spooled pages die with the workspace.
+
+        The spool lives inside the job's ``TemporaryDirectory``, and the
+        preservation guard moves the assembled PDF and nothing else, so
+        ``failed/`` holds exactly one kind of file.  Plan 29-09 is what adds a
+        page directory beside it; until then this is the whole contract.
+        """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
@@ -2480,14 +2699,15 @@ def _mismatched_duplex_scanner(fronts: int = 3, backs: int = 2) -> MagicMock:
         backs: Pages produced by pass B.
 
     Returns:
-        A ScannerBackend mock whose two scan_pages calls yield those pages.
+        A ScannerBackend mock whose two scan_pages calls spool those pages into
+        the sink the pipeline hands them.
 
     """
     scanner = MagicMock(spec=ScannerBackend)
-    scanner.scan_pages.side_effect = [
-        scan_batch([_make_content_image() for _ in range(fronts)]),
-        scan_batch([_make_content_image() for _ in range(backs)]),
-    ]
+    scanner.scan_pages.side_effect = spooling_in_turn(
+        [_make_content_image() for _ in range(fronts)],
+        [_make_content_image() for _ in range(backs)],
+    )
     return scanner
 
 
@@ -2771,7 +2991,7 @@ class TestTheDpiTheDeviceActuallyChose:
         default_settings.profiles["default"].resolution = 600
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(
+        scanner.scan_pages.side_effect = spooling(
             [_make_content_image()], resolution=300
         )
 
@@ -2800,10 +3020,11 @@ class TestTheDpiTheDeviceActuallyChose:
         default_settings.profiles["default"].resolution = 600
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [
-            scan_batch([_make_content_image() for _ in range(3)], resolution=150),
-            scan_batch([_make_content_image() for _ in range(2)], resolution=150),
-        ]
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image() for _ in range(3)],
+            [_make_content_image() for _ in range(2)],
+            resolution=150,
+        )
 
         fronts_pdf = tmp_path / "fronts.pdf"
         backs_pdf = tmp_path / "backs.pdf"
@@ -2847,10 +3068,10 @@ class TestTheDpiTheDeviceActuallyChose:
         default_settings.profiles["default"].duplex = "manual"
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = [
-            scan_batch([_make_content_image() for _ in range(2)], resolution=300),
-            scan_batch([_make_content_image() for _ in range(2)], resolution=150),
-        ]
+        scanner.scan_pages.side_effect = _spooling_at_each_resolution(
+            ([_make_content_image() for _ in range(2)], 300),
+            ([_make_content_image() for _ in range(2)], 150),
+        )
 
         with (
             patch("saneless.pipeline.assemble_pdf") as mock_assemble,
@@ -2883,7 +3104,7 @@ class TestRejectedPagesAreNotBlankPages:
     """
     D-07: a sheet the scanner could not read is counted, and counted apart.
 
-    ``pages_scanned`` is ``len(images)``, which already excludes a skipped
+    ``pages_scanned`` is ``len(records)``, which already excludes a skipped
     sheet, so a ten-sheet stack with one unreadable page reported nine and
     nobody learned a page was lost (T-24-23). The count must not be folded into
     the blank-page total, which Phase 30 renders as pages removed for being
@@ -2900,7 +3121,7 @@ class TestRejectedPagesAreNotBlankPages:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(
+        scanner.scan_pages.side_effect = spooling(
             [_make_content_image() for _ in range(3)], rejected=2
         )
 
@@ -2929,7 +3150,7 @@ class TestRejectedPagesAreNotBlankPages:
         default_settings.output.tmp_dir = str(tmp_path)
 
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.return_value = scan_batch(
+        scanner.scan_pages.side_effect = spooling(
             [_make_content_image() for _ in range(3)]
         )
 
