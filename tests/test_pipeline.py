@@ -2695,6 +2695,315 @@ class TestPreservation:
         assert len(list(failed_dir.glob("*.pdf"))) == 1
 
 
+def _spooling_then_failing(
+    pages: Sequence[Image.Image],
+    failure: Exception,
+) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
+    """
+    Build a ``scan_pages`` stand-in that spools some pages and then fails.
+
+    This is the mid-batch failure HARD-02 is about: a jam on sheet N+1 of a
+    stack whose first N sheets already went through the feeder.  The pages go
+    into the pipeline's own sink, so the records the preservation path finds --
+    and the files behind them -- are the ones production would have.
+
+    Args:
+        pages: The sheets that made it through, in acquisition order.
+        failure: What the device raises once they have.
+
+    Returns:
+        A callable with ``scan_pages``' own shape, for ``MagicMock.side_effect``.
+
+    """
+
+    def _spool_then_fail(
+        device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """Spool every page the device managed, then raise as it would."""
+        for page in pages:
+            sink.add(page)
+        raise failure
+
+    return _spool_then_fail
+
+
+def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
+    """
+    Return a scanner that spools ``pages`` distinct sheets and then raises.
+
+    Args:
+        pages: How many sheets reach the spool before the fault.
+        failure: The exception the device raises on the next sheet.
+
+    Returns:
+        A ScannerBackend mock ready for ``run_pipeline``.
+
+    """
+    scanner = MagicMock(spec=ScannerBackend)
+    scanner.scan_pages.side_effect = _spooling_then_failing(
+        [_distinct_page(index) for index in range(pages)], failure
+    )
+    return scanner
+
+
+class TestPartialScanPreservation:
+    """
+    HARD-02 / D-09: a mid-batch failure keeps the pages already fed.
+
+    A jam on page 40 of a 50-sheet stack used to discard the 39 sheets the
+    operator had already put through the feeder.  The spool holds them, so the
+    guard assembles them unfiltered into a ``(partial)`` PDF under ``failed/``
+    and names the count and the path in the exception it re-raises -- without
+    changing that exception's type, which is what keeps the job's error
+    category and the CLI's exit code correct (Phase 28 D-07).
+    """
+
+    def test_partial_scan_preserved_when_the_scanner_fails_mid_batch(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Three sheets fed, a jam on the fourth: the three are kept.
+
+        The page count is read back out of the preserved PDF rather than
+        inferred from its name, because the name is under test here too.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(
+                    3,
+                    ScanError("Scanner error on page 4: Document feeder jammed"),
+                ),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Jammed Stack", job_id="job-part-1"
+                ),
+            )
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        # ``partial``, not ``(partial)``: build_pdf_filename runs the title
+        # through sanitise_title_for_filename, whose allow-list drops the
+        # brackets.  The same is already true of the duplex-mismatch halves,
+        # whose own test asserts on ``fronts`` for exactly this reason.
+        assert "partial" in preserved[0].name
+        with pikepdf.open(preserved[0]) as pdf:
+            assert len(pdf.pages) == 3
+        message = str(excinfo.value)
+        assert "Document feeder jammed" in message
+        assert "3 page(s)" in message
+        assert str(preserved[0]) in message
+
+    def test_partial_scan_keeps_the_original_exception_type(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A ScanError stays a ScanError, so exit 1 and the category hold.
+
+        ``type(...) is``, not ``isinstance``: a silent widening to
+        ``SanelessError`` would satisfy an isinstance check while changing the
+        exit code the CLI chooses (Phase 28's table).
+        """
+        _isolate_dirs(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 3: Paper jam")
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(2, original),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Type Survives", job_id="job-part-2"
+                ),
+            )
+
+        assert type(excinfo.value) is ScanError
+        assert excinfo.value.__cause__ is original
+        assert classify_error(excinfo.value) is ErrorCategory.SCANNER
+
+    def test_partial_scan_is_not_blank_filtered(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        An anomaly is delivered whole for review, following the mismatch path.
+
+        Every spooled sheet here is blank enough that ``_drop_empty_pages``
+        would have removed it -- and removing them all would raise "All pages
+        were blank" and destroy the very evidence the operator needs.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        assert default_settings.profiles["default"].enable_empty_page_detection
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _spooling_then_failing(
+            [_make_empty_image() for _ in range(4)],
+            ScanError("Scanner error on page 5: Document feeder jammed"),
+        )
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="All Faint", job_id="job-part-3"
+                ),
+            )
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        with pikepdf.open(preserved[0]) as pdf:
+            assert len(pdf.pages) == 4
+
+    def test_a_partial_scan_is_never_uploaded(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """N-02's rejected alternative: no incomplete document reaches paperless."""
+        _isolate_dirs(default_settings, tmp_path)
+        paperless = MagicMock()
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=_jamming_scanner(3, ScanError("Feeder jammed")),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Never Sent", job_id="job-part-4"
+                ),
+            )
+
+        paperless.upload_document.assert_not_called()
+        paperless.poll_task.assert_not_called()
+
+    def test_cancel_preserves_nothing(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        D-10: the operator chose to stop, so nothing is kept.
+
+        ``ScanCancelledError`` is an ordinary ``Exception``, so a guard that
+        caught only broadly would file a cancelled scan into a directory
+        saneless never prunes.  The message must come through untouched, with
+        no preserved-at text appended and no ERROR logged.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = ScanCancelledError("Scan cancelled by the operator")
+
+        with (
+            caplog.at_level(logging.DEBUG, logger="saneless.pipeline"),
+            pytest.raises(
+                ScanCancelledError, match=r"^Scan cancelled by the operator$"
+            ) as excinfo,
+        ):
+            run_pipeline(
+                scanner=_jamming_scanner(3, original),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Cancelled", job_id="job-part-5"
+                ),
+            )
+
+        assert excinfo.value is original
+        assert not failed_dir.exists()
+        assert [
+            record for record in caplog.records if record.levelno >= logging.ERROR
+        ] == []
+
+    def test_zero_pages_spooled_keeps_todays_message_and_preserves_nothing(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Nothing reached the spool, so the feeder message stands unchanged."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = FeederEmptyError("No paper detected in feeder")
+
+        with pytest.raises(
+            FeederEmptyError, match=r"^No paper detected in feeder$"
+        ) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Empty Feeder", job_id="job-part-6"
+                ),
+            )
+
+        assert type(excinfo.value) is FeederEmptyError
+        assert not failed_dir.exists()
+
+    def test_an_empty_batch_still_says_no_pages_were_scanned(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """``_require_pages`` runs with an empty sink, so its message stands."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([])
+
+        with pytest.raises(ScanError, match=r"^No pages were scanned$"):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Pages", job_id="job-part-7"
+                ),
+            )
+
+        assert not failed_dir.exists()
+
+    def test_a_failed_partial_preservation_reports_both_failures(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Being told only "the feeder jammed" while the pages were destroyed is a lie.
+
+        ``failed_dir`` is made a regular file, so the guard's own mkdir raises
+        and the move can never run -- the shape ``_preserving`` already uses.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+        original = ScanError("Scanner error on page 4: Document feeder jammed")
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(3, original),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Both Fail", job_id="job-part-8"
+                ),
+            )
+
+        message = str(excinfo.value)
+        assert "Document feeder jammed" in message
+        assert str(failed_dir) in message
+        assert "NOT" in message
+        assert excinfo.value.__cause__ is original
+
+
 def _fill_failed_dir(failed_dir: Path, count: int) -> list[str]:
     """
     Pre-populate ``failed_dir`` with ``count`` preserved-looking PDFs.
