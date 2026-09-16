@@ -11,8 +11,12 @@ saneless exposes a web API at the configured host and port (default `0.0.0.0:808
 | GET | `/api/paperless/test` | Test paperless-ngx connection |
 | POST | `/api/scan` | Start a scan job |
 | GET | `/api/jobs/current/status` | Poll current job status |
-| GET | `/api/tags` | Fetch paperless-ngx tags |
+| GET | `/api/jobs/{job_id}/status` | Poll the status of one named job |
+| GET | `/api/checks` | Render the system status strip from cache |
+| POST | `/api/checks/refresh` | Re-run every check now and render the strip |
+| GET | `/api/tags` | Fetch paperless-ngx tags, optionally filtered |
 | GET | `/api/correspondents` | Fetch paperless-ngx correspondents |
+| GET | `/api/profiles/description` | One profile's description sentence |
 | POST | `/api/cache/invalidate` | Refresh cached metadata |
 | GET | `/api/jobs/history` | Job history table |
 | POST | `/api/flip/continue` | Continue manual duplex scan |
@@ -104,11 +108,56 @@ Returns the current or most recent job status. Used by HTMX polling to update th
 
 ---
 
+### `GET /api/jobs/{job_id}/status`
+
+Returns the status of one named job, rather than whichever job is current. The web UI polls this after a submit, so the browser that started a scan keeps following *its* job even when another one is running: that is what decides whether the flip prompt is shown to you or the "someone else started this scan" line.
+
+**Path parameter:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `job_id` | string | The job to report on. Opaque: it is a database lookup key and nothing else |
+
+**Response:** HTML partial, the same shape as [`GET /api/jobs/current/status`](#get-apijobscurrentstatus).
+
+An id that names no job is **not** a `404`. The partial falls back to the current-or-most-recent rendering, so a browser whose job has aged out of history keeps working, and a caller cannot use the status code to discover which job ids exist.
+
+---
+
+### `GET /api/checks`
+
+Renders the system status strip -- the Scanner, Paperless, Profiles, Fallback and Data folder rows shown at the top of the page, the same checks `saneless doctor` prints.
+
+**This is a cache read and never probes.** However many browser tabs are open, the underlying checks run no more often than their cache allows, so watching the page cannot generate scanner or paperless-ngx traffic.
+
+**Response:** HTML partial (the whole strip body, for `outerHTML` swap).
+
+Before any results exist the response is five `Checking...` rows carrying a self-poll; once results exist the body it returns carries no poll trigger, so the polling stops on its own. While a scan is running the scanner check is skipped and the strip says so rather than probing a device that is in use.
+
+---
+
+### `POST /api/checks/refresh`
+
+Re-runs every check immediately, ignoring the cache, and returns the refreshed strip. This is the `Check again` button: an operator who has just plugged the scanner back in should not have to wait out a TTL.
+
+**Response:** HTML partial (the strip body, for `outerHTML` swap).
+
+During a scan, the checks that would touch the scanner are skipped -- an explicit click does not get to interrupt a scan in progress -- and the Scanner row keeps its "not checked while a scan is running" message. If the check registry itself fails, the previous results stay on the page rather than blanking, and the failure is logged.
+
+---
+
 ### `GET /api/tags`
 
-Fetches paperless-ngx tags for the dropdown selector. Uses cached data when available.
+Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses cached data when available; an error reaching paperless-ngx renders an empty list rather than an error.
 
-**Response:** HTML partial (`<option>` elements for HTMX swap).
+**Query parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `q` | string | no | Filter text, at most 100 characters. Longer is rejected with `422` before any work. Filtering is done by saneless over the cached list -- `q` is never sent to paperless-ngx, and never appears in the response |
+| `tags` | int[] | no | The tag ids currently ticked. They ride along so that a filtered re-render keeps your selection: a tag you ticked and then filtered out of view stays selected and is still submitted |
+
+**Response:** HTML partial (the whole tag block including its wrapper, for `outerHTML` swap).
 
 ---
 
@@ -117,6 +166,20 @@ Fetches paperless-ngx tags for the dropdown selector. Uses cached data when avai
 Fetches paperless-ngx correspondents for the dropdown selector. Uses cached data when available.
 
 **Response:** HTML partial (`<option>` elements for HTMX swap).
+
+---
+
+### `GET /api/profiles/description`
+
+Returns the one-sentence description of a scan profile, for the help line beneath the profile dropdown. The web UI fetches it when the selection changes.
+
+**Query parameter:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `profile` | string | yes | The profile name. Validated against the configured profiles before anything else happens; an unknown name is rejected with `422` |
+
+**Response:** the description text alone, with no wrapper element. The text comes from the loaded profile's `description` field, so a profile you took over and described yourself shows your wording rather than the generated one. A profile with no description returns nothing, and the help line is empty.
 
 ---
 
@@ -193,6 +256,29 @@ Every error response saneless renders -- a refused scan, a validation failure, a
 A `429` carries `Retry-After: 30` in both forms.
 
 The message is a fixed sentence chosen by saneless for the kind of error. It never echoes request input or internal exception text. The error from [`GET /api/paperless/test`](#get-apipaperlesstest) and the `503` bodies from [`GET /health`](#get-health) keep their own shapes, documented above.
+
+### Every rejection
+
+One sentence per kind of refusal, and every sentence is a fixed developer constant -- no request input, no exception text, no file path, no token value, no paperless-ngx URL. The name in the first column is saneless's internal identifier for the case; it does not appear in the response, and is listed so a log line or a bug report can name one unambiguously.
+
+| Rejection | Status | Message |
+|-----------|--------|---------|
+| `QUEUE_FULL` | 429 | The scan queue is full. Wait for a scan to finish, then try again. |
+| `WORKER_DOWN` | 503 | The scan service is not running, so the scan was not started. Restart saneless, then try again. |
+| `WORKER_DEGRADED` | 503 | Job history cannot be saved right now, so the scan was not started. Check the server's free disk space and log, then try again. |
+| `TOKEN_UNSET` | 503 | The paperless-ngx API token has not been set, so the scan was not started. Put a real API token in the saneless config file, then restart saneless. |
+| `UNKNOWN_PROFILE` | 422 | That scan profile does not exist. Reload the page to see the current profiles. |
+| `TITLE_TOO_LONG` | 422 | The title is too long. Shorten it to 256 characters or fewer. |
+| `INVALID_REQUEST` | 422 | The request was not valid. Reload the page, then try again. |
+| `CROSS_SITE` | 403 | This request was blocked because it did not come from the saneless page. If saneless is behind a reverse proxy, make sure the proxy passes the original Host header. |
+| `NOT_FOUND` | 404 | That page or action does not exist. Reload the page, then try again. |
+| `METHOD_NOT_ALLOWED` | 405 | That action is not allowed. Reload the page, then try again. |
+| `INTERNAL` | 500 | Something went wrong on the server. Check the server log for details, then try again. |
+| `CLIENT_ERROR` | 400 | The request could not be completed. Reload the page, then try again. |
+
+**`TOKEN_UNSET` is new, and it is deliberately not `WORKER_DEGRADED`.** The scan service is working perfectly well; nobody set the paperless-ngx API token. Saying "the scan service was unavailable" would send a household member looking for a broken server, so the refusal says what is actually wrong and which file fixes it. A placeholder token counts as unset: saneless keeps a small fixed list of literals such as `changeme` and `your-api-token-here`, and an empty or whitespace-only token is the same case. See [Docker: placeholder tokens are detected](docker.md#placeholder-tokens-are-detected).
+
+While the token is unset the Scan button also renders disabled with the reason beneath it, and the status strip's Paperless row is red. The button is a courtesy; the route guard is the enforcement, so a direct `POST /api/scan` is refused just the same. Like `QUEUE_FULL`, `WORKER_DOWN` and `WORKER_DEGRADED`, a `TOKEN_UNSET` refusal records the attempt in job history as a failed job -- `Not started: the paperless-ngx API token has not been set` -- so an attempt that never scanned is still visible.
 
 ---
 
