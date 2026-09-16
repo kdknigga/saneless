@@ -2203,7 +2203,7 @@ class TestTagFilter:
 
         response = client.post(
             "/api/cache/invalidate?resource=tags",
-            data={"q": "rec", "tags": [3]},
+            data={"q": "rec", "tags": ["3"]},
         )
 
         assert response.status_code == 200

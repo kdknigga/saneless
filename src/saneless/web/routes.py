@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import JSONResponse
 
 from saneless.checks import (
@@ -63,6 +63,24 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _TAGS_FORM_DEFAULT = Form(default=[])
+
+# The same "no tags ticked" default, for the GET that renders the list.  htmx
+# sends an ``hx-include``'s values in the query string of a GET and in the body
+# of a POST, so the two methods need one of these each.  Both are module-level
+# constants so the parameter defaults themselves stay call-free (B008).
+_TAGS_QUERY_DEFAULT = Query(default=[])
+
+TAG_FILTER_MAX_LENGTH: Final = 100
+"""
+The cap on the tag filter, applied at the boundary before any work (T-30-76).
+
+A hundred characters is far more than a tag name and far less than a payload:
+the value is a substring test against names the operator chose, so anything
+longer cannot be a filter and is either a mistake or an attempt to make the
+server do work for nothing.  ``Query(max_length=...)`` turns it into a 422
+before the handler body runs, which is the same "validate at the boundary"
+shape ``MetadataResource`` uses for ``resource``.
+"""
 
 # The only metadata resources the cache holds.  A runtime alias, not a
 # TYPE_CHECKING import, because FastAPI reads it to validate the ``resource``
@@ -310,6 +328,65 @@ def _get_cached_or_fetch(
         )
         data = []
     return data
+
+
+def _tag_list_context(
+    state: State, *, q: str, selected: list[int]
+) -> dict[str, object]:
+    """
+    Build the tag checkbox list's context: the filtered list and pinned ticks.
+
+    Two lists, not one, and that is the whole of Amendment A-5.  The filter
+    request carries the currently ticked ids with it -- ``hx-include`` over a
+    checkbox list gathers only the boxes that are checked -- so this function
+    can re-render every one of them ticked, and pin the ones the filter
+    excludes *above* the filtered list.  A tick therefore cannot leave the DOM,
+    and a tick that cannot leave the DOM cannot be silently dropped from the
+    next submit.  A tag that is both ticked and matched is rendered by the
+    filtered loop alone, so it appears once rather than twice.
+
+    ``q`` is a Python-side substring test over the already-cached list and
+    nothing else (ASVS V5).  It is never interpolated into a paperless-ngx
+    query URL -- the cache holds the whole list, so there is nothing to ask
+    upstream and the filter costs no request at all (T-30-75) -- and it is
+    deliberately absent from the context this returns, so it cannot be echoed
+    back into the page (T-30-74).  Its length is already bounded by the
+    route's ``max_length`` before this runs (T-30-76).
+
+    Args:
+        state: Application state, for the metadata cache and Paperless client.
+        q: The filter text, matched case-insensitively against tag names.
+        selected: The tag ids the request reports as currently ticked.
+
+    Returns:
+        The context ``partials/tags.html`` renders: the pinned ticks, the
+        filtered list, the ticked ids and whether any tag exists at all.
+
+    """
+    everything = _get_cached_or_fetch(state.cache, state.paperless, "tags")
+    needle = q.casefold()
+    ticked = set(selected)
+    matched = [
+        tag for tag in everything if needle in str(tag.get("name", "")).casefold()
+    ]
+    matched_ids = {tag.get("id") for tag in matched}
+    pinned = [
+        tag
+        for tag in everything
+        if tag.get("id") in ticked and tag.get("id") not in matched_ids
+    ]
+    return {
+        "pinned": pinned,
+        "tags": matched,
+        # Not ``selected``: the index context already uses that name for the
+        # profile the page opens on, and an include shares its parent's
+        # context, so the two would collide on the full-page render.
+        "selected_tags": ticked,
+        # Which empty state to render when both lists are empty: "paperless-ngx
+        # has no tags" and "your filter matched none of them" are different
+        # facts and only one of them is the reader's to fix.
+        "any_tags": bool(everything),
+    }
 
 
 def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | None:
@@ -648,7 +725,10 @@ def index(request: Request) -> Response:
     # leaves its cold-start rows.
     state.refresher.note_watcher()
     profiles = _profile_options(state.worker)
-    tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
+    # A full page render is the unfiltered, nothing-ticked case of the same
+    # context the filter route builds, so it goes through the same function
+    # rather than a second shape the two could drift apart on.
+    tag_list = _tag_list_context(state, q="", selected=[])
     correspondents = _get_cached_or_fetch(
         state.cache, state.paperless, "correspondents"
     )
@@ -670,7 +750,7 @@ def index(request: Request) -> Response:
             # necessarily the first profile in the config file.
             "selected": profiles[0].name if profiles else "",
             "selected_description": profiles[0].description if profiles else "",
-            "tags": tags,
+            **tag_list,
             "correspondents": correspondents,
             **status,
             **_checks_context(state),
@@ -1137,19 +1217,35 @@ def refresh_checks(request: Request) -> Response:
 
 
 @router.get("/api/tags")
-def get_tags(request: Request) -> Response:
+def get_tags(
+    request: Request,
+    q: Annotated[str, Query(max_length=TAG_FILTER_MAX_LENGTH)] = "",
+    tags: list[int] = _TAGS_QUERY_DEFAULT,
+) -> Response:
     """
-    Fetch tag options for the dropdown selector.
+    Render the tag checkbox list, optionally narrowed by a filter.
 
-    Uses cached data when available, falling back to a fresh fetch
-    from paperless-ngx. Returns empty options on API errors.
+    Uses cached data when available, falling back to a fresh fetch from
+    paperless-ngx; an API error renders the empty list rather than an error.
+
+    The response is the whole swap target, wrapper included, because the filter
+    swaps it ``outerHTML``.  Both parameters arrive from the same
+    ``hx-include`` and are what makes the swap lossless: see
+    ``_tag_list_context`` for why the selection has to ride along, and why
+    ``q`` reaches neither paperless-ngx nor the response body.
+
+    Args:
+        request: The incoming HTTP request.
+        q: Filter text; a value over ``TAG_FILTER_MAX_LENGTH`` is a 422 before
+            any work happens.
+        tags: The tag ids the browser reports as currently ticked.
+
     """
     state = request.app.state
-    tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     return state.templates.TemplateResponse(
         request,
         "partials/tags.html",
-        {"tags": tags},
+        _tag_list_context(state, q=q, selected=tags),
     )
 
 
@@ -1212,7 +1308,12 @@ def get_profile_description(request: Request, profile: str) -> Response:
 
 
 @router.post("/api/cache/invalidate")
-def invalidate_cache(request: Request, resource: MetadataResource) -> Response:
+def invalidate_cache(
+    request: Request,
+    resource: MetadataResource,
+    q: Annotated[str, Form(max_length=TAG_FILTER_MAX_LENGTH)] = "",
+    tags: list[int] = _TAGS_FORM_DEFAULT,
+) -> Response:
     """
     Invalidate a specific cache entry and return fresh data.
 
@@ -1220,20 +1321,27 @@ def invalidate_cache(request: Request, resource: MetadataResource) -> Response:
     partial for the specified resource.  Any other resource name is a 422
     before the cache is touched (N-20).
 
+    The tag refresh renders the same partial the filter does, from the same
+    context, so a refresh mid-filter comes back filtered and still ticked.  The
+    two extra values arrive in the body rather than the query string only
+    because htmx sends an ``hx-include``'s values that way on a POST; they are
+    ignored for the correspondent resource, which includes nothing.
+
     Args:
         request: The incoming HTTP request.
         resource: Resource name to invalidate ('tags' or 'correspondents').
+        q: The tag filter currently in the box, if any.
+        tags: The tag ids currently ticked, if any.
 
     """
     state = request.app.state
     state.cache.invalidate(resource)
 
     if resource == "tags":
-        tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
         return state.templates.TemplateResponse(
             request,
             "partials/tags.html",
-            {"tags": tags},
+            _tag_list_context(state, q=q, selected=tags),
         )
 
     correspondents = _get_cached_or_fetch(
