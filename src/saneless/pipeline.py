@@ -334,10 +334,12 @@ class PipelineRequest:
 
     ``job_id`` names the assembled PDF, via
     :func:`saneless.pdf.build_pdf_filename`, and is what makes two scans of the
-    same title two distinct files rather than one overwriting the other. The
-    worker always supplies ``job.id``; the empty default exists only so the
-    dozens of tests that construct a request from a profile name and a title
-    need not invent one, and an empty value simply drops the segment.
+    same title two distinct files rather than one overwriting the other. Both
+    entry points supply a uuid4: the worker passes ``job.id``, and ``saneless
+    scan`` mints one for the run. The empty default exists only so the dozens
+    of tests that construct a request from a profile name and a title need not
+    invent one, and an empty value simply drops the segment -- which also
+    drops the uniqueness guarantee, so nothing in production may rely on it.
 
     It is defaulted rather than required, and sits with the other defaulted
     fields: moving it into the non-default block above would reorder the
