@@ -9,8 +9,9 @@ This page explains *how* saneless is structured and *why* it works the way it do
 Every scan job follows the same flow, whether triggered from the web UI or the CLI:
 
 ```
-Scanner -> [SaneBackend] -> PIL Images -> [Empty Page Filter] -> [img2pdf] -> PDF -> [PaperlessClient] -> paperless-ngx
-                                                                                  \-> [Consume Dir] (fallback)
+Scanner -> [SaneBackend] -> [Page Spool] -> spooled PNGs + ordered page records
+        -> [Empty Page Filter] -> [img2pdf + qpdf] -> PDF -> [PaperlessClient] -> paperless-ngx
+                                                          \-> [Consume Dir] (fallback)
 ```
 
 ### Scanner Abstraction
@@ -25,19 +26,39 @@ The `run_pipeline()` function coordinates the full scan flow:
 
 1. **Resolve scanner** -- find the configured device or auto-detect the first available one.
 2. **Set parameters** -- apply the selected profile's source, resolution, and color mode.
-3. **Acquire pages** -- scan via the scanner backend. For a simplex or hardware duplex profile this is a single `scan_pages()` call. A profile with `duplex = "manual"` splits this stage into three (see [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex)):
+3. **Acquire pages** -- scan via the scanner backend. Each page is written to the job's page spool as it arrives, as a PNG file with an ordered page record, rather than accumulated in memory: the backend hands one page to the spool and forgets it. Document order comes from the list of records, never from sorting or globbing the spool directory. For a simplex or hardware duplex profile this is a single `scan_pages()` call. A profile with `duplex = "manual"` splits this stage into three (see [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex)):
     1. **Pass A** -- scan the front sides through the feeder.
     2. **Flip wait** -- wait, for at most `flip_timeout_seconds`, for the operator to flip the stack and confirm. An abort cancels the job here (it ends `CANCELLED`) and a timeout fails it, both before pass B.
     3. **Pass B** -- scan the back sides, then reverse them and interleave them with the fronts. If the two passes disagree on page count, the fronts and backs are delivered as two separate PDFs instead.
 4. **Filter empty pages** -- remove blank pages using the [dual-threshold algorithm](empty-page-detection.md).
-5. **Assemble PDF** -- convert scanned PIL images to a PDF document.
+5. **Assemble PDF** -- embed the spooled page files into a PDF document.
 6. **Upload to paperless-ngx** -- send the PDF with metadata via the REST API, or fall back to the [consume directory](consume-directory-fallback.md) if the API is unavailable.
+
+Because the pages are already on disk, a scan that fails part-way through does not cost the operator the sheets that were already fed. What is kept depends on how the scan ended:
+
+- **A failure after N pages** -- a scanner fault, a page timeout, the feeder page cap, or the spool running out of room -- keeps those N pages as a partial PDF in `failed/` inside the data directory, and the error names the count and the path. It is never uploaded, and blank pages are not removed from it.
+- **A manual duplex scan whose pass B or flip fails** keeps the fronts pass A already scanned (and any backs pass B managed) as separately named PDFs in the same place. That covers a fault during pass B, an empty pass B, a flip wait that timed out, and a flip prompt that could not be read.
+- **A failure to assemble the PDF at all** keeps the spooled page files themselves, moved into a job-keyed directory under `failed/`, named in the error.
+- **An operator's cancel keeps nothing.** Aborting at the flip prompt, answering no, or Ctrl-C is a decision to stop, and saneless never prunes `failed/`, so a cancel that preserved pages would leave the operator files to clean up after choosing not to scan.
 
 Each stage emits a `PipelineEvent` (`SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`). `AWAITING_FLIP` marks the start of the flip wait and `SCANNING_REVERSE` the start of pass B, and each becomes a job state of the same name. The web UI uses these events to update the live status indicator via HTMX polling.
 
 ### PDF Assembly
 
-PDF assembly uses `img2pdf`, which embeds scanned PIL images directly into the PDF without re-encoding. This is lossless -- the image data in the PDF is byte-for-byte identical to what the scanner produced. No quality is lost, and assembly is fast because there is no re-compression step.
+PDF assembly uses `img2pdf`, which embeds each spooled PNG directly into the PDF without re-encoding it. This is lossless: the page is encoded once, as the PNG the spool wrote, and that PNG's image data is what the PDF carries. It is not byte-identical to the raw data the scanner sent over the wire -- that data was never stored -- but no pixel changes between the spooled page and the page in the PDF, and assembly is fast because there is no second compression step.
+
+Assembly converts one page at a time, writing each to its own single-page PDF, and then merges those with qpdf. That is why its memory does not grow with page count: at no point is more than one page's worth of PDF being built. Handing the whole set to `img2pdf` in one call instead would hold every page in memory until the document was finished, which is what a long scan used to do.
+
+### Memory, disk and timeouts
+
+These are the rules that decide how much machine a long scan needs, and how a scan that stalls ends.
+
+- **Roughly one decoded page is in memory at a time while scanning.** A page is handed to the spool and written out as it arrives, so the ceiling is a small constant -- measured at two live page images, the same for a 3-page job as for a 12-page one -- rather than something that grows with the stack. At A4 300 DPI colour a page is about 26 MB, so a few hundred megabytes of RAM is enough for a scan of any length.
+- **Disk is checked per page, not just once.** Before each page is written, saneless checks there is room for that page *plus* `min_free_space_mb`, which is held back so PDF assembly still has somewhere to work. A shortfall fails the scan naming the page number and the spool path, and the pages already spooled are kept.
+- **One 120-second per-page timeout bounds both paths.** The same limit applies to one sheet through the feeder and to one sheet on the flatbed; it is an internal constant, not a setting. At 300 DPI a page typically takes 10-15 seconds, so it only fires on a scanner that has genuinely stopped answering.
+- **On a timeout saneless cancels the read and waits for it to come back before closing the device.** The SANE rule is that no other operation may run while one is outstanding, so closing a device that is still mid-read is unsafe. saneless cancels, waits up to ten seconds, and closes only if the read returned. A page that arrives after the cancel is discarded rather than added to the document, because the failure has already been reported.
+- **A read that never comes back does not block shutdown.** Every blocking scanner call runs on a daemon thread, so `saneless serve` still stops on Ctrl-C, a container still stops on `docker stop`, and nothing hangs waiting for a scanner that has gone away.
+- **While such a read is outstanding, the next scan is refused.** saneless will not start another scan on a device it cannot safely close, so it refuses at once with a message asking you to restart saneless, without touching the scanner. If the stuck read does eventually return, the handle is closed and saneless recovers on its own -- a restart is the cure for a hang that never clears, not the only way out of a slow one.
 
 ### Paperless Upload
 
@@ -55,11 +76,13 @@ The worker communicates progress back to the web layer via state transitions on 
 
 **Failure handling.** A scan that fails -- a scanner error, an upload error, a flip wait that timed out -- fails its job and the worker moves on to the next one. A scan that ends without delivering a document ends in one of three ways: an operator's abort at the flip prompt is recorded `CANCELLED` and logged at INFO, with no traceback, because nothing went wrong; a failure is recorded `ERROR` and logged with its traceback; and a shutdown during a flip wait is recorded as a restart (`ERROR`, "The server restarted before this scan finished"). The terminal job states are `DONE`, `FALLBACK`, `ERROR` and `CANCELLED`. A failure of the worker's own job-store writes, or of its hourly history prune, is different: three in a row mark the worker degraded. While degraded, `/health` returns `503` with `job store failing` and new scans are refused, because a job whose outcome cannot be recorded should not ask anyone to feed paper. Whenever the worker has no job, every 5 seconds it retries any job records it could not write earlier, degraded or not -- a finished scan's outcome, a job failure, or the rejection of a refused scan that the web request could not record -- so a job the store briefly refused to end still ends once writes succeed again. A scan that reached paperless-ngx is still recorded as done, not as an error, even when recording that outcome failed at first. If those retries keep failing for three idle ticks in a row (about 15 seconds), the worker marks itself degraded as well, so a job store that stays broken shows up on `/health` instead of only in the logs; a store that heals sooner never degrades it. Degraded is not permanent either: while degraded, the worker also probes the job store on those same ticks, and it clears degraded on the first tick on which the probe succeeds and the records it still owes are written.
 
-**Shutdown.** Stopping sets a stop flag and shuts the queue down, so jobs still waiting are dropped rather than run, and a job parked at the flip prompt is answered with Abort. The server then waits at most 5 seconds for the worker thread to finish; before it exits, the thread tries once more to write any job records it still owes. A scan still inside the scanner at that point is abandoned: its job stays active and the next startup records it as "The server restarted before this scan finished", as it does for the dropped queued jobs. The job store and the paperless-ngx client are closed only once the worker thread has confirmed it stopped, so a thread still finishing a scan never writes to a closed database.
+**Shutdown.** Stopping sets a stop flag and shuts the queue down, so jobs still waiting are dropped rather than run, and a job parked at the flip prompt is answered with Abort. The server then waits at most 5 seconds for the worker thread to finish; before it exits, the thread tries once more to write any job records it still owes. A scan still inside the scanner at that point is abandoned: its job stays active and the next startup records it as "The server restarted before this scan finished", as it does for the dropped queued jobs. The job store, the paperless-ngx client and the scanner are closed only once the worker thread has confirmed it stopped, so a thread still finishing a scan never writes to a closed database.
+
+SANE itself is initialised once per process, at the first scanner backend a command or the server builds, and shut down explicitly when that entry point ends -- at the end of a one-shot CLI command, and at the end of the web server's lifespan, after the worker has confirmed it stopped. It is never torn down from an interpreter-exit hook and never from a request. Shutting SANE down closes every open handle, so it is skipped and logged if a read is still outstanding, for the same reason a single device is not closed mid-read.
 
 For manual duplex scanning, the pipeline waits between pass A (fronts) and pass B (backs) through a `FlipCoordinator`, a small interface with one method, `wait_for_flip(timeout)`, that returns one of three outcomes: continued, aborted or timed out. The pipeline does not know who answers. In the web server, the worker's coordinator is answered by the `/api/flip/continue` and `/api/flip/abort` routes, which the flip prompt's Continue and Abort scan buttons call. In the CLI, a coordinator asks the operator a yes/no question at the terminal. Whichever answer arrives first -- including the timeout -- is final, and later answers are dropped. In the web server the worker's coordinator is bound to its job and accepts an answer only once that job is waiting at the flip prompt, and the routes name the job they answer, so a stale or repeated click is dropped instead of reaching another job.
 
-The wait is bounded by `flip_timeout_seconds` (600 seconds by default), so an abandoned flip prompt cannot hold the worker thread forever: when the timeout elapses the job fails and the next queued job runs. The scanner itself is not what the timeout frees. The backend opens and closes the device inside each `scan_pages()` call, so the scanner handle is already released between the two passes; what the timeout releases is the worker thread.
+The wait is bounded by `flip_timeout_seconds` (600 seconds by default), so an abandoned flip prompt cannot hold the worker thread forever: when the timeout elapses the job fails and the next queued job runs. The scanner itself is not what the timeout frees. The backend opens and closes the device inside each `scan_pages()` call, so the scanner handle is already released between the two passes; what the timeout releases is the worker thread. The one exception is a pass A whose read was left outstanding after a timeout: that handle is deliberately not closed, and the flip prompt is never reached, because the scan has already failed (see [Memory, disk and timeouts](#memory-disk-and-timeouts)).
 
 ## Job Storage
 
