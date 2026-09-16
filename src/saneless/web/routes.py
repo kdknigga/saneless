@@ -20,6 +20,7 @@ from saneless.checks import (
     run_checks,
 )
 from saneless.config import is_placeholder_token, resolve_job_title
+from saneless.scanner.base import SourceKind, classify_source
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
@@ -551,6 +552,86 @@ def _status_context(
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _ProfileOption:
+    """
+    One entry of the Profile select: what it submits and what it reads as.
+
+    Attributes:
+        name: The profile name, which is the ``value`` the option submits.
+            It is the wire contract ``POST /api/scan`` already takes, so only
+            the text a household member reads is new here.
+        label: The human name shown in the dropdown.
+        description: The sentence shown beneath the select for this profile.
+
+    """
+
+    name: str
+    label: str
+    description: str
+
+
+def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
+    """
+    Build the ordered option list the Profile select renders (APPL-05, D-21).
+
+    D-21 asks for feeder profiles first on a sheet-fed device, and this is
+    where ``has_flatbed`` is read: sheet-fed means the device reports no
+    flatbed source, and at render time the server's evidence for that is the
+    generated profile set, which mirrors the device's sources.  So the answer
+    is derived from the profiles already in hand -- no new device probe, no new
+    config key, which is exactly what the decision asks for.
+
+    The classification comes from ``classify_source`` and from nowhere else:
+    its docstring states it is the only source-classification rule in the
+    codebase and forbids re-deriving the answer from the string.  That matters
+    most for the commonest real feeder name of all, whose first four letters
+    are the whole of the automatic rule -- an exact match is what keeps it out
+    of the single-page group, and this function inherits that answer rather
+    than asking again.
+
+    Args:
+        worker: The worker whose profile set is being rendered.
+
+    Returns:
+        One option per configured profile, feeder-first when the device is
+        sheet-fed and in configuration order otherwise.
+
+    """
+    entries: list[tuple[_ProfileOption, SourceKind]] = []
+    for name in worker.profile_names():
+        profile = worker.get_profile(name)
+        if profile is None:
+            # Listing and looking up are two locked calls, so a profile
+            # rewritten between them can be gone by the time it is read.  One
+            # option fewer for one render is honest; a placeholder would not
+            # be, and there is nothing to show under a name that no longer
+            # names anything.
+            continue
+        entries.append(
+            (
+                _ProfileOption(
+                    name=name,
+                    # Amendment A-3.  A deployed config whose profiles predate
+                    # this phase carries an empty human name: startup
+                    # generation only runs on a bare default config, so it is
+                    # skipped there, and a blank option is worse than a raw
+                    # profile name.  ``saneless auto-profiles --force`` is what
+                    # backfills the text, and the how-to says so.
+                    label=profile.label or name,
+                    description=profile.description,
+                ),
+                classify_source(profile.source),
+            )
+        )
+    sheet_fed = not any(kind is SourceKind.FLATBED for _, kind in entries)
+    if sheet_fed:
+        # A stable sort, so configuration order survives inside each group and
+        # the only thing this changes is which group comes first.
+        entries.sort(key=lambda entry: not entry[1].uses_feeder)
+    return tuple(option for option, _ in entries)
+
+
 @router.get("/")
 def index(request: Request) -> Response:
     """
@@ -566,7 +647,7 @@ def index(request: Request) -> Response:
     # lazy thread returns at its first guard for ever and the strip never
     # leaves its cold-start rows.
     state.refresher.note_watcher()
-    profiles = state.worker.profile_names()
+    profiles = _profile_options(state.worker)
     tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     correspondents = _get_cached_or_fetch(
         state.cache, state.paperless, "correspondents"
@@ -581,6 +662,14 @@ def index(request: Request) -> Response:
         "index.html",
         {
             "profiles": profiles,
+            # Which option the page opens on, and the sentence that goes with
+            # it.  A browser selects the first option when none is marked, so
+            # naming the first one here is the only way the highlighted option
+            # and the description beneath it cannot disagree on first paint --
+            # and after the D-21 regrouping the first option is no longer
+            # necessarily the first profile in the config file.
+            "selected": profiles[0].name if profiles else "",
+            "selected_description": profiles[0].description if profiles else "",
             "tags": tags,
             "correspondents": correspondents,
             **status,
@@ -1080,6 +1169,45 @@ def get_correspondents(request: Request) -> Response:
         request,
         "partials/correspondents.html",
         {"correspondents": correspondents},
+    )
+
+
+@router.get("/api/profiles/description")
+def get_profile_description(request: Request, profile: str) -> Response:
+    """
+    Return the sentence that explains one profile, for the select's help slot.
+
+    The text is read from the loaded ``ProfileConfig`` rather than re-derived
+    from the source name, so an operator who took a profile over -- by removing
+    ``auto_generated`` and writing their own wording -- sees their sentence and
+    not the generated one.
+
+    ``profile`` is a query parameter and not a path segment, precisely so there
+    is no traversal surface to reason about: the name never builds a path, a
+    URL or a template name.  It is validated against the known profile set
+    before any work, by one locked lookup that both checks the name and yields
+    the profile, leaving no check-then-read gap -- the same shape ``start_scan``
+    uses.  An unknown name is a 422 (T-30-69).
+
+    Args:
+        request: The incoming HTTP request.
+        profile: The profile name whose description is wanted.
+
+    Returns:
+        The description text alone, with no wrapper element.
+
+    Raises:
+        RequestRejected: The profile is not configured.
+
+    """
+    state = request.app.state
+    found = state.worker.get_profile(profile)
+    if found is None:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    return state.templates.TemplateResponse(
+        request,
+        "partials/profile_description.html",
+        {"description": found.description},
     )
 
 

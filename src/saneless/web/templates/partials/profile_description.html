@@ -1,0 +1,8 @@
+{# The description text alone, with no wrapper element around it. The help
+   slot that holds it is swapped innerHTML and has to survive every swap: it
+   carries the id that aria-describedby points at, the polite live region and
+   Pico's control-plus-help-text adjacency that gives it its muted styling.
+   The whitespace control is load-bearing. A profile with no description must
+   produce a byte-empty body, or the :empty rule has a whitespace text node to
+   trip over and the emptied slot keeps its margins as a stray gap. -#}
+{{ description }}
