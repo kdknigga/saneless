@@ -41,6 +41,7 @@ from saneless.vocabulary import (
     JobState,
     WorkerHealth,
 )
+from saneless.web import refresher as refresher_module
 from saneless.web.app import create_app
 from tests.conftest import StubScannerBackend, wait_for_state
 from tests.fake_sane import FakeSaneModule
@@ -299,24 +300,38 @@ def test_recovery_failure_starts_the_worker_degraded(
 # --- Guarded close at shutdown (ROBU-06, D-07, D-09) -------------------------
 
 
-def test_shutdown_closes_resources_after_the_worker_stops(
+def test_shutdown_closes_resources_after_both_threads_stop(
     settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A confirmed stop is followed by closing Paperless, then the store."""
-    app = _build_app(settings)
+    """
+    Both threads confirm before anything closes (A-7).
+
+    The refresher holds the same Paperless client the worker does and may be
+    inside SANE, so the close sequence is owed *two* confirmed stops, not one.
+    """
+    scanner = StubScannerBackend()
+    app = create_app(settings, scanner)
+    app.state.paperless.get_tags = list
+    app.state.paperless.get_correspondents = list
     worker = app.state.worker
+    refresher = app.state.refresher
     store: JobStore = app.state.job_store
     paperless = app.state.paperless
     calls: list[str] = []
     original_stop = worker.stop
+    original_refresher_stop = refresher.stop
     original_paperless_close = paperless.close
     original_store_close = store.close
 
     def recording_stop() -> bool:
         calls.append("worker.stop")
         return original_stop()
+
+    def recording_refresher_stop() -> bool:
+        calls.append("refresher.stop")
+        return original_refresher_stop()
 
     def recording_paperless_close() -> None:
         calls.append("paperless.close")
@@ -326,19 +341,204 @@ def test_shutdown_closes_resources_after_the_worker_stops(
         calls.append("job_store.close")
         original_store_close()
 
+    def recording_scanner_close() -> None:
+        calls.append("scanner.close")
+
     monkeypatch.setattr(worker, "stop", recording_stop)
+    monkeypatch.setattr(refresher, "stop", recording_refresher_stop)
     monkeypatch.setattr(paperless, "close", recording_paperless_close)
     monkeypatch.setattr(store, "close", recording_store_close)
+    monkeypatch.setattr(scanner, "close", recording_scanner_close)
     caplog.set_level(logging.INFO, logger=_APP_LOGGER)
     with TestClient(app):
         pass
-    assert calls == ["worker.stop", "paperless.close", "job_store.close"]
+    assert calls == [
+        "worker.stop",
+        "refresher.stop",
+        "paperless.close",
+        "job_store.close",
+        "scanner.close",
+    ]
     assert any(
         record.name == _APP_LOGGER
         and record.levelno == logging.INFO
         and record.getMessage() == "App shutdown complete"
         for record in caplog.records
     )
+
+
+def test_both_stop_events_are_set_before_either_join_begins(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The two bounded joins overlap, so the worst case is one bound, not two.
+
+    Asserted on the recorded order of the internal event sets and joins rather
+    than on elapsed time: a timing assertion here would be a flake on a loaded
+    machine and would still not say *why* the shutdown was quick.
+    """
+    app = _build_app(settings)
+    worker = app.state.worker
+    refresher = app.state.refresher
+    events: list[str] = []
+    worker_set = worker._stopping.set
+    refresher_set = refresher._stopping.set
+    worker_join = worker._thread.join
+    refresher_join = refresher._thread.join
+
+    def recording_worker_set() -> None:
+        events.append("worker.set")
+        worker_set()
+
+    def recording_refresher_set() -> None:
+        events.append("refresher.set")
+        refresher_set()
+
+    def recording_worker_join(timeout: float | None = None) -> None:
+        events.append("worker.join")
+        worker_join(timeout=timeout)
+
+    def recording_refresher_join(timeout: float | None = None) -> None:
+        events.append("refresher.join")
+        refresher_join(timeout=timeout)
+
+    monkeypatch.setattr(worker._stopping, "set", recording_worker_set)
+    monkeypatch.setattr(refresher._stopping, "set", recording_refresher_set)
+    monkeypatch.setattr(worker._thread, "join", recording_worker_join)
+    monkeypatch.setattr(refresher._thread, "join", recording_refresher_join)
+    with TestClient(app):
+        pass
+    assert set(events) == {
+        "worker.set",
+        "refresher.set",
+        "worker.join",
+        "refresher.join",
+    }
+    last_set = max(events.index("worker.set"), events.index("refresher.set"))
+    first_join = min(events.index("worker.join"), events.index("refresher.join"))
+    assert last_set < first_join
+
+
+def test_the_refresher_starts_after_the_worker(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate accessor needs a live worker behind it before the first tick."""
+    app = _build_app(settings)
+    worker = app.state.worker
+    refresher = app.state.refresher
+    calls: list[str] = []
+    worker_start = worker.start
+    refresher_start = refresher.start
+
+    def recording_worker_start() -> None:
+        calls.append("worker.start")
+        worker_start()
+
+    def recording_refresher_start() -> None:
+        calls.append("refresher.start")
+        refresher_start()
+
+    monkeypatch.setattr(worker, "start", recording_worker_start)
+    monkeypatch.setattr(refresher, "start", recording_refresher_start)
+    with TestClient(app):
+        pass
+    assert calls == ["worker.start", "refresher.start"]
+
+
+def test_the_refresher_thread_runs_only_inside_the_lifespan(
+    settings: Settings,
+) -> None:
+    """Entering starts the thread; leaving joins it, so no test leaks one."""
+    app = _build_app(settings)
+    refresher = app.state.refresher
+    assert refresher._thread.is_alive() is False
+    with TestClient(app):
+        assert refresher._thread.is_alive() is True
+    assert refresher._thread.is_alive() is False
+
+
+def test_startup_runs_no_check_probe(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Server start is never delayed by a probe (D-04, D-06).
+
+    Nothing stamps a watcher across an empty lifespan, so the refresher's ticks
+    return before reaching the network and the cache is still cold afterwards --
+    which is precisely the state the first render shows as ``Checking…``.
+    """
+    calls: list[object] = []
+
+    def spy_run_checks(context: object) -> tuple[()]:
+        calls.append(context)
+        return ()
+
+    monkeypatch.setattr(refresher_module, "run_checks", spy_run_checks)
+    app = _build_app(settings)
+    with TestClient(app):
+        pass
+    assert calls == []
+    assert app.state.checks.current().results is None
+
+
+def test_shutdown_leaves_resources_open_when_the_refresher_does_not_stop(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A refresher still inside a probe closes nothing, even with the worker stopped.
+
+    This is Pitfall 1: ``paperless.close()`` under an in-flight probe raises
+    inside the refresher, and ``scanner.close()`` runs ``sane_exit()`` while a
+    ``sane_get_devices`` call may be outstanding, which ``sane_backend`` names
+    as a segfault risk.
+    """
+    scanner = StubScannerBackend()
+    app = create_app(settings, scanner)
+    app.state.paperless.get_tags = list
+    app.state.paperless.get_correspondents = list
+    refresher = app.state.refresher
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    calls: list[str] = []
+    real_refresher_stop = refresher.stop
+    real_store_close = store.close
+    real_paperless_close = paperless.close
+
+    def stuck_stop() -> bool:
+        return False
+
+    def spy_paperless_close() -> None:
+        calls.append("paperless.close")
+
+    def spy_store_close() -> None:
+        calls.append("job_store.close")
+
+    def spy_scanner_close() -> None:
+        calls.append("scanner.close")
+
+    monkeypatch.setattr(refresher, "stop", stuck_stop)
+    monkeypatch.setattr(paperless, "close", spy_paperless_close)
+    monkeypatch.setattr(store, "close", spy_store_close)
+    monkeypatch.setattr(scanner, "close", spy_scanner_close)
+    caplog.set_level(logging.INFO, logger=_APP_LOGGER)
+    try:
+        with TestClient(app):
+            pass
+        assert calls == []
+        assert any(
+            record.name == _APP_LOGGER
+            and record.levelno == logging.WARNING
+            and "refresher" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        # The real thread was signalled by the lifespan and is idle; join it
+        # and release what the app left open, so this test leaks nothing.
+        assert real_refresher_stop() is True
+        real_paperless_close()
+        real_store_close()
 
 
 def test_shutdown_leaves_resources_open_when_the_worker_does_not_stop(
