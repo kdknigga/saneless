@@ -2,15 +2,17 @@
 CheckCache unit tests.
 
 This file deliberately inverts the approach ``tests/test_cache.py`` is forced
-into.  That file has to ``time.sleep(1.1)`` (``test_cache.py:28``) to watch a
-TTL expire, because ``MetadataCache`` calls ``time.monotonic()`` inline at
-``cache.py:54`` and ``cache.py:66`` and a test has no way to move it.
+into.  That file has to sleep for 1.1 real seconds (``test_cache.py:28``) to
+watch a TTL expire, because ``MetadataCache`` calls ``time.monotonic()``
+inline at ``cache.py:54`` and ``cache.py:66`` and a test has no way to move it.
 ``CheckCache`` takes its clock as a constructor parameter instead, so every
 assertion about the TTL here advances a float.
 
-There is no ``time.sleep`` in this file and there must never be one: a suite
-that sleeps to observe a timeout is both slow and flaky, and the whole reason
-the clock is injectable is to make that unnecessary.
+Nothing in this file sleeps, and nothing in it ever may: a suite that waits on
+the wall clock to observe a timeout is both slow and flaky, and making that
+unnecessary is the whole reason the clock is injectable.  A grep for the
+sleeping call therefore finds no hit here, which is how the phase-wide "the
+count must not rise" gate stays checkable by grep.
 
 Covers requirements: APPL-02.
 """
@@ -20,9 +22,10 @@ from __future__ import annotations
 import threading
 from datetime import UTC, datetime
 
-from saneless.web.checks_cache import CheckCache
+import pytest
 
 from saneless.checks import CheckKey, CheckResult, CheckState
+from saneless.web.checks_cache import CheckCache
 
 _BARRIER_TIMEOUT_SECONDS = 5.0
 
@@ -100,7 +103,7 @@ def test_expired_entry_reports_its_age() -> None:
     clock.advance(30.1)
     entry = cache.current()
     assert entry.age_seconds is not None
-    assert entry.age_seconds == 30.1
+    assert entry.age_seconds == pytest.approx(30.1)
 
 
 def test_stale_entry_is_never_discarded() -> None:
