@@ -1149,7 +1149,7 @@ class TestDevicesCommand:
         arrive as an empty list and print a label with nothing after it.
         """
 
-        class _RangeScanner:
+        class _RangeScanner(StubScannerBackend):
             """A scanner whose device constrains resolution with a range."""
 
             def __init__(self, host: str = "") -> None:
@@ -1159,7 +1159,7 @@ class TestDevicesCommand:
                 """Return one device, named as the SANE test backend names it."""
                 return [DeviceInfo("test:0", "TestVendor", "TestModel", "scanner")]
 
-            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
                 """Report resolution as a range and give no word list at all."""
                 return DeviceCapabilities(
                     sources=["Flatbed", "Automatic Document Feeder"],
@@ -1200,7 +1200,7 @@ class TestCliFlags:
         )
         monkeypatch.setattr("saneless.cli.configure_logging", capture_logging)
 
-        class MockSaneBackend:
+        class MockSaneBackend(StubScannerBackend):
             """Mock scanner that returns no devices."""
 
             def __init__(self, host: str = "") -> None:
@@ -1229,7 +1229,7 @@ class TestCliFlags:
         monkeypatch.setattr("saneless.cli.load_settings", capture_load)
         monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: None)
 
-        class MockSaneBackend:
+        class MockSaneBackend(StubScannerBackend):
             """Mock scanner that returns no devices."""
 
             def __init__(self, host: str = "") -> None:
@@ -2254,7 +2254,7 @@ class TestAutoProfiles:
             )
         )
 
-        class _AutoScanner:
+        class _AutoScanner(StubScannerBackend):
             """Mock scanner for auto-profiles tests."""
 
             def __init__(self, host: str = "") -> None:
@@ -2264,7 +2264,7 @@ class TestAutoProfiles:
                 """Return configured device list."""
                 return _devices
 
-            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
                 """Return configured capabilities."""
                 return _caps
 
@@ -2514,7 +2514,7 @@ class TestTruncation:
         """Devices table truncates long device names with ellipsis."""
         long_name = "x" * 50
 
-        class LongNameScanner:
+        class LongNameScanner(StubScannerBackend):
             """Scanner returning a device with a very long name."""
 
             def __init__(self, host: str = "") -> None:
@@ -2524,7 +2524,7 @@ class TestTruncation:
                 """Return a device with a 50-character name."""
                 return [DeviceInfo(long_name, "Vendor", "Model", "scanner")]
 
-            def get_capabilities(self, _device_id: str) -> DeviceCapabilities:
+            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
                 """Return minimal capabilities."""
                 return DeviceCapabilities(
                     sources=["Flatbed"],

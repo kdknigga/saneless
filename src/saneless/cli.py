@@ -541,6 +541,12 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         ctx.exit(ExitCode.CONFIG)
 
     scanner = SaneBackend(host=settings.scanner.host)
+    # click runs close callbacks when this command's Context leaves its `with`
+    # block: on success, on ctx.exit(), and while an exception propagates --
+    # all of them before the guarded group's error handlers choose an exit
+    # code. So SANE is already down by the time the error line is printed, and
+    # no early exit path can skip it (D-18).
+    ctx.call_on_close(scanner.close)
     paperless = PaperlessClient(
         settings.paperless.url,
         settings.paperless.token.get_secret_value(),
@@ -638,6 +644,9 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     if not as_json:
         click.echo("Discovering scanners...")
     scanner = SaneBackend(host=_settings.scanner.host)
+    # Registered before the first SANE call, so an enumeration that fails still
+    # leaves the process with SANE shut down (D-18).
+    ctx.call_on_close(scanner.close)
     device_list = scanner.get_devices()
 
     if not device_list:
@@ -762,6 +771,10 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     except ScanError as exc:
         msg = f"The web server could not start: {exc}"
         raise ConfigError(msg) from exc
+    # No close callback here, unlike the three one-shot commands: this backend
+    # outlives the command body.  The app is handed it and the lifespan closes
+    # it once the worker confirms it stopped, which is the only point at which
+    # no thread can still be inside SANE (D-18).
     app = create_app(settings, scanner)
 
     # Check port availability before starting to give a clear error. A port
@@ -859,6 +872,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     settings = _load_cli_settings(ctx)
 
     scanner = SaneBackend(host=settings.scanner.host)
+    # This command ends through ctx.exit() as well as by returning and by
+    # raising; a close callback covers all three (D-18).
+    ctx.call_on_close(scanner.close)
     device_list = scanner.get_devices()
     if not device_list:
         # A setup problem, exit 2 through the guard, exactly as `scan` reports
