@@ -14,6 +14,7 @@ Key safety measures:
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -38,7 +39,9 @@ from saneless.scanner.base import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterator
+    from collections.abc import Callable, Generator, Iterator
+
+    from saneless.scanner.base import PageRecord, PageSink
 
 # python-sane is imported as a module-level name so that tests can
 # monkeypatch ``sane_backend.sane`` without the real C extension
@@ -122,9 +125,12 @@ _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 # iteration. This cap is what stops that loop (Phase 21 security finding W-01).
 #
 # WHAT IT DOES NOT BOUND: memory. At A4 300 dpi colour a page is roughly 26 MB,
-# so 500 pages is roughly 13 GB, and pipeline.py materialises pages with list().
-# This cap must not be described as a memory bound, because it is not one.
-# Bounding memory is Phase 29's HARD-01/HARD-02.
+# so at 500 pages a backend that accumulated them would hold roughly 13 GB.
+# This cap must not be described as a memory bound, because it is not one: the
+# bound is that a page is handed to the sink and forgotten as it arrives, so
+# peak memory is a small constant number of decoded pages whatever this cap is
+# (HARD-01, D-01). The two are independent, and raising this one is not a
+# memory decision.
 #
 # SCOPE: the cap is per scan_pages() call. Phase 25's two manual-duplex passes
 # each call scan_pages() separately, so this is a per-pass cap, not a per-job
@@ -628,6 +634,18 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     count at or above ``_MIN_PAGE_BYTES``. Both answer "did the device hand
     back something decodable?". Neither looks at what is printed on the page.
 
+    That byte count is arithmetic over the page's dimensions and band count,
+    never a materialised copy of its raw buffer: measuring the length of one
+    copied a whole 26 MB page to learn a number that width, height and band
+    count already give (M-08's cheap win, D-06). The product is exact for
+    ``L`` and ``RGB``, which are the only two modes a SANE ``snap()`` produces
+    on either path here. It would be eight times too large for mode ``"1"``,
+    where Pillow packs eight pixels into a byte, and a bilevel page would
+    therefore clear the ``_MIN_PAGE_BYTES`` floor on eight times less data
+    than it looks like. That is recorded rather than handled because nothing
+    in this project produces mode ``"1"``; a path that starts to must revisit
+    the floor rather than this formula.
+
     Blank-page policy deliberately does not live here. The profile exposes
     ``enable_empty_page_detection`` along with user-visible mean and stddev
     thresholds, so a page discarded at this level would be discarded behind the
@@ -650,8 +668,10 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
         )
         return False
 
-    # Check 2: Minimum file size (raw pixel data)
-    raw_size = len(page_image.tobytes())
+    # Check 2: Minimum file size (raw pixel data), computed from the page
+    # rather than copied out of it -- see the docstring's caveat about mode
+    # "1" before reusing this formula anywhere else.
+    raw_size = page_image.size[0] * page_image.size[1] * len(page_image.getbands())
     if raw_size < _MIN_PAGE_BYTES:
         logger.warning("Page %d: too small (%d bytes), skipping", page_num, raw_size)
         return False
@@ -700,10 +720,21 @@ def _next_page_with_timeout(
 
 def _acquire_pages(
     dev: SaneDevice,
+    sink: PageSink,
+    crop: Callable[[Image.Image], Image.Image],
     timeout_per_page: float,
-) -> tuple[list[Image.Image], int]:
+) -> tuple[list[PageRecord], int]:
     """
-    Return the validated ADF pages, and how many sheets were skipped.
+    Spool the validated ADF pages, and report how many sheets were skipped.
+
+    A page flows device -> validate -> crop -> ``sink.add`` -> record, one at a
+    time, and no list of images exists anywhere along it (HARD-01, D-01).  The
+    only image-typed name that outlives a loop iteration is the one page being
+    acquired, which is why the live-page high-water mark a 12-page scan
+    measures is 2 and not 1: the loop variable still references page *k-1*
+    while page *k* is being read.  That is left alone deliberately -- a ``del``
+    added to make the number 1 would exist only to satisfy a test
+    (29-RESEARCH.md Finding 4).
 
     ``multi_scan()`` returns an iterator object and cannot raise, so the call
     is not guarded.  python-sane's ``_SaneIterator.__next__`` converts exactly
@@ -736,23 +767,30 @@ def _acquire_pages(
 
     Args:
         dev: Open SANE device handle.
+        sink: Where each accepted page goes.  ``add`` is called exactly once
+            per accepted page, after it passed its integrity checks and was
+            cropped, and nothing here retains the image afterwards.
+        crop: Applied to each accepted page before the sink sees it, so what
+            is spooled is what the PDF embeds.  It is the caller's closure
+            over the paper size, the resolution the device chose and whether
+            the scan area was set on the device.
         timeout_per_page: Maximum seconds to wait for each page.
 
     Returns:
-        The validated pages, and how many fed sheets were skipped for failing
-        their integrity checks.  The count leaves the backend inside D-12's
-        ``ScanBatch`` and by no other route.
+        The records the sink returned, in acquisition order, and how many fed
+        sheets were skipped for failing their integrity checks.  The count
+        leaves the backend inside D-12's ``ScanBatch`` and by no other route.
 
     Raises:
         FeederEmptyError: If the feeder produced no pages at all.
         ScanError: If a page times out, the device reports a fault, the page
-            count runs past ``_MAX_ADF_PAGES``, or every fed page failed its
-            integrity checks.
+            count runs past ``_MAX_ADF_PAGES``, every fed page failed its
+            integrity checks, or the sink could not take a page.
 
     """
     iterator = dev.multi_scan()
 
-    pages: list[Image.Image] = []
+    records: list[PageRecord] = []
     page_num = 0
     # Returned to the caller now rather than kept local: surfacing this count is
     # D-07, and its channel is D-12's ScanBatch and no second mechanism. It is
@@ -801,9 +839,17 @@ def _acquire_pages(
                 rejected_pages += 1
                 continue
 
-            # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf)
+            # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf).  Before
+            # the crop rather than after it: Pillow copies ``info`` into the
+            # cropped result, so a strip afterwards would have to be repeated
+            # on whichever object came back.
             page_image.info.pop("exif", None)
-            pages.append(page_image)
+
+            # Cropped here, per page, instead of over a finished list
+            # afterwards.  The sink is where this page stops being ours, so
+            # everything that has to happen to it happens before the hand-off
+            # -- and what is spooled is exactly what the PDF embeds (D-03).
+            records.append(sink.add(crop(page_image)))
     finally:
         # Shut down the timeout executor
         executor.shutdown(wait=False)
@@ -824,7 +870,7 @@ def _acquire_pages(
         )
         raise ScanError(all_rejected_msg)
 
-    return pages, rejected_pages
+    return records, rejected_pages
 
 
 def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
@@ -1092,12 +1138,20 @@ def _read_options(dev: SaneDevice, device_id: str) -> list:
         raise ScanError(options_msg) from exc
 
 
-def _snap_flatbed(dev: SaneDevice, device_id: str) -> Image.Image:
+def _snap_flatbed(
+    dev: SaneDevice,
+    device_id: str,
+    sink: PageSink,
+    crop: Callable[[Image.Image], Image.Image],
+) -> PageRecord:
     """
-    Acquire one flatbed page, translating python-sane's errors.
+    Acquire one flatbed page, validate it, and spool it.
 
     ``start()`` opens the SANE data channel and ``snap()`` drains it, so the
-    two are wrapped together and nothing else is.
+    two are wrapped together and nothing else is.  The validate-crop-spool
+    sequence that follows is deliberately outside that guard: it is the same
+    sequence the feeder path runs, so one page reaches the sink the same way
+    however it was acquired (HARD-04's validation half, D-14).
 
     The one message python-sane's own ADF iterator treats as the end of the
     feed (``sane.py:130``) is mapped to ``FeederEmptyError`` by the same exact
@@ -1109,23 +1163,48 @@ def _snap_flatbed(dev: SaneDevice, device_id: str) -> Image.Image:
     Args:
         dev: Open SANE device handle, already configured.
         device_id: The SANE device name, for the error message.
+        sink: Where the page goes.  ``add`` is called exactly once, after the
+            page passed its integrity checks and was cropped.
+        crop: Applied to the page before the sink sees it.
 
     Returns:
-        The scanned page.
+        The record the sink returned for the one scanned page.
 
     Raises:
         FeederEmptyError: If SANE reports the feeder out of documents.
-        ScanError: For any other failure, chained to the original (D-08).
+        ScanError: If the page fails its integrity checks, or for any other
+            failure, chained to the original (D-08).
 
     """
     try:
         dev.start()
-        return dev.snap()
+        image = dev.snap()
     except Exception as exc:
         if str(exc) == "Document feeder out of documents":
             raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
         snap_msg = f"Scanner error on {device_id}: {describe(exc)}"
         raise ScanError(snap_msg) from exc
+
+    # The same two integrity checks the feeder path runs.  The reason once
+    # given for omitting them here -- that the caller sees any failure as an
+    # exception -- describes the case they are not for: a zero-dimension
+    # image, or a buffer too small to be a page, returned *successfully*.
+    # Such an image flowed into the crop and then into assemble_pdf, where
+    # saving it was the first thing to notice, while the identical page
+    # arriving from a feeder was skipped, counted and reported.
+    #
+    # Fatal here rather than skipped: a flatbed exposes one sheet at a time,
+    # so there is no next page to fall back to and nothing to carry on to.
+    if not _validate_page_image(image, 1):
+        unreadable_msg = (
+            "The scanner returned an unreadable page (zero dimensions, or "
+            f"below {_MIN_PAGE_BYTES} bytes of image data)"
+        )
+        raise ScanError(unreadable_msg)
+
+    # Strip EXIF from flatbed scans too, before the crop copies ``info``.
+    image.info.pop("exif", None)
+    return sink.add(crop(image))
 
 
 class SaneDevice(Protocol):
@@ -1298,10 +1377,12 @@ class SaneBackend(ScannerBackend):
     def _scan_adf_pages(
         self,
         dev: SaneDevice,
+        sink: PageSink,
+        crop: Callable[[Image.Image], Image.Image],
         timeout_per_page: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
-    ) -> tuple[list[Image.Image], int]:
+    ) -> tuple[list[PageRecord], int]:
         """
-        Return the validated ADF pages, with a per-page timeout.
+        Spool the validated ADF pages, with a per-page timeout.
 
         Per user decision: "Wrap ADF iteration with per-page timeout (not per-job)
         -- cancel if single page takes longer than 2-3x expected duration."
@@ -1313,18 +1394,22 @@ class SaneBackend(ScannerBackend):
 
         Args:
             dev: Open SANE device handle.
+            sink: Where each accepted page goes.
+            crop: Applied to each accepted page before the sink sees it.
             timeout_per_page: Maximum seconds to wait for each page.
 
         Returns:
-            The validated pages, and the count of fed sheets skipped for
-            failing their integrity checks.
+            The records the sink returned, and the count of fed sheets skipped
+            for failing their integrity checks.
 
         """
-        return _acquire_pages(dev, timeout_per_page)
+        return _acquire_pages(dev, sink, crop, timeout_per_page)
 
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
         """
-        Acquire pages from scanner.
+        Acquire pages from scanner, handing each one to the sink.
 
         Opens the device, validates the requested source against
         available options, sets scan parameters, and returns the finished
@@ -1336,6 +1421,14 @@ class SaneBackend(ScannerBackend):
         measures leave it at all: a generator hands back images only, and its
         return value is discarded by the ``list()`` every caller wrapped it in.
 
+        Eager is not the same as accumulating, though, and this method holds no
+        list of images on either path (HARD-01, D-01). Each page is validated,
+        cropped and handed to ``sink`` as it arrives, and what comes back is a
+        record: where the page was written and what was measured about it. The
+        sink belongs to the caller because where a page lands is a pipeline
+        fact -- the workspace, the ``tmp_dir`` under it, the pass label in the
+        file name -- and none of that is the backend's business.
+
         The device being closed by the time this returns is a **consequence**
         of that, not a goal -- the handle previously stayed open until the
         generator was drained or garbage-collected. Close-while-reading and
@@ -1345,15 +1438,19 @@ class SaneBackend(ScannerBackend):
         Args:
             device_id: SANE device identifier string.
             settings: Scan settings (source, resolution, mode).
+            sink: Where each accepted page goes, exactly once per page, after
+                validation and cropping.
 
         Returns:
-            A ScanBatch carrying the pages, the resolution the device actually
-            used, and how many fed sheets failed their integrity checks.
+            A ScanBatch carrying the records the sink returned, the resolution
+            the device actually used, and how many fed sheets failed their
+            integrity checks.
 
         Raises:
-            ScanError: If the device does not support the requested source, or
-                if a flatbed scan returns a page that fails its integrity
-                checks -- unlike a fed sheet, there is no next page to skip to.
+            ScanError: If the device does not support the requested source, if
+                a flatbed scan returns a page that fails its integrity checks
+                -- unlike a fed sheet, there is no next page to skip to -- or
+                if the sink could not take a page.
             FeederEmptyError: If the ADF feeder is empty.
 
         """
@@ -1410,54 +1507,34 @@ class SaneBackend(ScannerBackend):
                     use_adf,
                 )
 
+            # Bound once here and handed down, so both acquisition paths crop
+            # the same way and neither has to carry the three geometry facts
+            # as extra parameters past ruff's PLR0913 ceiling.  _maybe_crop
+            # itself is unchanged; only where it is called from moved.
+            crop: Callable[[Image.Image], Image.Image] = functools.partial(
+                _maybe_crop,
+                paper_size=settings.paper_size,
+                resolution=actual_resolution,
+                geometry_set=geometry_set,
+            )
+
             if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
-                acquired, pages_rejected = self._scan_adf_pages(dev)
+                records, pages_rejected = self._scan_adf_pages(dev, sink, crop)
             else:
                 # Flatbed: start() initiates the SANE data channel, then
                 # snap() drains it via sane_read() loop.  Without start()
-                # the read loop has no data source.
-                image = _snap_flatbed(dev, device_id)
-                # The same two integrity checks the feeder path runs.  The
-                # reason given for omitting them here -- that the caller sees
-                # any failure as an exception -- describes the case they are
-                # not for: a zero-dimension image, or a buffer too small to be
-                # a page, returned *successfully*.  Such an image flowed into
-                # _maybe_crop and then into assemble_pdf, where img.save() on a
-                # 0x0 image was the first thing to notice, while the identical
-                # page arriving from a feeder was skipped, counted and
-                # reported.
-                #
-                # Fatal here rather than skipped: a flatbed exposes one sheet
-                # at a time, so there is no next page to fall back to and
-                # nothing to carry on to.
-                if not _validate_page_image(image, 1):
-                    unreadable_msg = (
-                        "The scanner returned an unreadable page (zero "
-                        f"dimensions, or below {_MIN_PAGE_BYTES} bytes of "
-                        "image data)"
-                    )
-                    raise ScanError(unreadable_msg)
-                # Strip EXIF from flatbed scans too
-                image.info.pop("exif", None)
-                acquired = [image]
-                # Nothing was skipped: an unreadable sheet raised above.
+                # the read loop has no data source.  Validation and the crop
+                # live in there too, so one sheet reaches the sink by the same
+                # route however it was acquired.
+                records = [_snap_flatbed(dev, device_id, sink, crop)]
+                # Nothing was skipped: an unreadable sheet raised in there.
                 pages_rejected = 0
-
-            pages = [
-                _maybe_crop(
-                    page,
-                    settings.paper_size,
-                    actual_resolution,
-                    geometry_set=geometry_set,
-                )
-                for page in acquired
-            ]
 
         # Assembled inside the device context but returned outside it, so the
         # handle is released before the caller ever sees the batch.
         return ScanBatch(
-            pages=pages,
+            pages=tuple(records),
             actual_resolution=actual_resolution,
             pages_rejected=pages_rejected,
         )

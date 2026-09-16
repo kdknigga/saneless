@@ -8,6 +8,7 @@ scan settings.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -29,6 +30,8 @@ __all__ = [
     "SourceKind",
     "classify_source",
 ]
+
+logger = logging.getLogger(__name__)
 
 
 class SourceKind(StrEnum):
@@ -200,13 +203,17 @@ class ScanBatch:
     """
     The pages one acquisition produced, and what the device actually did.
 
-    Three fields, and deliberately no per-page structure. Phase 29's HARD-01
-    owns the ordered per-page record design -- which sheet produced which page,
-    in what order, with what per-page fault -- and an object that grew
-    page-level detail here would quietly pre-empt that decision. Do not extend
-    this casually: a fact that is per-page belongs to HARD-01, not here. It
-    deliberately carries no geometry either, because D-19 reuses the existing
-    crop fallback rather than reporting the area back out.
+    Three fields, and the per-page structure is now ``pages`` itself: the
+    ordered page records HARD-01 called for are that design, and every
+    per-page fact -- which file a sheet landed in, what was measured about it,
+    where it sat in the pass -- belongs on ``PageRecord`` rather than here.
+    What survives at batch level is exactly the two things the device reports
+    about the pass as a whole, so this stays the one channel carrying
+    ``actual_resolution`` and ``pages_rejected`` alongside the records and
+    there is no second route out of the backend (Phase 24 D-12, amended by
+    D-01). Do not extend this casually: a fact that is per-page belongs on the
+    record. It deliberately carries no geometry either, because D-19 reuses
+    the existing crop fallback rather than reporting the area back out.
 
     ``frozen=True`` is a departure from the plain ``@dataclass`` used by
     ``DeviceInfo``, ``DeviceCapabilities``, ``ScanSettings`` and
@@ -216,7 +223,13 @@ class ScanBatch:
     it afterwards.
 
     Attributes:
-        pages: The acquired pages, in the order the device produced them.
+        pages: The page records the sink produced, in document order. The
+            order of this tuple is the document order, and
+            ``PageRecord.sequence`` -- not the filesystem, not a glob, not a
+            sort -- is the proof of it (D-02). After a manual-duplex
+            interleave the spooled file names do not sort into document order
+            at all, so recovering order from the directory is not a shortcut
+            but a bug.
         actual_resolution: The resolution the device reported back, in whole
             dpi. Not the requested one -- SANE substitutes silently -- and it
             is the value both the crop arithmetic and the PDF's declared page
@@ -229,7 +242,7 @@ class ScanBatch:
 
     """
 
-    pages: list[Image.Image]
+    pages: tuple[PageRecord, ...]
     actual_resolution: int
     pages_rejected: int
 
@@ -322,7 +335,7 @@ class PageSink(ABC):
         page lands, writes it, and measures it. The caller must not retain the
         image afterwards -- a retained reference is exactly the accumulation
         this seam exists to prevent, and it would put the memory bound back
-        where Phase 29 found it.
+        where M-08 measured it.
 
         Args:
             image: The page the device produced, already cropped if the
@@ -362,9 +375,11 @@ class ScannerBackend(ABC):
         """
 
     @abstractmethod
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
         """
-        Acquire pages from scanner.
+        Acquire pages from scanner, handing each one to the sink.
 
         This returns a completed batch rather than yielding pages. A generator
         can only hand back images, and its return value is discarded by the
@@ -372,12 +387,60 @@ class ScannerBackend(ABC):
         measures -- the resolution the device settled on, and the sheets it
         could not read -- had no way out of the backend at all.
 
+        The *input* is a sink for the matching reason (D-01). The backend must
+        never hold more than one decoded page: peak memory is a property of
+        who holds a page, not of how the pages are produced, and a backend
+        that accumulated them would put HARD-01's bound back where M-08
+        measured it at 1395 MB for 48 pages. Where a page lands is not the
+        backend's business either -- the workspace, the ``tmp_dir`` under it
+        and the job id in its name are all pipeline facts -- so the caller
+        supplies the concrete sink and the backend only fills it.
+
+        Two alternatives were rejected (D-01). Going back to a generator
+        streams pages out but throws away the two measured facts again, which
+        is what Phase 24 moved away from. A bare callback with no declared
+        contract was rejected because neither type checker could see what it
+        promised, so neither a wrong argument nor a wrong return value would
+        have been caught anywhere.
+
         Args:
             device_id: SANE device identifier string.
             settings: Scan settings (source, resolution, mode).
+            sink: Where each accepted page goes. The backend calls ``add`` on
+                it exactly once per accepted page, after that page passed its
+                integrity checks and was cropped, and retains nothing
+                afterwards.
 
         Returns:
-            A ScanBatch carrying the pages, the resolution the device actually
-            used, and how many fed sheets failed their integrity checks.
+            A ScanBatch carrying the records the sink returned, the resolution
+            the device actually used, and how many fed sheets failed their
+            integrity checks.
 
         """
+
+    def close(self) -> None:
+        """
+        Release whatever this backend holds process-wide (D-18, N-04).
+
+        Deliberately **not** an ``@abstractmethod``, and the default body does
+        nothing but say so. Most backends hold no process-global resource at
+        all, so requiring the method would force an empty override onto every
+        test stub and buy nothing; the one implementation that does hold one,
+        ``SaneBackend``, overrides it to run the process-level SANE shutdown.
+        Declaring it here is what lets an entry point shut a backend down
+        through this abstraction instead of by naming the concrete class.
+
+        An implementation logs a close failure and never raises it. That is
+        the rule ``SaneBackend._open_device``'s ``finally`` block already
+        follows for ``dev.close()``, and it holds for the same reason: an
+        exception raised out of a close would replace the error that ended the
+        scan, which is the one the operator actually needs to see.
+
+        The DEBUG line is the body: a bare docstring would be an empty method
+        on an ABC, which ruff's ``B027`` flags precisely because such a method
+        is usually an unfinished override, and this project adds no ``noqa``
+        to say otherwise. Logging which backend declined to close says it in
+        code instead, and it is the line that tells an operator reading a
+        shutdown log that nothing was skipped by accident.
+        """
+        logger.debug("close() is a no-op for %s", type(self).__name__)
