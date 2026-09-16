@@ -92,9 +92,9 @@ How you confirm the flip depends on where you started the scan:
     Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:
     ```
 
-    Answering yes (or pressing Enter, since yes is the default) starts pass B. Answering no, pressing Ctrl-C, or closing input (Ctrl-D) cancels the scan: saneless prints `Manual duplex scan cancelled at the flip prompt` and exits with exit code 130. An error reading the terminal at the prompt is a failure, not a cancel: the scan fails straight away with a `Scan error: Flip prompt failed: ...` line and exit code 1, and the error is logged. Nothing is uploaded in either case.
+    Answering yes (or pressing Enter, since yes is the default) starts pass B. Answering no, pressing Ctrl-C, or closing input (Ctrl-D) cancels the scan: saneless prints `Manual duplex scan cancelled at the flip prompt` and exits with exit code 130. An error reading the terminal at the prompt is a failure, not a cancel: the scan fails straight away with a `Scan error: Flip prompt failed: ...` line and exit code 1, and the error is logged. Nothing is uploaded in either case -- but the two cases differ in what is kept. A cancel keeps nothing, because you chose to stop. A failure keeps the front sides pass A already scanned, as a PDF under `failed/` in the data directory, whose path the error names.
 
-Either way, the wait is bounded by `flip_timeout_seconds` in the `[output]` section (600 seconds by default). If nobody confirms the flip in time, the job fails with `Manual duplex flip wait timed out after 600 seconds: nobody confirmed the stack was flipped` and nothing is uploaded. A timeout is a failure, not a cancel: the web job ends as failed, and `saneless scan` exits with code 1. See [Configuration](../reference/configuration.md#output).
+Either way, the wait is bounded by `flip_timeout_seconds` in the `[output]` section (600 seconds by default). If nobody confirms the flip in time, the job fails with `Manual duplex flip wait timed out after 600 seconds: nobody confirmed the stack was flipped` and nothing is uploaded. The fronts are kept, as above: nobody decided to abandon the scan, so the sheets that were fed are preserved rather than thrown away. A timeout is a failure, not a cancel: the web job ends as failed, and `saneless scan` exits with code 1. See [Configuration](../reference/configuration.md#output).
 
 !!! warning "The CLI needs an interactive terminal for manual duplex"
     Someone has to flip the stack between the two passes, so `saneless scan` refuses a manual
@@ -157,9 +157,13 @@ empty_page_stddev_threshold = 5.0
 
 To tune the thresholds or disable empty page detection, see [Configure Scan Profiles](configure-scan-profiles.md).
 
-## Page count mismatch handling
+## When a manual duplex scan does not come out whole
 
-If the front and back pass produce different page counts during manual duplex, saneless does not discard your scans. Instead, it assembles the fronts and backs into separate PDFs and uploads both to paperless-ngx for manual review.
+saneless does not discard your scans, whichever way a manual duplex job goes wrong.
+
+If the front and back pass produce different page counts, it assembles the fronts and backs into separate PDFs and uploads both to paperless-ngx for manual review.
+
+If the job fails instead -- a fault during pass B, a pass B that fed nothing, a flip wait that timed out, or a flip prompt that could not be read -- nothing is uploaded, and the fronts pass A scanned (with any backs pass B managed before it failed) are preserved as separately named PDFs under `failed/` in the data directory. The error names the paths. The one manual duplex ending that keeps nothing is the one you chose: **Abort scan**, answering no, or Ctrl-C at the flip prompt.
 
 Empty page detection is deliberately skipped for these two partial PDFs, even when the profile has `enable_empty_page_detection = true`. When the passes disagree, a blank back side is evidence about why -- a sheet that double-fed, or one that did not feed at all -- and the partial PDFs exist so you can see exactly what each pass picked up. Removing blank pages would throw that evidence away. Every scan that does not hit a mismatch still has its blank pages removed as usual.
 
