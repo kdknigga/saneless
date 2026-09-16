@@ -3574,6 +3574,131 @@ def _preserved_page_dirs(failed_dir: Path) -> list[Path]:
     return sorted(entry for entry in failed_dir.iterdir() if entry.is_dir())
 
 
+class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
+    """
+    WR-03: D-10's page-file fallback now covers the *partial* assembly too.
+
+    It was wired only around ``run_pipeline``'s main ``assemble_pdf``. The
+    realistic trigger is the same fault twice over: D-07's per-page check
+    refuses a sheet because the disk is full, the partial-scan guard fires,
+    ``assemble_pdf`` then also cannot write, and every page the guard exists to
+    keep went out with the workspace at exactly the moment the operator most
+    needed them.
+    """
+
+    def test_an_unassemblable_partial_still_keeps_the_page_files(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Three sheets fed, no PDF possible: three PNGs survive anyway."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 4: Document feeder jammed")
+        scanner = _jamming_scanner(3, original)
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(ScanError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="No Partial Either",
+                    job_id="job-wr3-1",
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert sorted(entry.name for entry in kept[0].iterdir()) == [
+            "a-0001.png",
+            "a-0002.png",
+            "a-0003.png",
+        ]
+        assert all(entry.stat().st_size > 0 for entry in kept[0].iterdir())
+        message = str(excinfo.value)
+        # Both failures, then what was salvaged in spite of them.
+        assert "Document feeder jammed" in message
+        assert "img2pdf refused the page" in message
+        assert f"The 3 spooled page file(s) were preserved at {kept[0]}" in message
+        # The type is what carries the exit code and the error category, and a
+        # scan that could not be assembled is still a scan failure.
+        assert type(excinfo.value) is ScanError
+        assert excinfo.value.__cause__ is original
+
+    def test_the_fallback_keeps_both_passes_of_a_duplex_job(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A pass-B jam whose partials will not build keeps every sheet fed.
+
+        Nothing about the fallback is per-pass: the spool holds both passes'
+        files under their ``a-``/``b-`` labels, so one directory keeps them all.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 2 of pass B: Paper jam")
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _failing_in_pass_b(2, 1, original)
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(ScanError),
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Duplex No Partial",
+                    job_id="job-wr3-2",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert sorted(entry.name for entry in kept[0].iterdir()) == [
+            "a-0001.png",
+            "a-0002.png",
+            "b-0001.png",
+        ]
+
+    def test_a_cancel_still_keeps_nothing_at_all(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        D-10 is unchanged: the operator chose to stop, so nothing is filed.
+
+        The fallback lives inside the broad handler, below the cancel
+        re-raise, and this is the assertion that keeps it there.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = _jamming_scanner(2, ScanCancelledError("Scan cancelled"))
+
+        with pytest.raises(ScanCancelledError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Cancelled Anyway",
+                    job_id="job-wr3-3",
+                ),
+            )
+
+        assert _preserved_page_dirs(failed_dir) == []
+        assert not failed_dir.exists() or list(failed_dir.glob("*.pdf")) == []
+
+
 class TestPreservationNamesWhatItDidKeep:
     """
     WR-02: a preservation that got half-way must not report a total loss.

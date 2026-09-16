@@ -459,6 +459,26 @@ def _require_pages(batch: ScanBatch) -> None:
         raise ScanError(msg)
 
 
+def _spool_dir_of(tmp_path: Path) -> Path:
+    """
+    Name the one directory inside a job workspace that holds page files.
+
+    Three places need it and only one of them creates it: ``run_pipeline``,
+    and then the two preservation paths that have to reach the pages after a
+    failure. Composing the name once means a later rename cannot leave one of
+    them quietly looking in the wrong place.
+
+    Args:
+        tmp_path: The job workspace.
+
+    Returns:
+        The spool subdirectory. It exists for the whole of the workspace's
+        life; ``run_pipeline`` creates it before the first pass runs.
+
+    """
+    return tmp_path / _SPOOL_DIR_NAME
+
+
 def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     """
     Log one WARNING when preserved scans have piled up in ``failed_dir``.
@@ -829,8 +849,9 @@ def _preserving_partial_scan(
         ScanCancelledError: Re-raised untouched, before anything is preserved.
         SanelessError: Otherwise the original exception's own type, re-raised
             with the page count and the destination appended to its message --
-            or, if preserving failed too, naming both failures, because a user
-            told only that the feeder jammed while the pages were also
+            or, if preserving failed too, naming both failures, whatever did
+            survive, and the page directory the pages fell back to, because a
+            user told only that the feeder jammed while the pages were also
             destroyed has been actively misinformed.
         ScanError: When a non-saneless exception escaped acquisition.
             Rebuilding an arbitrary third-party exception from a single string
@@ -866,6 +887,18 @@ def _preserving_partial_scan(
             )
         except (OSError, PdfError) as keep_exc:
             msg = _preservation_failure_message(exc, keep_exc, failed_dir, destinations)
+            # D-10's page-file fallback, which until now was wired only around
+            # run_pipeline's main assembly.  The realistic trigger is the one
+            # that caused the partial in the first place: D-07's per-page check
+            # refuses a page because the disk is full, this guard fires, and
+            # the partial PDF cannot be written either.  Without this, the N
+            # pages the guard exists to keep went out with the workspace
+            # (WR-03).
+            kept_pages = _preserve_page_files_after_partial_failure(
+                _spool_dir_of(tmp_path), failed_dir, request
+            )
+            if kept_pages is not None:
+                msg = f"{msg}. {kept_pages}"
             if isinstance(exc, SanelessError):
                 raise type(exc)(msg) from exc
             raise ScanError(msg) from exc
@@ -880,6 +913,100 @@ def _preserving_partial_scan(
         if isinstance(exc, SanelessError):
             raise type(exc)(msg) from exc
         raise ScanError(msg) from exc
+
+
+def _move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> None:
+    """
+    Move every spooled page file into ``destination`` (D-10).
+
+    A plain function and not only a guard, because two failure windows want
+    it: the assembly ``_preserving_page_files`` wraps, and the *partial*
+    assembly ``_preserving_partial_scan`` falls back to it from (WR-03).
+
+    Each page moves to its own **explicit** destination path rather than into
+    the bare directory, for the reason ``_preserving``'s docstring sets out:
+    ``shutil.Error`` does not inherit from ``OSError`` and would escape both
+    callers' handlers. ``shutil`` rather than ``Path.rename`` because
+    ``tmp_dir`` and ``data_dir`` may be on different filesystems.
+
+    Args:
+        spool_dir: The job's spool, inside the workspace that is about to be
+            unwound -- which is why every caller has to run inside it.
+        destination: The job-keyed directory to move the pages into. Created
+            here, and only if there is at least one page to put in it, so a
+            failure with an empty spool leaves no empty directory behind.
+        moved: Appended to as each page lands, in name order. An out-parameter
+            for the same reason ``_preserve_partial_passes`` has one: when this
+            raises on page 7 of 12, the caller still has to be able to say
+            which six it kept (WR-02).
+
+    Raises:
+        OSError: If the directory cannot be created or a move fails. Whatever
+            had already moved stays moved, and stays named in ``moved``.
+
+    """
+    page_files = sorted(entry for entry in spool_dir.iterdir() if entry.is_file())
+    if not page_files:
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    for page_file in page_files:
+        target = destination / page_file.name
+        shutil.move(page_file, target)
+        moved.append(target)
+    # Once, after the loop, so the count reflects the finished state -- the
+    # same reason _preserving calls it there.
+    _warn_if_failed_dir_growing(destination.parent)
+
+
+def _preserve_page_files_after_partial_failure(
+    spool_dir: Path,
+    failed_dir: Path,
+    request: PipelineRequest,
+) -> str | None:
+    """
+    Keep the page files when the *partial* PDF could not be built either.
+
+    D-10 wires the page-file fallback around ``run_pipeline``'s main assembly,
+    and the partial assembly inside ``_preserve_partial_passes`` had none: a
+    disk that filled up mid-scan refused the page, fired the partial-scan
+    guard, refused the partial PDF as well, and every page was then deleted
+    with the workspace at exactly the moment the operator most needed them
+    (WR-03). The pages are what the guard exists to keep; the partial PDF was
+    only ever the convenient shape to keep them in.
+
+    A pass that *did* assemble is therefore preserved twice over -- once as its
+    partial PDF and again as its page files. That is deliberate on a
+    double-failure path: sorting out one redundant copy is a minute's work, and
+    the alternative is deciding which half of an already-broken job to throw
+    away.
+
+    Nothing escapes. This is a last resort reporting on a failure the caller is
+    already raising, so a failure *here* is logged and folded into "nothing
+    extra survived" rather than replacing the error the operator needs to see.
+
+    Args:
+        spool_dir: The job's spool, still inside the workspace.
+        failed_dir: The durable directory the job-keyed page directory goes in.
+        request: The job id and title that directory is named from.
+
+    Returns:
+        A sentence naming the count and the directory, or None when the spool
+        was empty or not one page could be moved.
+
+    """
+    destination = (
+        failed_dir / Path(build_pdf_filename(request.job_id, request.title)).stem
+    )
+    moved: list[Path] = []
+    try:
+        _move_page_files(spool_dir, destination, moved)
+    except OSError:
+        logger.warning(
+            "The spooled page files could not be preserved either", exc_info=True
+        )
+    if not moved:
+        return None
+    return f"The {len(moved)} spooled page file(s) were preserved at {destination}"
 
 
 @contextlib.contextmanager
@@ -899,18 +1026,10 @@ def _preserving_page_files(spool_dir: Path, destination: Path) -> Iterator[None]
     (T-29-34). Two jobs with the same title cannot collide, which matters here
     because a collision would bury one failure's pages inside another's.
 
-    Each page moves to its own **explicit** destination path rather than into
-    the bare directory, for the reason ``_preserving``'s docstring sets out:
-    ``shutil.Error`` does not inherit from ``OSError`` and would escape the
-    handler below. ``shutil`` rather than ``Path.rename`` because ``tmp_dir``
-    and ``data_dir`` may be on different filesystems.
-
     Args:
         spool_dir: The job's spool, inside the workspace that is about to be
             unwound -- which is why this guard has to run inside it.
-        destination: The job-keyed directory to move the pages into. Created
-            here, and only if there is at least one page to put in it, so a
-            failure with an empty spool leaves no empty directory behind.
+        destination: The job-keyed directory to move the pages into.
 
     Yields:
         Nothing. The block it wraps is the assembly attempt itself.
@@ -919,7 +1038,7 @@ def _preserving_page_files(spool_dir: Path, destination: Path) -> Iterator[None]
         SanelessError: The original exception's own type, re-raised with the
             page count and the destination appended -- so a ``PdfError`` stays
             a ``PdfError`` and keeps exit 4 and its error category -- or, if
-            the move failed too, naming both failures.
+            the move failed too, naming both failures and whatever did land.
         PdfError: When a non-saneless exception escaped assembly. Rebuilding an
             arbitrary third-party exception from a single string is not safe,
             and from the job's point of view anything raised in this window is
@@ -931,18 +1050,7 @@ def _preserving_page_files(spool_dir: Path, destination: Path) -> Iterator[None]
     except Exception as exc:
         moved: list[Path] = []
         try:
-            page_files = sorted(
-                entry for entry in spool_dir.iterdir() if entry.is_file()
-            )
-            if page_files:
-                destination.mkdir(parents=True, exist_ok=True)
-                for page_file in page_files:
-                    target = destination / page_file.name
-                    shutil.move(page_file, target)
-                    moved.append(target)
-                # Once, after the loop, so the count reflects the finished
-                # state -- the same reason _preserving calls it there.
-                _warn_if_failed_dir_growing(destination.parent)
+            _move_page_files(spool_dir, destination, moved)
         except OSError as move_exc:
             msg = _preservation_failure_message(exc, move_exc, destination, moved)
             if isinstance(exc, SanelessError):
@@ -1280,7 +1388,7 @@ def _handle_duplex_mismatch(
     # around that one would preserve the same two passes twice: once as the two
     # partial PDFs, and again as the page files they were built from.
     with _preserving_page_files(
-        tmp_path / _SPOOL_DIR_NAME,
+        _spool_dir_of(tmp_path),
         delivery.failed_dir
         / Path(build_pdf_filename(request.job_id, request.title)).stem,
     ):
@@ -1910,7 +2018,7 @@ def run_pipeline(
         #
         # A subdirectory rather than tmp_path itself, so the assembled PDF and
         # the duplex-mismatch halves are not written among the pages.
-        spool_dir = tmp_path / _SPOOL_DIR_NAME
+        spool_dir = _spool_dir_of(tmp_path)
         spool_dir.mkdir()
 
         acquisition = _AcquisitionContext(
