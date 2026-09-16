@@ -672,17 +672,30 @@ class JobStore:
         title: str,
         tags: list[int] | None = None,
         correspondent: int | None = None,
-        thumbnail: str | None = None,
+        owner_token: str | None = None,
     ) -> Job:
         """
         Create and persist a new job.
+
+        ``owner_token`` occupies the parameter slot ``thumbnail`` used to hold.
+        Nothing ever passed ``thumbnail`` to this method -- verified by grep
+        across ``src/`` and ``tests/`` before it was removed -- because
+        :meth:`update_thumbnail` is the live writer, called by the worker once
+        a scan has produced an image (``worker.py:1288``).  Spending the freed
+        slot rather than adding a sixth parameter is deliberate: ruff's
+        ``PLR0913`` ceiling is five non-``self`` parameters and it counts
+        keyword-only ones too, so a sixth would need either a suppression,
+        which this project does not write, or a frozen-dataclass bundle in the
+        shape of :class:`JobResult`.  Neither is warranted to make room for a
+        parameter that replaces a dead one.
 
         Args:
             profile: Scan profile name.
             title: Document title.
             tags: Optional list of tag IDs.
             correspondent: Optional correspondent ID.
-            thumbnail: Optional base64-encoded JPEG thumbnail.
+            owner_token: The submitting browser's opaque session token, or None
+                when the submission carried none.
 
         Returns:
             The newly created Job instance.
@@ -701,19 +714,34 @@ class JobStore:
                     None,  # error_category
                     json.dumps(tags or []),
                     correspondent,
-                    thumbnail,
+                    # thumbnail -- never a submission field.  update_thumbnail
+                    # writes it once the worker has an image to write
+                    # (worker.py:1288), which is why the parameter that used to
+                    # sit in this position could be spent on owner_token.
+                    None,
                     datetime.now(tz=UTC).isoformat(),
                     # A new job has recorded nothing yet, so every result
                     # column starts NULL -- deliberately, because NULL means
                     # "never recorded" rather than a measured zero.  finish_job
-                    # is the writer of the first five, once the run ends;
-                    # owner_token still has no writer.
+                    # is the writer of these five, once the run ends.
                     None,  # outcome
                     None,  # pages_scanned
                     None,  # pages_removed
                     None,  # pages_uploaded
                     None,  # warning
-                    None,  # owner_token
+                    # owner_token's first and only writer (D-23).  The value is
+                    # an opaque session token minted by the web layer and kept
+                    # for exactly one purpose: rendering the flip prompt to the
+                    # browser that submitted this job rather than to every
+                    # browser watching it.  NULL means the row is unowned and
+                    # the prompt is rendered for everyone -- which is every row
+                    # written before this phase, including a manual-duplex job
+                    # still in flight across an upgrade, so no migration
+                    # backfills it and none is needed.  It is a footgun guard,
+                    # not an authentication mechanism: the column already
+                    # existed unused, and guessing a token grants nothing a LAN
+                    # neighbour cannot already do.
+                    owner_token,
                 ),
             )
             # Read the row back inside the same transaction, before the commit:
@@ -929,6 +957,30 @@ class JobStore:
             rows = self._conn.execute(_SELECT_RECENT, (limit,)).fetchall()
         return [self._row_to_job(row) for row in rows]
 
+    def _pending_jobs(self) -> list[Job]:
+        """
+        Read the queue oldest-first, without taking the lock.
+
+        The shared body of :meth:`list_pending` and :meth:`queue_position`.
+        Private and unlocked deliberately: both public callers already carry
+        ``@_locked``, and a public method may not call another public one --
+        ``sqlite3`` connection context managers do not nest, so an inner ``with
+        self._conn:`` commits the outer method's transaction early.  Factoring
+        the query here, rather than letting ``queue_position`` write a second
+        ``ORDER BY``, is what makes it impossible for a job's position and the
+        list it is a position into to disagree.
+
+        Returns:
+            List of Job instances awaiting a scanner, ordered by creation time
+            ascending.
+
+        """
+        with self._conn:
+            rows = self._conn.execute(
+                _LIST_PENDING, (JobState.PENDING.value,)
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
     @_locked
     def list_pending(self) -> list[Job]:
         """
@@ -941,20 +993,58 @@ class JobStore:
         variable-length ``IN`` ``fail_active_jobs`` needs -- but the state value
         is still bound rather than written into the statement text.
 
-        This method has NO production caller in this phase.  Showing a job its
-        position in the queue is APPL-08, which belongs to Phase 30; until then
-        its tests are its only consumer.
+        No production caller wants this list *as* a list.  What production
+        wants from the ordering is one job's place in it, which
+        :meth:`queue_position` reports for the status area's "N ahead of you"
+        line (APPL-08).  Both methods read it through ``_pending_jobs``, so
+        this method is the ordering's public shape and its tests are the
+        ordering's proof.
 
         Returns:
             List of Job instances awaiting a scanner, ordered by creation time
             ascending.
 
         """
-        with self._conn:
-            rows = self._conn.execute(
-                _LIST_PENDING, (JobState.PENDING.value,)
-            ).fetchall()
-        return [self._row_to_job(row) for row in rows]
+        return self._pending_jobs()
+
+    @_locked
+    def queue_position(self, job_id: str) -> int | None:
+        """
+        Count the queued jobs ahead of one job.
+
+        Zero-based: the job at the head of the queue has nothing ahead of it
+        and answers ``0``.  The UI adds nothing to the number -- it renders
+        ``(next in line)`` for ``0`` rather than ``(0 ahead of you)``, which is
+        technically true and reads like a bug -- and ``(N ahead of you)`` for
+        anything higher (UI-SPEC S5, APPL-08).
+
+        ``None`` means the job is not waiting.  A job that has left ``PENDING``
+        and an id no row carries both answer ``None``, because both mean the
+        same thing to the status area: there is no queue line to render.
+
+        Walks :meth:`list_pending`'s ordering through the shared
+        ``_pending_jobs`` query rather than asking the database for a rank.  A
+        second ``ORDER BY`` -- or a ``COUNT(*)`` over a hand-written predicate
+        -- would be a second definition of "ahead", and two definitions that
+        agree today drift tomorrow.  The queue is bounded by the submission
+        cap, so reading it is cheaper than keeping the two in step by hand.
+
+        Args:
+            job_id: The job to locate in the queue.
+
+        Returns:
+            The zero-based number of pending jobs ahead of job_id, or None when
+            that job is not pending.
+
+        """
+        return next(
+            (
+                position
+                for position, job in enumerate(self._pending_jobs())
+                if job.id == job_id
+            ),
+            None,
+        )
 
     @_locked
     def latest_run_job(self, exclude_ids: AbstractSet[str] = frozenset()) -> Job | None:

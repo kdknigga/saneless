@@ -2,7 +2,7 @@
 JobStore migration, list, prune, and error category tests.
 
 Covers requirements: UI-05, UI-06, PKG-01, STOR-01, STOR-02, STOR-03, STOR-04,
-STOR-05.
+STOR-05, APPL-08, APPL-09.
 """
 
 from __future__ import annotations
@@ -179,6 +179,41 @@ case rules out both "every active job" and "every job" as the predicate.
 
 QUEUE_BASE_HOURS = 1
 """How far back the ordering case's oldest queued job is backdated."""
+
+QUEUE_POSITION_ROWS = 5
+"""Jobs the queue_position agreement case creates.
+
+Enough that two can be moved out of PENDING from the middle of the queue and
+three still remain, so an implementation that counted rows rather than reading
+the queue ordering would report the wrong index for the survivors.
+"""
+
+CREATE_JOB_PARAMETERS = (
+    "self",
+    "profile",
+    "title",
+    "tags",
+    "correspondent",
+    "owner_token",
+)
+"""The exact parameter tuple ``JobStore.create_job`` is pinned to (APPL-09).
+
+Five non-``self`` parameters is ruff's ``PLR0913`` ceiling, and this project
+adds no suppressions.  Spelled out here so a sixth parameter cannot be added
+without editing a constant whose docstring says why it may not be, and so
+``thumbnail`` cannot be silently restored to the slot ``owner_token`` now holds
+(RESEARCH Pitfall 5).
+"""
+
+OWNER_TOKEN = "owner-token-4NcRfUjXn2r5u8x_A?D(G+KbPeShVmYq"
+"""A recognisable stand-in for the opaque browser token the web layer mints.
+
+Deliberately unlike any other value a jobs row holds, so the column-scan case
+can assert the string reached ``owner_token`` and no other text column.
+"""
+
+OTHER_OWNER_TOKEN = "owner-token-Z6w9z$C&F)J@McQfTjWnZr4u7x!A"
+"""A second token, for proving two jobs keep their own owners apart."""
 
 
 def _build_s3_schema(db_path: str) -> None:
@@ -1846,5 +1881,215 @@ class TestCreateRejectedJob:
             assert latest is not None
             assert latest.id == done_id
             assert store.list_recent(limit=1)[0].id == rejected.id
+        finally:
+            store.close()
+
+
+class TestOwnerToken:
+    """create_job's owner_token: round-trip, NULL-means-unowned, and the arg cap."""
+
+    def test_create_job_records_the_owner_token_it_was_given(self) -> None:
+        """A job created with an owner token carries it and re-reads it (APPL-09)."""
+        store = JobStore()
+        try:
+            job = store.create_job(
+                profile="default", title="Owned Doc", owner_token=OWNER_TOKEN
+            )
+
+            assert job.owner_token == OWNER_TOKEN
+            # Re-read rather than trusting the returned object: the point of
+            # the change is that the column now has a writer, not that the
+            # dataclass can hold the value (it already could -- job.py:501).
+            reread = store.get_job(job.id)
+            assert reread is not None
+            assert reread.owner_token == OWNER_TOKEN
+        finally:
+            store.close()
+
+    def test_create_job_without_an_owner_token_reads_back_none(self) -> None:
+        """An unowned job stores NULL, which is what every older row holds (D-23)."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="Unowned Doc")
+
+            assert job.owner_token is None
+            reread = store.get_job(job.id)
+            assert reread is not None
+            assert reread.owner_token is None
+        finally:
+            store.close()
+
+    def test_create_job_parameter_tuple_ends_at_owner_token(self) -> None:
+        """create_job's parameters are pinned to five non-self names (APPL-09)."""
+        # A pin against two separate regressions: a sixth parameter, which
+        # would trip PLR0913 and tempt a suppression, and a silent restoration
+        # of `thumbnail` to the slot owner_token now occupies.
+        parameters = tuple(inspect.signature(JobStore.create_job).parameters)
+
+        assert parameters == CREATE_JOB_PARAMETERS
+        assert "thumbnail" not in parameters
+
+    def test_create_rejected_job_still_records_a_null_owner_token(self) -> None:
+        """A refused submit is still unowned and still recorded nothing (D-05)."""
+        store = JobStore()
+        try:
+            job = store.create_rejected_job(
+                "default", "Refused", error=WORKER_DOWN_JOB_ERROR
+            )
+
+            assert job.owner_token is None
+            assert job.pages_scanned is None
+            assert job.pages_removed is None
+            assert job.pages_uploaded is None
+            reread = store.get_job(job.id)
+            assert reread is not None
+            assert reread.owner_token is None
+        finally:
+            store.close()
+
+    def test_owner_token_reaches_no_other_text_column(self) -> None:
+        """The token lands in owner_token alone -- never in error or title (T-30-09)."""
+        store = JobStore()
+        try:
+            job = store.create_job(
+                profile="default", title="Leak Check", owner_token=OWNER_TOKEN
+            )
+
+            row = store._conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job.id,)
+            ).fetchone()
+            columns = list(row.keys())
+            carrying = [
+                name
+                for name in columns
+                if isinstance(row[name], str) and OWNER_TOKEN in row[name]
+            ]
+
+            assert carrying == ["owner_token"], (
+                f"the owner token reached {', '.join(carrying)}"
+            )
+            assert job.error is None
+            assert job.title == "Leak Check"
+        finally:
+            store.close()
+
+    def test_two_jobs_keep_their_own_owner_tokens(self) -> None:
+        """Two owned jobs do not share or overwrite each other's token (D-23)."""
+        store = JobStore()
+        try:
+            first = store.create_job(
+                profile="default", title="First", owner_token=OWNER_TOKEN
+            )
+            second = store.create_job(
+                profile="default", title="Second", owner_token=OTHER_OWNER_TOKEN
+            )
+            unowned = store.create_job(profile="default", title="Third")
+
+            assert [job.owner_token for job in (first, second, unowned)] == [
+                OWNER_TOKEN,
+                OTHER_OWNER_TOKEN,
+                None,
+            ]
+        finally:
+            store.close()
+
+    def test_owner_token_survives_a_close_and_reopen(self, tmp_path: Path) -> None:
+        """Both the written token and a NULL one are durable on disk (APPL-09)."""
+        db_path = str(tmp_path / "jobs.db")
+        store = JobStore(db_path=db_path)
+        try:
+            owned_id = store.create_job(
+                profile="default", title="Owned", owner_token=OWNER_TOKEN
+            ).id
+            unowned_id = store.create_job(profile="default", title="Unowned").id
+        finally:
+            store.close()
+
+        reopened = JobStore(db_path=db_path)
+        try:
+            owned = reopened.get_job(owned_id)
+            unowned = reopened.get_job(unowned_id)
+
+            assert owned is not None
+            assert unowned is not None
+            assert owned.owner_token == OWNER_TOKEN
+            # A row written with no owner stays NULL across the reopen: NULL
+            # means unowned, and no migration backfills it (RESEARCH OQ 1).
+            assert unowned.owner_token is None
+        finally:
+            reopened.close()
+
+
+class TestQueuePosition:
+    """queue_position(): the zero-based "N ahead of you" source (APPL-08)."""
+
+    def test_queue_position_counts_the_jobs_ahead_of_each_pending_job(self) -> None:
+        """Three jobs queued in order report 0, 1 and 2 ahead (APPL-08)."""
+        store = JobStore()
+        try:
+            first, second, third = _create_in_order(store, 3)
+
+            positions = [
+                store.queue_position(job_id) for job_id in (first, second, third)
+            ]
+
+            # Zero-based: the job at the head of the queue has nothing ahead of
+            # it, which the UI renders as "(next in line)" rather than the
+            # technically-true "(0 ahead of you)" (UI-SPEC S5).
+            assert positions == [0, 1, 2]
+        finally:
+            store.close()
+
+    def test_queue_position_of_a_job_that_is_not_pending_is_none(self) -> None:
+        """A job that has left PENDING is not waiting, so it has no position."""
+        store = JobStore()
+        try:
+            running, waiting = _create_in_order(store, 2)
+            store.update_state(running, JobState.SCANNING)
+
+            assert store.queue_position(running) is None
+            # The job behind it moves up: the running job is no longer counted.
+            assert store.queue_position(waiting) == 0
+        finally:
+            store.close()
+
+    def test_queue_position_of_an_unknown_job_id_is_none(self) -> None:
+        """An id no row carries is not in the queue, so it has no position."""
+        store = JobStore()
+        try:
+            _create_in_order(store, 2)
+
+            assert store.queue_position("not-a-job-id") is None
+        finally:
+            store.close()
+
+    def test_queue_position_agrees_with_list_pending_ordering(self) -> None:
+        """Every pending job's position is its index in list_pending (APPL-08)."""
+        store = JobStore()
+        try:
+            created = _create_in_order(store, QUEUE_POSITION_ROWS)
+            store.update_state(created[1], JobState.SCANNING)
+            store.finish_job(created[3], JobState.DONE)
+
+            listed = [job.id for job in store.list_pending()]
+
+            # The two must be computed from one ordering, not two that happen
+            # to agree today: a second ORDER BY is what drifts.
+            assert listed == [created[0], created[2], created[4]]
+            assert [store.queue_position(job_id) for job_id in listed] == list(
+                range(len(listed))
+            )
+            for job_id in (created[1], created[3]):
+                assert store.queue_position(job_id) is None
+        finally:
+            store.close()
+
+    def test_queue_position_on_an_empty_store_is_none(self) -> None:
+        """An empty queue answers None rather than raising (APPL-08)."""
+        store = JobStore()
+        try:
+            assert store.list_pending() == []
+
+            assert store.queue_position("not-a-job-id") is None
         finally:
             store.close()
