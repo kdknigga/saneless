@@ -22,17 +22,21 @@ already proven.  No test here sleeps.
 
 from __future__ import annotations
 
+import os
 import socket
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import httpx
 import pytest
 
 from saneless import checks
 from saneless.checks import (
     PROBE_CONNECT_SECONDS,
+    PROBE_READ_SECONDS,
     SANED_PORT,
+    CheckContext,
     CheckKey,
     CheckResult,
     CheckState,
@@ -42,15 +46,41 @@ from saneless.checks import (
     check_state_class,
     check_state_glyph,
     check_state_label,
+    run_checks,
     worst_state,
 )
+from saneless.config import (
+    OutputConfig,
+    PaperlessConfig,
+    ProfileConfig,
+    ScannerConfig,
+    Settings,
+)
+from saneless.exceptions import ScanError
+from saneless.paperless import PaperlessClient
+from saneless.scanner.base import DeviceInfo
+from saneless.vocabulary import (
+    ConnectionStatus,
+    ProfileStorage,
+    connection_status_message,
+)
+from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 # Loopback connects resolve or refuse immediately, so a short budget keeps a
 # hung test from burning the suite's 60 s timeout.
 _PROBE_BUDGET = 0.5
+
+# A token that is not a placeholder, so the Paperless check reaches its probe.
+_REAL_TOKEN = "a-real-looking-token"
+
+# Skips the two writability tests when the suite runs as root, for whom a
+# directory with no write bit is writable anyway.
+_NOT_ROOT = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores the write bit, so the case cannot exist"
+)
 
 
 @pytest.fixture
@@ -407,3 +437,1028 @@ class TestImportHygiene:
         )
         offenders = [line for line in source.splitlines() if line.startswith(forbidden)]
         assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# The five checks
+# ---------------------------------------------------------------------------
+
+
+class _CountingBackend(StubScannerBackend):
+    """A backend that reports what it is told to and counts the times it is asked."""
+
+    def __init__(self, devices: list[DeviceInfo] | None = None) -> None:
+        """
+        Record the devices this backend will report.
+
+        Args:
+            devices: What ``get_devices`` should return; empty when omitted.
+
+        """
+        self.devices = devices if devices is not None else []
+        self.calls = 0
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Report the configured devices and count the call.
+
+        Returns:
+            The devices this stub was built with.
+
+        """
+        self.calls += 1
+        return self.devices
+
+
+class _RaisingBackend(StubScannerBackend):
+    """A backend whose enumeration fails the way a wedged SANE fails."""
+
+    def __init__(self) -> None:
+        """Start with no calls recorded."""
+        self.calls = 0
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Fail the way ``SaneBackend.get_devices`` fails.
+
+        Returns:
+            Never returns.
+
+        Raises:
+            ScanError: Always.
+
+        """
+        self.calls += 1
+        msg = "SANE is wedged"
+        raise ScanError(msg)
+
+
+def _device(vendor: str = "Brother", model: str = "ADS-2700W") -> DeviceInfo:
+    """
+    Build a DeviceInfo whose SANE id names a host, as a net-backend id does.
+
+    Args:
+        vendor: The device's vendor string.
+        model: The device's model string.
+
+    Returns:
+        A DeviceInfo for the scanner check to describe.
+
+    """
+    return DeviceInfo(
+        name="net:scanbox.lan:brother5:bus0;dev1",
+        vendor=vendor,
+        model=model,
+        device_type="scanner",
+    )
+
+
+class _RequestCounter:
+    """Counts the HTTP requests a Paperless check issues, and their timeouts."""
+
+    def __init__(self, responder: Callable[[httpx.Request], httpx.Response]) -> None:
+        """
+        Wrap a responder so every call through it is recorded.
+
+        Args:
+            responder: What the stub server answers with.
+
+        """
+        self.responder = responder
+        self.count = 0
+        self.timeouts: list[dict[str, float | None]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Record the request and delegate to the responder.
+
+        Args:
+            request: The request the client issued.
+
+        Returns:
+            Whatever the responder answers.
+
+        """
+        self.count += 1
+        self.timeouts.append(request.extensions["timeout"])
+        return self.responder(request)
+
+
+def _ok_response(_request: httpx.Request) -> httpx.Response:
+    """
+    Answer every request with an empty, successful tag page.
+
+    Args:
+        _request: Ignored.
+
+    Returns:
+        A 200 with an empty result list.
+
+    """
+    return httpx.Response(200, json={"count": 0, "results": []})
+
+
+def _paperless(
+    counter: _RequestCounter, url: str = "http://paperless:8000"
+) -> PaperlessClient:
+    """
+    Build a Paperless client wired to a counting mock transport.
+
+    Args:
+        counter: The recorder every request passes through.
+        url: The base URL to configure.
+
+    Returns:
+        A client that issues no real network traffic.
+
+    """
+    return PaperlessClient(
+        url=url, token=_REAL_TOKEN, _transport=httpx.MockTransport(counter)
+    )
+
+
+def _settings(
+    tmp_path: Path,
+    *,
+    host: str = "",
+    token: str = _REAL_TOKEN,
+    consume_dir: str = "",
+    data_dir: str | None = None,
+) -> Settings:
+    """
+    Build a Settings object whose every path is inside the test's tmp_path.
+
+    Args:
+        tmp_path: The test's own directory.
+        host: The configured ``scanner.host``.
+        token: The configured paperless token.
+        consume_dir: The fallback folder, empty when not configured.
+        data_dir: The data folder; defaults to a writable one under tmp_path.
+
+    Returns:
+        A Settings instance touching nothing outside tmp_path.
+
+    """
+    if data_dir is None:
+        resolved = tmp_path / "data"
+        resolved.mkdir(exist_ok=True)
+        data_dir = str(resolved)
+    return Settings(
+        scanner=ScannerConfig(host=host, device="test:device:001"),
+        paperless=PaperlessConfig(
+            url="http://paperless:8000", token=token, consume_dir=consume_dir
+        ),
+        output=OutputConfig(
+            tmp_dir=str(tmp_path / "tmp"),
+            data_dir=data_dir,
+            log_file=str(tmp_path / "saneless.log"),
+        ),
+        profiles={"default": ProfileConfig()},
+    )
+
+
+def _with_profiles(settings: Settings, profiles: dict[str, ProfileConfig]) -> Settings:
+    """
+    Return the same settings carrying a different profile set.
+
+    Args:
+        settings: The base settings.
+        profiles: The profiles to substitute, possibly none at all.
+
+    Returns:
+        A copy whose ``profiles`` is exactly what was passed.
+
+    """
+    return settings.model_copy(update={"profiles": profiles})
+
+
+def _context(
+    settings: Settings,
+    *,
+    scanner: StubScannerBackend | None = None,
+    paperless: PaperlessClient | None = None,
+    profile_storage: ProfileStorage = ProfileStorage.PERSISTED,
+    skip_scanner: bool = False,
+) -> CheckContext:
+    """
+    Assemble a CheckContext from the pieces a test cares about.
+
+    Args:
+        settings: The configuration the checks read.
+        scanner: The backend, or None for "python-sane is not installed".
+        paperless: The client, or None for "no usable client was built".
+        profile_storage: What the worker's profile write actually did.
+        skip_scanner: Whether a scan is running.
+
+    Returns:
+        A ready CheckContext.
+
+    """
+    return CheckContext(
+        settings=settings,
+        scanner=scanner,
+        paperless=paperless,
+        profile_storage=profile_storage,
+        skip_scanner=skip_scanner,
+    )
+
+
+def _row(results: tuple[CheckResult, ...], key: CheckKey) -> CheckResult:
+    """
+    Pick one check's row out of a full run.
+
+    Args:
+        results: Everything ``run_checks`` returned.
+        key: The row wanted.
+
+    Returns:
+        The single result carrying that key.
+
+    """
+    return next(result for result in results if result.key is key)
+
+
+class TestScannerCheck:
+    """The Scanner row, including the pre-probe that keeps it fast (APPL-02)."""
+
+    def test_a_named_device_is_ready(self, tmp_path: Path) -> None:
+        """
+        A reported device is named in the row a household member reads.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        results = run_checks(_context(_settings(tmp_path), scanner=backend))
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.OK
+        assert row.message == "Brother ADS-2700W is ready."
+        assert row.next_step == ""
+
+    def test_an_unnamed_device_is_just_ready(self, tmp_path: Path) -> None:
+        """
+        A device the backend cannot describe still reports ready.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device(vendor="", model="")])
+        results = run_checks(_context(_settings(tmp_path), scanner=backend))
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.OK
+        assert row.message == "Ready."
+
+    def test_the_sane_device_id_is_never_rendered(self, tmp_path: Path) -> None:
+        """
+        The row names the model, never the SANE id, which embeds the host.
+
+        A ``net`` backend device id is ``net:<host>:<backend>:...``.  Putting
+        it on the index page would publish a LAN address to everyone who can
+        load the page, which is the same reason the fallback row omits the
+        folder path (ASVS V7, T-30-21).
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        results = run_checks(_context(_settings(tmp_path), scanner=backend))
+        row = _row(results, CheckKey.SCANNER)
+        assert "scanbox.lan" not in row.message
+        assert "net:" not in row.message
+
+    def test_no_devices_is_not_reachable(self, tmp_path: Path) -> None:
+        """
+        A backend that finds nothing is reported as not reachable.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(_context(_settings(tmp_path), scanner=_CountingBackend()))
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.FAIL
+        assert row.message == "Not reachable."
+        assert row.next_step == (
+            "Check the scanner is switched on and connected, then press Check again."
+        )
+
+    def test_a_raising_backend_is_not_reachable(self, tmp_path: Path) -> None:
+        """
+        An enumeration that throws is a red row, not a crash.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(_context(_settings(tmp_path), scanner=_RaisingBackend()))
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.FAIL
+        assert row.message == "Not reachable."
+
+    def test_no_scanner_support_is_its_own_row(self, tmp_path: Path) -> None:
+        """
+        A machine without python-sane gets the A-1 row, not a refusal to run.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(_context(_settings(tmp_path), scanner=None))
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.FAIL
+        assert row.message == "Scanner support is not installed on this machine."
+        assert (
+            row.next_step == "Install saneless with scanner support, then restart it."
+        )
+
+    def test_a_skipped_scanner_makes_no_backend_call(self, tmp_path: Path) -> None:
+        """
+        D-08: while a scan runs the backend is not touched at all.
+
+        Nothing in ``sane_backend.py`` mutually excludes two SANE calls, so
+        this is correctness rather than politeness -- a status probe landing on
+        the device mid-scan is a second caller into the same C library.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        results = run_checks(
+            _context(_settings(tmp_path), scanner=backend, skip_scanner=True)
+        )
+        row = _row(results, CheckKey.SCANNER)
+        assert backend.calls == 0
+        assert row.skipped is True
+        assert row.message == "Not checked while a scan is running."
+
+    def test_a_skipped_scanner_is_not_red(self, tmp_path: Path) -> None:
+        """
+        The skipped row does not turn a scripted health gate red.
+
+        A scan in flight is direct evidence the scanner was working moments
+        ago, so "we did not look" is reported as ``OK`` with ``skipped`` set
+        rather than as a failure.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        results = run_checks(
+            _context(_settings(tmp_path), scanner=backend, skip_scanner=True)
+        )
+        assert _row(results, CheckKey.SCANNER).state is CheckState.OK
+        assert worst_state(results) is not CheckState.FAIL
+
+    def test_a_closed_saned_port_skips_the_backend(self, tmp_path: Path) -> None:
+        """
+        An unplugged sane-net host answers in about two seconds, not two minutes.
+
+        The pre-probe is the whole mitigation for T-30-22: ``get_devices()``
+        has no timeout at any layer, so the only way not to hang is not to
+        call it.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host=f"127.0.0.1:{_closed_port()}")
+        results = run_checks(_context(settings, scanner=backend))
+        row = _row(results, CheckKey.SCANNER)
+        assert backend.calls == 0
+        assert row.state is CheckState.FAIL
+        assert row.message == "Not reachable."
+
+    def test_a_listening_saned_port_reaches_the_backend(
+        self, tmp_path: Path, listening_port: int
+    ) -> None:
+        """
+        A reachable host costs one extra handshake and then behaves as before.
+
+        Args:
+            tmp_path: The test's own directory.
+            listening_port: A loopback port the fixture is listening on.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host=f"127.0.0.1:{listening_port}")
+        results = run_checks(_context(settings, scanner=backend))
+        assert backend.calls == 1
+        assert _row(results, CheckKey.SCANNER).state is CheckState.OK
+
+    def test_no_configured_host_is_never_pre_probed(self, tmp_path: Path) -> None:
+        """
+        A USB deployment has no TCP to probe, so the backend runs directly.
+
+        This is also the fallback that cannot produce a false FAIL: when there
+        is no entry to dial, no probe runs and the check behaves exactly as it
+        did before the probe existed.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        results = run_checks(_context(_settings(tmp_path, host=""), scanner=backend))
+        assert backend.calls == 1
+        assert _row(results, CheckKey.SCANNER).state is CheckState.OK
+
+
+_PROBE_OUTCOMES = [
+    pytest.param(200, CheckState.OK, ConnectionStatus.CONNECTED, id="connected"),
+    pytest.param(
+        401, CheckState.FAIL, ConnectionStatus.TOKEN_REJECTED, id="token-rejected"
+    ),
+    pytest.param(404, CheckState.FAIL, ConnectionStatus.NOT_FOUND, id="not-found"),
+    pytest.param(
+        500, CheckState.FAIL, ConnectionStatus.SERVER_ERROR, id="server-error"
+    ),
+]
+
+
+class TestPaperlessCheck:
+    """The Paperless row reuses the five sentences that already exist (D-02)."""
+
+    @pytest.mark.parametrize("token", ["", "   ", "changeme", "YOUR_TOKEN_HERE"])
+    def test_a_placeholder_token_fails_without_a_request(
+        self, tmp_path: Path, token: str
+    ) -> None:
+        """
+        D-14: an unset token is decided before any network call is made.
+
+        Args:
+            tmp_path: The test's own directory.
+            token: A token nobody replaced.
+
+        """
+        counter = _RequestCounter(_ok_response)
+        client = _paperless(counter)
+        try:
+            results = run_checks(
+                _context(_settings(tmp_path, token=token), paperless=client)
+            )
+        finally:
+            client.close()
+        row = _row(results, CheckKey.PAPERLESS)
+        assert counter.count == 0
+        assert row.state is CheckState.FAIL
+        assert row.message == "The paperless-ngx API token has not been set."
+        assert row.next_step == (
+            "Put a real API token in the saneless config file, then restart saneless."
+        )
+
+    @pytest.mark.parametrize(("status_code", "state", "status"), _PROBE_OUTCOMES)
+    def test_each_outcome_reuses_the_existing_sentence(
+        self,
+        tmp_path: Path,
+        status_code: int,
+        state: CheckState,
+        status: ConnectionStatus,
+    ) -> None:
+        """
+        Every outcome's message comes from ``connection_status_message``.
+
+        Args:
+            tmp_path: The test's own directory.
+            status_code: What the stub server answers with.
+            state: The check state that outcome produces.
+            status: The ConnectionStatus the status code maps to.
+
+        """
+
+        def responder(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code, text="")
+
+        counter = _RequestCounter(responder)
+        client = _paperless(counter)
+        try:
+            results = run_checks(_context(_settings(tmp_path), paperless=client))
+        finally:
+            client.close()
+        row = _row(results, CheckKey.PAPERLESS)
+        assert row.state is state
+        assert row.message == connection_status_message(status)
+
+    def test_an_unreachable_host_reuses_the_existing_sentence(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A transport failure is the fifth outcome, with its own next step.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+
+        def responder(_request: httpx.Request) -> httpx.Response:
+            msg = "no route"
+            raise httpx.ConnectError(msg)
+
+        counter = _RequestCounter(responder)
+        client = _paperless(counter)
+        try:
+            results = run_checks(_context(_settings(tmp_path), paperless=client))
+        finally:
+            client.close()
+        row = _row(results, CheckKey.PAPERLESS)
+        assert row.state is CheckState.FAIL
+        assert row.message == "Could not reach paperless-ngx."
+        assert row.next_step == (
+            "Check paperless-ngx is running and on the network, then press Check again."
+        )
+
+    def test_the_probe_is_bounded(self, tmp_path: Path) -> None:
+        """
+        The check never spends the client's flat 30 s on a health row.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        counter = _RequestCounter(_ok_response)
+        client = _paperless(counter)
+        try:
+            run_checks(_context(_settings(tmp_path), paperless=client))
+        finally:
+            client.close()
+        assert counter.timeouts[0]["connect"] == PROBE_CONNECT_SECONDS
+        assert counter.timeouts[0]["read"] == PROBE_READ_SECONDS
+
+    def test_no_client_is_an_address_problem(self, tmp_path: Path) -> None:
+        """
+        A client that could not be built at all is reported as a bad address.
+
+        The only way ``PaperlessClient.__init__`` refuses is an unusable URL,
+        so this reuses the "not found at that URL" row rather than inventing a
+        sixth sentence.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(_context(_settings(tmp_path), paperless=None))
+        row = _row(results, CheckKey.PAPERLESS)
+        assert row.state is CheckState.FAIL
+        assert row.message == "The paperless-ngx API was not found at that URL."
+        assert row.next_step == (
+            "Check the paperless-ngx address in the saneless config file."
+        )
+
+
+class TestProfilesCheck:
+    """One result, chosen by a precedence this test pins (D-22, A-3)."""
+
+    def test_no_profiles_fails(self, tmp_path: Path) -> None:
+        """
+        An appliance with no profile cannot scan at all.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(_context(_with_profiles(_settings(tmp_path), {})))
+        row = _row(results, CheckKey.PROFILES)
+        assert row.state is CheckState.FAIL
+        assert row.message == "No scan profiles are configured."
+        assert row.next_step == 'Run "saneless auto-profiles" to create them.'
+
+    def test_a_readonly_config_location_is_amber(self, tmp_path: Path) -> None:
+        """
+        D-22, verbatim: a read-only config location is a warning, not a failure.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        context = _context(
+            _settings(tmp_path), profile_storage=ProfileStorage.IN_MEMORY_UNWRITABLE
+        )
+        row = _row(run_checks(context), CheckKey.PROFILES)
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "Generated in memory — the config location is read-only, "
+            "so they are lost on restart."
+        )
+        assert row.next_step == (
+            "Make the saneless config directory writable, then restart saneless."
+        )
+
+    def test_no_config_file_is_its_own_amber_row(self, tmp_path: Path) -> None:
+        """
+        "No file to save to" and "cannot write the file" are different facts.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        context = _context(
+            _settings(tmp_path),
+            profile_storage=ProfileStorage.IN_MEMORY_NO_CONFIG_FILE,
+        )
+        row = _row(run_checks(context), CheckKey.PROFILES)
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "Generated in memory — no configuration file is in use, "
+            "so they are lost on restart."
+        )
+        assert (
+            row.next_step == "Create a saneless config file so the profiles are saved."
+        )
+
+    def test_an_unnamed_generated_profile_is_amber(self, tmp_path: Path) -> None:
+        """
+        A-3: a generated profile with no label shows as a name the dropdown fakes.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        profiles = {"default": ProfileConfig(auto_generated=True, label="")}
+        row = _row(
+            run_checks(_context(_with_profiles(_settings(tmp_path), profiles))),
+            CheckKey.PROFILES,
+        )
+        assert row.state is CheckState.WARN
+        assert row.message == "Some profiles have no name yet."
+        assert row.next_step == 'Run "saneless auto-profiles --force" to name them.'
+
+    def test_a_hand_written_profile_without_a_label_is_fine(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The A-3 warning is about generated profiles, not hand-written ones.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        profiles = {"default": ProfileConfig(auto_generated=False, label="")}
+        row = _row(
+            run_checks(_context(_with_profiles(_settings(tmp_path), profiles))),
+            CheckKey.PROFILES,
+        )
+        assert row.state is CheckState.OK
+
+    def test_the_count_is_pluralised(self, tmp_path: Path) -> None:
+        """
+        Two profiles read as two, and one reads as one.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        two = {"a": ProfileConfig(), "b": ProfileConfig()}
+        row = _row(
+            run_checks(_context(_with_profiles(_settings(tmp_path), two))),
+            CheckKey.PROFILES,
+        )
+        assert row.message == "2 scan profiles configured."
+        one = {"a": ProfileConfig()}
+        row = _row(
+            run_checks(_context(_with_profiles(_settings(tmp_path), one))),
+            CheckKey.PROFILES,
+        )
+        assert row.message == "1 scan profile configured."
+
+    def test_none_configured_beats_a_readonly_location(self, tmp_path: Path) -> None:
+        """
+        Precedence, step one: a red row wins over an amber one.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        context = _context(
+            _with_profiles(_settings(tmp_path), {}),
+            profile_storage=ProfileStorage.IN_MEMORY_UNWRITABLE,
+        )
+        assert _row(run_checks(context), CheckKey.PROFILES).state is CheckState.FAIL
+
+    def test_a_readonly_location_beats_an_unnamed_profile(self, tmp_path: Path) -> None:
+        """
+        Precedence, step two: losing the profiles matters more than naming them.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        profiles = {"default": ProfileConfig(auto_generated=True, label="")}
+        context = _context(
+            _with_profiles(_settings(tmp_path), profiles),
+            profile_storage=ProfileStorage.IN_MEMORY_UNWRITABLE,
+        )
+        row = _row(run_checks(context), CheckKey.PROFILES)
+        assert "read-only" in row.message
+
+
+class TestFallbackCheck:
+    """A missing fallback folder is amber, never red (APPL-11, D-22)."""
+
+    def test_an_unset_fallback_is_amber(self, tmp_path: Path) -> None:
+        """
+        APPL-11 verbatim: not configured is a warning about a real risk.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        row = _row(run_checks(_context(_settings(tmp_path))), CheckKey.FALLBACK)
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "Not configured; scans cannot be kept if paperless-ngx is down."
+        )
+        assert row.next_step == (
+            "Set a fallback folder in the saneless config so scans are kept "
+            "when paperless-ngx is down."
+        )
+
+    def test_a_writable_fallback_is_green(self, tmp_path: Path) -> None:
+        """
+        A configured folder that accepts a file is green.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        folder = tmp_path / "consume"
+        folder.mkdir()
+        settings = _settings(tmp_path, consume_dir=str(folder))
+        row = _row(run_checks(_context(settings)), CheckKey.FALLBACK)
+        assert row.state is CheckState.OK
+        assert row.message == (
+            "A folder is set up to keep scans if paperless-ngx is down."
+        )
+
+    def test_a_missing_fallback_folder_is_red(self, tmp_path: Path) -> None:
+        """
+        A folder that was configured and is not there cannot keep anything.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _settings(tmp_path, consume_dir=str(tmp_path / "gone"))
+        row = _row(run_checks(_context(settings)), CheckKey.FALLBACK)
+        assert row.state is CheckState.FAIL
+        assert row.message == "The fallback folder cannot be written to."
+        assert row.next_step == "Check the folder exists and saneless can write to it."
+
+    @_NOT_ROOT
+    def test_an_unwritable_fallback_folder_is_red(self, tmp_path: Path) -> None:
+        """
+        Writability is probed by writing, not by asking ``os.access``.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        folder = tmp_path / "readonly-consume"
+        folder.mkdir()
+        folder.chmod(0o500)
+        try:
+            settings = _settings(tmp_path, consume_dir=str(folder))
+            row = _row(run_checks(_context(settings)), CheckKey.FALLBACK)
+        finally:
+            folder.chmod(0o700)
+        assert row.state is CheckState.FAIL
+
+    def test_no_row_renders_the_folder_path(self, tmp_path: Path) -> None:
+        """
+        The configured path never reaches the page (T-30-21).
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        folder = tmp_path / "consume"
+        folder.mkdir()
+        settings = _settings(tmp_path, consume_dir=str(folder))
+        row = _row(run_checks(_context(settings)), CheckKey.FALLBACK)
+        assert str(folder) not in row.message
+        assert str(folder) not in row.next_step
+
+
+class TestDataDirCheck:
+    """The data folder holds the job database, so it has to accept a write."""
+
+    def test_a_writable_data_folder_is_green(self, tmp_path: Path) -> None:
+        """
+        The default test settings point at a folder that exists.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        row = _row(run_checks(_context(_settings(tmp_path))), CheckKey.DATA_DIR)
+        assert row.state is CheckState.OK
+        assert row.message == "The data folder is writable."
+
+    @_NOT_ROOT
+    def test_an_unwritable_data_folder_is_red(self, tmp_path: Path) -> None:
+        """
+        A data folder that refuses a write stops saneless recording anything.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        folder = tmp_path / "readonly-data"
+        folder.mkdir()
+        folder.chmod(0o500)
+        try:
+            settings = _settings(tmp_path, data_dir=str(folder))
+            row = _row(run_checks(_context(settings)), CheckKey.DATA_DIR)
+        finally:
+            folder.chmod(0o700)
+        assert row.state is CheckState.FAIL
+        assert row.message == "The data folder cannot be written to."
+        assert row.next_step == (
+            "Check the folder exists and saneless can write to it, "
+            "then restart saneless."
+        )
+
+
+def _broken_context(tmp_path: Path) -> CheckContext:
+    """
+    Build a context in which every single check goes wrong.
+
+    Args:
+        tmp_path: The test's own directory.
+
+    Returns:
+        A context whose five rows are all WARN or FAIL.
+
+    """
+    settings = _with_profiles(
+        _settings(
+            tmp_path,
+            host=f"127.0.0.1:{_closed_port()}",
+            token="changeme",
+            consume_dir=str(tmp_path / "missing-consume"),
+            data_dir=str(tmp_path / "missing-data"),
+        ),
+        {},
+    )
+    return _context(
+        settings,
+        scanner=_RaisingBackend(),
+        paperless=None,
+        profile_storage=ProfileStorage.IN_MEMORY_UNWRITABLE,
+    )
+
+
+class TestRunChecks:
+    """The registry is complete, ordered, total and unable to raise (D-02)."""
+
+    def test_every_key_appears_exactly_once(self, tmp_path: Path) -> None:
+        """
+        A healthy context still produces all five rows.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()]))
+        )
+        keys = [result.key for result in results]
+        assert set(keys) == set(CheckKey)
+        assert len(keys) == len(set(keys))
+
+    def test_every_key_appears_when_everything_is_broken(self, tmp_path: Path) -> None:
+        """
+        A context where nothing works still produces all five rows.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(_broken_context(tmp_path))
+        assert {result.key for result in results} == set(CheckKey)
+
+    def test_rows_arrive_in_member_order(self, tmp_path: Path) -> None:
+        """
+        Both surfaces render in this order, so the order is the registry's.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(_context(_settings(tmp_path)))
+        assert [result.key for result in results] == list(CheckKey)
+
+    def test_a_raising_check_becomes_a_row(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A check that throws is a red row, never an exception out of the strip.
+
+        A registry that can raise would take the whole status strip down, and
+        with it the four checks that were fine.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to break one check on purpose.
+
+        """
+
+        def boom(_context: CheckContext) -> CheckResult:
+            msg = "the data folder check exploded"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(checks, "_check_data_dir", boom)
+        results = run_checks(_context(_settings(tmp_path)))
+        row = _row(results, CheckKey.DATA_DIR)
+        assert row.state is CheckState.FAIL
+        assert "exploded" not in row.message
+        assert row.next_step
+
+    def test_warnings_alone_do_not_collapse_to_fail(self, tmp_path: Path) -> None:
+        """
+        D-01, D-22: a missing fallback and a read-only config are amber together.
+
+        This is the case the whole three-state design exists for: the
+        appliance scans and files perfectly, and a scripted health gate must
+        not go red because it could be tidier.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        counter = _RequestCounter(_ok_response)
+        client = _paperless(counter)
+        try:
+            context = _context(
+                _settings(tmp_path),
+                scanner=_CountingBackend([_device()]),
+                paperless=client,
+                profile_storage=ProfileStorage.IN_MEMORY_UNWRITABLE,
+            )
+            results = run_checks(context)
+        finally:
+            client.close()
+        assert worst_state(results) is CheckState.WARN
+        assert _row(results, CheckKey.FALLBACK).state is CheckState.WARN
+        assert _row(results, CheckKey.PROFILES).state is CheckState.WARN
+
+    def test_a_skipped_scanner_still_runs_the_other_four(self, tmp_path: Path) -> None:
+        """
+        Pausing the scanner check pauses nothing else.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        results = run_checks(
+            _context(_settings(tmp_path), scanner=backend, skip_scanner=True)
+        )
+        assert [result.skipped for result in results] == [
+            True,
+            False,
+            False,
+            False,
+            False,
+        ]
+
+    @pytest.mark.parametrize("key", list(CheckKey))
+    def test_no_row_leaks_a_path_url_token_or_traceback(
+        self, tmp_path: Path, key: CheckKey
+    ) -> None:
+        """
+        ASVS V7: nothing internal reaches a LAN-visible page through a row.
+
+        Args:
+            tmp_path: The test's own directory.
+            key: The row under inspection.
+
+        """
+        row = _row(run_checks(_broken_context(tmp_path)), key)
+        for text in (row.message, row.next_step):
+            assert "/" not in text
+            assert "http" not in text
+            assert "changeme" not in text
+            assert "Traceback" not in text
+            assert str(tmp_path) not in text
+
+    def test_a_warn_row_always_says_what_to_do(self, tmp_path: Path) -> None:
+        """
+        Every amber and red row carries a next step; green rows carry none.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        for row in run_checks(_broken_context(tmp_path)):
+            assert row.next_step, row.key
+        healthy = run_checks(
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()]))
+        )
+        for row in healthy:
+            if row.state is CheckState.OK:
+                assert row.next_step == "", row.key
