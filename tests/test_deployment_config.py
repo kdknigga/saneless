@@ -40,8 +40,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from saneless.config import is_placeholder_token
-from saneless.vocabulary import ExitCode
+from saneless.config import WebConfig, is_placeholder_token
+from saneless.vocabulary import (
+    ExitCode,
+    RequestRejection,
+    rejection_message,
+    rejection_status_code,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
@@ -951,4 +956,130 @@ def test_docker_reference_documents_the_consume_mount_and_the_timezone() -> None
     assert "placeholder" in text.lower(), (
         f"{name} does not explain that placeholder token values are detected "
         "and refuse scans (APPL-07)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 30: the reference documents, derived from the source (T-30-89)
+# ---------------------------------------------------------------------------
+
+WEB_API_REFERENCE = DOCS_DIR / "reference" / "web-api.md"
+FIRST_WEB_UI_SCAN = DOCS_DIR / "getting-started" / "first-web-ui-scan.md"
+ROUTES_MODULE = REPO_ROOT / "src" / "saneless" / "web" / "routes.py"
+
+_ROUTE_DECORATOR = re.compile(
+    r"^@router\.(get|post|put|patch|delete)\(\s*\"([^\"]+)\"", re.MULTILINE
+)
+
+# The stale sentence the reserve-columns paragraph used to end on. Phase 23
+# filled the page counters in and Phase 30 renders them; Phase 30 also writes
+# owner_token. Reverting the correction fails here (T-30-87).
+ARCHITECTURE_STALE_RESERVE_CLAIM = "nothing writes any of them yet"
+
+
+def _declared_routes() -> list[tuple[str, str]]:
+    """Return ``(METHOD, path)`` for every route declared in ``routes.py``."""
+    source = ROUTES_MODULE.read_text(encoding="utf-8")
+    routes = [
+        (method.upper(), path) for method, path in _ROUTE_DECORATOR.findall(source)
+    ]
+    assert routes, f"no route decorators found in {ROUTES_MODULE.name}"
+    return routes
+
+
+def test_every_route_is_documented_in_the_web_api_reference() -> None:
+    """
+    Every route in ``routes.py`` has its own heading in ``web-api.md``.
+
+    The expectation is derived from the decorators rather than a hard-coded
+    list, so a route added in a later phase cannot ship undocumented: adding it
+    fails this test until the reference gains its section (T-30-89).
+    """
+    text, name = _read(WEB_API_REFERENCE)
+    missing = [
+        f"{method} {path}"
+        for method, path in _declared_routes()
+        if f"`{method} {path}`" not in text
+    ]
+    assert not missing, (
+        f"{name} has no `METHOD /path` heading for these routes:\n" + "\n".join(missing)
+    )
+
+
+def test_every_rejection_member_is_documented_with_its_message() -> None:
+    """Every ``RequestRejection`` member, status and sentence is in the reference."""
+    text, name = _read(WEB_API_REFERENCE)
+    missing = [
+        f"{member.name} ({rejection_status_code(member)}): {rejection_message(member)}"
+        for member in RequestRejection
+        if member.name not in text or rejection_message(member) not in text
+    ]
+    assert not missing, (
+        f"{name} does not document these rejections, with the member name and "
+        "the exact sentence saneless renders:\n" + "\n".join(missing)
+    )
+
+
+def test_every_web_config_field_is_documented() -> None:
+    """
+    Each ``[web]`` key is in the config reference with a ``SANELESS_WEB__`` row.
+
+    Derived from ``WebConfig.model_fields``: a key added to the section later
+    cannot ship without both references gaining it (APPL-10, T-30-89).
+    """
+    config_text, config_name = _read(CONFIG_REFERENCE)
+    env_text, env_name = _read(ENV_REFERENCE)
+    assert "[web]" in config_text, (
+        f"{config_name} has no [web] section, so the form-shape keys are undocumented"
+    )
+    for field in WebConfig.model_fields:
+        assert field in config_text, f"{config_name} does not document [web] {field}"
+        variable = f"SANELESS_WEB__{field.upper()}"
+        assert variable in env_text, f"{env_name} has no {variable} row"
+
+
+def test_config_reference_says_where_the_bind_address_lives() -> None:
+    """The ``[web]`` section admits ``web_host``/``web_port`` stayed in ``[output]``."""
+    text, name = _read(CONFIG_REFERENCE)
+    section = text.split("## `[web]`", 1)
+    assert len(section) == 2, f"{name} has no `[web]` section heading"
+    body = section[1].split("\n## ", 1)[0]
+    for needle in ("web_host", "web_port", "[output]"):
+        assert needle in body, (
+            f"{name}'s [web] section does not mention {needle}, so a reader who "
+            "looks there for the bind address finds nothing and no explanation"
+        )
+
+
+def test_architecture_no_longer_calls_the_job_columns_unwritten() -> None:
+    """The reserve-columns paragraph stops claiming nothing writes them."""
+    text, name = _read(ARCHITECTURE)
+    assert ARCHITECTURE_STALE_RESERVE_CLAIM not in text, (
+        f"{name} still says {ARCHITECTURE_STALE_RESERVE_CLAIM!r} about the job "
+        "columns. pages_scanned, pages_removed and pages_uploaded are written "
+        "by the worker's success path and displayed in the status area and the "
+        "history Title cell; owner_token is written at submit and gates the "
+        "flip prompt (T-30-87)"
+    )
+    for written in ("pages_scanned", "owner_token"):
+        assert written in text, (
+            f"{name} no longer names {written}; the correction should say what "
+            "is true now rather than delete the paragraph"
+        )
+
+
+def test_first_web_ui_scan_walks_the_current_form() -> None:
+    """The getting-started walkthrough describes the shipped page, not the old one."""
+    text, name = _read(FIRST_WEB_UI_SCAN)
+    for element, needle in (
+        ("the status strip", "System status"),
+        ("the Check again button", "Check again"),
+        ("the tag checkbox list", "checkbox"),
+        ("the tag filter", "filter"),
+        ("the profile description line", "description"),
+    ):
+        assert needle in text, f"{name} does not walk {element} (looked for {needle!r})"
+    assert "multi-select" not in text.lower(), (
+        f"{name} still calls the tag picker a multi-select dropdown; it is a "
+        "checkbox list (D-30, D-31)"
     )
