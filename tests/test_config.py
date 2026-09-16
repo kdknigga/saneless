@@ -17,10 +17,12 @@ from pydantic import ValidationError
 import saneless.config as config_mod
 from saneless.config import (
     DEFAULT_RESOLUTION,
+    PLACEHOLDER_TOKENS,
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
     Settings,
+    is_placeholder_token,
     load_settings,
     resolve_job_title,
     validate_settings_dirs,
@@ -2029,3 +2031,100 @@ class TestDataDir:
         settings = load_settings()
         assert settings.output.data_dir == str(override)
         assert settings.output.db_path == override / "saneless.db"
+
+
+class TestPlaceholderToken:
+    """
+    ``is_placeholder_token`` is an exact-match predicate, not a heuristic (D-14).
+
+    ``doctor``, the status strip, the scan route and ``saneless scan`` must all
+    agree on whether the appliance can upload, so there is one predicate. The
+    set is a small fixed literal set deliberately: refusing a legitimate token
+    from a future paperless-ngx version is worse than missing an exotic
+    placeholder (APPL-07).
+    """
+
+    @pytest.mark.parametrize("blank", ["", " ", "   ", "\t\n", "\t \n "])
+    def test_blank_is_a_placeholder(self, blank: str) -> None:
+        """An unset or whitespace-only token is a placeholder."""
+        assert is_placeholder_token(blank) is True
+
+    @pytest.mark.parametrize("token", sorted(PLACEHOLDER_TOKENS))
+    def test_every_literal_in_the_set_is_a_placeholder(self, token: str) -> None:
+        """Every member of PLACEHOLDER_TOKENS is recognised."""
+        assert is_placeholder_token(token) is True
+
+    @pytest.mark.parametrize(
+        "known",
+        [
+            "changeme",
+            "your-token-here",
+            "your-api-token-here",
+            "your_token_here",
+            "token",
+            "replace-me",
+        ],
+    )
+    def test_the_documented_literals_are_members(self, known: str) -> None:
+        """The literals the docs and compose file ship are in the set."""
+        assert known in PLACEHOLDER_TOKENS
+
+    @pytest.mark.parametrize(
+        "written",
+        ["CHANGEME", " changeme ", "ChangeMe", "\tCHANGEME\n", "YOUR-TOKEN-HERE"],
+    )
+    def test_case_and_surrounding_space_do_not_hide_a_placeholder(
+        self, written: str
+    ) -> None:
+        """Matching is case-insensitive after stripping."""
+        assert is_placeholder_token(written) is True
+
+    @pytest.mark.parametrize(
+        "real",
+        [
+            "40characterhexlookingrealapitokenvalue00",
+            "changeme7f3a91",
+            "my-changeme",
+            "notchangeme",
+            "tokenizer",
+            "your-token-here-really",
+        ],
+    )
+    def test_a_real_token_is_not_a_placeholder(self, real: str) -> None:
+        """Membership is exact: a superstring of a placeholder is a real token."""
+        assert is_placeholder_token(real) is False
+
+    def test_the_example_config_ships_a_token_the_predicate_refuses(self) -> None:
+        """
+        ``saneless.toml.example``'s token is a member, read not hard-coded.
+
+        The example and the predicate cannot drift apart: if someone edits the
+        example's placeholder, this test fails until the set is updated.
+        """
+        example = tomllib.loads(
+            (Path(__file__).resolve().parents[1] / "saneless.toml.example").read_text()
+        )
+        shipped = example["paperless"]["token"]
+        assert shipped in PLACEHOLDER_TOKENS
+        assert is_placeholder_token(shipped) is True
+
+    def test_predicate_is_annotated_to_take_a_plain_string(self) -> None:
+        """
+        The predicate takes an already-unwrapped ``str`` (CFG-05, ASVS V7).
+
+        Asserted on the annotation rather than by calling it with a
+        ``SecretStr``, because a call that type-checkers reject would need a
+        suppression to write down.
+        """
+        assert is_placeholder_token.__annotations__["value"] == "str"
+        assert is_placeholder_token.__annotations__["return"] == "bool"
+
+    def test_config_module_adds_no_secret_unwrap_site(self) -> None:
+        """
+        The predicate does not add a ``get_secret_value`` call to config.py.
+
+        Only ``cli.py scan`` and ``web/app.py create_app`` unwrap the token
+        (T-30-05, N-15); config.py itself never does.
+        """
+        source = Path(config_mod.__file__).read_text()
+        assert "get_secret_value" not in source
