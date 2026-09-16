@@ -28,7 +28,7 @@ from saneless.pdf import (
     build_pdf_filename,
     sanitise_title_for_filename,
 )
-from saneless.pipeline import _SPOOL_LABEL_A
+from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.spool import SpooledPageSink
 
 if TYPE_CHECKING:
@@ -212,7 +212,7 @@ def _recording_convert(calls: list[dict[str, object]]) -> Callable[..., object]:
     return wrapper
 
 
-def _recording_job(argvs: list[list[str]]) -> Callable[..., pikepdf.Job]:
+def _recording_job(argvs: list[list[str]]) -> Callable[[list[str]], pikepdf.Job]:
     """
     Wrap ``pikepdf.Job`` so the argv it is built with is recorded.
 
@@ -225,10 +225,10 @@ def _recording_job(argvs: list[list[str]]) -> Callable[..., pikepdf.Job]:
     """
     real_job = pikepdf.Job
 
-    def factory(argv: list[str], **kwargs: object) -> pikepdf.Job:
+    def factory(argv: list[str]) -> pikepdf.Job:
         """Record ``argv``, then build the real ``pikepdf.Job``."""
         argvs.append(list(argv))
-        return real_job(argv, **kwargs)
+        return real_job(argv)
 
     return factory
 
@@ -236,7 +236,7 @@ def _recording_job(argvs: list[list[str]]) -> Callable[..., pikepdf.Job]:
 class _FailingJob:
     """A ``pikepdf.Job`` stand-in whose ``run`` always fails."""
 
-    def __init__(self, argv: list[str], **_kwargs: object) -> None:
+    def __init__(self, argv: list[str]) -> None:
         """Accept and keep the argv a real ``pikepdf.Job`` would be given."""
         self.argv = argv
 
@@ -546,13 +546,16 @@ class TestBoundedAssembly:
 
         merged = assemble_pdf(records, output_dir, filename="merged.pdf", dpi=300)
 
-        reference = tmp_path / "single-convert.pdf"
-        reference.write_bytes(
-            img2pdf.convert(
-                [str(record.path) for record in records],
-                layout_fun=img2pdf.get_fixed_dpi_layout_fun((300, 300)),
-            )
+        # No outputstream here, so convert returns the bytes -- the very
+        # contract whose other half (None when streaming) retired the old
+        # ``pdf_bytes is None`` guard.
+        reference_bytes = img2pdf.convert(
+            [str(record.path) for record in records],
+            layout_fun=img2pdf.get_fixed_dpi_layout_fun((300, 300)),
         )
+        assert reference_bytes is not None
+        reference = tmp_path / "single-convert.pdf"
+        reference.write_bytes(reference_bytes)
         assert _media_boxes(merged) == _media_boxes(reference)
         assert _embedded_streams(merged) == _embedded_streams(reference)
 
@@ -569,6 +572,35 @@ class TestBoundedAssembly:
         assemble_pdf(records, output_dir, filename="only.pdf", dpi=300)
 
         assert sorted(path.name for path in output_dir.rglob("*")) == ["only.pdf"]
+
+    def test_merge_survives_duplex_records_sharing_a_sequence_number(
+        self, spool_dir: Path, output_dir: Path
+    ) -> None:
+        """
+        A duplex interleave hands assembly two records both numbered 1.
+
+        ``PageRecord.sequence`` is assigned per acquisition pass, so pass A's
+        first front and pass B's first back are both sequence 1 -- their
+        *file names* differ, their numbers do not. Naming the single-page
+        scratch PDFs from the sequence would therefore write one over the
+        other and merge the survivor twice; naming them from the position in
+        ``records`` cannot. Four distinct pages in, four distinct pages out.
+        """
+        fronts = SpooledPageSink(spool_dir, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
+        backs = SpooledPageSink(spool_dir, _SPOOL_LABEL_B, _TEST_RESERVE_MB)
+        records = [
+            fronts.add(Image.new("RGB", (120, 160), "white")),
+            backs.add(Image.new("RGB", (120, 160), "red")),
+            fronts.add(Image.new("RGB", (120, 160), "blue")),
+            backs.add(Image.new("RGB", (120, 160), "green")),
+        ]
+        assert [record.sequence for record in records] == [1, 1, 2, 2]
+
+        pdf_path = assemble_pdf(records, output_dir, filename="duplex.pdf", dpi=300)
+
+        assert _embedded_streams(pdf_path) == [
+            _png_idat_payload(record.path) for record in records
+        ]
 
     def test_a_failing_merge_becomes_pdf_error(
         self,
