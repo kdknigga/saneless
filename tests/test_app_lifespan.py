@@ -376,6 +376,13 @@ def test_both_stop_events_are_set_before_either_join_begins(
     Asserted on the recorded order of the internal event sets and joins rather
     than on elapsed time: a timing assertion here would be a flake on a loaded
     machine and would still not say *why* the shutdown was quick.
+
+    ``refresher.join`` usually does not appear at all.  By the time the worker's
+    bounded join returns, the refresher's one-second ``Event.wait`` has woken on
+    the event set before it and the thread has already exited, so ``stop()``
+    skips the join entirely.  That absence *is* the overlap, which is why this
+    asserts over the joins that happened rather than over a fixed four-element
+    list.
     """
     app = _build_app(settings)
     worker = app.state.worker
@@ -408,15 +415,15 @@ def test_both_stop_events_are_set_before_either_join_begins(
     monkeypatch.setattr(refresher._thread, "join", recording_refresher_join)
     with TestClient(app):
         pass
-    assert set(events) == {
-        "worker.set",
-        "refresher.set",
-        "worker.join",
-        "refresher.join",
-    }
+    assert {"worker.set", "refresher.set"} <= set(events)
     last_set = max(events.index("worker.set"), events.index("refresher.set"))
-    first_join = min(events.index("worker.join"), events.index("refresher.join"))
-    assert last_set < first_join
+    joins = [index for index, name in enumerate(events) if name.endswith(".join")]
+    assert joins
+    assert all(index > last_set for index in joins)
+    # Non-vacuous: the worker's join is always reached, and the refresher was
+    # already signalled before it began.  That is the overlap.
+    assert "worker.join" in events
+    assert events.index("refresher.set") < events.index("worker.join")
 
 
 def test_the_refresher_starts_after_the_worker(

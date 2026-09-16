@@ -111,6 +111,22 @@ class CheckRefresher:
         with self._watch_lock:
             self._last_watched = now
 
+    def request_stop(self) -> None:
+        """
+        Ask the refresher to stop, without waiting for the thread.
+
+        This is the signal half of :meth:`stop`, split out for a caller that
+        has more than one thread to bring down.  The lifespan has two, each
+        with a join bounded by ``STOP_JOIN_SECONDS``: signalling both before
+        joining either makes the two joins overlap, so the worst-case shutdown
+        stays one bound instead of two (Amendment A-7).
+
+        Setting the event is the whole of it, so this never blocks, and calling
+        it on a refresher that was never started -- a lifespan that failed
+        during startup -- is safe.
+        """
+        self._stopping.set()
+
     def stop(self) -> bool:
         """
         Stop the refresher and report whether the thread actually stopped.
@@ -120,13 +136,14 @@ class CheckRefresher:
         worker's ``STOP_JOIN_SECONDS``; when this returns ``False`` the thread
         is still inside a probe and may still write to the cache, so the
         lifespan must leave the Paperless client and the scanner open (A-7).
-        Calling it again, or on a refresher never started, is safe.
+        Calling it again, or on a refresher never started, is safe -- including
+        after :meth:`request_stop`, which sets the same event.
 
         Returns:
             Whether the refresher thread has stopped.
 
         """
-        self._stopping.set()
+        self.request_stop()
         if self._thread.is_alive():
             self._thread.join(timeout=STOP_JOIN_SECONDS)
         stopped = not self._thread.is_alive()

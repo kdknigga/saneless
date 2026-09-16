@@ -206,9 +206,17 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         outlives its retention is harmless, and a service that will not come
         up over it is not.
 
-        Shutdown stops the worker first and closes the Paperless client, the
-        job store and the scanner only when the worker confirms it stopped
-        (D-09, D-18).
+        The check refresher starts last, after the worker, and never probes on
+        the way up: the cache is cold, the first render says ``Checking…`` and
+        a self-stopping poll fills the strip in (D-06).  That is a deliberate
+        continuation of Phase 26's non-blocking startup -- an unplugged scanner
+        host is a TCP connect that hangs until the OS gives up, and a server
+        that would not finish starting because of one is a worse appliance than
+        one that starts and says so.
+
+        Shutdown stops both threads before closing anything, and closes the
+        Paperless client, the job store and the scanner only when both confirm
+        they stopped (D-09, D-18, A-7).
         """
         validate_settings_dirs(settings)
         try:
@@ -233,19 +241,46 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         except Exception:
             logger.warning("Startup history prune failed", exc_info=True)
         worker.start()
+        # After the worker, because the refresher's gate accessor reads
+        # worker.scanner_gate at probe time and its context reads
+        # worker.profile_storage.  Starting it costs one thread and no probe.
+        refresher.start()
         logger.info("App started")
         yield
+        # Both stop events are set before either join begins, so the two
+        # bounded joins overlap and the worst case stays STOP_JOIN_SECONDS
+        # instead of doubling to one bound per thread (A-7).  request_stop()
+        # is the signal half of the refresher's stop; worker.stop() sets its
+        # own event as its first act and only then joins.
+        refresher.request_stop()
         # worker.stop() blocks the event loop for at most STOP_JOIN_SECONDS,
         # during lifespan shutdown, after uvicorn has stopped serving (D-08).
-        if not worker.stop():
+        worker_stopped = worker.stop()
+        refresher_stopped = refresher.stop()
+        if not (worker_stopped and refresher_stopped):
             # D-09: the store closes only after a confirmed stop, so a stuck
             # thread never hits "Cannot operate on a closed database".  D-07:
             # the abandoned job is not written here -- that would race its own
             # final write; the next startup's recovery records it.
+            #
+            # A-7 extends the same guarantee to the refresher, which holds this
+            # same Paperless client and may be inside sane_get_devices:
+            # paperless.close() would raise inside a live probe, and
+            # scanner.close() would run sane_exit() with a SANE call
+            # outstanding, which sane_backend.shutdown() documents as a
+            # segfault risk.
+            stuck = " and ".join(
+                name
+                for name, stopped in (
+                    ("Scan worker", worker_stopped),
+                    ("check refresher", refresher_stopped),
+                )
+                if not stopped
+            )
             logger.warning(
-                "Scan worker did not stop within %s s (job %s still running); "
-                "leaving the job store, Paperless client and scanner open for "
-                "process exit",
+                "%s did not stop within %s s; leaving the job store, Paperless "
+                "client and scanner open for process exit (current job: %s)",
+                stuck,
                 STOP_JOIN_SECONDS,
                 worker.current_job_id,
             )
