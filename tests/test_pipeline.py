@@ -23,6 +23,7 @@ from saneless.exceptions import (
     FeederEmptyError,
     PaperlessError,
     PaperlessTimeoutError,
+    PdfError,
     ScanCancelledError,
     ScanError,
 )
@@ -40,6 +41,7 @@ from saneless.pipeline import (
     _check_disk_space,
     _interleave_duplex,
     _preserving,
+    _warn_if_failed_dir_growing,
     run_pipeline,
 )
 from saneless.scanner.base import DeviceInfo, ScannerBackend
@@ -3537,6 +3539,309 @@ class TestFailedDirWarning:
         assert "preserved at" in str(escaped)
         # iterdir, not glob: the patch is still in force.
         assert len([path for path in failed_dir.iterdir() if path.is_file()]) == 1
+
+
+def _fail_assembly(message: str = "img2pdf refused the page") -> MagicMock:
+    """
+    Patch-ready stand-in whose assembly always raises a ``PdfError``.
+
+    Args:
+        message: The failure text the error carries.
+
+    Returns:
+        A MagicMock ready for ``patch("saneless.pipeline.assemble_pdf", ...)``.
+
+    """
+    assembling = MagicMock()
+    assembling.side_effect = PdfError(message)
+    return assembling
+
+
+def _preserved_page_dirs(failed_dir: Path) -> list[Path]:
+    """
+    Return the preserved page directories sitting in ``failed_dir``.
+
+    Args:
+        failed_dir: The durable directory, which need not exist.
+
+    Returns:
+        Every subdirectory, sorted by name.
+
+    """
+    if not failed_dir.is_dir():
+        return []
+    return sorted(entry for entry in failed_dir.iterdir() if entry.is_dir())
+
+
+class TestAssemblyFailureKeepsThePageFiles:
+    """
+    D-10: no PDF could be built, so the pages themselves are what is kept.
+
+    Phase 28 deferred this case. The spool holds real files, so an assembly
+    failure moves them into ``failed/<job-keyed-name>/`` -- a second *kind* of
+    artefact in a directory that until now held only PDFs, which is why the
+    growth check has to learn about it too.
+    """
+
+    def test_a_pdf_error_moves_the_page_files_into_a_job_keyed_directory(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Three pages on the spool, assembly refuses: three PNGs survive."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_distinct_page(index) for index in range(3)]
+        )
+        paperless = MagicMock()
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(PdfError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Bad Assembly", job_id="job-pdf-1"
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        pages = sorted(kept[0].iterdir())
+        assert len(pages) == 3
+        assert {page.suffix for page in pages} == {".png"}
+        assert all(page.stat().st_size > 0 for page in pages)
+        message = str(excinfo.value)
+        assert "img2pdf refused the page" in message
+        assert "3 spooled page file(s)" in message
+        assert str(kept[0]) in message
+        paperless.upload_document.assert_not_called()
+
+    def test_an_assembly_failure_stays_a_pdf_error(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Exit 4 and the PDF error category depend on the type surviving.
+
+        ``type(...) is``, not ``isinstance``: a widening to ``SanelessError``
+        would pass an isinstance check and still change the exit code.
+        """
+        _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_distinct_page(0)])
+        original = PdfError("img2pdf refused the page")
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", MagicMock(side_effect=original)),
+            pytest.raises(PdfError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Still Pdf", job_id="job-pdf-2"
+                ),
+            )
+
+        assert type(excinfo.value) is PdfError
+        assert excinfo.value.__cause__ is original
+        assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
+
+    def test_two_assembly_failures_make_two_directories(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The directory name is job-keyed, so one failure cannot bury another.
+
+        Same title, two job ids: two directories, and neither move lands on a
+        destination that already held pages.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+
+        for job_id in ("job-pdf-first", "job-pdf-second"):
+            scanner = MagicMock(spec=ScannerBackend)
+            scanner.scan_pages.side_effect = spooling(
+                [_distinct_page(index) for index in range(2)]
+            )
+            with (
+                patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+                pytest.raises(PdfError),
+            ):
+                run_pipeline(
+                    scanner=scanner,
+                    paperless=MagicMock(),
+                    settings=default_settings,
+                    request=PipelineRequest(
+                        profile_name="default",
+                        title="Same Title Twice",
+                        job_id=job_id,
+                    ),
+                )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 2
+        assert kept[0].name != kept[1].name
+        assert [len(list(directory.iterdir())) for directory in kept] == [2, 2]
+
+    def test_an_assembly_failure_leaves_no_leftover_temp_directories(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The workspace still unwinds; only the page files escaped it."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling([_distinct_page(0)])
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(PdfError),
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Leftovers", job_id="job-pdf-3"
+                ),
+            )
+
+        scratch = tmp_path / "scratch"
+        assert [item for item in scratch.iterdir() if item.is_dir()] == []
+        assert len(_preserved_page_dirs(failed_dir)) == 1
+
+
+def _preserved_pages_dir(failed_dir: Path, name: str, page_bytes: int) -> Path:
+    """
+    Write a preserved page directory of the shape an assembly failure leaves.
+
+    One page at the top and one in a nested subdirectory, so a size sum that
+    is not recursive reports the wrong total and says so.
+
+    Args:
+        failed_dir: The durable directory; created if absent.
+        name: The job-keyed directory name.
+        page_bytes: How many bytes the top-level page file holds.
+
+    Returns:
+        The directory written.
+
+    """
+    pages_dir = failed_dir / name
+    (pages_dir / "nested").mkdir(parents=True)
+    (pages_dir / "a-0001.png").write_bytes(b"x" * page_bytes)
+    (pages_dir / "nested" / "a-0002.png").write_bytes(b"y" * page_bytes)
+    return pages_dir
+
+
+class TestFailedDirCountsPreservedPageDirectories:
+    """
+    D-10: ``failed/`` holds two kinds of artefact now, and both are counted.
+
+    A growth check that only globbed ``*.pdf`` would under-report a directory
+    filling up with preserved page directories -- silently, which is the one
+    thing T-29-36's warning exists to prevent.
+    """
+
+    def test_failed_dir_counts_directories_towards_the_threshold(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One directory on top of threshold-minus-one PDFs crosses it."""
+        failed_dir = tmp_path / "failed"
+        _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
+        _preserved_pages_dir(failed_dir, "20260101-000000-jobx-doc", 110 * 1024)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            _warn_if_failed_dir_growing(failed_dir)
+
+        message = next(
+            record.getMessage()
+            for record in caplog.records
+            if str(failed_dir) in record.getMessage()
+        )
+        assert str(FAILED_DIR_WARN_THRESHOLD) in message
+        # 2 x 110 KiB of page files plus 19 x 512 bytes of PDFs.  A size sum
+        # that skipped the directories, or walked only their top level, would
+        # report 0.0 or 0.1 here.
+        assert "0.2 MiB" in message
+
+    def test_failed_dir_stays_silent_below_the_threshold_with_directories(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Counting directories must not lower the bar for warning."""
+        failed_dir = tmp_path / "failed"
+        _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 2)
+        _preserved_pages_dir(failed_dir, "20260101-000000-joby-doc", 1024)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+            _warn_if_failed_dir_growing(failed_dir)
+
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if "MiB" in record.getMessage()
+        ] == []
+
+    def test_failed_dir_counts_directories_never_raises_on_a_vanished_walk(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A directory removed underneath the walk ends the check silently.
+
+        The walk lives inside the existing ``try``, so it returns through the
+        same ``except OSError`` that has always kept a bookkeeping failure from
+        displacing the delivery failure already in flight.
+        """
+        failed_dir = tmp_path / "failed"
+        _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD)
+        pages_dir = _preserved_pages_dir(failed_dir, "20260101-000000-jobz-doc", 1024)
+        real_rglob = Path.rglob
+
+        def exploding_rglob(self: Path, pattern: str) -> Iterator[Path]:
+            if self == pages_dir:
+                msg = "the preserved page directory vanished"
+                raise OSError(msg)
+            return real_rglob(self, pattern)
+
+        monkeypatch.setattr(Path, "rglob", exploding_rglob)
+
+        # The assertion is that this returns at all.
+        _warn_if_failed_dir_growing(failed_dir)
+
+    def test_failed_dir_counts_directories_never_raises_on_an_unreadable_dir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable failed/ is still not a reason to raise."""
+        failed_dir = tmp_path / "failed"
+        _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD)
+        real_iterdir = Path.iterdir
+
+        def exploding_iterdir(self: Path) -> Iterator[Path]:
+            if self == failed_dir:
+                msg = "failed/ became unreadable"
+                raise OSError(msg)
+            return real_iterdir(self)
+
+        monkeypatch.setattr(Path, "iterdir", exploding_iterdir)
+
+        _warn_if_failed_dir_growing(failed_dir)
 
 
 def _mismatched_duplex_scanner(fronts: int = 3, backs: int = 2) -> MagicMock:
