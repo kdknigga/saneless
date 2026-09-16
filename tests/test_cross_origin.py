@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import pytest
@@ -455,8 +456,16 @@ def test_rejection_log_escapes_control_characters_in_the_path(
         sent.append(message)
 
     guard = CrossOriginGuard(_never_called)
-    with caplog.at_level(logging.WARNING, logger=GUARD_LOGGER):
-        asyncio.run(guard(scope, receive, send))
+    # On its own thread: a Playwright session earlier in the same run can leave
+    # an event loop running on this one, where asyncio.run refuses.  The
+    # sibling in tests/test_web_errors.py already carries this workaround; this
+    # one did not, and it is one of the failures that makes `uv run pytest` --
+    # the whole suite in one process, which is the release gate -- red (WR-08).
+    with (
+        caplog.at_level(logging.WARNING, logger=GUARD_LOGGER),
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        pool.submit(lambda: asyncio.run(guard(scope, receive, send))).result()
     assert sent[0]["type"] == "http.response.start"
     assert sent[0]["status"] == 403
     records = [r for r in caplog.records if r.name == GUARD_LOGGER]
