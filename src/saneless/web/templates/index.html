@@ -12,8 +12,9 @@
       #status-area -- is preserved untouched.
    #checks-strip is the persistent live region and #checks-body is the swap
    target: the container survives every swap, which is what makes aria-live
-   work at all, and it is polite and never role="alert" because a health list
-   must not interrupt and the page has exactly one assertive region. #}
+   work at all, and it is polite and never assertive because a health list must
+   not interrupt and the page is allowed exactly one assertive region -- the
+   #status-message slot below, which keeps it. #}
 <article id="checks-card">
     <h2>System status</h2>
     <div id="checks-strip" aria-live="polite">

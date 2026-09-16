@@ -279,9 +279,16 @@ def _status_context(
         job_store: The job store to read the job from.
         claimed: The job id and answer this request itself claimed, if any.
 
+    ``refresh_checks`` is False here for every caller, and that is the whole of
+    the flag's policy: ``start_scan`` sets it True on its own, so a status poll
+    or a flip answer cannot carry an out-of-band strip.  Defaulting it in this
+    one builder rather than at each call site is what stops a route added later
+    from acquiring the behaviour by forgetting to say no.
+
     Returns:
-        ``{"job": ..., "flip_answer": ...}`` where ``flip_answer`` is None
-        unless the rendered job is ``AWAITING_FLIP`` and has been answered.
+        The job, its flip answer and a false strip-refresh flag.
+        ``flip_answer`` is None unless the rendered job is ``AWAITING_FLIP``
+        and has been answered.
 
     """
     job = _current_or_recent_job(worker, job_store)
@@ -291,7 +298,7 @@ def _status_context(
             answer = claimed[1]
         else:
             answer = worker.flip_answer(job.id)
-    return {"job": job, "flip_answer": answer}
+    return {"job": job, "flip_answer": answer, "refresh_checks": False}
 
 
 @router.get("/")
@@ -559,11 +566,21 @@ def start_scan(
     match result:
         case SubmitResult.ACCEPTED:
             # A job created by this request cannot have a flip answer yet.
-            # Only a successful scan clears the status-message slot (D-03).
+            # Only a successful scan clears the status-message slot (D-03), and
+            # only a successful scan carries the strip out-of-band: the scanner
+            # has just become busy, so D-08's paused note is due now rather than
+            # at the end of the cache's TTL.  The strip's own context rides
+            # along because the partial is rendered inside this response.
             return state.templates.TemplateResponse(
                 request,
                 "partials/status_response.html",
-                {"job": job, "flip_answer": None, "clear_message": True},
+                {
+                    "job": job,
+                    "flip_answer": None,
+                    "clear_message": True,
+                    "refresh_checks": True,
+                    **_checks_context(state),
+                },
             )
         case SubmitResult.QUEUE_FULL:
             rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
