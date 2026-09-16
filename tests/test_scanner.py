@@ -48,6 +48,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+# The backend module's own logger, for the tests that read what it reported.
+_BACKEND_LOGGER = "saneless.scanner.sane_backend"
+
 # ---------------------------------------------------------------------------
 # Mock helpers
 # ---------------------------------------------------------------------------
@@ -452,6 +455,34 @@ def sane_backend(fake_sane_module: FakeSaneModule) -> SaneBackend:
     return SaneBackend()
 
 
+@pytest.fixture(autouse=True)
+def sane_init_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """
+    Give every test in this module an uninitialised SANE to start from.
+
+    SANE initialisation is process-level now (D-17): the first ``SaneBackend``
+    built in a process initialises it and every later one does not.  Without
+    this, the first test to build a backend would suppress ``sane.init()`` for
+    every test after it, and the whole module's init assertions would quietly
+    start reading a call that an earlier test made.
+
+    The reset goes through the public ``shutdown()`` rather than into the
+    guard's own state, because "after a shutdown a later init is allowed" is
+    exactly the behaviour D-17 promises; reaching past it would let the promise
+    rot while these tests kept passing.
+
+    ``monkeypatch`` is requested, and not used, purely for its ordering: it is
+    the fixture ``fake_sane_module`` patches the module-level ``sane`` name
+    through, so requesting it here makes this fixture the younger of the two
+    and its teardown the earlier one.  The final ``shutdown()`` therefore still
+    finds the fake in place instead of the ``None`` the undo restores.
+    """
+    _ = monkeypatch  # ordering only: tear down before the sane-module undo
+    sane_backend_mod.shutdown()
+    yield
+    sane_backend_mod.shutdown()
+
+
 class TestSaneBackendInit:
     """SaneBackend initialization tests."""
 
@@ -460,13 +491,6 @@ class TestSaneBackendInit:
     ) -> None:
         """SaneBackend constructor calls sane.init() exactly once."""
         assert fake_sane_module.init_call_count == 0
-        SaneBackend()
-        assert fake_sane_module.init_call_count == 1
-
-    def test_sane_backend_init_calls_sane_init_exactly_once(
-        self, fake_sane_module: FakeSaneModule
-    ) -> None:
-        """A single SaneBackend instance only triggers one init call."""
         SaneBackend()
         assert fake_sane_module.init_call_count == 1
 
@@ -501,6 +525,171 @@ class TestSaneBackendInit:
         monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
         SaneBackend(host="192.168.1.50:192.168.1.51")
         assert os.environ["SANE_NET_HOSTS"] == "192.168.1.50:192.168.1.51"
+
+
+def _guard_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """
+    Collect the backend module's WARNING messages.
+
+    Args:
+        caplog: The capturing fixture, already set to WARNING for the module.
+
+    Returns:
+        One string per WARNING the backend logged during the call phase.
+
+    """
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == _BACKEND_LOGGER and record.levelno == logging.WARNING
+    ]
+
+
+class TestSaneInitGuard:
+    """
+    SANE is initialised once per process, behind a guard (HARD-05, D-17).
+
+    ``sane_init`` is a process-global call: the second one is at best wasted
+    and at worst -- on a ``net`` backend, whose host list is read only at the
+    first -- an operator's configuration silently doing nothing.  The guard is
+    a guard rather than a singleton on purpose: three CLI commands and the web
+    server each build their own ``SaneBackend``, and every one of them has to
+    keep working.
+    """
+
+    def test_init_once_for_two_backends_in_one_process(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """Two SaneBackend constructions call sane.init() once between them."""
+        SaneBackend()
+        SaneBackend()
+        assert fake_sane_module.init_call_count == 1
+
+    def test_init_once_warns_when_a_later_host_differs(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A second, different host is named alongside the one in effect."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend(host="scanner-a.local")
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+        SaneBackend(host="scanner-b.local")
+
+        warnings = _guard_warnings(caplog)
+        assert len(warnings) == 1
+        assert "scanner-a.local" in warnings[0]
+        assert "scanner-b.local" in warnings[0]
+        # The second host changes nothing: SANE read the list at the first
+        # init, so neither the call count nor the environment may move.
+        assert fake_sane_module.init_call_count == 1
+        assert os.environ["SANE_NET_HOSTS"] == "scanner-a.local"
+
+    def test_init_once_stays_quiet_when_a_later_host_matches(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Repeating the configured host is the normal case, not a warning."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend(host="scanner-a.local")
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+        SaneBackend(host="scanner-a.local")
+
+        assert _guard_warnings(caplog) == []
+        assert fake_sane_module.init_call_count == 1
+
+    def test_init_once_stays_quiet_when_a_later_backend_has_no_host(
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No host asks for nothing, so nothing was ignored and nothing warns."""
+        monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+        SaneBackend(host="scanner-a.local")
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+        SaneBackend()
+
+        assert _guard_warnings(caplog) == []
+        assert fake_sane_module.init_call_count == 1
+
+    def test_init_once_resets_after_shutdown(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """A shutdown re-arms the guard, so the next construction initialises."""
+        SaneBackend()
+        sane_backend_mod.shutdown()
+        SaneBackend()
+        assert fake_sane_module.init_call_count == 2
+
+    def test_init_once_under_concurrent_construction(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """
+        Threads racing to build a backend still produce one init call.
+
+        The web server builds its backend on the main thread while the worker
+        thread is already running, so the check and the call have to be one
+        critical section rather than merely close together.
+        """
+        thread_count = 8
+        ready = threading.Barrier(thread_count)
+        failures: list[BaseException] = []
+
+        def build() -> None:
+            ready.wait(5)
+            try:
+                SaneBackend()
+            except Exception as exc:
+                # Carried back to the test thread: an exception raised here
+                # would be reported as an unhandled thread exception with no
+                # assertion attached to it.
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=build, name=f"init-race-{i}")
+            for i in range(thread_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+
+        assert failures == []
+        assert fake_sane_module.init_call_count == 1
+
+    def test_init_once_is_not_recorded_when_init_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed init raises and leaves the guard unset, so a retry runs."""
+        failing = FakeSaneModule(init_error=FakeSaneError("no SANE here"))
+        monkeypatch.setattr(sane_backend_mod, "sane", failing)
+        with pytest.raises(ScanError, match="Could not initialise SANE: no SANE here"):
+            SaneBackend()
+        assert failing.init_call_count == 1
+
+        working = FakeSaneModule()
+        monkeypatch.setattr(sane_backend_mod, "sane", working)
+        SaneBackend()
+        assert working.init_call_count == 1
+
+    def test_backend_stays_freely_constructible(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """
+        The guard guards init, not construction: no singleton, no factory.
+
+        Every one-shot CLI command builds its own backend and the web server
+        builds another; a guard that returned a shared instance would change
+        what ``SaneBackend()`` means for all of them.
+        """
+        first = SaneBackend()
+        second = SaneBackend()
+        assert first is not second
+        assert fake_sane_module.init_call_count == 1
 
 
 class TestSaneBackendGetDevices:
