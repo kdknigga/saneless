@@ -521,6 +521,45 @@ def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     )
 
 
+def _preservation_failure_message(
+    exc: Exception,
+    failure: Exception,
+    destination: Path,
+    kept: Sequence[Path],
+) -> str:
+    """
+    Report a failed preservation without disowning what it had already moved.
+
+    Every preservation guard here moves artefacts one at a time, so a failure
+    on the third of twelve leaves two of them sitting in ``failed/``. Saying
+    "the scan could NOT be preserved" at that point is the inversion of the
+    failure ``_preserving``'s own docstring warns about -- told nothing was
+    saved when some of it was -- and it is the more expensive half of the
+    pair: an operator who believes it rescans and never looks in ``failed/``,
+    which saneless never prunes (WR-02).
+
+    The wording when nothing survived is left exactly as it was, because that
+    sentence is true and is quoted in this phase's own record.
+
+    Args:
+        exc: The original failure the guard was covering.
+        failure: What went wrong while preserving.
+        destination: The directory the artefacts were being moved into.
+        kept: Whatever did reach it before the failure, in move order.
+
+    Returns:
+        The message for the exception the guard re-raises.
+
+    """
+    if not kept:
+        return f"{exc}. The scan could NOT be preserved to {destination}: {failure}"
+    saved = ", ".join(str(path) for path in kept)
+    return (
+        f"{exc}. The scan could NOT be fully preserved to {destination}: "
+        f"{failure}. Only {saved} was kept"
+    )
+
+
 @contextlib.contextmanager
 def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
     """
@@ -600,7 +639,7 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
             if destinations:
                 _warn_if_failed_dir_growing(failed_dir)
         except OSError as move_exc:
-            msg = f"{exc}. The scan could NOT be preserved to {failed_dir}: {move_exc}"
+            msg = _preservation_failure_message(exc, move_exc, failed_dir, destinations)
             raise PaperlessError(msg) from exc
         if not destinations:
             raise
@@ -694,7 +733,8 @@ def _preserve_partial_passes(
     tmp_path: Path,
     request: PipelineRequest,
     failed_dir: Path,
-) -> list[Path]:
+    destinations: list[Path],
+) -> None:
     """
     Assemble every spooled pass, unfiltered, and move it into ``failed_dir``.
 
@@ -718,9 +758,11 @@ def _preserve_partial_passes(
         request: The job id and title the preserved names are composed from.
         failed_dir: The durable directory to move them into, created here
             because ``data_dir`` may have gone since it was validated.
-
-    Returns:
-        The destinations, in pass order.
+        destinations: Appended to as each pass lands, in pass order. An
+            out-parameter rather than a return value on purpose: when this
+            raises on the second of two passes, the caller still has to be
+            able to say which one it kept, and a return value it never
+            received cannot tell it (WR-02).
 
     Raises:
         OSError: If the directory cannot be created or a move fails.
@@ -728,7 +770,6 @@ def _preserve_partial_passes(
 
     """
     failed_dir.mkdir(parents=True, exist_ok=True)
-    destinations: list[Path] = []
     for suffix, records in ledger.spooled():
         partial_pdf = assemble_pdf(
             records,
@@ -739,7 +780,6 @@ def _preserve_partial_passes(
         destination = failed_dir / partial_pdf.name
         shutil.move(partial_pdf, destination)
         destinations.append(destination)
-    return destinations
 
 
 @contextlib.contextmanager
@@ -819,12 +859,13 @@ def _preserving_partial_scan(
             # today's messages -- FeederEmptyError, "No pages were scanned" --
             # stand exactly as they are.
             raise
+        destinations: list[Path] = []
         try:
-            destinations = _preserve_partial_passes(
-                ledger, tmp_path, request, failed_dir
+            _preserve_partial_passes(
+                ledger, tmp_path, request, failed_dir, destinations
             )
         except (OSError, PdfError) as keep_exc:
-            msg = f"{exc}. The scan could NOT be preserved to {failed_dir}: {keep_exc}"
+            msg = _preservation_failure_message(exc, keep_exc, failed_dir, destinations)
             if isinstance(exc, SanelessError):
                 raise type(exc)(msg) from exc
             raise ScanError(msg) from exc
@@ -903,7 +944,7 @@ def _preserving_page_files(spool_dir: Path, destination: Path) -> Iterator[None]
                 # state -- the same reason _preserving calls it there.
                 _warn_if_failed_dir_growing(destination.parent)
         except OSError as move_exc:
-            msg = f"{exc}. The scan could NOT be preserved to {destination}: {move_exc}"
+            msg = _preservation_failure_message(exc, move_exc, destination, moved)
             if isinstance(exc, SanelessError):
                 raise type(exc)(msg) from exc
             raise PdfError(msg) from exc
