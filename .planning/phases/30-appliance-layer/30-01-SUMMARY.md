@@ -233,6 +233,12 @@ Every string and lookup the eight downstream plans render now exists, is exporte
 
 No blockers.
 
+## Self-Check: PASSED
+
+- Files claimed created/modified: `src/saneless/vocabulary.py`, `tests/test_vocabulary.py`, `.planning/phases/30-appliance-layer/30-01-SUMMARY.md` — all present on disk.
+- Commits claimed: `fd13ebd`, `385dff4`, `9d4fb66`, `464b1bf`, `c475cad`, `c8e65b6` — all present in `git log`, in the stated RED-before-GREEN order, on top of the plan's base `6867e79`.
+- Shared orchestrator artefacts (`STATE.md`, `ROADMAP.md`, `REQUIREMENTS.md`) deliberately untouched: this ran as a parallel worktree executor.
+
 ---
 *Phase: 30-appliance-layer*
 *Completed: 2026-09-16*
