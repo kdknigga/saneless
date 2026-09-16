@@ -296,6 +296,43 @@ def test_stop_on_a_refresher_that_never_started_returns_true(
     assert refresher.stop() is True
 
 
+def test_request_stop_signals_without_joining(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    started_refreshers: list[CheckRefresher],
+) -> None:
+    """
+    The signal half of stop(), so a caller can set two events then join two.
+
+    The lifespan owns two bounded joins.  Doing them one whole ``stop()`` at a
+    time would cost ``2 * STOP_JOIN_SECONDS`` in the worst case; signalling both
+    first makes the joins overlap and keeps the bound at one (A-7).
+    """
+    _spy(monkeypatch)
+    cache = CheckCache()
+    gate = threading.Lock()
+    refresher = CheckRefresher(
+        cache=cache,
+        context_factory=lambda: _context(default_settings),
+        scanner_gate=lambda: gate,
+    )
+    started_refreshers.append(refresher)
+    refresher.start()
+    refresher.request_stop()
+    assert refresher._stopping.is_set() is True
+    assert refresher.stop() is True
+
+
+def test_request_stop_on_a_refresher_that_never_started_is_safe(
+    default_settings: Settings,
+) -> None:
+    """A lifespan that failed before start() must still be able to signal."""
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.request_stop()
+    assert refresher._stopping.is_set() is True
+    assert refresher.stop() is True
+
+
 def test_stop_is_safe_to_call_twice(
     default_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
