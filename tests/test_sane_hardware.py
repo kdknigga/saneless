@@ -127,7 +127,20 @@ class TestRealSaneTestBackend:
         identical -- a "list is not empty" assertion would pass for the wrong
         reason with a half-broken fixture, and would also pass on a developer
         machine that had leaked its own scanner into the list.
+
+        The guard check comes first, and it is not defensive padding.  The
+        process-global init guard (D-17) makes ``SaneBackend()`` a no-op when
+        some earlier test in the same process left it set over a fake ``sane``
+        module, and the only symptom is this empty list -- a diagnosis nobody
+        would reach from ``assert 'test:0' in []``.  Naming the real cause here
+        is what turns that into a one-line answer.
         """
+        assert sane_backend_mod._INIT.done is False, (
+            "SANE was already marked initialised before this test constructed a "
+            "backend, so sane.init() was skipped and the device list is empty "
+            "for a reason that has nothing to do with libsane: an earlier test "
+            "leaked the process-global init guard (D-17)"
+        )
         names = [device.name for device in SaneBackend().get_devices()]
         assert "test:0" in names
 
