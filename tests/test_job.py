@@ -180,6 +180,14 @@ case rules out both "every active job" and "every job" as the predicate.
 QUEUE_BASE_HOURS = 1
 """How far back the ordering case's oldest queued job is backdated."""
 
+QUEUE_POSITION_ROWS = 5
+"""Jobs the queue_position agreement case creates.
+
+Enough that two can be moved out of PENDING from the middle of the queue and
+three still remain, so an implementation that counted rows rather than reading
+the queue ordering would report the wrong index for the survivors.
+"""
+
 CREATE_JOB_PARAMETERS = (
     "self",
     "profile",
@@ -2010,3 +2018,78 @@ class TestOwnerToken:
             assert unowned.owner_token is None
         finally:
             reopened.close()
+
+
+class TestQueuePosition:
+    """queue_position(): the zero-based "N ahead of you" source (APPL-08)."""
+
+    def test_queue_position_counts_the_jobs_ahead_of_each_pending_job(self) -> None:
+        """Three jobs queued in order report 0, 1 and 2 ahead (APPL-08)."""
+        store = JobStore()
+        try:
+            first, second, third = _create_in_order(store, 3)
+
+            positions = [
+                store.queue_position(job_id) for job_id in (first, second, third)
+            ]
+
+            # Zero-based: the job at the head of the queue has nothing ahead of
+            # it, which the UI renders as "(next in line)" rather than the
+            # technically-true "(0 ahead of you)" (UI-SPEC S5).
+            assert positions == [0, 1, 2]
+        finally:
+            store.close()
+
+    def test_queue_position_of_a_job_that_is_not_pending_is_none(self) -> None:
+        """A job that has left PENDING is not waiting, so it has no position."""
+        store = JobStore()
+        try:
+            running, waiting = _create_in_order(store, 2)
+            store.update_state(running, JobState.SCANNING)
+
+            assert store.queue_position(running) is None
+            # The job behind it moves up: the running job is no longer counted.
+            assert store.queue_position(waiting) == 0
+        finally:
+            store.close()
+
+    def test_queue_position_of_an_unknown_job_id_is_none(self) -> None:
+        """An id no row carries is not in the queue, so it has no position."""
+        store = JobStore()
+        try:
+            _create_in_order(store, 2)
+
+            assert store.queue_position("not-a-job-id") is None
+        finally:
+            store.close()
+
+    def test_queue_position_agrees_with_list_pending_ordering(self) -> None:
+        """Every pending job's position is its index in list_pending (APPL-08)."""
+        store = JobStore()
+        try:
+            created = _create_in_order(store, QUEUE_POSITION_ROWS)
+            store.update_state(created[1], JobState.SCANNING)
+            store.finish_job(created[3], JobState.DONE)
+
+            listed = [job.id for job in store.list_pending()]
+
+            # The two must be computed from one ordering, not two that happen
+            # to agree today: a second ORDER BY is what drifts.
+            assert listed == [created[0], created[2], created[4]]
+            assert [store.queue_position(job_id) for job_id in listed] == list(
+                range(len(listed))
+            )
+            for job_id in (created[1], created[3]):
+                assert store.queue_position(job_id) is None
+        finally:
+            store.close()
+
+    def test_queue_position_on_an_empty_store_is_none(self) -> None:
+        """An empty queue answers None rather than raising (APPL-08)."""
+        store = JobStore()
+        try:
+            assert store.list_pending() == []
+
+            assert store.queue_position("not-a-job-id") is None
+        finally:
+            store.close()
