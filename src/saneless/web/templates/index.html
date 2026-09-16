@@ -37,12 +37,40 @@
           hx-disabled-elt="#scan-btn"
           hx-disinherit="hx-disabled-elt">
 
+        {# UI-SPEC S4. Three things a reader will question, answered here.
+
+           1. The swap is innerHTML and never outerHTML. The help slot below
+              carries the id that aria-describedby points at, the polite live
+              region, and the adjacency to this control that gives it Pico's
+              muted help-text styling. Replacing the element breaks all three;
+              replacing only its text breaks none.
+           2. The option value stays the profile name. That is the wire
+              contract POST /api/scan already takes, so only the text a
+              household member reads is new. The human name falls back to the
+              name itself, because a config whose profiles predate this phase
+              carries none until auto-profiles --force is run (Amendment A-3).
+           3. This select issues its own GET, but it declares no
+              disable-during-request attribute of its own, and the form's
+              existing hx-disinherit already covers the one the form declares,
+              so NO attribute is added to the form element above. The C-10 fix
+              stays exactly as written. (The attribute is named in prose rather
+              than quoted so a grep for it still counts only the places that
+              set it.)
+
+           The slot doubles as this control's one line of help text (APPL-10);
+           there is deliberately no second one. #}
         <label for="profile-select">Profile</label>
-        <select name="profile" id="profile-select">
+        <select name="profile" id="profile-select"
+                aria-describedby="profile-description"
+                hx-get="/api/profiles/description"
+                hx-trigger="change"
+                hx-target="#profile-description"
+                hx-swap="innerHTML">
             {% for p in profiles %}
-            <option value="{{ p }}">{{ p }}</option>
+            <option value="{{ p.name }}"{% if p.name == selected %} selected{% endif %}>{{ p.label or p.name }}</option>
             {% endfor %}
         </select>
+        <small id="profile-description" aria-live="polite">{{ selected_description }}</small>
 
         <label for="title-input">Title</label>
         <input type="text" name="title" id="title-input" maxlength="{{ title_max_length }}"
