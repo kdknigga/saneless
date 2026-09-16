@@ -559,24 +559,62 @@ Plans:
 **Plans**: 19 plans
 
 Plans:
+**Wave 1**
+
 - [ ] 30-01-PLAN.md — Vocabulary: error advice with next steps, the shared local-time formatter, page counts, the busy line, the token rejection member
 - [ ] 30-02-PLAN.md — Config: the placeholder-token predicate, profile label/description fields, the `[web]` section
 - [ ] 30-03-PLAN.md — Job store: the owner_token writer and queue_position
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
 - [ ] 30-04-PLAN.md — Pipeline pass-count channel; worker scanner gate, profile storage and front pages
 - [ ] 30-05-PLAN.md — Auto-profiles: generated label and description as tool-owned keys
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
 - [ ] 30-06-PLAN.md — checks.py: the shared three-state registry and the bounded Paperless probe
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
 - [ ] 30-07-PLAN.md — Check cache with an injected clock, and the lazy refresher thread
 - [ ] 30-08-PLAN.md — `saneless doctor` and its CLI reference section
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
 - [ ] 30-09-PLAN.md — App composition: Jinja filters, app.state, dual-thread lifespan shutdown
 - [ ] 30-10-PLAN.md — CLI: the `Try:` advice line, `scan`'s token refusal, the local-time jobs table
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
 - [ ] 30-11-PLAN.md — Status strip: routes, partials, cold-start poll, paused during scan
+
+**Wave 7** *(blocked on Wave 6 completion)*
+
 - [ ] 30-12-PLAN.md — Plain-language errors, page counts and the local Time cell in the templates
+
+**Wave 8** *(blocked on Wave 7 completion)*
+
 - [ ] 30-13-PLAN.md — Owner cookie, owner-gated flip prompt, queue position, Abort confirmation
+
+**Wave 9** *(blocked on Wave 8 completion)*
+
 - [ ] 30-14-PLAN.md — Placeholder-token refusal in the web layer and the disabled Scan button
+
+**Wave 10** *(blocked on Wave 9 completion)*
+
 - [ ] 30-15-PLAN.md — Profile select with a live description and feeder-first ordering
+
+**Wave 11** *(blocked on Wave 10 completion)*
+
 - [ ] 30-16-PLAN.md — Form help text, thumb-friendly tag picker with filter, the simpler form
+
+**Wave 12** *(blocked on Wave 11 completion)*
+
 - [ ] 30-17-PLAN.md — Browser verification part 1: egress gate, strip, errors, counts, timestamps
 - [ ] 30-18-PLAN.md — Compose template, reference docs and master UI-SPEC accuracy
+
+**Wave 13** *(blocked on Wave 12 completion)*
+
 - [ ] 30-19-PLAN.md — Browser verification part 2: two contexts, tag picker, blocked Scan button
 
 **UI hint**: yes

@@ -1,8 +1,8 @@
 ---
 phase: 30
 slug: appliance-layer
-status: draft
-nyquist_compliant: false
+status: approved-for-execution
+nyquist_compliant: true
 wave_0_complete: false
 created: 2026-09-16
 ---
@@ -179,12 +179,20 @@ checks may never be marked "manual-only" or "needs human".*
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all ❌ MISSING references above
-- [ ] No watch-mode flags
-- [ ] No `time.sleep` introduced anywhere
-- [ ] Feedback latency < 90s (full suite)
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all ❌ MISSING references above
+- [x] No watch-mode flags
+- [x] `nyquist_compliant: true` set in frontmatter
+- [ ] No `time.sleep` introduced anywhere — *plan-set gate only; the browser plans
+      (30-17, 30-19) each carry a grep asserting the count does not rise. Confirmed
+      at execution, not at planning.*
+- [ ] Feedback latency < 90s (full suite) — *77s measured before this phase's tests
+      were added. Re-measure after execution.*
 
-**Approval:** pending
+**Approval:** approved for execution 2026-09-16 — gsd-plan-checker returned
+VERIFICATION PASSED against the 19-plan set with no blockers.
+
+`wave_0_complete` stays `false` deliberately: the plan set *covers* every Wave 0 test
+file by name, but the tests themselves are written during execution. Flip it when
+Wave 0 lands.

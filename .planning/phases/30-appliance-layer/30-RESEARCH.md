@@ -1379,7 +1379,11 @@ Outside the scan form, so the `hx-disinherit` landmine does not apply.
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All five were resolved during planning (2026-09-16); each resolution names the plan
+> that adopted it. Recorded here so the decision is not re-litigated at execution time.
+
 
 1. **Does an existing NULL `owner_token` mean "everyone" or "nobody"?**
    - What we know: every row in every deployed database has `owner_token IS NULL`
@@ -1390,6 +1394,9 @@ Outside the scan form, so the `hx-disinherit` landmine does not apply.
      pre-upgrade behaviour exactly, affects only rows that predate the feature, and cannot
      be exploited (there is no way to create a NULL-token job after this phase).
 
+**RESOLVED (plan 30-03):** recommendation adopted — NULL `owner_token` is treated as
+unowned and the prompt renders for everyone.
+
 2. **`[web]` as a new top-level section, or two keys under `[output]`?**
    - What we know: `web_host`/`web_port` already live in `OutputConfig`
      (`config.py:368-369`); `Settings` is `extra="forbid"` so a new section is a real
@@ -1399,11 +1406,17 @@ Outside the scan form, so the `hx-disinherit` landmine does not apply.
      `[output]` for backwards compatibility. Moving `web_host`/`web_port` would be a
      breaking config change and is not in scope.
 
+**RESOLVED (plan 30-02):** recommendation adopted — a new top-level `[web]` section,
+with `web_host`/`web_port` left in `[output]` for backwards compatibility.
+
 3. **`scanner_gate` on the worker, or advisory `current_job_id` only?**
    - What we know: there is no SANE mutual exclusion today (Pitfall 2); the race window is
      small but the consequence is a concurrent SANE call, not a slow page.
    - Recommendation: the gate. If the plan judges it too invasive, it must say so
      explicitly and record the accepted race — not leave it implicit.
+
+   **RESOLVED (plan 30-04):** the real `scanner_gate` on the worker, not the advisory
+   `current_job_id` read. The accepted race is therefore not taken.
 
 4. **Does `resolve_job_title`'s `Scan <time>` fallback go local (APPL-12)?**
    - What we know: `config.py:333` renders UTC and its docstring points at APPL-12 as the
@@ -1411,8 +1424,15 @@ Outside the scan form, so the `hx-disinherit` landmine does not apply.
    - Recommendation: change it, and say so in `docs/how-to/configure-scan-profiles.md`.
      Whatever is decided, decide it — the in-tree comment makes silence a regression.
 
+   **RESOLVED (plan 30-10):** yes — the fallback goes local, and the three documents
+   quoting the old UTC shape are corrected in the same phase.
+
 5. **Fifth history column, or a second line in the Title cell (D-32)?**
    - Left to the planner by CONTEXT. §6 sets out the width cost of each.
+   - Left to the planner by CONTEXT. §6 sets out the width cost of each.
+
+   **RESOLVED (plan 30-12), per UI-SPEC S3:** a second line in the Title cell, not a
+   fifth column — Pitfall 11 is designed out.
 
 ---
 
