@@ -572,7 +572,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 30-06-PLAN.md — checks.py: the shared three-state registry and the bounded Paperless probe
+- [x] 30-06-PLAN.md — checks.py: the shared three-state registry and the bounded Paperless probe
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 5/19 | In Progress|  |
+| 30. Appliance Layer | 6/19 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
