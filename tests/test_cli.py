@@ -51,19 +51,34 @@ from saneless.scanner.base import (
     DeviceInfo,
     ScanBatch,
     ScannerBackend,
-    ScanSettings,
 )
 from saneless.vocabulary import FlipOutcome, JobState, state_label
+from tests.conftest import StubScannerBackend, scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     from click.testing import Result
 
+    from saneless.scanner.base import PageSink, ScanSettings
+
 _TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
 # Keeps the suite out of the developer's real ~/.local/state/saneless.
 _TEST_DATA = str(Path(tempfile.gettempdir()) / "saneless-test" / "data")
 _TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
+
+
+def _inked_page() -> Image.Image:
+    """
+    Draw a page with enough ink that the real empty-page filter keeps it.
+
+    Returns:
+        A clearly non-blank RGB image.
+
+    """
+    page = Image.new("RGB", (100, 100), "white")
+    ImageDraw.Draw(page).rectangle([10, 10, 90, 90], fill="black")
+    return page
 
 
 def _make_settings(**overrides: object) -> Settings:
@@ -127,14 +142,20 @@ def _patch_cli(
         monkeypatch.setattr("saneless.cli.SaneBackend", scanner_cls)
     else:
 
-        class MockSaneBackend(ScannerBackend):
+        class MockSaneBackend(StubScannerBackend):
             """
             Mock scanner backend for CLI tests.
 
-            Subclasses the ABC so the type checkers can see the contract at
-            all. This was one of the two CLI stubs that would *not* have
-            failed when ScanBatch replaced the generator in this phase --
-            every stub that does subclass was caught by the checkers.
+            Subclasses the shared conftest stub, which subclasses the ABC, so
+            the type checkers can see the contract at all. This was one of the
+            two CLI stubs that would *not* have failed when ScanBatch replaced
+            the generator in this phase -- every stub that does subclass was
+            caught by the checkers, and the sink switch caught this one.
+
+            Only the two device-reporting methods are local, because these
+            tests read the richer device list and capabilities back out of the
+            CLI's own output. ``scan_pages`` is the base's: one inked page,
+            spooled through the caller's sink.
             """
 
             def __init__(self, host: str = "") -> None:
@@ -169,13 +190,6 @@ def _patch_cli(
                         ),
                     ],
                 )
-
-            def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-                """Return a batch holding a single test image with content."""
-                img = Image.new("RGB", (100, 100), "white")
-                draw = ImageDraw.Draw(img)
-                draw.rectangle([10, 10, 90, 90], fill="black")
-                return ScanBatch(pages=[img], actual_resolution=300, pages_rejected=0)
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
 
@@ -379,7 +393,7 @@ class TestScanCommand:
     def test_scan_scan_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Pipeline raises ScanError -> exit code 1."""
 
-        class FailScanner(ScannerBackend):
+        class FailScanner(StubScannerBackend):
             """
             Scanner that always raises ScanError.
 
@@ -388,21 +402,22 @@ class TestScanCommand:
             only because the body always raises, and the checkers had nothing
             to compare it against because the class did not subclass the ABC
             it was standing in for.
+
+            ``get_devices`` comes from the shared conftest stub, which answers
+            ``[]`` exactly as the local copy did.
             """
 
             def __init__(self, host: str = "") -> None:
                 """Accept host parameter for API compatibility."""
 
-            def get_devices(self) -> list[DeviceInfo]:
-                """Unused here: the pipeline fails before device discovery."""
-                return []
-
             def get_capabilities(self, device_id: str) -> DeviceCapabilities:
                 """Unused here: the pipeline fails before capabilities load."""
                 return DeviceCapabilities(sources=[], resolutions=[], modes=[])
 
-            def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-                """Raise a scan error."""
+            def scan_pages(
+                self, device_id: str, settings: ScanSettings, sink: PageSink
+            ) -> ScanBatch:
+                """Raise a scan error, spooling nothing."""
                 msg = "Paper jam"
                 raise ScanError(msg)
 
@@ -509,8 +524,8 @@ def _counting_scanner(calls: list[str]) -> type[ScannerBackend]:
 
     """
 
-    class CountingScanner(ScannerBackend):
-        """Scanner reporting a feeder, returning one inked page per pass."""
+    class CountingScanner(StubScannerBackend):
+        """Scanner reporting a feeder, spooling one inked page per pass."""
 
         def __init__(self, host: str = "") -> None:
             """Accept host parameter for API compatibility."""
@@ -527,13 +542,24 @@ def _counting_scanner(calls: list[str]) -> type[ScannerBackend]:
                 modes=["color"],
             )
 
-        def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-            """Record the call and return a single page with content."""
+        def scan_pages(
+            self, device_id: str, settings: ScanSettings, sink: PageSink
+        ) -> ScanBatch:
+            """
+            Record the call, then spool a single page with content.
+
+            Args:
+                device_id: Recorded, one entry per call, in call order.
+                settings: Only ``resolution`` is used, and only to report back.
+                sink: The pipeline's own sink, which receives the page.
+
+            Returns:
+                A batch of the single record the sink returned.
+
+            """
             calls.append(device_id)
-            img = Image.new("RGB", (100, 100), "white")
-            draw = ImageDraw.Draw(img)
-            draw.rectangle([10, 10, 90, 90], fill="black")
-            return ScanBatch(pages=[img], actual_resolution=300, pages_rejected=0)
+            record = sink.add(_inked_page())
+            return scan_batch([record], resolution=settings.resolution)
 
     return CountingScanner
 
@@ -2566,8 +2592,10 @@ def _raising_scanner(exc: BaseException) -> type[ScannerBackend]:
             """Raise the configured exception."""
             raise exc
 
-        def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-            """Raise the configured exception."""
+        def scan_pages(
+            self, device_id: str, settings: ScanSettings, sink: PageSink
+        ) -> ScanBatch:
+            """Raise the configured exception, spooling nothing."""
             raise exc
 
     return RaisingScanner

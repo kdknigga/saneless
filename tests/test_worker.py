@@ -32,12 +32,7 @@ from saneless.exceptions import (
 )
 from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
 from saneless.pipeline import PipelineEvent, ScanResult
-from saneless.scanner.base import (
-    DeviceCapabilities,
-    DeviceInfo,
-    ScanBatch,
-    ScannerBackend,
-)
+from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     RESTART_REASON,
     TERMINAL_STATES,
@@ -48,14 +43,14 @@ from saneless.vocabulary import (
     classify_error,
 )
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
-from tests.conftest import scan_batch
+from tests.conftest import StubScannerBackend, scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from unittest.mock import MagicMock
 
     from saneless.pipeline import PipelineRequest
-    from saneless.scanner.base import ScanSettings
+    from saneless.scanner.base import PageSink, ScanSettings
 
 
 @pytest.fixture(autouse=True)
@@ -1108,7 +1103,7 @@ def _inked_page() -> Image.Image:
     return page
 
 
-class _PassBGatedScanner(ScannerBackend):
+class _PassBGatedScanner(StubScannerBackend):
     """
     A scanner whose second ``scan_pages`` call waits for the test to release it.
 
@@ -1121,6 +1116,11 @@ class _PassBGatedScanner(ScannerBackend):
     subclass of the ABC is caught by the type checkers when the backend
     contract changes, and a mock is not.
 
+    ``get_devices`` comes from ``StubScannerBackend`` and answers ``[]``, which
+    is what keeps startup profile generation (D-14) from swapping the settings
+    under these tests.  Only ``get_capabilities`` is overridden, because these
+    tests need a feeder rather than the base's flatbed.
+
     Attributes:
         release_pass_b: Set by the test to let pass B return.
         scan_calls: How many times ``scan_pages`` has been entered.
@@ -1131,10 +1131,6 @@ class _PassBGatedScanner(ScannerBackend):
         """Start with pass B held."""
         self.release_pass_b = threading.Event()
         self.scan_calls = 0
-
-    def get_devices(self) -> list[DeviceInfo]:
-        """Report no devices, so startup profile generation keeps the settings."""
-        return []
 
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """
@@ -1149,22 +1145,26 @@ class _PassBGatedScanner(ScannerBackend):
         """
         return DeviceCapabilities(sources=["ADF"], resolutions=[300], modes=["color"])
 
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
         """
-        Return one inked page, holding the second and later calls on the gate.
+        Spool one inked page, holding the second and later calls on the gate.
 
         Args:
             device_id: Ignored.
-            settings: Ignored.
+            settings: Only ``resolution`` is used, and only to report it back.
+            sink: The pipeline's own sink, which receives the page.
 
         Returns:
-            A batch of one non-blank page.
+            A batch of the single record the sink returned.
 
         """
         self.scan_calls += 1
         if self.scan_calls >= 2:
             self.release_pass_b.wait(_PASS_B_GATE_CEILING)
-        return scan_batch([_inked_page()])
+        record = sink.add(_inked_page())
+        return scan_batch([record], resolution=settings.resolution)
 
 
 def _manual_duplex_settings(settings: Settings) -> Settings:
@@ -1302,7 +1302,7 @@ class TestWorkerPassB:
         assert scanner.scan_calls == 2
 
 
-class _GatedScanner(ScannerBackend):
+class _GatedScanner(StubScannerBackend):
     """
     A scanner that holds chosen ``scan_pages`` calls until the test releases them.
 
@@ -1312,7 +1312,10 @@ class _GatedScanner(ScannerBackend):
     pass is genuinely in flight before it sends a signal.  That is what makes
     "a click during pass A" a staged state rather than a timing guess.
 
-    A concrete class rather than a ``MagicMock``, like ``_PassBGatedScanner``.
+    A concrete class rather than a ``MagicMock``, like ``_PassBGatedScanner``,
+    and inheriting the same ``get_devices`` answer of ``[]`` from
+    ``StubScannerBackend`` for the same reason: startup profile generation
+    (D-14) must leave these tests' settings alone.
 
     Attributes:
         gates: Per held call number, set by the test to let that call return.
@@ -1338,10 +1341,6 @@ class _GatedScanner(ScannerBackend):
         for gate in self.gates.values():
             gate.set()
 
-    def get_devices(self) -> list[DeviceInfo]:
-        """Report no devices, so startup profile generation keeps the settings."""
-        return []
-
     def get_capabilities(self, device_id: str) -> DeviceCapabilities:
         """
         Report a feeder-only device.
@@ -1355,16 +1354,19 @@ class _GatedScanner(ScannerBackend):
         """
         return DeviceCapabilities(sources=["ADF"], resolutions=[300], modes=["color"])
 
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
         """
-        Return one inked page, holding the configured calls on their gates.
+        Spool one inked page, holding the configured calls on their gates.
 
         Args:
             device_id: Ignored.
-            settings: Ignored.
+            settings: Only ``resolution`` is used, and only to report it back.
+            sink: The pipeline's own sink, which receives the page.
 
         Returns:
-            A batch of one non-blank page.
+            A batch of the single record the sink returned.
 
         """
         self.scan_calls += 1
@@ -1372,25 +1374,33 @@ class _GatedScanner(ScannerBackend):
         if call in self.gates:
             self.entered[call].set()
             self.gates[call].wait(_PASS_B_GATE_CEILING)
-        return scan_batch([_inked_page()])
+        record = sink.add(_inked_page())
+        return scan_batch([record], resolution=settings.resolution)
 
 
 class _JammingGatedScanner(_GatedScanner):
     """A ``_GatedScanner`` whose held calls jam with a ``ScanError`` once released."""
 
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
         """
         Wait on the gate like ``_GatedScanner``, then fail as a paper jam.
 
+        The page is spooled before the raise, exactly as a real backend that
+        jammed partway through a feed would leave it: the sink already holds
+        whatever arrived before the failure.
+
         Args:
             device_id: Ignored.
-            settings: Ignored.
+            settings: Passed through to ``_GatedScanner``.
+            sink: Passed through to ``_GatedScanner``.
 
         Raises:
             ScanError: Always, after the gate is released.
 
         """
-        super().scan_pages(device_id, settings)
+        super().scan_pages(device_id, settings, sink)
         raise ScanError(_JAM_MESSAGE)
 
 
