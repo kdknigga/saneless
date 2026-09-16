@@ -245,6 +245,18 @@ details.tech-details > summary {
     min-height: 2.75rem;
 }
 
+/* Why the Scan button is greyed out, on its own line beneath it. A disabled
+   button cannot be focused or reliably hovered, so the reason has to be
+   visible text rather than a tooltip. The colour comes from .status-error on
+   the element itself -- --pico-del-color, already measured at 7.83:1 light and
+   5.60:1 dark on the card surface -- so this rule introduces no colour value
+   of its own. The top margin is the 8px step the spacing scale already uses.
+   */
+#scan-blocked-reason {
+    display: block;
+    margin-top: 0.5rem;
+}
+
 /* htmx trigger elements that should not be visible */
 .htmx-hidden {
     display: none;

@@ -84,6 +84,23 @@
         </select>
 
         {% include "partials/scan_button.html" %}
+        {# Why the button above is greyed out, as visible text in the reading
+           order directly after it (UI-SPEC S8).  Not a title tooltip, and not
+           the ARIA disabled-state attribute -- named in prose here so a grep
+           forbidding it across these templates still returns nothing.  A
+           disabled button cannot be focused, so aria-describedby on it is
+           never announced on focus and a tooltip is unreachable by keyboard
+           and unreliable on touch; keeping the button focusable by swapping
+           the real disabled attribute for the ARIA one is forbidden, because
+           it would break Phase 26's disabled contract and hx-disabled-elt.
+           It renders only when blocked, so it is never an out-of-band swap
+           target and never has to exist as an empty placeholder: the verdict
+           comes from Settings, which cannot change while the process runs.
+           The sentence is a developer constant from vocabulary.py; this
+           template composes no prose.  No attribute is added to the form
+           element above, so the C-10 inheritance fix stays exactly as written.
+           #}
+        {% if scan_blocked %}<small id="scan-blocked-reason" class="status-error">{{ scan_blocked_reason }}</small>{% endif %}
     </form>
 </article>
 
