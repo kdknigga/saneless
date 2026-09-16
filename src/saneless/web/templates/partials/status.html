@@ -1,19 +1,53 @@
+{# The poll follows the job this browser submitted, when it submitted one: the
+   scan response bakes that id into this URL, so a second person's scan cannot
+   take the status area over.  A browser that submitted nothing -- or whose job
+   has since been pruned -- keeps the current-job URL and the inference behind
+   it, unchanged (D-25). #}
 <div id="status-area"
      {% if job and job.is_active %}
-     hx-get="/api/jobs/current/status"
+     {% if followed_job_id %}hx-get="/api/jobs/{{ followed_job_id }}/status"{% else %}hx-get="/api/jobs/current/status"{% endif %}
      hx-trigger="every 1s"
      hx-swap="outerHTML"
      {% endif %}>
   {% if job %}
     {% if job.is_busy %}
-      <p aria-busy="true">{{ job.state | progress_label }}</p>
+      {# One server-built string, not a sentence composed here: templates own no
+         vocabulary, and a page that assembled its own copy would be a second
+         place for it to drift from the contract.  The line carries the queue
+         position, the manual-duplex front count, or the plain in-flight prose,
+         whichever applies (APPL-08, D-33). #}
+      <p aria-busy="true">{{ busy_line }}</p>
     {% elif job.state == JobState.AWAITING_FLIP %}
-      {# CR-01: once this job's flip wait is answered, acknowledge the answer
-         instead of re-rendering buttons that look as though the click did nothing. #}
+      {# Three-way, in this order (UI-SPEC S5).
+
+         CR-01: once this job's flip wait is answered, acknowledge the answer
+         instead of re-rendering buttons that look as though the click did nothing.
+
+         The second arm is the owner gate (APPL-09, D-24).  The decision is made
+         on the server and the two buttons are simply not emitted for anybody
+         else; hiding them with CSS would be an ASVS V4 failure and is
+         forbidden.  Everything else about the two renderings is identical --
+         state, title, counts, thumbnail, errors -- because the token gates the
+         controls and nothing else.  A NULL owner token means unowned, and the
+         prompt then renders for everyone, so a manual-duplex job in flight
+         across an upgrade is still answerable.
+
+         D-26: there is deliberately no third control here and no second timer.
+         Somebody who closed the tab is the same case as somebody who walked
+         away, and the bounded Phase 25 flip timeout already resolves both.  The
+         absence IS the rendering, so it is asserted by test rather than left to
+         a reviewer's memory.
+
+         The last arm's copy deliberately ends without the three periods that
+         in-progress copy normally carries.  It is locked copy, written that way
+         twice, and the style exception is recorded here so a later tidy-up does
+         not "fix" it. #}
       {% if flip_answer %}
       <p aria-busy="true">{{ flip_answer | flip_answer_label }}</p>
-      {% else %}
+      {% elif is_owner %}
       {% include "partials/flip.html" %}
+      {% else %}
+      <p aria-busy="true">Waiting for the stack to be flipped</p>
       {% endif %}
     {% elif job.state == JobState.DONE %}
       {# The counts are a footnote to the outcome, so they read after it and

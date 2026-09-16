@@ -22,6 +22,10 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from httpx import Response
+
+    from saneless.job import Job
+
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -51,8 +55,10 @@ from saneless.vocabulary import (
     error_next_step,
     local_time,
     page_counts,
+    progress_label,
     rejection_message,
 )
+from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
@@ -976,3 +982,575 @@ class TestAppComposition:
         probing daemon as a side effect.
         """
         assert unstarted_app.state.refresher._thread.is_alive() is False
+
+
+# --- The owner cookie (APPL-09, D-23, D-24) ---------------------------------
+
+# The cookie's name, spelled out here rather than imported from the route
+# module: a test that imported the constant would still pass if the wire name
+# changed underneath every browser that already holds one.
+_OWNER_COOKIE = "saneless_owner"
+
+# ``secrets.token_urlsafe(32)`` is 32 random bytes in unpadded URL-safe base64,
+# which is always 43 characters.  Asserting the length is the only way this
+# suite can see the entropy behind the value it is handed.
+_MINIMUM_OWNER_COOKIE_LENGTH = 43
+
+
+def _owner_set_cookie(response: Response) -> str | None:
+    """
+    Return the raw ``Set-Cookie`` header carrying the owner token, if any.
+
+    The raw header is parsed instead of the client's cookie jar because the jar
+    normalises away exactly what D-23 pins: an absent ``Max-Age`` and an absent
+    ``Secure`` are both invisible once httpx has turned the header into a jar
+    entry, so a jar assertion could not tell a session cookie from a persistent
+    one.
+
+    Args:
+        response: The response to read the headers of.
+
+    Returns:
+        The whole header line, or None when this response mints nothing.
+
+    """
+    for header in response.headers.get_list("set-cookie"):
+        if header.startswith(f"{_OWNER_COOKIE}="):
+            return header
+    return None
+
+
+def _newest_job(client: TestClient) -> Job:
+    """
+    Return the most recently written job row.
+
+    Args:
+        client: The client whose app owns the job store.
+
+    Returns:
+        The newest row, which is the one the last submit created.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    return job_store.list_recent(limit=1)[0]
+
+
+def _submit_scan(client: TestClient, title: str) -> str:
+    """
+    Submit one scan through the real route and return the job it created.
+
+    Args:
+        client: The browser submitting the scan.
+        title: The document title to submit.
+
+    Returns:
+        The id of the created job row.
+
+    """
+    response = client.post("/api/scan", data={"profile": "duplex", "title": title})
+    assert response.status_code == 200
+    return _newest_job(client).id
+
+
+def _other_browser(client: TestClient) -> TestClient:
+    """
+    Return a second client over the same running app, with its own cookie jar.
+
+    Two clients rather than one client with its jar emptied: the jar is the
+    thing under test, and two jars are what D-23's "one token per browser"
+    actually means.  The app is already started by the first client's fixture,
+    so this one is used without entering its lifespan.
+
+    Args:
+        client: The client whose app to share.
+
+    Returns:
+        A second client holding no cookies.
+
+    """
+    return TestClient(_app(client))
+
+
+@pytest.fixture
+def accepting_client(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """Return the shared client, with submits accepted but no pipeline run."""
+    monkeypatch.setattr(
+        _app(client).state.worker, "submit", lambda _job: SubmitResult.ACCEPTED
+    )
+    return client
+
+
+@pytest.fixture
+def owned_flip(
+    accepting_client: TestClient,
+) -> Iterator[tuple[str, WorkerFlipCoordinator]]:
+    """
+    Stage a job waiting at a flip prompt, owned by ``accepting_client``.
+
+    The token is minted by a real ``POST /api/scan`` rather than written
+    straight into the row, so the fixture exercises the mint a browser gets
+    instead of a hand-made value that only resembles one.
+    """
+    job_id = _submit_scan(accepting_client, "Owned Flip")
+    worker = _app(accepting_client).state.worker
+    job_store: JobStore = _app(accepting_client).state.job_store
+    job_store.update_state(job_id, JobState.AWAITING_FLIP)
+    coordinator = WorkerFlipCoordinator(job_id)
+    coordinator.arm()
+    worker._current_job_id = job_id
+    worker._flip_coordinator = coordinator
+    try:
+        yield job_id, coordinator
+    finally:
+        worker._flip_coordinator = None
+        worker._current_job_id = None
+
+
+class TestOwnerCookie:
+    """
+    The owner token's mint, its reuse, and the gate it puts on a flip answer.
+
+    Covers APPL-09 and decisions D-23 (a session cookie, one per browser) and
+    D-24 (the token gates the two flip buttons and nothing else).
+    """
+
+    def test_owner_cookie_is_httponly_lax_and_session_only(
+        self, accepting_client: TestClient
+    ) -> None:
+        """The first submit mints D-23's exact attribute set, and nothing else."""
+        response = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "First Scan"}
+        )
+
+        header = _owner_set_cookie(response)
+        assert header is not None
+        attributes = header.lower()
+        assert "httponly" in attributes
+        assert "samesite=lax" in attributes
+        assert "path=/" in attributes
+        # A session cookie dies with the browser, so neither lifetime attribute
+        # may appear.  Secure is deliberately absent too: the appliance is
+        # served over plain HTTP on a LAN, and Secure would silently disable
+        # the cookie rather than harden it.
+        assert "max-age" not in attributes
+        assert "expires" not in attributes
+        assert "secure" not in attributes
+
+    def test_owner_cookie_value_is_recorded_on_the_job(
+        self, accepting_client: TestClient
+    ) -> None:
+        """The job row records exactly the token the browser was handed."""
+        accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Recorded"}
+        )
+
+        assert (
+            _newest_job(accepting_client).owner_token
+            == accepting_client.cookies[_OWNER_COOKIE]
+        )
+
+    def test_owner_cookie_is_minted_once_per_browser(
+        self, accepting_client: TestClient
+    ) -> None:
+        """A second submit from the same browser mints nothing (D-23)."""
+        first = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "One"}
+        )
+        second = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Two"}
+        )
+
+        assert _owner_set_cookie(first) is not None
+        assert _owner_set_cookie(second) is None
+
+    def test_owner_cookie_reuse_records_the_same_value_on_a_second_job(
+        self, accepting_client: TestClient
+    ) -> None:
+        """Two tabs on one device do not disown each other (D-23)."""
+        accepting_client.post("/api/scan", data={"profile": "duplex", "title": "One"})
+        accepting_client.post("/api/scan", data={"profile": "duplex", "title": "Two"})
+
+        job_store: JobStore = _app(accepting_client).state.job_store
+        recorded = {job.owner_token for job in job_store.list_recent(limit=2)}
+        assert recorded == {accepting_client.cookies[_OWNER_COOKIE]}
+
+    def test_owner_cookie_carries_at_least_32_bytes_of_entropy(
+        self, accepting_client: TestClient
+    ) -> None:
+        """The mint is token_urlsafe(32), which is 43 characters (T-30-57)."""
+        accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Entropy"}
+        )
+
+        minted = accepting_client.cookies[_OWNER_COOKIE]
+        assert len(minted) >= _MINIMUM_OWNER_COOKIE_LENGTH
+
+    @pytest.mark.parametrize("presented", ["", "   "], ids=["empty", "whitespace"])
+    def test_owner_cookie_that_is_blank_is_replaced(
+        self, accepting_client: TestClient, presented: str
+    ) -> None:
+        """A blank cookie is treated as no cookie and a fresh one is minted."""
+        accepting_client.cookies.set(_OWNER_COOKIE, presented)
+
+        response = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Blank"}
+        )
+
+        header = _owner_set_cookie(response)
+        assert header is not None
+        # The value is read out of the header rather than the jar: the jar now
+        # holds the blank cookie this test planted as well as the minted one.
+        minted = header.split(";", 1)[0].removeprefix(f"{_OWNER_COOKIE}=")
+        assert minted.strip() != ""
+        assert _newest_job(accepting_client).owner_token == minted
+
+    def test_owner_cookie_holder_can_continue_the_flip(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+    ) -> None:
+        """The browser that submitted the job answers Continue (APPL-09)."""
+        job_id, coordinator = owned_flip
+
+        response = accepting_client.post("/api/flip/continue", data={"job_id": job_id})
+
+        assert response.status_code == 200
+        assert coordinator.answer is FlipOutcome.CONTINUED
+
+    def test_owner_cookie_holder_can_abort_the_flip(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+    ) -> None:
+        """The browser that submitted the job answers Abort (APPL-09)."""
+        job_id, coordinator = owned_flip
+
+        response = accepting_client.post("/api/flip/abort", data={"job_id": job_id})
+
+        assert response.status_code == 200
+        assert coordinator.answer is FlipOutcome.ABORTED
+
+    def test_owner_cookie_absent_cannot_continue_the_flip(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+    ) -> None:
+        """
+        A second browser's Continue is dropped, not errored (D-16, D-24).
+
+        The household member who did not load the paper must not be able to
+        start pass B, and must not be shown a failure for trying either: the
+        answer is simply not taken and the current status comes back.
+        """
+        job_id, coordinator = owned_flip
+
+        response = _other_browser(accepting_client).post(
+            "/api/flip/continue", data={"job_id": job_id}
+        )
+
+        assert response.status_code == 200
+        assert 'id="status-area"' in response.text
+        assert coordinator.answer is None
+
+    def test_owner_cookie_absent_cannot_abort_the_flip(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+    ) -> None:
+        """A second browser's Abort is dropped the same way (D-16, D-24)."""
+        job_id, coordinator = owned_flip
+
+        response = _other_browser(accepting_client).post(
+            "/api/flip/abort", data={"job_id": job_id}
+        )
+
+        assert response.status_code == 200
+        assert 'id="status-area"' in response.text
+        assert coordinator.answer is None
+
+    def test_owner_cookie_is_not_required_when_the_job_has_none(
+        self, client: TestClient, waiting_flip: tuple[str, WorkerFlipCoordinator]
+    ) -> None:
+        """
+        A NULL owner token means unowned, so anyone may answer (UI-SPEC S5).
+
+        This is the manual-duplex job that was already in flight when the
+        appliance was upgraded.  A strict rule would make it un-continuable and
+        force it to time out.
+        """
+        job_id, coordinator = waiting_flip
+        job_store: JobStore = _app(client).state.job_store
+        staged = job_store.get_job(job_id)
+        assert staged is not None
+        assert staged.owner_token is None
+
+        response = client.post("/api/flip/continue", data={"job_id": job_id})
+
+        assert response.status_code == 200
+        assert coordinator.answer is FlipOutcome.CONTINUED
+
+    def test_owner_cookie_never_reaches_the_body_or_the_log(
+        self,
+        accepting_client: TestClient,
+        owned_flip: tuple[str, WorkerFlipCoordinator],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The token appears in no rendered markup and no log record (T-30-59)."""
+        job_id, _ = owned_flip
+        minted = accepting_client.cookies[_OWNER_COOKIE]
+
+        with caplog.at_level(logging.DEBUG):
+            page = accepting_client.get("/")
+            polled = accepting_client.get("/api/jobs/current/status")
+            answered = accepting_client.post(
+                "/api/flip/continue", data={"job_id": job_id}
+            )
+
+        for body in (page.text, polled.text, answered.text):
+            assert minted not in body
+        assert minted not in caplog.text
+
+
+# --- The followed job and the queue line (APPL-08, D-25) ---------------------
+
+
+def _displayed(markup: str) -> str:
+    """
+    Return the markup with its HTML entities resolved, as a reader sees it.
+
+    Jinja autoescapes the whole busy line, and APPL-08's copy quotes the title
+    with apostrophes, so the sentence is spelled with entities in the markup
+    and only reads back as written once they are resolved.  Copy assertions use
+    this; escaping assertions deliberately do not, because unescaping first
+    would make them vacuous.
+
+    Args:
+        markup: The rendered response body.
+
+    Returns:
+        The same text with entities resolved.
+
+    """
+    return html.unescape(markup)
+
+
+def _running_job(client: TestClient, title: str) -> str:
+    """
+    Create a SCANNING job and make it the worker's current job.
+
+    Args:
+        client: The client whose app owns the store and worker.
+        title: The document title to give it.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title=title)
+    job_store.update_state(job.id, JobState.SCANNING)
+    _app(client).state.worker._current_job_id = job.id
+    return job.id
+
+
+def _queued_job(client: TestClient, title: str) -> str:
+    """
+    Create a job and leave it PENDING, waiting in the queue.
+
+    Args:
+        client: The client whose app owns the store.
+        title: The document title to give it.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    return job_store.create_job(profile="default", title=title).id
+
+
+class TestFollowedJob:
+    """
+    The status area follows the job this browser submitted (D-25).
+
+    A submitter who sees another household member's scan reported back at them
+    learns nothing about their own, which is the whole of APPL-08's complaint.
+    """
+
+    def test_followed_job_status_reports_that_job_not_the_running_one(
+        self, client: TestClient
+    ) -> None:
+        """The named job is rendered whatever the worker happens to be running."""
+        _running_job(client, "Someone Elses Scan")
+        job_store: JobStore = _app(client).state.job_store
+        mine = job_store.create_job(profile="default", title="My Scan")
+        job_store.finish_job(mine.id, JobState.DONE)
+
+        response = client.get(f"/api/jobs/{mine.id}/status")
+
+        assert response.status_code == 200
+        assert "Done: My Scan" in response.text
+        assert "Someone Elses Scan" not in response.text
+
+    def test_followed_job_status_falls_back_when_the_id_is_unknown(
+        self, client: TestClient
+    ) -> None:
+        """
+        A pruned job degrades to today's inference, not to a 404.
+
+        A 404 would also confirm to a caller which ids exist, which is a fact
+        the appliance has no reason to hand out (T-30-61).
+        """
+        _running_job(client, "Still Running")
+
+        followed = client.get("/api/jobs/no-such-job-at-all/status")
+        current = client.get("/api/jobs/current/status")
+
+        assert followed.status_code == 200
+        assert followed.text == current.text
+
+    def test_followed_job_poll_url_names_the_followed_job(
+        self, client: TestClient
+    ) -> None:
+        """An active followed job keeps being polled by id."""
+        job_id = _running_job(client, "Polled By Id")
+
+        response = client.get(f"/api/jobs/{job_id}/status")
+
+        assert f'hx-get="/api/jobs/{job_id}/status"' in response.text
+
+    def test_followed_job_unknown_id_polls_the_current_url(
+        self, client: TestClient
+    ) -> None:
+        """The fallback rendering polls the current-job URL, as it always did."""
+        _running_job(client, "Still Running")
+
+        response = client.get("/api/jobs/no-such-job-at-all/status")
+
+        assert 'hx-get="/api/jobs/current/status"' in response.text
+
+    def test_followed_job_id_is_baked_into_the_scan_response(
+        self, accepting_client: TestClient
+    ) -> None:
+        """POST /api/scan hands back a poll URL naming the job it created."""
+        job_id = _submit_scan(accepting_client, "Freshly Submitted")
+
+        response = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Second Submit"}
+        )
+
+        newest = _newest_job(accepting_client).id
+        assert newest != job_id
+        assert f'hx-get="/api/jobs/{newest}/status"' in response.text
+
+    def test_followed_job_current_status_route_is_unchanged(
+        self, client: TestClient
+    ) -> None:
+        """A browser that submitted nothing keeps today's route and inference."""
+        _running_job(client, "Inferred")
+
+        response = client.get("/api/jobs/current/status")
+
+        assert response.status_code == 200
+        assert 'hx-get="/api/jobs/current/status"' in response.text
+        assert "/api/jobs/current/status" in response.text
+
+
+class TestQueueLine:
+    """
+    What a queued submitter is told while they wait (APPL-08, UI-SPEC S5).
+
+    Every case renders through the existing busy branch; no new state branch is
+    added, which is what keeps the flip controls disappearing the moment a job
+    leaves AWAITING_FLIP.
+    """
+
+    def test_queue_line_names_the_running_job_and_the_count(
+        self, client: TestClient
+    ) -> None:
+        """One job ahead reads as APPL-08 writes it."""
+        _running_job(client, "Tax return")
+        _queued_job(client, "Ahead Of Me")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "Waiting for 'Tax return' to finish (1 ahead of you)" in _displayed(
+            response.text
+        )
+
+    def test_queue_line_says_next_in_line_for_zero_ahead(
+        self, client: TestClient
+    ) -> None:
+        """The last job in the queue is told it is next, not that zero wait."""
+        _running_job(client, "Tax return")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "Waiting for 'Tax return' to finish (next in line)" in _displayed(
+            response.text
+        )
+
+    def test_queue_line_never_says_zero_ahead_of_you(self, client: TestClient) -> None:
+        """
+        ``(0 ahead of you)`` is never rendered.
+
+        It is technically true and reads like a bug, which is the one thing
+        this milestone is spending itself on removing.
+        """
+        _running_job(client, "Tax return")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "0 ahead of you" not in _displayed(response.text)
+
+    def test_queue_line_is_absent_when_nothing_is_running(
+        self, client: TestClient
+    ) -> None:
+        """A PENDING job with an idle worker keeps the unchanged progress copy."""
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert progress_label(JobState.PENDING) in _displayed(response.text)
+        assert "Waiting for" not in _displayed(response.text)
+
+    def test_queue_line_escapes_the_running_title(self, client: TestClient) -> None:
+        """The title is user data and is autoescaped, never injected (T-30-62)."""
+        _running_job(client, "<script>alert(1)</script>")
+        mine = _queued_job(client, "Mine")
+
+        response = client.get(f"/api/jobs/{mine}/status")
+
+        assert "<script>alert(1)</script>" not in response.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+
+    def test_queue_line_shows_the_front_count_on_pass_b(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pass B leads with the pages already counted on pass A (APPL-03, D-33)."""
+        monkeypatch.setattr(ScanWorker, "front_pages", property(lambda _self: 12))
+        job_id = _running_job(client, "Duplex Stack")
+        job_store: JobStore = _app(client).state.job_store
+        job_store.update_state(job_id, JobState.SCANNING_REVERSE)
+
+        response = client.get(f"/api/jobs/{job_id}/status")
+
+        displayed = _displayed(response.text)
+        assert "Front: 12 pages · " in displayed
+        assert progress_label(JobState.SCANNING_REVERSE) in displayed
+
+    def test_queue_line_is_built_in_the_route_and_not_the_template(self) -> None:
+        """
+        The template renders one server-built string and composes nothing.
+
+        Templates own no vocabulary (Pattern C); a page that assembled its own
+        sentence would be a second place for the copy to drift.
+        """
+        status = (
+            Path(app_module.__file__).parent / "templates" / "partials" / "status.html"
+        ).read_text(encoding="utf-8")
+        assert "busy_line(" not in status
+        assert "progress_label" not in status

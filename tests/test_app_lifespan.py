@@ -728,6 +728,11 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
         "data": {"profile": "default", "title": "D-19 proof"},
     },
     "/api/jobs/current/status": {"method": "GET"},
+    # Driven with the literal template path, which names no row.  That is a
+    # real request the route handles by design: an unknown id degrades to the
+    # current-or-most-recent rendering rather than a 404 (D-25), so no job has
+    # to be staged for this proof to reach the handler.
+    "/api/jobs/{job_id}/status": {"method": "GET"},
     # The strip is a cache read, so it enters no SANE call at all; the refresh
     # route is the one that does, which is exactly why this proof must drive it
     # -- it runs the scanner check through the same backend handle the worker
