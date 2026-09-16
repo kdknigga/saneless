@@ -89,8 +89,9 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         outlives its retention is harmless, and a service that will not come
         up over it is not.
 
-        Shutdown stops the worker first and closes the Paperless client and
-        the job store only when the worker confirms it stopped (D-09).
+        Shutdown stops the worker first and closes the Paperless client, the
+        job store and the scanner only when the worker confirms it stopped
+        (D-09, D-18).
         """
         validate_settings_dirs(settings)
         try:
@@ -126,13 +127,19 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
             # final write; the next startup's recovery records it.
             logger.warning(
                 "Scan worker did not stop within %s s (job %s still running); "
-                "leaving the job store and Paperless client open for process exit",
+                "leaving the job store, Paperless client and scanner open for "
+                "process exit",
                 STOP_JOIN_SECONDS,
                 worker.current_job_id,
             )
             return
         paperless.close()
         job_store.close()
+        # Last, and only here: closing the scanner shuts SANE down for the
+        # whole process, and sane_exit() closes every open handle while
+        # holding the GIL.  A worker that did not stop may still be inside a
+        # read, which is why the branch above returns instead (D-18).
+        scanner.close()
         logger.info("App shutdown complete")
 
     app = FastAPI(lifespan=lifespan)
