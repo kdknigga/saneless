@@ -51,7 +51,7 @@ from saneless.config import (
     Settings,
 )
 from saneless.scanner.base import DeviceInfo
-from saneless.vocabulary import ConnectionStatus, local_time
+from saneless.vocabulary import ConnectionStatus, JobState, local_time
 from saneless.web import app as app_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
@@ -855,3 +855,165 @@ class TestStripStyles:
         browser suite measures and this file pins what it measures.
         """
         assert "min-height: 2.75rem;" in _css()
+
+
+# The two hidden loaders, and the out-of-band wrapper, matched as literals: an
+# htmx trigger is only as good as its exact attribute spelling.
+_HISTORY_LOADER = 'hx-get="/api/jobs/history"'
+_STRIP_LOADER = 'hx-get="/api/checks"'
+_OOB_CHECKS = re.compile(r'<div id="checks-body" hx-swap-oob="true"')
+_OOB_SCAN_BTN = 'id="scan-btn" hx-swap-oob="true"'
+
+_PARTIALS_DIR = _PACKAGE_DIR / "templates" / "partials"
+_STATUS_TEMPLATE = _PARTIALS_DIR / "status.html"
+_TERMINAL_RELOAD_TEMPLATE = _PARTIALS_DIR / "terminal_reload.html"
+
+
+def _templates_containing(needle: str) -> list[str]:
+    """
+    Name every template file holding `needle`.
+
+    Returns:
+        The matching file names, sorted, so an assertion can name them.
+
+    """
+    return sorted(
+        path.name
+        for path in _PACKAGE_DIR.joinpath("templates").rglob("*.html")
+        if needle in path.read_text(encoding="utf-8")
+    )
+
+
+def _finish_a_job(client: TestClient, state: JobState) -> None:
+    """Create a job, drive it to `state`, and make it the worker's current."""
+    job_store = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title="Terminal")
+    job_store.update_state(job.id, state, error="disk on fire")
+    _adopt_as_current_job(client, job.id)
+
+
+class TestTerminalReloadPartial:
+    """The four identical hidden loaders became one partial that does more."""
+
+    def test_the_partial_holds_both_loaders(self) -> None:
+        """
+        History and the strip are reloaded by the same terminal event.
+
+        The strip loader is here rather than left to the TTL because D-08's
+        paused note has to clear the moment the scan ends; waiting out thirty
+        seconds would leave the page claiming a scan is still running.
+        """
+        source = _TERMINAL_RELOAD_TEMPLATE.read_text(encoding="utf-8")
+        assert _HISTORY_LOADER in source
+        assert _STRIP_LOADER in source
+        assert source.count('hx-trigger="load"') == 2
+        assert source.count('class="htmx-hidden"') == 2
+
+    def test_status_html_holds_no_loader_markup_of_its_own(self) -> None:
+        """The four copies are gone, not merely joined by a fifth."""
+        source = _STATUS_TEMPLATE.read_text(encoding="utf-8")
+        assert "htmx-hidden" not in source
+        assert _HISTORY_LOADER not in source
+
+    def test_every_terminal_branch_includes_it(self) -> None:
+        """DONE, FALLBACK, CANCELLED and ERROR all reload the same way."""
+        source = _STATUS_TEMPLATE.read_text(encoding="utf-8")
+        assert source.count('include "partials/terminal_reload.html"') == 4
+
+    def test_the_history_loader_lives_in_exactly_two_templates(self) -> None:
+        """
+        One copy for the status branches, one for the request-error slot.
+
+        ``partials/error.html`` keeps its own because an error is rendered
+        without a status area at all, so it cannot share the status partial's.
+        """
+        assert _templates_containing(_HISTORY_LOADER) == [
+            "error.html",
+            "terminal_reload.html",
+        ]
+
+    @pytest.mark.parametrize(
+        "state",
+        [JobState.DONE, JobState.FALLBACK, JobState.CANCELLED, JobState.ERROR],
+    )
+    def test_a_terminal_status_reloads_the_strip(
+        self, client: TestClient, state: JobState
+    ) -> None:
+        """Whatever ended the scan, the strip un-pauses at once."""
+        _finish_a_job(client, state)
+        markup = client.get("/api/jobs/current/status").text
+        assert _HISTORY_LOADER in markup
+        assert _STRIP_LOADER in markup
+
+    def test_an_active_job_reloads_neither(self, client: TestClient) -> None:
+        """A scan still running has nothing terminal to report yet."""
+        _finish_a_job(client, JobState.SCANNING)
+        markup = client.get("/api/jobs/current/status").text
+        assert _HISTORY_LOADER not in markup
+        assert _STRIP_LOADER not in markup
+
+
+class TestWhichResponsesCarryWhat:
+    """UI-SPEC § Interaction Map: the out-of-band table, asserted row by row."""
+
+    def test_a_scan_submit_carries_the_strip_out_of_band(
+        self, client: TestClient
+    ) -> None:
+        """
+        D-08's paused note appears the instant the scan is accepted.
+
+        Without this the strip would keep claiming a live Scanner reading for
+        up to a full TTL after the scanner became unavailable.
+        """
+        response = client.post(
+            "/api/scan", data={"profile": "default", "title": "OOB proof"}
+        )
+        assert response.status_code == 200
+        assert _OOB_CHECKS.search(response.text) is not None
+
+    def test_the_status_poll_does_not(self, client: TestClient) -> None:
+        """
+        A poll carrying it would re-render the strip every second for nothing.
+
+        That is the same reason ``clear_message`` is scan-only, and it is why
+        the flag is set in exactly one handler.
+        """
+        assert _OOB_CHECKS.search(client.get("/api/jobs/current/status").text) is None
+
+    def test_a_flip_answer_does_not(self, client: TestClient) -> None:
+        """A flip answer changes the job, not the appliance's health."""
+        response = client.post("/api/flip/continue", data={"job_id": "no-such-job"})
+        assert response.status_code == 200
+        assert _OOB_CHECKS.search(response.text) is None
+
+    def test_an_error_response_carries_neither(self, client: TestClient) -> None:
+        """An error slot renders the sentence and nothing out-of-band."""
+        response = client.post(
+            "/api/scan", data={"profile": "no-such-profile", "title": ""}
+        )
+        assert response.status_code != 200
+        assert _OOB_CHECKS.search(response.text) is None
+        assert _OOB_SCAN_BTN not in response.text
+
+    def test_a_refresh_does_not_re_render_the_scan_button(
+        self, client: TestClient
+    ) -> None:
+        """
+        The strip is not a status response, so it owns no button state.
+
+        An OOB ``#scan-btn`` here would let a Check again click re-enable a
+        button the server had deliberately disabled.
+        """
+        response = client.post("/api/checks/refresh")
+        assert _OOB_SCAN_BTN not in response.text
+        assert 'id="scan-btn"' not in response.text
+
+    def test_the_flag_is_set_by_exactly_one_handler(self) -> None:
+        """
+        ``refresh_checks=True`` appears once in the route module.
+
+        A second setter would be a second response re-rendering the strip, and
+        the reason the flag exists at all is that only the submit has news.
+        """
+        source = Path(routes_module.__file__).read_text(encoding="utf-8")
+        assert source.count("refresh_checks=True") == 1
