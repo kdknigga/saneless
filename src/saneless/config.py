@@ -49,6 +49,8 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_RESOLUTION",
     "PLACEHOLDER_TOKENS",
+    "PROFILE_DESCRIPTION_MAX_LENGTH",
+    "PROFILE_LABEL_MAX_LENGTH",
     "LogLevel",
     "OutputConfig",
     "PaperlessConfig",
@@ -75,6 +77,18 @@ DEFAULT_RESOLUTION = 300
 300 DPI is the minimum recommended by Tesseract OCR and the industry
 standard for professional document scanning. See Phase 11 research.
 """
+
+# The bounds on the two generated profile text fields (D-18, APPL-05). Named
+# constants rather than inline integers, the way TITLE_MAX_LENGTH is, so the
+# schema, the generator and the tests read the same number. A label is an
+# option's text and a description is one short sentence beneath it; both are
+# rendered into HTML, so they are bounded for the same reason default_title is
+# (T-30-06, T-30-08, ROBU-08).
+PROFILE_LABEL_MAX_LENGTH: Final = 64
+"""The longest ``profiles.<name>.label`` a config may carry."""
+
+PROFILE_DESCRIPTION_MAX_LENGTH: Final = 200
+"""The longest ``profiles.<name>.description`` a config may carry."""
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 """The logging level names ``output.log_level`` accepts (CFG-04, M-21).
@@ -318,6 +332,28 @@ class ProfileConfig(BaseModel):
     # before-validator: it only ever adds ``duplex``, which is a real field.
     # populate_by_name keeps both ``title`` and ``default_title`` accepted.
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    # The profile's human name and the sentence beneath it in the dropdown
+    # (APPL-05, UI-SPEC S4). Declared first so a human opening the file reads
+    # the human name before the machine settings.
+    #
+    # D-18: these are persisted, tool-owned keys. They join Phase 27 D-02's
+    # owned key set and behave exactly like ``source`` / ``mode`` /
+    # ``resolution``: ``saneless auto-profiles`` writes them, ``--force``
+    # overwrites them in place, and D-03's "an owned key a fresh generation
+    # does not write is deleted" applies. The operator's escape hatch is the
+    # documented one -- remove ``auto_generated`` to take the profile over.
+    #
+    # Bounded for the same reason ``default_title`` is: they are rendered into
+    # HTML, and nothing else bounds what a config file can put on the page
+    # (T-30-06, T-30-08, ROBU-08).
+    #
+    # Defaulting to ``""`` is what keeps a config written before this phase
+    # loading under ``extra="forbid"``; the dropdown renders ``label or name``
+    # (Amendment A-3) so a pre-existing generated profile is never a blank
+    # option.
+    label: str = Field(default="", max_length=PROFILE_LABEL_MAX_LENGTH)
+    description: str = Field(default="", max_length=PROFILE_DESCRIPTION_MAX_LENGTH)
 
     source: str = "Flatbed"
     resolution: int = DEFAULT_RESOLUTION
