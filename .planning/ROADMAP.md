@@ -526,7 +526,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 29-06-PLAN.md — Migrate the eight remaining stub scanners; close the red interval
+- [x] 29-06-PLAN.md — Migrate the eight remaining stub scanners; close the red interval
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
@@ -602,7 +602,7 @@ Plans:
 | 26. Worker and Web Robustness | 19/19 | Complete    | 2026-09-15 |
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
-| 29. Geometry, Memory, and Timeouts | 5/11 | In Progress|  |
+| 29. Geometry, Memory, and Timeouts | 6/11 | In Progress|  |
 | 30. Appliance Layer | 0/? | Not started | - |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
