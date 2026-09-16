@@ -664,16 +664,25 @@ class TestFlipPromptUI:
 
 _COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').length"
 
-# Counts htmx:afterRequest for the two selects that load on page load. htmx
-# 2.0.8 strips hx-disabled-elt's `disabled` inside the request's onload handler,
-# before it fires afterRequest, so once both events have fired the inheritance
-# trap has either sprung or it has not. Registered as an init script so the
-# listener exists before htmx issues the load requests.
+# Counts the two in-form controls that load themselves on page load. htmx 2.0.8
+# strips hx-disabled-elt's `disabled` inside the request's onload handler, after
+# the swap and before htmx:afterSettle, so once both events have fired the
+# inheritance trap has either sprung or it has not. Registered as an init script
+# so the listener exists before htmx issues the load requests.
+#
+# afterSettle, not afterRequest: the tag list is swapped outerHTML, and htmx
+# fires afterRequest on the element it requested *after* that swap has already
+# detached it, so the event never reaches this document-level listener. The
+# settle pass runs on the elements that are now in the document, on htmx's
+# default 20 ms settle delay -- which is later still, so it remains a sound
+# "the trap has had its chance" signal. The correspondent select is swapped
+# innerHTML and settles as itself; the new tag list settles under the same id
+# the old one carried, because the partial renders its own wrapper.
 _RECORD_LOAD_REQUESTS = """
 window.__selectLoadsFinished = 0;
-document.addEventListener("htmx:afterRequest", (event) => {
+document.addEventListener("htmx:afterSettle", (event) => {
     const id = event.detail.elt && event.detail.elt.id;
-    if (id === "tags-select" || id === "correspondent-select") {
+    if (id === "tags-list" || id === "correspondent-select") {
         window.__selectLoadsFinished += 1;
     }
 });
