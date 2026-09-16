@@ -71,12 +71,35 @@ In the path settings (`tmp_dir`, `data_dir`, `log_file`, and `consume_dir` under
 | `web_host` | string | `"0.0.0.0"` | Web server bind address. The default `0.0.0.0` listens on all network interfaces |
 | `web_port` | int | `8080` | Web server port |
 
+## `[web]`
+
+Which optional controls the scan form shows. Both default to `true`, so an existing deployment's form is unchanged by upgrading.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `show_tags` | bool | `true` | Show the Tags checkbox list on the scan form. `false` hides the whole Tags block, filter included |
+| `show_correspondent` | bool | `true` | Show the Correspondent dropdown on the scan form. `false` hides it |
+
+This is one appliance with one configured form shape, not a per-browser preference: everyone who opens the page sees the same form, and there is no control in the UI to turn either back on. Edit the file and restart saneless.
+
+**Hiding a control changes the form, never the scan.** The profile's `default_tags` and `default_correspondent` still apply to every scan it runs, exactly as they do when the controls are visible and left untouched -- the same way a blank title still falls back to the profile's `title`. So `show_tags = false` with `default_tags = [3, 7]` means every scan from that profile is tagged 3 and 7, and nobody has to think about it. Use this to hand a household member a form with a Profile, a Title and a Scan button.
+
+**The bind address is not here.** `web_host` and `web_port` stayed under [`[output]`](#output), where they have always been, because moving them would break every deployment that already sets them or their `SANELESS_OUTPUT__WEB_*` variables. `[web]` holds only the form-shape keys.
+
+```toml
+[web]
+show_tags = true
+show_correspondent = false
+```
+
 ## `[profiles.NAME]`
 
 Scan profiles define scanner settings and default metadata. At least one profile named `default` must exist.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `label` | string | `""` | What the web UI's profile dropdown calls this profile, at most 64 characters. Empty means the option shows the profile's own name. `saneless auto-profiles` fills it in ("Feeder, double-sided") |
+| `description` | string | `""` | One short sentence shown beneath the dropdown when this profile is selected, at most 200 characters. Empty means no description line. `saneless auto-profiles` fills it in |
 | `source` | string | `"Flatbed"` | Scan source, as your scanner reports it: for example `Flatbed`, `ADF`, `ADF Duplex`, `Auto`. Run `saneless devices --capabilities` to list them. |
 | `duplex` | string | `"none"` | How both sides of a sheet are scanned: `none`, `hardware` or `manual`. `manual` runs the two-pass flip workflow and needs a single-sided feeder source (see [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex)). `hardware` is declarative: nothing reads it, and the scanner still decides from `source` whether to scan both sides; it records what the scanner does so the profile describes itself. |
 | `auto_source_mode` | string | `"flatbed"` | When source is `"Auto"`: route as `"flatbed"` (single page) or `"adf"` (multi-page feeder). Ignored for explicit sources. |
@@ -90,6 +113,8 @@ Scan profiles define scanner settings and default metadata. At least one profile
 | `empty_page_stddev_threshold` | float | `5.0` | Standard deviation threshold for empty page detection |
 | `enable_empty_page_detection` | bool | `true` | Enable automatic empty page removal |
 | `auto_generated` | bool | `false` | Whether this profile was auto-generated from scanner capabilities |
+
+`auto_generated = true` marks a profile as tool-owned: `saneless auto-profiles --force` rewrites its generated keys, `label` and `description` among them, so anything you write there is replaced the next time you run it. **To take a profile over, delete its `auto_generated` line.** saneless then leaves the whole profile alone, and your own `label` and `description` are what the dropdown shows. See [Configure Scan Profiles](../how-to/configure-scan-profiles.md) for the full ownership rules.
 
 ---
 
@@ -120,7 +145,13 @@ min_free_space_mb = 500
 web_host = "0.0.0.0"
 web_port = 8080
 
+[web]
+show_tags = true
+show_correspondent = true
+
 [profiles.default]
+label = "Glass (flatbed)"
+description = "One page at a time from the scanner glass."
 source = "Flatbed"
 resolution = 300
 mode = "Color"
