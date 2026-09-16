@@ -16,13 +16,32 @@
       {% include "partials/flip.html" %}
       {% endif %}
     {% elif job.state == JobState.DONE %}
+      {# The counts are a footnote to the outcome, so they read after it and
+         before the preview (UI-SPEC S3).
+
+         The guard is `counts` being None -- what the filter below returns when
+         any one of the three is NULL -- and NEVER a count's own truthiness
+         (D-32, Pitfall 4).  Four of the six terminal cases have NULL counts by
+         construction: worker.py leaves them NULL on error and on cancel, job.py
+         on a refused submit, and no pre-Phase-23 row was ever backfilled.  A
+         measured 0, by contrast, is a true measurement and renders as 0.
+
+         Success criterion 3 therefore means "every terminal job that RECORDED
+         counts": ERROR and CANCELLED rows have none to show, and D-32 accepts
+         that, so a later reader need not chase a phantom. #}
       <p class="status-done">&#10003; Done: {{ job.title }}</p>
+      {% set counts = job | page_counts %}
+      {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
       {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.FALLBACK %}
       <p class="status-fallback">&#8594; Saved to folder: {{ job.title }}</p>
       {% if job.warning %}
       <p class="status-fallback">{{ job.warning }}</p>
       {% endif %}
+      {# After the warning as well as the outcome: the warning is about the
+         scan's fate, the counts are only about its size. #}
+      {% set counts = job | page_counts %}
+      {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
       {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.CANCELLED %}
       {# D-01: a cancel is a deliberate stop, not a failure, so it is not announced as an alert. #}

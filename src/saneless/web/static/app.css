@@ -216,6 +216,18 @@ article > .history-table-wrap {
     }
 }
 
+/* The page counts are a quiet second line under the outcome, in the status
+   area and in the Title cell alike -- so one class and one rule serve both,
+   and display: block is what makes the counts their own line in a <td> as
+   well as in a <div>. Muted, never a status colour: a count is a measurement,
+   not an outcome. Deliberately not wrapped in <small>: inside the table the
+   mobile rule already reduces the cell to 0.875rem, and a nested <small>
+   would compound to about 12px and create a fifth type size. */
+.page-counts {
+    display: block;
+    color: var(--pico-muted-color);
+}
+
 /* "Technical details" is a rare control, but it is still a control someone
    taps standing at the scanner, so give the summary a finger-sized row. The
    min-height is the WCAG 2.5.5 touch-target floor, stated rather than relied
