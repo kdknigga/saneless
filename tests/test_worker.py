@@ -31,6 +31,7 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.job import ErrorCategory, Job, JobResult, JobState, JobStore
+from saneless.paperless import UploadResult
 from saneless.pipeline import PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.vocabulary import (
@@ -5152,3 +5153,334 @@ class TestWorkerJobEndings:
         assert [job.state for job in finished] == [JobState.CANCELLED] * len(jobs)
         assert health is WorkerHealth.HEALTHY
         assert next_submit is SubmitResult.ACCEPTED
+
+
+# What a jam raised from pass B says on the row.
+_PASS_B_JAM = "Scanner error on test:device:001: Document feeder jammed in pass B"
+
+
+class _CountedPassScanner(StubScannerBackend):
+    """
+    A manual-duplex scanner with a chosen page count per pass and a held pass B.
+
+    ``_PassBGatedScanner`` already holds pass B open, but it spools exactly one
+    page per pass, so "the front count" and "the back count" are the same
+    number and a test cannot tell which one it is reading.  This one takes both
+    counts, which is what makes ``fronts != backs`` -- and so the back count
+    failing to overwrite the front count -- observable.
+
+    Concrete rather than a ``MagicMock``, like every other fake here, and
+    inheriting ``get_devices() -> []`` from ``StubScannerBackend`` so startup
+    profile generation (D-14) leaves these tests' settings alone.
+
+    Attributes:
+        release_pass_b: Set by the test to let pass B return.
+        scan_calls: How many times ``scan_pages`` has been entered.
+
+    """
+
+    def __init__(self, fronts: int = 3, backs: int = 3) -> None:
+        """
+        Hold pass B, and answer each pass with its own page count.
+
+        Args:
+            fronts: Pages pass A spools.
+            backs: Pages pass B spools.
+
+        """
+        self.release_pass_b = threading.Event()
+        self.scan_calls = 0
+        self._per_pass = (fronts, backs)
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """
+        Report a feeder-only device.
+
+        Args:
+            device_id: Ignored.
+
+        Returns:
+            Capabilities naming a single feeder source.
+
+        """
+        return DeviceCapabilities(sources=["ADF"], resolutions=[300], modes=["color"])
+
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Spool this pass's pages, holding the second and later calls on the gate.
+
+        Args:
+            device_id: Ignored.
+            settings: Only ``resolution`` is used, and only to report it back.
+            sink: The pipeline's own sink, which receives the pages.
+
+        Returns:
+            A batch of the records the sink returned.
+
+        """
+        self.scan_calls += 1
+        if self.scan_calls >= 2:
+            self.release_pass_b.wait(_PASS_B_GATE_CEILING)
+        wanted = self._per_pass[min(self.scan_calls, 2) - 1]
+        records = [sink.add(_inked_page()) for _ in range(wanted)]
+        return scan_batch(records, resolution=settings.resolution)
+
+
+class _JammingPassBScanner(_CountedPassScanner):
+    """A ``_CountedPassScanner`` whose pass B jams once the gate releases it."""
+
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """
+        Spool the pass as usual, then fail pass B as a paper jam.
+
+        Args:
+            device_id: Passed through.
+            settings: Passed through.
+            sink: Passed through.
+
+        Returns:
+            Pass A's batch.
+
+        Raises:
+            ScanError: On pass B, after the gate is released.
+
+        """
+        batch = super().scan_pages(device_id, settings, sink)
+        if self.scan_calls >= 2:
+            raise ScanError(_PASS_B_JAM)
+        return batch
+
+
+def _run_duplex_job(worker: ScanWorker, store: JobStore, title: str) -> Job:
+    """
+    Submit one manual-duplex job to an already-started worker.
+
+    Args:
+        worker: An already-started worker.
+        store: The store the job is created in.
+        title: The job title.
+
+    Returns:
+        The created job.
+
+    """
+    job = store.create_job("duplex", title)
+    worker.submit(job)
+    return job
+
+
+class TestFrontPages:
+    """
+    ``ScanWorker.front_pages`` carries pass A's count out of a running job (D-33).
+
+    The status area renders from the job row, and the row has no column for
+    this: CONTEXT forbids a schema migration, and the number is wanted only
+    while one specific job is in ``SCANNING_REVERSE``.  So it lives on the
+    worker beside ``current_job_id``, is written by the pipeline's pass-count
+    callback, and is cleared however the job ends.
+    """
+
+    def test_a_fresh_worker_reports_front_pages_as_none(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+    ) -> None:
+        """Before any job there is no pass A, so there is no count."""
+        store = JobStore()
+        worker = ScanWorker(
+            _CountedPassScanner(), mock_paperless, isolated_duplex_settings, store
+        )
+        try:
+            assert worker.front_pages is None
+        finally:
+            store.close()
+
+    def test_front_pages_holds_pass_a_count_at_the_flip_prompt(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The count is readable from another thread while the job is in flight.
+
+        The worker thread is blocked in the flip wait, so this read happens on
+        the test thread against a live job -- which is exactly how a request
+        thread rendering the status area will read it.
+        """
+        scanner = _CountedPassScanner(fronts=3, backs=3)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Front Count At Prompt")
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            at_prompt = worker.front_pages
+            worker.continue_flip(job.id)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert at_prompt == 3
+
+    def test_front_pages_is_readable_while_pass_b_is_in_flight(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """D-33: SCANNING_REVERSE is exactly when the strip wants the number."""
+        scanner = _CountedPassScanner(fronts=4, backs=4)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Front Count During Pass B")
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.continue_flip(job.id)
+            wait_for_state(store, job.id, JobState.SCANNING_REVERSE, _STATE_BUDGET)
+            during = worker.front_pages
+            scanner.release_pass_b.set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert during == 4
+        assert finished.state is JobState.DONE
+
+    def test_front_pages_is_not_overwritten_by_the_back_count(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        The back count arrives too, and is ignored.
+
+        Pass A feeds three sheets and pass B two, so the two counts are
+        distinguishable; the upload is held open so the read happens after pass
+        B has finished and announced its own number.
+        """
+        scanner = _CountedPassScanner(fronts=3, backs=2)
+        uploading = threading.Event()
+        release_upload = threading.Event()
+
+        def holding_upload(*_args: object, **_kwargs: object) -> UploadResult:
+            """
+            Announce the upload, then wait for the test to release it.
+
+            Returns:
+                A successful upload result.
+
+            """
+            uploading.set()
+            release_upload.wait(_PASS_B_GATE_CEILING)
+            return UploadResult(delivered_to_api=True, task_uuid="held-task")
+
+        mock_paperless.upload_document.side_effect = holding_upload
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Back Count Ignored")
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.continue_flip(job.id)
+            scanner.release_pass_b.set()
+            assert uploading.wait(_PASS_B_GATE_CEILING)
+            after_pass_b = worker.front_pages
+        finally:
+            release_upload.set()
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert after_pass_b == 3
+
+    def test_front_pages_is_cleared_after_a_successful_job(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A finished job leaves no count behind for the next one to read."""
+        scanner = _CountedPassScanner(fronts=2, backs=2)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Cleared After Success")
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            worker.continue_flip(job.id)
+            scanner.release_pass_b.set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            cleared = _wait_until(lambda: worker.front_pages is None, _STATE_BUDGET)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert finished.state is JobState.DONE
+        assert cleared
+
+    def test_front_pages_is_cleared_after_a_failed_job(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A pass-B jam is an ERROR, and it clears the count too."""
+        scanner = _JammingPassBScanner(fronts=2, backs=2)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Cleared After Error")
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            at_prompt = worker.front_pages
+            worker.continue_flip(job.id)
+            scanner.release_pass_b.set()
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            cleared = _wait_until(lambda: worker.front_pages is None, _STATE_BUDGET)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert at_prompt == 2
+        assert finished.state is JobState.ERROR
+        assert cleared
+
+    def test_front_pages_is_cleared_after_a_cancelled_job(
+        self,
+        mock_paperless: MagicMock,
+        isolated_duplex_settings: Settings,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """An Abort at the prompt ends the job before pass B, and clears it."""
+        scanner = _CountedPassScanner(fronts=5, backs=5)
+        store = JobStore()
+        worker = ScanWorker(scanner, mock_paperless, isolated_duplex_settings, store)
+        try:
+            worker.start()
+            job = _run_duplex_job(worker, store, "Cleared After Cancel")
+            wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
+            at_prompt = worker.front_pages
+            worker.abort_flip(job.id)
+            finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+            cleared = _wait_until(lambda: worker.front_pages is None, _STATE_BUDGET)
+        finally:
+            scanner.release_pass_b.set()
+            worker.stop()
+            store.close()
+
+        assert at_prompt == 5
+        assert finished.state is JobState.CANCELLED
+        assert cleared
+        assert scanner.scan_calls == 1
