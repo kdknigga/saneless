@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from markupsafe import escape
 
 from saneless.config import (
     OutputConfig,
@@ -293,7 +294,7 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
         # and has lost the literal `Error: ` prefix, because the sentence names
         # the problem itself. `role="alert"` moved to a wrapping <div> so the
         # next step is announced too; it is asserted in TestStatusAreaError.
-        sentence = error_message(_DEFAULT_ERROR_CATEGORY)
+        sentence = escape(error_message(_DEFAULT_ERROR_CATEGORY))
         assert f'<p class="status-error">&#10007; {sentence}</p>' in text
         assert "&#10007; Error: disk on fire" not in text
     if state is JobState.FALLBACK:
@@ -368,10 +369,15 @@ class TestStatusAreaError:
         assert text.count('role="alert"') == 1
         match = _ALERT_DIV.search(text)
         assert match is not None, "the ERROR branch renders no alert div"
+        # Escaped, because ASSEMBLY's next step contains an apostrophe and
+        # Jinja renders it as `&#39;`. Comparing against the raw constant would
+        # quietly exempt exactly the copy most likely to carry punctuation.
+        sentence = escape(error_message(category))
+        next_step = escape(error_next_step(category))
         body = match.group("body")
-        assert error_message(category) in body
-        assert error_next_step(category) in body
-        assert f'<p class="status-error">&#10007; {error_message(category)}</p>' in body
+        assert sentence in body
+        assert next_step in body
+        assert f'<p class="status-error">&#10007; {sentence}</p>' in body
 
     def test_the_disclosure_is_collapsed_and_sits_outside_the_alert(
         self, client: TestClient
@@ -430,7 +436,7 @@ class TestStatusAreaError:
         assert _LEGACY_ERROR_LINE in text
         assert text.count('role="alert"') == 1
         assert "tech-details" not in text
-        assert error_next_step(ErrorCategory.UNKNOWN) not in text
+        assert escape(error_next_step(ErrorCategory.UNKNOWN)) not in text
 
     @pytest.mark.parametrize("category", [_DEFAULT_ERROR_CATEGORY, None])
     def test_no_log_path_reaches_the_rendered_page(

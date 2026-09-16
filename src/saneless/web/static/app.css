@@ -216,6 +216,17 @@ article > .history-table-wrap {
     }
 }
 
+/* "Technical details" is a rare control, but it is still a control someone
+   taps standing at the scanner, so give the summary a finger-sized row. The
+   min-height is the WCAG 2.5.5 touch-target floor, stated rather than relied
+   upon: Pico's own summary padding clears it today, and a future padding
+   change must not silently drop the row below 44px. */
+details.tech-details > summary {
+    display: flex;
+    align-items: center;
+    min-height: 2.75rem;
+}
+
 /* htmx trigger elements that should not be visible */
 .htmx-hidden {
     display: none;
