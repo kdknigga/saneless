@@ -398,6 +398,90 @@ def test_shutdown_leaves_resources_open_when_the_worker_does_not_stop(
         real_store_close()
 
 
+class _ClosingScanner(StubScannerBackend):
+    """A stub backend that records the closes the lifespan gives it."""
+
+    def __init__(self) -> None:
+        """Start with no close recorded."""
+        self.close_calls = 0
+
+    def close(self) -> None:
+        """Count the close the lifespan owes this backend."""
+        self.close_calls += 1
+
+
+def test_shutdown_closes_the_scanner_after_the_store(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The scanner is the third thing closed, after Paperless and the store (D-18).
+
+    It goes last because it is the one whose close reaches process-global
+    state: ``sane_exit`` closes every open handle, so it runs only once the
+    worker has confirmed it stopped and the rest of the shutdown is done.
+    """
+    scanner = _ClosingScanner()
+    app = create_app(settings, scanner)
+    app.state.paperless.get_tags = list
+    app.state.paperless.get_correspondents = list
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    calls: list[str] = []
+    original_paperless_close = paperless.close
+    original_store_close = store.close
+
+    def recording_paperless_close() -> None:
+        calls.append("paperless.close")
+        original_paperless_close()
+
+    def recording_store_close() -> None:
+        calls.append("job_store.close")
+        original_store_close()
+
+    def recording_scanner_close() -> None:
+        calls.append("scanner.close")
+
+    monkeypatch.setattr(paperless, "close", recording_paperless_close)
+    monkeypatch.setattr(store, "close", recording_store_close)
+    monkeypatch.setattr(scanner, "close", recording_scanner_close)
+    with TestClient(app):
+        pass
+
+    assert calls == ["paperless.close", "job_store.close", "scanner.close"]
+
+
+def test_shutdown_leaves_the_scanner_open_when_the_worker_does_not_stop(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A worker that did not stop may still be inside SANE, so nothing is closed.
+
+    This is the same rule D-09 already applies to the store and the Paperless
+    client, and it matters more here: ``sane_exit`` closes every open handle
+    and runs holding the GIL, which is precisely what a thread still inside a
+    read cannot survive.
+    """
+    scanner = _ClosingScanner()
+    app = create_app(settings, scanner)
+    app.state.paperless.get_tags = list
+    app.state.paperless.get_correspondents = list
+    worker = app.state.worker
+    store: JobStore = app.state.job_store
+    paperless = app.state.paperless
+    real_stop = worker.stop
+
+    monkeypatch.setattr(worker, "stop", lambda: False)
+    try:
+        with TestClient(app):
+            pass
+        assert scanner.close_calls == 0
+    finally:
+        # The real thread is idle; stop it and release what the app left open.
+        assert real_stop()
+        paperless.close()
+        store.close()
+
+
 def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
     """With the real, idle worker, leaving the lifespan closes the job store."""
     app = _build_app(settings)

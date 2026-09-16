@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import gc
 import importlib
@@ -18,8 +19,10 @@ from typing import TYPE_CHECKING, NamedTuple
 import pytest
 from PIL import Image, ImageDraw
 
+import saneless.cli as cli_module
 import saneless.scanner as scanner_pkg
 import saneless.scanner.sane_backend as sane_backend_mod
+import saneless.web.app as app_module
 from saneless.exceptions import ConfigError, FeederEmptyError, ScanError
 from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.scanner.base import (
@@ -47,6 +50,7 @@ from tests.fake_sane import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
+    from types import ModuleType
 
 # The backend module's own logger, for the tests that read what it reported.
 _BACKEND_LOGGER = "saneless.scanner.sane_backend"
@@ -690,6 +694,145 @@ class TestSaneInitGuard:
         second = SaneBackend()
         assert first is not second
         assert fake_sane_module.init_call_count == 1
+
+
+def _failing_exit() -> None:
+    """
+    Stand in for a ``sane.exit()`` that raises, as a broken backend's does.
+
+    Raises:
+        FakeSaneError: Always; that is what the caller is testing against.
+
+    """
+    msg = "sane_exit failed"
+    raise FakeSaneError(msg)
+
+
+class TestSaneShutdown:
+    """
+    SANE is shut down at an entry point, once, and never over an error (D-18).
+
+    ``shutdown()`` is the other half of the init guard: the entry point that
+    owns the process calls it when the process is ending, and nothing else
+    calls it at all.  ``atexit`` is not used and must not be, because it runs
+    while a daemon reader thread may still be inside ``sane_read``.
+    """
+
+    def test_shutdown_calls_sane_exit_once_however_often_it_is_called(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """Repeated shutdowns are the normal case for several backends."""
+        SaneBackend()
+        sane_backend_mod.shutdown()
+        sane_backend_mod.shutdown()
+        assert fake_sane_module.exit_call_count == 1
+
+    def test_shutdown_calls_nothing_when_sane_was_never_initialised(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """With no init there is nothing to undo, and sane_exit is undefined."""
+        sane_backend_mod.shutdown()
+        assert fake_sane_module.exit_call_count == 0
+
+    def test_shutdown_never_raises_when_sane_exit_fails(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A failing shutdown is logged and swallowed.
+
+        It runs while the process is on its way out, under a click close
+        callback or a lifespan shutdown, where a raise would replace whatever
+        error the operator is actually being shown.
+        """
+        SaneBackend()
+
+        monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
+        sane_backend_mod.shutdown()
+
+    def test_shutdown_re_arms_the_guard_even_when_sane_exit_failed(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed exit must not leave the process unable to initialise again."""
+        SaneBackend()
+        working_exit = fake_sane_module.exit
+
+        monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
+        sane_backend_mod.shutdown()
+
+        # Only the exit is restored: a blanket undo would take the whole fake
+        # module with it and send the next construction at the real one.
+        monkeypatch.setattr(fake_sane_module, "exit", working_exit)
+        SaneBackend()
+        assert fake_sane_module.init_call_count == 2
+
+    def test_close_delegates_to_shutdown(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """An entry point closes the backend it holds; SANE goes down with it."""
+        backend = SaneBackend()
+        backend.close()
+        assert fake_sane_module.exit_call_count == 1
+
+    def test_close_overrides_the_base_no_op(self) -> None:
+        """
+        The abstraction is what the entry points close through.
+
+        ``create_app`` and the CLI hold a ``ScannerBackend``, so the shutdown
+        has to arrive through the declared method rather than by naming the
+        concrete class.
+        """
+        assert SaneBackend.close is not ScannerBackend.close
+
+    def test_close_never_raises(
+        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A raise from a close callback would replace the operator's error."""
+        backend = SaneBackend()
+        monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
+        backend.close()
+
+    @pytest.mark.parametrize(
+        "module",
+        [sane_backend_mod, cli_module, app_module],
+        ids=["sane_backend", "cli", "web.app"],
+    )
+    def test_no_entry_point_installs_an_interpreter_exit_hook(
+        self, module: ModuleType
+    ) -> None:
+        """
+        Teardown is explicit at the entry point, never at interpreter exit.
+
+        An interpreter-exit hook runs while a daemon reader thread may still
+        be inside ``sane_read``, which is the one sequence ``sane_exit`` --
+        which closes every open handle, holding the GIL -- cannot survive.
+
+        Python offers no way to ask which callbacks are registered, so the
+        absence is asserted where it is decided: no module here imports the
+        registry, and none of them calls anything that registers.  The check
+        is structural rather than textual on purpose -- the backend's own
+        docstrings explain at length why ``concurrent.futures``' interpreter-
+        exit join made a pooled reader unsurvivable, and prose recording a
+        rejected design is not the design.
+        """
+        tree = ast.parse(inspect.getsource(module))
+        imported = {
+            alias.name.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        } | {
+            node.module.partition(".")[0]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        }
+        assert "atexit" not in imported
+
+        called = [
+            ast.unparse(node.func)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+        ]
+        assert [name for name in called if "register" in name] == []
 
 
 class TestSaneBackendGetDevices:
@@ -2074,6 +2217,31 @@ class TestSaneBackendCancelSequence:
         assert fake_device.calls == calls_before
         assert fake_device.close_calls == 0
         assert fake_device.cancel_calls == 1
+
+    def test_shutdown_leaves_sane_up_while_a_read_is_outstanding(
+        self,
+        sane_backend: SaneBackend,
+        fake_sane_module: FakeSaneModule,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A wedged backend is not shut down, and the refusal is logged (D-18).
+
+        ``sane_exit`` closes every open handle and runs holding the GIL, so it
+        is the close-while-reading hazard applied to every handle at once.  An
+        un-exited SANE in a process that is ending anyway costs nothing next to
+        that, so this path skips rather than risks it.
+        """
+        self._wedge(sane_backend, fake_device, page_sink)
+        caplog.set_level(logging.WARNING, logger=_BACKEND_LOGGER)
+
+        sane_backend.close()
+
+        assert fake_sane_module.exit_call_count == 0
+        assert fake_sane_module.exit_while_blocked is False
+        assert any("has not returned" in message for message in _guard_warnings(caplog))
 
     def test_the_wedge_clears_when_the_late_read_finally_returns(
         self,
