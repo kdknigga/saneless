@@ -10,8 +10,11 @@ is deliberately not the spool, because the spooled pages are supposed to
 survive assembly untouched.
 """
 
+import os
 import re
 import struct
+import subprocess
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -629,6 +632,151 @@ class TestBoundedAssembly:
         )
         assert message.endswith("fake qpdf merge failure")
         assert isinstance(excinfo.value.__cause__, pikepdf.PdfError)
+
+
+# The flat-memory proof, run in a child process because the thing being
+# measured is resident memory and only a fresh process has an honest peak.
+#
+# The pages are **random** pixels, deliberately: deflate cannot compress noise,
+# so the PNG the spool writes lands within a few percent of the decoded size,
+# and "the decoded size of the extra pages" below is then a faithful stand-in
+# for what a linear assembly would have to be holding.
+_MEMORY_PAGE_WIDTH = 1200
+_MEMORY_PAGE_HEIGHT = 1200
+_MEMORY_SMALL_PAGES = 4
+_MEMORY_LARGE_PAGES = 16
+_RGB_BANDS = 3
+# ru_maxrss is reported in kilobytes on Linux (getrusage(2)); every other
+# figure in this test is in bytes, so the conversion happens exactly once.
+_RU_MAXRSS_UNIT_BYTES = 1024
+# A bounded wait, not a sleep (TEST-02).  Measured at 0.9 s and 3.0 s for the
+# two runs, so 20 s is slack rather than a limit, and two of them still leave
+# the test far inside pytest-timeout's 60 s.
+_MEMORY_CHILD_TIMEOUT_SECONDS = 20
+
+_MEMORY_CHILD_SOURCE = """\
+import os
+import resource
+from pathlib import Path
+
+import pikepdf
+from PIL import Image
+
+from saneless.pdf import assemble_pdf
+from saneless.spool import SpooledPageSink
+
+page_count = int(os.environ["SANELESS_TEST_PAGES"])
+width = int(os.environ["SANELESS_TEST_WIDTH"])
+height = int(os.environ["SANELESS_TEST_HEIGHT"])
+workspace = Path(os.environ["SANELESS_TEST_WORKSPACE"])
+
+spool = workspace / "spool"
+spool.mkdir(parents=True)
+sink = SpooledPageSink(spool, "a", 1)
+
+records = []
+for _ in range(page_count):
+    # One page decoded at a time: the parent is measuring assembly, so the
+    # spooling phase must not be what sets the high-water mark.
+    image = Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
+    records.append(sink.add(image))
+    del image
+
+pdf_path = assemble_pdf(records, workspace / "out", "memory.pdf", 300)
+with pikepdf.open(pdf_path) as pdf:
+    assembled_pages = len(pdf.pages)
+
+peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+print(f"pages={assembled_pages} peak_kib={peak}")
+"""
+
+
+def _measure_assembly(script: Path, workspace: Path, page_count: int) -> dict[str, int]:
+    """
+    Spool and assemble ``page_count`` pages in a child, and read its peak RSS.
+
+    Every argv element is a literal and the per-run values travel in the
+    environment, exactly as ``test_atomic_write._run_in_mount_namespace`` does.
+    That is not decoration: ``sys.executable`` sitting in the argv is the one
+    thing that takes the call off ruff's S603 allow-list, and this project adds
+    no suppressions. ``shell=False`` throughout -- the shell is an explicit
+    program running an explicit literal, with nothing interpolated into it.
+
+    ``saneless`` is installed editable, so the child's imports resolve from
+    ``sys.executable`` alone with no ``PYTHONPATH`` fiddling.
+
+    Args:
+        script: The child source, already written to disk.
+        workspace: A directory the child creates its spool and output under.
+        page_count: How many pages the child spools and assembles.
+
+    Returns:
+        ``{"pages": ..., "peak_kib": ...}`` as the child reported them.
+
+    """
+    env = {
+        **os.environ,
+        "SANELESS_TEST_PYTHON": sys.executable,
+        "SANELESS_TEST_SCRIPT": str(script),
+        "SANELESS_TEST_PAGES": str(page_count),
+        "SANELESS_TEST_WIDTH": str(_MEMORY_PAGE_WIDTH),
+        "SANELESS_TEST_HEIGHT": str(_MEMORY_PAGE_HEIGHT),
+        "SANELESS_TEST_WORKSPACE": str(workspace),
+    }
+    completed = subprocess.run(
+        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" "$SANELESS_TEST_SCRIPT"'],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_MEMORY_CHILD_TIMEOUT_SECONDS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    fields = dict(item.split("=", 1) for item in completed.stdout.split())
+    return {"pages": int(fields["pages"]), "peak_kib": int(fields["peak_kib"])}
+
+
+class TestAssemblyMemory:
+    """HARD-01's memory sentence, measured rather than asserted."""
+
+    def test_peak_memory_is_flat_in_page_count(self, tmp_path: Path) -> None:
+        """
+        Assembling four times as many pages does not cost four times the RAM.
+
+        Measured the way RESEARCH.md Finding 3 measured it: peak
+        ``ru_maxrss`` in a child process. ``tracemalloc`` is unusable for this
+        -- a 26 MB Pillow image adds 460 bytes to its traced total, because the
+        pixels are malloc'd in C -- and in-process measurement has no honest
+        peak anyway once an earlier test has already grown the heap.
+
+        The same measurement against the single-convert implementation grew
+        from 454 MB at 12 pages to 1395 MB at 48, and to 787 MB with
+        ``outputstream=`` alone; the per-page-plus-qpdf path measured flat at
+        131 MB for both. A regression to either of the old shapes fails here.
+        """
+        script = tmp_path / "measure_assembly_memory.py"
+        script.write_text(_MEMORY_CHILD_SOURCE, encoding="utf-8")
+
+        small = _measure_assembly(script, tmp_path / "small", _MEMORY_SMALL_PAGES)
+        large = _measure_assembly(script, tmp_path / "large", _MEMORY_LARGE_PAGES)
+
+        assert small["pages"] == _MEMORY_SMALL_PAGES
+        assert large["pages"] == _MEMORY_LARGE_PAGES
+
+        # The budget is derived, not chosen: it is exactly what the extra
+        # pages weigh decoded, so exceeding it means assembly was holding
+        # them.  A linear assembly holds each page's compressed bytes *and*
+        # the whole finished document, so it overshoots this by about 2x.
+        decoded_page_bytes = _MEMORY_PAGE_WIDTH * _MEMORY_PAGE_HEIGHT * _RGB_BANDS
+        extra_pages = _MEMORY_LARGE_PAGES - _MEMORY_SMALL_PAGES
+        budget_bytes = decoded_page_bytes * extra_pages
+        growth_bytes = (large["peak_kib"] - small["peak_kib"]) * _RU_MAXRSS_UNIT_BYTES
+
+        assert growth_bytes < budget_bytes, (
+            f"peak grew {growth_bytes} bytes over {extra_pages} extra pages, "
+            f"which is not less than the {budget_bytes} bytes they decode to"
+        )
 
 
 class TestPdfBoundary:
