@@ -39,7 +39,7 @@ Evidence paths (all absolute):
 | Interaction library | htmx 2.0.8, served from the package at `/static/vendor/htmx-2.0.8.min.js` with a SHA-384 `integrity` attribute (vendored in Phase 26) |
 | App JavaScript | none. The app script and its `<script>` tag were deleted in Phase 26; the page runs only vendored htmx |
 | Templating | Jinja2 served by FastAPI |
-| Icon library | none — Unicode glyphs only (`U+21BB` refresh, `U+2713` checkmark, `U+2717` cross, `U+2192` rightwards arrow) plus two inline SVG illustrations in `flip.html` |
+| Icon library | none — Unicode text-presentation glyphs only (`U+21BB` refresh, `U+2713` checkmark, `U+2717` cross, `U+2192` rightwards arrow, `U+2298` circled slash; Phase 30 added `U+0021` `!` for a `WARN` check and `U+00B7` `·` for the cold-start marker and the counts separator) plus two inline SVG illustrations in `flip.html`. `!` is used for `WARN` because every Unicode warning symbol (U+26A0, U+2757) has emoji presentation on at least one shipping platform — U+26A0 is already recorded as rejected for that reason below |
 | Font | PicoCSS default system stack (`--pico-font-family`): `system-ui, -apple-system, "Segoe UI", Roboto, ...` |
 | Theme mode | automatic, from the OS `prefers-color-scheme`; `<html>` carries no `data-theme` attribute (Pico v2 engages automatic dark only when it is absent); `<meta name="color-scheme" content="light dark">` is present |
 | Layout container | PicoCSS `.container` applied to `<header>` and `<main>` |
@@ -64,9 +64,28 @@ The only non-Pico classes defined in `app.css`:
 | `.status-error` | Error color (uses `--pico-del-color`) for error text and history cell | `status.html`, `history.html`, `error.html` |
 | `.status-fallback` | Warning color (amber) for a consume-directory fallback — a degraded success, so deliberately neither the ins green nor the del red. Uses `var(--saneless-status-fallback)`: `#a16207` in light (4.92:1) and `#ca8a04` in dark (6.11:1) | `status.html`, `history.html` |
 | `.history-table-wrap` | Horizontal scroll wrapper for job history table on narrow viewports | `index.html` |
-| `.sr-only` | Screen-reader-only text for icon-only button labels | `index.html` (refresh buttons) |
+| `.sr-only` | Screen-reader-only text for icon-only button labels | `index.html` (refresh buttons), `partials/checks.html` (per-row state word) |
 
-No `!important` anywhere (validated in Phase 12).
+Added in Phase 30 — fourteen rows, seventeen distinct selectors, no `!important` and no colour literal among them:
+
+| Class | Purpose | Location |
+|-------|---------|----------|
+| `.check-list` | Unstyled `<ul>` holding the five check rows | `partials/checks.html` |
+| `.check-row` | Flex row: glyph gutter, name column, message | `partials/checks.html` |
+| `.check-glyph` | 16px glyph gutter, so the five names line up | `partials/checks.html` |
+| `.check-name` | 112px bold name column | `partials/checks.html` |
+| `.check-next` | Muted second line carrying a next step; `WARN`/`FAIL` rows only | `partials/checks.html` |
+| `.check-meta` | Muted freshness line (`Last checked …`) | `partials/checks.html` |
+| `.check-refresh` | The `Check again` button: `width: auto` (overriding Pico's full-width default), ≥ 44px tall | `partials/checks.html` |
+| `.check-ok` / `.check-warn` / `.check-fail` / `.check-checking` | The four glyph colours. Aliases over existing tokens — no new colour value | `partials/checks.html` |
+| `.tag-list` | Scrollable checkbox list, 280px max-height | `index.html` + `partials/tags.html` |
+| `label.tag-option` | One full-width ≥ 44px tap target per tag | `partials/tags.html` |
+| `.page-counts` | Muted block line for the counts sentence | `partials/status.html`, `partials/history.html` |
+| `details.tech-details > summary` | ≥ 44px tall disclosure control | `partials/status.html`, `partials/error.html` |
+| `#profile-description:empty` | Hides the description slot when a profile has none | `index.html` |
+| `#scan-blocked-reason` | The one line under a disabled Scan button saying why | `index.html` |
+
+No `!important` anywhere (validated in Phase 12, and no Phase 30 rule adds one).
 
 ---
 
@@ -77,8 +96,8 @@ All spacing resolves against PicoCSS v2 tokens (`--pico-spacing`, `--pico-border
 | Token | Value (rem) | Value (px @16px root) | Usage in saneless |
 |-------|-------------|-----------------------|-------------------|
 | 0.25rem | 0.25rem | 4px | `.refresh-btn` top/bottom padding |
-| 0.5rem | 0.5rem | 8px | `.refresh-btn` horizontal padding + left margin; `.thumbnail` top margin |
-| 1rem | 1rem | 16px | `#status-area` outer margin + padding; `#status-message > p` left padding (Phase 26: insets the request error text to the status line's x); `.flip-illustration` vertical margin; mobile flip gap |
+| 0.5rem | 0.5rem | 8px | `.refresh-btn` horizontal padding + left margin; `.thumbnail` top margin; `.check-row` gap and bottom margin; `label.tag-option` gap; `#scan-blocked-reason` top margin |
+| 1rem | 1rem | 16px | `#status-area` outer margin + padding; `#status-message > p` left padding (Phase 26: insets the request error text to the status line's x); `.flip-illustration` vertical margin; mobile flip gap; `.check-glyph` gutter; `.check-meta` top margin; `.tag-list` bottom margin (`var(--pico-spacing)`) |
 | 2rem | 2rem | 32px | `.flip-illustration` desktop gap between SVGs |
 
 Pico base spacing tokens inherited (not overridden): `--pico-spacing` ≈ 1rem (16px) drives default gaps between form controls, article padding, table cell padding, headings.
@@ -94,6 +113,18 @@ Pico base spacing tokens inherited (not overridden): `--pico-spacing` ≈ 1rem (
 Exceptions:
 - Screen-reader `.sr-only` uses `1px`/`-1px` sizes per the standard visually-hidden pattern. This is a11y technique, not layout spacing.
 - 120px SVG width for flip illustrations is a fixed artistic dimension, not a grid token.
+
+**Justified exceptions added in Phase 30.** The standard scale is 4/8/16/24/32/48/64, so these three are exceptions even though each is a multiple of 4. Each is a measured constraint rather than a layout choice:
+
+| Size | rem | Exception because | Justification |
+|------|-----|-------------------|---------------|
+| 44px | 2.75rem | not a scale step | The WCAG 2.5.5 touch-target floor, required verbatim by D-30. Applied to `label.tag-option` min-height, `.check-refresh` min-height and `details.tech-details > summary` min-height |
+| 112px | 7rem | not a scale step | The measured width of the longest check name (`Data folder`) at 16px/700 plus breathing room, so the five messages align in one column. 96px clips it; 128px wastes width at 320px |
+| 280px | 17.5rem | not a scale step | Six 44px rows minus a part-row, so the tag list visibly scrolls rather than appearing to end. Either neighbouring scale step (256 or 320) shows five whole rows or pushes the Scan button further below the fold |
+
+`#scan-blocked-reason` uses the ordinary 8px step for its top margin and is not an exception.
+
+**No new breakpoint.** The existing `@media (max-width: 576px)` rule already gives history cells `white-space: normal; word-break: break-word`, which is what makes the two-line Title cell work on a phone. At 320px a check row still fits: 16 (glyph) + 8 + 112 (name) + 8 + ~176 (message, wrapping).
 
 ### Responsive breakpoint
 
@@ -167,6 +198,25 @@ Status text sits on the page surface in `#status-area` and on the `td` backgroun
 | `.status-cancelled` | light | `rgb(100, 107, 121)` | 5.36:1 | 5.36:1 | PASS |
 | `.status-cancelled` | dark | `rgb(123, 132, 149)` | 4.77:1 | 4.53:1 | PASS |
 
+Phase 30 added five class names over these same tokens and **introduced no new colour value and re-measured nothing.** The strip lives inside an `<article>`, so for its classes the **card** column is the binding one:
+
+| Class | Token | Scheme | Computed colour | vs page / `td` | vs card | AA 4.5:1 |
+|-------|-------|--------|-----------------|----------------|---------|----------|
+| `.check-ok` | `--pico-ins-color` | light | `rgb(29, 106, 84)` | 6.48:1 | 6.48:1 | PASS |
+| `.check-ok` | `--pico-ins-color` | dark | `rgb(98, 175, 154)` | 6.94:1 | 6.59:1 | PASS |
+| `.check-warn` | `--saneless-status-fallback` | light | `rgb(161, 98, 7)` | 4.92:1 | 4.92:1 | PASS |
+| `.check-warn` | `--saneless-status-fallback` | dark | `rgb(202, 138, 4)` | 6.11:1 | 5.80:1 | PASS |
+| `.check-fail` | `--pico-del-color` | light | `rgb(136, 57, 53)` | 7.83:1 | 7.83:1 | PASS |
+| `.check-fail` | `--pico-del-color` | dark | `rgb(206, 126, 123)` | 5.89:1 | 5.60:1 | PASS |
+| `.check-checking`, `.page-counts` | `--pico-muted-color` | light | `rgb(100, 107, 121)` | 5.36:1 | 5.36:1 | PASS |
+| `.check-checking`, `.page-counts` | `--pico-muted-color` | dark | `rgb(123, 132, 149)` | 4.77:1 | 4.53:1 | PASS |
+
+`.check-next`, `.check-meta` and every help `<small>` read the same muted token as `.check-checking`. `#scan-blocked-reason` carries `.status-error` and so takes that class's measured ratios unchanged.
+
+The `warn` state **reuses** `--saneless-status-fallback` and the property is **not renamed**: one amber serves a degraded success and a warning check alike, the vendored-asset coupling contract requires the block to stay intact, and `tests/test_browser.py::_AMBER` pins both values. `4.53:1` — muted on the dark card — remains the tightest margin on the page and is the already-guarded value.
+
+**Colour is never the only channel.** Each check row carries a distinct glyph (`✓` / `!` / `✗` / `·`), a bold name, and an `.sr-only` state word (`OK:` / `Warning:` / `Failed:`) before the name, so a colour-blind or monochrome reader loses nothing (WCAG 1.4.1).
+
 The `.status-cancelled` rows, and since Phase 28 the card column for every class, are asserted in Chromium by `tests/test_browser.py::TestDarkModeEngagement::test_status_colour_meets_aa_contrast` (placements `status-area`, `history-cell` and `card`). The dark card is the tightest margin on this page (4.53:1); a Pico bump that lowers it below 4.5:1 fails that test, and the fix is an app-owned `--saneless-status-cancelled` pair per convention rules 1-3. Forced dark (`data-theme="dark"`) resolves to the same dark value and ratio.
 
 **60/30/10 compliance:** the ratio is enforced by Pico's classless defaults rather than by this project. The only app-specific colored surface is the 1px (0.0625rem, Pico 2.1.1 `--pico-border-width`) left border on `#status-area` painted with `--pico-primary` — the single accent moment on the page. (Earlier revisions of this spec said 4px; the rendered border was always 1px.) The `#status-message > p` border uses the same token but is `transparent`, so it adds no colour.
@@ -176,6 +226,9 @@ Accent (`--pico-primary`) is reserved for:
 2. `#status-area` left border (active job visual anchor)
 3. `.refresh-btn` icon color (tag/correspondent cache invalidation controls)
 4. htmx `aria-busy` spinner animation (Pico built-in)
+5. the checked state of a tag checkbox (`--pico-primary-background`, Pico default styling) — recorded explicitly, added in Phase 30, so it is not read as an unlisted accent surface
+
+The semantic colours (success, warning, error) stay **text-only**: no fill, no border, no button.
 
 Destructive/secondary actions:
 - "Abort scan" button uses Pico's `.secondary` class, not a destructive red. This is the only non-primary button style in use.
@@ -202,9 +255,16 @@ Inventory of every interactive/presentational component currently shipped.
 | Scan card | `<article>` with `<h2>Scan</h2>` + form | `index.html` | Card 1 |
 | Profile select | `<select name="profile">` | `index.html` | Server-rendered options from Settings |
 | Title input | `<input type="text">` with placeholder "Document title (auto-generated if empty)" and `maxlength="256"` (from `vocabulary.TITLE_MAX_LENGTH`, the same cap the server enforces) | `index.html` | |
-| Tags multi-select | `<select multiple>` hydrated via `hx-get="/api/tags" hx-trigger="load"` | `index.html` + `partials/tags.html` | TTL-cached |
-| Tag refresh button | Icon-only `<button>` U+21BB with `aria-label` + `.sr-only` text, `hx-post="/api/cache/invalidate?resource=tags"` | `index.html` | |
-| Correspondent select | `<select>` with leading "No correspondent" option, hydrated via `hx-get="/api/correspondents"` | `index.html` + `partials/correspondents.html` | TTL-cached |
+| Tags checkbox list | `<div id="tags-list" class="tag-list">` of `label.tag-option` checkboxes, hydrated via `hx-get="/api/tags" hx-trigger="load"`, swapped `outerHTML` | `index.html` + `partials/tags.html` | TTL-cached. Replaced the `<select multiple>` in Phase 30 (D-30, D-31): each label is a full-width ≥ 44px tap target. Hidden entirely when `web.show_tags` is false |
+| Tag filter | `<input type="search" id="tag-filter" name="q" form="tag-filter-form">`, `hx-get="/api/tags"` on `keyup changed delay:300ms` with `hx-include="#tags-list"` | `index.html` | The `form` attribute binds it to the empty `#tag-filter-form` **outside** the scan form, so the filter text is never submitted with a scan and Enter filters instead of scanning. Ticked tags ride along and are re-rendered checked, pinned above the filtered list, so a filter can never silently drop a selection |
+| Tag refresh button | Icon-only `<button>` U+21BB with `aria-label` + `.sr-only` text, `hx-post="/api/cache/invalidate?resource=tags"`, `hx-include="#tag-filter, #tags-list"` | `index.html` | Keeps the filter text and the ticks across the refresh |
+| Correspondent select | `<select>` with leading "No correspondent" option, hydrated via `hx-get="/api/correspondents"` | `index.html` + `partials/correspondents.html` | TTL-cached. Hidden entirely when `web.show_correspondent` is false |
+| Profile description | `<small id="profile-description" aria-live="polite">`, refreshed via `hx-get="/api/profiles/description"` on `change` | `index.html` + `partials/profile_description.html` | One sentence under the profile select. `#profile-description:empty` hides the slot, so a profile without a description leaves no gap. The persistent element is the live region; only its contents swap |
+| System status strip | `<article id="checks-card">` with `<h2>System status</h2>` and a persistent `<div id="checks-strip" aria-live="polite">` wrapping the swap target `#checks-body` | `index.html` + `partials/checks.html` | The first card on the page, **outside** the scan form. Five rows (Scanner, Paperless, Profiles, Fallback, Data folder), a freshness line, and `Check again`. `aria-live="polite"` and **no `role="alert"`** — a health list must never interrupt, and exactly one assertive region exists on the page. Cold start renders five `Checking…` rows carrying `hx-trigger="load, every 2s"`; the body that replaces them carries no trigger, so the poll ends itself. Never a steady-state poll |
+| Check again button | `<button type="button" class="check-refresh secondary">`, `hx-post="/api/checks/refresh"` → `#checks-body`, `outerHTML` | `partials/checks.html` | Visible text, not an icon: a household member is the reader. Pico `.secondary`, because accent is reserved for Scan. `width: auto` overrides Pico's full-width default; ≥ 44px tall |
+| Technical details disclosure | `<details class="tech-details"><summary>Technical details</summary>` | `partials/status.html`, `partials/error.html` | Collapsed by default, keyboard-operable natively, **outside** the `role="alert"` region so it is not announced with the failure. Holds `job.error`, the category and the job id in the status area; the status code and, when written, the rejected job id in the slot. Never a log path, never exception text in the slot |
+| Disabled-Scan reason | `<small id="scan-blocked-reason" class="status-error">`, rendered by `index.html` immediately after the button include, only when blocked | `index.html` | Visible text rather than a tooltip, because a `disabled` button cannot be focused or reliably hovered. Never an OOB target; see the Scan button state table |
+| Terminal reload | `partials/terminal_reload.html` — the hidden history loader plus a hidden `hx-get="/api/checks"` loader, both `hx-trigger="load"` | `partials/status.html` | Included by every terminal branch. Repaints the history table and un-pauses the status strip the moment a scan ends, rather than waiting out the check cache's TTL |
 | Correspondent refresh button | Mirror of tag refresh | `index.html` | |
 | Primary scan button | `<button type="submit" id="scan-btn">`, server-rendered from the current (else most recent run) job | `partials/scan_button.html` (the only copy of its markup), included inline by `index.html` and out-of-band (`hx-swap-oob="true"`) by `partials/status_response.html` | Every status response (scan success, status poll, flip Continue/Abort) re-renders it out of band, so the server alone decides its state. Disabled while a job is active; `aria-busy="true"` only while busy (omitted, never `"false"`, otherwise); label `Scanning\u2026` while busy, `Waiting for flip\u2026` at `AWAITING_FLIP`, else `Scan` (both use the `&#8230;` entity). Full state table under Interaction Patterns |
 | Request error message | `<div id="status-message" role="alert"></div>`, a sibling placed directly above `#status-area`, outside the form and outside the polled element; empty (no children, 0px tall) until an error lands | `index.html` + `partials/error.html` | Any 4xx/5xx from an htmx request is retargeted here and renders `<p class="status-error">\u2717 {message}</p>` (`.status-error` text, no `role="alert"` on the `<p>`). Cleared out of band only by a successful `POST /api/scan` |
@@ -214,11 +274,11 @@ Inventory of every interactive/presentational component currently shipped.
 | Duplex flip prompt | `.flip-prompt` with two-paragraph instructions, `.flip-illustration` SVG pair, and `<div role="group">` with Continue + Abort buttons | `partials/flip.html` | Abort uses Pico `.secondary` |
 | Flip SVGs | Inline SVGs with `aria-label`; "Long edge (correct)" shows curved arrow + checkmark, "Short edge (incorrect)" shows X mark | `partials/flip.html` | `currentColor` strokes follow theme |
 | Job history card | `<article>` with `<h2>` + `.history-table-wrap` + `<table role="grid">` | `index.html` | Card 2 |
-| Job history table | 4 columns: Time (YYYY-MM-DD HH:MM), Profile, Title, Status | `partials/history.html` | Status cell applies `.status-done` / `.status-error` / `.status-fallback` / `.status-cancelled` |
+| Job history table | 4 columns: Time (local, with the zone named), Profile, Title, Status | `partials/history.html` | Status cell applies `.status-done` / `.status-error` / `.status-fallback` / `.status-cancelled`. The Title cell carries the page counts as a **second line** (`span.page-counts`) when all three counts were recorded — deliberately not a fifth column (Phase 30 S3) |
 | Humanized state labels | Jinja filter `state_label` maps each enum value to its humanized status label; the full list is under Job history in the Copywriting Contract | `vocabulary.py:state_label`, registered as a filter in `app.py` | Presented in history Status column, and (since Phase 23) in the `saneless jobs` table |
 | Empty history | Single `<tr><td colspan="4">No scan history yet.</td></tr>` | `partials/history.html` | |
 
-**Component count:** 19 distinct UI elements across 10 template files.
+**Component count:** 26 distinct UI elements across 13 template files. (Phase 30 added seven — the status strip, `Check again`, the tag filter, the profile description, the technical-details disclosure, the disabled-Scan reason line and the terminal reload — and three partials: `checks.html`, `profile_description.html`, `terminal_reload.html`. The Tags row was rewritten in place to the checkbox list rather than counted twice.)
 
 ---
 
@@ -240,31 +300,73 @@ All strings currently shipped to users. Verbatim — preserve capitalization and
 | Profile label | `Profile` |
 | Title label | `Title` |
 | Title placeholder | `Document title (auto-generated if empty)` |
-| Tags label | `Tags` |
+| Tags label | `Tags` (a `<legend>`, since the block is a `<fieldset>`) |
 | Tag refresh `aria-label` / tooltip | `Refresh tags` |
+| Tag filter placeholder | `Filter tags` |
+| Tag list empty (no tags at all) | `No tags in paperless-ngx yet.` |
+| Tag list empty (filter matches nothing) | `No tags match that filter.` |
 | Correspondent label | `Correspondent` |
 | Correspondent refresh `aria-label` / tooltip | `Refresh correspondents` |
 | Correspondent "none" option | `No correspondent` (index.html) / `-- None --` (partial hydration) ⚠️ inconsistency |
 | Primary CTA (idle) | `Scan` |
 | Primary CTA (busy) | `Scanning…` (U+2026, written `Scanning&#8230;` in `partials/scan_button.html`) |
 | Primary CTA (waiting on the flip) | `Waiting for flip…` (U+2026, written `Waiting for flip&#8230;`) |
+| Primary CTA (blocked by a placeholder token) | `Scan` — the label does not change; the reason line explains why it is disabled |
+| Blocked CTA reason (`#scan-blocked-reason`) | `The paperless-ngx API token has not been set — see System status above.` It deliberately does not repeat the fix: the strip's Paperless row, a few centimetres above, owns the remedy |
+
+#### Help text (Phase 30, APPL-10)
+
+One `<small>` per control, immediately following it, wired with `aria-describedby`. Pico's built-in help-text pattern; no new CSS.
+
+| Control | Help line |
+|---------|-----------|
+| Profile | *(the live description, `#profile-description`)* |
+| Title | `What this document should be called in paperless-ngx.` |
+| Tags (fieldset) | `Labels to file this under in paperless-ngx. Optional.` |
+| Filter tags | `Type to narrow the list. Ticked tags stay ticked.` |
+| Correspondent | `Who sent this document? Optional.` |
+
+The Title `placeholder` is unchanged and says something different from its help line, so the two do not repeat each other.
+
+#### System status strip (`partials/checks.html`, Phase 30)
+
+| Element | Copy |
+|---------|------|
+| Card heading | `System status` |
+| Secondary CTA | `Check again` |
+| Row names | `Scanner`, `Paperless`, `Profiles`, `Fallback`, `Data folder` |
+| Cold-start row and freshness line | `Checking…` (U+2026, matching the Scan button's ellipsis, not three ASCII periods) |
+| Freshness, results, no scan | `Last checked {local time}.` |
+| Freshness, paused by a scan | `Paused during scan — last checked {local time}.` (em dash U+2014 with spaces) |
+| Freshness, cold start during a scan | `Paused during scan — not checked yet.` |
+| Scanner, skipped during a scan | `Not checked while a scan is running.` |
+| Fallback, not configured | `Not configured; scans cannot be kept if paperless-ngx is down.` |
+| Screen-reader state words | `OK:` / `Warning:` / `Failed:` before each name, so colour is never the only channel |
+
+The twenty verbatim row messages and their next steps live in `.planning/phases/30-appliance-layer/30-UI-SPEC.md` § S1. Every one is a developer constant owned by `vocabulary.py`, shared byte-for-byte with `saneless doctor`: neither surface may hold a message the other does not. **No path, URL, token or exception text appears in any row** — the fallback row deliberately omits the folder path, and the Paperless rows never render the URL or the token.
 
 ### Status area (`partials/status.html`)
 
 | State | Copy | Decoration |
 |-------|------|------------|
 | Idle | `Ready to scan.` | plain `<p>` |
-| PENDING | `Starting scan...` | `<p aria-busy="true">` |
+| PENDING, nothing running | `Starting scan...` | `<p aria-busy="true">` |
+| PENDING, N ≥ 1 jobs ahead | `Waiting for 'Tax return' to finish (1 ahead of you)` — single quotes around the title, which is user data, autoescaped and never truncated (the line wraps) | `<p aria-busy="true">`; no new state branch |
+| PENDING, 0 jobs ahead | `Waiting for 'Tax return' to finish (next in line)` — `(0 ahead of you)` is never rendered: technically true, reads like a bug | `<p aria-busy="true">` |
 | SCANNING | `Scanning...` | `<p aria-busy="true">` |
-| AWAITING_FLIP (unanswered) | The duplex flip prompt (`partials/flip.html`, copy below) in place of a status line | no `aria-busy`; the Continue and Abort scan controls exist only in this branch |
+| AWAITING_FLIP (unanswered, this browser owns the job) | The duplex flip prompt (`partials/flip.html`, copy below) in place of a status line | no `aria-busy`; the Continue and Abort scan controls exist only in this branch |
+| AWAITING_FLIP (unanswered, a different browser owns the job) | `Waiting for the stack to be flipped` — **no trailing ellipsis**, a deliberate exception to the in-progress copy style, recorded because the string is locked copy | `<p aria-busy="true">`; **the buttons are not rendered**, not hidden with CSS. Everything else — state, title, counts, thumbnail, errors — is identical for both viewers. A NULL `owner_token` means unowned and renders the prompt for everyone, so a job in flight across an upgrade stays continuable |
 | AWAITING_FLIP (answered) | `Flip confirmed. Scanning reverse sides next...` after Continue / `Aborting scan...` after Abort (copy from `vocabulary.flip_answer_label`), shown while the store still records `AWAITING_FLIP` but the job's flip wait has been answered | `<p aria-busy="true">`; no Continue or Abort scan controls |
 | SCANNING_REVERSE | `Scanning reverse sides...` | `<p aria-busy="true">` |
 | ASSEMBLING | `Assembling PDF...` | `<p aria-busy="true">` |
 | UPLOADING | `Uploading to paperless-ngx...` | `<p aria-busy="true">` |
 | DONE | `✓ Done: {job.title}` (U+2713) | `.status-done` |
-| ERROR | `✗ Error: {job.error}` (U+2717) | `role="alert"` + `.status-error` |
+| ERROR (with a category) | `✗ {category message}` (U+2717) on one line, then `{next step}` on the next, then a collapsed `Technical details` disclosure holding `job.error`, `Category: {…}` and `Job: {…}` | `role="alert"` on a wrapping `<div>` covering **both** the sentence and the next step; `.status-error` on the first `<p>`. The `<details>` sits outside the alert. The literal `Error: ` prefix is gone — the sentence names the problem itself |
+| ERROR (no category: a row written before Phase 21) | `✗ Error: {job.error}` (U+2717) | `role="alert"` + `.status-error`, exactly as before. Substituting a category sentence here would print "Something went wrong." over a row that still holds a truthful specific message |
 | FALLBACK | `→ Saved to folder: {job.title}` (U+2192), then `{job.warning}` on its own line when a warning is recorded | `.status-fallback` on both paragraphs; no `role="alert"` |
 | CANCELLED | `⊘ Cancelled: {job.title}` (U+2298) | `.status-cancelled`; no `role="alert"` |
+
+**Page counts (Phase 30, S3).** `DONE` and `FALLBACK` carry one more line, a `.page-counts` paragraph after the outcome line (and after `FALLBACK`'s warning line), before the thumbnail: `12 pages scanned, 2 blank removed, 10 uploaded`. Only the first clause pluralises (`1 page scanned, 0 blank removed, 1 uploaded`); the other two carry no noun. The line is built by one shared `page_counts` filter and returns nothing at all — no element, no empty line — unless **all three** counts were recorded. A measured `0` renders as `0`: the rule is about NULL, not about a true zero, and the guard is `is not none`, never truthiness. `ERROR`, `CANCELLED` and `REJECTED` rows have no counts by construction and show none.
 
 **CANCELLED is a deliberate stop (EXC-04), so it is neither red nor an alert.** It is terminal: the status area stops polling, the Scan button re-enables, and the hidden history-reload div repaints the table with a `Cancelled` cell.
 
@@ -301,6 +403,7 @@ All strings are developer-authored constants owned by `vocabulary.rejection_mess
 | Queue full | 429 | `The scan queue is full. Wait for a scan to finish, then try again.` |
 | Worker thread down | 503 | `The scan service is not running, so the scan was not started. Restart saneless, then try again.` |
 | Worker degraded: job store failing | 503 | `Job history cannot be saved right now, so the scan was not started. Check the server's free disk space and log, then try again.` |
+| Paperless token unset or a placeholder (Phase 30, `TOKEN_UNSET`) | 503 | `The paperless-ngx API token has not been set, so the scan was not started. Put a real API token in the saneless config file, then restart saneless.` |
 | Unknown profile | 422 | `That scan profile does not exist. Reload the page to see the current profiles.` |
 | Title too long | 422 | `The title is too long. Shorten it to 256 characters or fewer.` |
 | Any other request validation failure (bad `resource`, missing or malformed form field such as `job_id`, non-integer tag) | 422 | `The request was not valid. Reload the page, then try again.` |
@@ -313,6 +416,10 @@ All strings are developer-authored constants owned by `vocabulary.rejection_mess
 
 The number `256` comes from `vocabulary.TITLE_MAX_LENGTH`, the same constant as the title input's `maxlength` and the server's form cap.
 
+`TOKEN_UNSET` is its own `RequestRejection` member and deliberately **not** a reuse of the degraded-worker one (Phase 30, D-15): the scan service is working perfectly well, and saying "the scan service was unavailable" when the truth is "nobody set the token" would send a household member looking for a broken server. Its `503` matches the two other refuse-to-start rejections, so htmx response handling and the history refresh behave identically; a `4xx` would imply the request was at fault, which it was not. The status code is surfaced only inside the `Technical details` disclosure.
+
+Each slot message is now followed by a collapsed `Technical details` disclosure carrying the HTTP status code and, when a row was written, the rejected job's id. Those two facts are the **only** technical detail the slot may carry — exception text, request input and the log path are forbidden here.
+
 ### Job-row `error` texts (Phase 26)
 
 Written to the job store; like every other `job.error` they carry no trailing period.
@@ -322,6 +429,7 @@ Written to the job store; like every other `job.error` they carry no trailing pe
 | Submit rejected: queue full | `Not started: the scan queue was full` | History Status cell `Failed` (`.status-error`); CLI job listing. Never the status area |
 | Submit rejected: worker down | `Not started: the scan service was not running` | same |
 | Submit rejected: worker degraded (row write succeeded) | `Not started: the scan service was unavailable` | same |
+| Submit rejected: paperless token unset or a placeholder (Phase 30) | `Not started: the paperless-ngx API token has not been set` | same |
 | Crash recovery at startup; also a flip wait aborted by shutdown | `The server restarted before this scan finished` | Status area when it is the most recent run job: `✗ Error: The server restarted before this scan finished` (existing ERROR branch, `role="alert"`, `.status-error`); History `Failed` |
 
 Rejected rows use the existing presentation: humanised label `Failed`, class `.status-error`. There is no "Rejected" label and no new history column.
@@ -331,7 +439,7 @@ Rejected rows use the existing presentation: humanised label `Failed`, class `.s
 - Sentence case for all UI strings; no title case.
 - In-progress statuses end with `...` (three ASCII dots), not ellipsis.
 - Terminal statuses prefixed by glyphs (`✓` / `✗` / `→`), not emoji. Text-presentation code points only: U+26A0 WARNING SIGN was considered for the fallback line in Phase 23 and rejected because it has an emoji presentation by default on most platforms.
-- Destructive confirmations are absent — "Abort scan" proceeds immediately without a modal.
+- One destructive confirmation exists: `Abort scan` asks `Abort this scan? It will stop and cannot be resumed.` through a native `hx-confirm` dialog (D-27). No other action confirms.
 - No exclamation marks, no emoji, no brand voice adjectives.
 - Placeholders describe behavior, not hints ("auto-generated if empty").
 
@@ -340,11 +448,13 @@ Rejected rows use the existing presentation: humanised label `Failed`, class `.s
 The following patterns would flag on generic copywriting heuristics but are **intentional** product decisions for saneless. They are documented here so downstream checkers, auditors, and future contributors do not "fix" them as defects:
 
 - **Primary CTA is a single word — `Scan`.** saneless has one purpose: scan a document and upload it to paperless-ngx. A verb-noun CTA (`Scan document`, `Start scan`) would add noise without disambiguating anything. The single-word form is retained deliberately.
-- **`Abort scan` has no confirmation dialog.** Scan sessions are time-sensitive (paper is in the feeder, user is standing at the hardware). An immediate abort matches the physical workflow — a modal would interrupt the user's focus at exactly the wrong moment. Data loss is bounded: aborting only discards the in-flight scan, not any completed job or uploaded document. Instant-action was chosen over confirm-then-act on purpose.
+- **`Abort scan` confirms before it acts (D-27, Phase 30).** The button carries `hx-confirm="Abort this scan? It will stop and cannot be resumed."` — one question, one consequence, and nothing the code does not guarantee. It deliberately does **not** promise the already-scanned pages are kept: that is an unverifiable claim, and unverifiable claims are what Phase 30 removes. The native `window.confirm` dialog is unstyled and fully accessible (focus-trapped, keyboard-operable, announced by every screen reader), so this costs no modal partial, no route and no script. `hx-confirm` sits on the **button** in `flip.html`, outside `<form hx-post="/api/scan">`; putting it on the form would make every child request confirm and would require extending `hx-disinherit`. The label stays `Abort scan` in Pico `.secondary`, not a destructive red.
+
+    **This supersedes an earlier decision recorded here.** Until Phase 30 this spec recorded instant-action as intentional, on the grounds that a scan is time-sensitive and a dialog would interrupt someone standing at the hardware. D-27 reverses it: an abort at the flip prompt discards a stack that has already been fed, so one keystroke to confirm is cheaper than re-feeding the paper.
 
 ### Known copy inconsistencies (candidates for future normalization)
 
-1. Correspondent "none" option reads `No correspondent` in the initial index render but `-- None --` after htmx hydration. Recommend picking one.
+1. Correspondent "none" option reads `No correspondent` in the initial index render but `-- None --` after htmx hydration. Recommend picking one. **Still open after Phase 30**, deliberately: that phase rewrote the tag picker but did not touch `partials/correspondents.html`, so neither string moved.
 2. **Status: resolved in Phase 26.** Busy CTA label was `Scanning...` (three dots, Jinja) vs `Scanning…` (U+2026, JS). With the app script deleted, `partials/scan_button.html` is the only source of the label and uses the `&#8230;` entity, so only `Scanning…` remains. The status area's progress prose keeps its three ASCII periods; that is a different string with a different owner.
 
 ---
@@ -357,30 +467,41 @@ The following patterns would flag on generic copywriting heuristics but are **in
 |---------|-----------|--------|------|
 | Scan form submit (`hx-disabled-elt="#scan-btn"`, `hx-disinherit="hx-disabled-elt"`) | `POST /api/scan` | `#status-area` | `outerHTML`; the 200 response also carries an OOB `#scan-btn` and an OOB clear of `#status-message` |
 | Status area self-poll (active states only) | `GET /api/jobs/current/status` every 1s | `#status-area` | `outerHTML`; the response also carries an OOB `#scan-btn` (never the slot clear) |
-| Tags select load | `GET /api/tags` on `load` | self (`this`) | `innerHTML` |
+| Tag list load | `GET /api/tags` on `load` | self (`this`) | `outerHTML` (changed in Phase 30: the target is a `<div>`, not a `<select>`) |
 | Correspondent select load | `GET /api/correspondents` on `load` | self (`this`) | `innerHTML` |
-| Tag refresh | `POST /api/cache/invalidate?resource=tags` | `#tags-select` | `innerHTML` |
+| Tag refresh | `POST /api/cache/invalidate?resource=tags`, `hx-include="#tag-filter, #tags-list"` | `#tags-list` | `outerHTML` (changed in Phase 30; keeps the filter text and the ticks) |
 | Correspondent refresh | `POST /api/cache/invalidate?resource=correspondents` | `#correspondent-select` | `innerHTML` |
+| Tag filter typed | `GET /api/tags` on `keyup changed delay:300ms`, `hx-include="#tags-list"` | `#tags-list` | `outerHTML` |
+| Enter in the tag filter | `GET /api/tags` via `submit` on `#tag-filter-form` | `#tags-list` | `outerHTML`; implicit submission is redirected away from the scan form |
+| Profile changed | `GET /api/profiles/description` on `change` | `#profile-description` | `innerHTML` |
+| Strip cold-start poll | `GET /api/checks` on `load, every 2s` | `#checks-body` | `outerHTML`; the trigger is absent once results exist, so it stops itself |
+| `Check again` | `POST /api/checks/refresh` | `#checks-body` | `outerHTML` |
+| Terminal-state strip reload | `GET /api/checks` on `load`, inside `partials/terminal_reload.html` | `#checks-body` | `outerHTML` |
+| Followed-job status poll | `GET /api/jobs/{id}/status` every 1s | `#status-area` | `outerHTML`; `GET /api/jobs/current/status` stays for a browser that submitted nothing |
 | Flip continue | `POST /api/flip/continue` | `#status-area` | `outerHTML`; the response also carries an OOB `#scan-btn` |
-| Flip abort | `POST /api/flip/abort` | `#status-area` | `outerHTML`; the response also carries an OOB `#scan-btn` |
+| Flip abort | `POST /api/flip/abort` | `#status-area` | `outerHTML`; the response also carries an OOB `#scan-btn`. `hx-confirm` sits on the **button** (D-27) |
 | Terminal DONE/ERROR/FALLBACK hidden history reload | `GET /api/jobs/history` on `load` | `#history-body` | `outerHTML` |
 | Any 4xx/5xx from any htmx request (Phase 26) | as issued | `#status-message`, via the `HX-Retarget` response header | `innerHTML`, via `HX-Reswap`, so the container and its `role="alert"` survive |
 | Rejected-submit history refresh (429/503 from `POST /api/scan`, only when the rejected row was written) | `GET /api/jobs/history` on `load`, inside the error partial | `#history-body` | `outerHTML` |
 
 `base.html` carries a `<meta name="htmx-config">` whose `responseHandling` restates all three entries (`204` no swap, `[23]..` swap, `[45]..` swap with `error: true`), so htmx swaps 4xx/5xx bodies instead of dropping them. htmx 2.0.8 merges meta config shallowly: a meta holding only the `[45]..` entry would replace the array and stop every 2xx swap.
 
-**Which responses carry what (Phase 26).**
+**Which responses carry what (Phase 26, extended by Phase 30).**
 
-| Response | `#status-area` | OOB `#scan-btn` | OOB clear `#status-message` |
-|---|---|---|---|
-| `GET /` (full page) | inline | inline, not OOB (exactly one) | n/a (slot rendered empty) |
-| `POST /api/scan` success | yes | yes | yes |
-| `GET /api/jobs/current/status` | yes | yes | no |
-| `POST /api/flip/continue`, `POST /api/flip/abort` success | yes | yes | no |
-| Any error response | no | no | no |
-| Tags / correspondents / cache invalidate / history | no | no | no |
+| Response | `#status-area` | OOB `#scan-btn` | OOB clear `#status-message` | OOB `#checks-body` |
+|---|---|---|---|---|
+| `GET /` (full page) | inline | inline, not OOB (exactly one) | n/a (slot rendered empty) | inline, not OOB |
+| `POST /api/scan` success | yes | yes | yes | **yes** (the `refresh_checks` flag, set only by `start_scan`, exactly parallel to `clear_message`) |
+| `GET /api/jobs/{id}/status`, `GET /api/jobs/current/status` | yes | yes | no | no |
+| `POST /api/flip/continue`, `POST /api/flip/abort` success | yes | yes | no | no |
+| Any error response | no | no | no | no |
+| Checks / tags / profile description / correspondents / cache invalidate / history | no | no | no | n/a |
 
-The slot clear rides only on a successful scan: a poll or flip response carrying it would erase a rejection shown mid-scan within a second.
+The slot clear rides only on a successful scan: a poll or flip response carrying it would erase a rejection shown mid-scan within a second. The OOB strip rides on the same response so the "paused during scan" note appears at once rather than at the next TTL.
+
+**Every OOB `#scan-btn` in that table is rendered from `partials/scan_button.html`** and therefore carries the `scan_blocked` flag, so no status response can hand back an enabled button while the paperless-ngx token is a placeholder. **`#scan-blocked-reason` is never an OOB target**, and `POST /api/checks/refresh` carries neither an OOB button nor an OOB reason line: re-running the checks cannot change a verdict derived from `Settings`, which is loaded once at process start.
+
+**The `hx-disinherit` promise, restated.** Every control Phase 30 added inside `<form hx-post="/api/scan">` — the profile `<select>`, the tag filter `<input>`, `#tags-list` and the tag checkboxes — sets **no** `hx-disabled-elt` of its own and is already covered by the form's existing `hx-disinherit="hx-disabled-elt"`. **No attribute was added to the `<form>` element**, so the C-10 fix is untouched. Everything else new (`Check again`, the `hx-confirm` on Abort, `#tag-filter-form`) is outside the form. This matters because on htmx 2.0.8 an inherited `hx-disabled-elt` strips `disabled` from a server-disabled button as soon as a child request finishes: if the blocked state lived anywhere but the single button partial, the first tag or profile-description request to complete would re-enable the Scan button.
 
 **Flip routes (Phase 25).** Both flip buttons still target `#status-area` with an `outerHTML` swap, and both routes answer immediately — neither waits for pass B to start. The status partial they return reports the job resolved as "current job, else most recent", the same lookup the status poll and the index page use, so a click that lands just as the job ends shows that job rather than `Ready to scan.`. The flip controls are rendered only while the job is `AWAITING_FLIP` and unanswered. Both buttons send the job's id as a `job_id` form field via `hx-vals`, and the routes drop an answer that names any other job or arrives before that job reached `AWAITING_FLIP` (CR-01). The first answer (Continue, Abort, or the flip timeout) is final; a later click is dropped and the route returns the job's current status. An accepted answer renders the acknowledgment row (`Flip confirmed. Scanning reverse sides next...` / `Aborting scan...`) rather than re-rendering the prompt, and the status poll keeps showing it until the job leaves `AWAITING_FLIP`.
 
@@ -407,6 +528,22 @@ The slot clear rides only on a successful scan: a poll or flip response carrying
 | `AWAITING_FLIP` (answered or not) | present | absent | Waiting for flip… |
 | `DONE` / `FALLBACK` / `ERROR` | absent | absent | Scan |
 
+**A placeholder token is a second, independent source of `disabled` (Phase 30, S8/D-15).** The job-keyed rows above are unchanged; `scan_blocked` ORs into `disabled` and touches nothing else:
+
+| Condition | `disabled` | `aria-busy` | Label | `aria-describedby` | Reason line |
+|---|---|---|---|---|---|
+| blocked, no job active | present | absent | `Scan` | `scan-blocked-reason` | rendered |
+| blocked, job active | present | per job state | per job state | `scan-blocked-reason` | rendered |
+| not blocked | per the table above, unchanged | unchanged | unchanged | absent | absent |
+
+- **The label stays `Scan` when blocked.** A disabled control with a red line beneath it already says "you cannot do this, and here is why". A fourth label string would dissolve the single-word CTA this spec deliberately keeps.
+- `disabled` is one boolean with two sources, so precedence never arises: it is the OR, and the label and `aria-busy` still come from the job.
+- **Exactly one condition blocks: a blank, whitespace-only or literal-set placeholder paperless-ngx token.** No other failed check disables the button. An unreachable scanner, a paperless-ngx that is down, an unwritable data folder — the user is allowed to try and gets a plain-language error. Do not generalise this to "any FAIL check".
+- **Every out-of-band `#scan-btn` re-render carries the flag**, because `partials/scan_button.html` stays the only copy of the markup and re-reads server state each time. No status response, poll or flip answer can hand back an enabled button while the token is a placeholder.
+- **`#scan-blocked-reason` is never an OOB target.** The verdict comes from `Settings`, loaded once at process start, so it cannot change while the process runs and there is no live flip to orchestrate. The line is rendered by `index.html` immediately after the button include, only when blocked, and never exists as an empty placeholder. `POST /api/checks/refresh` deliberately carries neither an OOB button nor an OOB reason line: re-running the checks cannot change the verdict.
+- **Not `aria-disabled`, not a `title` tooltip.** A `disabled` button is not focusable, so a tooltip is unreachable by keyboard and unreliable on touch. The reason is visible text in the reading order directly after the button; `aria-describedby` is kept so an AT user exploring by element still reaches it. Switching to `aria-disabled="true"` to keep the button focusable is forbidden — it would break the `disabled` contract above and `hx-disabled-elt`.
+- **The button is the courtesy; the route guard is the enforcement.** `POST /api/scan` refuses unconditionally and writes a `REJECTED` job row, so curl, a script, and a browser whose `disabled` was removed in devtools are all refused alike.
+
 ### Scan button: interaction timeline
 
 | Moment | Button | Status area | Slot |
@@ -422,13 +559,16 @@ The busy label appears one round-trip after the click, when the OOB copy lands, 
 ### Form semantics
 
 - Native `<form>` submit via htmx; no client-side validation beyond the title input's `maxlength`. The server validates authoritatively and reports failures in `#status-message`.
-- Multi-select (`<select multiple>`) uses native browser UI — no custom token picker.
-- No confirmation dialogs anywhere (see "Deliberate design decisions" above for the Abort rationale).
+- Tags are a **native checkbox list**, not a `<select multiple>` and not a custom token picker (Phase 30, D-30/D-31): a `<select multiple>` needs a modifier key to deselect, which no phone has. Every control on the page is a native element.
+- The tag filter input is bound by its `form` attribute to an empty `#tag-filter-form` **outside** the scan form, so its text is never submitted with a scan and pressing Enter in it filters the list rather than starting one.
+- Exactly one confirmation dialog: `hx-confirm` on the `Abort scan` button (D-27, see "Deliberate design decisions" above). It is on the button, not the form, so no other request inherits it.
 - Only state mutation the user can perform mid-job is Continue / Abort during `AWAITING_FLIP`.
 
 ### Polling / transport
 
 - Live status polling interval: **1 second** (`hx-trigger="every 1s"`). Polling is self-limiting: only the active-state branches of `status.html` include the `hx-get`; terminal states render a static element, so the poll stops naturally on DONE/ERROR/FALLBACK.
+- The status strip's cold-start poll runs at **2 seconds** and is self-limiting in the same way: the body it fetches once results exist carries no trigger, so the swap that installs it is the last one. **There is no steady-state strip poll.** Once results land, the strip is refetched only by `Check again`, by the terminal-state reload, or by a page load — a permanent poll would keep the lazy check refresher awake for every abandoned browser tab. `GET /api/checks` is a cache read and never probes, so no number of open tabs can raise the probe rate above the cache's TTL.
+- Both self-limiting polls use the in-tree "trigger absent in the swapped-in body" idiom rather than HTTP 286, which would require changing the tuned `htmx-config` meta.
 
 ---
 
