@@ -786,10 +786,18 @@ class TestManualDuplexPrompt:
         )
 
         assert result.exit_code == 1, result.output
-        assert (
-            "Scan error: Flip prompt failed: [Errno 5] Input/output error"
-            in result.stderr.splitlines()
+        # A prefix rather than the whole line: since plan 29-09 the fronts pass
+        # A already fed are preserved, because nobody chose to stop, and the
+        # error line goes on to name how many were kept and where.  The exit
+        # code is unchanged, which is what preserving the exception type buys.
+        failure_line = next(
+            line
+            for line in result.stderr.splitlines()
+            if line.startswith(
+                "Scan error: Flip prompt failed: [Errno 5] Input/output error"
+            )
         )
+        assert "were preserved at" in failure_line
         assert _FLIP_CANCEL_LINE not in result.output
         assert len(calls) == 1
         assert uploads == []
