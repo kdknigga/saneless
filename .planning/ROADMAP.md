@@ -581,8 +581,8 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 30-09-PLAN.md — App composition: Jinja filters, app.state, dual-thread lifespan shutdown
-- [ ] 30-10-PLAN.md — CLI: the `Try:` advice line, `scan`'s token refusal, the local-time jobs table
+- [x] 30-09-PLAN.md — App composition: Jinja filters, app.state, dual-thread lifespan shutdown
+- [x] 30-10-PLAN.md — CLI: the `Try:` advice line, `scan`'s token refusal, the local-time jobs table
 
 **Wave 6** *(blocked on Wave 5 completion)*
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 8/19 | In Progress|  |
+| 30. Appliance Layer | 10/19 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
