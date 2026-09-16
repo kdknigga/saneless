@@ -40,7 +40,7 @@
         <label for="profile-select">Profile</label>
         <select name="profile" id="profile-select">
             {% for p in profiles %}
-            <option value="{{ p }}">{{ p }}</option>
+            <option value="{{ p.name }}"{% if p.name == selected %} selected{% endif %}>{{ p.label or p.name }}</option>
             {% endfor %}
         </select>
 
