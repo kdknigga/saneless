@@ -1922,16 +1922,17 @@ class TestSaneBackendCancelSequence:
         )
         fake_device.block_read(ReadBlockMode.PARTIAL)
 
-        with (
-            pytest.raises(ScanError, match="timed out"),
-            sane_backend._open_device(_TEST_DEVICE) as dev,
-        ):
-            sane_backend_mod._snap_flatbed(
-                dev, _TEST_DEVICE, page_sink, _uncropped, timeout=0.05
-            )
+        with sane_backend._open_device(_TEST_DEVICE) as dev:
+            with pytest.raises(ScanError, match="timed out"):
+                sane_backend_mod._snap_flatbed(
+                    dev, _TEST_DEVICE, page_sink, _uncropped, timeout=0.05
+                )
+            # Inside the device context, so the count is the acquisition's own
+            # cancel and not the context manager's routine one on the way out.
+            assert fake_device.cancel_calls == 1
+            assert fake_device.close_while_blocked is False
+            assert fake_device.close_calls == 0
 
-        assert fake_device.cancel_calls == 1
-        assert fake_device.close_while_blocked is False
         assert page_sink.records == ()
 
     def test_flatbed_unreadable_sheet_is_fatal_not_skipped(

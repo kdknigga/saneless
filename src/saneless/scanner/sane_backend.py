@@ -5,10 +5,12 @@ This module provides the concrete SaneBackend that communicates with
 physical scanners through the SANE (Scanner Access Now Easy) library.
 Key safety measures:
 - sane.init() called exactly once at construction time (Pitfall #1)
-- Device handles managed via context manager with cancel+close (Pitfall #4)
+- Device handles managed via context manager with cancel+close (Pitfall #4),
+  skipped entirely while a read is still inside SANE (HARD-03, D-12/D-13)
 - No progress callbacks to snap() (Pitfall #2)
 - Source option validated against device capabilities (Pitfall #5)
-- ADF multi-page scan with per-page timeout and inline validation
+- Every blocking acquisition, fed or flatbed, runs on a daemon thread under
+  one per-page timeout, with inline validation (HARD-03, HARD-04)
 """
 
 from __future__ import annotations
@@ -17,8 +19,7 @@ import contextlib
 import functools
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
+import threading
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Protocol, assert_never
@@ -102,7 +103,35 @@ PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
 
 # Per-page timeout: 2x a generous single-page scan estimate (60s at 600 DPI).
 # At 300 DPI typical scan is ~10-15s, so 120s is very conservative.
+#
+# It bounds one page on BOTH acquisition paths: one fed sheet's next(iterator)
+# and one flatbed sheet's start()+snap() alike, with no second constant and no
+# config key of its own (HARD-04, D-14).
 _DEFAULT_PAGE_TIMEOUT_SECONDS: float = 120.0
+
+# How long the timeout path waits for a cancelled read to come back before it
+# gives up on the handle entirely.
+#
+# The value is worth justifying rather than asserting, because every candidate
+# is defensible in isolation and only the three cases together decide it:
+#
+# - A cooperative backend returns in microseconds. Measured against the real
+#   SANE `test` backend, dev.cancel() returned in 0.000 s from another thread
+#   and the blocked snap() returned 0.0 s after that.
+# - A `net` backend with a live saned returns within one RPC round trip, since
+#   saned select()s on the control fd while scanning and the client's blocked
+#   read then sees EOF.
+# - A `net` backend with a dead link will not return within ANY grace. A
+#   longer wait therefore buys nothing except a later error message for the
+#   operator, and D-13 already makes the resulting wedge recover by itself the
+#   moment the read does come back.
+#
+# 10 s also sits inside pytest-timeout's 60 s, so a test that hits the whole
+# grace still fails as an assertion rather than as a session timeout, and
+# outside the web worker's STOP_JOIN_SECONDS of 5 s, which is deliberate: a
+# shutdown during the grace returns promptly anyway, because the thread the
+# grace is waiting on is a daemon and nothing joins it.
+_CANCEL_GRACE_SECONDS: float = 10.0
 
 # Minimum raw image data size in bytes. Catches a corrupt or truncated buffer.
 #
@@ -187,9 +216,10 @@ def _as_image(obj: object) -> Image.Image:
     """
     Cast an object to Image.Image for type checker satisfaction.
 
-    ThreadPoolExecutor.submit(next, iterator) loses generic type info,
-    so ty cannot infer the result is Image.Image. This cast is safe
-    because the iterator is known to yield Image.Image.
+    A value handed back through a thread's result slot has lost its generic
+    type, so neither checker can infer that what the iterator yielded is an
+    ``Image.Image``. The check is real rather than a cast: it is the one place
+    a device double returning something else would be caught.
     """
     if not isinstance(obj, Image.Image):
         msg = f"Expected Image, got {type(obj)}"
@@ -679,43 +709,423 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     return True
 
 
-def _next_page_with_timeout(
-    executor: ThreadPoolExecutor,
-    iterator: Iterator[Image.Image],
-    page_num: int,
-    timeout_per_page: float,
-) -> Image.Image:
+class _Slot:
     """
-    Acquire one page from the ADF iterator under a wall-clock timeout.
+    The one value a reader thread hands back, or the one it raised.
 
-    ``signal.alarm`` is not safe in a non-main thread, so the blocking
-    ``next(iterator)`` call is submitted to a single-worker executor and
-    waited on with a timeout instead.
+    A mutable cell rather than a queue because there is exactly one producer,
+    exactly one value, and exactly one consumer -- and because the consumer
+    may give up before the producer ever writes, which is the whole point.
+    """
+
+    __slots__ = ("error", "value")
+
+    def __init__(self) -> None:
+        """Start empty: no value written, and nothing raised."""
+        self.value: object = None
+        self.error: BaseException | None = None
+
+
+@dataclass
+class _Wedge:
+    """
+    What the module remembers about a reader thread still inside SANE (D-13).
+
+    Module-level and **mutated, never rebound**.  Rebinding would need a
+    ``global`` statement, which the ``PL`` rules in ruff's ``select`` reject;
+    the one existing rebinding in this file carries a ``# noqa`` for exactly
+    that, and CLAUDE.md forbids adding another, so this state lives in a
+    container instead of in a name.
+
+    ``device`` and ``iterator`` are **strong** references, deliberately.
+    ``SaneDev_dealloc`` calls ``sane_close()`` and ``_SaneIterator.__del__``
+    calls ``device.cancel()``, so letting a wedged handle be garbage-collected
+    would reintroduce exactly the close-while-reading this module now avoids
+    (29-RESEARCH.md Pitfall 3).
+
+    ``done`` identifies *which* acquisition is wedged.  A reader that wakes up
+    long afterwards compares against it, so a late wake-up belonging to an
+    abandoned acquisition cannot clear a wedge that a later one recorded.
+    """
+
+    stuck: bool = False
+    done: threading.Event | None = None
+    device: SaneDevice | None = None
+    iterator: object = None
+    device_id: str = ""
+    page_label: str = ""
+
+
+# Guards every read and write of _WEDGE.  Three threads reach it -- the worker
+# that gave up, the reader that eventually returns, and whichever thread starts
+# the next job -- and the close-or-wedge decision is a check and a write that
+# must not be split.
+_WEDGE_LOCK = threading.Lock()
+_WEDGE = _Wedge()
+
+# The prefix every acquisition thread is named with, so a stuck reader is
+# identifiable in a ``faulthandler`` dump or a debugger without guessing.
+_READER_THREAD_PREFIX = "sane-read-"
+
+
+def _page_label(page_num: int) -> str:
+    """
+    Name one page, for its timeout message and its reader thread.
 
     Args:
-        executor: Single-worker executor owned by the caller.
-        iterator: The ``multi_scan()`` iterator being drained.
         page_num: Zero-based index of the page being acquired.
-        timeout_per_page: Maximum seconds to wait for this page.
 
     Returns:
-        The page image.
-
-    Raises:
-        ScanError: If the page did not arrive within the timeout.
+        The one-based human label, e.g. ``"Page 3"``.
 
     """
-    future = executor.submit(next, iterator)
-    try:
-        return _as_image(future.result(timeout=timeout_per_page))
-    except FuturesTimeoutError as timeout_exc:
-        logger.error(
-            "Page %d timed out after %.0fs",
-            page_num + 1,
-            timeout_per_page,
+    return f"Page {page_num + 1}"
+
+
+def _cancel_and_settle(dev: SaneDevice, done: threading.Event, grace: float) -> bool:
+    """
+    Cancel a blocked read from a second thread, then wait for it to return.
+
+    The cancel runs on a thread of its own and not on the caller's, and that
+    is a correctness requirement rather than tidiness.  On the ``net`` backend
+    ``sane_cancel`` is ``sanei_w_call(SANE_NET_CANCEL)`` -- a blocking RPC on
+    the control wire, issued before the local data fd is closed -- so against a
+    saned that has stopped answering it hangs whoever calls it.  Whoever calls
+    it here is the worker thread running the whole job, so the grace would
+    bound nothing at all (``backend/net.c``; 29-RESEARCH.md Pitfall 2).
+
+    It is sound to call at all only because ``sane_cancel`` releases the GIL,
+    as ``sane_read`` does, which is what lets one Python thread cancel what
+    another is blocked in (``_sane.c`` 2.9.2, verified).  The cancel thread is
+    a daemon for the same reason the reader is: if the RPC never returns, it
+    must not keep the process alive.
+
+    A failing cancel is logged and swallowed.  There is nothing else to do
+    with it -- the read is already lost -- and raising here would replace the
+    timeout the operator actually needs to see.
+
+    Args:
+        dev: The device handle the blocked read is inside.
+        done: The event the reader sets when it returns, however it returns.
+        grace: Seconds to wait for the reader after the cancel is fired.
+
+    Returns:
+        True if the reader returned within the grace, False if it did not.
+
+    """
+
+    def fire() -> None:
+        try:
+            dev.cancel()
+        except Exception:
+            logger.warning("Cancelling the blocked read failed", exc_info=True)
+
+    canceller = threading.Thread(target=fire, name="sane-cancel", daemon=True)
+    canceller.start()
+    return done.wait(grace)
+
+
+def _mark_wedged(dev: SaneDevice, done: threading.Event, label: str) -> bool:
+    """
+    Record that a read never came back, unless it just did.
+
+    The check and the write are one critical section because the reader may
+    return in the instant between the grace expiring and this call.  Reading
+    ``done`` under the same lock the reader takes *after* setting it is what
+    makes that window closed rather than merely narrow.
+
+    Args:
+        dev: The handle the reader is still inside.
+        done: The event identifying this acquisition.
+        label: The page label, for the refusal message.
+
+    Returns:
+        True if the backend is now wedged, False if the reader beat the call.
+
+    """
+    with _WEDGE_LOCK:
+        if done.is_set():
+            return False
+        _WEDGE.stuck = True
+        _WEDGE.done = done
+        _WEDGE.device = dev
+        _WEDGE.page_label = label
+        return True
+
+
+def _release_wedge(dev: SaneDevice, done: threading.Event) -> None:
+    """
+    Close the handle and clear the wedge, from the reader thread itself.
+
+    The reader closes rather than the thread that gave up on it, because by
+    then the thread that gave up has long since raised -- and the reader is
+    the only thread that knows the read is over, which is the one fact SANE
+    requires before any other operation may run on the handle.
+
+    A close failure is logged and never raised: this runs in a daemon thread
+    whose exception nobody would see, and an unhandled one would surface in a
+    test run as a ``PytestUnhandledThreadExceptionWarning`` turned into an
+    error.
+
+    Args:
+        dev: The handle to release.
+        done: The event identifying this acquisition; a reader belonging to
+            some earlier, already-forgotten acquisition matches nothing here
+            and does nothing.
+
+    """
+    with _WEDGE_LOCK:
+        if not (_WEDGE.stuck and _WEDGE.done is done):
+            return
+        logger.warning(
+            "The read on %s returned at last (%s); closing the handle",
+            _WEDGE.device_id or "the scanner",
+            _WEDGE.page_label,
         )
-        timeout_msg = f"Page {page_num + 1} timed out after {timeout_per_page:.0f}s"
-        raise ScanError(timeout_msg) from timeout_exc
+        try:
+            dev.close()
+        except Exception:
+            logger.warning("Could not close the released scanner", exc_info=True)
+        _WEDGE.stuck = False
+        _WEDGE.done = None
+        _WEDGE.device = None
+        _WEDGE.iterator = None
+        _WEDGE.device_id = ""
+        _WEDGE.page_label = ""
+
+
+def _wedged_by(dev: SaneDevice) -> bool:
+    """
+    Report whether this handle is the one a reader is still inside.
+
+    Args:
+        dev: The handle to test.
+
+    Returns:
+        True if a reader never returned from a read on this device.
+
+    """
+    with _WEDGE_LOCK:
+        return _WEDGE.stuck and _WEDGE.device is dev
+
+
+def _retain_iterator(dev: SaneDevice, iterator: object) -> bool:
+    """
+    Keep a wedged device's iterator alive, reversing the old ``del``.
+
+    ``del iterator`` used to be the cleanup; on this path it is the hazard.
+    ``_SaneIterator.__del__`` calls ``device.cancel()``, so dropping the last
+    reference to a wedged device's iterator issues a SANE call on a handle a
+    read is still inside -- the thing this whole sequence exists to prevent.
+
+    Args:
+        dev: The handle the iterator drives.
+        iterator: The ``multi_scan()`` iterator.
+
+    Returns:
+        True if the iterator was retained because the device is wedged.
+
+    """
+    with _WEDGE_LOCK:
+        if _WEDGE.stuck and _WEDGE.device is dev:
+            _WEDGE.iterator = iterator
+            return True
+        return False
+
+
+def _name_wedged_device(dev: SaneDevice, device_id: str) -> bool:
+    """
+    Record which device is wedged, and report that it is.
+
+    The acquisition helper knows the handle but not its SANE name; the device
+    context manager knows both.  This is where the two meet, so the refusal a
+    later call raises can name the device the operator has to deal with.
+
+    Only the device id is recorded.  No host string and no credential from
+    ``SANE_NET_HOSTS`` is written anywhere on this path (ASVS V7).
+
+    Args:
+        dev: The handle being released, or not.
+        device_id: Its SANE name.
+
+    Returns:
+        True if a reader is still inside this handle.
+
+    """
+    with _WEDGE_LOCK:
+        if _WEDGE.stuck and _WEDGE.device is dev:
+            _WEDGE.device_id = device_id
+            return True
+        return False
+
+
+def _refuse_if_wedged(device_id: str, operation: str) -> None:
+    """
+    Refuse a new SANE operation while a read is still outstanding (D-13).
+
+    Called before anything is opened, because the refusal is worthless
+    otherwise: ``sane_open`` on a device whose previous read never returned is
+    itself one of the operations the SANE standard forbids.
+
+    The wedge is not permanent.  When the late read finally returns, the
+    reader thread closes the handle and clears this record, so a transient
+    network hang recovers without a restart -- which is why the message says
+    "if it does not" rather than "restart saneless".
+
+    Args:
+        device_id: The device the refused call was for.
+        operation: What the caller was about to do, in the message.
+
+    Raises:
+        ScanError: If a reader is still inside SANE.
+
+    """
+    with _WEDGE_LOCK:
+        if not _WEDGE.stuck:
+            return
+        wedged_id = _WEDGE.device_id or "the scanner"
+        label = _WEDGE.page_label or "an earlier page"
+    wedged_msg = (
+        f"Could not {operation} {device_id}: a read on {wedged_id} ({label}) "
+        f"has not returned, and SANE allows no other operation on a device "
+        f"while one is outstanding. The scan will be possible again as soon "
+        f"as the scanner releases it. Restart saneless if it does not."
+    )
+    raise ScanError(wedged_msg)
+
+
+def _settle_or_wedge(
+    dev: SaneDevice, done: threading.Event, grace: float, label: str
+) -> bool:
+    """
+    Run the D-12 tail: cancel, wait out the grace, then close or wedge.
+
+    Args:
+        dev: The handle the blocked read is inside.
+        done: The event identifying this acquisition.
+        grace: Seconds to wait for the reader after the cancel.
+        label: The page label, for the log and the later refusal.
+
+    Returns:
+        True if the read returned, so the caller's device context may close
+        the handle normally.  False if it did not, in which case the handle is
+        wedged and nothing may touch it.
+
+    """
+    if _cancel_and_settle(dev, done, grace):
+        return True
+    if not _mark_wedged(dev, done, label):
+        return True
+    logger.critical(
+        "%s: the scanner did not respond to the cancel within %.0fs. The "
+        "device handle is being left open because a read is still inside "
+        "SANE; no further scan can run until it returns.",
+        label,
+        grace,
+    )
+    return False
+
+
+def _acquire_with_timeout(
+    dev: SaneDevice,
+    work: Callable[[], object],
+    page_label: str,
+    timeout: float,
+    grace: float = _CANCEL_GRACE_SECONDS,
+) -> Image.Image:
+    """
+    Run one blocking SANE acquisition under a wall-clock bound (D-11, D-12).
+
+    ``signal.alarm`` is not safe off the main thread, so the bound has to come
+    from a second thread either way.  What changed is *which* second thread.
+    The thread pool that used to supply it was the wrong one: every worker
+    ``concurrent.futures`` starts is non-daemon, and its ``_python_exit``
+    hook -- registered with ``threading._register_atexit`` -- joins all of
+    them at interpreter exit.  A pooled worker stuck in a blocking C call
+    therefore stops the process from exiting at all: ``docker stop`` waits out
+    its grace and then SIGKILLs, and a test session hangs.  Measured on
+    CPython 3.14.2 against a real blocking read: pooled worker stuck, never
+    exits; non-daemon thread stuck, never exits; ``daemon=True`` thread stuck,
+    exits in 0.24 s.
+
+    So each acquisition gets a fresh ``daemon=True`` thread.  A thread per page
+    costs nothing beside a multi-second scan, and -- unlike a shared pool --
+    one stuck read cannot poison the next job.
+
+    On timeout the sequence is cancel, wait, then close only if the read
+    returned, and the cancel goes out on a thread of its own
+    (``_cancel_and_settle``).  **The late value is discarded unconditionally.**
+    Only whether the reader *returned* is consulted, never what it returned:
+    measured on real libsane, a cancelled ``snap()`` hands back a truncated
+    image rather than raising -- 3779x242 of a full page -- and that image
+    clears ``_validate_page_image``, so "use it, it arrived after all" would
+    put one more page in the PDF than the error message claims (Pitfall 1).
+
+    A ``KeyboardInterrupt`` arriving while this waits takes the identical path
+    and is then re-raised, so Ctrl-C during a read leaves the device in the
+    same state a timeout does (D-15).  ``reader.start()`` is inside the guarded
+    block so there is no window in which the interrupt could land after the
+    thread exists but before the handler could cancel it.
+
+    The reader catches ``BaseException`` and stores it: nothing may reach
+    ``threading.excepthook``, where an unhandled thread exception becomes a
+    ``PytestUnhandledThreadExceptionWarning`` and, under this project's
+    ``filterwarnings = ["error"]``, an error in an unrelated test.
+
+    Args:
+        dev: The open handle the work will block inside.
+        work: The blocking call, as a no-argument callable.
+        page_label: Names the page in the timeout message and the thread.
+        timeout: Maximum seconds to wait for the page.
+        grace: Maximum seconds to wait for the read after cancelling it.
+
+    Returns:
+        The acquired page.
+
+    Raises:
+        ScanError: If the page did not arrive within the timeout, naming the
+            unresponsive cancel as well when the read never came back.
+        BaseException: Whatever the work raised, re-raised unchanged --
+            including ``StopIteration``, by design, because that is the
+            feeder-empty signal the caller's ladder is written around.
+
+    """
+    done = threading.Event()
+    slot = _Slot()
+
+    def read() -> None:
+        try:
+            slot.value = work()
+        except BaseException as exc:
+            # Handed to the waiter rather than raised: see the docstring.
+            slot.error = exc
+        finally:
+            done.set()
+            _release_wedge(dev, done)
+
+    reader = threading.Thread(
+        target=read, name=f"{_READER_THREAD_PREFIX}{page_label}", daemon=True
+    )
+    try:
+        reader.start()
+        finished = done.wait(timeout)
+    except KeyboardInterrupt:
+        _settle_or_wedge(dev, done, grace, page_label)
+        raise
+    if finished:
+        if slot.error is not None:
+            raise slot.error
+        return _as_image(slot.value)
+
+    returned = _settle_or_wedge(dev, done, grace, page_label)
+    logger.error("%s timed out after %.0fs", page_label, timeout)
+    timeout_msg = f"{page_label} timed out after {timeout:.0f}s"
+    if not returned:
+        timeout_msg += (
+            "; the scanner did not respond to the cancel, so saneless is "
+            "still waiting for that read to return"
+        )
+    raise ScanError(timeout_msg)
 
 
 def _acquire_pages(
@@ -723,6 +1133,7 @@ def _acquire_pages(
     sink: PageSink,
     crop: Callable[[Image.Image], Image.Image],
     timeout_per_page: float,
+    grace: float = _CANCEL_GRACE_SECONDS,
 ) -> tuple[list[PageRecord], int]:
     """
     Spool the validated ADF pages, and report how many sheets were skipped.
@@ -775,6 +1186,10 @@ def _acquire_pages(
             over the paper size, the resolution the device chose and whether
             the scan area was set on the device.
         timeout_per_page: Maximum seconds to wait for each page.
+        grace: Maximum seconds to wait for a timed-out read to come back
+            after it has been cancelled.  Injectable for the same reason
+            ``timeout_per_page`` is: a test proving the unresponsive-cancel
+            path must not wait out the module's real ten seconds.
 
     Returns:
         The records the sink returned, in acquisition order, and how many fed
@@ -799,12 +1214,15 @@ def _acquire_pages(
     # users as pages removed for being blank, so reporting a corrupt page
     # through it would be a new small lie in a phase about removing them.
     rejected_pages = 0
-    executor = ThreadPoolExecutor(max_workers=1)
     try:
         while True:
             try:
-                page_image = _next_page_with_timeout(
-                    executor, iterator, page_num, timeout_per_page
+                page_image = _acquire_with_timeout(
+                    dev,
+                    functools.partial(next, iterator),
+                    _page_label(page_num),
+                    timeout_per_page,
+                    grace,
                 )
             except StopIteration:
                 break
@@ -851,10 +1269,16 @@ def _acquire_pages(
             # -- and what is spooled is exactly what the PDF embeds (D-03).
             records.append(sink.add(crop(page_image)))
     finally:
-        # Shut down the timeout executor
-        executor.shutdown(wait=False)
-        # Delete iterator before cancel to avoid __del__ issues (Pitfall #1)
-        del iterator
+        # Pitfall #1's ``del iterator`` was a cleanup; on the wedge path it is
+        # the hazard, and this branch is that reversal. Dropping the last
+        # reference runs ``_SaneIterator.__del__``, which calls
+        # ``device.cancel()`` -- a SANE call on a handle a read is still
+        # inside, which is the one thing D-12 exists to prevent. When the
+        # device is wedged the record takes the reference instead, and the
+        # reader thread drops it when it finally returns. On every other path
+        # the ``del`` is exactly what it always was.
+        if not _retain_iterator(dev, iterator):
+            del iterator
 
     if page_num == 0:
         raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE)
@@ -1143,15 +1567,22 @@ def _snap_flatbed(
     device_id: str,
     sink: PageSink,
     crop: Callable[[Image.Image], Image.Image],
+    timeout: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
 ) -> PageRecord:
     """
-    Acquire one flatbed page, validate it, and spool it.
+    Acquire one flatbed page under the ADF's timeout, validate it, and spool it.
 
     ``start()`` opens the SANE data channel and ``snap()`` drains it, so the
-    two are wrapped together and nothing else is.  The validate-crop-spool
-    sequence that follows is deliberately outside that guard: it is the same
-    sequence the feeder path runs, so one page reaches the sink the same way
-    however it was acquired (HARD-04's validation half, D-14).
+    two are wrapped together and nothing else is.  They go through
+    ``_acquire_with_timeout`` as a single unit of work, under the same
+    ``_DEFAULT_PAGE_TIMEOUT_SECONDS`` a fed sheet gets and with no config key
+    of its own: one sheet is one sheet, whichever way it was presented, and a
+    platen that stops answering used to hang the job forever while the
+    identical failure on a feeder was reported in two minutes (HARD-04, D-14).
+
+    The validate-crop-spool sequence that follows is deliberately outside that
+    guard: it is the same sequence the feeder path runs, so one page reaches
+    the sink the same way however it was acquired (HARD-04's validation half).
 
     The one message python-sane's own ADF iterator treats as the end of the
     feed (``sane.py:130``) is mapped to ``FeederEmptyError`` by the same exact
@@ -1166,19 +1597,31 @@ def _snap_flatbed(
         sink: Where the page goes.  ``add`` is called exactly once, after the
             page passed its integrity checks and was cropped.
         crop: Applied to the page before the sink sees it.
+        timeout: Maximum seconds to wait for the sheet.  Defaults to the one
+            constant the feeder path uses; a test injects a short one the same
+            way ``timeout_per_page`` is injected there.
 
     Returns:
         The record the sink returned for the one scanned page.
 
     Raises:
         FeederEmptyError: If SANE reports the feeder out of documents.
-        ScanError: If the page fails its integrity checks, or for any other
-            failure, chained to the original (D-08).
+        ScanError: If the sheet did not arrive within the timeout, if the page
+            fails its integrity checks, or for any other failure, chained to
+            the original (D-08).
 
     """
-    try:
+
+    def start_and_snap() -> Image.Image:
         dev.start()
-        image = dev.snap()
+        return dev.snap()
+
+    try:
+        image = _acquire_with_timeout(dev, start_and_snap, _page_label(0), timeout)
+    except ScanError:
+        # The timeout path's own error, already worded and already logged.
+        # FeederEmptyError subclasses ScanError and reaches here the same way.
+        raise
     except Exception as exc:
         if str(exc) == "Document feeder out of documents":
             raise FeederEmptyError(_FEEDER_EMPTY_MESSAGE) from exc
@@ -1286,7 +1729,14 @@ class SaneBackend(ScannerBackend):
         Context manager for SANE device lifecycle.
 
         Opens the device, yields it for use, then ensures cancel()
-        and close() are called on all exit paths (normal and error).
+        and close() are called on all exit paths (normal and error) --
+        **unless** a reader thread is still inside SANE on this handle, in
+        which case both are skipped.  That is not an omission: the SANE
+        standard forbids any other operation while one is outstanding, and
+        ``sane_close`` additionally runs holding the GIL while ``sane_read``
+        has released it, so a close racing a blocked read is the one sequence
+        python-sane cannot survive (D-12).  The handle is released later by
+        the reader thread itself, and until then the wedge record holds it.
 
         Args:
             device_id: SANE device identifier string.
@@ -1307,15 +1757,24 @@ class SaneBackend(ScannerBackend):
         try:
             yield dev
         finally:
-            with contextlib.suppress(Exception):
-                dev.cancel()
-            try:
-                dev.close()
-            except Exception:
-                # Logged, never raised: an exception from close() here would
-                # replace the one that ended the scan, which is the error the
-                # operator needs to see (T-28-16).
-                logger.warning("Could not close scanner %s", device_id, exc_info=True)
+            if _name_wedged_device(dev, device_id):
+                logger.critical(
+                    "Leaving scanner %s open: a read has not returned, so "
+                    "neither cancel() nor close() may be issued on it",
+                    device_id,
+                )
+            else:
+                with contextlib.suppress(Exception):
+                    dev.cancel()
+                try:
+                    dev.close()
+                except Exception:
+                    # Logged, never raised: an exception from close() here
+                    # would replace the one that ended the scan, which is the
+                    # error the operator needs to see (T-28-16).
+                    logger.warning(
+                        "Could not close scanner %s", device_id, exc_info=True
+                    )
 
     def get_devices(self) -> list[DeviceInfo]:
         """
@@ -1359,7 +1818,12 @@ class SaneBackend(ScannerBackend):
             list or a range -- with at most one of the two populated and
             neither derived from the other.
 
+        Raises:
+            ScanError: If a previous read has not returned, in which case no
+                SANE call is made at all (D-13).
+
         """
+        _refuse_if_wedged(device_id, "read the capabilities of")
         with self._open_device(device_id) as dev:
             raw_options = _read_options(dev, device_id)
             sources = _constraint(raw_options, "source").values or []
@@ -1380,6 +1844,7 @@ class SaneBackend(ScannerBackend):
         sink: PageSink,
         crop: Callable[[Image.Image], Image.Image],
         timeout_per_page: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
+        grace: float = _CANCEL_GRACE_SECONDS,
     ) -> tuple[list[PageRecord], int]:
         """
         Spool the validated ADF pages, with a per-page timeout.
@@ -1387,23 +1852,26 @@ class SaneBackend(ScannerBackend):
         Per user decision: "Wrap ADF iteration with per-page timeout (not per-job)
         -- cancel if single page takes longer than 2-3x expected duration."
 
-        The work lives in the module-level ``_acquire_pages``, which uses
-        concurrent.futures.ThreadPoolExecutor to wrap each next(iterator) call
-        with a timeout, since signal.alarm is not safe in non-main threads
-        (per RESEARCH.md Open Question 1).
+        The work lives in the module-level ``_acquire_pages``, which runs each
+        blocking ``next(iterator)`` on a fresh ``daemon=True`` thread and waits
+        on an event: ``signal.alarm`` is not safe off the main thread, and the
+        thread pool this replaced left non-daemon workers that
+        ``concurrent.futures`` joins at interpreter exit, so one stuck read
+        stopped the process from exiting at all (D-11).
 
         Args:
             dev: Open SANE device handle.
             sink: Where each accepted page goes.
             crop: Applied to each accepted page before the sink sees it.
             timeout_per_page: Maximum seconds to wait for each page.
+            grace: Maximum seconds to wait for a cancelled read to return.
 
         Returns:
             The records the sink returned, and the count of fed sheets skipped
             for failing their integrity checks.
 
         """
-        return _acquire_pages(dev, sink, crop, timeout_per_page)
+        return _acquire_pages(dev, sink, crop, timeout_per_page, grace)
 
     def scan_pages(
         self, device_id: str, settings: ScanSettings, sink: PageSink
@@ -1431,9 +1899,9 @@ class SaneBackend(ScannerBackend):
 
         The device being closed by the time this returns is a **consequence**
         of that, not a goal -- the handle previously stayed open until the
-        generator was drained or garbage-collected. Close-while-reading and
-        cancel semantics are Phase 29's HARD-03/HARD-04 and are deliberately
-        not folded in here.
+        generator was drained or garbage-collected. The one exception is a
+        read that never returned: the handle is then deliberately left open
+        and this method refuses outright until it does (D-12, D-13).
 
         Args:
             device_id: SANE device identifier string.
@@ -1447,13 +1915,16 @@ class SaneBackend(ScannerBackend):
             integrity checks.
 
         Raises:
-            ScanError: If the device does not support the requested source, if
-                a flatbed scan returns a page that fails its integrity checks
-                -- unlike a fed sheet, there is no next page to skip to -- or
-                if the sink could not take a page.
+            ScanError: If a previous read has not returned, in which case no
+                SANE call is made at all (D-13); if the device does not
+                support the requested source; if a page times out; if a
+                flatbed scan returns a page that fails its integrity checks --
+                unlike a fed sheet, there is no next page to skip to -- or if
+                the sink could not take a page.
             FeederEmptyError: If the ADF feeder is empty.
 
         """
+        _refuse_if_wedged(device_id, "scan from")
         with self._open_device(device_id) as dev:
             # Fetched once and passed on: _resolve_source reads the source
             # constraint from it and _set_geometry reads the scan-area options,
