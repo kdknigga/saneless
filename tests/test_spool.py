@@ -302,3 +302,36 @@ class TestSpooledPageSinkFailures:
         assert str(blocked / "a-0001.png") in message
         assert isinstance(excinfo.value.__cause__, OSError)
         assert sink.records == ()
+
+    def test_an_unmeasurable_directory_becomes_a_chained_scan_error(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A spool directory that has gone is a disk fault, not a scanner one.
+
+        ``add``'s docstring promises "no raw OSError escapes this method"
+        (D-07), and ``_write`` honoured it while ``_check_room_for`` did not:
+        ``shutil.disk_usage`` on a directory whose mount went away raises
+        ``FileNotFoundError``.  Untranslated it escaped past
+        ``_acquire_pages``' ``except ScanError`` ladder into its generic
+        handler, where it came back as "Scanner error on page N" -- blaming
+        the scanner for a disk fault -- and on the flatbed path it escaped
+        untranslated altogether (WR-11).
+
+        The directory is removed after the sink is built, so the failure is
+        the one production sees: a spool that existed when the scan started
+        and did not when the page arrived.
+        """
+        spool = tmp_path / "spool"
+        spool.mkdir()
+        sink = SpooledPageSink(spool, "a", 0)
+        spool.rmdir()
+
+        with pytest.raises(ScanError) as excinfo:
+            sink.add(_white_page())
+
+        message = str(excinfo.value)
+        assert "Could not measure free space for page 1" in message
+        assert str(spool) in message
+        assert isinstance(excinfo.value.__cause__, OSError)
+        assert sink.records == ()
