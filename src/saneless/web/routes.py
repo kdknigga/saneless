@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated, Literal, assert_never
+from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import JSONResponse
 
+from saneless.checks import (
+    CHECKING_GLYPH,
+    CHECKING_MESSAGE,
+    CHECKING_STATE_CLASS,
+    CHECKING_STATE_LABEL,
+    CheckKey,
+    run_checks,
+)
 from saneless.config import resolve_job_title
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
@@ -22,16 +30,19 @@ from saneless.vocabulary import (
     RequestRejection,
     SubmitResult,
     WorkerHealth,
+    local_time,
     worker_health_detail,
 )
 from saneless.web.errors import RequestRejected
 
 if TYPE_CHECKING:
+    from starlette.datastructures import State
     from starlette.responses import Response
 
     from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
     from saneless.web.cache import MetadataCache
+    from saneless.web.checks_cache import CachedChecks
     from saneless.worker import ScanWorker
 
 __all__ = ["router"]
@@ -52,6 +63,116 @@ _TAGS_FORM_DEFAULT = Form(default=[])
 # TYPE_CHECKING import, because FastAPI reads it to validate the ``resource``
 # query parameter: anything else is a 422 instead of reaching the cache (N-20).
 MetadataResource = Literal["tags", "correspondents"]
+
+# The freshness line's four UI-SPEC variants, composed here rather than in the
+# template: the strip's templates own no vocabulary, and a page that assembled
+# its own prose would be a second place for the copy to drift from D-08's
+# specimen.  The dash is U+2014 with spaces on both sides, as that specimen
+# writes it.
+_PAUSED_PREFIX: Final = "Paused during scan — "
+_COLD_PAUSED_LINE: Final = f"{_PAUSED_PREFIX}not checked yet."
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckingRow:
+    """
+    One cold-start placeholder row, before any probe has happened (D-06).
+
+    It is not a :class:`~saneless.checks.CheckResult` because "we have not
+    looked yet" is not one of the three ``CheckState`` members, and inventing a
+    fourth would owe an exit-code rule to ``saneless doctor`` for a state the
+    CLI cannot ever be in -- it probes synchronously and always has an answer.
+    So the row carries the class, glyph and screen-reader word directly, and
+    every one of them is a constant imported from ``saneless.checks``: the
+    template still authors none of them.
+
+    Only ``key`` varies, so the five rows are built once at import.
+
+    Attributes:
+        key: Which check this row is standing in for.
+        state_class: The muted colour class the glyph is drawn in.
+        glyph: The neutral cold-start marker.
+        state_label: The word a screen reader hears in the glyph's place.
+        message: The cold-start copy.
+
+    """
+
+    key: CheckKey
+    state_class: str = CHECKING_STATE_CLASS
+    glyph: str = CHECKING_GLYPH
+    state_label: str = CHECKING_STATE_LABEL
+    message: str = CHECKING_MESSAGE
+
+
+# One placeholder per CheckKey, in member order, so a cold strip still renders
+# five *named* rows rather than an empty list that reads as "nothing to report".
+_CHECKING_ROWS: Final = tuple(_CheckingRow(key=key) for key in CheckKey)
+
+
+def _freshness_line(cached: CachedChecks, *, scan_active: bool) -> str:
+    """
+    Compose the one sentence under the rows, for the four situations.
+
+    The four variants are UI-SPEC S1's, verbatim.  Two axes produce them:
+    whether any results exist yet, and whether a scan is holding the scanner.
+    The paused wording is D-08's whole point -- a strip that silently showed a
+    half-hour-old Scanner row during a scan would be lying by omission, and one
+    that blanked would throw away the four rows that are still true.
+
+    The timestamp goes through the shared ``local_time`` filter, which is the
+    same object ``saneless doctor``'s table uses, so the two surfaces cannot
+    disagree about the zone or the format (APPL-12, D-35).
+
+    Args:
+        cached: The cache snapshot this render is showing.
+        scan_active: Whether the worker currently has a job in flight.
+
+    Returns:
+        The exact sentence for this situation.
+
+    """
+    if cached.results is None or cached.checked_at is None:
+        return _COLD_PAUSED_LINE if scan_active else CHECKING_MESSAGE
+    stamp = local_time(cached.checked_at)
+    if scan_active:
+        return f"{_PAUSED_PREFIX}last checked {stamp}."
+    return f"Last checked {stamp}."
+
+
+def _checks_context(state: State) -> dict[str, object]:
+    """
+    Build the context ``partials/checks.html`` renders from, without probing.
+
+    D-04: this reads the cache and never calls ``run_checks``.  Probing inside
+    a request handler is what an unplugged scanner host would make hang -- a
+    sane-net connect that Linux retries six times costs roughly two minutes
+    inside a blocking C call, and a page that waited for it would be a page
+    that never arrives.  The background refresher is what fills the cache; this
+    only reads what is already there.
+
+    ``checks`` is ``None`` on a cold cache, and that is the single fact the
+    template branches on: no results means the poll trigger is emitted and the
+    placeholder rows are drawn, results means neither.  Nothing else in the
+    strip is conditional.
+
+    Args:
+        state: The application state holding the cache and the worker.
+
+    Returns:
+        ``checks``, ``checking_rows``, ``freshness_line`` and ``scan_active``.
+
+    """
+    cached: CachedChecks = state.checks.current()
+    # The worker's own record of a job in flight, not the scanner gate: reading
+    # the gate would mean acquiring it, and a render is not allowed to contend
+    # for the lock a live scan holds.
+    scan_active = state.worker.current_job_id is not None
+    return {
+        "checks": cached.results,
+        "checking_rows": _CHECKING_ROWS,
+        "freshness_line": _freshness_line(cached, scan_active=scan_active),
+        "scan_active": scan_active,
+    }
 
 
 def _get_cached_or_fetch(
@@ -158,9 +279,16 @@ def _status_context(
         job_store: The job store to read the job from.
         claimed: The job id and answer this request itself claimed, if any.
 
+    ``refresh_checks`` is False here for every caller, and that is the whole of
+    the flag's policy: ``start_scan`` sets it True on its own, so a status poll
+    or a flip answer cannot carry an out-of-band strip.  Defaulting it in this
+    one builder rather than at each call site is what stops a route added later
+    from acquiring the behaviour by forgetting to say no.
+
     Returns:
-        ``{"job": ..., "flip_answer": ...}`` where ``flip_answer`` is None
-        unless the rendered job is ``AWAITING_FLIP`` and has been answered.
+        The job, its flip answer and a false strip-refresh flag.
+        ``flip_answer`` is None unless the rendered job is ``AWAITING_FLIP``
+        and has been answered.
 
     """
     job = _current_or_recent_job(worker, job_store)
@@ -170,7 +298,7 @@ def _status_context(
             answer = claimed[1]
         else:
             answer = worker.flip_answer(job.id)
-    return {"job": job, "flip_answer": answer}
+    return {"job": job, "flip_answer": answer, "refresh_checks": False}
 
 
 @router.get("/")
@@ -183,6 +311,11 @@ def index(request: Request) -> Response:
     paperless-ngx, and loads recent job history from the database.
     """
     state = request.app.state
+    # D-05: the refresher only probes while a page says someone is looking, so
+    # every route that renders the strip has to stamp this.  Without it the
+    # lazy thread returns at its first guard for ever and the strip never
+    # leaves its cold-start rows.
+    state.refresher.note_watcher()
     profiles = state.worker.profile_names()
     tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     correspondents = _get_cached_or_fetch(
@@ -201,6 +334,7 @@ def index(request: Request) -> Response:
             "tags": tags,
             "correspondents": correspondents,
             **status,
+            **_checks_context(state),
             "jobs": jobs,
             # The title input's maxlength; templates own no vocabulary (ROBU-08).
             "title_max_length": TITLE_MAX_LENGTH,
@@ -432,11 +566,21 @@ def start_scan(
     match result:
         case SubmitResult.ACCEPTED:
             # A job created by this request cannot have a flip answer yet.
-            # Only a successful scan clears the status-message slot (D-03).
+            # Only a successful scan clears the status-message slot (D-03), and
+            # only a successful scan carries the strip out-of-band: the scanner
+            # has just become busy, so D-08's paused note is due now rather than
+            # at the end of the cache's TTL.  The strip's own context rides
+            # along because the partial is rendered inside this response.
             return state.templates.TemplateResponse(
                 request,
                 "partials/status_response.html",
-                {"job": job, "flip_answer": None, "clear_message": True},
+                {
+                    "job": job,
+                    "flip_answer": None,
+                    "clear_message": True,
+                    "refresh_checks": True,
+                    **_checks_context(state),
+                },
             )
         case SubmitResult.QUEUE_FULL:
             rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
@@ -471,6 +615,76 @@ def current_job_status(request: Request) -> Response:
         request,
         "partials/status_response.html",
         _status_context(state.worker, state.job_store),
+    )
+
+
+@router.get("/api/checks")
+def get_checks(request: Request) -> Response:
+    """
+    Render the status strip from the cache.
+
+    This is the target of the cold-start poll, and it is a cache read: it never
+    probes, so no number of open browser tabs can raise the probe rate above
+    the cache's TTL (D-04, T-30-26).  The poll ends itself -- the body this
+    returns once results exist carries no ``hx-trigger``, so the swap that
+    installs it is the last one.
+    """
+    state = request.app.state
+    state.refresher.note_watcher()
+    return state.templates.TemplateResponse(
+        request,
+        "partials/checks.html",
+        _checks_context(state),
+    )
+
+
+@router.post("/api/checks/refresh")
+def refresh_checks(request: Request) -> Response:
+    """
+    Re-probe every check now, bypassing the TTL, and render the result (D-09).
+
+    This is the one handler in this module allowed to probe, and the bypass is
+    the whole point of the button.  Routing the click through the refresher's
+    policy instead would do nothing for the first thirty seconds after a page
+    load -- ``_tick`` returns early on a fresh cache -- which is precisely when
+    somebody who has just plugged the scanner back in presses it.
+
+    During a scan it re-runs only the checks that do not touch the scanner: the
+    gate is tried without blocking exactly as the refresher tries it, and a
+    failed attempt sets ``skip_scanner``.  An explicit click does not get to
+    defeat the exclusive-scanner rule, because nothing in the SANE backend
+    mutually excludes two callers and a status probe landing mid-scan is a
+    second caller into the same C library.
+
+    ``CrossOriginGuard`` is app-wide middleware on every non-safe method
+    (``web/app.py``), so this POST inherits the cross-site check and must
+    **not** add a per-route dependency: a dependency is something a route added
+    later can forget, and the middleware is not (T-30-46, D-23).
+
+    A registry that raised is logged and stores nothing, leaving the previous
+    entry in place.  ``run_checks`` catches its own per-check failures, so
+    reaching that handler means the registry itself broke -- and a strip that
+    blanked would be worse than one still showing what was true a moment ago.
+    """
+    state = request.app.state
+    state.refresher.note_watcher()
+    gate = state.worker.scanner_gate
+    acquired = gate.acquire(blocking=False)
+    try:
+        context = replace(state.refresher.build_context(), skip_scanner=not acquired)
+        results = run_checks(context)
+    except Exception:
+        # No exception text goes near the cache or the page (ASVS V7).
+        logger.exception("Check refresh failed; keeping the previous results")
+    else:
+        state.checks.store(results)
+    finally:
+        if acquired:
+            gate.release()
+    return state.templates.TemplateResponse(
+        request,
+        "partials/checks.html",
+        _checks_context(state),
     )
 
 

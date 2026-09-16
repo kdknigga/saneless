@@ -111,6 +111,29 @@ class CheckRefresher:
         with self._watch_lock:
             self._last_watched = now
 
+    def build_context(self) -> CheckContext:
+        """
+        Assemble the dependencies for one probe, exactly as a tick would.
+
+        Public because D-09's Refresh button probes from a request handler and
+        has to bypass the TTL to do it: routing that click through
+        :meth:`_tick` would do nothing at all while the cache is still fresh,
+        which is exactly when somebody who has just plugged the scanner back in
+        presses the button.  Handing the one factory back out is what keeps the
+        button's probe and the thread's probe building the *same* context,
+        instead of the route assembling a second one that could drift.
+
+        It builds a context and nothing else: no probe, no cache write and no
+        lock, so calling it from a request thread costs nothing.
+
+        Returns:
+            A context with ``skip_scanner`` unset.  The caller sets that from
+            its own non-blocking attempt on the scanner gate, because only the
+            caller knows whether it got the gate.
+
+        """
+        return self._context_factory()
+
     def request_stop(self) -> None:
         """
         Ask the refresher to stop, without waiting for the thread.
@@ -200,7 +223,7 @@ class CheckRefresher:
         gate = self._scanner_gate()
         acquired = gate.acquire(blocking=False)
         try:
-            context = replace(self._context_factory(), skip_scanner=not acquired)
+            context = replace(self.build_context(), skip_scanner=not acquired)
             results = run_checks(context)
         except Exception:
             # No exception text goes anywhere near the cache or the page; the

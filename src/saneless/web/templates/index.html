@@ -1,6 +1,27 @@
 {% extends "base.html" %}
 {% block content %}
 
+{# --- Section 0: System status --- #}
+{# First in the block, for three reasons in this order (UI-SPEC S1 Placement):
+   1. The phase goal is that a household member can tell AT A GLANCE whether
+      the appliance is healthy, and at a glance means first.
+   2. It is outside <form hx-post="/api/scan">, so the hx-disabled-elt /
+      hx-disinherit landmine cannot reach it.  No attribute is added to the
+      form element; the C-10 fix below stays exactly as written.
+   3. Phase 26's invariant -- #status-message is the immediate sibling above
+      #status-area -- is preserved untouched.
+   #checks-strip is the persistent live region and #checks-body is the swap
+   target: the container survives every swap, which is what makes aria-live
+   work at all, and it is polite and never assertive because a health list must
+   not interrupt and the page is allowed exactly one assertive region -- the
+   #status-message slot below, which keeps it. #}
+<article id="checks-card">
+    <h2>System status</h2>
+    <div id="checks-strip" aria-live="polite">
+        {% include "partials/checks.html" %}
+    </div>
+</article>
+
 {# --- Section 1: Scan Form --- #}
 <article>
     <h2>Scan</h2>
