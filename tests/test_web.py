@@ -62,6 +62,7 @@ from saneless.web import app as app_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
+from saneless.web.routes import _profile_options, _ProfileOption
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend
 
@@ -1560,3 +1561,232 @@ class TestQueueLine:
         ).read_text(encoding="utf-8")
         assert "busy_line(" not in status
         assert "progress_label" not in status
+
+
+def _configure_profiles(client: TestClient, profiles: dict[str, ProfileConfig]) -> None:
+    """Replace the worker's profile set, under its own lock (D-19)."""
+    _app(client).state.worker._set_profiles(profiles)
+
+
+class TestProfileDescriptionRoute:
+    """GET /api/profiles/description -- the sentence under the select (APPL-05)."""
+
+    def test_a_known_profile_returns_its_description_text_alone(
+        self, client: TestClient
+    ) -> None:
+        """The body is the sentence with no wrapper element around it."""
+        _configure_profiles(
+            client,
+            {"glass": ProfileConfig(description="Scans one page from the glass.")},
+        )
+
+        response = client.get("/api/profiles/description", params={"profile": "glass"})
+
+        assert response.status_code == 200
+        assert response.text == "Scans one page from the glass."
+
+    def test_an_unknown_profile_name_gets_a_422_from_the_description_route(
+        self, client: TestClient
+    ) -> None:
+        """The name is validated against the profile set, never used as a path."""
+        _configure_profiles(client, {"glass": ProfileConfig()})
+
+        response = client.get(
+            "/api/profiles/description", params={"profile": "../../etc/passwd"}
+        )
+
+        assert response.status_code == 422
+
+    def test_a_missing_profile_parameter_gets_a_422_from_the_description_route(
+        self, client: TestClient
+    ) -> None:
+        """The parameter is required, so an absent one never reaches the worker."""
+        response = client.get("/api/profiles/description")
+
+        assert response.status_code == 422
+
+    def test_an_empty_description_returns_an_empty_body(
+        self, client: TestClient
+    ) -> None:
+        """A byte-empty body is what lets the :empty CSS rule hide the slot."""
+        _configure_profiles(client, {"bare": ProfileConfig()})
+
+        response = client.get("/api/profiles/description", params={"profile": "bare"})
+
+        assert response.status_code == 200
+        assert response.text == ""
+
+    def test_a_description_containing_markup_is_escaped_not_rendered(
+        self, client: TestClient
+    ) -> None:
+        """Config free text is autoescaped and never marked safe (T-30-70)."""
+        _configure_profiles(
+            client,
+            {"evil": ProfileConfig(description="<script>alert(1)</script>")},
+        )
+
+        response = client.get("/api/profiles/description", params={"profile": "evil"})
+
+        assert "<script>" not in response.text
+        assert "&lt;script&gt;" in response.text
+
+    def test_the_description_route_is_a_plain_def(self, client: TestClient) -> None:
+        """Every handler runs on the threadpool, this one included (ROBU-05)."""
+        routes = [
+            route
+            for route in _app(client).routes
+            if isinstance(route, APIRoute) and route.path == "/api/profiles/description"
+        ]
+
+        assert len(routes) == 1
+        assert not inspect.iscoroutinefunction(routes[0].endpoint)
+
+
+class TestProfileOrdering:
+    """The option list the select renders, and the D-21 feeder-first rule."""
+
+    def test_options_carry_the_name_label_and_description_of_each_profile(
+        self, client: TestClient
+    ) -> None:
+        """One option object per profile, carrying all three fields."""
+        _configure_profiles(
+            client,
+            {
+                "adf": ProfileConfig(
+                    source="ADF",
+                    label="Feeder, single-sided",
+                    description="Feeds a stack of sheets.",
+                )
+            },
+        )
+
+        options = _profile_options(_app(client).state.worker)
+
+        assert options == (
+            _ProfileOption(
+                name="adf",
+                label="Feeder, single-sided",
+                description="Feeds a stack of sheets.",
+            ),
+        )
+
+    def test_a_blank_label_falls_back_to_the_profile_name(
+        self, client: TestClient
+    ) -> None:
+        """A config written before this phase never shows a blank option (A-3)."""
+        _configure_profiles(client, {"adf-duplex": ProfileConfig(source="ADF Duplex")})
+
+        (option,) = _profile_options(_app(client).state.worker)
+
+        assert option.label == "adf-duplex"
+
+    def test_feeder_profiles_lead_the_ordering_when_no_flatbed_source_exists(
+        self, client: TestClient
+    ) -> None:
+        """No flatbed source is the literal definition of sheet-fed (D-21)."""
+        _configure_profiles(
+            client,
+            {
+                "pick": ProfileConfig(source="Auto"),
+                "stack": ProfileConfig(source="ADF"),
+            },
+        )
+
+        options = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in options] == ["stack", "pick"]
+
+    def test_an_automatic_document_feeder_source_takes_the_feeder_ordering(
+        self, client: TestClient
+    ) -> None:
+        """
+        The commonest real feeder name starts with the letters of the auto rule.
+
+        ``classify_source`` matches the automatic source by exact equality for
+        exactly this reason, and the ordering has to inherit that answer rather
+        than ask the source string again.
+        """
+        _configure_profiles(
+            client,
+            {
+                "mystery": ProfileConfig(source="Whatever"),
+                "feeder": ProfileConfig(source="Automatic Document Feeder"),
+            },
+        )
+
+        options = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in options] == ["feeder", "mystery"]
+
+    def test_config_order_survives_inside_each_group_of_the_sheet_fed_ordering(
+        self, client: TestClient
+    ) -> None:
+        """The regrouping is stable, so neither group is internally reshuffled."""
+        _configure_profiles(
+            client,
+            {
+                "pick-1": ProfileConfig(source="Auto"),
+                "stack-1": ProfileConfig(source="ADF"),
+                "pick-2": ProfileConfig(source="Auto"),
+                "stack-2": ProfileConfig(source="ADF Duplex"),
+            },
+        )
+
+        options = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in options] == [
+            "stack-1",
+            "stack-2",
+            "pick-1",
+            "pick-2",
+        ]
+
+    def test_a_flatbed_source_anywhere_leaves_the_ordering_alone(
+        self, client: TestClient
+    ) -> None:
+        """A device with glass is not sheet-fed, so config order is kept."""
+        _configure_profiles(
+            client,
+            {
+                "glass": ProfileConfig(source="Flatbed"),
+                "stack": ProfileConfig(source="ADF"),
+            },
+        )
+
+        options = _profile_options(_app(client).state.worker)
+
+        assert [option.name for option in options] == ["glass", "stack"]
+
+    def test_a_profile_that_disappears_mid_build_is_dropped_from_the_ordering(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A profile rewritten between the two locked calls is skipped, not None."""
+        worker = _app(client).state.worker
+        _configure_profiles(client, {"stays": ProfileConfig(), "goes": ProfileConfig()})
+        real_lookup = worker.get_profile
+        monkeypatch.setattr(
+            worker,
+            "get_profile",
+            lambda name: None if name == "goes" else real_lookup(name),
+        )
+
+        options = _profile_options(worker)
+
+        assert [option.name for option in options] == ["stays"]
+
+    def test_the_rendered_option_ordering_matches_the_rule(
+        self, client: TestClient
+    ) -> None:
+        """The page consumes the ordered list, not the bare name list."""
+        _configure_profiles(
+            client,
+            {
+                "pick": ProfileConfig(source="Auto"),
+                "stack": ProfileConfig(source="ADF"),
+            },
+        )
+
+        response = client.get("/")
+
+        rendered = re.findall(r'<option value="([^"]+)"', response.text)
+        assert rendered[:2] == ["stack", "pick"]
