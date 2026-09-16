@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+import saneless.scanner.sane_backend as sane_backend_mod
+from saneless.exceptions import ScanError
 from saneless.pipeline import _SPOOL_LABEL_A
 from saneless.scanner.base import ScanSettings
 from saneless.scanner.sane_backend import SaneBackend
@@ -27,11 +29,35 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+    from PIL import Image
+
 # The free-space reserve these sinks keep beyond the page being written.  Zero
 # for the same reason the in-process scanner tests use zero: these tests are
 # about libsane, not about D-07's shortfall arithmetic, and a positive reserve
 # would fail them on a CI runner with a nearly full disk.
 _NO_FREE_SPACE_RESERVE = 0
+
+# The options that make the real ``test`` backend's read genuinely slow, and
+# the resolution without which they do nothing.
+#
+# The delay is implemented in the backend's reader child as one ``usleep`` per
+# buffer written (``backend/test.c``), so it repeats only as often as there are
+# buffers.  ``read_limit_size = 1`` makes every buffer a single byte and 1200
+# dpi makes there be a great many of them; at a low resolution the whole page
+# fits in one buffer and the scan *cannot* be made slow however long the delay
+# is.  The resolution is therefore load-bearing, not incidental.
+_SLOW_READ_OPTIONS: tuple[tuple[str, object], ...] = (
+    ("read_delay", True),
+    ("read_delay_duration", 200_000),  # microseconds; the option's maximum
+    ("read_limit", True),
+    ("read_limit_size", 1),
+    ("resolution", 1200),
+)
+
+# How long the cancel test lets the read run before bounding it.  Long enough
+# that the read is provably under way and short enough to keep the test brisk;
+# the measured read was still blocked after three seconds with these options.
+_SLOW_READ_TIMEOUT_SECONDS = 0.5
 
 
 def _page_sink_for(tmp_path: Path) -> SpooledPageSink:
@@ -197,3 +223,61 @@ class TestRealSaneTestBackend:
         assert all(
             image.convert("L").getextrema() == (0, 0) for image in images_of(batch)
         )
+
+
+@pytest.mark.sane_hardware
+class TestRealSaneCancelSequence:
+    """
+    HARD-03's D-12 sequence, proven once against libsane instead of a double.
+
+    Everywhere else the cancel path is driven through an Event-gated fake, and
+    a fake is exactly what cannot answer the question this class asks: whether
+    a real ``sane_cancel`` issued from another thread actually releases a real
+    ``sane_read``, and whether the handle is still usable afterwards.  Both are
+    properties of the C library, and both are the premises the whole timeout
+    design rests on.
+    """
+
+    def test_a_cancel_unblocks_a_slow_read_and_the_handle_still_closes(self) -> None:
+        """
+        A read made genuinely slow is cancelled, returns, and the handle closes.
+
+        The backend's own helper drives it, so what is proven is the shipped
+        sequence and not a re-implementation of it: the timeout fires, the
+        cancel goes out on its own thread, the reader comes back inside the
+        grace, and the error therefore does *not* accuse the scanner of
+        ignoring the cancel.  ``close()`` afterwards is the last link -- it is
+        the call the frontend may make only once the read has returned.
+        """
+        backend = SaneBackend()
+        assert backend is not None  # the constructor is what ran sane.init()
+        device = sane_backend_mod.sane.open("test:0")
+        try:
+            try:
+                device.source = "Automatic Document Feeder"
+                device.mode = "Gray"
+                for name, value in _SLOW_READ_OPTIONS:
+                    setattr(device, name, value)
+            except AttributeError:
+                pytest.skip("this libsane test backend has no read-delay options")
+
+            def start_and_snap() -> Image.Image:
+                device.start()
+                return device.snap()
+
+            with pytest.raises(ScanError) as raised:
+                sane_backend_mod._acquire_with_timeout(
+                    device, start_and_snap, "Page 1", _SLOW_READ_TIMEOUT_SECONDS
+                )
+
+            message = str(raised.value)
+            assert "timed out" in message
+            # The real device answers the cancel, so the unresponsive-cancel
+            # wording must be absent -- and the backend must not be wedged.
+            assert "did not respond" not in message
+            assert sane_backend_mod._WEDGE.stuck is False
+        finally:
+            # Not in a suppression: "close() succeeds after a cancelled read"
+            # is one of the two things this test exists to establish, so a
+            # failure here has to fail the test rather than be swallowed.
+            device.close()
