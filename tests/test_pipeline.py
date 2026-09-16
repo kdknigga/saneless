@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import errno
 import logging
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -3571,6 +3572,158 @@ def _preserved_page_dirs(failed_dir: Path) -> list[Path]:
     if not failed_dir.is_dir():
         return []
     return sorted(entry for entry in failed_dir.iterdir() if entry.is_dir())
+
+
+class TestPreservationNamesWhatItDidKeep:
+    """
+    WR-02: a preservation that got half-way must not report a total loss.
+
+    Every guard here moves artefacts one at a time, so a failure part-way
+    through leaves some of them sitting in ``failed/`` while the message says
+    the scan "could NOT be preserved".  That is the inversion of the failure
+    ``_preserving``'s own docstring names -- told nothing was saved when some
+    of it was -- and it is the more expensive half: an operator who believes
+    it rescans and never looks in a directory saneless never prunes.
+    """
+
+    def test_a_half_preserved_partial_scan_names_the_half_it_kept(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """The fronts landed, the backs would not assemble: say so."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 2 of pass B: Paper jam")
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _failing_in_pass_b(3, 1, original)
+        calls = 0
+
+        def _fronts_then_refuse(
+            records: Sequence[PageRecord],
+            output_dir: Path,
+            filename: str,
+            dpi: int,
+        ) -> Path:
+            """Assemble the fronts for real, then refuse the backs."""
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return assemble_pdf(records, output_dir, filename, dpi)
+            msg = "qpdf refused the backs"
+            raise PdfError(msg)
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fronts_then_refuse),
+            pytest.raises(ScanError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Half Kept",
+                    job_id="job-half-1",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        kept = list(failed_dir.glob("*.pdf"))
+        assert len(kept) == 1
+        assert "fronts" in kept[0].name
+        message = str(excinfo.value)
+        # Both failures are still reported, which is the existing contract.
+        assert "Paper jam" in message
+        assert "qpdf refused the backs" in message
+        # And the new part: the file that is really sitting there is named.
+        assert "could NOT be fully preserved" in message
+        assert f"Only {kept[0]} was kept" in message
+
+    def test_a_half_moved_page_directory_names_the_pages_it_kept(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two of three PNGs moved before the volume went away: say so."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_distinct_page(index) for index in range(3)]
+        )
+        real_move = shutil.move
+        moved: list[Path] = []
+
+        def _two_then_fail(src: Path, dst: Path) -> object:
+            """Move the first two pages for real, then fail on the third."""
+            if len(moved) == 2:
+                msg = "the volume went away"
+                raise OSError(msg)
+            moved.append(Path(dst))
+            return real_move(src, dst)
+
+        monkeypatch.setattr(pipeline_module.shutil, "move", _two_then_fail)
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(PdfError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Half Moved",
+                    job_id="job-half-2",
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert sorted(entry.name for entry in kept[0].iterdir()) == [
+            "a-0001.png",
+            "a-0002.png",
+        ]
+        message = str(excinfo.value)
+        assert "img2pdf refused the page" in message
+        assert "the volume went away" in message
+        assert "could NOT be fully preserved" in message
+        assert f"Only {moved[0]}, {moved[1]} was kept" in message
+
+    def test_a_preservation_that_kept_nothing_still_says_exactly_that(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The total-loss sentence is unchanged, because it was true.
+
+        Only the half-way case was misreporting; widening the new wording over
+        both would make every preservation failure read as a partial one.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+        original = ScanError("Scanner error on page 2: Paper jam")
+        scanner = _jamming_scanner(1, original)
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Nothing Kept",
+                    job_id="job-half-3",
+                ),
+            )
+
+        message = str(excinfo.value)
+        assert f"The scan could NOT be preserved to {failed_dir}" in message
+        assert "fully preserved" not in message
+        assert "was kept" not in message
 
 
 class TestAssemblyFailureKeepsThePageFiles:
