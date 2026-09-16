@@ -73,10 +73,10 @@ class CheckCache:
 
     1. **The clock is a constructor parameter.**  ``MetadataCache`` calls
        ``time.monotonic()`` inline (``cache.py:54`` and ``cache.py:66``), which
-       is the sole reason ``tests/test_cache.py:28`` has to ``time.sleep(1.1)``
-       to watch a TTL expire.  Injecting the clock lets every test here advance
-       a float instead, so this cache costs the suite no wall-clock time and
-       has no timing flake to inherit.
+       is the sole reason ``tests/test_cache.py:28`` has to sleep for 1.1 real
+       seconds to watch a TTL expire.  Injecting the clock lets every test here
+       advance a float instead, so this cache costs the suite no wall-clock
+       time and has no timing flake to inherit.
     2. **It keeps last-known-good.**  ``MetadataCache.get_or_fetch``
        (``cache.py:69-116``) re-raises when a fetch fails and caches nothing;
        ``routes.py:79-86`` is what swallows that and substitutes ``[]``.  D-08
