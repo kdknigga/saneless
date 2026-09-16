@@ -29,7 +29,40 @@
       <p class="status-cancelled">&#8856; Cancelled: {{ job.title }}</p>
       {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.ERROR %}
+      {# Three things a reader of this branch will question, answered here.
+
+         The alert role moved from the <p> to a wrapping <div> so the alert
+         covers the next step as well as the sentence.  The next step is the most
+         actionable content on the page; leaving it outside the alert would mean
+         a screen-reader user never hears it.  The <details> stays OUTSIDE the
+         alert, so "Technical details" is not announced with the failure.
+
+         The specific message is relocated, not removed.  vocabulary.error_message's
+         own docstring warns that swapping the specific message for a category
+         sentence would be a regression, so job.error is still rendered -- inside
+         the disclosure.  APPL-04 *adds* the category sentence and the next step.
+
+         The log file path is deliberately absent (D-13).  It is a host filesystem
+         path and this page is visible to the whole LAN, so the disclosure carries
+         only job.error, the category and the job id and nothing else.
+
+         A NULL error_category is a row written before Phase 21.  It renders
+         today's shape verbatim: substituting UNKNOWN would print "Something went
+         wrong." over a row that still holds a truthful specific message. #}
+      {% if job.error_category %}
+      <div role="alert">
+        <p class="status-error">&#10007; {{ job.error_category | error_message }}</p>
+        <p>{{ job.error_category | error_next_step }}</p>
+      </div>
+      <details class="tech-details">
+        <summary>Technical details</summary>
+        <p>{{ job.error }}</p>
+        <p>Category: {{ job.error_category }}</p>
+        <p>Job: {{ job.id }}</p>
+      </details>
+      {% else %}
       <p role="alert" class="status-error">&#10007; Error: {{ job.error }}</p>
+      {% endif %}
       {% include "partials/terminal_reload.html" %}
     {% endif %}
     {% if job.thumbnail %}
