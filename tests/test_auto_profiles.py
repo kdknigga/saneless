@@ -1620,11 +1620,19 @@ auto_generated = true
     def test_merge_adds_a_missing_name_in_generated_key_order(
         self, tmp_path: Path, *, force: bool
     ) -> None:
-        """A name the file lacks is added with today's key order and flag."""
+        """
+        A name the file lacks is added with today's key order and flag.
+
+        The human name leads the table, which is why _OWNED_KEYS puts it
+        first: this is the order a reader opening the config meets.
+        """
         config_file, result = self._write(tmp_path, force=force, extra=True)
         assert result.added == ("fresh",)
         assert (
             "[profiles.fresh]\n"
+            'label = "Feeder, double-sided"\n'
+            "description = "
+            '"Scans both sides of every page using the document feeder."\n'
             'source = "ADF Duplex"\n'
             "resolution = 300\n"
             'mode = "Color"\n'
