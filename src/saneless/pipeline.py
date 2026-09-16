@@ -1315,6 +1315,15 @@ def _scan_manual_duplex(
     carries the thumbnail callback, so the strip shows the first front and
     fires exactly once per job (D-05).
 
+    Both sinks register themselves with ``acquisition.ledger`` before their
+    pass starts, so every ending below that is not the operator's own decision
+    keeps whatever reached the spool (D-10): a fault in either pass, an empty
+    pass B, a flip-wait timeout and a broken flip prompt all leave pass A's
+    fronts -- and any backs already fed -- as the two separately named partial
+    PDFs the mismatch recovery also produces. The exception itself is unchanged
+    here; ``_preserving_partial_scan``, in ``run_pipeline``, is what appends
+    the count and the destination to its message.
+
     Args:
         scanner: Scanner backend instance.
         acquisition: The device, the scan settings and the spool this job's
@@ -1329,7 +1338,8 @@ def _scan_manual_duplex(
 
     Raises:
         ScanCancelledError: If the operator aborts at the flip prompt.  Raised
-            before pass B starts.
+            before pass B starts, and the one ending here that preserves
+            nothing, because somebody chose to stop (D-10).
         ScanError: ``No pages were scanned`` if pass A returns no pages, before
             anyone is asked to flip; ``No back pages were scanned in pass B``,
             naming pass A's count, if pass B returns none, before the count
@@ -1353,11 +1363,20 @@ def _scan_manual_duplex(
         min_free_space_mb=acquisition.min_free_space_mb,
         thumbnail_callback=request.thumbnail_callback,
     )
+    # Registered before the pass runs, under the same ``(fronts)`` name the
+    # mismatch recovery gives this half, so every way pass A's sheets can be
+    # lost from here on keeps them (D-10).  Registering afterwards would miss
+    # the case the registration exists for: a fault part-way through pass A.
+    acquisition.ledger.register(_FRONTS_SUFFIX, front_sink)
     front_batch = scanner.scan_pages(
         acquisition.device_id, acquisition.settings, front_sink
     )
     # Before the flip prompt, so nobody is asked to flip nothing (EXC-03).
     _require_pages(front_batch)
+    # Pass A's answer is the better resolution to preserve at than the one the
+    # profile asked for, and it is the same value _duplex_resolution goes on to
+    # prefer when both passes complete.
+    acquisition.ledger.note_resolution(front_batch.actual_resolution)
     front_pages = front_batch.pages
     logger.info("Pass A: scanned %d front page(s)", len(front_pages))
 
@@ -1379,6 +1398,15 @@ def _scan_manual_duplex(
             if cause is not None:
                 msg = f"Flip prompt failed: {describe(cause)}"
                 raise ScanError(msg) from cause
+            # The one ending here that keeps NOTHING, and the asymmetry is
+            # policy rather than oversight: D-10 preserves pass A's fronts
+            # after a flip timeout or a broken prompt precisely because nobody
+            # chose to stop, and refuses to preserve them here because somebody
+            # did.  ``failed/`` is never pruned automatically, so filing an
+            # abandoned scan into it would leave the operator tidying up after
+            # a decision they already made.  _preserving_partial_scan excludes
+            # this exception explicitly, by type; do not turn it into a
+            # ScanError to "simplify" the handler.
             msg = "Manual duplex scan cancelled at the flip prompt"
             raise ScanCancelledError(msg)
         case FlipOutcome.TIMED_OUT:
@@ -1398,13 +1426,17 @@ def _scan_manual_duplex(
         pass_label=_SPOOL_LABEL_B,
         min_free_space_mb=acquisition.min_free_space_mb,
     )
+    # Registered under ``(backs)``, again before the pass runs.  The two halves
+    # are a single document between them, so a failure on either has to keep
+    # both -- the same rule, and the same two names, that the mismatch recovery
+    # already applies under its one shared guard (D-10).
+    acquisition.ledger.register(_BACKS_SUFFIX, back_sink)
     back_batch = scanner.scan_pages(
         acquisition.device_id, acquisition.settings, back_sink
     )
     # Before the count comparison, so no half is assembled from an empty list.
     # Not _require_pages: "No pages were scanned" is false once pass A fed the
     # fronts, so the message names the pass and what pass A scanned (IN-01).
-    # The fronts are still lost here; keeping them needs Phase 29's spooling.
     if not back_batch.pages:
         msg = (
             "No back pages were scanned in pass B "

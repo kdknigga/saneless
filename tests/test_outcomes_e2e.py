@@ -453,9 +453,12 @@ _CASES = [
         expected_state=JobState.ERROR,
         expected_outcome=None,
         expected_pages=(None, None, None),
-        # The timeout raises before pass B and before assembly, so there is no
-        # PDF to preserve: Phase 23's guard spans upload and poll only.
-        expected_failed_pdfs=0,
+        # One, since plan 29-09: the timeout raises before pass B and before
+        # the document's own assembly, but pass A's three fronts are on the
+        # spool and nobody chose to stop, so D-10 keeps them as a ``(fronts)``
+        # partial.  Phase 23's guard, which spans upload and poll only, still
+        # never runs on this path.
+        expected_failed_pdfs=1,
         expected_consume_pdfs=0,
         source=_DUPLEX_SOURCE,
         duplex="manual",
@@ -463,7 +466,12 @@ _CASES = [
         flip_timeout=_FLIP_TIMEOUT_BUDGET,
         awaits_flip=True,
         operator_flips=False,
-        error_contains=("flip wait timed out", "nobody confirmed"),
+        error_contains=(
+            "flip wait timed out",
+            "nobody confirmed",
+            "3 page(s)",
+            "were preserved at",
+        ),
     ),
 ]
 
