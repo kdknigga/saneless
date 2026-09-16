@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import gc
 import importlib
 import logging
 import os
@@ -3248,6 +3249,174 @@ class TestScanBatch:
 
         assert dev.close_calls == 1
         assert len(batch.pages) == 1
+
+
+# ---------------------------------------------------------------------------
+# HARD-01: the peak-memory bound, and the one-page-per-sink-call rule
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSink(PageSink):
+    """
+    A sink that records every ``add`` and delegates to a real one.
+
+    Subclasses ``PageSink`` rather than being one of ``unittest.mock``'s
+    auto-specced doubles, for the reason ``tests/conftest.py``'s own stubs
+    record: a mock returns whatever it is given, so a contract change slips
+    past it, while a subclass is a type error in both checkers the moment
+    ``add`` stops matching.  The delegate is a real ``SpooledPageSink``, so the
+    pages this test asserts about were genuinely written and can be read back.
+    """
+
+    def __init__(self, delegate: SpooledPageSink) -> None:
+        """
+        Wrap a real sink.
+
+        Args:
+            delegate: The sink that actually writes and measures each page.
+
+        """
+        self._delegate = delegate
+        self.added: list[Image.Image] = []
+        self.returned: list[PageRecord] = []
+
+    def add(self, image: Image.Image) -> PageRecord:
+        """
+        Record the page, pass it to the delegate, and record what came back.
+
+        Args:
+            image: The one page the backend handed over.
+
+        Returns:
+            The delegate's record, unchanged.
+
+        """
+        self.added.append(image)
+        record = self._delegate.add(image)
+        self.returned.append(record)
+        return record
+
+
+def _feeder_of(pages: int, monkeypatch: pytest.MonkeyPatch) -> FakeSaneDev:
+    """
+    Build a fresh feeder of ``pages`` sheets and wire it into the backend.
+
+    Args:
+        pages: How many sheets the feeder holds.
+        monkeypatch: Fixture used to patch the module-level ``sane`` name.
+
+    Returns:
+        The device the next ``SaneBackend()`` will open.
+
+    """
+    dev = FakeSaneDev(pages=pages)
+    _backend_with(dev, monkeypatch)
+    return dev
+
+
+class TestPeakPageMemory:
+    """
+    HARD-01's bound, proven by counting live page images (D-08).
+
+    The instrument is a ``weakref`` per page the fake hands out, and the three
+    obvious alternatives were all measured and rejected:
+
+    - ``tracemalloc`` cannot see this memory at all.  A 26 MB Pillow image adds
+      **460 bytes** to the traced total, because the pixels are malloc'd in C
+      rather than through the Python allocator.
+    - RSS is far too noisy for CI, and answers about the whole process rather
+      than about the pages.
+    - A hash-based weak set cannot hold Pillow images: ``Image`` defines
+      ``__eq__`` without ``__hash__``, so building one raises ``TypeError``.
+
+    The honest high-water mark is **2**, not 1, and the reason is structural:
+    ``_acquire_pages``' loop variable still references page *k-1* while page
+    *k* is being read.  A ``del`` that made the number 1 would exist only to
+    satisfy a test, and it was declined (29-RESEARCH.md Finding 4).
+
+    Which is why the bound is asserted two ways.  ``<= 2`` alone would survive
+    a regression that grew the constant; equality between a 3-page run and a
+    12-page one is what actually proves independence from page count, and that
+    independence -- not the constant -- is the claim HARD-01 makes.
+
+    One trap, recorded because it silently inverts the measurement:
+    ``load_feeder()`` makes the device keep a strong reference to every page it
+    was loaded with, so the counter would report the *test's* retention rather
+    than the backend's, and reads 12 for a 12-page run.  These tests therefore
+    let the fake generate its pages, which are already distinguishable by page
+    index, and assert that distinctness rather than assuming it.
+    """
+
+    def test_live_page_images_stays_bounded(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        page_sink: SpooledPageSink,
+        second_pass_sink: SpooledPageSink,
+    ) -> None:
+        """A 12-page scan holds at most 2 pages at once, and 3 holds the same."""
+        settings = _feeder_settings()
+
+        long_run = _feeder_of(12, monkeypatch)
+        batch = SaneBackend().scan_pages("test:0", settings, page_sink)
+
+        assert len(batch.pages) == 12
+        assert long_run.high_water_live_pages <= 2
+
+        short_run = _feeder_of(3, monkeypatch)
+        short_batch = SaneBackend().scan_pages("test:0", settings, second_pass_sink)
+
+        assert len(short_batch.pages) == 3
+        # The bound does not grow with the stack: four times the pages, the
+        # same peak.  This is the assertion that fails if anything downstream
+        # starts accumulating.
+        assert long_run.high_water_live_pages == short_run.high_water_live_pages
+
+    def test_live_page_images_falls_as_pages_are_released(self) -> None:
+        """The counter tracks releases, so a steady reading means retention."""
+        dev = FakeSaneDev(pages=3)
+        issued = list(dev.multi_scan())
+
+        assert len(issued) == 3
+        assert dev.live_page_images() == 3
+        assert dev.high_water_live_pages == 3
+
+        issued.clear()
+        gc.collect()
+
+        assert dev.live_page_images() == 0
+        # The high-water mark is a maximum, so it never falls back.
+        assert dev.high_water_live_pages == 3
+
+    def test_sink_receives_one_image_per_page(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``add`` runs once per page, with one image, and its records are the batch."""
+        dev = _feeder_of(12, monkeypatch)
+        recording = _RecordingSink(_page_sink_for(tmp_path))
+
+        batch = SaneBackend().scan_pages("test:0", _feeder_settings(), recording)
+
+        assert len(recording.added) == 12
+        assert dev.calls.count("snap") == 12
+        assert all(isinstance(page, Image.Image) for page in recording.added)
+        # The batch is exactly what the sink handed back, in the order it did:
+        # the backend keeps no pages of its own to assemble a different answer
+        # from.
+        assert batch.pages == tuple(recording.returned)
+
+    def test_a_twelve_page_scan_numbers_its_records_one_to_twelve(
+        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
+    ) -> None:
+        """Sequences run 1..12 with no gap and no repeat, and pages are distinct."""
+        _feeder_of(12, monkeypatch)
+
+        batch = SaneBackend().scan_pages("test:0", _feeder_settings(), page_sink)
+
+        # Compared as a whole list rather than page by page, so a failure
+        # prints the sequence that was actually produced.
+        assert [record.sequence for record in batch.pages] == list(range(1, 13))
+        spooled = [image.tobytes() for image in images_of(batch)]
+        assert len(set(spooled)) == 12
 
 
 # ---------------------------------------------------------------------------
