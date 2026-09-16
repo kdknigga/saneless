@@ -1963,3 +1963,210 @@ class TestScanButtonFollowsTheRenderedJob:
 
         assert "disabled" in match.group("attrs")
         assert _DESCRIBED_BY in match.group("attrs")
+
+
+# Every help line on the scan form, keyed by the id the control points at
+# (UI-SPEC S6). Profile is deliberately not here: its help line is the live
+# description plan 30-15 built, and a second one would be a second line under
+# one control.
+_HELP_TEXT = {
+    "title-help": "What this document should be called in paperless-ngx.",
+    "tag-filter-help": "Type to narrow the list. Ticked tags stay ticked.",
+    "tags-help": "Labels to file this under in paperless-ngx. Optional.",
+    "correspondent-help": "Who sent this document? Optional.",
+}
+
+# The identified help slots the idle page renders, in document order. Profile's
+# leads because its control does; `#scan-blocked-reason` is absent because this
+# appliance's token is real, and the tag list's empty-state line carries no id
+# because it is a state of the list and not a help line for a control.
+_HELP_SLOT_IDS = [
+    "profile-description",
+    "title-help",
+    "tag-filter-help",
+    "tags-help",
+    "correspondent-help",
+]
+
+# Pico styles a help line through `:where(input,select,textarea,fieldset)+small`,
+# so each slot has to be its control's *adjacent* sibling. The markup that must
+# sit immediately before each one, whitespace aside.
+_HELP_ADJACENCY = [
+    (r'id="title-input"[^>]*>', "title-help"),
+    (r'id="tag-filter"[^>]*>', "tag-filter-help"),
+    (r"</fieldset>", "tags-help"),
+    (r"</select>", "correspondent-help"),
+]
+
+# The filter box, whole, as the page renders it.
+_TAG_FILTER_INPUT = re.compile(r'<input[^>]*id="tag-filter"[^>]*>')
+
+# The filter's own form: empty, and with no submit button of its own.
+_TAG_FILTER_FORM = re.compile(
+    r'<form id="tag-filter-form"(?P<attrs>[^>]*)>(?P<body>.*?)</form>', re.DOTALL
+)
+
+# The tag list's wrapper, which the partial renders and every swap replaces.
+_TAGS_LIST = re.compile(r'<div id="tags-list"[^>]*>')
+
+
+class TestFormHelpTextAndTagPicker:
+    """
+    UI-SPEC S6: one plain-words line per control, and a filter that cannot scan.
+
+    Two of these assertions exist because of hazards the design removes rather
+    than guards against. The filter input's HTML form owner is a separate empty
+    form, so Enter in it filters instead of starting a scan and a scan can never
+    carry the filter text (A-6); and nothing at all is added to the scan form
+    element, so the C-10 inheritance fix stays byte-identical (Pitfall 8).
+    """
+
+    def test_every_control_has_one_help_line_wired_with_aria_describedby(
+        self, client: TestClient
+    ) -> None:
+        """Four sentences, four slots, four references -- one each (APPL-10)."""
+        page = client.get("/").text
+
+        for slot, sentence in _HELP_TEXT.items():
+            assert page.count(f'<small id="{slot}">{sentence}</small>') == 1, slot
+            assert page.count(f'aria-describedby="{slot}"') == 1, slot
+
+    def test_the_help_lines_are_the_only_identified_small_elements(
+        self, client: TestClient
+    ) -> None:
+        """
+        Exactly five slots, in order, and Profile's is the live description.
+
+        Asserted as the whole list rather than by membership, so a second help
+        line under any one control fails here -- Profile's included, where the
+        description plan 30-15 built already is the line.
+        """
+        page = client.get("/").text
+
+        assert re.findall(r'<small id="([^"]+)"', page) == _HELP_SLOT_IDS
+
+    def test_each_help_line_is_its_control_s_adjacent_sibling(
+        self, client: TestClient
+    ) -> None:
+        """Pico's `+small` rule is what makes a help line look like one."""
+        page = client.get("/").text
+
+        for before, slot in _HELP_ADJACENCY:
+            assert re.search(before + r'\s*<small id="' + slot + '"', page), slot
+
+    def test_the_title_placeholder_survives_its_new_help_line(
+        self, client: TestClient
+    ) -> None:
+        """The two say different things, so neither replaces the other."""
+        match = _TITLE_INPUT.search(client.get("/").text)
+
+        assert match is not None
+        assert 'placeholder="Document title (auto-generated if empty)"' in match.group(
+            0
+        )
+        assert 'aria-describedby="title-help"' in match.group(0)
+
+    def test_the_tag_filter_input_carries_its_form_owner_and_htmx_wiring(
+        self, client: TestClient
+    ) -> None:
+        """The seven attributes S6 specifies, the form owner first (A-6, D-31)."""
+        match = _TAG_FILTER_INPUT.search(client.get("/").text)
+
+        assert match is not None, "tag filter input not rendered"
+        for attribute in (
+            'type="search"',
+            'name="q"',
+            'form="tag-filter-form"',
+            'hx-get="/api/tags"',
+            'hx-target="#tags-list"',
+            'hx-swap="outerHTML"',
+            'hx-trigger="keyup changed delay:300ms"',
+            'hx-include="#tags-list"',
+        ):
+            assert attribute in match.group(0), attribute
+
+    def test_the_tag_filter_form_is_an_empty_sibling_after_the_scan_form(
+        self, client: TestClient
+    ) -> None:
+        """
+        Enter in the filter filters, because the input belongs to this form.
+
+        It sits after the scan form's closing tag and before the Scan article
+        ends, so it is a sibling and not a nested form -- which HTML forbids.
+        """
+        page = client.get("/").text
+        scan_form_close = page.index("</form>")
+        filter_form_open = page.index('<form id="tag-filter-form"')
+
+        assert filter_form_open > scan_form_close
+        assert "</article>" not in page[scan_form_close:filter_form_open]
+
+        match = _TAG_FILTER_FORM.search(page)
+        assert match is not None
+        assert match.group("body").strip() == ""
+        assert "<button" not in match.group("body")
+        for attribute in (
+            'hx-get="/api/tags"',
+            'hx-target="#tags-list"',
+            'hx-swap="outerHTML"',
+            'hx-include="#tags-list"',
+        ):
+            assert attribute in match.group("attrs"), attribute
+
+    def test_the_tag_list_loads_itself_and_swaps_its_whole_wrapper(
+        self, client: TestClient
+    ) -> None:
+        """The swap target is the div, so the swap has to be outerHTML."""
+        match = _TAGS_LIST.search(client.get("/").text)
+
+        assert match is not None, "tag list wrapper not rendered"
+        for attribute in (
+            'class="tag-list"',
+            'hx-get="/api/tags"',
+            'hx-trigger="load"',
+            'hx-target="this"',
+            'hx-swap="outerHTML"',
+        ):
+            assert attribute in match.group(0), attribute
+
+    def test_the_tag_block_adds_no_attribute_to_the_scan_form(self) -> None:
+        """
+        The form is byte-identical to before this plan (C-10, Pitfall 8).
+
+        This is the decisive advantage of the form-owner attribute over
+        `hx-params="not q"` on the form, which would have needed the
+        `hx-disinherit` list extended.
+        """
+        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
+        match = _SCAN_FORM_TAG.search(index)
+
+        assert match is not None
+        assert match.group("attrs").split() == _SCAN_FORM_ATTRS
+        assert "hx-confirm" not in index
+
+    def test_no_template_keeps_the_tag_multi_select(self) -> None:
+        """D-30: one control, one partial -- the multi-select is deleted."""
+        for path in sorted(_TEMPLATES_DIR.rglob("*.html")):
+            source = path.read_text(encoding="utf-8")
+            assert 'name="tags" multiple' not in source, path
+            assert '<select name="tags"' not in source, path
+
+    def test_the_tag_and_correspondent_refresh_buttons_survive_the_rewrite(
+        self, client: TestClient
+    ) -> None:
+        """Both maintenance controls stay; only the tag one's target moves."""
+        page = client.get("/").text
+
+        assert page.count('aria-label="Refresh tags"') == 1
+        assert page.count('aria-label="Refresh correspondents"') == 1
+
+        refresh = re.search(
+            r'<button type="button"[^>]*resource=tags[^>]*>', page, re.DOTALL
+        )
+        assert refresh is not None
+        for attribute in (
+            'hx-target="#tags-list"',
+            'hx-swap="outerHTML"',
+            'hx-include="#tag-filter, #tags-list"',
+        ):
+            assert attribute in refresh.group(0), attribute

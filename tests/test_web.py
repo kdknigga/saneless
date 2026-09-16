@@ -2210,3 +2210,23 @@ class TestTagFilter:
         assert 'id="tags-list"' in response.text
         assert "checked" in _checkbox(response.text, 3)
         assert "invoice" not in response.text
+
+    def test_tag_filter_text_on_a_scan_submit_does_not_refuse_the_scan(
+        self, client: TestClient
+    ) -> None:
+        """
+        The belt to the form-owner attribute's braces (A-6).
+
+        The filter input's HTML form owner is ``#tag-filter-form``, so a scan
+        cannot carry ``q`` at all.  This covers the residual case -- a scripted
+        client, or a browser that lost the attribute -- by proving the route
+        ignores the field rather than refusing the submit.
+        """
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Stray Filter", "q": "rec"},
+        )
+
+        assert response.status_code == 200
+        job_store: JobStore = _app(client).state.job_store
+        assert job_store.list_recent(limit=1)[0].title == "Stray Filter"
