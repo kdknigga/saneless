@@ -22,11 +22,13 @@ import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from markupsafe import escape
 
 from saneless.config import (
     OutputConfig,
@@ -35,24 +37,29 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.job import JobResult
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
+    ErrorCategory,
     JobState,
     RequestRejection,
+    error_message,
+    error_next_step,
+    page_counts,
     progress_label,
     rejection_message,
     state_label,
 )
+from saneless.web import app as app_module
 from saneless.web.app import create_app
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
 
     from saneless.job import JobStore
 
@@ -85,6 +92,23 @@ class _StubScanner(StubScannerBackend):
         ]
 
 
+# The log file every app in this module writes to. D-13 forbids a host
+# filesystem path from reaching a LAN-visible page, so this name is deliberately
+# unlike anything a template could produce by accident.
+_LOG_FILE_NAME = "render-test-do-not-render-me.log"
+
+# The category `_job_in_state` records on an ERROR row unless a test asks for
+# another. Production never writes an ERROR row without one -- the worker always
+# classifies (`worker.py`) -- so this, not NULL, is the shape the status area's
+# main path renders. REJECTED is avoided because D-06 gives it its own routing.
+_DEFAULT_ERROR_CATEGORY = ErrorCategory.SCANNER
+
+# The templates and the stylesheet, located the way the app locates them, so a
+# moved package cannot make a source assertion pass on an empty file.
+_PACKAGE_DIR = Path(app_module.__file__).parent
+_TEMPLATES_DIR = _PACKAGE_DIR / "templates"
+_APP_CSS = _PACKAGE_DIR / "static" / "app.css"
+
 # The scan button, captured whole so attribute and text assertions cannot be
 # satisfied by markup somewhere else on the page.
 _SCAN_BUTTON = re.compile(
@@ -104,7 +128,14 @@ def _make_app(tmp_path: Path) -> FastAPI:
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
-        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+        output=OutputConfig(
+            tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
+            # Named distinctively so `test_no_log_path_reaches_the_page` can
+            # search the rendered markup for it and mean something: the default
+            # would be a path fragment that could collide with tmp_path itself.
+            log_file=str(tmp_path / _LOG_FILE_NAME),
+        ),
         # Two profiles, so the set is not the bare default.  With only
         # ``default``, the worker's startup generation (D-14) would build
         # profiles from _StubScanner's device and swap them in while these
@@ -170,15 +201,33 @@ def _set_warning(job_store: JobStore, job_id: str, warning: str) -> None:
 
 
 def _job_in_state(
-    client: TestClient, state: JobState, warning: str | None = None
-) -> None:
-    """Create a job, drive it to `state`, and make it the worker's current job."""
+    client: TestClient,
+    state: JobState,
+    warning: str | None = None,
+    error_category: ErrorCategory | None = _DEFAULT_ERROR_CATEGORY,
+) -> str:
+    """
+    Create a job, drive it to `state`, and make it the worker's current job.
+
+    The category is written for every state, exactly as `error` already was:
+    only the ERROR branch reads either, so the other states are unaffected, and
+    keeping one write means the helper has one shape. Pass
+    ``error_category=None`` to get a pre-Phase-21 row, whose status area falls
+    back to the specific message alone.
+
+    Returns:
+        The job's id, which the technical-details assertions need.
+
+    """
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Render Test")
-    job_store.update_state(job.id, state, error="disk on fire")
+    job_store.update_state(
+        job.id, state, error="disk on fire", error_category=error_category
+    )
     if warning is not None:
         _set_warning(job_store, job.id, warning)
     _adopt_as_current_job(client, job.id)
+    return job.id
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -243,10 +292,13 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     if state is JobState.DONE:
         assert '<p class="status-done">&#10003; Done: Render Test</p>' in text
     if state is JobState.ERROR:
-        assert (
-            '<p role="alert" class="status-error">&#10007; Error: disk on fire</p>'
-            in text
-        )
+        # APPL-04, UI-SPEC S2: the paragraph now carries the category sentence
+        # and has lost the literal `Error: ` prefix, because the sentence names
+        # the problem itself. `role="alert"` moved to a wrapping <div> so the
+        # next step is announced too; it is asserted in TestStatusAreaError.
+        sentence = escape(error_message(_DEFAULT_ERROR_CATEGORY))
+        assert f'<p class="status-error">&#10007; {sentence}</p>' in text
+        assert "&#10007; Error: disk on fire" not in text
     if state is JobState.FALLBACK:
         assert (
             '<p class="status-fallback">&#8594; Saved to folder: Render Test</p>'
@@ -261,6 +313,200 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     # The history-refresh hook belongs to the terminal states only -- all four
     # of them, FALLBACK and CANCELLED included, or the table goes stale.
     assert ('hx-get="/api/jobs/history"' in text) is (state in TERMINAL_STATES)
+
+
+# The alert region and the disclosure, captured whole. Neither nests a <div> or
+# a <details>, so a non-greedy body is exact rather than merely convenient.
+_ALERT_DIV = re.compile(r'<div role="alert">(?P<body>.*?)</div>', re.DOTALL)
+_TECH_DETAILS = re.compile(
+    r'<details class="tech-details"(?P<attrs>[^>]*)>(?P<body>.*?)</details>',
+    re.DOTALL,
+)
+
+# The legacy ERROR line, byte for byte. A row written before Phase 21 carries no
+# category, and UI-SPEC S2 requires today's shape verbatim for it: substituting
+# UNKNOWN would print "Something went wrong." over a row that still holds a
+# truthful specific message.
+_LEGACY_ERROR_LINE = (
+    '<p role="alert" class="status-error">&#10007; Error: disk on fire</p>'
+)
+
+
+class TestStatusAreaError:
+    """
+    The ERROR branch after APPL-04: a sentence, a next step, and a disclosure.
+
+    UI-SPEC S2. The three things worth breaking a test over are that the alert
+    covers the next step and not just the sentence, that the specific message
+    was relocated rather than deleted, and that no host filesystem path ever
+    reaches the markup (D-13).
+    """
+
+    @staticmethod
+    def _status(client: TestClient) -> str:
+        """
+        Render the status area for the current job.
+
+        Returns:
+            The status poll's body.
+
+        """
+        return client.get("/api/jobs/current/status").text
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_one_alert_covers_the_sentence_and_the_next_step(
+        self, client: TestClient, category: ErrorCategory
+    ) -> None:
+        """
+        The alert announces the message *and* what to do about it (APPL-04).
+
+        The next step is the most actionable content on the page; leaving it
+        outside the alert would mean a screen-reader user never hears it.
+        Parametrised over ``list(ErrorCategory)`` so an eighth member cannot be
+        added without forcing a decision here.
+        """
+        _job_in_state(client, JobState.ERROR, error_category=category)
+        text = self._status(client)
+
+        assert text.count('role="alert"') == 1
+        match = _ALERT_DIV.search(text)
+        assert match is not None, "the ERROR branch renders no alert div"
+        # Escaped, because ASSEMBLY's next step contains an apostrophe and
+        # Jinja renders it as `&#39;`. Comparing against the raw constant would
+        # quietly exempt exactly the copy most likely to carry punctuation.
+        sentence = escape(error_message(category))
+        next_step = escape(error_next_step(category))
+        body = match.group("body")
+        assert sentence in body
+        assert next_step in body
+        assert f'<p class="status-error">&#10007; {sentence}</p>' in body
+
+    def test_the_disclosure_is_collapsed_and_sits_outside_the_alert(
+        self, client: TestClient
+    ) -> None:
+        """
+        "Technical details" is not announced with the failure, and starts shut.
+
+        No ``open`` attribute, so the detail is one tap away rather than in the
+        way; and outside the alert, so a screen reader reads the sentence and
+        the next step without the debugging aid.
+        """
+        _job_in_state(client, JobState.ERROR)
+        text = self._status(client)
+
+        details = _TECH_DETAILS.search(text)
+        assert details is not None, "the ERROR branch renders no disclosure"
+        assert "open" not in details.group("attrs")
+        assert "<summary>Technical details</summary>" in details.group("body")
+
+        alert = _ALERT_DIV.search(text)
+        assert alert is not None
+        assert "<details" not in alert.group("body")
+
+    def test_the_disclosure_holds_the_specific_message_category_and_job_id(
+        self, client: TestClient
+    ) -> None:
+        """
+        The specific message is relocated, not removed (UI-SPEC S2, D-13).
+
+        ``vocabulary.error_message``'s own docstring warns that swapping the
+        specific message for a category sentence would be a regression, so
+        ``job.error`` is still rendered -- inside the disclosure, with the two
+        other facts D-13 permits and nothing else.
+        """
+        job_id = _job_in_state(client, JobState.ERROR)
+        details = _TECH_DETAILS.search(self._status(client))
+        assert details is not None
+        body = details.group("body")
+
+        assert "disk on fire" in body
+        assert f"Category: {_DEFAULT_ERROR_CATEGORY.value}" in body
+        assert f"Job: {job_id}" in body
+
+    def test_a_row_without_a_category_renders_the_legacy_line_verbatim(
+        self, client: TestClient
+    ) -> None:
+        """
+        A pre-Phase-21 row keeps today's shape, with no next step and no detail.
+
+        Substituting UNKNOWN would print "Something went wrong." over a row
+        that still holds a truthful specific message (UI-SPEC S2).
+        """
+        _job_in_state(client, JobState.ERROR, error_category=None)
+        text = self._status(client)
+
+        assert _LEGACY_ERROR_LINE in text
+        assert text.count('role="alert"') == 1
+        assert "tech-details" not in text
+        assert escape(error_next_step(ErrorCategory.UNKNOWN)) not in text
+
+    @pytest.mark.parametrize("category", [_DEFAULT_ERROR_CATEGORY, None])
+    def test_no_log_path_reaches_the_rendered_page(
+        self, client: TestClient, category: ErrorCategory | None
+    ) -> None:
+        """
+        The configured log file never appears in the markup (D-13, T-30-52).
+
+        It is a host filesystem path on a LAN-visible page. Both the
+        categorised and the legacy branch are checked, because the disclosure
+        is the surface that would be tempted to offer one.
+        """
+        _job_in_state(client, JobState.ERROR, error_category=category)
+        for text in (self._status(client), client.get("/").text):
+            assert _LOG_FILE_NAME not in text
+
+    def test_no_template_names_a_log_path(self) -> None:
+        """
+        No template under ``web/templates/`` references a log path at all.
+
+        The rendered-page assertion above proves this app does not leak one;
+        this proves no template *could*, which is the durable half (T-30-52).
+        """
+        offenders = sorted(
+            path.name
+            for path in _TEMPLATES_DIR.rglob("*.html")
+            if re.search(
+                r"log_file|log_path|logfile",
+                path.read_text(encoding="utf-8"),
+                re.IGNORECASE,
+            )
+        )
+        assert offenders == []
+
+    def test_the_disclosure_escapes_markup_rather_than_interpolating_it(
+        self, client: TestClient
+    ) -> None:
+        """
+        ``job.error`` is exception-derived text and is escaped (T-30-54).
+
+        Moving it into a disclosure moved an untrusted string to a new place in
+        the document; autoescaping is a setting, and a setting can be changed,
+        so the property is pinned here as it already is for ``job.warning``.
+        """
+        job_store: JobStore = _app(client).state.job_store
+        job = job_store.create_job(profile="default", title="Render Test")
+        job_store.update_state(
+            job.id,
+            JobState.ERROR,
+            error="<script>alert(1)</script>",
+            error_category=_DEFAULT_ERROR_CATEGORY,
+        )
+        _adopt_as_current_job(client, job.id)
+
+        text = self._status(client)
+        assert "<script>alert(1)</script>" not in text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+
+    def test_the_summary_clears_the_touch_target_floor(self) -> None:
+        """
+        The summary is a finger-sized row (UI-SPEC S2, WCAG 2.5.5).
+
+        Rare control or not, it is still one someone taps standing at the
+        scanner.
+        """
+        css = _APP_CSS.read_text(encoding="utf-8")
+        assert "details.tech-details > summary {" in css
+        assert "min-height: 2.75rem;" in css
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -569,6 +815,278 @@ def test_fallback_warning_is_escaped_not_injected(client: TestClient) -> None:
     text = client.get("/api/jobs/current/status").text
     assert "<script>alert(1)</script>" not in text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+
+
+# A scan that produced twelve pages, discarded two as blank and sent ten on.
+_COUNTS = JobResult(
+    outcome=None,
+    warning=None,
+    pages_scanned=12,
+    pages_removed=2,
+    pages_uploaded=10,
+)
+
+# The one-page scan that measured no blanks. Its zero is a true measurement and
+# must render as 0; only a NULL suppresses the sentence (D-32, Pitfall 4).
+_ONE_PAGE = JobResult(
+    outcome=None,
+    warning=None,
+    pages_scanned=1,
+    pages_removed=0,
+    pages_uploaded=1,
+)
+
+# The six terminal cases UI-SPEC S3 enumerates, and what each records. Only the
+# first two record counts: `worker.py` leaves them NULL on error and on cancel,
+# `job.py` leaves them NULL on a refused submit, and no pre-Phase-23 row was
+# ever backfilled. Four of six is the common path, not an edge.
+_TERMINAL_CASES = [
+    pytest.param(JobState.DONE, None, _COUNTS, id="done"),
+    pytest.param(JobState.FALLBACK, None, _COUNTS, id="fallback"),
+    pytest.param(JobState.ERROR, _DEFAULT_ERROR_CATEGORY, None, id="error"),
+    pytest.param(JobState.CANCELLED, None, None, id="cancelled"),
+    pytest.param(JobState.ERROR, ErrorCategory.REJECTED, None, id="rejected"),
+    pytest.param(JobState.DONE, None, None, id="pre-phase-23"),
+]
+
+# The two branches that record counts, so the parametrised expectation is one
+# membership test rather than a second copy of the table above.
+_CASES_WITH_COUNTS = {"done", "fallback"}
+
+
+def _finished_job(
+    client: TestClient,
+    state: JobState,
+    result: JobResult | None,
+    error_category: ErrorCategory | None = None,
+) -> str:
+    """
+    Finish a job in `state`, recording `result`'s counts or leaving them NULL.
+
+    ``finish_job`` is the only writer of the count columns, and omitting the
+    result leaves all three NULL rather than zero -- which is exactly how the
+    four countless terminal cases arise in production.
+
+    Returns:
+        The job's id.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    job = job_store.create_job(profile="default", title="Render Test")
+    job_store.finish_job(
+        job.id,
+        state,
+        result=result,
+        error="disk on fire",
+        error_category=error_category,
+    )
+    _adopt_as_current_job(client, job.id)
+    return job.id
+
+
+class TestPageCounts:
+    """
+    Where the page counts render, and where they deliberately do not (APPL-03).
+
+    UI-SPEC S3, D-32. Success criterion 3 means "every terminal job that
+    recorded counts": ERROR and CANCELLED rows have none by construction, and
+    D-32 accepts that, so a later reader need not chase a phantom.
+    """
+
+    @pytest.mark.parametrize(("state", "category", "result"), _TERMINAL_CASES)
+    def test_pages_render_for_exactly_the_cases_that_recorded_them(
+        self,
+        client: TestClient,
+        request: pytest.FixtureRequest,
+        state: JobState,
+        category: ErrorCategory | None,
+        result: JobResult | None,
+    ) -> None:
+        """
+        Two of the six terminal cases show counts; four show no element at all.
+
+        Not an empty paragraph and not a blank line -- nothing. A sentence
+        naming two of three counts would invite the reader to wonder about the
+        third, so one NULL suppresses the whole line.
+        """
+        case = request.node.callspec.id
+        _finished_job(client, state, result, category)
+        text = client.get("/api/jobs/current/status").text
+
+        expected = case in _CASES_WITH_COUNTS
+        assert ('<p class="page-counts">' in text) is expected
+        assert ("page-counts" in text) is expected
+
+    def test_pages_sentence_is_the_shared_filter_verbatim(
+        self, client: TestClient
+    ) -> None:
+        """The status area shows what `page_counts` built, not its own wording."""
+        _finished_job(client, JobState.DONE, _COUNTS)
+        sentence = page_counts(_COUNTS)
+        assert sentence is not None
+        text = client.get("/api/jobs/current/status").text
+        assert f'<p class="page-counts">{sentence}</p>' in text
+        assert "12 pages scanned, 2 blank removed, 10 uploaded" in text
+
+    def test_a_measured_zero_pages_renders_as_zero(self, client: TestClient) -> None:
+        """
+        A scan where nothing was blank really did remove 0 pages (D-32).
+
+        The guard is the filter returning None, never truthiness; a truthiness
+        guard anywhere on this path would delete this line.
+        """
+        _finished_job(client, JobState.DONE, _ONE_PAGE)
+        text = client.get("/api/jobs/current/status").text
+        assert (
+            '<p class="page-counts">1 page scanned, 0 blank removed, 1 uploaded</p>'
+            in text
+        )
+
+    def test_the_pages_line_follows_the_outcome_and_precedes_the_thumbnail(
+        self, client: TestClient
+    ) -> None:
+        """
+        The counts are the last paragraph of the terminal branch (UI-SPEC S3).
+
+        They are a footnote to the outcome, so they read after it -- and before
+        the preview, which is the end of the status area.
+        """
+        job_id = _finished_job(client, JobState.DONE, _COUNTS)
+        _app(client).state.job_store.update_thumbnail(job_id, "dGVzdA==")
+        text = client.get("/api/jobs/current/status").text
+
+        assert text.index('class="status-done"') < text.index('class="page-counts"')
+        assert text.index('class="page-counts"') < text.index('class="thumbnail"')
+
+    def test_the_fallback_pages_line_follows_the_warning(
+        self, client: TestClient
+    ) -> None:
+        """Under FALLBACK the counts read after the warning, not between it and the outcome."""
+        job_store: JobStore = _app(client).state.job_store
+        job = job_store.create_job(profile="default", title="Render Test")
+        job_store.finish_job(
+            job.id,
+            JobState.FALLBACK,
+            result=JobResult(
+                outcome=None,
+                warning="Metadata was not applied.",
+                pages_scanned=12,
+                pages_removed=2,
+                pages_uploaded=10,
+            ),
+        )
+        _adopt_as_current_job(client, job.id)
+        text = client.get("/api/jobs/current/status").text
+
+        assert text.index("Metadata was not applied.") < text.index(
+            'class="page-counts"'
+        )
+
+    def test_the_history_title_cell_carries_the_pages_as_a_second_line(
+        self, client: TestClient
+    ) -> None:
+        """
+        The counts are a second line in the Title cell, not a fifth column.
+
+        A span with `display: block`, so it forms its own line inside the cell
+        the mobile rule already wraps (UI-SPEC S3).
+        """
+        _finished_job(client, JobState.DONE, _COUNTS)
+        sentence = page_counts(_COUNTS)
+        assert sentence is not None
+        text = client.get("/api/jobs/history").text
+        assert f'<span class="page-counts">{sentence}</span>' in text
+
+    def test_the_history_cell_omits_the_pages_element_entirely(
+        self, client: TestClient
+    ) -> None:
+        """A row with no counts renders no span, not an empty one."""
+        _finished_job(client, JobState.CANCELLED, None)
+        text = client.get("/api/jobs/history").text
+        assert "page-counts" not in text
+
+    def test_the_history_table_still_has_four_columns(self) -> None:
+        """
+        Pitfall 11 is designed out, not guarded against (UI-SPEC S3).
+
+        A fifth column would drift against `colspan`, and would compete with
+        the Time column S7 simultaneously widens.
+        """
+        index = (_TEMPLATES_DIR / "index.html").read_text(encoding="utf-8")
+        history = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
+            encoding="utf-8"
+        )
+        assert index.count("<th>") == 4
+        assert history.count('colspan="4"') == 1
+
+    def test_no_template_guards_a_page_count_with_truthiness(self) -> None:
+        """
+        The guard is the filter returning None, never a count's truthiness.
+
+        `{% if job.pages_removed %}` would silently delete a true zero, so no
+        template is allowed to write one (D-32, Pitfall 4).
+        """
+        offenders = sorted(
+            path.name
+            for path in _TEMPLATES_DIR.rglob("*.html")
+            if "if job.pages_" in path.read_text(encoding="utf-8")
+        )
+        assert offenders == []
+
+    def test_the_stylesheet_gains_one_muted_pages_rule(self) -> None:
+        """
+        One class, one rule, no new colour literal (UI-SPEC S3).
+
+        Muted rather than a status colour, because a count is a measurement and
+        not an outcome.
+        """
+        css = _APP_CSS.read_text(encoding="utf-8")
+        assert css.count(".page-counts") == 1
+        assert "display: block;" in css
+        assert "color: var(--pico-muted-color);" in css
+
+
+class TestHistoryTimeCell:
+    """The history Time cell names its zone (APPL-12, D-34, D-35, UI-SPEC S7)."""
+
+    def test_the_time_cell_names_the_zone(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A copy-pasted line is self-describing, so the zone is on every row.
+
+        `local_time` renders whatever zone the C library reports, so pinning
+        `TZ` and calling `time.tzset()` is the only way to assert a shape on a
+        host in an unknown zone; the trailing `tzset` makes the library notice
+        monkeypatch's teardown.
+        """
+        monkeypatch.setenv("TZ", "America/Chicago")
+        time.tzset()
+        try:
+            _finished_job(client, JobState.DONE, _COUNTS)
+            text = client.get("/api/jobs/history").text
+            cell = re.search(r"<tr>\s*<td>([^<]*)</td>", text)
+            assert cell is not None, "no history row rendered"
+            assert re.fullmatch(
+                r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+", cell.group(1).strip()
+            )
+        finally:
+            monkeypatch.undo()
+            time.tzset()
+
+    def test_the_time_cell_renders_through_the_shared_filter(self) -> None:
+        """
+        No `strftime` survives in the template: one function serves both surfaces.
+
+        `cli.py` imports the same object, so the web table and the CLI table
+        cannot disagree about the zone or the format without editing the one
+        implementation (UI-SPEC S7).
+        """
+        source = (_TEMPLATES_DIR / "partials" / "history.html").read_text(
+            encoding="utf-8"
+        )
+        assert "strftime" not in source
+        assert source.count("local_time") == 1
 
 
 # How long the owed-write test waits for the worker to act.  Idle ticks run at

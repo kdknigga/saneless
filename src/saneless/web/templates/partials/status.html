@@ -16,20 +16,72 @@
       {% include "partials/flip.html" %}
       {% endif %}
     {% elif job.state == JobState.DONE %}
+      {# The counts are a footnote to the outcome, so they read after it and
+         before the preview (UI-SPEC S3).
+
+         The guard is `counts` being None -- what the filter below returns when
+         any one of the three is NULL -- and NEVER a count's own truthiness
+         (D-32, Pitfall 4).  Four of the six terminal cases have NULL counts by
+         construction: worker.py leaves them NULL on error and on cancel, job.py
+         on a refused submit, and no pre-Phase-23 row was ever backfilled.  A
+         measured 0, by contrast, is a true measurement and renders as 0.
+
+         Success criterion 3 therefore means "every terminal job that RECORDED
+         counts": ERROR and CANCELLED rows have none to show, and D-32 accepts
+         that, so a later reader need not chase a phantom. #}
       <p class="status-done">&#10003; Done: {{ job.title }}</p>
+      {% set counts = job | page_counts %}
+      {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
       {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.FALLBACK %}
       <p class="status-fallback">&#8594; Saved to folder: {{ job.title }}</p>
       {% if job.warning %}
       <p class="status-fallback">{{ job.warning }}</p>
       {% endif %}
+      {# After the warning as well as the outcome: the warning is about the
+         scan's fate, the counts are only about its size. #}
+      {% set counts = job | page_counts %}
+      {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
       {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.CANCELLED %}
       {# D-01: a cancel is a deliberate stop, not a failure, so it is not announced as an alert. #}
       <p class="status-cancelled">&#8856; Cancelled: {{ job.title }}</p>
       {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.ERROR %}
+      {# Three things a reader of this branch will question, answered here.
+
+         The alert role moved from the <p> to a wrapping <div> so the alert
+         covers the next step as well as the sentence.  The next step is the most
+         actionable content on the page; leaving it outside the alert would mean
+         a screen-reader user never hears it.  The <details> stays OUTSIDE the
+         alert, so "Technical details" is not announced with the failure.
+
+         The specific message is relocated, not removed.  vocabulary.error_message's
+         own docstring warns that swapping the specific message for a category
+         sentence would be a regression, so job.error is still rendered -- inside
+         the disclosure.  APPL-04 *adds* the category sentence and the next step.
+
+         The log file path is deliberately absent (D-13).  It is a host filesystem
+         path and this page is visible to the whole LAN, so the disclosure carries
+         only job.error, the category and the job id and nothing else.
+
+         A NULL error_category is a row written before Phase 21.  It renders
+         today's shape verbatim: substituting UNKNOWN would print "Something went
+         wrong." over a row that still holds a truthful specific message. #}
+      {% if job.error_category %}
+      <div role="alert">
+        <p class="status-error">&#10007; {{ job.error_category | error_message }}</p>
+        <p>{{ job.error_category | error_next_step }}</p>
+      </div>
+      <details class="tech-details">
+        <summary>Technical details</summary>
+        <p>{{ job.error }}</p>
+        <p>Category: {{ job.error_category }}</p>
+        <p>Job: {{ job.id }}</p>
+      </details>
+      {% else %}
       <p role="alert" class="status-error">&#10007; Error: {{ job.error }}</p>
+      {% endif %}
       {% include "partials/terminal_reload.html" %}
     {% endif %}
     {% if job.thumbnail %}
