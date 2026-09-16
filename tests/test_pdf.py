@@ -11,6 +11,7 @@ survive assembly untouched.
 """
 
 import re
+import struct
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
@@ -58,6 +59,11 @@ JOB_B = "bbbbbbbb-1111-2222-3333-444444444444"
 # anywhere the suite can run, and it is still a real check rather than a
 # disabled one.
 _TEST_RESERVE_MB = 1
+
+# A PNG file opens with an 8-byte signature; chunks follow it, each one a
+# 4-byte length, a 4-byte type, that many payload bytes and a 4-byte CRC.
+_PNG_SIGNATURE_LENGTH = 8
+_PNG_CHUNK_OVERHEAD = 12
 
 # Every error class img2pdf 0.6.3 defines.  Each is a direct ``Exception``
 # subclass with no shared base, which is why the boundary cannot catch a tuple.
@@ -130,6 +136,114 @@ def _embedded_streams(pdf_path: Path) -> list[bytes]:
             (image,) = pikepdf.Page(page).images.values()
             streams.append(image.read_raw_bytes())
     return streams
+
+
+def _media_boxes(pdf_path: Path) -> list[tuple[float, float, float, float]]:
+    """
+    Read every page's MediaBox exactly, in page order.
+
+    Exact rather than rounded, unlike :func:`_rounded_media_box`: this one
+    compares two PDFs against each other rather than against a nominal paper
+    size, so a hundredth of a point of drift between them is a real difference.
+
+    Args:
+        pdf_path: The PDF to read.
+
+    Returns:
+        One ``(llx, lly, urx, ury)`` tuple per page.
+
+    """
+    with pikepdf.open(pdf_path) as pdf:
+        boxes = [pikepdf.Rectangle(page.mediabox) for page in pdf.pages]
+    return [(box.llx, box.lly, box.urx, box.ury) for box in boxes]
+
+
+def _png_idat_payload(png_path: Path) -> bytes:
+    """
+    Concatenate a PNG's IDAT chunk payloads -- the compressed pixel data.
+
+    This is the strongest available statement of D-03's "the spooled PNG is
+    exactly what img2pdf embeds": for a non-interlaced, non-alpha PNG img2pdf
+    copies the IDAT payload into the PDF stream untouched, so this byte string
+    must come back out of the assembled PDF verbatim. Decoding either side
+    would only prove the two images look alike, which a re-encode would also
+    satisfy.
+
+    Args:
+        png_path: The spooled page to read.
+
+    Returns:
+        Every IDAT payload in the file, concatenated in file order.
+
+    """
+    raw = png_path.read_bytes()
+    payload = bytearray()
+    offset = _PNG_SIGNATURE_LENGTH
+    while offset < len(raw):
+        (length,) = struct.unpack(">I", raw[offset : offset + 4])
+        if raw[offset + 4 : offset + 8] == b"IDAT":
+            payload += raw[offset + 8 : offset + 8 + length]
+        offset += length + _PNG_CHUNK_OVERHEAD
+    return bytes(payload)
+
+
+def _recording_convert(calls: list[dict[str, object]]) -> Callable[..., object]:
+    """
+    Wrap the real ``img2pdf.convert`` so every call is recorded and performed.
+
+    A wrapper rather than a fake: the assertions are about *how many* times
+    convert runs and *with what*, and a fake that skipped the real work would
+    leave nothing for the merge to merge.
+
+    Args:
+        calls: The list each call appends a ``{"images", "kwargs"}`` record to.
+
+    Returns:
+        A stand-in for ``img2pdf.convert`` that delegates to the real one.
+
+    """
+    real_convert = img2pdf.convert
+
+    def wrapper(*args: object, **kwargs: object) -> object:
+        """Record this call, then delegate to the real ``img2pdf.convert``."""
+        calls.append({"images": args[0] if args else None, "kwargs": dict(kwargs)})
+        return real_convert(*args, **kwargs)
+
+    return wrapper
+
+
+def _recording_job(argvs: list[list[str]]) -> Callable[..., pikepdf.Job]:
+    """
+    Wrap ``pikepdf.Job`` so the argv it is built with is recorded.
+
+    Args:
+        argvs: The list each construction appends its argv to.
+
+    Returns:
+        A stand-in for the ``pikepdf.Job`` constructor that builds a real one.
+
+    """
+    real_job = pikepdf.Job
+
+    def factory(argv: list[str], **kwargs: object) -> pikepdf.Job:
+        """Record ``argv``, then build the real ``pikepdf.Job``."""
+        argvs.append(list(argv))
+        return real_job(argv, **kwargs)
+
+    return factory
+
+
+class _FailingJob:
+    """A ``pikepdf.Job`` stand-in whose ``run`` always fails."""
+
+    def __init__(self, argv: list[str], **_kwargs: object) -> None:
+        """Accept and keep the argv a real ``pikepdf.Job`` would be given."""
+        self.argv = argv
+
+    def run(self) -> NoReturn:
+        """Fail the way qpdf fails, with a pikepdf exception type."""
+        msg = "fake qpdf merge failure"
+        raise pikepdf.PdfError(msg)
 
 
 @pytest.fixture
@@ -320,6 +434,171 @@ class TestAssemblePdf:
         assert _embedded_streams(forward) == list(reversed(_embedded_streams(backward)))
 
 
+class TestBoundedAssembly:
+    """
+    D-03 as amended: one convert per page, then a qpdf merge.
+
+    ``img2pdf.convert`` reads every input fully into memory and finalises the
+    whole document before ``outputstream`` is written, so a single convert is
+    linear in page count whether it streams or not (measured: 1395 MB and
+    787 MB respectively at 48 pages). Converting one page at a time and merging
+    the single-page PDFs with qpdf measured flat at 131 MB for both 12 and 48
+    pages. These tests hold that shape in place and prove the merged document
+    is not a different document.
+    """
+
+    def test_merge_produces_one_page_per_record_in_record_order(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+    ) -> None:
+        """Three records become three pages, each carrying its own spooled PNG."""
+        records = spool_pages(
+            [
+                Image.new("RGB", (120, 160), "white"),
+                Image.new("RGB", (120, 160), "red"),
+                Image.new("RGB", (120, 160), "blue"),
+            ]
+        )
+
+        pdf_path = assemble_pdf(records, output_dir, filename="merged.pdf", dpi=300)
+
+        with pikepdf.open(pdf_path) as pdf:
+            assert len(pdf.pages) == 3
+        assert _embedded_streams(pdf_path) == [
+            _png_idat_payload(record.path) for record in records
+        ]
+
+    def test_convert_runs_once_per_page_with_an_outputstream(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Assembly never hands img2pdf more than one page at a time."""
+        records = spool_pages(
+            [
+                Image.new("RGB", (120, 160), colour)
+                for colour in ("white", "red", "blue")
+            ]
+        )
+        calls: list[dict[str, object]] = []
+        monkeypatch.setattr(pdf_mod.img2pdf, "convert", _recording_convert(calls))
+
+        assemble_pdf(records, output_dir, filename="perpage.pdf", dpi=300)
+
+        assert len(calls) == len(records)
+        assert [call["images"] for call in calls] == [
+            [str(record.path)] for record in records
+        ]
+        for call in calls:
+            kwargs = call["kwargs"]
+            assert isinstance(kwargs, dict)
+            assert "outputstream" in kwargs
+
+    def test_merge_runs_exactly_one_qpdf_job(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One qpdf job, over an argv built only from files assembly just wrote."""
+        records = spool_pages(
+            [Image.new("RGB", (120, 160), colour) for colour in ("white", "red")]
+        )
+        argvs: list[list[str]] = []
+        monkeypatch.setattr(pdf_mod.pikepdf, "Job", _recording_job(argvs))
+
+        pdf_path = assemble_pdf(records, output_dir, filename="job.pdf", dpi=300)
+
+        assert len(argvs) == 1
+        (argv,) = argvs
+        assert argv[0] == "qpdf"
+        assert "--empty" in argv
+        assert "--pages" in argv
+        assert argv[-1] == str(pdf_path)
+        # T-29-29: every input named in the argv is a file this call created
+        # inside its own scratch directory under the output directory.
+        singles = argv[argv.index("--pages") + 1 : argv.index("--")]
+        assert len(singles) == len(records)
+        assert all(Path(single).is_relative_to(output_dir) for single in singles)
+
+    def test_merge_matches_a_single_convert_pdf(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The merged document is the single-convert document, page for page.
+
+        Same page count, the same exact MediaBox on every page, and the same
+        embedded image stream bytes -- which is what makes the amendment a
+        change of memory profile rather than a change of output.
+        """
+        records = spool_pages(
+            [
+                Image.new("RGB", (2480, 3508), "white"),
+                Image.new("RGB", (1240, 1754), "red"),
+                Image.new("RGB", (2480, 3508), "blue"),
+            ]
+        )
+
+        merged = assemble_pdf(records, output_dir, filename="merged.pdf", dpi=300)
+
+        reference = tmp_path / "single-convert.pdf"
+        reference.write_bytes(
+            img2pdf.convert(
+                [str(record.path) for record in records],
+                layout_fun=img2pdf.get_fixed_dpi_layout_fun((300, 300)),
+            )
+        )
+        assert _media_boxes(merged) == _media_boxes(reference)
+        assert _embedded_streams(merged) == _embedded_streams(reference)
+
+    def test_merge_leaves_no_single_page_pdf_behind(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+    ) -> None:
+        """The per-page scratch PDFs are temporary; only the merged one survives."""
+        records = spool_pages(
+            [Image.new("RGB", (120, 160), colour) for colour in ("white", "red")]
+        )
+
+        assemble_pdf(records, output_dir, filename="only.pdf", dpi=300)
+
+        assert sorted(path.name for path in output_dir.rglob("*")) == ["only.pdf"]
+
+    def test_a_failing_merge_becomes_pdf_error(
+        self,
+        spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
+        output_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        EXC-01 is unaffected: the existing broad boundary already covers pikepdf.
+
+        ``Job.run()`` raises pikepdf exception types, which are ordinary
+        ``Exception`` subclasses, so no new ``except`` clause was needed and the
+        message keeps its shape -- the page count and the target path.
+        """
+        records = spool_pages(
+            [Image.new("RGB", (120, 160), colour) for colour in ("white", "red")]
+        )
+        monkeypatch.setattr(pdf_mod.pikepdf, "Job", _FailingJob)
+
+        with pytest.raises(PdfError) as excinfo:
+            assemble_pdf(records, output_dir, "boom.pdf", dpi=300)
+
+        message = str(excinfo.value)
+        assert message.startswith(
+            f"Could not assemble 2 page(s) into {output_dir / 'boom.pdf'}: "
+        )
+        assert message.endswith("fake qpdf merge failure")
+        assert isinstance(excinfo.value.__cause__, pikepdf.PdfError)
+
+
 class TestPdfBoundary:
     """
     ``assemble_pdf`` is a module boundary that raises only ``PdfError``.
@@ -402,22 +681,6 @@ class TestPdfBoundary:
 
         assert isinstance(excinfo.value.__cause__, OSError)
         assert str(blocker / "out" / "x.pdf") in str(excinfo.value)
-
-    def test_convert_returning_none_becomes_pdf_error(
-        self,
-        one_page: list[PageRecord],
-        output_dir: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The defensive None guard raises PdfError, not RuntimeError."""
-
-        def fake_convert(*_args: object, **_kwargs: object) -> None:
-            return None
-
-        monkeypatch.setattr(pdf_mod.img2pdf, "convert", fake_convert)
-
-        with pytest.raises(PdfError, match=r"img2pdf\.convert returned None"):
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300)
 
     def test_message_names_page_count_and_target_path(
         self,
