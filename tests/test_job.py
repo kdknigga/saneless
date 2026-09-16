@@ -2,7 +2,7 @@
 JobStore migration, list, prune, and error category tests.
 
 Covers requirements: UI-05, UI-06, PKG-01, STOR-01, STOR-02, STOR-03, STOR-04,
-STOR-05.
+STOR-05, APPL-08, APPL-09.
 """
 
 from __future__ import annotations
@@ -179,6 +179,33 @@ case rules out both "every active job" and "every job" as the predicate.
 
 QUEUE_BASE_HOURS = 1
 """How far back the ordering case's oldest queued job is backdated."""
+
+CREATE_JOB_PARAMETERS = (
+    "self",
+    "profile",
+    "title",
+    "tags",
+    "correspondent",
+    "owner_token",
+)
+"""The exact parameter tuple ``JobStore.create_job`` is pinned to (APPL-09).
+
+Five non-``self`` parameters is ruff's ``PLR0913`` ceiling, and this project
+adds no suppressions.  Spelled out here so a sixth parameter cannot be added
+without editing a constant whose docstring says why it may not be, and so
+``thumbnail`` cannot be silently restored to the slot ``owner_token`` now holds
+(RESEARCH Pitfall 5).
+"""
+
+OWNER_TOKEN = "owner-token-4NcRfUjXn2r5u8x_A?D(G+KbPeShVmYq"
+"""A recognisable stand-in for the opaque browser token the web layer mints.
+
+Deliberately unlike any other value a jobs row holds, so the column-scan case
+can assert the string reached ``owner_token`` and no other text column.
+"""
+
+OTHER_OWNER_TOKEN = "owner-token-Z6w9z$C&F)J@McQfTjWnZr4u7x!A"
+"""A second token, for proving two jobs keep their own owners apart."""
 
 
 def _build_s3_schema(db_path: str) -> None:
@@ -1848,3 +1875,138 @@ class TestCreateRejectedJob:
             assert store.list_recent(limit=1)[0].id == rejected.id
         finally:
             store.close()
+
+
+class TestOwnerToken:
+    """create_job's owner_token: round-trip, NULL-means-unowned, and the arg cap."""
+
+    def test_create_job_records_the_owner_token_it_was_given(self) -> None:
+        """A job created with an owner token carries it and re-reads it (APPL-09)."""
+        store = JobStore()
+        try:
+            job = store.create_job(
+                profile="default", title="Owned Doc", owner_token=OWNER_TOKEN
+            )
+
+            assert job.owner_token == OWNER_TOKEN
+            # Re-read rather than trusting the returned object: the point of
+            # the change is that the column now has a writer, not that the
+            # dataclass can hold the value (it already could -- job.py:501).
+            reread = store.get_job(job.id)
+            assert reread is not None
+            assert reread.owner_token == OWNER_TOKEN
+        finally:
+            store.close()
+
+    def test_create_job_without_an_owner_token_reads_back_none(self) -> None:
+        """An unowned job stores NULL, which is what every older row holds (D-23)."""
+        store = JobStore()
+        try:
+            job = store.create_job(profile="default", title="Unowned Doc")
+
+            assert job.owner_token is None
+            reread = store.get_job(job.id)
+            assert reread is not None
+            assert reread.owner_token is None
+        finally:
+            store.close()
+
+    def test_create_job_parameter_tuple_ends_at_owner_token(self) -> None:
+        """create_job's parameters are pinned to five non-self names (APPL-09)."""
+        # A pin against two separate regressions: a sixth parameter, which
+        # would trip PLR0913 and tempt a suppression, and a silent restoration
+        # of `thumbnail` to the slot owner_token now occupies.
+        parameters = tuple(inspect.signature(JobStore.create_job).parameters)
+
+        assert parameters == CREATE_JOB_PARAMETERS
+        assert "thumbnail" not in parameters
+
+    def test_create_rejected_job_still_records_a_null_owner_token(self) -> None:
+        """A refused submit is still unowned and still recorded nothing (D-05)."""
+        store = JobStore()
+        try:
+            job = store.create_rejected_job(
+                "default", "Refused", error=WORKER_DOWN_JOB_ERROR
+            )
+
+            assert job.owner_token is None
+            assert job.pages_scanned is None
+            assert job.pages_removed is None
+            assert job.pages_uploaded is None
+            reread = store.get_job(job.id)
+            assert reread is not None
+            assert reread.owner_token is None
+        finally:
+            store.close()
+
+    def test_owner_token_reaches_no_other_text_column(self) -> None:
+        """The token lands in owner_token alone -- never in error or title (T-30-09)."""
+        store = JobStore()
+        try:
+            job = store.create_job(
+                profile="default", title="Leak Check", owner_token=OWNER_TOKEN
+            )
+
+            row = store._conn.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job.id,)
+            ).fetchone()
+            columns = list(row.keys())
+            carrying = [
+                name
+                for name in columns
+                if isinstance(row[name], str) and OWNER_TOKEN in row[name]
+            ]
+
+            assert carrying == ["owner_token"], (
+                f"the owner token reached {', '.join(carrying)}"
+            )
+            assert job.error is None
+            assert job.title == "Leak Check"
+        finally:
+            store.close()
+
+    def test_two_jobs_keep_their_own_owner_tokens(self) -> None:
+        """Two owned jobs do not share or overwrite each other's token (D-23)."""
+        store = JobStore()
+        try:
+            first = store.create_job(
+                profile="default", title="First", owner_token=OWNER_TOKEN
+            )
+            second = store.create_job(
+                profile="default", title="Second", owner_token=OTHER_OWNER_TOKEN
+            )
+            unowned = store.create_job(profile="default", title="Third")
+
+            assert [job.owner_token for job in (first, second, unowned)] == [
+                OWNER_TOKEN,
+                OTHER_OWNER_TOKEN,
+                None,
+            ]
+        finally:
+            store.close()
+
+    def test_owner_token_survives_a_close_and_reopen(self, tmp_path: Path) -> None:
+        """Both the written token and a NULL one are durable on disk (APPL-09)."""
+        db_path = str(tmp_path / "jobs.db")
+        store = JobStore(db_path=db_path)
+        try:
+            owned_id = store.create_job(
+                profile="default", title="Owned", owner_token=OWNER_TOKEN
+            ).id
+            unowned_id = store.create_job(profile="default", title="Unowned").id
+        finally:
+            store.close()
+
+        reopened = JobStore(db_path=db_path)
+        try:
+            owned = reopened.get_job(owned_id)
+            unowned = reopened.get_job(unowned_id)
+
+            assert owned is not None
+            assert unowned is not None
+            assert owned.owner_token == OWNER_TOKEN
+            # A row written with no owner stays NULL across the reopen: NULL
+            # means unowned, and no migration backfills it (RESEARCH OQ 1).
+            assert unowned.owner_token is None
+        finally:
+            reopened.close()
