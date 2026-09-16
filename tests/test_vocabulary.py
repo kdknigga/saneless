@@ -7,8 +7,10 @@ Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import FrozenInstanceError, fields
-from typing import cast
+from datetime import UTC, datetime, timedelta, timezone
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -29,6 +31,7 @@ from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    LOCAL_TIME_FORMAT,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     TERMINAL_STATES,
@@ -46,6 +49,7 @@ from saneless.vocabulary import (
     ScanOutcome,
     SubmitResult,
     WorkerHealth,
+    busy_line,
     classify_error,
     connection_status_message,
     error_advice,
@@ -54,12 +58,17 @@ from saneless.vocabulary import (
     exit_code_for,
     flip_answer_label,
     job_state_for,
+    local_time,
+    page_counts,
     progress_label,
     rejection_message,
     rejection_status_code,
     state_label,
     worker_health_detail,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 
 class TestJobStateMembers:
@@ -489,6 +498,205 @@ class TestDeveloperConstantStrings:
             assert "%s" not in text
             assert "http" not in text.lower()
             assert "traceback" not in text.lower()
+
+
+@pytest.fixture
+def local_zone(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
+    """
+    Give one test control of the process's local zone, then restore it.
+
+    ``local_time`` renders whatever zone the C library reports, so pinning
+    ``TZ`` and calling ``time.tzset()`` is the only way to assert an exact
+    string on a host in an unknown zone.  monkeypatch removes the env var at
+    teardown; the trailing ``tzset`` is what makes the C library notice.
+    """
+
+    def _use(zone: str) -> None:
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+
+    yield _use
+    time.tzset()
+
+
+class TestLocalTime:
+    """local_time shared timestamp formatter tests (APPL-12, D-34, D-35)."""
+
+    def test_local_time_format_is_the_one_shared_format(self) -> None:
+        """The web filter and the CLI table read one format constant (D-35)."""
+        assert LOCAL_TIME_FORMAT == "%Y-%m-%d %H:%M %Z"
+
+    def test_local_time_renders_the_servers_zone(
+        self, local_zone: Callable[[str], None]
+    ) -> None:
+        """A UTC instant renders in the server's local zone, named (D-34)."""
+        local_zone("America/Chicago")
+        assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC)) == (
+            "2026-09-16 14:03 CDT"
+        )
+
+    def test_local_time_names_utc_when_the_server_is_utc(
+        self, local_zone: Callable[[str], None]
+    ) -> None:
+        """A UTC server still gets the zone named on the line (D-35)."""
+        local_zone("UTC")
+        assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC)) == (
+            "2026-09-16 19:03 UTC"
+        )
+
+    def test_local_time_ignores_the_values_own_zone(
+        self, local_zone: Callable[[str], None]
+    ) -> None:
+        """
+        A value carrying another zone still renders the server's (D-34).
+
+        ``astimezone()`` is called with no argument, so the answer is the
+        process's zone whatever the argument's tzinfo happens to be.
+        """
+        local_zone("America/Chicago")
+        tokyo = timezone(timedelta(hours=9))
+        assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=tokyo)) == (
+            "2026-09-16 05:03 CDT"
+        )
+
+
+class TestPageCounts:
+    """page_counts sentence tests (APPL-03, D-32)."""
+
+    def test_page_counts_sentence(self) -> None:
+        """The three counts render as one sentence (APPL-03)."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=12,
+            pages_removed=2,
+            pages_uploaded=10,
+        )
+        assert page_counts(job) == "12 pages scanned, 2 blank removed, 10 uploaded"
+
+    def test_page_counts_pluralises_only_the_first_clause(self) -> None:
+        """Only the scanned clause carries a noun, so only it pluralises."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=1,
+            pages_removed=0,
+            pages_uploaded=1,
+        )
+        assert page_counts(job) == "1 page scanned, 0 blank removed, 1 uploaded"
+
+    def test_page_counts_renders_a_measured_zero(self) -> None:
+        """
+        A measured 0 is a measurement and renders as 0 (D-32, Pitfall 4).
+
+        D-32's "never render 0" is about NULL.  A scan where nothing was blank
+        really did remove 0 pages, and saying so is the truth.
+        """
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=0,
+            pages_removed=0,
+            pages_uploaded=0,
+        )
+        assert page_counts(job) == "0 pages scanned, 0 blank removed, 0 uploaded"
+
+    @pytest.mark.parametrize(
+        "missing", ["pages_scanned", "pages_removed", "pages_uploaded"]
+    )
+    def test_page_counts_is_none_when_any_count_is_null(self, missing: str) -> None:
+        """One NULL count means nothing at all is rendered (D-32)."""
+        counts = {"pages_scanned": 12, "pages_removed": 2, "pages_uploaded": 10}
+        counts[missing] = None
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            **counts,
+        )
+        assert page_counts(job) is None
+
+    def test_page_counts_is_none_for_an_uncounted_job(self) -> None:
+        """An ERROR or pre-Phase-23 row has no counts, so renders none (D-32)."""
+        job = Job(id="j", profile="default", title="t", state=JobState.ERROR)
+        assert page_counts(job) is None
+
+
+class TestBusyLine:
+    """busy_line in-progress line tests (APPL-08, D-25, D-33)."""
+
+    @pytest.mark.parametrize("state", sorted(BUSY_STATES))
+    def test_busy_line_falls_back_to_progress_label(self, state: JobState) -> None:
+        """With nothing extra known, the busy line is today's prose (D-33)."""
+        assert busy_line(state) == progress_label(state)
+
+    def test_busy_line_names_the_job_ahead(self) -> None:
+        """A queued job is told what it is waiting for (APPL-08, D-25)."""
+        assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=1) == (
+            "Waiting for 'Tax return' to finish (1 ahead of you)"
+        )
+
+    def test_busy_line_counts_more_than_one_ahead(self) -> None:
+        """The count is the number of jobs ahead, not a fixed word (APPL-08)."""
+        assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=2) == (
+            "Waiting for 'Tax return' to finish (2 ahead of you)"
+        )
+
+    def test_busy_line_says_next_in_line_instead_of_zero_ahead(self) -> None:
+        """
+        "(0 ahead of you)" is never rendered (D-25).
+
+        It is technically true and reads like a bug.
+        """
+        assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=0) == (
+            "Waiting for 'Tax return' to finish (next in line)"
+        )
+
+    def test_busy_line_needs_both_halves_of_the_queue_position(self) -> None:
+        """A title with no count is not enough to claim a position (D-25)."""
+        assert busy_line(JobState.PENDING, queue_title="Tax return") == progress_label(
+            JobState.PENDING
+        )
+
+    def test_busy_line_shows_the_front_count(self) -> None:
+        """Pass B names how many fronts are already scanned (D-33, APPL-03)."""
+        assert busy_line(JobState.SCANNING_REVERSE, front_pages=12) == (
+            "Front: 12 pages · " + progress_label(JobState.SCANNING_REVERSE)
+        )
+
+    def test_busy_line_pluralises_the_front_count(self) -> None:
+        """One front page is a page, not pages (D-33)."""
+        assert busy_line(JobState.SCANNING_REVERSE, front_pages=1) == (
+            "Front: 1 page · " + progress_label(JobState.SCANNING_REVERSE)
+        )
+
+    def test_busy_line_omits_an_unknown_front_count(self) -> None:
+        """An unknown front count renders no count at all (D-33)."""
+        assert busy_line(JobState.SCANNING_REVERSE, front_pages=None) == (
+            progress_label(JobState.SCANNING_REVERSE)
+        )
+
+    def test_busy_line_shows_the_front_count_only_on_pass_b(self) -> None:
+        """The front count belongs to SCANNING_REVERSE and no other state."""
+        assert busy_line(JobState.SCANNING, front_pages=12) == progress_label(
+            JobState.SCANNING
+        )
+
+    def test_busy_line_queue_position_wins_over_the_front_count(self) -> None:
+        """The queue line is the first branch, whatever else is known (D-33)."""
+        assert busy_line(
+            JobState.SCANNING_REVERSE,
+            front_pages=12,
+            queue_title="Tax return",
+            queue_ahead=2,
+        ) == ("Waiting for 'Tax return' to finish (2 ahead of you)")
 
 
 class TestWorkerHealth:
