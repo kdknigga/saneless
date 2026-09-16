@@ -682,6 +682,7 @@ class FakeSaneDev:
     issued_pages: list[weakref.ref[Image.Image]]
     high_water_live_pages: int
     read_gate: threading.Event
+    read_started: threading.Event
     close_while_blocked: bool
     _block_mode: ReadBlockMode | None
     _blocked_readers: int
@@ -752,6 +753,7 @@ class FakeSaneDev:
         state["issued_pages"] = []
         state["high_water_live_pages"] = 0
         state["read_gate"] = threading.Event()
+        state["read_started"] = threading.Event()
         state["close_while_blocked"] = False
         state["_block_mode"] = None
         state["_blocked_readers"] = 0
@@ -877,6 +879,12 @@ class FakeSaneDev:
         A method rather than a constructor keyword for the usual reason:
         ``__init__`` already carries ruff's maximum of five arguments.
 
+        Two events rather than one, because a test needs both edges: the
+        blocked read sets ``read_started`` on the way in and waits on
+        ``read_gate`` on the way out, so "a read is now blocked" and "let it
+        go" are separately observable.  One event could not do both -- the
+        gate is unset for precisely as long as the block lasts.
+
         Args:
             mode: What the blocked read does when its gate is released, and
                 whether ``cancel()`` releases it at all.
@@ -884,6 +892,7 @@ class FakeSaneDev:
         """
         self.__dict__["_block_mode"] = mode
         self.__dict__["read_gate"].clear()
+        self.__dict__["read_started"].clear()
 
     def release_read(self) -> None:
         """
@@ -944,6 +953,12 @@ class FakeSaneDev:
 
         """
         self.__dict__["_blocked_readers"] += 1
+        # Set from inside the reader, so a test that has to act *while* a read
+        # is blocked -- delivering a SIGINT, say -- waits on a real event
+        # instead of polling ``calls`` behind a sleep.  ``read_gate`` cannot
+        # serve: it is the event the reader is about to wait ON, and it is
+        # unset for exactly as long as the block lasts.
+        self.__dict__["read_started"].set()
         try:
             self.read_gate.wait(_READ_GATE_CEILING_SECONDS)
         finally:
