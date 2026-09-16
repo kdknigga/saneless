@@ -343,6 +343,23 @@ EXIT_CODES = frozenset(int(code) for code in ExitCode)
 _CODE_ROW = re.compile(r"^\| (\d+) \|", re.MULTILINE)
 _COMMAND_HEADING = re.compile(r"^## `saneless ([a-z-]+)`$", re.MULTILINE)
 
+# The sentence at the top of the CLI reference that counts the commands, and
+# the number words it may be written with.  The count is compared against the
+# sections actually present rather than against a literal, so the seventh
+# command is caught by the same test as the sixth.
+_COUNT_SENTENCE = re.compile(r"^saneless provides (\w+) commands\b", re.MULTILINE)
+_NUMBER_WORDS = {
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
 OLD_SCRIPTING_ABORT = (
     "aborted at the flip prompt or not confirmed within `flip_timeout_seconds` "
     "exits with code 1"
@@ -421,6 +438,15 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     command but ``scan`` builds a PDF, so only ``scan`` has 4; only ``scan``
     and ``serve`` construct a Paperless client, so only they have 3; ``jobs``
     never touches SANE, so it has no 1.
+
+    ``doctor`` has the same four codes as ``jobs``, for three separate reasons.
+    No 1: it never fails on SANE at all -- Amendment A-1 turns a missing
+    python-sane into a ``FAIL`` row rather than a refusal, and the scanner
+    check reports an unreachable device instead of raising. No 3: it does
+    construct a Paperless client, but ``test_connection`` returns a status
+    rather than raising, and a URL the client cannot be built from becomes the
+    "not found at that URL" row instead of a ``PaperlessError``. No 4: it
+    assembles nothing.
     """
     text, name = _read(CLI_REFERENCE)
     tables = _command_exit_tables(text, name)
@@ -436,6 +462,7 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     assert _documented_codes(tables["jobs"]) == {0, 2, 5, 130}
     assert _documented_codes(tables["serve"]) == {0, 2, 3, 5, 130}
     assert _documented_codes(tables["auto-profiles"]) == {0, 1, 2, 5, 130}
+    assert _documented_codes(tables["doctor"]) == {0, 2, 5, 130}
     assert "abort" not in _table_row(tables["scan"], "1").lower(), (
         f"{name}: scan's exit-1 row still describes a flip-prompt abort"
     )
@@ -447,6 +474,61 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
         assert "no scanner" not in _table_row(tables[command], "1").lower(), (
             f"{name}: `saneless {command}` documents no scanner under 1"
         )
+
+
+def test_cli_reference_command_count_matches_its_sections() -> None:
+    """
+    The opening sentence's command count equals the number of command sections.
+
+    Derived rather than pinned to a literal: the sentence said "five" for as
+    long as there were five commands and would have gone on saying it for the
+    sixth, the seventh and the eighth. Comparing it against the sections that
+    are actually present is the only form of this test that keeps working.
+    """
+    text, name = _read(CLI_REFERENCE)
+    match = _COUNT_SENTENCE.search(text)
+    assert match, f"{name} no longer states how many commands saneless provides"
+    stated = _NUMBER_WORDS.get(match[1])
+    assert stated is not None, (
+        f"{name}: {match[1]!r} is not a number word this test knows; "
+        f"add it to _NUMBER_WORDS"
+    )
+    documented = len(_COMMAND_HEADING.findall(text))
+    assert stated == documented, (
+        f"{name} says saneless provides {match[1]} commands but documents {documented}"
+    )
+
+
+def test_doctor_promises_no_json_mode() -> None:
+    """
+    Neither document offers ``doctor --json``, because it does not ship.
+
+    Research found no consumer for one -- not in the docs, the tests, the
+    Dockerfile or the compose file -- and CONTEXT says a JSON mode ships only
+    with a reader. A document that promises one would be a wire contract
+    somebody parses before anybody implements it, so the decision is pinned
+    here rather than left to be re-litigated.
+    """
+    for path in (CLI_REFERENCE, CLI_SCRIPTING):
+        text, name = _read(path)
+        assert "doctor --json" not in text, (
+            f"{name} promises a `doctor --json` that does not exist"
+        )
+
+
+def test_scripting_does_not_claim_every_read_command_has_json() -> None:
+    """
+    The JSON section names the commands that have ``--json``, rather than all.
+
+    ``doctor`` is a read command with no ``--json``, so the old blanket claim
+    became false the moment it shipped. This is the assertion that would have
+    caught it.
+    """
+    text, name = _read(CLI_SCRIPTING)
+    assert "All read commands support" not in text, (
+        f"{name} still claims every read command supports --json"
+    )
+    assert "doctor" in text, f"{name} does not mention doctor's exit semantics"
 
 
 def test_job_database_documented_under_exit_code_two() -> None:
