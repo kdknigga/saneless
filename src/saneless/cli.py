@@ -26,6 +26,14 @@ from .auto_profiles import (
     generate_profiles,
     write_profiles_to_config,
 )
+from .checks import (
+    CheckContext,
+    CheckKey,
+    CheckState,
+    check_name,
+    run_checks,
+    worst_state,
+)
 from .config import (
     Settings,
     load_settings,
@@ -36,6 +44,7 @@ from .config import (
 )
 from .exceptions import (
     ConfigError,
+    PaperlessError,
     SanelessError,
     ScanCancelledError,
     ScanError,
@@ -58,6 +67,7 @@ from .vocabulary import (
     ExitCode,
     FlipOutcome,
     JobState,
+    ProfileStorage,
     classify_error,
     exit_code_for,
     progress_label,
@@ -68,7 +78,7 @@ from .web.app import create_app
 if TYPE_CHECKING:
     from .auto_profiles import ProfileWriteResult
     from .config import ProfileConfig
-    from .scanner.base import DeviceCapabilities
+    from .scanner.base import DeviceCapabilities, ScannerBackend
 
 __all__ = ["ClickFlipCoordinator", "_truncate", "cli"]
 
@@ -915,3 +925,189 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
         click.echo(f"Cannot write {config_path}: {exc.strerror or exc}", err=True)
         ctx.exit(ExitCode.CONFIG)
     _echo_write_result(result, profiles)
+
+
+def _state_marker(state: CheckState) -> str:
+    """
+    Return the bracketed token ``doctor`` prints in front of one check row.
+
+    These are CLI affordances rather than vocabulary, which is why they are not
+    ``check_state_label``: that function answers "what does a screen reader
+    announce", and the answer there is ``"Failed"``, a word. Here the job is a
+    scannable left margin in a fixed-width terminal, so all three tokens are
+    the same width and a reader's eye finds the red rows without reading them.
+
+    A total ``match``, for the reason ``checks.py``'s four lookups are: a
+    fourth ``CheckState`` stops this function type-checking until somebody
+    decides what it looks like.
+
+    Args:
+        state: The state to mark.
+
+    Returns:
+        ``"[ OK ]"``, ``"[WARN]"`` or ``"[FAIL]"``.
+
+    Raises:
+        AssertionError: If the value is not a CheckState member.
+
+    """
+    match state:
+        case CheckState.OK:
+            marker = "[ OK ]"
+        case CheckState.WARN:
+            marker = "[WARN]"
+        case CheckState.FAIL:
+            marker = "[FAIL]"
+        case _:
+            assert_never(state)
+    return marker
+
+
+# The three column widths `saneless doctor` renders with, all derived rather
+# than written down, exactly as _STATUS_COL_WIDTH is and for the same reason: a
+# sixth CheckKey with a longer name, or a fourth CheckState with a wider token,
+# must not be able to overflow an 80-column terminal without anyone noticing.
+# The indent puts a next step underneath the message it belongs to, so a row
+# and its remedy read as one item rather than two.
+_MARKER_WIDTH = max(len(_state_marker(state)) for state in CheckState)
+_NAME_COL_WIDTH = max(len(check_name(key)) for key in CheckKey)
+_NEXT_STEP_INDENT = " " * (_MARKER_WIDTH + 1 + _NAME_COL_WIDTH + 1)
+
+
+def _doctor_scanner(settings: Settings) -> ScannerBackend | None:
+    """
+    Build a scanner backend for one ``doctor`` run, or report that there is none.
+
+    ``None`` is how ``CheckContext`` represents "no scanner support on this
+    machine", and producing it here rather than letting the failure out is the
+    whole of Amendment A-1 on the SANE side.
+
+    All three failure shapes collapse to ``None``. ``ImportError`` is the bare
+    missing module; ``ConfigError`` is what ``require_sane`` -- which
+    ``SaneBackend.__init__`` calls for itself -- raises once it has translated
+    that ``ImportError``; and ``ScanError`` is ``sane.init()`` refusing. The
+    last is the least obvious of the three and is deliberate: a libsane that
+    will not initialise is SANE support this machine does not actually have,
+    the row's "install scanner support, then restart" is the right advice for
+    it, and letting it out instead would exit 1 -- a code ``doctor``'s
+    documented table does not list, for a command that scans nothing.
+
+    Args:
+        settings: The loaded configuration, for the sane-net host.
+
+    Returns:
+        A backend, or None when none could be built.
+
+    """
+    try:
+        return SaneBackend(host=settings.scanner.host)
+    except (ImportError, ConfigError, ScanError) as exc:
+        # The type name only. The ConfigError's own message names the install
+        # hint and the ImportError names a shared object path, and neither
+        # belongs on a report a household member is meant to act on.
+        logger.info("Scanner support unavailable: %s", type(exc).__name__)
+        return None
+
+
+def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
+    """
+    Build a Paperless client for one ``doctor`` run, or report that there is none.
+
+    ``PaperlessClient.__init__`` refuses exactly one thing -- a URL httpx will
+    not parse -- and it refuses it with ``PaperlessError``, which the group
+    guard would turn into exit 3. That would cost the operator the other four
+    rows to report a fact the Paperless row already has a sentence for, and it
+    would put a code in ``doctor``'s output that its documented table does not
+    list. ``None`` reaches ``checks.py`` as the "not found at that URL" row.
+
+    Args:
+        settings: The loaded configuration.
+
+    Returns:
+        A client, or None when none could be built.
+
+    """
+    try:
+        return PaperlessClient(
+            settings.paperless.url,
+            settings.paperless.token.get_secret_value(),
+            settings.paperless.consume_dir,
+        )
+    except PaperlessError as exc:
+        # The message names the URL, which may carry user:pass@ (WR-08, D-08).
+        logger.info("Paperless client unavailable: %s", type(exc).__name__)
+        return None
+
+
+# Amendment A-1: this command deliberately does NOT call require_sane(), which
+# is the first statement of `scan` (cli.py:515-519), `devices`, `serve` and
+# `auto-profiles`. Those four cannot do their job without a scanner, so
+# refusing early is honest. `doctor`'s job is to say what is wrong, and a
+# machine with no python-sane is precisely the machine whose owner needs that
+# said: it still has a token, profiles, a fallback folder and a data directory
+# to be told about. The import failure is caught in _doctor_scanner and
+# rendered as one FAIL row among five instead of a refusal to run at all.
+#
+# There is no --json, and this is a decision rather than an omission. Research
+# found no consumer anywhere in the docs, the tests, the Dockerfile or the
+# compose file; REQUIREMENTS' Out of Scope table already refuses a container
+# HEALTHCHECK that calls `doctor`, which is the one caller that would have
+# wanted a machine shape. A JSON mode would be a wire contract with no reader,
+# and a wire contract is only free until the first person parses it. The
+# human-readable table plus the exit code is the whole contract.
+@cli.command()
+@click.pass_context
+def doctor(ctx: click.Context) -> None:
+    """Check that saneless is ready to scan."""
+    settings = _load_cli_settings(ctx)
+    scanner = _doctor_scanner(settings)
+    if scanner is not None:
+        # Registered before the first SANE call, so a check that fails still
+        # leaves the process with SANE shut down (D-18).
+        ctx.call_on_close(scanner.close)
+    paperless = _doctor_paperless(settings)
+    try:
+        results = run_checks(
+            CheckContext(
+                settings=settings,
+                scanner=scanner,
+                paperless=paperless,
+                # The CLI can report two of the three storage outcomes and
+                # never the third. IN_MEMORY_UNWRITABLE is what the *worker*
+                # records when its one startup attempt to persist generated
+                # profiles was refused; a one-shot command attempts no persist,
+                # so it has no such outcome to report and must not invent one
+                # by probing -- Phase 27 D-09's motivating failure is a bind
+                # mount where the directory is writable and only the rename
+                # fails, which no probe short of the write itself can see.
+                profile_storage=(
+                    ProfileStorage.PERSISTED
+                    if settings.config_path is not None
+                    else ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
+                ),
+            )
+        )
+    finally:
+        if paperless is not None:
+            paperless.close()
+
+    for result in results:
+        click.echo(
+            f"{_state_marker(result.state):<{_MARKER_WIDTH}} "
+            f"{check_name(result.key):<{_NAME_COL_WIDTH}} {result.message}"
+        )
+        if result.next_step:
+            click.echo(f"{_NEXT_STEP_INDENT}{result.next_step}")
+
+    # D-01's mapping, and no new ExitCode member to express it. Three reasons,
+    # in order: tests/test_deployment_config.py:393,403 assert the documented
+    # global tables equal every member, so a sixth code is a documentation
+    # change in three files and a revision of Phase 28's D-07 table; 2 already
+    # means "can't start, fix your setup", which is what every red check is
+    # saying; and `doctor` reports a list, so one process has one exit code to
+    # give and splitting a red Paperless row out to 3 would mean choosing which
+    # red row the shell gets to hear about. A WARN is deliberately not a
+    # failure -- an appliance that scans and files is not broken because it
+    # could be tidier, and a gate that goes red for tidiness gets ignored.
+    if worst_state(results) is CheckState.FAIL:
+        ctx.exit(ExitCode.CONFIG)
