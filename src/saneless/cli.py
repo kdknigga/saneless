@@ -36,6 +36,7 @@ from .checks import (
 )
 from .config import (
     Settings,
+    is_placeholder_token,
     load_settings,
     log_config_sources,
     resolve_job_title,
@@ -98,6 +99,18 @@ _STATUS_COL_WIDTH = max(len(state_label(state)) for state in JobState)
 _FLIP_PROMPT = (
     "Flip the stack over and load it back into the feeder. Scan the back sides?"
 )
+
+# Why `scan` refuses when nobody configured paperless-ngx (D-16, APPL-07). A
+# developer constant: it names the problem and never the value, the URL or the
+# config path. Lower-cased and without a full stop because it is the tail of
+# Phase 28 D-08's `<what saneless was doing>: <problem>` line, unlike
+# checks.py's sentence for the same fact, which stands alone in a table row.
+#
+# The name carries no password-ish word on purpose: ruff's S105 reads the
+# *name* of the target, not the value, so `_TOKEN_...` here would be flagged as
+# a hardcoded credential. This is vocabulary.py's `_REJECTED_WIRE_VALUE` idiom
+# rather than a suppression.
+_UNSET_CREDENTIAL_PROBLEM = "the paperless-ngx API token has not been set"
 
 
 # Whether a human can answer a prompt here, behind a function of its own rather
@@ -549,6 +562,27 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # title, else "Scan <time>"; blank after stripping counts as not typed.
     now = datetime.now(tz=UTC)
     resolved_title = resolve_job_title(title, settings.profiles[profile], now=now)
+
+    # D-16: refused here, before the scanner is opened, because a scan that
+    # cannot upload is wasted paper. The refusal is unconditional -- a
+    # configured paperless.consume_dir fallback does not soften it, or `scan`,
+    # `doctor` and the web UI would disagree about whether the appliance can
+    # work. `devices`, `auto-profiles` and `jobs` are deliberately untouched:
+    # none of them talks to paperless-ngx.
+    #
+    # This is the second place cli.py unwraps the token; the PaperlessClient
+    # construction below is the other. The value goes to the predicate and
+    # nowhere else -- it is never logged, echoed or interpolated into the
+    # message, which is a developer constant (ASVS V7, T-30-42). The line is
+    # built in Phase 28 D-08's shape because ErrorCategory.CONFIG prints the
+    # exception as-is (_failure_line), so the "what saneless was doing" half
+    # has to be part of the message.
+    if is_placeholder_token(settings.paperless.token.get_secret_value()):
+        msg = (
+            f"Scanning '{resolved_title}' with profile '{profile}': "
+            f"{_UNSET_CREDENTIAL_PROBLEM}"
+        )
+        raise ConfigError(msg)
 
     manual_duplex = settings.profiles[profile].duplex == "manual"
     # Refused here, before the backend exists, so no paper moves: from cron or a
