@@ -24,6 +24,7 @@ from .config import config_search_paths
 from .exceptions import ConfigError, ScanCancelledError
 from .job import JobResult
 from .pipeline import (
+    SCAN_LABEL_FRONT,
     FlipAnswerSlot,
     FlipCoordinator,
     PipelineEvent,
@@ -374,6 +375,13 @@ class ScanWorker:
         self._profiles_lock = threading.Lock()
         self._flip_coordinator: WorkerFlipCoordinator | None = None
         self._current_job_id: str | None = None
+        # Pass A's page count for the job in flight, written by the pipeline's
+        # pass-count callback on the worker thread and read by request threads
+        # rendering the status area (D-33).  Its own lock rather than
+        # _profiles_lock: they guard unrelated state and sharing one would make
+        # a status render wait behind a profile swap for no reason.
+        self._front_pages_lock = threading.Lock()
+        self._front_pages: int | None = None
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
         # Idle ticks in a row whose owed-write retry raised (WR-10), with no
@@ -672,6 +680,30 @@ class ScanWorker:
     def current_job_id(self) -> str | None:
         """ID of the currently processing job, or None."""
         return self._current_job_id
+
+    @property
+    def front_pages(self) -> int | None:
+        """
+        Pass A's page count for the job in flight, or ``None``.
+
+        It is set while the current job is in manual duplex, from the moment
+        pass A finishes, and is cleared however the job ends.  The status area
+        reads it only when the job it is rendering is in
+        ``JobState.SCANNING_REVERSE``: at any other moment the number either
+        does not exist yet or is about to be superseded by the row's own
+        ``pages_scanned``.
+
+        Deliberately not a ``Job`` column.  CONTEXT forbids a schema migration
+        in this phase, and the value would be a poor column anyway -- it is
+        meaningful for the length of one pass and meaningless the instant the
+        job ends, which is the opposite of what the job table stores.
+
+        Returns:
+            The count, or ``None`` when no manual-duplex pass A has finished.
+
+        """
+        with self._front_pages_lock:
+            return self._front_pages
 
     def profile_names(self) -> list[str]:
         """
@@ -1255,6 +1287,11 @@ class ScanWorker:
             # the idle tick, where its failure cannot fail a job (D-13).
             self._flip_coordinator = None
             self._current_job_id = None
+            # Cleared here rather than at the start of the next job, so no
+            # observer can ever read the previous job's count against a row
+            # that has already moved on (D-33).
+            with self._front_pages_lock:
+                self._front_pages = None
 
     def _scan_job(self, job: Job) -> None:
         """
@@ -1288,6 +1325,16 @@ class ScanWorker:
 
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
             self._job_store.update_thumbnail(_jid, thumb)
+
+        # The back count is ignored on purpose.  It arrives a moment before the
+        # ScanResult that carries the run's real total, so storing it would
+        # replace the number the operator is reading with one that is about to
+        # be replaced again -- a flicker in place of information (D-33).
+        def _pass_count_cb(label: str, count: int) -> None:
+            if label != SCAN_LABEL_FRONT:
+                return
+            with self._front_pages_lock:
+                self._front_pages = count
 
         # The worker persisted SCANNING just above, before starting the
         # pipeline.  run_pipeline re-announces it as its first event; rewriting
@@ -1339,6 +1386,7 @@ class ScanWorker:
             correspondent=job.correspondent,
             status_callback=_status_cb,
             thumbnail_callback=_thumbnail_cb,
+            pass_count_callback=_pass_count_cb,
             flip_coordinator=coordinator,
         )
         try:
