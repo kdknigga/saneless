@@ -45,12 +45,44 @@ What the common cases mean:
   them. If the pages were not blank, make detection more conservative or turn it off; see
   [When Every Page Is Blank](../explanation/empty-page-detection.md#when-every-page-is-blank).
 - **The flip wait timed out.** A manual duplex scan waited `flip_timeout_seconds` for someone to
-  flip the stack and nobody answered. A timeout is a failure, not a cancel. See
+  flip the stack and nobody answered. A timeout is a failure, not a cancel. The front sides the
+  first pass already scanned are kept: saneless assembles them into a PDF under `failed/` in its
+  data directory and names the path in the error. See
   [Manual Duplex](set-up-adf-duplex.md#manual-duplex).
 - **The flip prompt failed.** Reading your answer failed while `saneless scan` was asking you to
   flip the stack, for example with an I/O error or input that could not be decoded. The cause is
-  logged with its traceback. End of input is not a failure: Ctrl-D, or a terminal that closes, at
-  the prompt cancels the scan (exit 130).
+  logged with its traceback, and the fronts are kept the same way a flip timeout keeps them. End
+  of input is not a failure: Ctrl-D, or a terminal that closes, at the prompt cancels the scan
+  (exit 130).
+- **The scan stopped part-way through the stack.** The scanner failed after some sheets had
+  already been fed -- a jam, a misfeed, a page that took too long, or the working directory
+  running out of room. Those sheets are not lost. saneless assembles them into a PDF under
+  `failed/` in its data directory, and the error names both the count and the path:
+
+    ```
+    Scanner error on page 40: Document feeder jammed. The 39 page(s) scanned before the error were preserved at /var/lib/saneless/failed/20260916-013255-4c8627dd-invoice-partial.pdf
+    ```
+
+    Nothing is uploaded. Clear whatever stopped the feeder, then either scan the whole stack again
+    and delete the preserved file, or keep it and scan only the sheets it is missing. Empty page
+    detection is deliberately not applied to a preserved scan, so it shows exactly what the feeder
+    picked up. saneless never deletes anything from `failed/`; draining it is your job (see
+    [Docker volumes](../reference/docker.md#volumes)).
+- **A page took too long.** saneless allows 120 seconds for each page, on the feeder and on the
+  flatbed alike, and the line reads `Page 3 timed out after 120s`. On a network scanner this
+  usually means the link dropped mid-page. Any sheets scanned before it are preserved as above.
+- **saneless says to restart it.** After a page times out, saneless cancels the read and waits for
+  the scanner to acknowledge. When it never does, the device cannot be reused safely, so the next
+  scan is refused before saneless touches the scanner at all, with a line ending:
+
+    ```
+    The scan will be possible again as soon as the scanner releases it. Restart saneless if it does not.
+    ```
+
+    That wording is literal. A hang that clears itself -- a network scanner that comes back, a
+    driver that finally returns -- releases the device on its own and the next scan works with no
+    restart. If the message keeps appearing, check the link to the scanner first, because the read
+    cannot return while that is down, and then restart saneless.
 
 To check that saneless can see the scanner at all, run:
 
@@ -143,8 +175,11 @@ The line starts with `PDF error:`. saneless scanned the pages but could not writ
 - If both are fine, the PDF library refused one of the scanned images, and the line gives its
   reason. Try the scan again with a different `mode` or `resolution` in the profile.
 
-The scanned pages are only held in memory while the PDF is built, so they are not kept when this
-fails: scan the document again once the cause is fixed.
+The scanned pages are not lost when this fails. saneless writes each page to disk as it arrives,
+so when assembly is what failed it moves those page files into a job-keyed directory under
+`failed/` in its data directory and names that directory in the error. The pages are ordinary PNG
+files, one per sheet in the order they were scanned. Fix the cause and scan again, or assemble
+them yourself if rescanning the document is not practical.
 
 ## Cancelled scans (exit 130)
 
@@ -154,8 +189,11 @@ Exit 130 means the scan was stopped on purpose, not that something broke:
 - You pressed Ctrl-C while a one-shot command (`scan`, `devices`, `auto-profiles`, `jobs`) was
   running, or while `serve` was still starting up.
 
-Nothing is uploaded. In the web UI, a scan cancelled with **Abort scan** at the flip step is shown
-as Cancelled, in grey rather than as an error. A flip wait that times out is not a cancel: it
+Nothing is uploaded, and nothing is kept in `failed/` either. A failure keeps whatever it can,
+because you cannot get those sheets back without feeding them again; a cancel keeps nothing,
+because you chose to stop and saneless would only be leaving you files to delete. In the web UI, a
+scan cancelled with **Abort scan** at the flip step is shown as Cancelled, in grey rather than as
+an error. A flip wait that times out is not a cancel: it
 fails with exit 1. Ctrl-C on `saneless serve` once the web server is running is a normal stop and
 exits 0.
 

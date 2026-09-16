@@ -56,6 +56,8 @@ Settings are resolved in this order (highest to lowest priority):
 | `SANELESS_OUTPUT__WEB_HOST` | `output.web_host` | string | `0.0.0.0` (the default: all network interfaces) |
 | `SANELESS_OUTPUT__WEB_PORT` | `output.web_port` | int | `8080` |
 
+`SANELESS_OUTPUT__MIN_FREE_SPACE_MB` is the free disk space saneless keeps in reserve for assembling the PDF. It is checked twice: once before a scan starts, and again before each page is written to disk, against that page's size *plus* this reserve. A scan that runs out of room fails naming the page number and the path, and the pages already scanned are preserved. See [`[output]`](configuration.md#output) for every field in this section.
+
 ## Notes
 
 - **Profile fields** use `SANELESS_PROFILES__<NAME>__<FIELD>`, for example `SANELESS_PROFILES__RECEIPT__TITLE=Receipt` for `title` in `[profiles.receipt]`. Variable names are case-insensitive, and profile names are lower-cased. A `default` profile must still exist: with no config file, set at least one `SANELESS_PROFILES__DEFAULT__<FIELD>` too, or loading fails.

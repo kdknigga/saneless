@@ -163,6 +163,15 @@ _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 # (HARD-01, D-01). The two are independent, and raising this one is not a
 # memory decision.
 #
+# WHAT IT STILL BOUNDS, INDIRECTLY: spool disk. Every page this loop acquires
+# is written to the job's spool, so the page count fixed here is also the
+# ceiling on how much of the workspace one runaway pass can consume. It is a
+# ceiling, not the check: SpooledPageSink._check_room_for refuses each page
+# individually, against that page's decoded size plus the operator's
+# min_free_space_mb reserve, and that is what actually protects the disk
+# (D-07). This cap's contribution is only that the loop cannot keep asking
+# forever while that check does its work.
+#
 # SCOPE: the cap is per scan_pages() call. Phase 25's two manual-duplex passes
 # each call scan_pages() separately, so this is a per-pass cap, not a per-job
 # one.
