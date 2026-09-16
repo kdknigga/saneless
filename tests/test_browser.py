@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     from saneless.job import Job, JobStore
+    from saneless.scanner.base import PageSink, ScanSettings
 
 import httpx
 import pytest
@@ -56,13 +57,7 @@ from saneless.config import (
 )
 from saneless.job import JobResult
 from saneless.paperless import UploadResult
-from saneless.scanner.base import (
-    DeviceCapabilities,
-    DeviceInfo,
-    ScanBatch,
-    ScannerBackend,
-    ScanSettings,
-)
+from saneless.scanner.base import DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     TERMINAL_STATES,
     FlipOutcome,
@@ -72,6 +67,7 @@ from saneless.vocabulary import (
 )
 from saneless.web.app import create_app
 from saneless.worker import WorkerFlipCoordinator
+from tests.conftest import StubScannerBackend, scan_batch
 
 # Every palette value these tests assert against, in one place. All of them are
 # valid only for Pico 2.1.1, the version vendored as
@@ -101,7 +97,7 @@ _SCAN_GATE_TIMEOUT = 30.0
 """Longest a closed gate holds ``scan_pages``, so a test that forgets it cannot hang."""
 
 
-class _BrowserTestScanner(ScannerBackend):
+class _BrowserTestScanner(StubScannerBackend):
     """
     Concrete scanner stub for browser tests, with a gate on ``scan_pages``.
 
@@ -109,6 +105,10 @@ class _BrowserTestScanner(ScannerBackend):
     (``gate.clear()``) to hold a job in SCANNING while it looks at the page, and
     opens it again (``gate.set()``) to let the job finish. The wait is bounded,
     so a gate left closed by a failing test ends the scan rather than the run.
+
+    Capabilities come from ``StubScannerBackend``, which reports the same
+    flatbed at 300 dpi in colour the local copy did. Only ``get_devices``
+    differs, because these tests want a device with a recognisable name.
     """
 
     def __init__(self) -> None:
@@ -117,7 +117,13 @@ class _BrowserTestScanner(ScannerBackend):
         self.gate.set()
 
     def get_devices(self) -> list[DeviceInfo]:
-        """Return a single fake device."""
+        """
+        Report a single fake device.
+
+        Returns:
+            A one-element list naming the browser test device.
+
+        """
         return [
             DeviceInfo(
                 name="test:browser:001",
@@ -127,30 +133,30 @@ class _BrowserTestScanner(ScannerBackend):
             ),
         ]
 
-    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-        """Return default capabilities."""
-        return DeviceCapabilities(
-            sources=["Flatbed"],
-            resolutions=[300],
-            modes=["color"],
-        )
-
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
+    def scan_pages(
+        self, device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
         """
-        Wait for the gate, then return one page with content on it.
+        Wait for the gate, then spool one page with content on it.
 
         The page is half black rather than blank: the default profile's empty
         page detection would drop an all-white page and end the job in ERROR,
         and the browser tests need a scan that can reach DONE.
+
+        Args:
+            device_id: Ignored; this stub scans nothing real.
+            settings: Only ``resolution`` is used, and only to report it back.
+            sink: The pipeline's own sink, which receives the page.
+
+        Returns:
+            A batch of the single record the sink returned.
+
         """
         self.gate.wait(timeout=_SCAN_GATE_TIMEOUT)
         page = Image.new("RGB", (100, 100), "white")
         page.paste((0, 0, 0), (0, 0, 50, 100))
-        return ScanBatch(
-            pages=[page],
-            actual_resolution=settings.resolution,
-            pages_rejected=0,
-        )
+        record = sink.add(page)
+        return scan_batch([record], resolution=settings.resolution)
 
 
 class _BrowserServer(NamedTuple):
