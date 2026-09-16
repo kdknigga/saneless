@@ -556,7 +556,28 @@ Plans:
   4. Every user-facing error shows a plain-language message and a suggested next step, with the raw technical detail inside a collapsed disclosure
   5. Two browser contexts show the owner the Continue/Abort flip prompt (with confirmation on Abort) and the non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels with descriptions, feeder-first on sheet-fed scanners, and say so on the strip when the config mount is read-only
 
-**Plans**: TBD
+**Plans**: 19 plans
+
+Plans:
+- [ ] 30-01-PLAN.md — Vocabulary: error advice with next steps, the shared local-time formatter, page counts, the busy line, the token rejection member
+- [ ] 30-02-PLAN.md — Config: the placeholder-token predicate, profile label/description fields, the `[web]` section
+- [ ] 30-03-PLAN.md — Job store: the owner_token writer and queue_position
+- [ ] 30-04-PLAN.md — Pipeline pass-count channel; worker scanner gate, profile storage and front pages
+- [ ] 30-05-PLAN.md — Auto-profiles: generated label and description as tool-owned keys
+- [ ] 30-06-PLAN.md — checks.py: the shared three-state registry and the bounded Paperless probe
+- [ ] 30-07-PLAN.md — Check cache with an injected clock, and the lazy refresher thread
+- [ ] 30-08-PLAN.md — `saneless doctor` and its CLI reference section
+- [ ] 30-09-PLAN.md — App composition: Jinja filters, app.state, dual-thread lifespan shutdown
+- [ ] 30-10-PLAN.md — CLI: the `Try:` advice line, `scan`'s token refusal, the local-time jobs table
+- [ ] 30-11-PLAN.md — Status strip: routes, partials, cold-start poll, paused during scan
+- [ ] 30-12-PLAN.md — Plain-language errors, page counts and the local Time cell in the templates
+- [ ] 30-13-PLAN.md — Owner cookie, owner-gated flip prompt, queue position, Abort confirmation
+- [ ] 30-14-PLAN.md — Placeholder-token refusal in the web layer and the disabled Scan button
+- [ ] 30-15-PLAN.md — Profile select with a live description and feeder-first ordering
+- [ ] 30-16-PLAN.md — Form help text, thumb-friendly tag picker with filter, the simpler form
+- [ ] 30-17-PLAN.md — Browser verification part 1: egress gate, strip, errors, counts, timestamps
+- [ ] 30-18-PLAN.md — Compose template, reference docs and master UI-SPEC accuracy
+- [ ] 30-19-PLAN.md — Browser verification part 2: two contexts, tag picker, blocked Scan button
 
 **UI hint**: yes
 
