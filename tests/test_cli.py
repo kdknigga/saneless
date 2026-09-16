@@ -26,7 +26,8 @@ from click.testing import CliRunner
 from PIL import Image, ImageDraw
 
 import saneless.cli as cli_module
-from saneless.cli import ClickFlipCoordinator, _truncate, cli
+import saneless.vocabulary as vocabulary_module
+from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -36,13 +37,15 @@ from saneless.config import (
 )
 from saneless.exceptions import (
     ConfigError,
+    FeederEmptyError,
     PaperlessError,
     PdfError,
+    SanelessError,
     ScanCancelledError,
     ScanError,
     StorageError,
 )
-from saneless.job import JobStore
+from saneless.job import Job, JobStore
 from saneless.logging_config import configure_logging
 from saneless.paperless import UploadResult
 from saneless.pipeline import PipelineEvent, PipelineRequest
@@ -53,7 +56,15 @@ from saneless.scanner.base import (
     ScanBatch,
     ScannerBackend,
 )
-from saneless.vocabulary import FlipOutcome, JobState, state_label
+from saneless.vocabulary import (
+    ErrorCategory,
+    FlipOutcome,
+    JobState,
+    error_next_step,
+    exit_code_for,
+    local_time,
+    state_label,
+)
 from tests.conftest import StubScannerBackend, scan_batch
 
 if TYPE_CHECKING:
@@ -220,6 +231,29 @@ def _patch_cli(
         monkeypatch.setattr("saneless.cli.PaperlessClient", MockPaperlessClient)
 
     return CliRunner(), settings
+
+
+def _failure_lines(result: Result) -> list[str]:
+    """
+    Return a classified failure's stderr with the D-12 advice line removed.
+
+    Every ``SanelessError`` the guard classifies to a code other than
+    ``UNEXPECTED`` now prints two things: Phase 28's locked failure line and
+    the category's ``Try: `` next step (APPL-04, D-12). The tests below were
+    written when there was only the first, and each still means "one failure
+    line and no traceback" -- so the advice line is *asserted* and stripped in
+    one place rather than each assertion being loosened to a substring check.
+
+    Args:
+        result: The CliRunner result of a command that failed.
+
+    Returns:
+        The stderr lines before the advice line.
+
+    """
+    lines = result.stderr.splitlines()
+    assert lines[-1].startswith("Try: "), result.stderr
+    return lines[:-1]
 
 
 class TestCliHelp:
@@ -1718,7 +1752,7 @@ class TestRequireSane:
         result = runner.invoke(cli, [command])
 
         assert result.exit_code == 2, result.output
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert "python-sane cannot be imported" in lines[0]
         assert reason in lines[0]
@@ -2152,10 +2186,10 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
-        assert result.stderr == (
+        assert _failure_lines(result) == [
             f"Cannot bind to 127.0.0.1:8080: [Errno {errno.EADDRINUSE}] "
-            "Address already in use\n"
-        )
+            "Address already in use"
+        ]
         assert runs == []
         sock.close.assert_called_once()
 
@@ -2176,7 +2210,7 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert "web server could not start" in lines[0]
         assert "127.0.0.1:8080" in lines[0]
@@ -2251,7 +2285,7 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
-        assert result.stderr.splitlines() == [
+        assert _failure_lines(result) == [
             "The web server could not start: Could not initialise SANE: "
             "Error during device I/O"
         ]
@@ -2297,7 +2331,7 @@ class TestServeCommand:
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 3, result.output
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1, result.stderr
         assert lines[0].startswith(
             "Paperless error: Paperless URL http://host:abc is not valid"
@@ -2440,7 +2474,7 @@ class TestAutoProfiles:
 
         result = runner.invoke(cli, ["auto-profiles"])
         assert result.exit_code == 2
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith("No scanner found: ")
 
@@ -2815,7 +2849,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 2
-        assert result.stderr.splitlines() == [
+        assert _failure_lines(result) == [
             "Configuration error in /etc/saneless/config.toml:",
             "  line 12, column 5: Invalid value",
         ]
@@ -2837,7 +2871,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 1
-        assert result.stderr.splitlines() == [
+        assert _failure_lines(result) == [
             "Scan error: Could not open scanner epson2:libusb:001:004: Invalid argument"
         ]
         assert "Traceback" not in result.output
@@ -2859,7 +2893,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 3
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith(
             "Paperless error: Could not reach Paperless at http://paperless:8000"
@@ -2891,7 +2925,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 4
-        lines = result.stderr.splitlines()
+        lines = _failure_lines(result)
         assert len(lines) == 1
         assert lines[0].startswith(
             "PDF error: Could not assemble 1 page(s) into /tmp/x.pdf: "
@@ -2913,7 +2947,7 @@ class TestExitCodes:
         result = runner.invoke(cli, ["scan"])
 
         assert result.exit_code == 2
-        assert result.stderr.splitlines() == ["No scanner found"]
+        assert _failure_lines(result) == ["No scanner found"]
 
     def test_scan_cancelled_exits_130_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3455,3 +3489,573 @@ class TestEntryPointsCloseTheBackend:
 
         assert result.exit_code == 0, result.output
         assert [scanner.close_calls for scanner in built] == [0]
+
+
+# The five categories a SanelessError can carry through the guard to an exit
+# code that is not ExitCode.UNEXPECTED, each paired with an exception
+# classify_error maps to it.  UNKNOWN and REJECTED are deliberately absent:
+# both map to UNEXPECTED, which takes the _report_unexpected branch, and D-12
+# leaves that branch alone because its category is a guess.
+_ADVISED_CATEGORIES: list[tuple[ErrorCategory, type[SanelessError]]] = [
+    (ErrorCategory.FEEDER, FeederEmptyError),
+    (ErrorCategory.SCANNER, ScanError),
+    (ErrorCategory.CONFIG, ConfigError),
+    (ErrorCategory.UPLOAD, PaperlessError),
+    (ErrorCategory.ASSEMBLY, PdfError),
+]
+
+
+def _scan_raising(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> Result:
+    """
+    Run ``scan`` against a pipeline that raises ``exc``, and return the result.
+
+    The failure is raised from inside the command rather than from the settings
+    loader so it travels the whole ``_GuardedGroup.invoke`` path the advice line
+    is added to.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        exc: The exception the stub pipeline raises.
+
+    Returns:
+        The CliRunner result.
+
+    """
+    runner, _ = _patch_cli(monkeypatch)
+
+    def failing_pipeline(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    monkeypatch.setattr("saneless.cli.run_pipeline", failing_pipeline)
+    return runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+
+class TestFailureAdvice:
+    """
+    The second CLI line, ``Try: <next step>`` (APPL-04, D-12).
+
+    Phase 28's failure line is printed byte-identically and the advice follows
+    it on stderr, so a script parsing line 1 is unaffected.
+    """
+
+    def test_feeder_failure_prints_the_failure_line_then_the_advice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The UI-SPEC S2 specimen: the locked line, then ``Try: ``."""
+        exc = FeederEmptyError("the feeder is empty")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines[0] == "Scan error: the feeder is empty"
+        assert lines[1] == (
+            "Try: Load the pages squarely in the feeder, clear any jam, then "
+            "start the scan again."
+        )
+
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_the_advice_line_is_error_next_step_verbatim(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """Every advised category renders the shared vocabulary string."""
+        result = _scan_raising(monkeypatch, exc_type("boom"))
+
+        lines = result.stderr.strip().split("\n")
+        assert lines[1] == f"Try: {error_next_step(category)}"
+
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_line_one_is_byte_identical_now_that_advice_follows_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """The advice is additive: line 1 is still exactly _failure_line's."""
+        exc = exc_type("boom")
+        result = _scan_raising(monkeypatch, exc)
+
+        lines = result.stderr.strip().split("\n")
+        assert lines[0] == _failure_line(exc, category)
+        assert len(lines) == 2
+
+    @pytest.mark.parametrize(("category", "exc_type"), _ADVISED_CATEGORIES)
+    def test_exit_codes_are_unchanged_by_the_advice_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        category: ErrorCategory,
+        exc_type: type[SanelessError],
+    ) -> None:
+        """Phase 28's D-07 exit code per category still holds."""
+        result = _scan_raising(monkeypatch, exc_type("boom"))
+
+        assert result.exit_code == int(exit_code_for(category))
+
+    def test_the_advice_goes_to_stderr_not_stdout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A script redirecting stdout is unaffected by the advice line."""
+        result = _scan_raising(monkeypatch, FeederEmptyError("the feeder is empty"))
+
+        assert "Try: " in result.stderr
+        assert "Try: " not in result.stdout
+
+    def test_the_prefix_carries_no_colour_and_no_glyph(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The prefix is exactly ``Try: `` -- one space, nothing else."""
+        result = _scan_raising(monkeypatch, FeederEmptyError("the feeder is empty"))
+
+        advice = result.stderr.strip().split("\n")[1]
+        assert advice.startswith("Try: ")
+        assert "\x1b" not in advice
+
+    def test_an_unexpected_saneless_error_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare SanelessError takes _report_unexpected, which is unchanged."""
+        result = _scan_raising(monkeypatch, SanelessError("boom"))
+
+        assert result.exit_code == 5
+        assert "Try: " not in result.stderr
+
+    def test_a_non_saneless_exception_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The final except Exception arm is untouched by D-12."""
+        result = _scan_raising(monkeypatch, RuntimeError("boom"))
+
+        assert result.exit_code == 5
+        assert "Try: " not in result.stderr
+
+    def test_a_storage_error_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """StorageError has its own arm and its own line; it gains no advice."""
+        result = _scan_raising(monkeypatch, StorageError("db is unreadable"))
+
+        assert result.exit_code == 2
+        assert result.stderr.startswith("Job database error: db is unreadable")
+        assert "Try: " not in result.stderr
+
+    def test_a_cancelled_scan_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancel is not a failure, so there is nothing to advise (D-03)."""
+        result = _scan_raising(monkeypatch, ScanCancelledError("Cancelled"))
+
+        assert result.exit_code == 130
+        assert "Try: " not in result.stderr
+
+    def test_a_keyboard_interrupt_gets_no_advice_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ctrl-C exits 130 with one line, as it did before D-12."""
+        result = _scan_raising(monkeypatch, KeyboardInterrupt())
+
+        assert result.exit_code == 130
+        assert "Try: " not in result.stderr
+
+
+def _refusing_paperless() -> type:
+    """
+    Build a PaperlessClient stand-in whose construction fails the test.
+
+    ``scan`` builds the client after the scanner, so reaching it at all would
+    mean the D-16 guard ran too late.
+
+    Returns:
+        A class that raises if it is ever constructed.
+
+    """
+
+    class _NeverBuilt:
+        """A paperless client that must not be reached."""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            """Fail loudly: D-16 refuses before this point."""
+            msg = "PaperlessClient was built despite a placeholder token"
+            raise AssertionError(msg)
+
+    return _NeverBuilt
+
+
+def _open_counting_scanner(opens: list[str]) -> type[ScannerBackend]:
+    """
+    Build a scanner class that records every construction and device query.
+
+    "Before the scanner is opened" is the whole point of D-16, so it is
+    asserted from a counter rather than assumed from the exit code.
+
+    Args:
+        opens: The list every call appends its name to.
+
+    Returns:
+        A ``ScannerBackend`` subclass sharing that list.
+
+    """
+
+    class _CountingScanner(StubScannerBackend):
+        """A stub that records being opened."""
+
+        def __init__(self, host: str = "") -> None:
+            """Record the construction -- this is what "opened" means here."""
+            opens.append("SaneBackend")
+
+        def get_devices(self) -> list[DeviceInfo]:
+            """Record the query and report one device."""
+            opens.append("get_devices")
+            return [DeviceInfo("test:device:001", "Test", "Model", "flatbed scanner")]
+
+    return _CountingScanner
+
+
+def _token_settings(value: str, consume_dir: str = "") -> Settings:
+    """
+    Build settings carrying ``value`` as the paperless-ngx token.
+
+    Args:
+        value: The configured token, placeholder or not.
+        consume_dir: A fallback consume directory, when the test needs one.
+
+    Returns:
+        Settings otherwise identical to the suite's defaults.
+
+    """
+    return _make_settings(
+        paperless=PaperlessConfig(
+            url="http://localhost:8000",
+            token=value,
+            consume_dir=consume_dir,
+        ),
+    )
+
+
+class TestScanTokenRefusal:
+    """
+    ``saneless scan`` refuses a placeholder token before paper moves (D-16).
+
+    The check runs before the scanner is opened, it is unconditional, and the
+    three commands that never talk to paperless-ngx are untouched (APPL-07).
+    """
+
+    def test_a_blank_token_is_a_placeholder_and_exits_2_before_the_scanner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset token refuses with exit 2 and zero scanner opens."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(""),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+
+    @pytest.mark.parametrize("value", ["changeme", "your-api-token-here", "   "])
+    def test_a_placeholder_token_exits_2_before_the_scanner(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Every member of the literal set refuses the same way."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(value),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+
+    def test_a_real_token_is_not_a_placeholder_and_scans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real-looking token leaves ``scan`` exactly as it was."""
+        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("a-real-token"))
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 0, result.output
+        assert "Done: Tax return" in result.output
+
+    def test_a_consume_dir_fallback_does_not_soften_the_placeholder_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-16: a configured fallback must not make the surfaces disagree."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings("changeme", consume_dir=str(tmp_path)),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+
+    def test_the_placeholder_refusal_names_the_title_and_profile_then_advises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It is a ConfigError, so it wears the D-08 shape and the D-12 advice."""
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings("changeme"),
+            scanner_cls=_open_counting_scanner([]),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        lines = result.stderr.splitlines()
+        assert lines[0] == (
+            "Scanning 'Tax return' with profile 'default': "
+            "the paperless-ngx API token has not been set"
+        )
+        assert lines[1] == f"Try: {error_next_step(ErrorCategory.CONFIG)}"
+
+    def test_the_placeholder_refusal_never_echoes_the_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ASVS V7: the token is passed to the predicate, never rendered."""
+        secret = "your-token-here"
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(secret),
+            scanner_cls=_open_counting_scanner([]),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2
+        assert secret not in result.output
+        assert secret not in result.stderr
+
+    def test_devices_is_unaffected_by_a_placeholder_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``devices`` never talks to paperless-ngx, so it still exits 0."""
+        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("changeme"))
+
+        result = runner.invoke(cli, ["devices"])
+
+        assert result.exit_code == 0, result.output
+        assert "Epson" in result.output
+
+    def test_jobs_is_unaffected_by_a_placeholder_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``jobs`` reads the local database only, so it still exits 0."""
+        settings = _token_settings("changeme")
+        settings.output = OutputConfig(
+            tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
+            log_file=str(tmp_path / "saneless.log"),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+
+    def test_auto_profiles_is_unaffected_by_a_placeholder_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``auto-profiles`` only reads the scanner, so it still exits 0."""
+        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("changeme"))
+
+        with runner.isolated_filesystem():
+            result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+
+
+@pytest.fixture
+def cli_local_zone(monkeypatch: pytest.MonkeyPatch) -> Generator[Callable[[str], None]]:
+    """
+    Give one test control of the process's local zone, then restore it.
+
+    The same technique plan 30-01's ``local_zone`` fixture uses: ``local_time``
+    renders whatever zone the C library reports, so pinning ``TZ`` and calling
+    ``time.tzset()`` is the only way to assert an exact string on a host in an
+    unknown zone. The trailing ``tzset`` is what makes the C library notice the
+    variable monkeypatch removed.
+
+    Yields:
+        A function that switches the process's zone for the rest of the test.
+
+    """
+
+    def _use(zone: str) -> None:
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+
+    yield _use
+    time.tzset()
+
+
+def _jobs_header_title_width(header: str) -> int:
+    """
+    Measure the Title column's width from a rendered ``jobs`` header.
+
+    Measured rather than recomputed from the CLI's own constants, so a test
+    that says "24 at 80 columns" is reading the output an operator sees.
+    ``Title`` is padded to its width and ``Status`` follows one space later.
+
+    Args:
+        header: The first line ``saneless jobs`` printed.
+
+    Returns:
+        The Title column's width in characters.
+
+    """
+    after_profile = cli_module._TIME_COL_WIDTH + 1 + 15 + 1
+    return header[after_profile:].index("Status") - 1
+
+
+class TestJobsTableWidth:
+    """The human ``jobs`` table renders local time and still fits (APPL-12)."""
+
+    @staticmethod
+    def _settings_for(tmp_path: Path) -> Settings:
+        """Build Settings whose data_dir -- and so db_path -- is tmp_path."""
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+
+    def _one_job(self, db_path: str) -> Job:
+        """Create one job and return it as the store recorded it."""
+        store = JobStore(db_path=db_path)
+        store.create_job(profile="default", title="Invoice")
+        recorded = store.list_recent(limit=1)[0]
+        store.close()
+        return recorded
+
+    def test_the_cli_and_the_web_share_one_formatter_object(self) -> None:
+        """D-35: cli.py imports the function, it does not re-derive the format."""
+        assert cli_module.local_time is vocabulary_module.local_time
+
+    def test_the_table_renders_local_time_with_the_zone_named(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        cli_local_zone: Callable[[str], None],
+    ) -> None:
+        """Each row's timestamp is local_time's output, seconds dropped."""
+        cli_local_zone("America/Chicago")
+        settings = self._settings_for(tmp_path)
+        job = self._one_job(str(settings.output.db_path))
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        row = result.output.strip().split("\n")[2]
+        assert row.startswith(local_time(job.created_at))
+        assert job.created_at.strftime("%Y-%m-%d %H:%M:%S") not in row
+
+    def test_the_timestamp_column_width_is_derived_not_written_down(self) -> None:
+        """A six-character zone token cannot silently truncate the column."""
+        assert len(local_time(datetime.now(tz=UTC))) <= cli_module._TIME_COL_WIDTH
+        assert cli_module._TIME_COL_WIDTH == 22
+
+    def test_the_title_column_is_24_at_80_columns(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Unchanged from before this plan: the zone token fits in the slack."""
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        self._one_job(str(settings.output.db_path))
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.strip().split("\n")
+        assert _jobs_header_title_width(lines[0]) == 24
+        assert all(len(line) <= 80 for line in lines)
+
+    def test_a_narrow_terminal_floors_the_title_column_at_15(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """40 columns still renders a table rather than raising."""
+        monkeypatch.setenv("COLUMNS", "40")
+        settings = self._settings_for(tmp_path)
+        self._one_job(str(settings.output.db_path))
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        lines = result.output.strip().split("\n")
+        assert _jobs_header_title_width(lines[0]) == 15
+
+
+class TestJobsJsonContract:
+    """``jobs --json`` stays UTC ISO-8601: it is a machine contract (D-34)."""
+
+    @staticmethod
+    def _settings_for(tmp_path: Path) -> Settings:
+        """Build Settings whose data_dir -- and so db_path -- is tmp_path."""
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+
+    def test_created_at_is_utc_iso_8601_whatever_the_servers_zone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        cli_local_zone: Callable[[str], None],
+    ) -> None:
+        """The offset is +00:00 even on a server the table renders as CDT."""
+        cli_local_zone("America/Chicago")
+        settings = self._settings_for(tmp_path)
+        store = JobStore(db_path=str(settings.output.db_path))
+        store.create_job(profile="default", title="Invoice")
+        recorded = store.list_recent(limit=1)[0]
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        created_at = json.loads(result.output)[0]["created_at"]
+        assert created_at.endswith("+00:00")
+        assert datetime.fromisoformat(created_at) == recorded.created_at
+
+    def test_json_never_carries_the_local_rendering(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        cli_local_zone: Callable[[str], None],
+    ) -> None:
+        """Localising a machine contract would break every script silently."""
+        cli_local_zone("America/Chicago")
+        settings = self._settings_for(tmp_path)
+        job = JobStore(db_path=str(settings.output.db_path))
+        job.create_job(profile="default", title="Invoice")
+        recorded = job.list_recent(limit=1)[0]
+        job.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert local_time(recorded.created_at) not in result.output

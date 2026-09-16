@@ -36,6 +36,7 @@ from .checks import (
 )
 from .config import (
     Settings,
+    is_placeholder_token,
     load_settings,
     log_config_sources,
     resolve_job_title,
@@ -69,7 +70,9 @@ from .vocabulary import (
     JobState,
     ProfileStorage,
     classify_error,
+    error_next_step,
     exit_code_for,
+    local_time,
     progress_label,
     state_label,
 )
@@ -90,6 +93,26 @@ logger = logging.getLogger(__name__)
 # terminal without anyone noticing.
 _STATUS_COL_WIDTH = max(len(state_label(state)) for state in JobState)
 
+# The widest zone token ``%Z`` produces at a realistic offset: five characters,
+# the ``+0545`` shape the tz database falls back to where there is no
+# abbreviation (RESEARCH § 8, assumption A3). The only literal in the width
+# below, and the one this host cannot demonstrate on its own.
+_WIDEST_ZONE_TOKEN = len("+0545")
+
+# Width of the Timestamp column in `saneless jobs`, derived from a rendered
+# sample rather than written down, exactly as _STATUS_COL_WIDTH is. The date
+# and time half is fixed-width; only the zone token this host happens to report
+# varies, so the column reserves the widest realistic one instead of trusting
+# the three letters most of the world sees. A host whose token is wider still
+# wins the max(), so a zone abbreviation cannot silently truncate the column.
+# Comes to 22, which is what ts_w was before local time arrived -- the reserve
+# the seconds used to occupy is exactly the reserve the zone now needs.
+_TIME_COL_SAMPLE = local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC))
+_TIME_COL_WIDTH = max(
+    len(_TIME_COL_SAMPLE),
+    len(_TIME_COL_SAMPLE.rsplit(" ", 1)[0]) + 1 + _WIDEST_ZONE_TOKEN,
+)
+
 # What the operator is asked between the two manual-duplex passes.  A yes/no
 # question rather than "press Enter" on purpose: click's pause(), the only API that
 # matches "press Enter", is a documented no-op off a terminal and would start
@@ -97,6 +120,18 @@ _STATUS_COL_WIDTH = max(len(state_label(state)) for state in JobState)
 _FLIP_PROMPT = (
     "Flip the stack over and load it back into the feeder. Scan the back sides?"
 )
+
+# Why `scan` refuses when nobody configured paperless-ngx (D-16, APPL-07). A
+# developer constant: it names the problem and never the value, the URL or the
+# config path. Lower-cased and without a full stop because it is the tail of
+# Phase 28 D-08's `<what saneless was doing>: <problem>` line, unlike
+# checks.py's sentence for the same fact, which stands alone in a table row.
+#
+# The name carries no password-ish word on purpose: ruff's S105 reads the
+# *name* of the target, not the value, so `_TOKEN_...` here would be flagged as
+# a hardcoded credential. This is vocabulary.py's `_REJECTED_WIRE_VALUE` idiom
+# rather than a suppression.
+_UNSET_CREDENTIAL_PROBLEM = "the paperless-ngx API token has not been set"
 
 
 # Whether a human can answer a prompt here, behind a function of its own rather
@@ -426,7 +461,17 @@ class _GuardedGroup(click.Group):
                 _report_unexpected(ctx, exc)
             else:
                 _log_failure(ctx, exc)
+                # D-12: two lines, and the first one is not ours to change.
+                # Line 1 is Phase 28 D-08's locked shape, printed unchanged, so
+                # a script parsing it and the doc-truth message-shape tests that
+                # pin it are both unaffected. Line 2 is the same
+                # error_next_step string the web error page renders -- which is
+                # why the copy is surface-neutral and never says "press Scan" or
+                # "run the command" (D-10, D-11). The UNEXPECTED branch above
+                # gets no advice: its category is a guess about an exception
+                # saneless did not raise.
                 click.echo(_failure_line(exc, category), err=True)
+                click.echo(f"Try: {error_next_step(category)}", err=True)
             ctx.exit(code)
         except Exception as exc:
             _report_unexpected(ctx, exc)
@@ -538,6 +583,27 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # title, else "Scan <time>"; blank after stripping counts as not typed.
     now = datetime.now(tz=UTC)
     resolved_title = resolve_job_title(title, settings.profiles[profile], now=now)
+
+    # D-16: refused here, before the scanner is opened, because a scan that
+    # cannot upload is wasted paper. The refusal is unconditional -- a
+    # configured paperless.consume_dir fallback does not soften it, or `scan`,
+    # `doctor` and the web UI would disagree about whether the appliance can
+    # work. `devices`, `auto-profiles` and `jobs` are deliberately untouched:
+    # none of them talks to paperless-ngx.
+    #
+    # This is the second place cli.py unwraps the token; the PaperlessClient
+    # construction below is the other. The value goes to the predicate and
+    # nowhere else -- it is never logged, echoed or interpolated into the
+    # message, which is a developer constant (ASVS V7, T-30-42). The line is
+    # built in Phase 28 D-08's shape because ErrorCategory.CONFIG prints the
+    # exception as-is (_failure_line), so the "what saneless was doing" half
+    # has to be part of the message.
+    if is_placeholder_token(settings.paperless.token.get_secret_value()):
+        msg = (
+            f"Scanning '{resolved_title}' with profile '{profile}': "
+            f"{_UNSET_CREDENTIAL_PROBLEM}"
+        )
+        raise ConfigError(msg)
 
     manual_duplex = settings.profiles[profile].duplex == "manual"
     # Refused here, before the backend exists, so no paper moves: from cron or a
@@ -738,6 +804,11 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                             # is the machine contract and scripts compare
                             # against "DONE" / "FALLBACK".
                             "state": j.state.value,
+                            # UTC ISO-8601, deliberately not localised: this
+                            # is a machine contract documented in
+                            # docs/how-to/cli-scripting.md, and APPL-12 asks
+                            # for local time on *user-facing* surfaces. The
+                            # human table below goes local; this does not.
                             "created_at": j.created_at.isoformat(),
                             "outcome": j.outcome.value if j.outcome else None,
                             "warning": j.warning,
@@ -749,7 +820,7 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
             )
         else:
             cols = shutil.get_terminal_size((80, 24)).columns
-            ts_w = 22
+            ts_w = _TIME_COL_WIDTH
             profile_w = 15
             # Three single spaces separate the four columns.
             title_w = max(15, cols - (ts_w + profile_w + _STATUS_COL_WIDTH + 3))
@@ -761,7 +832,10 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
             click.echo("-" * min(len(header), cols))
             for j in recent:
                 click.echo(
-                    f"{j.created_at.strftime('%Y-%m-%d %H:%M:%S'):<{ts_w}} "
+                    # The one shared formatter the web history table reads, so
+                    # the two surfaces cannot drift (D-34, D-35). Seconds are
+                    # gone and the zone is named.
+                    f"{local_time(j.created_at):<{ts_w}} "
                     f"{_truncate(j.profile, profile_w):<{profile_w}} "
                     f"{_truncate(j.title, title_w):<{title_w}} "
                     f"{state_label(j.state)}"

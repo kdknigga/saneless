@@ -41,7 +41,7 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--title` | TEXT | the profile's `title`, else `Scan <date time>` | Document title for paperless-ngx; a blank title counts as omitted |
+| `--title` | TEXT | the profile's `title`, else `Scan <local date time with the zone named>` | Document title for paperless-ngx; a blank title counts as omitted |
 | `--profile` | TEXT | `default` | Scan profile name from config |
 
 **Exit codes:**
@@ -50,11 +50,15 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
 |------|---------|
 | 0 | Scan and upload completed successfully |
 | 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt) |
-| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, no scanner found, or python-sane not installed) |
+| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, an unset or placeholder paperless-ngx API token, no scanner found, or python-sane not installed) |
 | 3 | Paperless-ngx upload error (unreachable after retries, upload rejected, malformed Paperless URL) |
 | 4 | PDF assembly error (disk full, unwritable output directory) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt, or Ctrl-C during the scan) |
+
+With neither `--title` nor a profile `title`, the document title is the scan's start time rendered in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. Set `TZ` on the server (or in `docker-compose.yml`) if that zone is wrong; a container reports UTC unless you do.
+
+If the paperless-ngx API token is unset, blank or still one of the shipped placeholders such as `changeme`, `scan` refuses with exit code 2 before the scanner is opened, so no paper is fed for an upload that cannot succeed. A configured `paperless.consume_dir` fallback does not change this: run `saneless doctor` to see the same fact the web UI reports.
 
 For a profile with `duplex = "manual"`, `scan` pauses between the two passes and asks `Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:`. Yes (the default) scans the back sides. No, Ctrl-D (end of input, which is also what a terminal that closes produces) or Ctrl-C at the flip prompt cancels the scan, prints one line and exits with code 130. A read error at the flip prompt, such as an I/O error or undecodable input, fails the scan with exit code 1, and the error is logged with its traceback. When stdin is not a terminal, `scan` refuses the profile with exit code 2 before any page is fed. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
 
@@ -128,6 +132,8 @@ saneless [--config PATH] [-v] jobs [--json] [--limit N]
 | 2 | Configuration error (invalid config, or the job database is unreadable or has an unsupported schema) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 130 | Cancelled (Ctrl-C) |
+
+The table's `Timestamp` column renders each job's start time in the server's local timezone with the zone named, for example `2026-03-22 09:30 CDT`, and drops seconds. `--json` is a machine contract and is unaffected: its `created_at` stays a UTC ISO-8601 string carrying the `+00:00` offset. See [Use the CLI for Scripting](../how-to/cli-scripting.md#job-history-json).
 
 `jobs` does not need python-sane, and on a fresh install it creates the data directory and prints an empty history.
 
