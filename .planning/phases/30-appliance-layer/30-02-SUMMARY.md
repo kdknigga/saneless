@@ -167,6 +167,13 @@ Ready for the wave-2 plans that read this schema:
 - **30-06/30-11 (form shape, tag picker)** can read `settings.web.show_tags` / `.show_correspondent`. D-29 is a hard constraint on those plans: hiding a control must change the form and never the scan, so `default_tags` and `default_correspondent` must still be applied when the controls are hidden.
 - **Docs are not updated.** `docs/reference/configuration.md` still lists only `[scanner]`, `[paperless]`, `[output]` and `[profiles]`. The `[web]` keys and the `label`/`description` profile keys need documenting, and the how-to guide needs D-18's "remove `auto_generated` to take the profile over" escape hatch. A later plan in this phase owns that.
 
+## Self-Check: PASSED
+
+- All modified files exist on disk: `src/saneless/config.py`, `tests/test_config.py`, `.planning/phases/30-appliance-layer/30-02-SUMMARY.md`
+- All seven commits present on `worktree-agent-ae1cf3d21174d057f`, RED before GREEN for each of the three TDD tasks: `13ec30f`, `7ad3df5`, `2e1cd25`, `e7599e3`, `2482529`, `6bf9d8a`, `caba98f`
+- No files deleted relative to the plan base `6867e79`; working tree clean
+- No modifications to `STATE.md` or `ROADMAP.md` (orchestrator-owned)
+
 ---
 *Phase: 30-appliance-layer, Plan: 02*
 *Completed: 2026-09-16*
