@@ -478,17 +478,35 @@ def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     Any filesystem trouble -- a permission change, a race, the directory
     disappearing underneath us -- ends the check silently instead.
 
+    ``failed_dir`` holds two kinds of artefact, and both count. A preserved
+    scan is usually a PDF, but an assembly failure has no PDF to keep and
+    preserves the spooled page files themselves, as a job-keyed *directory*
+    (D-10). Counting only ``*.pdf`` would let a directory fill up with those
+    and report nothing, which is precisely the silence this warning exists to
+    break -- so a directory counts as one preserved scan and contributes its
+    whole recursive size to the total.
+
     Args:
-        failed_dir: The directory preserved PDFs are moved into. Every scan
+        failed_dir: The directory preserved scans are moved into. Every scan
             this guard preserved has already been moved in by the time this
             runs, so all of them are included in the count.
 
     """
     try:
         preserved = list(failed_dir.glob("*.pdf"))
-        if len(preserved) < FAILED_DIR_WARN_THRESHOLD:
+        # The walk lives inside this try on purpose: a page directory removed
+        # underneath it -- by an operator draining failed/ while a job fails --
+        # raises OSError and must leave through the same silent return.
+        page_dirs = [entry for entry in failed_dir.iterdir() if entry.is_dir()]
+        if len(preserved) + len(page_dirs) < FAILED_DIR_WARN_THRESHOLD:
             return
         total_bytes = sum(pdf.stat().st_size for pdf in preserved)
+        total_bytes += sum(
+            page.stat().st_size
+            for page_dir in page_dirs
+            for page in page_dir.rglob("*")
+            if page.is_file()
+        )
     except OSError:
         # Deliberately silent, per the docstring: a bookkeeping failure must
         # not displace the delivery failure the guard is about to re-raise.
@@ -497,7 +515,7 @@ def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
         "%d preserved scans (%.1f MiB) have accumulated in %s -- saneless "
         "never deletes these files itself, so draining the directory is yours "
         "to do once those documents are safely in paperless-ngx",
-        len(preserved),
+        len(preserved) + len(page_dirs),
         total_bytes / (1024 * 1024),
         failed_dir,
     )
@@ -821,6 +839,83 @@ def _preserving_partial_scan(
         if isinstance(exc, SanelessError):
             raise type(exc)(msg) from exc
         raise ScanError(msg) from exc
+
+
+@contextlib.contextmanager
+def _preserving_page_files(spool_dir: Path, destination: Path) -> Iterator[None]:
+    """
+    Keep the spooled page files when the PDF they belong to cannot be built.
+
+    Phase 28 deferred this case; D-10 answers it. There is no PDF to preserve,
+    because building one is exactly what failed, so the pages themselves move
+    out of the workspace instead -- into a job-keyed directory under
+    ``failed/``, which is a second *kind* of artefact that directory has never
+    held before. ``_warn_if_failed_dir_growing`` counts it.
+
+    The destination's name is derived from ``build_pdf_filename``'s output, so
+    the directory inherits that function's uniqueness argument unchanged: a UTC
+    timestamp, a truncated job-id segment and a sanitised, length-capped title
+    (T-29-34). Two jobs with the same title cannot collide, which matters here
+    because a collision would bury one failure's pages inside another's.
+
+    Each page moves to its own **explicit** destination path rather than into
+    the bare directory, for the reason ``_preserving``'s docstring sets out:
+    ``shutil.Error`` does not inherit from ``OSError`` and would escape the
+    handler below. ``shutil`` rather than ``Path.rename`` because ``tmp_dir``
+    and ``data_dir`` may be on different filesystems.
+
+    Args:
+        spool_dir: The job's spool, inside the workspace that is about to be
+            unwound -- which is why this guard has to run inside it.
+        destination: The job-keyed directory to move the pages into. Created
+            here, and only if there is at least one page to put in it, so a
+            failure with an empty spool leaves no empty directory behind.
+
+    Yields:
+        Nothing. The block it wraps is the assembly attempt itself.
+
+    Raises:
+        SanelessError: The original exception's own type, re-raised with the
+            page count and the destination appended -- so a ``PdfError`` stays
+            a ``PdfError`` and keeps exit 4 and its error category -- or, if
+            the move failed too, naming both failures.
+        PdfError: When a non-saneless exception escaped assembly. Rebuilding an
+            arbitrary third-party exception from a single string is not safe,
+            and from the job's point of view anything raised in this window is
+            an assembly failure.
+
+    """
+    try:
+        yield
+    except Exception as exc:
+        moved: list[Path] = []
+        try:
+            page_files = sorted(
+                entry for entry in spool_dir.iterdir() if entry.is_file()
+            )
+            if page_files:
+                destination.mkdir(parents=True, exist_ok=True)
+                for page_file in page_files:
+                    target = destination / page_file.name
+                    shutil.move(page_file, target)
+                    moved.append(target)
+                # Once, after the loop, so the count reflects the finished
+                # state -- the same reason _preserving calls it there.
+                _warn_if_failed_dir_growing(destination.parent)
+        except OSError as move_exc:
+            msg = f"{exc}. The scan could NOT be preserved to {destination}: {move_exc}"
+            if isinstance(exc, SanelessError):
+                raise type(exc)(msg) from exc
+            raise PdfError(msg) from exc
+        if not moved:
+            raise
+        msg = (
+            f"{exc}. The {len(moved)} spooled page file(s) "
+            f"were preserved at {destination}"
+        )
+        if isinstance(exc, SanelessError):
+            raise type(exc)(msg) from exc
+        raise PdfError(msg) from exc
 
 
 def _drop_empty_pages(
@@ -1692,6 +1787,10 @@ def run_pipeline(
             removed every page; or if a manual duplex flip prompt fails or its
             wait times out. When pages had already reached the spool, the
             message additionally names how many were kept and where.
+        PdfError: If the PDF cannot be assembled. The spooled page files are
+            moved into a job-keyed directory under
+            ``settings.output.failed_dir`` first, and the message names the
+            count and that directory (D-10).
         PaperlessError: If upload or polling fails. The message names where
             the assembled PDF was preserved, or -- if preservation failed
             too -- reports both failures.
@@ -1825,12 +1924,21 @@ def run_pipeline(
         # the declared page size cannot disagree. A device that substitutes
         # would otherwise produce both a mis-cropped page and a MediaBox at odds
         # with its own content, re-opening part of OUTC-06.
-        pdf_path = assemble_pdf(
-            filtered,
-            tmp_path,
-            filename=build_pdf_filename(request.job_id, request.title),
-            dpi=actual_dpi,
-        )
+        pdf_filename = build_pdf_filename(request.job_id, request.title)
+        # The same name, minus its extension, for the directory the pages fall
+        # back to when no PDF can be built: one composition, so the two
+        # artefacts a single job can leave in failed/ are named consistently
+        # and inherit the same uniqueness argument (D-10).  Composed once, not
+        # twice, because build_pdf_filename stamps the current second.
+        with _preserving_page_files(
+            spool_dir, settings.output.failed_dir / Path(pdf_filename).stem
+        ):
+            pdf_path = assemble_pdf(
+                filtered,
+                tmp_path,
+                filename=pdf_filename,
+                dpi=actual_dpi,
+            )
         logger.info("PDF assembled: %s", pdf_path)
 
         # Steps 4 and 5: upload and poll, both inside the preservation guard.

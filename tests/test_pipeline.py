@@ -3664,10 +3664,15 @@ class TestAssemblyFailureKeepsThePageFiles:
 
         Same title, two job ids: two directories, and neither move lands on a
         destination that already held pages.
+
+        The ids differ inside their first eight characters, because that is
+        all of the job id ``build_pdf_filename`` puts in a name -- the same
+        constraint ``test_two_preserved_scans_sharing_a_title_are_two_files``
+        already works within.  Production ids are uuid4s.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
 
-        for job_id in ("job-pdf-first", "job-pdf-second"):
+        for job_id in ("pdf-one", "pdf-two"):
             scanner = MagicMock(spec=ScannerBackend)
             scanner.scan_pages.side_effect = spooling(
                 [_distinct_page(index) for index in range(2)]
