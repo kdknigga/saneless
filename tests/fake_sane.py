@@ -54,9 +54,11 @@ purpose rather than discovered there.
 
 from __future__ import annotations
 
+import threading
 import time
 import weakref
-from typing import TYPE_CHECKING, Any
+from enum import StrEnum
+from typing import TYPE_CHECKING, Any, assert_never
 
 from PIL import Image, ImageDraw
 
@@ -67,6 +69,7 @@ __all__ = [
     "FakeSaneDev",
     "FakeSaneError",
     "FakeSaneModule",
+    "ReadBlockMode",
     "build_option_table",
 ]
 
@@ -129,6 +132,53 @@ _GEOMETRY_NAMES = tuple(name for name, _title in _GEOMETRY_OPTIONS)
 # Small enough to keep a multi-page feeder test cheap, and deliberately smaller
 # than any paper size at a realistic dpi -- see set_page_size().
 _DEFAULT_PAGE_SIZE = (200, 300)
+
+# The ceiling every Event-gated read waits under, and the reason it has one.
+#
+# A gate that is deliberately never released must still not outlive the test
+# session, so the wait is bounded rather than infinite.  30 s sits under
+# pytest-timeout's 60 s, so an abandoned reader expires inside the run instead
+# of after it, and comfortably above the backend's 10 s cancel grace, so it is
+# always the gate -- never this ceiling -- that decides when a blocked read
+# comes back.  It is a bounded wait and not a sleep: nothing waits it out on a
+# passing test, which is what TEST-02 forbids.
+_READ_GATE_CEILING_SECONDS = 30.0
+
+# The denominator that makes a post-cancel page truncated rather than absent.
+#
+# Measured on real libsane (29-RESEARCH.md Finding 2): a cancelled ``snap()``
+# returns a *truncated image* rather than raising -- 3779x242 of a full page,
+# which clears the backend's 10 KB floor and would be spooled by any code that
+# used a late value.  A quarter of the default 200x300 page is 200x75, i.e.
+# 45,000 bytes of RGB data, which clears that same floor for the same reason.
+# Modelling the truncation this way is what makes the backend's discard rule
+# testable instead of incidental.
+_TRUNCATED_PAGE_DIVISOR = 4
+
+# The message a real cancelled read raises with when it raises at all: SANE's
+# ``SANE_STATUS_CANCELLED`` renders as this string through ``sane_strstatus``.
+_CANCELLED_MESSAGE = "Operation was cancelled"
+
+
+class ReadBlockMode(StrEnum):
+    """
+    How an Event-gated read ends, and whether ``cancel()`` ends it at all.
+
+    The three variants are the three things real libsane was measured or read
+    to do when a read is cancelled, and a test double that offered only one of
+    them would let the backend's timeout path look correct on the other two.
+    """
+
+    # cancel() releases the gate and the read returns a truncated page -- the
+    # measured behaviour, and the one the backend must refuse to spool.
+    PARTIAL = "partial"
+    # cancel() releases the gate and the read raises, as a backend reporting a
+    # status that is neither GOOD nor EOF does.
+    RAISE = "raise"
+    # cancel() does not release the gate at all: the scanner never answers.
+    # Only release_read() ends this one, which is how a test drives the
+    # backend's wedge and then its recovery.
+    NEVER = "never"
 
 
 def _option_is_active(cap: int) -> bool:
@@ -631,6 +681,10 @@ class FakeSaneDev:
     close_calls: int
     issued_pages: list[weakref.ref[Image.Image]]
     high_water_live_pages: int
+    read_gate: threading.Event
+    close_while_blocked: bool
+    _block_mode: ReadBlockMode | None
+    _blocked_readers: int
     _options: list[tuple]
     _values: dict[str, Any]
     _pages: int
@@ -697,6 +751,10 @@ class FakeSaneDev:
         state["close_calls"] = 0
         state["issued_pages"] = []
         state["high_water_live_pages"] = 0
+        state["read_gate"] = threading.Event()
+        state["close_while_blocked"] = False
+        state["_block_mode"] = None
+        state["_blocked_readers"] = 0
 
     def __setattr__(self, key: str, value: object) -> None:
         """
@@ -799,6 +857,104 @@ class FakeSaneDev:
 
         """
         self.__dict__["_page_delay"] = seconds
+
+    def block_read(self, mode: ReadBlockMode) -> None:
+        """
+        Arm the Event-gated blocking read, so a cancel can be exercised.
+
+        A read that has started and has not come back is a real condition --
+        it is the whole of HARD-03 -- so it belongs in the one shared device
+        rather than in a bespoke blocking iterator written per test, for the
+        same reason ``set_page_delay`` gives: a hand-rolled blocking double is
+        a device handle of its own, and this module exists so there is exactly
+        one of those.
+
+        Unlike ``set_page_delay`` this costs no wall-clock time at all.  The
+        blocked ``snap()`` waits on ``read_gate``, so a test observes the block
+        and ends it by setting an ``Event`` rather than by outwaiting a sleep,
+        which is what TEST-02 requires.
+
+        A method rather than a constructor keyword for the usual reason:
+        ``__init__`` already carries ruff's maximum of five arguments.
+
+        Args:
+            mode: What the blocked read does when its gate is released, and
+                whether ``cancel()`` releases it at all.
+
+        """
+        self.__dict__["_block_mode"] = mode
+        self.__dict__["read_gate"].clear()
+
+    def release_read(self) -> None:
+        """
+        Release the gate, whatever the armed mode is.
+
+        ``cancel()`` releases it only in the two modes that model a scanner
+        which answered.  This is the other way a blocked read ends: the late
+        answer that arrives after the backend has already given up on it, and
+        the one that lets a test watch a wedged backend recover.
+        """
+        self.__dict__["read_gate"].set()
+
+    def read_is_blocked(self) -> bool:
+        """
+        Report whether a reader is inside the gate right now.
+
+        Read by ``close()`` and by ``FakeSaneModule.exit()``, which is the
+        whole point: both are operations the SANE standard forbids while a
+        read is outstanding, so the fake records them happening rather than
+        refusing them, and the test asserts they did not happen.
+
+        Returns:
+            True while at least one ``snap()`` is waiting on ``read_gate``.
+
+        """
+        return self._blocked_readers > 0
+
+    def _truncated_page(self) -> Image.Image:
+        """
+        Build the partial page a cancelled read hands back.
+
+        Full width, a fraction of the height, and still above the backend's
+        byte floor -- see ``_TRUNCATED_PAGE_DIVISOR`` for the measurement this
+        models.  Mode ``RGB``, like every other page this fake produces, so the
+        backend's byte-count arithmetic stays exact (Pitfall 7).
+
+        Returns:
+            A short page that would pass ``_validate_page_image``.
+
+        """
+        width, height = self._page_size
+        short = max(1, height // _TRUNCATED_PAGE_DIVISOR)
+        return _page_image(self._page_index, (width, short))
+
+    def _await_gate(self, mode: ReadBlockMode) -> Image.Image:
+        """
+        Block until the gate opens, then end the read the armed way.
+
+        Args:
+            mode: The armed mode.
+
+        Returns:
+            The truncated page, for the two modes that return one.
+
+        Raises:
+            FakeSaneError: In ``RAISE`` mode, as a backend reporting a status
+                that is neither GOOD nor EOF does.
+
+        """
+        self.__dict__["_blocked_readers"] += 1
+        try:
+            self.read_gate.wait(_READ_GATE_CEILING_SECONDS)
+        finally:
+            self.__dict__["_blocked_readers"] -= 1
+        match mode:
+            case ReadBlockMode.RAISE:
+                raise FakeSaneError(_CANCELLED_MESSAGE)
+            case ReadBlockMode.PARTIAL | ReadBlockMode.NEVER:
+                return self._truncated_page()
+            case _:
+                assert_never(mode)
 
     def live_page_images(self) -> int:
         """
@@ -1086,13 +1242,18 @@ class FakeSaneDev:
         positionally, but a positional boolean is not allowed by this
         project's lint rules and nothing outside this module passes it.
 
+        When a blocking mode is armed this is where the block lives, because
+        this is where the real ``snap()`` sits in ``sane_read``: ``start()``
+        opens the data channel and returns, and it is the read loop that hangs
+        when a device stops answering.
+
         Args:
             no_cancel: Accepted for signature compatibility; unused.
 
         Returns:
             The page image -- the one ``load_feeder()`` supplied for this
-            position, or a generated page when the feeder was not loaded with
-            exact images.
+            position, a generated page when the feeder was not loaded with
+            exact images, or the truncated page a cancelled read hands back.
 
         Raises:
             BaseException: The error armed with ``fail_call("snap", ...)``,
@@ -1104,13 +1265,17 @@ class FakeSaneDev:
         error = self._call_errors.get("snap")
         if error is not None:
             raise error
-        loaded = self._page_images
-        index = self._page_index
-        page = (
-            loaded[index]
-            if index < len(loaded)
-            else _page_image(index, self._page_size)
-        )
+        mode = self._block_mode
+        if mode is None:
+            loaded = self._page_images
+            index = self._page_index
+            page = (
+                loaded[index]
+                if index < len(loaded)
+                else _page_image(index, self._page_size)
+            )
+        else:
+            page = self._await_gate(mode)
         self._page_index += 1
         # Sampled here, immediately before the page leaves the device, so the
         # page about to be returned is itself counted.  That is deliberate: it
@@ -1138,18 +1303,37 @@ class FakeSaneDev:
         return _FakeSaneIterator(self)
 
     def cancel(self) -> None:
-        """Record that the device was cancelled."""
+        """
+        Record the cancel, and release a gated read when the mode says so.
+
+        ``sane_cancel`` releases the GIL in python-sane, so the real call can
+        be made from a second thread while a read blocks in the first -- which
+        is exactly what the backend does, and what this models.  Whether the
+        read then comes back is the scanner's answer, not the frontend's, so
+        it is the armed ``ReadBlockMode`` and not this method that decides.
+        """
         self.cancel_calls += 1
+        if self._block_mode in {ReadBlockMode.PARTIAL, ReadBlockMode.RAISE}:
+            self.__dict__["read_gate"].set()
 
     def close(self) -> None:
         """
-        Record that the device was closed.
+        Record that the device was closed, and whether a read was blocked.
+
+        ``close_while_blocked`` is the assertion HARD-03 turns on.  The SANE
+        standard forbids any other operation while a read is outstanding, and
+        ``sane_close`` additionally runs holding the GIL, so a close racing a
+        read is doubly unsafe.  The fake records it rather than refusing it:
+        a double that refused would turn the defect into an exception the
+        backend could catch, instead of the silent corruption it really is.
 
         Raises:
             BaseException: The error armed with ``fail_call("close", ...)``,
                 after the call has been counted.
 
         """
+        if self.read_is_blocked():
+            self.__dict__["close_while_blocked"] = True
         self.close_calls += 1
         error = self._call_errors.get("close")
         if error is not None:
@@ -1188,6 +1372,7 @@ class FakeSaneModule:
         """
         self.init_call_count = 0
         self.exit_call_count = 0
+        self.exit_while_blocked = False
         self._init_error = init_error
         self._open_error = open_error
         self._get_devices_error = get_devices_error
@@ -1249,5 +1434,15 @@ class FakeSaneModule:
         return self._device
 
     def exit(self) -> None:
-        """Record the shutdown call."""
+        """
+        Record the shutdown call, and whether a read was blocked at the time.
+
+        ``sane_exit`` closes every handle that is still open **and** runs
+        holding the GIL, so calling it while a read is outstanding is the same
+        hazard as ``close()`` and then some.  ``exit_while_blocked`` records
+        it; ``exit_call_count`` keeps the meaning D-19's assertions already
+        read it with, unchanged.
+        """
+        if self._device.read_is_blocked():
+            self.exit_while_blocked = True
         self.exit_call_count += 1
