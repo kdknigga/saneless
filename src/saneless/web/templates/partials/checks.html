@@ -12,8 +12,8 @@
       abandoned browser tab, which is the exact cost D-05 exists to avoid.
 
    `oob` follows partials/scan_button.html: the one copy of this markup renders
-   itself out-of-band when a scan submit carries it, so there is never a second
-   element with id="checks-body" on the page.
+   itself out-of-band when a scan submit carries it, so the swap target's id is
+   never duplicated by a wrapper around a second copy of this markup.
 
    The template owns no vocabulary.  Every class, glyph and word comes either
    from a Jinja filter implemented in saneless.checks or from a constant this

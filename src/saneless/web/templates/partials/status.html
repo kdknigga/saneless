@@ -17,20 +17,20 @@
       {% endif %}
     {% elif job.state == JobState.DONE %}
       <p class="status-done">&#10003; Done: {{ job.title }}</p>
-      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+      {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.FALLBACK %}
       <p class="status-fallback">&#8594; Saved to folder: {{ job.title }}</p>
       {% if job.warning %}
       <p class="status-fallback">{{ job.warning }}</p>
       {% endif %}
-      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+      {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.CANCELLED %}
       {# D-01: a cancel is a deliberate stop, not a failure, so it is not announced as an alert. #}
       <p class="status-cancelled">&#8856; Cancelled: {{ job.title }}</p>
-      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+      {% include "partials/terminal_reload.html" %}
     {% elif job.state == JobState.ERROR %}
       <p role="alert" class="status-error">&#10007; Error: {{ job.error }}</p>
-      <div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+      {% include "partials/terminal_reload.html" %}
     {% endif %}
     {% if job.thumbnail %}
       <img src="data:image/jpeg;base64,{{ job.thumbnail }}" alt="First page preview" class="thumbnail">
