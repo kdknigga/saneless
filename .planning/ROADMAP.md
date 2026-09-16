@@ -576,8 +576,8 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 30-07-PLAN.md — Check cache with an injected clock, and the lazy refresher thread
-- [ ] 30-08-PLAN.md — `saneless doctor` and its CLI reference section
+- [x] 30-07-PLAN.md — Check cache with an injected clock, and the lazy refresher thread
+- [x] 30-08-PLAN.md — `saneless doctor` and its CLI reference section
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 6/19 | In Progress|  |
+| 30. Appliance Layer | 8/19 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
