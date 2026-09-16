@@ -33,6 +33,15 @@ Docker's restart policies act only when a container exits, so an unhealthy conta
 | `/tmp/saneless` | Scratch space for the scan in progress; every file in it is deleted as the scan finishes | No (ephemeral OK) |
 | `/consume` | Consume directory fallback for file-based ingestion | No (only if using fallback) |
 
+`/consume` is the path the shipped `docker-compose.yml` uses, as a commented
+line you uncomment. Share it with paperless-ngx -- mount the same volume at
+paperless-ngx's `PAPERLESS_CONSUMPTION_DIR` -- and **set
+`paperless.consume_dir` to the same container path in `config.toml`.** The
+mount alone changes nothing: saneless falls back only when `consume_dir` names
+a directory. See [Consume directory
+fallback](../explanation/consume-directory-fallback.md) for when it activates
+and what it costs.
+
 Mount the configuration *directory* (`./config:/etc/saneless`), not `config.toml` itself. saneless rewrites `config.toml` by writing a temp file beside it and renaming it over the original; over a single-file bind mount that rename fails with EBUSY, and over a read-only mount the write is refused. See [Moving from a single-file config mount](../how-to/deploy-docker-compose.md#moving-from-a-single-file-config-mount).
 
 `/var/lib/saneless` is not optional, and it is not the same kind of directory
@@ -98,11 +107,31 @@ All `SANELESS_*` environment variables are supported inside the container. Commo
 |----------|---------------|---------|
 | `SANELESS_SCANNER__HOST` | `192.168.1.50` | Network scanner IP address |
 | `SANELESS_PAPERLESS__URL` | `http://paperless:8000` | Paperless-ngx URL (Docker network) |
-| `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token |
+| `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token. Prefer `config.toml` -- see below |
 | `SANELESS_OUTPUT__WEB_PORT` | `8080` | Override web server port |
 | `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. **Already set by the image** -- override it only if you mount the volume somewhere else |
+| `TZ` | `America/Chicago` | Standard container variable, **not** a saneless setting. A container's clock reports UTC without it, and saneless renders every timestamp in the server's local zone, so `TZ` is what makes the job history, `saneless jobs` and the fallback document title show your local time |
 
 See [Environment Variables](environment-variables.md) for the full list.
+
+### Placeholder tokens are detected
+
+saneless keeps a small fixed list of literal token values that mean "nobody
+configured this" -- `changeme`, `your-api-token-here` and their family -- and
+treats an empty or whitespace-only token the same way. When the configured
+token is one of them, the server still starts, so you can see why, but the
+status strip shows Paperless red, the web UI's Scan button is disabled with the
+reason, and `saneless scan` exits 2 before the scanner is opened. The check is
+exact, never a substring match: `changeme7f3a91` is a real token.
+
+So do not copy a placeholder into a deployment expecting to fix it later --
+nothing will scan until it is replaced.
+
+**An environment variable overrides `config.toml`.** Setting
+`SANELESS_PAPERLESS__TOKEN` in a compose file wins over the token in the
+mounted config file, silently. Keep the secret in `config/config.toml` alone,
+and leave the compose `environment:` block free of it -- which is what the
+shipped template now does.
 
 ## Minimal docker-compose.yml
 
@@ -173,12 +202,24 @@ services:
     volumes:
       - ./config:/etc/saneless
       - saneless-data:/var/lib/saneless
+      # Optional consume-directory fallback; also set
+      # paperless.consume_dir = "/consume" in config.toml.
+      # - paperless-consume:/consume
     environment:
-      - SANELESS_PAPERLESS__URL=http://paperless:8000
-      - SANELESS_PAPERLESS__TOKEN=changeme
+      - TZ=America/Chicago
       - SANELESS_SCANNER__HOST=192.168.1.50
+      # The paperless-ngx URL and token belong in config/config.toml. Setting
+      # them here overrides that file silently.
     restart: unless-stopped
 
 volumes:
   saneless-data:
+```
+
+`config/config.toml` alongside it carries the connection:
+
+```toml
+[paperless]
+url = "http://paperless:8000"
+token = "abc123def456"
 ```

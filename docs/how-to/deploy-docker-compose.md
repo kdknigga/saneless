@@ -46,8 +46,11 @@ services:
     volumes:
       - paperless-data:/usr/src/paperless/data
       - paperless-media:/usr/src/paperless/media
+      # Uncomment with the saneless side below to enable the fallback:
+      # - paperless-consume:/usr/src/paperless/consume
     environment:
       - PAPERLESS_SECRET_KEY=change-me-to-a-long-random-string
+      # - PAPERLESS_CONSUMPTION_DIR=/usr/src/paperless/consume
     restart: unless-stopped
 
   saneless:
@@ -57,9 +60,18 @@ services:
     volumes:
       - ./config:/etc/saneless
       - saneless-data:/var/lib/saneless
+      # Optional: the consume-directory fallback. When the paperless-ngx API
+      # cannot be reached at all, saneless drops the assembled PDF here
+      # instead of failing the scan, and paperless-ngx ingests it once it is
+      # back. Set paperless.consume_dir in config.toml to /consume as well --
+      # the mount on its own does nothing.
+      # - paperless-consume:/consume
     environment:
-      - SANELESS_PAPERLESS__URL=http://paperless:8000
-      - SANELESS_PAPERLESS__TOKEN=your-paperless-api-token
+      # Without this the container reports UTC, so every timestamp saneless
+      # shows is UTC. Set your own zone.
+      - TZ=America/Chicago
+      # The paperless URL and token are NOT set here on purpose: anything set
+      # here overrides config.toml silently. See below.
       # Uncomment for network scanners:
       # - SANELESS_SCANNER__HOST=192.168.1.50
     restart: unless-stopped
@@ -68,12 +80,16 @@ volumes:
   paperless-data:
   paperless-media:
   saneless-data:
+  # paperless-consume:
 ```
 
 Key details:
 
 - **Image:** `ghcr.io/kris-knigga/saneless:latest` includes `libsane` and handles `python-sane` compilation automatically
 - **Port 8080:** The saneless web UI
+- **One place for the token:** the paperless-ngx URL and token live in `config/config.toml`, and this compose file deliberately sets neither. **An environment variable overrides the config file**, silently: set `SANELESS_PAPERLESS__TOKEN` here and saneless uses that value and ignores the one in `config.toml`. If it is a placeholder, or empty, saneless shows the status strip red and refuses to scan, and the token you carefully put in `config.toml` has nothing to do with it. Leave the block commented and edit the file
+- **`TZ`:** a container's clock reports UTC. Without `TZ`, every timestamp saneless displays -- the job history, `saneless jobs`, and the fallback title it gives a document in paperless-ngx -- is UTC rather than your local time. It is a standard container variable, not a saneless setting
+- **Consume mount (optional):** `paperless-consume:/consume` shared with paperless-ngx is the [consume-directory fallback](../explanation/consume-directory-fallback.md). Uncomment the volume on both services, the `PAPERLESS_CONSUMPTION_DIR` line, and the entry under `volumes:`, then set `consume_dir = "/consume"` under `[paperless]` in `config.toml`. Mounting without setting `consume_dir` does nothing
 - **Config mount:** `./config:/etc/saneless` -- a read-write directory mount. saneless replaces `config.toml` atomically (it writes a temp file in the same directory, then renames it over the original). A single-file bind mount makes that rename fail with EBUSY, and saneless reports "Mount its directory instead"
 - **Data volume:** `saneless-data:/var/lib/saneless` is required, not optional. It holds the job database and the `failed/` directory, where saneless preserves any scan it could not deliver to paperless-ngx. The image already sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless`, so mounting the volume there is all that is needed. See [Docker volumes](../reference/docker.md#volumes) for what accumulates in `failed/` and how to drain it
 - **Shared network:** Both services are on the default Docker Compose network, so `http://paperless:8000` resolves automatically
@@ -104,6 +120,9 @@ Then open the web UI at `http://localhost:8080` in your browser. You should see 
 ## Environment variable configuration
 
 You can configure saneless entirely through environment variables using the `SANELESS_` prefix with `__` as the nested delimiter. This is useful when you prefer not to mount a config file:
+
+!!! warning "An environment variable overrides `config.toml`"
+    Environment variables sit above the config file, so a variable set in your compose file wins over the same setting in `config/config.toml` -- silently, with nothing in the UI to say where the value came from. That is why the example above sets the paperless-ngx connection in the file and not here. Pick one place per setting; for the token, make it `config/config.toml`.
 
 | Setting | Environment Variable |
 |---|---|
@@ -167,6 +186,43 @@ Pull the latest image and recreate the container:
 docker compose pull saneless
 docker compose up -d
 ```
+
+### Remove your own `SANELESS_PAPERLESS__TOKEN` line
+
+Earlier versions of this guide, and of the `docker-compose.yml` shipped in the
+repository, set the paperless-ngx connection in the `environment:` block:
+
+```yaml
+    environment:
+      # Delete both of these from your own compose file. `changeme` is one of
+      # the placeholder literals saneless now detects and refuses to scan with.
+      # - SANELESS_PAPERLESS__URL=http://paperless:8000
+      # - SANELESS_PAPERLESS__TOKEN=changeme
+```
+
+Those lines are in *your* compose file, and upgrading the image does not touch
+them. **Delete them.** An environment variable overrides `config.toml`, so
+while that line is there:
+
+- The token in `config/config.toml` is ignored, however correct it is.
+- If the value is a placeholder -- `changeme` is one of the literals saneless
+  now detects -- the status strip stays **red**, the Scan button stays
+  disabled, and `saneless scan` exits 2, no matter what you edit into the file.
+
+After deleting the lines, put the connection in `config/config.toml`:
+
+```toml
+[paperless]
+url = "http://paperless:8000"
+token = "your-paperless-api-token"
+```
+
+Then `docker compose up -d` to recreate the container, and check the status
+strip: the Paperless row turns green once the token is real and reachable.
+
+While you are there, add `TZ` to the `environment:` block if it is not already
+set. Without it the container reports UTC and every timestamp saneless shows is
+UTC rather than your local time.
 
 ### Moving from a single-file config mount
 
