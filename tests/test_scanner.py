@@ -38,7 +38,7 @@ from saneless.scanner.base import (
 )
 from saneless.scanner.sane_backend import GeometryUnit, SaneBackend
 from saneless.spool import SpooledPageSink
-from tests.conftest import images_of
+from tests.conftest import images_of, reset_sane_process_state
 from tests.fake_sane import (
     FakeSaneDev,
     FakeSaneError,
@@ -459,32 +459,63 @@ def sane_backend(fake_sane_module: FakeSaneModule) -> SaneBackend:
     return SaneBackend()
 
 
-@pytest.fixture(autouse=True)
-def sane_init_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+class TestTheSuiteResetsTheProcessGlobalSaneState:
     """
-    Give every test in this module an uninitialised SANE to start from.
+    The suite-wide reset really re-arms the init guard, in both its branches.
 
-    SANE initialisation is process-level now (D-17): the first ``SaneBackend``
-    built in a process initialises it and every later one does not.  Without
-    this, the first test to build a backend would suppress ``sane.init()`` for
-    every test after it, and the whole module's init assertions would quietly
-    start reading a call that an earlier test made.
-
-    The reset goes through the public ``shutdown()`` rather than into the
-    guard's own state, because "after a shutdown a later init is allowed" is
-    exactly the behaviour D-17 promises; reaching past it would let the promise
-    rot while these tests kept passing.
-
-    ``monkeypatch`` is requested, and not used, purely for its ordering: it is
-    the fixture ``fake_sane_module`` patches the module-level ``sane`` name
-    through, so requesting it here makes this fixture the younger of the two
-    and its teardown the earlier one.  The final ``shutdown()`` therefore still
-    finds the fake in place instead of the ``None`` the undo restores.
+    The guard is process state (D-17), so a module that builds a
+    ``SaneBackend`` over a fake and leaves ``_INIT.done`` set silently
+    suppresses ``sane.init()`` for every later test in the same process -- and
+    the later test that then makes real SANE calls fails with an empty device
+    list rather than with anything that names the cause.  ``conftest``'s
+    ``sane_process_state`` fixture is what makes that unrepresentable; these
+    two tests are what stop it being quietly weakened.
     """
-    _ = monkeypatch  # ordering only: tear down before the sane-module undo
-    sane_backend_mod.shutdown()
-    yield
-    sane_backend_mod.shutdown()
+
+    def test_the_reset_rearms_the_guard_after_a_backend_was_built(
+        self, fake_sane_module: FakeSaneModule
+    ) -> None:
+        """A constructed backend leaves nothing behind once the reset runs."""
+        SaneBackend()
+        assert sane_backend_mod._INIT.done is True
+
+        reset_sane_process_state()
+
+        assert sane_backend_mod._INIT.done is False
+        assert fake_sane_module.exit_call_count == 1
+        # The proof that the guard is genuinely re-armed and not merely
+        # reported as such: the next construction initialises again.
+        SaneBackend()
+        assert fake_sane_module.init_call_count == 2
+
+    def test_the_reset_rearms_the_guard_even_when_a_wedge_was_left_behind(
+        self, fake_sane_module: FakeSaneModule, fake_device: FakeSaneDev
+    ) -> None:
+        """
+        A leaked wedge does not strand the guard, and no sane_exit() is risked.
+
+        ``shutdown()`` deliberately refuses while a read is recorded as
+        outstanding, because ``sane_exit()`` closes every open handle (D-13,
+        D-18).  Left at that, a test that wedged the backend would set
+        ``_INIT.done`` for the rest of the process.  The reset finishes the job
+        by hand instead -- and ``exit_call_count`` staying 0 is the assertion
+        that it did *not* reach for the unsafe call on the way.
+        """
+        SaneBackend()
+        record = sane_backend_mod._WEDGE
+        record.stuck = True
+        record.done = threading.Event()
+        record.device = fake_device
+        record.device_id = "fake:0"
+        record.page_label = "Page 1"
+
+        reset_sane_process_state()
+
+        assert sane_backend_mod._INIT.done is False
+        assert record.stuck is False
+        assert record.device is None
+        assert record.done is None
+        assert fake_sane_module.exit_call_count == 0
 
 
 class TestSaneBackendInit:

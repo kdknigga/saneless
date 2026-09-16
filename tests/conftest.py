@@ -21,6 +21,7 @@ from saneless.config import (
 )
 from saneless.paperless import UploadResult
 from saneless.pipeline import FlipCoordinator
+from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
 from saneless.vocabulary import FlipOutcome
 
@@ -126,6 +127,78 @@ def _suite_leaves_cwd_config_alone() -> Iterator[None]:
     yield
     if _config_file_stamp(path) != before:
         pytest.fail(f"the test suite created or modified {path}")
+
+
+def reset_sane_process_state() -> None:
+    """
+    Return SANE to "never initialised, not wedged" for the next test.
+
+    ``_INIT`` and ``_WEDGE`` are process-global by design (D-17, D-13): the
+    first ``SaneBackend`` built in a process initialises SANE and every later
+    one deliberately does not, and a read that never came back refuses the
+    next scan on a *different* backend object.  Both are exactly the kind of
+    state a test cannot be trusted to leave behind, so the suite resets them
+    around every test rather than asking each module to remember.
+
+    The reset goes through the public ``shutdown()`` and not into the guard's
+    own fields, because "after a shutdown a later init is allowed" is the
+    behaviour D-17 promises; reaching past it would let that promise rot while
+    the tests kept passing.
+
+    ``shutdown()`` has one documented refusal: it leaves the guard armed when a
+    read is still recorded as outstanding, because ``sane_exit()`` closes every
+    open handle and SANE forbids that while an operation is in flight.  A test
+    that wedged the backend and did not release it would therefore strand
+    ``_INIT.done`` at ``True`` -- the very leak this helper exists to stop --
+    so that one case is finished off by hand, and pointedly *without* calling
+    ``sane_exit()``, which would be unsafe for the same reason ``shutdown()``
+    declined to.
+    """
+    sane_backend_mod.shutdown()
+    if not sane_backend_mod._INIT.done:
+        return
+    record = sane_backend_mod._WEDGE
+    record.stuck = False
+    record.done = None
+    record.device = None
+    record.iterator = None
+    record.device_id = ""
+    record.page_label = ""
+    sane_backend_mod._INIT.done = False
+    sane_backend_mod._INIT.host = ""
+    sane_backend_mod._INIT.version = None
+
+
+@pytest.fixture(autouse=True)
+def sane_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """
+    Give every test in the suite an uninitialised, unwedged SANE (D-17, D-13).
+
+    This is suite-wide and not module-wide on purpose.  The guard is process
+    state, so a single module that builds a real ``SaneBackend`` over a fake
+    ``sane`` and does not reset it suppresses ``sane.init()`` for every later
+    test in the same process -- including the ones that then make real SANE
+    calls against a library that was never initialised.  A module-local fixture
+    fixes only the module that remembers to add one; this cannot be forgotten
+    by construction.
+
+    ``monkeypatch`` is requested, and not used, purely for its ordering.  It is
+    the fixture every module patches ``sane_backend.sane`` through, and a
+    fixture that requests it is torn down before its ``undo`` runs -- so the
+    final reset still finds the fake in place rather than the real library that
+    the undo restores.
+
+    Args:
+        monkeypatch: Requested for teardown ordering only.
+
+    Yields:
+        Nothing; the reset runs on both sides of the test.
+
+    """
+    _ = monkeypatch  # ordering only: tear down before the sane-module undo
+    reset_sane_process_state()
+    yield
+    reset_sane_process_state()
 
 
 @pytest.fixture(autouse=True)
