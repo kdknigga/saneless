@@ -82,6 +82,11 @@ SECRET_MARKER = "zz-secret"
 # unlike anything the slot could produce by accident.
 LOG_FILE_NAME = "errors-test-do-not-render-me.log"
 
+# The row the test-only history route pretends its refusal wrote.  The renderer
+# reloads Job History exactly when there is a row to reload it for, so this
+# route has to name one to ask for the reload at all.
+REJECTED_ROW_ID = "zz-rejected-row"
+
 
 # --- Test-only routes --------------------------------------------------------
 
@@ -92,8 +97,8 @@ def _raise_rejection(name: str) -> None:
 
 
 def _raise_rejection_with_history(name: str) -> None:
-    """Raise the RequestRejected named in the path, asking for a history refresh."""
-    raise errors.RequestRejected(RequestRejection(name), refresh_history=True)
+    """Raise the RequestRejected named in the path, as if it had written a row."""
+    raise errors.RequestRejected(RequestRejection(name), job_id=REJECTED_ROW_ID)
 
 
 def _raise_plain_http_exception(status: int) -> None:
@@ -323,9 +328,10 @@ def test_refresh_history_appends_the_hidden_history_loader(
     )
     assert response.status_code == 429
     assert response.headers["HX-Retarget"] == "#status-message"
-    # This route refreshes history without writing a row, so the disclosure
-    # names no job: the affordance does not claim detail it does not have.
-    assert response.text.strip() == f"{_error_body(rejection, 429)}\n{HISTORY_LOADER}"
+    # History reloads because a row was written, and the disclosure names that
+    # same row -- one fact, not two that could disagree (D-05).
+    body = _error_body(rejection, 429, REJECTED_ROW_ID)
+    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
 
 
 def test_no_history_loader_without_refresh_history(client: TestClient) -> None:

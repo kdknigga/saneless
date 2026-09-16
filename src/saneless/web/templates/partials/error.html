@@ -1,2 +1,24 @@
+{# Why this disclosure is deliberately short.
+
+   Phase 26 D-10 and ASVS V7 forbid exception text, request input and the log
+   path from ever reaching this surface, so the HTTP status code and the id of
+   the row a refused submit wrote (D-05) are the only technical facts the slot
+   is permitted to carry.  Saying that out loud is better than a uniform
+   affordance that sometimes lies about having detail.
+
+   The twelve Phase 26 slot messages are unchanged.  Each is already "the
+   problem, then what to do next" in one sentence pair, so APPL-04's
+   message-plus-next-step requirement is met by the string itself; splitting a
+   locked, doc-pinned copy table would be churn with no reader benefit.
+
+   No alert role here: #status-message is itself the alert region, and a second
+   one inside it would announce the failure twice. #}
 <p class="status-error">&#10007; {{ message }}</p>
+<details class="tech-details">
+  <summary>Technical details</summary>
+  <p>Status: {{ status_code }}</p>
+  {%- if job_id %}
+  <p>Job: {{ job_id }}</p>
+  {%- endif %}
+</details>
 {% if refresh_history %}<div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>{% endif %}

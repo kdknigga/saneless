@@ -79,15 +79,23 @@ class RequestRejected(HTTPException):
     """
 
     def __init__(
-        self, rejection: RequestRejection, *, refresh_history: bool = False
+        self, rejection: RequestRejection, *, job_id: str | None = None
     ) -> None:
         """
         Build the exception from a rejection.
 
         Args:
             rejection: The vocabulary member to render.
-            refresh_history: Whether the rendered error should also reload Job
-                History, because the rejected attempt wrote a job row (D-05).
+            job_id: The id of the job row the refused attempt wrote, or None
+                when it wrote none.  This one argument carries what used to be
+                two: the rendered error reloads Job History exactly when a row
+                was written, so a separate ``refresh_history`` flag was a
+                second degree of freedom that production never used
+                independently and that a reader had to check could not
+                disagree with the id (D-05).  The id is also one of only two
+                technical facts the error slot may carry (D-10): it is the row
+                the user will find in Job History a moment later, never an
+                arbitrary request value.
 
         """
         super().__init__(
@@ -95,7 +103,7 @@ class RequestRejected(HTTPException):
             detail=rejection_message(rejection),
         )
         self.rejection = rejection
-        self.refresh_history = refresh_history
+        self.job_id = job_id
 
 
 def rejection_for_status(status_code: int) -> RequestRejection:
@@ -131,17 +139,28 @@ def render_error(
     rejection: RequestRejection,
     *,
     status_code: int,
-    refresh_history: bool = False,
+    job_id: str | None = None,
     extra_headers: Mapping[str, str] | None = None,
 ) -> Response:
     """
     Render an error response for either an htmx or a plain request.
 
+    The htmx body offers a short "Technical details" disclosure carrying the
+    status code and, when the refused attempt wrote a job row, that row's id.
+    Those two are the whole permitted vocabulary of the slot: Phase 26 D-10 and
+    ASVS V7 forbid exception text, request input and the log path from ever
+    reaching it, and a uniform affordance that sometimes lied about having
+    detail would be worse than one that says what it has (APPL-04, UI-SPEC S2).
+
+    Whether Job History reloads is decided here rather than in the template, so
+    the partial keeps no rule of its own: it reloads exactly when a row was
+    written, which is exactly when there is an id to name (D-05).
+
     Args:
         request: The request being answered.
         rejection: The vocabulary member whose message is shown.
         status_code: The HTTP status code to send.
-        refresh_history: Whether the htmx body also reloads Job History.
+        job_id: The row the refused attempt wrote, or None when it wrote none.
         extra_headers: Headers the exception carries and the response must
             keep, such as a 405's ``Allow`` (WR-08, RFC 9110 section 15.5.6).
 
@@ -160,7 +179,12 @@ def render_error(
         return request.app.state.templates.TemplateResponse(
             request,
             "partials/error.html",
-            {"message": message, "refresh_history": refresh_history},
+            {
+                "message": message,
+                "status_code": status_code,
+                "job_id": job_id,
+                "refresh_history": job_id is not None,
+            },
             status_code=status_code,
             headers=headers,
         )
@@ -180,7 +204,7 @@ async def _http_exception(request: Request, exc: Exception) -> Response:
             request,
             exc.rejection,
             status_code=exc.status_code,
-            refresh_history=exc.refresh_history,
+            job_id=exc.job_id,
         )
     # The exception's own headers are kept: the router's 405 carries the
     # ``Allow`` header RFC 9110 requires on a 405 (WR-08).
