@@ -29,6 +29,7 @@ import re
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from urllib.parse import parse_qs
 
@@ -37,7 +38,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from fastapi import FastAPI
-    from playwright.sync_api import BrowserContext, Page, Request, Response, Route
+    from playwright.sync_api import (
+        BrowserContext,
+        Locator,
+        Page,
+        Request,
+        Response,
+        Route,
+    )
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     from saneless.job import Job, JobStore
@@ -49,6 +57,7 @@ import uvicorn
 from PIL import Image
 from playwright.sync_api import expect
 
+from saneless.checks import CHECKING_MESSAGE, CheckKey
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -93,9 +102,52 @@ _ERROR_RED = {"light": "rgb(136, 57, 53)", "dark": "rgb(206, 126, 123)"}
 _MUTED = {"light": "rgb(100, 107, 121)", "dark": "rgb(123, 132, 149)"}
 """Pico's ``--pico-muted-color`` (#646b79 / #7b8495) behind ``.status-cancelled``."""
 
+_SUCCESS_GREEN = {"light": "rgb(29, 106, 84)", "dark": "rgb(98, 175, 154)"}
+"""Pico's ``--pico-ins-color`` behind ``.check-ok``, per 30-UI-SPEC, as computed."""
+
+# The status strip's three verdict colours, each pinned to the token 30-UI-SPEC
+# § Color says it reads. The amber is the existing _AMBER rather than a second
+# pair of literals: .check-warn and .status-fallback share one custom property
+# on purpose, so a drift in either must be reported by both.
+_CHECK_STATE_COLOURS = {
+    "check-ok": _SUCCESS_GREEN,
+    "check-warn": _AMBER,
+    "check-fail": _ERROR_RED,
+}
+
 
 _SCAN_GATE_TIMEOUT = 30.0
 """Longest a closed gate holds ``scan_pages``, so a test that forgets it cannot hang."""
+
+
+def _spool_pages(sink: PageSink, count: int, resolution: int) -> ScanBatch:
+    """
+    Spool ``count`` pages with content on them and batch the records back.
+
+    Each page is half black rather than blank: the default profile's empty-page
+    detection would drop an all-white page and end the job in ERROR, and the
+    browser tests need scans that can reach DONE.
+
+    Shared by the one-page stub below and the manual-duplex stub further down,
+    which differ only in how many sheets a pass produces and in which pass the
+    gate holds.
+
+    Args:
+        sink: The pipeline's own sink, which receives each page.
+        count: How many sheets this pass produces.
+        resolution: The resolution to report the device settled on.
+
+    Returns:
+        A batch of the records the sink returned, in order.
+
+    """
+    records = [Image.new("RGB", (100, 100), "white") for _ in range(count)]
+    for page in records:
+        page.paste((0, 0, 0), (0, 0, 50, 100))
+    return scan_batch(
+        [sink.add(page) for page in records],
+        resolution=resolution,
+    )
 
 
 class _BrowserTestScanner(StubScannerBackend):
@@ -140,10 +192,6 @@ class _BrowserTestScanner(StubScannerBackend):
         """
         Wait for the gate, then spool one page with content on it.
 
-        The page is half black rather than blank: the default profile's empty
-        page detection would drop an all-white page and end the job in ERROR,
-        and the browser tests need a scan that can reach DONE.
-
         Args:
             device_id: Ignored; this stub scans nothing real.
             settings: Only ``resolution`` is used, and only to report it back.
@@ -154,10 +202,7 @@ class _BrowserTestScanner(StubScannerBackend):
 
         """
         self.gate.wait(timeout=_SCAN_GATE_TIMEOUT)
-        page = Image.new("RGB", (100, 100), "white")
-        page.paste((0, 0, 0), (0, 0, 50, 100))
-        record = sink.add(page)
-        return scan_batch([record], resolution=settings.resolution)
+        return _spool_pages(sink, 1, settings.resolution)
 
 
 class _BrowserServer(NamedTuple):
@@ -257,6 +302,46 @@ def _stop_uvicorn(running: _RunningUvicorn) -> None:
     assert not running.thread.is_alive(), "uvicorn test server did not shut down"
 
 
+@contextmanager
+def _serve(
+    settings: Settings, scanner: _BrowserTestScanner
+) -> Iterator[_BrowserServer]:
+    """
+    Run a private app on loopback for the length of one test, then shut it down.
+
+    ``blocked_server`` and ``lan_server`` each hand-rolled this; the tests that
+    need a *cold* check cache or a scan held mid-flight need it several times
+    more, and none of them can use the session server -- its cache is warm
+    within a second of the first page load and its scanner is shared with every
+    other test in the module.
+
+    The caller must add the yielded URL to ``egress_allowlist``: the gate knows
+    only the session server, and a page served from here would otherwise be
+    aborted on its very first request.
+
+    Args:
+        settings: The configuration the private app runs with.
+        scanner: The stub backend it scans through.
+
+    Yields:
+        The running server, its app and its scanner.
+
+    """
+    app = create_app(settings, scanner)
+    running = _start_uvicorn(app, host="127.0.0.1")
+    try:
+        yield _BrowserServer(
+            url=f"http://127.0.0.1:{running.port}", app=app, scanner=scanner
+        )
+    finally:
+        # Unconditionally, and before the shutdown: lifespan shutdown joins the
+        # worker on a 5 s bound, and a gate a failing test left closed would
+        # hold that worker inside scan_pages for the stub's own 30 s timeout.
+        # The failure would then be reported as a server that would not stop.
+        scanner.gate.set()
+        _stop_uvicorn(running)
+
+
 @pytest.fixture(scope="session")
 def browser_server(
     tmp_path_factory: pytest.TempPathFactory,
@@ -295,6 +380,51 @@ def _is_allowed(url: str, allowlist: list[str]) -> bool:
     return any(url == base or url.startswith(base + "/") for base in allowlist)
 
 
+# Pitfall 9, stated in full because this factory exists only to design it out.
+#
+# The gate used to be a closure written inside the ``context`` fixture below,
+# which made it unreachable from anywhere else in the module. A test that needs
+# two browser sessions at once has to build its own contexts with
+# ``browser.new_context()`` -- the owner/non-owner proof of the flip prompt is
+# exactly that shape -- and a hand-made context carries none of the overridden
+# fixture's routing. It would therefore have had NO gate at all: its page could
+# reach the real internet in CI and nothing in the suite would have noticed,
+# because the only ``blocked`` list anybody asserted on belonged to a context
+# that test never used. The escape is silent, which is what makes it dangerous.
+#
+# The rule this factory enforces is therefore twofold, and both halves matter:
+# every context created in this module must install a gate built here, and
+# every one of them must be covered by a ``blocked`` assertion at teardown. One
+# list may be shared by several contexts, which is the point -- a single
+# assertion then speaks for all of them.
+def _make_gate(blocked: list[str], allowlist: list[str]) -> Callable[[Route], None]:
+    """
+    Build the no-egress route handler every context in this module installs.
+
+    Args:
+        blocked: The list each refused URL is appended to. The caller asserts it
+            empty at teardown; sharing one list across contexts is supported and
+            is how a multi-context test keeps a single assertion honest.
+        allowlist: The base URLs a page may reach. Read when each request
+            arrives rather than captured, so a base appended after the gate is
+            installed still counts.
+
+    Returns:
+        A handler suitable for ``context.route("**/*", ...)``.
+
+    """
+
+    def _gate(route: Route) -> None:
+        url = route.request.url
+        if _is_allowed(url, allowlist):
+            route.continue_()
+        else:
+            blocked.append(url)
+            route.abort()
+
+    return _gate
+
+
 @pytest.fixture
 def context(
     context: BrowserContext, egress_allowlist: list[str]
@@ -309,18 +439,12 @@ def context(
     the UI needs no internet (ROBU-09) rather than assuming it from the network
     the run happens to have, and it is what lets every browser test run offline
     in the CI ``browser`` job (ROBU-11).
+
+    The gate itself comes from ``_make_gate`` rather than being written here, so
+    a hand-made context can install the identical one; see that factory's note.
     """
     blocked: list[str] = []
-
-    def _gate(route: Route) -> None:
-        url = route.request.url
-        if _is_allowed(url, egress_allowlist):
-            route.continue_()
-        else:
-            blocked.append(url)
-            route.abort()
-
-    context.route("**/*", _gate)
+    context.route("**/*", _make_gate(blocked, egress_allowlist))
     yield context
     assert blocked == [], f"the page tried to reach the network: {blocked}"
 
@@ -902,8 +1026,10 @@ _PROBE_CONTEXT_CONTRAST = (
     if (context === "status-area") {
         document.getElementById("status-area").appendChild(probe);
     } else if (context === "card") {
-        // The first <article> is the Scan card: the secondary surface, which
-        // is the one a status line placed inside a card would sit on.
+        // Any <article> is Pico's secondary surface, which is the one a line
+        // placed inside a card sits on -- the status strip's card and the Scan
+        // card are the same colour, so the first one serves for both. (It used
+        // to be the Scan card; #checks-card now precedes it.)
         document.querySelector("article").appendChild(probe);
     } else {
         const row = document.createElement("tr");
@@ -2457,3 +2583,251 @@ class TestTagFilterInChromium:
             assert box is not None, index
             assert box["height"] >= 44, box
             assert box["width"] >= list_box["width"] - 2, (box, list_box)
+
+
+# ---------------------------------------------------------------------------
+# The status strip, in Chromium.
+#
+# Per CLAUDE.md nothing in this phase's browser contract is deferred to a
+# person. Every row of 30-UI-SPEC's Verification Contract that names a browser
+# is automated -- here and in the classes below -- and none of them is marked
+# for a human to look at. The one out-of-suite item is scanner reachability
+# against physical hardware, which cannot be stubbed and which 30-VALIDATION.md
+# already records as the hardware-only check it is.
+# ---------------------------------------------------------------------------
+
+_PAUSED_PREFIX = "Paused during scan \N{EM DASH} "
+"""The freshness line's prefix while a scan holds the scanner (D-08, UI-SPEC S1)."""
+
+_SCANNER_PAUSED_MESSAGE = "Not checked while a scan is running."
+"""The Scanner row's message for the same situation."""
+
+
+def _check_row(page: Page, name: str) -> Locator:
+    """
+    Return the strip row whose name column reads exactly ``name``.
+
+    Locating by the rendered name rather than by index is deliberate: the row
+    order is ``CheckKey`` member order, which is a contract the enum states, but
+    a test that read row 0 would silently start asserting about a different
+    check the day a sixth member is inserted above it.
+
+    Args:
+        page: The browser page.
+        name: The name column's exact text, e.g. ``"Scanner"``.
+
+    Returns:
+        A locator for the one matching ``.check-row``.
+
+    """
+    return page.locator(f'.check-row:has(.check-name:text-is("{name}"))')
+
+
+@pytest.fixture
+def cold_strip_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app whose check cache is cold and stays cold until asked.
+
+    The background refresher is stopped rather than raced. Left running it
+    fills the cache on its first tick, so the cold window would be "however
+    long a tick takes" and the cold-start assertions would be racing a
+    stopwatch -- the flake T-30-84 exists to design out. Stopped, the strip
+    stays cold until the test itself asks for a probe through
+    ``POST /api/checks/refresh``, which is the app's own probe-and-store path
+    and not a reimplementation of it.
+    """
+    with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
+        assert server.app.state.refresher.stop(), "the refresher thread did not stop"
+        egress_allowlist.append(server.url)
+        yield server
+
+
+def _probe_now(server: _BrowserServer) -> None:
+    """
+    Make the appliance probe and store its checks, from outside the browser.
+
+    ``POST /api/checks/refresh`` is the "Check again" route: it takes the
+    scanner gate without blocking, sets ``skip_scanner`` from the outcome, runs
+    the probes and stores them. Calling it over HTTP rather than clicking the
+    button leaves the *page* untouched, so what discovers the new results is
+    the strip's own poll -- which is the half of the cold-start contract under
+    test. Neither ``Origin`` nor ``Sec-Fetch-Site`` is sent, which is the
+    non-browser branch ``CrossOriginGuard`` allows by design.
+
+    Args:
+        server: The private server to probe.
+
+    """
+    response = httpx.post(f"{server.url}/api/checks/refresh", timeout=30.0)
+    assert response.status_code == 200, response.status_code
+
+
+@pytest.mark.browser
+class TestStatusStripInChromium:
+    """
+    The health strip, read from a real page (APPL-02, D-06, D-08).
+
+    Four claims live only here. Which card a household member's eye lands on
+    first is a document-order fact about the rendered page; the poll starting
+    and then stopping is htmx acting on an attribute that a template assertion
+    can see but not follow; the three verdict colours are cascade outcomes; and
+    the paused rendering is what two pieces of server state look like once they
+    have been through Jinja and Pico.
+    """
+
+    def test_the_strip_is_the_first_card_and_leaves_phase_26s_slot_alone(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        ``#checks-card`` is the first card, and the alert slot is untouched (P1).
+
+        "At a glance" is the phase goal and at a glance means first, so the
+        ordinal is asserted rather than merely the presence. The second half is
+        phase 26's invariant: ``#status-message`` is the immediate element
+        sibling above ``#status-area``, and inserting a card above the form must
+        not have moved either of them.
+        """
+        page.goto(browser_server_url)
+
+        expect(page.locator("main > article").nth(0)).to_have_id("checks-card")
+        strip_precedes_scan_card = page.evaluate(
+            "() => Boolean("
+            "document.getElementById('checks-card').compareDocumentPosition("
+            "document.querySelector('main > article:not(#checks-card)')) "
+            "& Node.DOCUMENT_POSITION_FOLLOWING)"
+        )
+        assert strip_precedes_scan_card is True
+
+        # One swap target, never two: the partial renders its own wrapper and is
+        # also emitted out of band on a scan submit, so a duplicated id is the
+        # specific way that arrangement could go wrong.
+        assert page.evaluate("document.querySelectorAll('#checks-body').length") == 1
+        assert (
+            page.evaluate(
+                "() => document.getElementById('status-message').nextElementSibling.id"
+            )
+            == "status-area"
+        )
+
+    def test_a_cold_strip_polls_itself_until_results_land_and_then_stops(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        The cold body carries the 2 s poll; the body that replaces it does not (P2).
+
+        This is the in-tree "the response ends its own poll" idiom, and it is
+        the one thing about it a template assertion cannot say: that htmx really
+        re-requests on the trigger, and that the trigger-less body arriving
+        really is the last swap. The results are stored from outside the
+        browser, so the swap observed here is the page's own poll finding them.
+        """
+        page.goto(cold_strip_server.url)
+
+        body = page.locator("#checks-body")
+        expect(body).to_have_attribute("hx-trigger", re.compile(r"every 2s"))
+        rows = page.locator("#checks-body .check-row")
+        expect(rows).to_have_count(len(CheckKey))
+        expect(body).to_contain_text(CHECKING_MESSAGE)
+
+        _probe_now(cold_strip_server)
+
+        # ":not([hx-trigger])" rather than a negated attribute assertion: it is
+        # the attribute's *absence* that ends the poll, and a locator that
+        # matches only the trigger-less body auto-waits for exactly that.
+        expect(page.locator("#checks-body:not([hx-trigger])")).to_have_count(
+            1, timeout=10_000
+        )
+        expect(rows).to_have_count(len(CheckKey))
+        expect(page.locator("#checks-body")).not_to_contain_text(CHECKING_MESSAGE)
+
+    @pytest.mark.parametrize("cls", ["check-ok", "check-warn", "check-fail"])
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_every_check_state_colour_clears_aa_on_the_card(
+        self,
+        page: Page,
+        browser_server_url: str,
+        scheme: Literal["light", "dark"],
+        cls: Literal["check-ok", "check-warn", "check-fail"],
+    ) -> None:
+        """
+        The three verdict colours are legible where the strip really is (P3).
+
+        The card is the binding surface: the strip lives inside an
+        ``<article>``, and the dark card is lighter than the dark page, so it is
+        the tighter of the two. Each colour is also checked by value, so a
+        palette drift is reported as the wrong colour rather than only as a
+        ratio that still happens to clear 4.5.
+        """
+        page.emulate_media(color_scheme=scheme)
+        page.goto(browser_server_url)
+
+        probe = page.evaluate(_PROBE_CONTEXT_CONTRAST, {"cls": cls, "context": "card"})
+        colour = probe["colour"]
+        background = _flatten(probe["backgroundStack"])
+        ratio = _contrast_ratio(colour, background)
+        assert colour == _CHECK_STATE_COLOURS[cls][scheme], (colour, background)
+        assert ratio >= 4.5, (colour, background, ratio)
+
+    @pytest.mark.parametrize("cls", ["check-ok", "check-warn", "check-fail"])
+    def test_forced_dark_theme_gives_the_check_states_their_dark_colours(
+        self,
+        page: Page,
+        browser_server_url: str,
+        cls: Literal["check-ok", "check-warn", "check-fail"],
+    ) -> None:
+        """
+        A forced ``data-theme`` reaches all three, under a light OS (P3).
+
+        The OS preference alone never sets ``data-theme``, so the emulated case
+        above cannot exercise the forced-dark rule at all. One of the three
+        reads an app-owned property and two read Pico's own tokens, and this is
+        what proves the forced-dark block reaches every one of them -- and that
+        the dark colour still clears AA on the dark card.
+        """
+        page.emulate_media(color_scheme="light")
+        page.goto(browser_server_url)
+        page.evaluate("() => { document.documentElement.dataset.theme = 'dark'; }")
+
+        probe = page.evaluate(_PROBE_CONTEXT_CONTRAST, {"cls": cls, "context": "card"})
+        colour = probe["colour"]
+        background = _flatten(probe["backgroundStack"])
+        ratio = _contrast_ratio(colour, background)
+        assert colour == _CHECK_STATE_COLOURS[cls]["dark"], (colour, background)
+        assert ratio >= 4.5, (colour, background, ratio)
+
+    def test_a_scan_in_flight_pauses_the_scanner_row_and_says_so(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        The Scanner row is skipped and the freshness line says why (P4, D-08).
+
+        The two inputs are set to exactly what a live scan produces -- a current
+        job on the worker, and the scanner gate held -- rather than by running
+        one. What a gate-holding worker does is ``tests/test_worker.py``'s
+        subject and the skip decision is ``tests/test_refresher.py``'s; what is
+        only provable here is that the pair of them renders as a paused strip
+        rather than a stale or a blank one, which is the whole of D-08.
+        """
+        server = cold_strip_server
+        job_store: JobStore = server.app.state.job_store
+        worker = server.app.state.worker
+        job = job_store.create_job(profile="default", title="Scanning Doc")
+        job_store.update_state(job.id, JobState.SCANNING)
+        worker._current_job_id = job.id
+        try:
+            page.goto(server.url)
+            with worker.scanner_gate:
+                _probe_now(server)
+
+                scanner_row = _check_row(page, "Scanner")
+                expect(scanner_row).to_contain_text(
+                    _SCANNER_PAUSED_MESSAGE, timeout=10_000
+                )
+                meta = page.locator(".check-meta")
+                expect(meta).to_contain_text(_PAUSED_PREFIX)
+                assert meta.inner_text().startswith(_PAUSED_PREFIX), meta.inner_text()
+        finally:
+            worker._current_job_id = None
+            job_store.delete_job(job.id)
