@@ -31,6 +31,7 @@ from saneless.vocabulary import (
     RequestRejection,
     SubmitResult,
     WorkerHealth,
+    busy_line,
     local_time,
     worker_health_detail,
 )
@@ -350,10 +351,54 @@ def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | Non
     return job
 
 
+def _busy_line(worker: ScanWorker, job_store: JobStore, job: Job | None) -> str | None:
+    """
+    Compose the one line the status area shows while the rendered job works.
+
+    Built here rather than composed in the template, because templates own no
+    vocabulary: a page that assembled its own sentence would be a second place
+    for the copy to drift from what ``vocabulary.busy_line`` says.
+
+    Three situations, in the precedence ``busy_line`` itself documents.  A
+    PENDING job while the worker runs a *different* one is waiting in the
+    queue, and is told what it is waiting for and how many jobs are ahead
+    (APPL-08).  The job the worker is actually running, on its second
+    manual-duplex pass, leads with the pages counted on the first.  Everything
+    else is the plain progress prose, unchanged.
+
+    The zero case reads as being next in line; a count of none ahead is never
+    spelled out as a number, because it is technically true and reads like a
+    bug (UI-SPEC S5).  That rule lives in ``vocabulary.busy_line``, so this
+    function passes the count through and does not restate it.
+
+    Args:
+        worker: The scan worker, for the job in flight and its front count.
+        job_store: The job store, for the running job's title and the position.
+        job: The job being rendered, or None when nothing has ever run.
+
+    Returns:
+        One line of plain text, or None when there is no job to describe.
+
+    """
+    if job is None:
+        return None
+    running_id = worker.current_job_id
+    if job.state is JobState.PENDING and running_id not in (None, job.id):
+        running = job_store.get_job(running_id) if running_id else None
+        ahead = job_store.queue_position(job.id)
+        if running is not None and ahead is not None:
+            return busy_line(job.state, queue_title=running.title, queue_ahead=ahead)
+    if job.id == running_id and job.state is JobState.SCANNING_REVERSE:
+        return busy_line(job.state, front_pages=worker.front_pages)
+    return busy_line(job.state)
+
+
 def _status_context(
     worker: ScanWorker,
     job_store: JobStore,
     claimed: tuple[str, FlipOutcome] | None = None,
+    *,
+    followed_job_id: str | None = None,
 ) -> dict[str, object]:
     """
     Build the context ``partials/status.html`` renders from.
@@ -373,10 +418,20 @@ def _status_context(
     the job being rendered, so a posted foreign job id cannot acknowledge a
     job nobody answered (T-25-49).
 
+    ``followed_job_id`` is the second such extra fact: the job this browser
+    submitted, baked into its poll URL by ``start_scan``.  It is used only to
+    select which job is rendered, and when it names no existing row the
+    function falls back to ``_current_or_recent_job``, so a browser whose job
+    has been pruned degrades to today's behaviour instead of meeting a 404
+    (D-25).  The context key echoes back only an id that was actually found,
+    which is what keeps that fallback rendering byte-identical to the one
+    ``GET /api/jobs/current/status`` produces.
+
     Args:
         worker: The scan worker, for the job in flight and its flip answer.
         job_store: The job store to read the job from.
         claimed: The job id and answer this request itself claimed, if any.
+        followed_job_id: The job this browser submitted, if it submitted one.
 
     ``refresh_checks`` is False here for every caller, and that is the whole of
     the flag's policy: ``start_scan`` sets it True on its own, so a status poll
@@ -385,19 +440,28 @@ def _status_context(
     from acquiring the behaviour by forgetting to say no.
 
     Returns:
-        The job, its flip answer and a false strip-refresh flag.
-        ``flip_answer`` is None unless the rendered job is ``AWAITING_FLIP``
-        and has been answered.
+        The job, its flip answer, the followed job's id, the one busy line and
+        a false strip-refresh flag.  ``flip_answer`` is None unless the
+        rendered job is ``AWAITING_FLIP`` and has been answered.
 
     """
-    job = _current_or_recent_job(worker, job_store)
+    followed = job_store.get_job(followed_job_id) if followed_job_id else None
+    job = (
+        followed if followed is not None else _current_or_recent_job(worker, job_store)
+    )
     answer: FlipOutcome | None = None
     if job is not None and job.state is JobState.AWAITING_FLIP:
         if claimed is not None and claimed[0] == job.id:
             answer = claimed[1]
         else:
             answer = worker.flip_answer(job.id)
-    return {"job": job, "flip_answer": answer, "refresh_checks": False}
+    return {
+        "job": job,
+        "flip_answer": answer,
+        "refresh_checks": False,
+        "followed_job_id": followed.id if followed is not None else None,
+        "busy_line": _busy_line(worker, job_store, job),
+    }
 
 
 @router.get("/")
@@ -686,8 +750,12 @@ def start_scan(
                 request,
                 "partials/status_response.html",
                 {
-                    "job": job,
-                    "flip_answer": None,
+                    # The created job is the followed job, so the poll URL this
+                    # browser is handed names it and the status area keeps
+                    # reporting the scan this person started (D-25).
+                    **_status_context(
+                        state.worker, state.job_store, followed_job_id=job.id
+                    ),
                     "clear_message": True,
                     "refresh_checks": True,
                     **_checks_context(state),
@@ -735,6 +803,41 @@ def current_job_status(request: Request) -> Response:
         request,
         "partials/status_response.html",
         _status_context(state.worker, state.job_store),
+    )
+
+
+@router.get("/api/jobs/{job_id}/status")
+def followed_job_status(request: Request, job_id: str) -> Response:
+    """
+    Poll the status of the job this browser submitted (D-25).
+
+    Declared after ``/api/jobs/current/status`` so that literal path keeps
+    winning: a browser that submitted nothing still gets today's route and
+    today's current-or-most-recent inference.
+
+    The path parameter is an opaque store lookup key and nothing else.  It
+    never builds a filesystem path, a URL or a template name, so there is no
+    traversal surface to guard (T-30-61), and an id naming no row is a
+    fallback rather than a 404 by design: a browser whose job has been pruned
+    degrades to the inferred rendering, and a 404 would additionally confirm to
+    a caller which ids exist.
+
+    Everything else matches ``current_job_status``: the Scan button rides along
+    out-of-band (ROBU-04) and ``#status-message`` is left alone (D-03).
+
+    Args:
+        request: The incoming HTTP request.
+        job_id: The job this browser is following.
+
+    Returns:
+        The status partial rendered for that job.
+
+    """
+    state = request.app.state
+    return state.templates.TemplateResponse(
+        request,
+        "partials/status_response.html",
+        _status_context(state.worker, state.job_store, followed_job_id=job_id),
     )
 
 
