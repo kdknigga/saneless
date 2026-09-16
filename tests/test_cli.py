@@ -3654,3 +3654,225 @@ class TestFailureAdvice:
 
         assert result.exit_code == 130
         assert "Try: " not in result.stderr
+
+
+def _refusing_paperless() -> type:
+    """
+    Build a PaperlessClient stand-in whose construction fails the test.
+
+    ``scan`` builds the client after the scanner, so reaching it at all would
+    mean the D-16 guard ran too late.
+
+    Returns:
+        A class that raises if it is ever constructed.
+
+    """
+
+    class _NeverBuilt:
+        """A paperless client that must not be reached."""
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            """Fail loudly: D-16 refuses before this point."""
+            msg = "PaperlessClient was built despite a placeholder token"
+            raise AssertionError(msg)
+
+    return _NeverBuilt
+
+
+def _open_counting_scanner(opens: list[str]) -> type[ScannerBackend]:
+    """
+    Build a scanner class that records every construction and device query.
+
+    "Before the scanner is opened" is the whole point of D-16, so it is
+    asserted from a counter rather than assumed from the exit code.
+
+    Args:
+        opens: The list every call appends its name to.
+
+    Returns:
+        A ``ScannerBackend`` subclass sharing that list.
+
+    """
+
+    class _CountingScanner(StubScannerBackend):
+        """A stub that records being opened."""
+
+        def __init__(self, host: str = "") -> None:
+            """Record the construction -- this is what "opened" means here."""
+            opens.append("SaneBackend")
+
+        def get_devices(self) -> list[DeviceInfo]:
+            """Record the query and report one device."""
+            opens.append("get_devices")
+            return [DeviceInfo("test:device:001", "Test", "Model", "flatbed scanner")]
+
+    return _CountingScanner
+
+
+def _token_settings(value: str, consume_dir: str = "") -> Settings:
+    """
+    Build settings carrying ``value`` as the paperless-ngx token.
+
+    Args:
+        value: The configured token, placeholder or not.
+        consume_dir: A fallback consume directory, when the test needs one.
+
+    Returns:
+        Settings otherwise identical to the suite's defaults.
+
+    """
+    return _make_settings(
+        paperless=PaperlessConfig(
+            url="http://localhost:8000",
+            token=value,
+            consume_dir=consume_dir,
+        ),
+    )
+
+
+class TestScanTokenRefusal:
+    """
+    ``saneless scan`` refuses a placeholder token before paper moves (D-16).
+
+    The check runs before the scanner is opened, it is unconditional, and the
+    three commands that never talk to paperless-ngx are untouched (APPL-07).
+    """
+
+    def test_a_blank_token_is_a_placeholder_and_exits_2_before_the_scanner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset token refuses with exit 2 and zero scanner opens."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(""),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+
+    @pytest.mark.parametrize("value", ["changeme", "your-api-token-here", "   "])
+    def test_a_placeholder_token_exits_2_before_the_scanner(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Every member of the literal set refuses the same way."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(value),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+
+    def test_a_real_token_is_not_a_placeholder_and_scans(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real-looking token leaves ``scan`` exactly as it was."""
+        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("a-real-token"))
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 0, result.output
+        assert "Done: Tax return" in result.output
+
+    def test_a_consume_dir_fallback_does_not_soften_the_placeholder_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """D-16: a configured fallback must not make the surfaces disagree."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings("changeme", consume_dir=str(tmp_path)),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+
+    def test_the_placeholder_refusal_names_the_title_and_profile_then_advises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It is a ConfigError, so it wears the D-08 shape and the D-12 advice."""
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings("changeme"),
+            scanner_cls=_open_counting_scanner([]),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        lines = result.stderr.splitlines()
+        assert lines[0] == (
+            "Scanning 'Tax return' with profile 'default': "
+            "the paperless-ngx API token has not been set"
+        )
+        assert lines[1] == f"Try: {error_next_step(ErrorCategory.CONFIG)}"
+
+    def test_the_placeholder_refusal_never_echoes_the_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ASVS V7: the token is passed to the predicate, never rendered."""
+        secret = "your-token-here"
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(secret),
+            scanner_cls=_open_counting_scanner([]),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2
+        assert secret not in result.output
+        assert secret not in result.stderr
+
+    def test_devices_is_unaffected_by_a_placeholder_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``devices`` never talks to paperless-ngx, so it still exits 0."""
+        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("changeme"))
+
+        result = runner.invoke(cli, ["devices"])
+
+        assert result.exit_code == 0, result.output
+        assert "Epson" in result.output
+
+    def test_jobs_is_unaffected_by_a_placeholder_token(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``jobs`` reads the local database only, so it still exits 0."""
+        settings = _token_settings("changeme")
+        settings.output = OutputConfig(
+            tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
+            log_file=str(tmp_path / "saneless.log"),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+
+    def test_auto_profiles_is_unaffected_by_a_placeholder_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``auto-profiles`` only reads the scanner, so it still exits 0."""
+        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("changeme"))
+
+        with runner.isolated_filesystem():
+            result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
