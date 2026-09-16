@@ -672,17 +672,30 @@ class JobStore:
         title: str,
         tags: list[int] | None = None,
         correspondent: int | None = None,
-        thumbnail: str | None = None,
+        owner_token: str | None = None,
     ) -> Job:
         """
         Create and persist a new job.
+
+        ``owner_token`` occupies the parameter slot ``thumbnail`` used to hold.
+        Nothing ever passed ``thumbnail`` to this method -- verified by grep
+        across ``src/`` and ``tests/`` before it was removed -- because
+        :meth:`update_thumbnail` is the live writer, called by the worker once
+        a scan has produced an image (``worker.py:1288``).  Spending the freed
+        slot rather than adding a sixth parameter is deliberate: ruff's
+        ``PLR0913`` ceiling is five non-``self`` parameters and it counts
+        keyword-only ones too, so a sixth would need either a suppression,
+        which this project does not write, or a frozen-dataclass bundle in the
+        shape of :class:`JobResult`.  Neither is warranted to make room for a
+        parameter that replaces a dead one.
 
         Args:
             profile: Scan profile name.
             title: Document title.
             tags: Optional list of tag IDs.
             correspondent: Optional correspondent ID.
-            thumbnail: Optional base64-encoded JPEG thumbnail.
+            owner_token: The submitting browser's opaque session token, or None
+                when the submission carried none.
 
         Returns:
             The newly created Job instance.
@@ -701,19 +714,34 @@ class JobStore:
                     None,  # error_category
                     json.dumps(tags or []),
                     correspondent,
-                    thumbnail,
+                    # thumbnail -- never a submission field.  update_thumbnail
+                    # writes it once the worker has an image to write
+                    # (worker.py:1288), which is why the parameter that used to
+                    # sit in this position could be spent on owner_token.
+                    None,
                     datetime.now(tz=UTC).isoformat(),
                     # A new job has recorded nothing yet, so every result
                     # column starts NULL -- deliberately, because NULL means
                     # "never recorded" rather than a measured zero.  finish_job
-                    # is the writer of the first five, once the run ends;
-                    # owner_token still has no writer.
+                    # is the writer of these five, once the run ends.
                     None,  # outcome
                     None,  # pages_scanned
                     None,  # pages_removed
                     None,  # pages_uploaded
                     None,  # warning
-                    None,  # owner_token
+                    # owner_token's first and only writer (D-23).  The value is
+                    # an opaque session token minted by the web layer and kept
+                    # for exactly one purpose: rendering the flip prompt to the
+                    # browser that submitted this job rather than to every
+                    # browser watching it.  NULL means the row is unowned and
+                    # the prompt is rendered for everyone -- which is every row
+                    # written before this phase, including a manual-duplex job
+                    # still in flight across an upgrade, so no migration
+                    # backfills it and none is needed.  It is a footgun guard,
+                    # not an authentication mechanism: the column already
+                    # existed unused, and guessing a token grants nothing a LAN
+                    # neighbour cannot already do.
+                    owner_token,
                 ),
             )
             # Read the row back inside the same transaction, before the commit:
