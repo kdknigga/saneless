@@ -45,6 +45,7 @@ __all__ = [
     "FlipOutcome",
     "JobState",
     "PageCounted",
+    "ProfileStorage",
     "RequestRejection",
     "ScanOutcome",
     "SubmitResult",
@@ -149,6 +150,35 @@ class PageCounted(Protocol):
     @property
     def pages_uploaded(self) -> int | None:
         """Pages sent to paperless-ngx, or None if nothing counted them."""
+
+
+class ProfileStorage(StrEnum):
+    """
+    What became of the generated scan profiles at startup.
+
+    The worker makes exactly one attempt to persist generated profiles when it
+    starts, and records the outcome here.  It has to be recorded rather than
+    recomputed because ``_persist_generated_profiles`` returns ``None`` for two
+    genuinely different situations -- no config file was loaded at all, and a
+    config file was loaded but could not be written -- and the status strip's
+    Profiles row must tell a household member which one happened (Amendment
+    A-2, D-22).  One is "saneless has no config file to save to"; the other is
+    "saneless has one and cannot write it", and only the second is worth
+    investigating.
+
+    A fresh ``os.access()`` probe at check time cannot substitute for the
+    record.  Phase 27 D-09's motivating failure is EBUSY on a single-file bind
+    mount, where the directory is writable, ``os.access`` says yes, and only
+    the rename fails.  The check reads what the write actually did.
+
+    ``PERSISTED`` means the profiles are in the config file and will survive a
+    restart.  Both ``IN_MEMORY_`` members mean they are in memory for this run
+    only.
+    """
+
+    PERSISTED = "PERSISTED"
+    IN_MEMORY_NO_CONFIG_FILE = "IN_MEMORY_NO_CONFIG_FILE"
+    IN_MEMORY_UNWRITABLE = "IN_MEMORY_UNWRITABLE"
 
 
 class ExitCode(IntEnum):
