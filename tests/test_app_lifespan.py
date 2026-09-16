@@ -22,7 +22,6 @@ from typing import TYPE_CHECKING
 
 import pytest
 from fastapi.testclient import TestClient
-from PIL import Image
 
 from saneless.config import (
     OutputConfig,
@@ -32,15 +31,9 @@ from saneless.config import (
     Settings,
 )
 from saneless.job import JobStore
-from saneless.scanner.base import (
-    DeviceCapabilities,
-    DeviceInfo,
-    ScanBatch,
-    ScannerBackend,
-    ScanSettings,
-)
 from saneless.vocabulary import RESTART_REASON, JobState, WorkerHealth
 from saneless.web.app import create_app
+from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -52,28 +45,6 @@ _APP_LOGGER = "saneless.web.app"
 # The status area's opening tag, captured whole so a polling attribute
 # elsewhere on the page cannot satisfy or break the assertion.
 _STATUS_AREA = re.compile(r'<div id="status-area"(?P<attrs>[^>]*)>')
-
-
-class _StubScanner(ScannerBackend):
-    """Concrete scanner stub; these tests never run a scan."""
-
-    def get_devices(self) -> list[DeviceInfo]:
-        """Return an empty device list."""
-        return []
-
-    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-        """Return default capabilities."""
-        return DeviceCapabilities(
-            sources=["Flatbed"], resolutions=[300], modes=["color"]
-        )
-
-    def scan_pages(self, device_id: str, settings: ScanSettings) -> ScanBatch:
-        """Return a batch holding a single white test image."""
-        return ScanBatch(
-            pages=[Image.new("RGB", (100, 100), "white")],
-            actual_resolution=settings.resolution,
-            pages_rejected=0,
-        )
 
 
 @dataclass(frozen=True)
@@ -104,7 +75,7 @@ def settings(tmp_path: Path) -> Settings:
 
 def _build_app(settings: Settings) -> FastAPI:
     """Build the real app with a stub scanner and no Paperless network calls."""
-    app = create_app(settings, _StubScanner())
+    app = create_app(settings, StubScannerBackend())
     app.state.paperless.get_tags = list
     app.state.paperless.get_correspondents = list
     return app
