@@ -946,7 +946,9 @@ class PaperlessClient:
             raise PaperlessError(msg)
         return None
 
-    def test_connection(self) -> ConnectionStatus:
+    def test_connection(
+        self, *, timeout: httpx.Timeout | None = None
+    ) -> ConnectionStatus:
         """
         Probe paperless-ngx and report which of five outcomes occurred.
 
@@ -964,6 +966,26 @@ class PaperlessClient:
         ``vocabulary.connection_status_message``, which does dispatch on a
         closed set.
 
+        The bound is a per-request override rather than a constructor
+        argument, because the two kinds of caller want different budgets.
+        ``SaneBackend.get_devices()`` has no timeout at any layer -- not in
+        python-sane, not in ``sane_get_devices(3)``, and not settable from
+        Python -- so the SANE side of the status strip needs a socket
+        pre-probe to get any bound at all; httpx, by contrast, takes one per
+        request.  The status strip and ``saneless doctor`` pass a short budget
+        so an unplugged host is discovered in about two seconds instead of
+        thirty, while ``GET /api/paperless/test`` deliberately keeps today's
+        client default and therefore calls this with no argument at all.
+
+        Bounding the probe needs no new exception handling.  The
+        ``except httpx.TransportError`` arm below is the base class of
+        ``ConnectTimeout`` and ``ReadTimeout`` as well as ``ConnectError``, so
+        a budget that expires already lands on UNREACHABLE.
+
+        Args:
+            timeout: The per-request budget to send, or None to use the
+                client's own 30 s default.
+
         Returns:
             A ConnectionStatus member.  It is a StrEnum, and its values are
             the public JSON contract documented in
@@ -973,7 +995,11 @@ class PaperlessClient:
 
         """
         try:
-            response = self._client.get("/api/tags/", params={"page_size": 1})
+            response = self._client.get(
+                "/api/tags/",
+                params={"page_size": 1},
+                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+            )
         except httpx.TransportError:
             # The base class of ConnectError, ConnectTimeout and ReadTimeout.
             # Catching only ConnectError let the timeout siblings escape to
