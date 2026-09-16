@@ -2124,6 +2124,26 @@ _BLOCKED_REASON_TEXT = (
 _BLOCKED_REASON_SELECTOR = "#scan-blocked-reason"
 
 
+def _blocked_settings(tmp_dir: Path) -> Settings:
+    """
+    Build the browser settings with the shipped placeholder token in place.
+
+    One definition, because two servers run with it: the session-scoped one
+    below, and the private one plan 30-19 uses for the claims that write a job
+    row. A second copy of this ``model_copy`` would be a second place for the
+    placeholder to drift from ``is_placeholder_token``'s idea of one.
+    """
+    configured = _browser_test_settings(tmp_dir)
+    return configured.model_copy(
+        update={
+            "paperless": PaperlessConfig(
+                url=configured.paperless.url,
+                token=_SHIPPED_PLACEHOLDER,
+            )
+        }
+    )
+
+
 @pytest.fixture(scope="session")
 def blocked_server(
     tmp_path_factory: pytest.TempPathFactory,
@@ -2137,16 +2157,7 @@ def blocked_server(
     """
     tmp_dir = tmp_path_factory.mktemp("browser-blocked")
     scanner = _BrowserTestScanner()
-    configured = _browser_test_settings(tmp_dir)
-    settings = configured.model_copy(
-        update={
-            "paperless": PaperlessConfig(
-                url=configured.paperless.url,
-                token=_SHIPPED_PLACEHOLDER,
-            )
-        }
-    )
-    app = create_app(settings, scanner)
+    app = create_app(_blocked_settings(tmp_dir), scanner)
     running = _start_uvicorn(app, host="127.0.0.1")
     yield _BrowserServer(
         url=f"http://127.0.0.1:{running.port}", app=app, scanner=scanner
@@ -2287,6 +2298,9 @@ class TestBlockedScanButtonInABrowser:
 
         assert page.locator(_BLOCKED_REASON_SELECTOR).count() == 0
         assert page.locator("#scan-btn").get_attribute("aria-describedby") is None
+        # The other half of the same flag, asserted here so the blocked case
+        # below is a difference and not just a presence (plan 30-19, P16).
+        expect(page.locator("#scan-btn")).to_be_enabled()
 
 
 _OWNER_COOKIE_NAME = "saneless_owner"
@@ -3738,3 +3752,184 @@ class TestSimplerFormInChromium:
 
         expect(page.locator("#status-area .status-done")).to_be_visible(timeout=15_000)
         wait_for_state(job_store, job.id, TERMINAL_STATES, timeout=_JOB_FINISH_TIMEOUT)
+
+
+# ---------------------------------------------------------------------------
+# The courtesy and the enforcement (D-15, APPL-07).
+#
+# The disabled Scan button and the route guard are two different promises, and
+# only one of them is load-bearing. The first class below proves the button
+# stays greyed out through a run of real status responses; the second removes
+# the attribute the way anybody with devtools can and proves the scan is
+# refused anyway.
+# ---------------------------------------------------------------------------
+
+_SERVICE_UNAVAILABLE = 503
+"""The status a refused submit answers with, shared by all three refusals."""
+
+_POLL_TICKS = 3
+"""How many completed status responses count as "the poll ran for a while"."""
+
+_TOKEN_UNSET_SLOT_TEXT = (
+    "✗ The paperless-ngx API token has not been set, so the scan was not "
+    "started. Put a real API token in the saneless config file, then restart "
+    "saneless."
+)
+"""The slot's exact text for the refusal: the error partial's cross plus S8's copy."""
+
+_TOKEN_UNSET_ROW_ERROR = "Not started: the paperless-ngx API token has not been set"
+"""The job row's own error, written as the literal because it is locked copy."""
+
+
+@pytest.fixture
+def private_blocked_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app whose paperless-ngx token is the shipped placeholder.
+
+    Private rather than the session-scoped ``blocked_server``: both tests below
+    write to the job store -- one parks an active job on the worker, the other
+    leaves a refused row behind -- and either would follow the rest of that
+    fixture's class onto its supposedly idle page.
+
+    No Paperless stub is installed, and that is not an oversight: on this
+    server no scan can ever reach an upload, which is the whole point of it.
+    """
+    with _serve(_blocked_settings(tmp_path), _BrowserTestScanner()) as server:
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.mark.browser
+class TestBlockedButtonThroughTheStatusPoll:
+    """
+    A run of real status responses does not give the blocked button back (C-10).
+
+    ``test_the_blocked_button_survives_its_own_page_load_requests`` covers the
+    requests the form issues on load. This covers the other stream of requests
+    a real page makes: the one-second status poll, each response of which
+    re-renders the button out of band from server state. The blocked flag has
+    to survive every one of them, and the last one -- taken once nothing is
+    active any more -- is where the flag is the only thing still holding the
+    button shut.
+    """
+
+    def test_the_blocked_button_stays_blocked_across_a_run_of_polls(
+        self, page: Page, private_blocked_server: _BrowserServer
+    ) -> None:
+        """
+        Three poll responses later the button is still disabled (P16).
+
+        And once the job retires, the flag is the only thing still holding it
+        shut, so the last swap is the tightest of the four readings.
+
+        The job is parked directly rather than scanned, for the reason plan
+        30-17's P4 gives: what the page needs is the two pieces of state a live
+        scan produces, and running one would make the assertion wait on a
+        worker thread it is not testing. Here it could not run one anyway --
+        the guard refuses every submit on this server.
+
+        The waits are completed responses, never a sleep: "several ticks" is a
+        count of round trips, and a stopwatch would be measuring the host.
+        """
+        server = private_blocked_server
+        job_store: JobStore = server.app.state.job_store
+        worker = server.app.state.worker
+        job = job_store.create_job(profile="default", title="Polled Doc")
+        job_store.update_state(job.id, JobState.SCANNING)
+        worker._current_job_id = job.id
+        try:
+            page.goto(server.url)
+            button = page.locator("#scan-btn")
+            expect(button).to_be_disabled()
+
+            for _ in range(_POLL_TICKS):
+                with page.expect_response(
+                    lambda r: _POLL_URL.search(r.url) is not None
+                ):
+                    pass
+
+            # Read without retrying: a retrying assertion on a button that is
+            # re-rendered every second would hide a trap that sprung and then
+            # healed on the following tick.
+            assert button.is_disabled(), "a status poll re-enabled a blocked button"
+            assert button.get_attribute("aria-describedby") == "scan-blocked-reason"
+
+            # Retire the job so the next out-of-band render is made with
+            # nothing active. What is left holding the button shut is the
+            # blocked flag and nothing else, which is the state the rest of
+            # this module's blocked assertions are made in -- reached here
+            # through a real swap rather than a fresh page load.
+            job_store.finish_job(job.id, JobState.CANCELLED)
+            worker._current_job_id = None
+
+            expect(page.locator("#status-area .status-cancelled")).to_be_visible(
+                timeout=10_000
+            )
+            assert button.is_disabled(), "the final swap re-enabled a blocked button"
+            assert (button.text_content() or "").strip() == "Scan"
+            assert button.get_attribute("aria-describedby") == "scan-blocked-reason"
+            expect(page.locator(_BLOCKED_REASON_SELECTOR)).to_be_visible()
+        finally:
+            worker._current_job_id = None
+            job_store.delete_job(job.id)
+
+
+@pytest.mark.browser
+class TestTheGuardBehindTheBlockedButton:
+    """
+    The button is the courtesy; this is the proof the guard is the refusal (D-15).
+
+    ``tests/test_web_errors.py`` already refuses this submit against a client
+    that has no button at all, which is the stronger statement about the route.
+    What it cannot say is that the two halves of D-15 really are separable in a
+    browser: that the greyed-out button is a convenience anyone with devtools
+    can take away, and that taking it away buys nothing. That is what this
+    does, by removing the attribute and clicking.
+    """
+
+    def test_a_tampered_button_still_cannot_start_a_scan(
+        self, page: Page, private_blocked_server: _BrowserServer
+    ) -> None:
+        """
+        ``disabled`` removed, clicked, refused, and recorded as Failed (P17).
+
+        Three separate claims, because a refusal that left any one of them
+        unmet would be a different bug: the person is told why in the slot, no
+        scan started, and the attempt is in Job History rather than silently
+        swallowed (D-05). The row's error is asserted through the job store
+        because Job History renders a state label and not the sentence -- the
+        sentence is what ``saneless jobs`` and the API surface.
+        """
+        server = private_blocked_server
+        job_store: JobStore = server.app.state.job_store
+        page.goto(server.url)
+        button = page.locator("#scan-btn")
+        expect(button).to_be_disabled()
+
+        page.evaluate(
+            "() => document.getElementById('scan-btn').removeAttribute('disabled')"
+        )
+        expect(button).to_be_enabled()
+
+        with page.expect_response(lambda r: r.url.endswith("/api/scan")) as caught:
+            button.click()
+        assert caught.value.status == _SERVICE_UNAVAILABLE, caught.value.status
+
+        # Told why, in the slot phase 26 reserved for request errors (D-02).
+        expect(page.locator(_SLOT_MESSAGE)).to_have_text(_TOKEN_UNSET_SLOT_TEXT)
+        # And nothing started: the status area was never the target of this
+        # response, and it still says what an idle appliance says.
+        expect(page.locator("#status-area")).to_have_text("Ready to scan.")
+        expect(page.locator("#status-area [aria-busy]")).to_have_count(0)
+
+        status_cell = page.locator("#history-body tr").first.locator("td").nth(3)
+        expect(status_cell).to_have_text("Failed", timeout=5_000)
+        expect(status_cell).to_have_class(re.compile(r"\bstatus-error\b"))
+
+        recent = job_store.list_recent(1)
+        assert recent, "the refused submit recorded no job row"
+        written = recent[0]
+        assert written.error == _TOKEN_UNSET_ROW_ERROR, written.error
+        assert written.error_category is ErrorCategory.REJECTED
