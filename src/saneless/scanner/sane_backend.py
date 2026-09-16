@@ -1772,12 +1772,45 @@ def _read_options(dev: SaneDevice, device_id: str) -> list:
         raise ScanError(options_msg) from exc
 
 
+@dataclass(frozen=True)
+class _PageBudget:
+    """
+    How long one page may take, and how long its cancel may.
+
+    Bundled into one record rather than passed as two parameters because
+    ``_snap_flatbed`` already sits exactly on ruff's ``PLR0913`` argument
+    limit, and CLAUDE.md forbids both raising the limit and suppressing the
+    rule. ``_acquire_pages`` takes the two separately and is at the same limit
+    without needing this, so the asymmetry is the lint's, not a design
+    statement; ``pipeline._DeliveryContext`` is the same answer to the same
+    constraint.
+
+    Both defaults are the module constants the ADF path uses, so "one sheet is
+    one sheet, whichever way it was presented" (D-14) is expressed in the
+    default rather than merely asserted about it.
+
+    Attributes:
+        timeout: Maximum seconds to wait for the sheet.
+        grace: Maximum seconds to wait for a cancelled read to return.
+
+    """
+
+    timeout: float = _DEFAULT_PAGE_TIMEOUT_SECONDS
+    grace: float = _CANCEL_GRACE_SECONDS
+
+
+# The shared default instance.  A module constant and not an inline
+# ``_PageBudget()`` in the signature, because a call in a default argument is
+# what ruff's B008 rejects; a frozen instance is safe to share.
+_DEFAULT_PAGE_BUDGET = _PageBudget()
+
+
 def _snap_flatbed(
     dev: SaneDevice,
     device_id: str,
     sink: PageSink,
     crop: Callable[[Image.Image], Image.Image],
-    timeout: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
+    budget: _PageBudget = _DEFAULT_PAGE_BUDGET,
 ) -> PageRecord:
     """
     Acquire one flatbed page under the ADF's timeout, validate it, and spool it.
@@ -1807,9 +1840,13 @@ def _snap_flatbed(
         sink: Where the page goes.  ``add`` is called exactly once, after the
             page passed its integrity checks and was cropped.
         crop: Applied to the page before the sink sees it.
-        timeout: Maximum seconds to wait for the sheet.  Defaults to the one
-            constant the feeder path uses; a test injects a short one the same
-            way ``timeout_per_page`` is injected there.
+        budget: The per-page timeout and the cancel grace.  Both default to the
+            constants the feeder path uses, and both are injectable for the
+            reason ``_acquire_pages``' are: a test proving the
+            unresponsive-cancel path must not wait out the module's real ten
+            seconds, and without an injectable grace there could be no fast
+            flatbed equivalent of ``test_did_not_respond_to_cancel`` at all
+            (WR-10).
 
     Returns:
         The record the sink returned for the one scanned page.
@@ -1827,7 +1864,9 @@ def _snap_flatbed(
         return dev.snap()
 
     try:
-        image = _acquire_with_timeout(dev, start_and_snap, _page_label(0), timeout)
+        image = _acquire_with_timeout(
+            dev, start_and_snap, _page_label(0), budget.timeout, budget.grace
+        )
     except ScanError:
         # The timeout path's own error, already worded and already logged.
         # FeederEmptyError subclasses ScanError and reaches here the same way.

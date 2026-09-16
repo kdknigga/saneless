@@ -2326,23 +2326,30 @@ class TestSaneBackendCancelSequence:
         """
         HARD-04: one flatbed sheet is bounded exactly as one fed sheet is.
 
-        The default is asserted alongside the behaviour because D-14's claim
+        The defaults are asserted alongside the behaviour because D-14's claim
         is not merely "the flatbed times out" but "with the same constant, and
         no new config key".  A second timeout that happened to be equal today
-        would satisfy the first half and quietly drift apart later.
+        would satisfy the first half and quietly drift apart later.  The grace
+        is pinned for the same reason, and because it is the parameter that
+        makes the unresponsive-cancel path testable at all (WR-10).
         """
-        assert (
+        budget = (
             inspect.signature(sane_backend_mod._snap_flatbed)
-            .parameters["timeout"]
+            .parameters["budget"]
             .default
-            == sane_backend_mod._DEFAULT_PAGE_TIMEOUT_SECONDS
         )
+        assert budget.timeout == sane_backend_mod._DEFAULT_PAGE_TIMEOUT_SECONDS
+        assert budget.grace == sane_backend_mod._CANCEL_GRACE_SECONDS
         fake_device.block_read(ReadBlockMode.PARTIAL)
 
         with sane_backend._open_device(_TEST_DEVICE) as dev:
             with pytest.raises(ScanError, match="timed out"):
                 sane_backend_mod._snap_flatbed(
-                    dev, _TEST_DEVICE, page_sink, _uncropped, timeout=0.05
+                    dev,
+                    _TEST_DEVICE,
+                    page_sink,
+                    _uncropped,
+                    sane_backend_mod._PageBudget(timeout=0.05),
                 )
             # Inside the device context, so the count is the acquisition's own
             # cancel and not the context manager's routine one on the way out.
@@ -2351,6 +2358,53 @@ class TestSaneBackendCancelSequence:
             assert fake_device.close_calls == 0
 
         assert page_sink.records == ()
+
+    def test_flatbed_did_not_respond_to_cancel(
+        self,
+        sane_backend: SaneBackend,
+        fake_device: FakeSaneDev,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        The platen equivalent of ``test_did_not_respond_to_cancel`` (WR-10).
+
+        D-14's claim is "one sheet is one sheet, whichever way it was
+        presented", and until the grace became injectable here there was no
+        flatbed version of this proof that did not wait out the module's real
+        ten seconds -- so the half of the claim that matters most, what happens
+        when the scanner ignores the cancel, was asserted only for the feeder.
+        """
+        fake_device.block_read(ReadBlockMode.NEVER)
+        began = time.monotonic()
+
+        with (
+            caplog.at_level(logging.CRITICAL),
+            pytest.raises(ScanError) as raised,
+            sane_backend._open_device(_TEST_DEVICE) as dev,
+        ):
+            sane_backend_mod._snap_flatbed(
+                dev,
+                _TEST_DEVICE,
+                page_sink,
+                _uncropped,
+                sane_backend_mod._PageBudget(timeout=0.05, grace=0.05),
+            )
+
+        # The injected grace was really used, not the module's ten seconds --
+        # which is the whole difference this parameter makes.
+        assert time.monotonic() - began < 1.0
+        message = str(raised.value)
+        assert "timed out" in message
+        assert "did not respond" in message
+        assert fake_device.close_calls == 0
+        assert fake_device.close_while_blocked is False
+        assert page_sink.records == ()
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.CRITICAL
+        ]
 
     def test_flatbed_unreadable_sheet_is_fatal_not_skipped(
         self,
