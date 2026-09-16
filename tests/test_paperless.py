@@ -1834,6 +1834,109 @@ class TestConnectionTest:
         assert any("429" in message for message in caplog.messages)
 
 
+class TestConnectionTimeout:
+    """
+    The probe can be bounded per request without changing any caller (APPL-02).
+
+    ``PaperlessClient`` sets one flat 30 s on its ``httpx.Client``, which is
+    thirty seconds of a household member staring at a spinner when the
+    paperless-ngx host is unplugged.  The status strip and ``saneless doctor``
+    need a two-second answer, while ``GET /api/paperless/test`` deliberately
+    keeps today's client default, so the bound is a per-request override and
+    not a new constructor argument.
+
+    Every assertion here reads ``request.extensions["timeout"]``, the dict
+    httpx hands the transport, rather than measuring wall-clock.  The suite
+    forbids ``sleep`` and a timing assertion against a real socket would be
+    flaky on a loaded machine; what actually needs proving is *which budget was
+    sent*, and that is a value, not a duration.
+    """
+
+    @staticmethod
+    def _recorded_timeout(
+        timeout: httpx.Timeout | None,
+    ) -> dict[str, float | None]:
+        """
+        Run ``test_connection`` and return the timeout the transport was given.
+
+        Args:
+            timeout: The bound to pass, or None to call with no argument at
+                all -- which is the case that proves the existing route is
+                untouched.
+
+        Returns:
+            The ``timeout`` extension dict httpx handed the mock transport.
+
+        """
+        seen: list[dict[str, float | None]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.extensions["timeout"])
+            return httpx.Response(200, json={"count": 0, "results": []})
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            _transport=_make_transport(handler),
+        )
+        try:
+            if timeout is None:
+                client.test_connection()
+            else:
+                client.test_connection(timeout=timeout)
+        finally:
+            client.close()
+        return seen[0]
+
+    @pytest.mark.parametrize(("status_code", "expected"), _CONNECTION_STATUS_CASES)
+    def test_no_timeout_argument_keeps_every_outcome(
+        self, status_code: int, expected: ConnectionStatus
+    ) -> None:
+        """
+        Calling with no bound classifies exactly as it does today.
+
+        Args:
+            status_code: The status the stub server answers with.
+            expected: The outcome that status has always produced.
+
+        """
+        assert _connection_result_for_status(status_code) is expected
+
+    def test_no_timeout_argument_uses_the_client_default(self) -> None:
+        """
+        A bare call still carries the client's 30 s, so no caller changed.
+
+        This is the assertion that proves ``GET /api/paperless/test`` keeps
+        today's behaviour: the route calls ``test_connection()`` with no
+        argument, and what it sends is the constructor's flat 30 s.
+        """
+        recorded = self._recorded_timeout(None)
+        assert recorded["connect"] == 30.0
+        assert recorded["read"] == 30.0
+
+    def test_explicit_timeout_is_sent_to_the_transport(self) -> None:
+        """A passed bound reaches the request, connect and read separately."""
+        recorded = self._recorded_timeout(httpx.Timeout(5.0, connect=2.0))
+        assert recorded["connect"] == 2.0
+        assert recorded["read"] == 5.0
+
+    def test_connect_timeout_is_unreachable(self) -> None:
+        """
+        A bounded connect that expires reports UNREACHABLE, not an exception.
+
+        ``ConnectTimeout`` subclasses ``TransportError``, so the existing arm
+        already covers it -- asserted here so bounding the probe rests on a
+        tested claim rather than on reading the class hierarchy.
+        """
+        result = _connection_result_for_exception(httpx.ConnectTimeout)
+        assert result is ConnectionStatus.UNREACHABLE
+
+    def test_read_timeout_is_unreachable(self) -> None:
+        """A host that accepts and then says nothing is UNREACHABLE too."""
+        result = _connection_result_for_exception(httpx.ReadTimeout)
+        assert result is ConnectionStatus.UNREACHABLE
+
+
 # ---------------------------------------------------------------------------
 # Auth header test
 # ---------------------------------------------------------------------------
