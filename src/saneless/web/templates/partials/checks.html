@@ -1,0 +1,57 @@
+{# The status strip's swap target, and two load-bearing facts about it.
+
+   1. The poll trigger is emitted ONLY while the poll is wanted.  A cold cache
+      has no results, so this body asks for itself again every 2s; the body
+      that replaces it has results, carries no trigger, and so ends the poll.
+      That is the in-tree idiom (partials/status.html lines 1-6) and it is
+      deliberately NOT HTTP 286, which would need a change to the tuned
+      htmx-config meta in base.html.
+   2. There is never a steady-state poll.  Once results land the strip is
+      refetched only by Check again, by the terminal-state reload, or by a page
+      load.  A permanent poll would keep D-05's lazy refresher awake for every
+      abandoned browser tab, which is the exact cost D-05 exists to avoid.
+
+   `oob` follows partials/scan_button.html: the one copy of this markup renders
+   itself out-of-band when a scan submit carries it, so there is never a second
+   element with id="checks-body" on the page.
+
+   The template owns no vocabulary.  Every class, glyph and word comes either
+   from a Jinja filter implemented in saneless.checks or from a constant this
+   route already put on the row, and the only condition here is "are there
+   results yet", never a comparison against a CheckState value. #}
+{%- macro check_row(name, state_class, glyph, state_label, message, next_step) -%}
+    <li class="check-row">
+      <span class="check-glyph {{ state_class }}" aria-hidden="true">{{ glyph }}</span>
+      <span class="sr-only">{{ state_label }}:</span>
+      <span class="check-name">{{ name }}</span>
+      <span>
+        {{ message }}
+        {% if next_step %}<span class="check-next">{{ next_step }}</span>{% endif %}
+      </span>
+    </li>
+{%- endmacro -%}
+<div id="checks-body"{% if oob %} hx-swap-oob="true"{% endif %}
+     {%- if checks is none %}
+     hx-get="/api/checks" hx-trigger="load, every 2s" hx-target="this" hx-swap="outerHTML"
+     aria-busy="true"
+     {%- endif %}>
+  <ul class="check-list">
+    {% if checks is none %}
+      {% for c in checking_rows %}
+      {{ check_row(c.key | check_name, c.state_class, c.glyph, c.state_label, c.message, "") }}
+      {% endfor %}
+    {% else %}
+      {% for c in checks %}
+      {{ check_row(c.key | check_name,
+                   c.state | check_state_class,
+                   c.state | check_state_glyph,
+                   c.state | check_state_label,
+                   c.message,
+                   c.next_step) }}
+      {% endfor %}
+    {% endif %}
+  </ul>
+  <p class="check-meta">{{ freshness_line }}</p>
+  <button type="button" class="check-refresh secondary"
+          hx-post="/api/checks/refresh" hx-target="#checks-body" hx-swap="outerHTML">Check again</button>
+</div>

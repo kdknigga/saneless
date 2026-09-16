@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from saneless.checks import CheckContext
+    from saneless.web.refresher import CheckRefresher
 
 # The paused Scanner row, quoted from UI-SPEC S1 so the route test fails if the
 # registry's sentence and the page's sentence ever drift apart (D-02).
@@ -104,21 +105,36 @@ class _RecordingRefresher:
     """
     Stands in for :class:`~saneless.web.refresher.CheckRefresher` in a request.
 
-    It counts :meth:`note_watcher` and does nothing else, which is what makes
+    It counts :meth:`note_watcher` and **swallows** it, which is what makes
     these tests deterministic.  The real refresher is still built and still
     started by the lifespan, but the routes stamp *this* object, so the real
     one never learns it has a watcher and its first guard returns on every
     tick -- no background probe can land mid-assertion and fill the cache a
     cold-start test just emptied.
+
+    :meth:`build_context` is delegated rather than faked, because the refresh
+    route probes through it and the context it hands over is the real one the
+    application assembled.
     """
 
-    def __init__(self) -> None:
-        """Start with no recorded watchers."""
+    def __init__(self, real: CheckRefresher) -> None:
+        """Wrap the refresher the app built, with no watchers recorded yet."""
+        self._real = real
         self.watch_count = 0
 
     def note_watcher(self) -> None:
         """Record one page render that said someone is looking."""
         self.watch_count += 1
+
+    def build_context(self) -> CheckContext:
+        """
+        Hand over the real refresher's context.
+
+        Returns:
+            The context one probe would run against.
+
+        """
+        return self._real.build_context()
 
 
 class _ProbeSpy:
@@ -203,7 +219,7 @@ def _make_app(tmp_path: Path, *, stub_refresher: bool = True) -> FastAPI:
         ConnectionStatus.CONNECTED
     )
     if stub_refresher:
-        app.state.refresher = _RecordingRefresher()
+        app.state.refresher = _RecordingRefresher(app.state.refresher)
     return app
 
 

@@ -728,6 +728,12 @@ _ROUTE_CALLS: dict[str, dict[str, Any]] = {
         "data": {"profile": "default", "title": "D-19 proof"},
     },
     "/api/jobs/current/status": {"method": "GET"},
+    # The strip is a cache read, so it enters no SANE call at all; the refresh
+    # route is the one that does, which is exactly why this proof must drive it
+    # -- it runs the scanner check through the same backend handle the worker
+    # uses, and it must not leave one outstanding at sane_exit() (D-18, A-7).
+    "/api/checks": {"method": "GET"},
+    "/api/checks/refresh": {"method": "POST"},
     "/api/tags": {"method": "GET"},
     "/api/correspondents": {"method": "GET"},
     "/api/cache/invalidate": {"method": "POST", "params": {"resource": "tags"}},

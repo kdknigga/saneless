@@ -53,6 +53,7 @@ __all__ = [
     "CHECKING_GLYPH",
     "CHECKING_MESSAGE",
     "CHECKING_STATE_CLASS",
+    "CHECKING_STATE_LABEL",
     "PROBE_CONNECT_SECONDS",
     "PROBE_READ_SECONDS",
     "SANED_PORT",
@@ -95,6 +96,12 @@ SANED_PORT: Final = 6566
 CHECKING_GLYPH: Final = "·"
 CHECKING_STATE_CLASS: Final = "check-checking"
 CHECKING_MESSAGE: Final = "Checking…"
+# The word that replaces the cold-start glyph for a screen reader.  The glyph
+# is ``aria-hidden``, so without this a listener would hear the row's name and
+# message with no marker at all where every other row has one.  It is a word
+# rather than the ellipsis for the same reason ``check_state_label`` says
+# "Failed" instead of "FAIL": the glyph's meaning has to survive as speech.
+CHECKING_STATE_LABEL: Final = "Checking"
 
 # How much of a device's own description a row will print.  Nothing else bounds
 # what a scanner can call itself, and the row is rendered into HTML next to
