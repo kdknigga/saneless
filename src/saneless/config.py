@@ -57,6 +57,7 @@ __all__ = [
     "ProfileConfig",
     "ScannerConfig",
     "Settings",
+    "WebConfig",
     "config_search_paths",
     "env_sourced_keys",
     "is_placeholder_token",
@@ -537,6 +538,33 @@ class OutputConfig(BaseModel):
         return Path(self.data_dir) / "failed"
 
 
+class WebConfig(BaseModel):
+    """Which optional controls the scan form shows."""
+
+    # An unknown key is an error, not silently dropped (CFG-01, M-18). Here it
+    # also means a mistyped key cannot quietly leave a control visible that the
+    # operator meant to hide (T-30-07).
+    model_config = ConfigDict(extra="forbid")
+
+    # D-28 and D-29 together. D-28: this is one appliance with one configured
+    # form shape, not a per-browser toggle -- the household member never sees a
+    # control the owner turned off, and the shape is testable without a
+    # browser. D-29: hiding a control changes the form and never the scan. The
+    # profile's ``default_tags`` and ``default_correspondent`` still apply,
+    # mirroring how a blank title already falls back to the profile title
+    # through ``resolve_job_title``. Both default True so an existing
+    # deployment's form is unchanged by the upgrade.
+    show_tags: bool = True
+    show_correspondent: bool = True
+
+
+# ``web_host`` and ``web_port`` are NOT here: they stay in ``[output]``
+# (config.py's OutputConfig) because moving them would be a breaking config
+# change for every deployment that sets them. So ``[web]`` currently holds only
+# the form-shape keys, and ``[output]`` holds the server's bind address -- an
+# acknowledged incoherence (RESEARCH, the [web] placement question), preferred
+# over breaking a key operators already write.
+
 _ENV_PREFIX: Final = "SANELESS_"
 """The environment variable prefix; the unknown-variable scan uses it too."""
 
@@ -567,6 +595,10 @@ class Settings(BaseSettings):
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     paperless: PaperlessConfig = Field(default_factory=PaperlessConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    # default_factory for the same reason the three above use one: a plain
+    # ``WebConfig()`` default would be built once at import, and every section
+    # on Settings uses a factory so none of them can freeze import-time state.
+    web: WebConfig = Field(default_factory=WebConfig)
     profiles: dict[str, ProfileConfig] = {"default": ProfileConfig()}
 
     # A PrivateAttr, not a field: a field would be settable from
@@ -680,10 +712,18 @@ def warn_on_legacy_duplex_sources(settings: Settings) -> None:
             )
 
 
+# Hand-maintained, and it must stay in step with ``Settings``' own fields: the
+# other readers derive from ``Settings.model_fields``, but ``_render_error``
+# looks the section's model up here, so a section missing from this mapping
+# loads fine and then renders a bare pydantic message instead of the D-11
+# "unknown key ...; valid keys: ..." line. TestEverySectionRendersUnknownKeys
+# parametrises over ``Settings``' own sections, so a section added to one and
+# not the other fails at once rather than silently losing its error line.
 _SECTION_MODELS: Final[dict[str, type[BaseModel]]] = {
     "scanner": ScannerConfig,
     "paperless": PaperlessConfig,
     "output": OutputConfig,
+    "web": WebConfig,
 }
 """The plain ``Settings`` sections, each a single table of keys (D-11)."""
 
