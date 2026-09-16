@@ -22,6 +22,7 @@ import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -41,18 +42,21 @@ from saneless.vocabulary import (
     BUSY_STATES,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
+    ErrorCategory,
     JobState,
     RequestRejection,
+    error_message,
+    error_next_step,
     progress_label,
     rejection_message,
     state_label,
 )
+from saneless.web import app as app_module
 from saneless.web.app import create_app
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from pathlib import Path
 
     from saneless.job import JobStore
 
@@ -85,6 +89,23 @@ class _StubScanner(StubScannerBackend):
         ]
 
 
+# The log file every app in this module writes to. D-13 forbids a host
+# filesystem path from reaching a LAN-visible page, so this name is deliberately
+# unlike anything a template could produce by accident.
+_LOG_FILE_NAME = "render-test-do-not-render-me.log"
+
+# The category `_job_in_state` records on an ERROR row unless a test asks for
+# another. Production never writes an ERROR row without one -- the worker always
+# classifies (`worker.py`) -- so this, not NULL, is the shape the status area's
+# main path renders. REJECTED is avoided because D-06 gives it its own routing.
+_DEFAULT_ERROR_CATEGORY = ErrorCategory.SCANNER
+
+# The templates and the stylesheet, located the way the app locates them, so a
+# moved package cannot make a source assertion pass on an empty file.
+_PACKAGE_DIR = Path(app_module.__file__).parent
+_TEMPLATES_DIR = _PACKAGE_DIR / "templates"
+_APP_CSS = _PACKAGE_DIR / "static" / "app.css"
+
 # The scan button, captured whole so attribute and text assertions cannot be
 # satisfied by markup somewhere else on the page.
 _SCAN_BUTTON = re.compile(
@@ -104,7 +125,14 @@ def _make_app(tmp_path: Path) -> FastAPI:
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
-        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+        output=OutputConfig(
+            tmp_dir=str(tmp_path),
+            data_dir=str(tmp_path),
+            # Named distinctively so `test_no_log_path_reaches_the_page` can
+            # search the rendered markup for it and mean something: the default
+            # would be a path fragment that could collide with tmp_path itself.
+            log_file=str(tmp_path / _LOG_FILE_NAME),
+        ),
         # Two profiles, so the set is not the bare default.  With only
         # ``default``, the worker's startup generation (D-14) would build
         # profiles from _StubScanner's device and swap them in while these
@@ -170,15 +198,33 @@ def _set_warning(job_store: JobStore, job_id: str, warning: str) -> None:
 
 
 def _job_in_state(
-    client: TestClient, state: JobState, warning: str | None = None
-) -> None:
-    """Create a job, drive it to `state`, and make it the worker's current job."""
+    client: TestClient,
+    state: JobState,
+    warning: str | None = None,
+    error_category: ErrorCategory | None = _DEFAULT_ERROR_CATEGORY,
+) -> str:
+    """
+    Create a job, drive it to `state`, and make it the worker's current job.
+
+    The category is written for every state, exactly as `error` already was:
+    only the ERROR branch reads either, so the other states are unaffected, and
+    keeping one write means the helper has one shape. Pass
+    ``error_category=None`` to get a pre-Phase-21 row, whose status area falls
+    back to the specific message alone.
+
+    Returns:
+        The job's id, which the technical-details assertions need.
+
+    """
     job_store: JobStore = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Render Test")
-    job_store.update_state(job.id, state, error="disk on fire")
+    job_store.update_state(
+        job.id, state, error="disk on fire", error_category=error_category
+    )
     if warning is not None:
         _set_warning(job_store, job.id, warning)
     _adopt_as_current_job(client, job.id)
+    return job.id
 
 
 @pytest.mark.parametrize("state", list(JobState))
@@ -243,10 +289,13 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     if state is JobState.DONE:
         assert '<p class="status-done">&#10003; Done: Render Test</p>' in text
     if state is JobState.ERROR:
-        assert (
-            '<p role="alert" class="status-error">&#10007; Error: disk on fire</p>'
-            in text
-        )
+        # APPL-04, UI-SPEC S2: the paragraph now carries the category sentence
+        # and has lost the literal `Error: ` prefix, because the sentence names
+        # the problem itself. `role="alert"` moved to a wrapping <div> so the
+        # next step is announced too; it is asserted in TestStatusAreaError.
+        sentence = error_message(_DEFAULT_ERROR_CATEGORY)
+        assert f'<p class="status-error">&#10007; {sentence}</p>' in text
+        assert "&#10007; Error: disk on fire" not in text
     if state is JobState.FALLBACK:
         assert (
             '<p class="status-fallback">&#8594; Saved to folder: Render Test</p>'
@@ -261,6 +310,195 @@ def test_status_area_prose(client: TestClient, state: JobState) -> None:
     # The history-refresh hook belongs to the terminal states only -- all four
     # of them, FALLBACK and CANCELLED included, or the table goes stale.
     assert ('hx-get="/api/jobs/history"' in text) is (state in TERMINAL_STATES)
+
+
+# The alert region and the disclosure, captured whole. Neither nests a <div> or
+# a <details>, so a non-greedy body is exact rather than merely convenient.
+_ALERT_DIV = re.compile(r'<div role="alert">(?P<body>.*?)</div>', re.DOTALL)
+_TECH_DETAILS = re.compile(
+    r'<details class="tech-details"(?P<attrs>[^>]*)>(?P<body>.*?)</details>',
+    re.DOTALL,
+)
+
+# The legacy ERROR line, byte for byte. A row written before Phase 21 carries no
+# category, and UI-SPEC S2 requires today's shape verbatim for it: substituting
+# UNKNOWN would print "Something went wrong." over a row that still holds a
+# truthful specific message.
+_LEGACY_ERROR_LINE = (
+    '<p role="alert" class="status-error">&#10007; Error: disk on fire</p>'
+)
+
+
+class TestStatusAreaError:
+    """
+    The ERROR branch after APPL-04: a sentence, a next step, and a disclosure.
+
+    UI-SPEC S2. The three things worth breaking a test over are that the alert
+    covers the next step and not just the sentence, that the specific message
+    was relocated rather than deleted, and that no host filesystem path ever
+    reaches the markup (D-13).
+    """
+
+    @staticmethod
+    def _status(client: TestClient) -> str:
+        """
+        Render the status area for the current job.
+
+        Returns:
+            The status poll's body.
+
+        """
+        return client.get("/api/jobs/current/status").text
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_one_alert_covers_the_sentence_and_the_next_step(
+        self, client: TestClient, category: ErrorCategory
+    ) -> None:
+        """
+        The alert announces the message *and* what to do about it (APPL-04).
+
+        The next step is the most actionable content on the page; leaving it
+        outside the alert would mean a screen-reader user never hears it.
+        Parametrised over ``list(ErrorCategory)`` so an eighth member cannot be
+        added without forcing a decision here.
+        """
+        _job_in_state(client, JobState.ERROR, error_category=category)
+        text = self._status(client)
+
+        assert text.count('role="alert"') == 1
+        match = _ALERT_DIV.search(text)
+        assert match is not None, "the ERROR branch renders no alert div"
+        body = match.group("body")
+        assert error_message(category) in body
+        assert error_next_step(category) in body
+        assert f'<p class="status-error">&#10007; {error_message(category)}</p>' in body
+
+    def test_the_disclosure_is_collapsed_and_sits_outside_the_alert(
+        self, client: TestClient
+    ) -> None:
+        """
+        "Technical details" is not announced with the failure, and starts shut.
+
+        No ``open`` attribute, so the detail is one tap away rather than in the
+        way; and outside the alert, so a screen reader reads the sentence and
+        the next step without the debugging aid.
+        """
+        _job_in_state(client, JobState.ERROR)
+        text = self._status(client)
+
+        details = _TECH_DETAILS.search(text)
+        assert details is not None, "the ERROR branch renders no disclosure"
+        assert "open" not in details.group("attrs")
+        assert "<summary>Technical details</summary>" in details.group("body")
+
+        alert = _ALERT_DIV.search(text)
+        assert alert is not None
+        assert "<details" not in alert.group("body")
+
+    def test_the_disclosure_holds_the_specific_message_category_and_job_id(
+        self, client: TestClient
+    ) -> None:
+        """
+        The specific message is relocated, not removed (UI-SPEC S2, D-13).
+
+        ``vocabulary.error_message``'s own docstring warns that swapping the
+        specific message for a category sentence would be a regression, so
+        ``job.error`` is still rendered -- inside the disclosure, with the two
+        other facts D-13 permits and nothing else.
+        """
+        job_id = _job_in_state(client, JobState.ERROR)
+        details = _TECH_DETAILS.search(self._status(client))
+        assert details is not None
+        body = details.group("body")
+
+        assert "disk on fire" in body
+        assert f"Category: {_DEFAULT_ERROR_CATEGORY.value}" in body
+        assert f"Job: {job_id}" in body
+
+    def test_a_row_without_a_category_renders_the_legacy_line_verbatim(
+        self, client: TestClient
+    ) -> None:
+        """
+        A pre-Phase-21 row keeps today's shape, with no next step and no detail.
+
+        Substituting UNKNOWN would print "Something went wrong." over a row
+        that still holds a truthful specific message (UI-SPEC S2).
+        """
+        _job_in_state(client, JobState.ERROR, error_category=None)
+        text = self._status(client)
+
+        assert _LEGACY_ERROR_LINE in text
+        assert text.count('role="alert"') == 1
+        assert "tech-details" not in text
+        assert error_next_step(ErrorCategory.UNKNOWN) not in text
+
+    @pytest.mark.parametrize("category", [_DEFAULT_ERROR_CATEGORY, None])
+    def test_no_log_path_reaches_the_rendered_page(
+        self, client: TestClient, category: ErrorCategory | None
+    ) -> None:
+        """
+        The configured log file never appears in the markup (D-13, T-30-52).
+
+        It is a host filesystem path on a LAN-visible page. Both the
+        categorised and the legacy branch are checked, because the disclosure
+        is the surface that would be tempted to offer one.
+        """
+        _job_in_state(client, JobState.ERROR, error_category=category)
+        for text in (self._status(client), client.get("/").text):
+            assert _LOG_FILE_NAME not in text
+
+    def test_no_template_names_a_log_path(self) -> None:
+        """
+        No template under ``web/templates/`` references a log path at all.
+
+        The rendered-page assertion above proves this app does not leak one;
+        this proves no template *could*, which is the durable half (T-30-52).
+        """
+        offenders = sorted(
+            path.name
+            for path in _TEMPLATES_DIR.rglob("*.html")
+            if re.search(
+                r"log_file|log_path|logfile",
+                path.read_text(encoding="utf-8"),
+                re.IGNORECASE,
+            )
+        )
+        assert offenders == []
+
+    def test_the_disclosure_escapes_markup_rather_than_interpolating_it(
+        self, client: TestClient
+    ) -> None:
+        """
+        ``job.error`` is exception-derived text and is escaped (T-30-54).
+
+        Moving it into a disclosure moved an untrusted string to a new place in
+        the document; autoescaping is a setting, and a setting can be changed,
+        so the property is pinned here as it already is for ``job.warning``.
+        """
+        job_store: JobStore = _app(client).state.job_store
+        job = job_store.create_job(profile="default", title="Render Test")
+        job_store.update_state(
+            job.id,
+            JobState.ERROR,
+            error="<script>alert(1)</script>",
+            error_category=_DEFAULT_ERROR_CATEGORY,
+        )
+        _adopt_as_current_job(client, job.id)
+
+        text = self._status(client)
+        assert "<script>alert(1)</script>" not in text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+
+    def test_the_summary_clears_the_touch_target_floor(self) -> None:
+        """
+        The summary is a finger-sized row (UI-SPEC S2, WCAG 2.5.5).
+
+        Rare control or not, it is still one someone taps standing at the
+        scanner.
+        """
+        css = _APP_CSS.read_text(encoding="utf-8")
+        assert "details.tech-details > summary {" in css
+        assert "min-height: 2.75rem;" in css
 
 
 @pytest.mark.parametrize("state", list(JobState))
