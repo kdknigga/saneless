@@ -1209,6 +1209,10 @@ def _handle_duplex_mismatch(
         the user actually needs (D-08).
 
     Raises:
+        PdfError: If either half cannot be assembled. The spooled page files of
+            both passes are moved into a job-keyed directory under
+            ``delivery.failed_dir`` first, and the message names the count and
+            that directory (D-10, CR-01).
         PaperlessError: If either upload or either poll fails. Both partial
             PDFs are moved to ``delivery.failed_dir`` first, and the message
             names them.
@@ -1219,18 +1223,38 @@ def _handle_duplex_mismatch(
     # and the caller is already handing us the request it comes from.
     notify = request.status_callback or _noop_callback
     notify(PipelineEvent.ASSEMBLING)
-    fronts_pdf = assemble_pdf(
-        fronts,
-        tmp_path / "fronts",
-        filename=build_pdf_filename(request.job_id, f"{request.title} (fronts)"),
-        dpi=delivery.dpi,
-    )
-    backs_pdf = assemble_pdf(
-        backs,
-        tmp_path / "backs",
-        filename=build_pdf_filename(request.job_id, f"{request.title} (backs)"),
-        dpi=delivery.dpi,
-    )
+    # The page-file guard, over the assembly and over nothing else (D-10).
+    #
+    # This arm returns early from run_pipeline, so neither guard that function
+    # opens is in scope here: the partial-scan guard closes before the dispatch
+    # and the page-file guard is opened below it, on the path this one never
+    # reaches.  Without this, a PdfError from either call below -- a full disk,
+    # a page file Pillow can no longer read, a qpdf refusal -- unwound the
+    # workspace and deleted every spooled page of BOTH passes, on the one path
+    # whose own docstring calls it "the one most likely to be holding a
+    # document the user actually needs".
+    #
+    # It stops at the assembly deliberately.  The upload below carries its own
+    # _preserving over both halves at once (D-08), and nesting this guard
+    # around that one would preserve the same two passes twice: once as the two
+    # partial PDFs, and again as the page files they were built from.
+    with _preserving_page_files(
+        tmp_path / _SPOOL_DIR_NAME,
+        delivery.failed_dir
+        / Path(build_pdf_filename(request.job_id, request.title)).stem,
+    ):
+        fronts_pdf = assemble_pdf(
+            fronts,
+            tmp_path / "fronts",
+            filename=build_pdf_filename(request.job_id, f"{request.title} (fronts)"),
+            dpi=delivery.dpi,
+        )
+        backs_pdf = assemble_pdf(
+            backs,
+            tmp_path / "backs",
+            filename=build_pdf_filename(request.job_id, f"{request.title} (backs)"),
+            dpi=delivery.dpi,
+        )
     logger.info(
         "Duplex mismatch: assembled %d fronts and %d backs as separate PDFs",
         len(fronts),
@@ -1869,8 +1893,11 @@ def run_pipeline(
         # The partial-scan guard spans acquisition and nothing else, and sits
         # INSIDE the TemporaryDirectory for the reason the spool comment above
         # gives.  It deliberately stops short of the duplex-mismatch delivery
-        # below, which carries its own _preserving guard: nesting the two would
-        # preserve the same two halves twice.
+        # below, which carries guards of its own: nesting the two would
+        # preserve the same two halves twice.  Those guards are inside
+        # _handle_duplex_mismatch, one over the assembly (the page files) and
+        # one over the upload (the two partial PDFs) -- not here, because this
+        # one would file the halves as (fronts)/(backs) partials as well.
         acquired: ScanBatch | _DuplexMismatch
         with _preserving_partial_scan(
             acquisition.ledger, tmp_path, request, settings.output.failed_dir

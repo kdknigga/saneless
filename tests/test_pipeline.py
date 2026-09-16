@@ -4003,6 +4003,145 @@ class TestDuplexMismatchDelivery:
         assert paperless.poll_task.call_count == 2
         assert len(list(failed_dir.glob("*.pdf"))) == 2
 
+    def test_duplex_mismatch_assembly_failure_keeps_every_spooled_page(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A PdfError on the fronts half keeps both passes' page files (CR-01).
+
+        This arm returns early from ``run_pipeline``, so neither guard that
+        function opens is in scope: the partial-scan guard has closed and the
+        page-file guard sits on the branch this path never reaches.  Until the
+        assembly here got a guard of its own, a full disk or a page file
+        Pillow could no longer read unwound the workspace and deleted every
+        sheet of *both* passes -- on the one path whose whole reason to exist
+        is handing an anomaly to a person.
+
+        The assertion is on the file names and not merely on a count, because
+        keeping only the half that assembled would satisfy a count.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        paperless = MagicMock()
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            pytest.raises(PdfError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Mismatch Assembly",
+                    job_id="job-dx-5",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        pages = sorted(entry.name for entry in kept[0].iterdir())
+        assert pages == [
+            "a-0001.png",
+            "a-0002.png",
+            "a-0003.png",
+            "b-0001.png",
+            "b-0002.png",
+        ]
+        assert all((kept[0] / name).stat().st_size > 0 for name in pages)
+        message = str(excinfo.value)
+        assert "img2pdf refused the page" in message
+        assert "5 spooled page file(s)" in message
+        assert str(kept[0]) in message
+        assert type(excinfo.value) is PdfError
+        paperless.upload_document.assert_not_called()
+
+    def test_duplex_mismatch_keeps_the_pages_when_the_backs_half_fails(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The guard spans both assembly calls, not just the first (CR-01).
+
+        A guard wrapped around the fronts alone would leave the backs
+        unprotected and still pass the sibling test above, so the failure is
+        moved to the second call here.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        fronts_pdf = tmp_path / "fronts.pdf"
+        fronts_pdf.write_bytes(b"%PDF-fake")
+        assembling = MagicMock(
+            side_effect=[fronts_pdf, PdfError("qpdf refused the merge")]
+        )
+        paperless = MagicMock()
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", assembling),
+            pytest.raises(PdfError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Backs Assembly",
+                    job_id="job-dx-6",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert len(sorted(kept[0].iterdir())) == 5
+        assert "qpdf refused the merge" in str(excinfo.value)
+        assert "5 spooled page file(s)" in str(excinfo.value)
+        paperless.upload_document.assert_not_called()
+
+    def test_duplex_mismatch_upload_failure_does_not_also_keep_the_pages(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The two guards do not overlap: an upload failure keeps the PDFs only.
+
+        D-08 puts one ``_preserving`` over both halves of the upload, and the
+        page-file guard stops at the assembly deliberately.  Nesting them would
+        file the same two passes twice -- once as the partial PDFs and again as
+        the page files they were built from -- and leave the operator two
+        copies of one anomaly to reconcile.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        paperless = _both_halves_delivered()
+        paperless.poll_task.side_effect = PaperlessError("Paperless reported FAILURE")
+
+        with pytest.raises(PaperlessError):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="No Double Keep",
+                    job_id="job-dx-7",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assert len(list(failed_dir.glob("*.pdf"))) == 2
+        assert _preserved_page_dirs(failed_dir) == []
+
     def test_duplex_mismatch_preserved_halves_have_distinct_names(
         self,
         default_settings: Settings,
