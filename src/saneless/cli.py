@@ -17,6 +17,7 @@ import traceback
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, assert_never
+from uuid import uuid4
 
 import click
 import uvicorn
@@ -564,6 +565,16 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         request = PipelineRequest(
             profile_name=profile,
             title=resolved_title,
+            # A uuid4, exactly as the worker supplies for a web job.  Without
+            # one, every CLI run composed {timestamp}-{title-slug}.pdf and rested
+            # on the timestamp alone -- while build_pdf_filename's whole
+            # collision argument is "uniqueness comes from the job id".  That
+            # is not cosmetic: preservation moves onto an explicit destination
+            # path, which overwrites silently, so two same-second scans of the
+            # same title would have destroyed one of them in failed/ (WR-09).
+            # This phase multiplied what lands there from one artefact kind to
+            # four and made them reachable from every mid-scan fault.
+            job_id=str(uuid4()),
             tags=settings.profiles[profile].default_tags or None,
             correspondent=settings.profiles[profile].default_correspondent,
             status_callback=status_callback,

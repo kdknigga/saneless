@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import tomllib
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -491,6 +492,64 @@ class TestScanCommand:
         request = captured["request"]
         assert hasattr(request, "profile_name")
         assert request.profile_name == "photo"
+
+    def test_two_cli_scans_of_one_title_preserve_as_two_files(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        WR-09: the CLI mints a job id, so a same-second rescan cannot overwrite.
+
+        ``build_pdf_filename`` rests its whole collision argument on the job
+        id -- "uniqueness comes from the job id, not from the timestamp" -- and
+        ``saneless scan`` supplied none, so every CLI run composed
+        ``{timestamp}-{title-slug}.pdf``.  Preservation moves onto an explicit
+        destination path, which overwrites silently, so two scans of one title
+        landing in the same second destroyed one of them.
+
+        The two runs are driven back to back in one second, which is the case
+        the timestamp alone cannot separate; asserting on the *files* rather
+        than on the request's ``job_id`` is what makes this a test of the
+        guarantee and not of the implementation.
+        """
+
+        class FailPaperless:
+            """Paperless client that always refuses, so both scans preserve."""
+
+            def __init__(self, *_a: object, **_kw: object) -> None:
+                """Accept and ignore all constructor arguments."""
+
+            def upload_document(self, *_a: object, **_kw: object) -> UploadResult:
+                """Raise a paperless error."""
+                msg = "Server down"
+                raise PaperlessError(msg)
+
+            def close(self) -> None:
+                """No-op close."""
+
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path / "scratch"),
+                data_dir=str(tmp_path / "state"),
+                log_file=_TEST_LOG,
+            ),
+        )
+        runner, _ = _patch_cli(
+            monkeypatch, settings=settings, paperless_cls=FailPaperless
+        )
+        stamps: list[str] = []
+
+        for _ in range(2):
+            result = runner.invoke(cli, ["scan", "--title", "Same Title"])
+            assert result.exit_code == 3
+            stamps.append(datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S"))
+
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 2
+        assert preserved[0].name != preserved[1].name
+        # Only meaningful if the two really did land in the same second: if
+        # they did not, the timestamp alone would have separated them and this
+        # test would pass without exercising the job id at all.
+        assert stamps[0] == stamps[1]
 
 
 _DUPLEX_PROFILE = "duplex"
