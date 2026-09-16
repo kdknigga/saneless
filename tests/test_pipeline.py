@@ -3004,6 +3004,302 @@ class TestPartialScanPreservation:
         assert excinfo.value.__cause__ is original
 
 
+def _failing_in_pass_b(
+    fronts: int,
+    backs: int,
+    failure: Exception,
+) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
+    """
+    Build a manual-duplex ``side_effect`` whose second pass fails part-way.
+
+    Pass A completes normally; pass B spools ``backs`` sheets and then raises.
+    ONE callable that counts its own calls, never a list of callables, for the
+    reason ``spooling_in_turn`` records at length.
+
+    Args:
+        fronts: How many sheets pass A feeds.
+        backs: How many sheets pass B gets through before the fault.
+        failure: What the device raises on the next sheet of pass B.
+
+    Returns:
+        A callable with ``scan_pages``' own shape, for ``MagicMock.side_effect``.
+
+    """
+    calls = 0
+
+    def _spool_next(
+        device_id: str, settings: ScanSettings, sink: PageSink
+    ) -> ScanBatch:
+        """Run pass A to completion, then fail part-way through pass B."""
+        nonlocal calls
+        index = calls
+        calls += 1
+        if index == 0:
+            pages = [_distinct_page(number) for number in range(fronts)]
+            return spooling(pages)(device_id, settings, sink)
+        for number in range(backs):
+            sink.add(_distinct_page(fronts + number))
+        raise failure
+
+    return _spool_next
+
+
+def _duplex_settings(settings: Settings, tmp_path: Path) -> Path:
+    """
+    Point the settings at isolated directories and make the profile duplex.
+
+    Args:
+        settings: The settings object to repoint, mutated in place.
+        tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        The ``failed/`` directory the preservation guards move into.
+
+    """
+    failed_dir = _isolate_dirs(settings, tmp_path)
+    settings.profiles["default"].source = "ADF"
+    settings.profiles["default"].duplex = "manual"
+    return failed_dir
+
+
+def _preserved_page_counts(failed_dir: Path) -> dict[str, int]:
+    """
+    Read every preserved PDF back and report its page count by half.
+
+    Args:
+        failed_dir: The directory the partial PDFs were moved into.
+
+    Returns:
+        A mapping of ``"fronts"`` / ``"backs"`` / ``"partial"`` -- whichever
+        marker the sanitised file name carries -- to that PDF's page count.
+
+    """
+    counts: dict[str, int] = {}
+    for preserved in failed_dir.glob("*.pdf"):
+        with pikepdf.open(preserved) as pdf:
+            pages = len(pdf.pages)
+        for marker in ("fronts", "backs", "partial"):
+            if marker in preserved.name:
+                counts[marker] = pages
+    return counts
+
+
+class TestPassBAndFlipFailuresKeepTheFronts:
+    """
+    D-10: every way pass A's fronts can be lost now keeps them.
+
+    The gap this closes was written into ``_scan_manual_duplex`` itself -- "The
+    fronts are still lost here; keeping them needs Phase 29's spooling" -- and
+    the halves are named exactly as the duplex-mismatch recovery already names
+    them, so an operator finds the same two artefacts either way.
+    """
+
+    def test_pass_b_preserves_fronts_when_the_scanner_fails(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A jam during pass B keeps the fronts and the backs fed so far."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 2 of pass B: Paper jam")
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _failing_in_pass_b(3, 1, original)
+        paperless = MagicMock()
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Pass B Jam",
+                    job_id="job-passb-1",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assert _preserved_page_counts(failed_dir) == {"fronts": 3, "backs": 1}
+        assert type(excinfo.value) is ScanError
+        assert excinfo.value.__cause__ is original
+        assert "4 page(s)" in str(excinfo.value)
+        paperless.upload_document.assert_not_called()
+
+    def test_pass_b_preserves_fronts_when_it_is_empty(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A pass B that fed nothing still keeps the fronts.
+
+        The existing message is unchanged; the preservation text is appended to
+        it, exactly as ``_preserving`` appends to a delivery failure's.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_distinct_page(index) for index in range(2)], []
+        )
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Empty Pass B Kept",
+                    job_id="job-passb-2",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assert _preserved_page_counts(failed_dir) == {"fronts": 2}
+        message = str(excinfo.value)
+        assert message.startswith(
+            "No back pages were scanned in pass B (pass A scanned 2 front page(s))"
+        )
+        assert "2 page(s)" in message
+
+    def test_pass_b_preserves_fronts_after_a_flip_wait_timeout(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """Nobody chose to stop, so the fronts are kept (D-10, Phase 28 D-02)."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        default_settings.output.flip_timeout_seconds = 17
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_distinct_page(index) for index in range(3)]
+        )
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Forgotten Flip",
+                    job_id="job-passb-3",
+                    flip_coordinator=_FixedFlipCoordinator(FlipOutcome.TIMED_OUT),
+                ),
+            )
+
+        assert _preserved_page_counts(failed_dir) == {"fronts": 3}
+        message = str(excinfo.value)
+        assert "flip wait timed out" in message
+        assert "3 page(s)" in message
+        assert type(excinfo.value) is ScanError
+        assert scanner.scan_pages.call_count == 1
+
+    def test_pass_b_preserves_fronts_after_a_broken_flip_prompt(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """A prompt that broke is not anyone's decision to stop, so keep them."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        cause = OSError(5, "Input/output error")
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_distinct_page(index) for index in range(2)]
+        )
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Broken Prompt Kept",
+                    job_id="job-passb-4",
+                    flip_coordinator=_BrokenPromptFlipCoordinator(cause),
+                ),
+            )
+
+        assert _preserved_page_counts(failed_dir) == {"fronts": 2}
+        assert "Flip prompt failed" in str(excinfo.value)
+        assert not isinstance(excinfo.value, ScanCancelledError)
+
+    def test_a_flip_abort_preserves_nothing(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The asymmetry is the policy: an abort is a decision, a timeout is not.
+
+        A cancelled run stays a cancel -- exit 130, not shown red -- and leaves
+        ``failed/`` untouched, because ``failed/`` is never pruned and nobody
+        asked for those pages to be filed there.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_distinct_page(index) for index in range(3)]
+        )
+
+        with pytest.raises(
+            ScanCancelledError,
+            match=r"^Manual duplex scan cancelled at the flip prompt$",
+        ) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Aborted",
+                    job_id="job-passb-5",
+                    flip_coordinator=_FixedFlipCoordinator(FlipOutcome.ABORTED),
+                ),
+            )
+
+        assert not failed_dir.exists()
+        # Still a cancel, not a scan failure: the worker reads the type to
+        # decide between its cancelled and error endings, and the CLI reads it
+        # for exit 130 rather than exit 1.
+        assert type(excinfo.value) is ScanCancelledError
+        assert not isinstance(excinfo.value, ScanError)
+
+    def test_pass_a_failing_mid_batch_keeps_its_fronts_too(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        D-10 applies to each manual-duplex pass, not only to pass B.
+
+        Nobody is asked to flip, so only one half exists and it is named as
+        the fronts it is.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _spooling_then_failing(
+            [_distinct_page(index) for index in range(2)],
+            ScanError("Scanner error on page 3: Paper jam"),
+        )
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Pass A Jam",
+                    job_id="job-passb-6",
+                    flip_coordinator=_FixedFlipCoordinator(FlipOutcome.CONTINUED),
+                ),
+            )
+
+        assert _preserved_page_counts(failed_dir) == {"fronts": 2}
+
+
 def _fill_failed_dir(failed_dir: Path, count: int) -> list[str]:
     """
     Pre-populate ``failed_dir`` with ``count`` preserved-looking PDFs.
