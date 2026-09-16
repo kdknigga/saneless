@@ -77,6 +77,11 @@ INPUT_MARKER = "zz-marker"
 BAD_INT = "abc"
 SECRET_MARKER = "zz-secret"
 
+# The log file every app in this module writes to.  D-13 forbids a host
+# filesystem path from reaching a LAN-visible page, so this name is deliberately
+# unlike anything the slot could produce by accident.
+LOG_FILE_NAME = "errors-test-do-not-render-me.log"
+
 
 # --- Test-only routes --------------------------------------------------------
 
@@ -122,6 +127,10 @@ def test_settings(tmp_path: Path) -> Settings:
         output=OutputConfig(
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
+            # Named distinctively so the slot can be searched for it and mean
+            # something: the default is a path fragment that could collide with
+            # tmp_path itself and pass on nothing.
+            log_file=str(tmp_path / LOG_FILE_NAME),
         ),
         profiles={
             "default": ProfileConfig(),
@@ -207,14 +216,49 @@ def _error_paragraph(rejection: RequestRejection) -> str:
     )
 
 
+def _error_body(
+    rejection: RequestRejection, status: int, job_id: str | None = None
+) -> str:
+    """
+    Return the exact slot body: the message, then the short disclosure.
+
+    The disclosure carries the HTTP status code and, when the refused attempt
+    wrote a job row, that row's id -- and nothing else.  Phase 26 D-10 and ASVS
+    V7 forbid exception text, request input and the log path from ever reaching
+    this surface, so this helper is the whole permitted vocabulary of the slot
+    (UI-SPEC S2).
+
+    Args:
+        rejection: The vocabulary member whose message is shown.
+        status: The response's HTTP status, which is not always the
+            rejection's own -- a framework 405 or 422 maps onto a generic
+            rejection while keeping its own code.
+        job_id: The id of the row a refused submit wrote, if it wrote one.
+
+    Returns:
+        The body the slot must equal once stripped.
+
+    """
+    lines = [
+        _error_paragraph(rejection),
+        '<details class="tech-details">',
+        "  <summary>Technical details</summary>",
+        f"  <p>Status: {status}</p>",
+    ]
+    if job_id is not None:
+        lines.append(f"  <p>Job: {job_id}</p>")
+    lines.append("</details>")
+    return "\n".join(lines)
+
+
 def _assert_htmx_error(
     response: httpx.Response, rejection: RequestRejection, status: int
 ) -> None:
-    """Assert an htmx error response is retargeted and carries only the paragraph."""
+    """Assert an htmx error response is retargeted and carries only the slot body."""
     assert response.status_code == status
     assert response.headers["HX-Retarget"] == "#status-message"
     assert response.headers["HX-Reswap"] == "innerHTML"
-    assert response.text.strip() == _error_paragraph(rejection)
+    assert response.text.strip() == _error_body(rejection, status)
 
 
 def _assert_json_error(
@@ -279,13 +323,124 @@ def test_refresh_history_appends_the_hidden_history_loader(
     )
     assert response.status_code == 429
     assert response.headers["HX-Retarget"] == "#status-message"
-    assert response.text.strip() == f"{_error_paragraph(rejection)}\n{HISTORY_LOADER}"
+    # This route refreshes history without writing a row, so the disclosure
+    # names no job: the affordance does not claim detail it does not have.
+    assert response.text.strip() == f"{_error_body(rejection, 429)}\n{HISTORY_LOADER}"
 
 
 def test_no_history_loader_without_refresh_history(client: TestClient) -> None:
     """The history loader is absent unless refresh_history is set."""
     response = client.get("/_test/reject/QUEUE_FULL", headers=HTMX_HEADERS)
     assert "/api/jobs/history" not in response.text
+
+
+# The disclosure, captured whole. It nests no <details>, so a non-greedy body is
+# exact rather than merely convenient.
+_TECH_DETAILS = re.compile(
+    r'<details class="tech-details"(?P<attrs>[^>]*)>(?P<body>.*?)</details>',
+    re.DOTALL,
+)
+
+# How many facts D-13 permits the slot's disclosure to carry: the HTTP status
+# code, and the id of the row a refused submit wrote.  Nothing else.
+_MAX_DISCLOSED_FACTS = 2
+
+
+class TestRequestErrorDisclosure:
+    """
+    The slot's deliberately short "Technical details" (UI-SPEC S2, APPL-04).
+
+    The exact-body assertions above already prove what the slot renders.  These
+    pin the properties that make the disclosure safe rather than merely
+    correct: it starts shut, it names a job only when one exists, and it can
+    never grow a third fact without a test noticing.
+    """
+
+    @staticmethod
+    def _details(response: httpx.Response) -> re.Match[str]:
+        """
+        Return the disclosure in `response`, failing if there is none.
+
+        Returns:
+            The match, whose ``attrs`` and ``body`` groups the tests read.
+
+        """
+        match = _TECH_DETAILS.search(response.text)
+        assert match is not None, "the error slot renders no disclosure"
+        return match
+
+    def test_the_disclosure_is_collapsed(self, client: TestClient) -> None:
+        """No ``open`` attribute: the detail is offered, never imposed."""
+        response = client.get("/_test/reject/QUEUE_FULL", headers=HTMX_HEADERS)
+        assert "open" not in self._details(response).group("attrs")
+        assert "<summary>Technical details</summary>" in response.text
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_the_disclosure_names_the_status_and_no_job(
+        self, client: TestClient, rejection: RequestRejection
+    ) -> None:
+        """
+        With no row written, the status code is the only fact (D-10, ASVS V7).
+
+        Parametrised over every rejection so a new member cannot quietly bring
+        a second fact with it.
+        """
+        response = client.get(f"/_test/reject/{rejection.value}", headers=HTMX_HEADERS)
+        body = self._details(response).group("body")
+        assert f"<p>Status: {rejection_status_code(rejection)}</p>" in body
+        assert "Job:" not in body
+        assert body.count("<p>") == 1
+
+    def test_the_disclosure_names_the_row_a_refused_submit_wrote(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A refused submit's own row is the one job id the slot may name (D-05).
+
+        It is the row the user will find in Job History a moment later, not an
+        arbitrary request value.
+        """
+        _refuse_submit(client, monkeypatch, SubmitResult.QUEUE_FULL)
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Queue Full"},
+            headers=HTMX_HEADERS,
+        )
+        body = self._details(response).group("body")
+        assert f"<p>Job: {_newest_job_id(client)}</p>" in body
+        assert body.count("<p>") == _MAX_DISCLOSED_FACTS
+
+    @pytest.mark.parametrize(
+        ("path", "headers"),
+        [
+            ("/_test/boom", HTMX_HEADERS),
+            (f"/_test/reject/{RequestRejection.CROSS_SITE.value}", HTMX_HEADERS),
+        ],
+        ids=["unhandled", "rejection"],
+    )
+    def test_the_slot_leaks_neither_exception_text_nor_a_log_path(
+        self, lenient_client: TestClient, path: str, headers: dict[str, str]
+    ) -> None:
+        """
+        Neither an exception's text nor the log file reaches the slot (T-30-53).
+
+        The disclosure is the affordance that would be tempted to offer both.
+        """
+        response = lenient_client.get(path, headers=headers)
+        assert SECRET_MARKER not in response.text
+        assert LOG_FILE_NAME not in response.text
+
+    def test_the_partial_carries_no_alert_role(self) -> None:
+        """
+        ``#status-message`` is the alert region; the partial must not be one.
+
+        Asserted against the template source as well as the responses above,
+        so a branch no test happens to drive cannot introduce a second alert.
+        """
+        source = (WEB_DIR / "templates" / "partials" / "error.html").read_text(
+            encoding="utf-8"
+        )
+        assert 'role="alert"' not in source
 
 
 # --- Framework-raised errors -------------------------------------------------
@@ -522,6 +677,20 @@ def _assert_rejected_row(client: TestClient, error: str) -> None:
     assert newest[0].error_category is ErrorCategory.REJECTED
 
 
+def _newest_job_id(client: TestClient) -> str:
+    """
+    Return the id of the newest job row.
+
+    Returns:
+        The row the refused submit just wrote, which is the only job id the
+        error slot is permitted to name (Phase 26 D-05).
+
+    """
+    newest = _job_store(client).list_recent(limit=1)
+    assert len(newest) == 1
+    return newest[0].id
+
+
 @pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
 def test_scan_unknown_profile_is_422_without_a_row(
     client: TestClient, *, htmx: bool
@@ -589,7 +758,8 @@ def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
     assert response.status_code == 429
     assert response.headers["Retry-After"] == "30"
     assert response.headers["HX-Retarget"] == "#status-message"
-    assert response.text.strip() == f"{_error_paragraph(rejection)}\n{HISTORY_LOADER}"
+    body = _error_body(rejection, 429, _newest_job_id(client))
+    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
     _assert_rejected_row(client, QUEUE_FULL_JOB_ERROR)
 
 
@@ -634,7 +804,8 @@ def test_scan_refused_submit_is_503_with_a_rejected_row(
     )
     assert response.status_code == 503
     assert "Retry-After" not in response.headers
-    assert response.text.strip() == f"{_error_paragraph(rejection)}\n{HISTORY_LOADER}"
+    body = _error_body(rejection, 503, _newest_job_id(client))
+    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
     _assert_rejected_row(client, error)
 
 
@@ -666,7 +837,8 @@ def test_scan_unhealthy_worker_is_503_before_submit(
         headers=HTMX_HEADERS,
     )
     assert response.status_code == 503
-    assert response.text.strip() == f"{_error_paragraph(rejection)}\n{HISTORY_LOADER}"
+    body = _error_body(rejection, 503, _newest_job_id(client))
+    assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
     assert offered == []
     _assert_rejected_row(client, error)
 
