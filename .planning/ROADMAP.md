@@ -561,9 +561,9 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 30-01-PLAN.md — Vocabulary: error advice with next steps, the shared local-time formatter, page counts, the busy line, the token rejection member
-- [ ] 30-02-PLAN.md — Config: the placeholder-token predicate, profile label/description fields, the `[web]` section
-- [ ] 30-03-PLAN.md — Job store: the owner_token writer and queue_position
+- [x] 30-01-PLAN.md — Vocabulary: error advice with next steps, the shared local-time formatter, page counts, the busy line, the token rejection member
+- [x] 30-02-PLAN.md — Config: the placeholder-token predicate, profile label/description fields, the `[web]` section
+- [x] 30-03-PLAN.md — Job store: the owner_token writer and queue_position
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -678,7 +678,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 0/? | Not started | - |
+| 30. Appliance Layer | 3/19 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |

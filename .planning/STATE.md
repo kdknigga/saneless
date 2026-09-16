@@ -4,8 +4,8 @@ milestone: v2.0
 milestone_name: milestone
 status: executing
 stopped_at: Phase 30 UI-SPEC approved
-last_updated: "2026-09-16T16:16:14.959Z"
-last_activity: 2026-09-16 -- Phase 30 planning complete
+last_updated: "2026-09-16T16:17:30.602Z"
+last_activity: 2026-09-16 -- Phase 30 execution started
 progress:
   total_phases: 15
   completed_phases: 11
@@ -21,17 +21,17 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 29 — Geometry, Memory, and Timeouts
+**Current focus:** Phase 30 — appliance-layer
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 29 (Geometry, Memory, and Timeouts) — EXECUTING
-Plan: 1 of 11
-Status: Ready to execute
+Phase: 30 (appliance-layer) — EXECUTING
+Plan: 1 of 19
+Status: Executing Phase 30
 Progress: [████████░░] 83%
 Next: Phase 25 (Manual Duplex) — not started, no phase directory yet
-Last activity: 2026-09-16 -- Phase 30 planning complete
+Last activity: 2026-09-16 -- Phase 30 execution started
 
 ## Performance Metrics
 
