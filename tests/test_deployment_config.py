@@ -22,6 +22,15 @@ code is a real one, and every real one is documented (D-07, D-13).
 The Phase 29 test pins the architecture page's "Memory, disk and timeouts"
 subsection, and the absence of the two claims that phase falsified (D-20).
 
+The Phase 30 tests hold the shipped compose template to D-17 -- the paperless
+connection is commented out, because a live line there silently overrides
+``./config/config.toml`` -- and to APPL-11's consume-directory mount and
+APPL-12's ``TZ``. They also pin the ``kris-knigga`` occurrence count, so this
+phase provably does not perform Phase 31's DLVR-01 rename, and derive the
+documentation's expectations from the source: the route decorators, the
+``WebConfig`` fields and the ``RequestRejection`` members, so a future addition
+cannot ship undocumented (APPL-05, APPL-07, APPL-10, APPL-11, APPL-12).
+
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
 """
@@ -31,7 +40,13 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from saneless.vocabulary import ExitCode
+from saneless.config import WebConfig, is_placeholder_token
+from saneless.vocabulary import (
+    ExitCode,
+    RequestRejection,
+    rejection_message,
+    rejection_status_code,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
@@ -756,4 +771,315 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
     )
     assert "lossless" in lowered, (
         f"{name} no longer says the PNG-to-PDF embed is lossless"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 30: the shipped deployment template (D-17, APPL-07, APPL-11, APPL-12)
+# ---------------------------------------------------------------------------
+
+# The number of ``kris-knigga`` strings in ``docker-compose.yml`` before this
+# phase: the image reference and the ``#configuration`` anchor link. Renaming
+# them is DLVR-01 in Phase 31, deliberately NOT this phase's work. Pinning the
+# count proves Phase 30 left those lines alone -- if this fires because the
+# rename really happened, the fix is to update this constant in that phase, not
+# to weaken the assertion (T-30-88).
+COMPOSE_KRIS_KNIGGA_COUNT = 2
+
+# Every environment variable that carries the paperless-ngx connection. A live
+# line here silently overrides ``./config/config.toml`` -- the U-01 finding.
+OVERRIDING_ENV_KEYS = ("SANELESS_PAPERLESS__URL", "SANELESS_PAPERLESS__TOKEN")
+
+_TOKEN_ASSIGNMENT = re.compile(r"SANELESS_PAPERLESS__TOKEN=(\S*)")
+
+CONSUME_MOUNT_SUBSTRING = ":/consume"
+
+
+def _is_comment(line: str) -> bool:
+    """Say whether a YAML (or fenced-YAML) line is commented out."""
+    return line.lstrip().startswith("#")
+
+
+def _numbered(path: Path) -> list[tuple[int, str]]:
+    """Return ``(line number, line)`` pairs for a file, 1-based."""
+    return list(enumerate(path.read_text(encoding="utf-8").splitlines(), start=1))
+
+
+def _comment_lines_above(lines: list[tuple[int, str]], index: int) -> int:
+    """Count the unbroken run of comment lines immediately above ``index``."""
+    count = 0
+    for _, line in reversed(lines[:index]):
+        if not _is_comment(line):
+            break
+        count += 1
+    return count
+
+
+def test_compose_ships_no_live_paperless_environment_line() -> None:
+    """No live ``environment:`` line sets the paperless URL or token (D-17)."""
+    offenders = [
+        f"{COMPOSE.name}:{number}: {line.strip()}"
+        for number, line in _numbered(COMPOSE)
+        if not _is_comment(line)
+        if any(f"{key}=" in line for key in OVERRIDING_ENV_KEYS)
+    ]
+    assert not offenders, (
+        "the shipped compose template still sets the paperless connection in "
+        "its environment: block, which silently overrides "
+        "./config/config.toml (D-17, U-01):\n" + "\n".join(offenders)
+    )
+
+
+def test_compose_says_the_environment_block_overrides_the_config_file() -> None:
+    """The commented block explains the override and the upgrade action."""
+    text = COMPOSE.read_text(encoding="utf-8").lower()
+    for needle in ("override", "config.toml"):
+        assert needle in text, (
+            f"{COMPOSE.name} does not say that an environment line "
+            f"{needle}s the config file (D-17)"
+        )
+    assert "delete" in text or "remove" in text, (
+        f"{COMPOSE.name} does not tell an operator who copied an earlier "
+        "version to remove their own token line, so their real config.toml "
+        "stays overridden and the status strip stays red"
+    )
+
+
+def test_compose_ships_the_consume_directory_mount_with_its_explanation() -> None:
+    """The consume-directory mount is present with two lines of why (APPL-11)."""
+    lines = _numbered(COMPOSE)
+    mounts = [
+        index
+        for index, (_, line) in enumerate(lines)
+        if CONSUME_MOUNT_SUBSTRING in line
+    ]
+    assert len(mounts) == 1, (
+        f"{COMPOSE.name}: expected exactly one consume-directory bind mount "
+        f"line containing {CONSUME_MOUNT_SUBSTRING!r}, found {len(mounts)}"
+    )
+    explanation = _comment_lines_above(lines, mounts[0])
+    assert explanation >= 2, (
+        f"{COMPOSE.name}: the consume-directory mount has {explanation} "
+        "comment lines above it; APPL-11 asks for a two-line explanation"
+    )
+    text = COMPOSE.read_text(encoding="utf-8").lower()
+    assert "consume_dir" in text, (
+        f"{COMPOSE.name} does not say that paperless.consume_dir must name the "
+        "same path, so an operator who uncomments the mount gets nothing"
+    )
+
+
+def test_compose_sets_the_timezone_with_an_explanation() -> None:
+    """The compose template sets ``TZ`` and says why (APPL-12, Pitfall 10)."""
+    lines = _numbered(COMPOSE)
+    settings = [index for index, (_, line) in enumerate(lines) if "TZ=" in line]
+    assert len(settings) == 1, (
+        f"{COMPOSE.name}: expected exactly one TZ line, found {len(settings)}"
+    )
+    index = settings[0]
+    assert not _is_comment(lines[index][1]), (
+        f"{COMPOSE.name}: the TZ line is commented out, so the shipped "
+        "template still reports UTC for every timestamp saneless displays"
+    )
+    assert _comment_lines_above(lines, index) >= 1, (
+        f"{COMPOSE.name}: the TZ line has no comment above it explaining that "
+        "a container reports UTC by default"
+    )
+    assert "utc" in COMPOSE.read_text(encoding="utf-8").lower(), (
+        f"{COMPOSE.name} does not mention UTC, so the TZ line reads as noise"
+    )
+
+
+def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
+    """
+    No live ``SANELESS_PAPERLESS__TOKEN=`` example is a detected placeholder.
+
+    ``changeme`` used to be the shipped value in both the compose template and
+    the Docker reference. This release detects it, shows the status strip red
+    and refuses scans (APPL-07, D-14), so presenting it as a working example
+    hands the reader a deployment that cannot scan. The expectation is derived
+    from ``is_placeholder_token`` rather than a hard-coded word list, so
+    widening that set cannot leave a stale example behind (T-30-86).
+    """
+    offenders: list[str] = []
+    for path in (COMPOSE, DOCKER_REFERENCE, DEPLOY_HOWTO):
+        for number, line in _numbered(path):
+            if _is_comment(line):
+                continue
+            match = _TOKEN_ASSIGNMENT.search(line)
+            if match is not None and is_placeholder_token(match.group(1)):
+                offenders.append(
+                    f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
+                )
+    assert not offenders, (
+        "a shipped example sets the paperless token to a value this release "
+        "detects as a placeholder and refuses scans for:\n" + "\n".join(offenders)
+    )
+
+
+def test_phase_30_does_not_perform_the_dlvr_01_rename() -> None:
+    """``kris-knigga`` appears in the compose template exactly as often as before."""
+    count = COMPOSE.read_text(encoding="utf-8").count("kris-knigga")
+    assert count == COMPOSE_KRIS_KNIGGA_COUNT, (
+        f"{COMPOSE.name} has {count} 'kris-knigga' strings, expected "
+        f"{COMPOSE_KRIS_KNIGGA_COUNT}. Renaming them is DLVR-01 in Phase 31; "
+        "Phase 30 must leave the image reference and its link alone (T-30-88)"
+    )
+
+
+def test_deploy_howto_tells_existing_operators_to_remove_their_token_line() -> None:
+    """The compose how-to states the upgrade action and its consequence."""
+    text, name = _read(DEPLOY_HOWTO)
+    lowered = text.lower()
+    assert "SANELESS_PAPERLESS__TOKEN" in text, (
+        f"{name} no longer names the variable an existing operator has to remove"
+    )
+    for needle in ("override", "config.toml"):
+        assert needle in lowered, (
+            f"{name} does not explain that an environment line {needle}s the "
+            "config file (D-17)"
+        )
+    assert "red" in lowered, (
+        f"{name} does not state the consequence -- the status strip stays red "
+        "-- for an operator who leaves their own token line in place"
+    )
+
+
+def test_docker_reference_documents_the_consume_mount_and_the_timezone() -> None:
+    """The Docker reference documents ``/consume``, ``TZ`` and placeholder refusal."""
+    text, name = _read(DOCKER_REFERENCE)
+    assert "/consume" in text, f"{name} does not document the consume mount"
+    assert "`TZ`" in text, (
+        f"{name} does not document TZ, which is what makes every displayed "
+        "timestamp local rather than UTC (APPL-12)"
+    )
+    assert "placeholder" in text.lower(), (
+        f"{name} does not explain that placeholder token values are detected "
+        "and refuse scans (APPL-07)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 30: the reference documents, derived from the source (T-30-89)
+# ---------------------------------------------------------------------------
+
+WEB_API_REFERENCE = DOCS_DIR / "reference" / "web-api.md"
+FIRST_WEB_UI_SCAN = DOCS_DIR / "getting-started" / "first-web-ui-scan.md"
+ROUTES_MODULE = REPO_ROOT / "src" / "saneless" / "web" / "routes.py"
+
+_ROUTE_DECORATOR = re.compile(
+    r"^@router\.(get|post|put|patch|delete)\(\s*\"([^\"]+)\"", re.MULTILINE
+)
+
+# The stale sentence the reserve-columns paragraph used to end on. Phase 23
+# filled the page counters in and Phase 30 renders them; Phase 30 also writes
+# owner_token. Reverting the correction fails here (T-30-87).
+ARCHITECTURE_STALE_RESERVE_CLAIM = "nothing writes any of them yet"
+
+
+def _declared_routes() -> list[tuple[str, str]]:
+    """Return ``(METHOD, path)`` for every route declared in ``routes.py``."""
+    source = ROUTES_MODULE.read_text(encoding="utf-8")
+    routes = [
+        (method.upper(), path) for method, path in _ROUTE_DECORATOR.findall(source)
+    ]
+    assert routes, f"no route decorators found in {ROUTES_MODULE.name}"
+    return routes
+
+
+def test_every_route_is_documented_in_the_web_api_reference() -> None:
+    """
+    Every route in ``routes.py`` has its own heading in ``web-api.md``.
+
+    The expectation is derived from the decorators rather than a hard-coded
+    list, so a route added in a later phase cannot ship undocumented: adding it
+    fails this test until the reference gains its section (T-30-89).
+    """
+    text, name = _read(WEB_API_REFERENCE)
+    missing = [
+        f"{method} {path}"
+        for method, path in _declared_routes()
+        if f"`{method} {path}`" not in text
+    ]
+    assert not missing, (
+        f"{name} has no `METHOD /path` heading for these routes:\n" + "\n".join(missing)
+    )
+
+
+def test_every_rejection_member_is_documented_with_its_message() -> None:
+    """Every ``RequestRejection`` member, status and sentence is in the reference."""
+    text, name = _read(WEB_API_REFERENCE)
+    missing = [
+        f"{member.name} ({rejection_status_code(member)}): {rejection_message(member)}"
+        for member in RequestRejection
+        if member.name not in text or rejection_message(member) not in text
+    ]
+    assert not missing, (
+        f"{name} does not document these rejections, with the member name and "
+        "the exact sentence saneless renders:\n" + "\n".join(missing)
+    )
+
+
+def test_every_web_config_field_is_documented() -> None:
+    """
+    Each ``[web]`` key is in the config reference with a ``SANELESS_WEB__`` row.
+
+    Derived from ``WebConfig.model_fields``: a key added to the section later
+    cannot ship without both references gaining it (APPL-10, T-30-89).
+    """
+    config_text, config_name = _read(CONFIG_REFERENCE)
+    env_text, env_name = _read(ENV_REFERENCE)
+    assert "[web]" in config_text, (
+        f"{config_name} has no [web] section, so the form-shape keys are undocumented"
+    )
+    for field in WebConfig.model_fields:
+        assert field in config_text, f"{config_name} does not document [web] {field}"
+        variable = f"SANELESS_WEB__{field.upper()}"
+        assert variable in env_text, f"{env_name} has no {variable} row"
+
+
+def test_config_reference_says_where_the_bind_address_lives() -> None:
+    """The ``[web]`` section admits ``web_host``/``web_port`` stayed in ``[output]``."""
+    text, name = _read(CONFIG_REFERENCE)
+    section = text.split("## `[web]`", 1)
+    assert len(section) == 2, f"{name} has no `[web]` section heading"
+    body = section[1].split("\n## ", 1)[0]
+    for needle in ("web_host", "web_port", "[output]"):
+        assert needle in body, (
+            f"{name}'s [web] section does not mention {needle}, so a reader who "
+            "looks there for the bind address finds nothing and no explanation"
+        )
+
+
+def test_architecture_no_longer_calls_the_job_columns_unwritten() -> None:
+    """The reserve-columns paragraph stops claiming nothing writes them."""
+    text, name = _read(ARCHITECTURE)
+    assert ARCHITECTURE_STALE_RESERVE_CLAIM not in text, (
+        f"{name} still says {ARCHITECTURE_STALE_RESERVE_CLAIM!r} about the job "
+        "columns. pages_scanned, pages_removed and pages_uploaded are written "
+        "by the worker's success path and displayed in the status area and the "
+        "history Title cell; owner_token is written at submit and gates the "
+        "flip prompt (T-30-87)"
+    )
+    for written in ("pages_scanned", "owner_token"):
+        assert written in text, (
+            f"{name} no longer names {written}; the correction should say what "
+            "is true now rather than delete the paragraph"
+        )
+
+
+def test_first_web_ui_scan_walks_the_current_form() -> None:
+    """The getting-started walkthrough describes the shipped page, not the old one."""
+    text, name = _read(FIRST_WEB_UI_SCAN)
+    for element, needle in (
+        ("the status strip", "System status"),
+        ("the Check again button", "Check again"),
+        ("the tag checkbox list", "checkbox"),
+        ("the tag filter", "filter"),
+        ("the profile description line", "description"),
+    ):
+        assert needle in text, f"{name} does not walk {element} (looked for {needle!r})"
+    assert "multi-select" not in text.lower(), (
+        f"{name} still calls the tag picker a multi-select dropdown; it is a "
+        "checkbox list (D-30, D-31)"
     )

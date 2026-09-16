@@ -232,7 +232,7 @@ The history table's visual presentation of these rows is unchanged: humanised la
 - `partials/status_response.html` includes `partials/status.html`, then the button with `oob = true`, then, only when `clear_message` is set, the S2 OOB clear element.
 - **Never** put the OOB button inside `partials/status.html`. `index.html` includes that partial, so the full page would carry two `id="scan-btn"`.
 
-### State table (rule carried forward unchanged; who renders it is what changes)
+### State table (who renders it is what changed in this phase; Phase 30 added a second source of `disabled`)
 
 | Job (current, else most recent run job) | `disabled` | `aria-busy` | Label (source text) | Rendered label |
 |---|---|---|---|---|
@@ -248,6 +248,16 @@ The history table's visual presentation of these rows is unchanged: humanised la
 - `aria-busy` is **omitted**, never `"false"`, when not busy. The deleted `app.js` wrote `aria-busy="false"`; the test that asserts it is rewritten.
 - The button's label uses the `&#8230;` entity (U+2026). This **resolves master-spec copy inconsistency #2** (`Scanning...` in Jinja vs `Scanning…` in JS): only the entity form remains. The status area's progress prose keeps its three ASCII periods; that is a different string with a different owner.
 - `SCANNING_REVERSE` gets no label of its own. It is busy, so it reads `Scanning…`, exactly as it does in `index.html` today.
+
+**Superseded in part by Phase 30 (S8, D-15).** The job-keyed rows above are still exactly right, but they are no longer the whole rule: a placeholder paperless-ngx API token adds a **second, independent source of `disabled`**, which leaves the label `Scan` and leaves `aria-busy` untouched, and adds `aria-describedby="scan-blocked-reason"`:
+
+| Condition | `disabled` | `aria-busy` | Label | `aria-describedby` | Reason line |
+|---|---|---|---|---|---|
+| blocked, no job active | present | absent | `Scan` | `scan-blocked-reason` | rendered |
+| blocked, job active | present | per job state | per job state | `scan-blocked-reason` | rendered |
+| not blocked | per the table above, unchanged | unchanged | unchanged | absent | absent |
+
+`disabled` becomes the OR of the two sources. Every OOB `#scan-btn` re-render carries the flag, because this partial stays the only copy of the markup; `#scan-blocked-reason` is **never** an OOB target. See `.planning/UI-SPEC.md` § Interaction Patterns for the full rule.
 
 ### Which responses carry what
 
