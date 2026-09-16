@@ -531,6 +531,25 @@ def test_scripting_does_not_claim_every_read_command_has_json() -> None:
     assert "doctor" in text, f"{name} does not mention doctor's exit semantics"
 
 
+def test_scripting_documents_jobs_json_created_at_as_utc() -> None:
+    """
+    The documented ``created_at`` example carries the ``+00:00`` offset.
+
+    ``jobs --json`` is a machine contract: APPL-12 localised the human table
+    and deliberately left the JSON in UTC, so the worked example a script
+    author copies has to show the offset. Without this assertion a later plan
+    could localise the contract and the document would agree with it.
+    """
+    text, name = _read(CLI_SCRIPTING)
+    examples = re.findall(r'"created_at": "([^"]+)"', text)
+    assert examples, f"{name} shows no created_at example to check"
+    for value in examples:
+        assert value.endswith("+00:00"), (
+            f"{name} documents created_at as {value!r}, which is not UTC ISO-8601"
+        )
+    assert "UTC" in text, f"{name} does not say the JSON timestamps stay UTC"
+
+
 def test_job_database_documented_under_exit_code_two() -> None:
     """
     A job database saneless cannot use is exit 2, never exit 5 (D-07 amendment).
