@@ -162,13 +162,25 @@ class SpooledPageSink(PageSink):
             stddev=stats.stddev[0],
         )
 
+        self._records.append(record)
+
         if sequence == 1 and self._thumbnail_callback is not None:
             # Not wrapped in a suppression: a thumbnail is a visible part of
             # what the operator sees, so a failure here should surface rather
             # than leave the strip silently blank.
+            #
+            # The record is appended *first*, and that ordering is load-bearing
+            # rather than tidy.  The callback can raise for reasons that have
+            # nothing to do with the page -- the web worker's is a job-store
+            # write, which raises sqlite3.Error on a locked or closed database,
+            # and generate_thumbnail itself raises OSError for a mode JPEG
+            # cannot encode.  Appending afterwards meant a raise here left
+            # a-0001.png on disk with no record of it: page_count() answered 0,
+            # so _preserving_partial_scan took its "nothing reached the spool"
+            # branch and let the workspace delete a sheet that had really been
+            # fed (WR-01).
             self._thumbnail_callback(generate_thumbnail(image))
 
-        self._records.append(record)
         logger.debug(
             "Spooled page %d to %s (%dx%d %s, mean %.1f, stddev %.1f)",
             sequence,
