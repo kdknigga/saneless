@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
+import pikepdf
 import pytest
 from PIL import Image, ImageDraw
 
@@ -26,6 +27,7 @@ from saneless.exceptions import (
     ScanError,
 )
 from saneless.paperless import UploadResult
+from saneless.pdf import assemble_pdf
 from saneless.pipeline import (
     _SPOOL_LABEL_A,
     _SPOOL_LABEL_B,
@@ -405,6 +407,116 @@ def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[...,
     return _assemble
 
 
+def _png_idat(png_bytes: bytes) -> bytes:
+    """
+    Concatenate a PNG's IDAT payloads: its compressed pixel data itself.
+
+    This is what img2pdf embeds when it passes a suitable PNG through -- the
+    zlib stream is copied into a ``/FlateDecode`` image object untouched -- so
+    it is directly comparable with what pikepdf reads back out of the PDF.
+    Comparing these bytes is a much stronger claim than comparing decoded
+    pixels: it says the PDF's page *is* that spooled file, not merely a page
+    that looks like it.
+
+    Args:
+        png_bytes: A whole PNG file, as the spool wrote it.
+
+    Returns:
+        Every IDAT chunk's payload, concatenated in file order.
+
+    """
+    payload = bytearray()
+    # 8-byte signature, then length/type/data/CRC chunks to the end.
+    position = 8
+    while position < len(png_bytes):
+        length = int.from_bytes(png_bytes[position : position + 4], "big")
+        chunk_type = png_bytes[position + 4 : position + 8]
+        if chunk_type == b"IDAT":
+            payload += png_bytes[position + 8 : position + 8 + length]
+        position += 12 + length
+    return bytes(payload)
+
+
+def _embedded_streams(pdf_path: Path) -> list[bytes]:
+    """
+    Read each PDF page's single embedded image stream, in page order.
+
+    Raw, not decoded, so the result can be compared with ``_png_idat``.
+
+    Args:
+        pdf_path: The assembled PDF to read.
+
+    Returns:
+        One raw stream per page, in the order the pages appear in the PDF.
+
+    """
+    streams: list[bytes] = []
+    with pikepdf.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            (image,) = pikepdf.Page(page).images.values()
+            streams.append(image.read_raw_bytes())
+    return streams
+
+
+class _AssemblingSomewhereDurable:
+    """
+    Stand in for ``assemble_pdf`` by calling the real one, somewhere durable.
+
+    The pipeline assembles inside its per-job workspace, a
+    ``TemporaryDirectory``: by the time ``run_pipeline`` returns, the PDF and
+    every page it embedded are gone.  A read-back therefore has to take its
+    copies while the job is still running.
+
+    The real ``assemble_pdf`` still does the work, so what is read back
+    afterwards is the production artefact rather than a test's imitation of
+    one.  Only the destination changes.
+    """
+
+    def __init__(self, output_dir: Path) -> None:
+        """
+        Remember where the PDF should be written instead.
+
+        Args:
+            output_dir: A directory outside the job workspace.  It need not
+                exist; ``assemble_pdf`` creates it.
+
+        """
+        self._output_dir = output_dir
+        self.records: list[PageRecord] = []
+        self.page_bytes: list[bytes] = []
+        self.pdf_path: Path | None = None
+
+    def __call__(
+        self,
+        records: Sequence[PageRecord],
+        output_dir: Path,
+        *,
+        filename: str,
+        dpi: int,
+    ) -> Path:
+        """
+        Copy the spooled pages out, then assemble them for real.
+
+        Args:
+            records: The pages the pipeline chose to assemble, in document
+                order.
+            output_dir: The workspace directory the pipeline asked for, which
+                is exactly what this stand-in exists to override.
+            filename: The PDF's file name, used unchanged.
+            dpi: The resolution the device reported, used unchanged.
+
+        Returns:
+            The assembled PDF's path, outside the workspace.
+
+        """
+        self.records = list(records)
+        self.page_bytes = [record.path.read_bytes() for record in records]
+        self.pdf_path = assemble_pdf(
+            records, self._output_dir, filename=filename, dpi=dpi
+        )
+        return self.pdf_path
+
+
 def _spooling_at_each_resolution(
     *passes: tuple[Sequence[Image.Image], int],
 ) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
@@ -478,6 +590,129 @@ class TestInterleave:
         _, fronts, backs = _duplex_spool(tmp_path, 3, 2)
         with pytest.raises(ScanError, match="Page count mismatch: 3 fronts, 2 backs"):
             _interleave_duplex(fronts, backs)
+
+
+class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
+    """
+    D-02 and D-04: document order is the record list's order, and nothing else.
+
+    The invariant both tests attack is one sentence: **nothing ever sorts or
+    globs the spool directory to recover page order.**  Order is carried by the
+    record list, and ``PageRecord.sequence`` is the proof of what the device
+    fed.
+
+    They attack it from opposite ends.  The twelve-page test follows a whole
+    simplex job out the far side, reading the assembled PDF back and matching
+    each of its pages against one specific spooled file.  The interleave test
+    builds a duplex job whose filename order is deliberately *not* its document
+    order, and asserts that difference before asserting the order itself -- so
+    an implementation that ever reached for ``sorted()`` or ``glob()`` would
+    fail it rather than pass it by luck.
+    """
+
+    def test_twelve_page_order_survives_into_the_assembled_pdf(
+        self,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A twelve-page scan is pages 1..12 of the PDF, each carrying its own page.
+
+        The equivalence being asserted, stated so this test cannot quietly
+        weaken into "there are twelve pages": for every position *i*, the raw
+        image stream pikepdf reads out of PDF page *i* is **byte-identical** to
+        the concatenated IDAT payload of the PNG that record *i* names.  That
+        is an equality between a PDF page and one specific spooled file.  The
+        twelve spooled files are asserted to be twelve *distinct* byte strings
+        first, so a PDF of twelve identical pages cannot satisfy it, and the
+        records are asserted to carry ``sequence`` 1..12, so the order being
+        matched is the order the device fed.
+
+        The real ``assemble_pdf`` runs: the stand-in only redirects the output
+        somewhere that outlives the job's workspace.
+        """
+        default_settings.output.tmp_dir = str(tmp_path / "scratch")
+        pages = [_distinct_page(index) for index in range(12)]
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(pages)
+
+        assembly = _AssemblingSomewhereDurable(tmp_path / "out")
+        with patch("saneless.pipeline.assemble_pdf", assembly):
+            result = run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=PipelineRequest(profile_name="default", title="Twelve Pages"),
+            )
+
+        assert result.outcome is ScanOutcome.SUCCESS
+        assert result.pages_scanned == 12
+        assert result.pages_removed == 0
+        assert [record.sequence for record in assembly.records] == list(range(1, 13))
+        # Distinct content, so the read-back below cannot be satisfied by
+        # twelve copies of one page.
+        assert len(set(assembly.page_bytes)) == 12
+
+        assert assembly.pdf_path is not None
+        streams = _embedded_streams(assembly.pdf_path)
+        assert len(streams) == 12
+        assert streams == [_png_idat(page) for page in assembly.page_bytes]
+
+    def test_interleave_records_never_recovers_order_from_the_filesystem(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A duplex job whose filename order is deliberately not its document order.
+
+        Pass A spools ``a-0001`` to ``a-0003`` and pass B ``b-0001`` to
+        ``b-0003`` into one directory, so sorting that directory by name yields
+        all three fronts and then all three backs.  The document order is
+        front1, back3, front2, back2, front3, back1: a different order.
+
+        The difference is asserted **first**, on purpose.  Without that
+        assertion this test would still pass against an implementation that
+        rebuilt the page list from a sorted glob, which is exactly the mistake
+        D-02 exists to forbid.
+
+        Nothing on disk moves: the interleave reorders records only, and every
+        record's ``path`` is the same before and after.
+        """
+        spool_dir, fronts, backs = _duplex_spool(tmp_path, 3, 3)
+        paths_before = [record.path for record in [*fronts, *backs]]
+        on_disk = [path.name for path in sorted(spool_dir.iterdir())]
+
+        interleaved = _interleave_duplex(fronts, backs)
+        document_order = [record.path.name for record in interleaved]
+
+        assert on_disk != document_order
+        assert on_disk == [
+            "a-0001.png",
+            "a-0002.png",
+            "a-0003.png",
+            "b-0001.png",
+            "b-0002.png",
+            "b-0003.png",
+        ]
+        assert document_order == [
+            "a-0001.png",
+            "b-0003.png",
+            "a-0002.png",
+            "b-0002.png",
+            "a-0003.png",
+            "b-0001.png",
+        ]
+        assert interleaved == [
+            fronts[0],
+            backs[2],
+            fronts[1],
+            backs[1],
+            fronts[2],
+            backs[0],
+        ]
+        assert [path.name for path in sorted(spool_dir.iterdir())] == on_disk
+        assert [record.path for record in [*fronts, *backs]] == paths_before
 
 
 class TestPipelineThumbnail:
