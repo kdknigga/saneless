@@ -1124,7 +1124,7 @@ class TestUnknownEnvironmentVariables:
             load_settings()
         line = _env_line(exc_info.value, "SANELESS_PAPERLES__TOKEN")
         assert "did you mean SANELESS_PAPERLESS__TOKEN" in line
-        assert "valid sections: scanner, paperless, output, profiles" in line
+        assert "valid sections: scanner, paperless, output, web, profiles" in line
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_unknown_env_single_underscore_suggests_double(
@@ -2234,13 +2234,13 @@ class TestWebConfig:
     a control changes the form and never the scan.
     """
 
-    def test_both_default_on(self) -> None:
+    def test_web_config_both_default_on(self) -> None:
         """Directly constructed Settings show both optional controls."""
         settings = Settings()
         assert settings.web.show_tags is True
         assert settings.web.show_correspondent is True
 
-    def test_a_config_without_a_web_table_gets_the_defaults(
+    def test_web_config_absent_table_gets_the_defaults(
         self, tmp_config_dir: Path
     ) -> None:
         """A config file that predates the section loads with both defaults."""
@@ -2250,7 +2250,7 @@ class TestWebConfig:
         assert settings.web.show_tags is True
         assert settings.web.show_correspondent is True
 
-    def test_toml_turns_a_control_off(self, tmp_config_dir: Path) -> None:
+    def test_web_config_toml_turns_a_control_off(self, tmp_config_dir: Path) -> None:
         """``[web] show_tags = false`` hides the tag control."""
         config_file = tmp_config_dir / "web_off.toml"
         config_file.write_text("[web]\nshow_tags = false\n")
@@ -2258,7 +2258,7 @@ class TestWebConfig:
         assert settings.web.show_tags is False
         assert settings.web.show_correspondent is True
 
-    def test_env_var_turns_a_control_off(
+    def test_web_config_env_var_turns_a_control_off(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """``SANELESS_WEB__SHOW_TAGS=false`` hides the tag control."""
@@ -2267,7 +2267,7 @@ class TestWebConfig:
         settings = load_settings()
         assert settings.web.show_tags is False
 
-    def test_unknown_key_under_web_is_a_rendered_error(
+    def test_web_config_unknown_key_is_a_rendered_error(
         self, tmp_config_dir: Path
     ) -> None:
         """
@@ -2285,7 +2285,7 @@ class TestWebConfig:
             "valid keys: show_tags, show_correspondent"
         ) in _error_lines(err)
 
-    def test_a_web_key_written_under_the_wrong_section_says_where_it_belongs(
+    def test_web_config_key_under_wrong_section_says_where_it_belongs(
         self, tmp_config_dir: Path
     ) -> None:
         """``show_tags`` under ``[output]`` is pointed at ``[web]``."""
@@ -2297,11 +2297,11 @@ class TestWebConfig:
             _error_lines(err)
         )
 
-    def test_web_is_extra_forbid(self) -> None:
+    def test_web_config_is_extra_forbid(self) -> None:
         """WebConfig forbids unknown keys the way every other section does."""
         assert WebConfig.model_config["extra"] == "forbid"
 
-    def test_settings_builds_web_with_a_default_factory(self) -> None:
+    def test_web_config_is_built_with_a_default_factory(self) -> None:
         """
         ``web`` is hung with ``default_factory``, matching the other sections.
 
@@ -2311,3 +2311,35 @@ class TestWebConfig:
         """
         field = Settings.model_fields["web"]
         assert field.default_factory is WebConfig
+
+
+class TestEverySectionRendersUnknownKeys:
+    """
+    Every plain section renders the D-11 unknown-key line, not a bare message.
+
+    The error renderer looks a section's model up in a hand-maintained mapping,
+    while every other reader derives the section list from ``Settings``' own
+    fields. A section added to one and not the other loads fine and then falls
+    back to pydantic's bare "Extra inputs are not permitted" -- exactly the
+    silence CFG-01 exists to remove. Asserted over the sections themselves so a
+    future section cannot be added without being wired up (CFG-01, M-18).
+    """
+
+    @pytest.mark.parametrize(
+        "section", sorted(set(Settings.model_fields) - {"profiles"})
+    )
+    def test_section_names_its_valid_keys(
+        self, section: str, tmp_config_dir: Path
+    ) -> None:
+        """An unknown key names the section, the key and that section's keys."""
+        err = _load_error(
+            tmp_config_dir / f"{section}_bogus.toml",
+            f"[{section}]\nzzz_bogus_key = 1\n",
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith(f"  [{section}] unknown key 'zzz_bogus_key'")
+        ]
+        assert len(matching) == 1
+        assert "valid keys: " in matching[0]
