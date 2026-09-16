@@ -15,9 +15,16 @@
    names are upstream text and stay autoescaped; nothing here is marked safe.
 
    The label is the tap target, not the box: app.css gives every row the full
-   width and a finger-sized height (UI-SPEC S6). #}
+   width and a finger-sized height (UI-SPEC S6).
+
+   The request attributes are on the full page render alone.  A wrapper that
+   arrived through a swap and still asked to fetch itself on parse would swap
+   itself again immediately, and then again -- an endless loop, which in
+   Chromium looks like checkboxes detaching from under the cursor.  Nothing is
+   lost by dropping them: the filter box, the refresh button and the filter
+   form each carry their own request. #}
 <div id="tags-list" class="tag-list"
-     hx-get="/api/tags" hx-trigger="load" hx-target="this" hx-swap="outerHTML">
+     {%- if tags_load_on_render %} hx-get="/api/tags" hx-trigger="load" hx-target="this" hx-swap="outerHTML"{% endif %}>
     {%- for tag in pinned %}
     <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" checked> {{ tag.name }}</label>
     {%- endfor %}
