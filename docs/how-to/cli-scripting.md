@@ -9,12 +9,14 @@ Automate scanning workflows with saneless CLI commands, JSON output, and predict
 
 ## JSON output mode
 
-All read commands support `--json` for machine-parseable output:
+`saneless devices` and `saneless jobs` support `--json` for machine-parseable output:
 
 ```bash
 saneless devices --json
 saneless jobs --json --limit 10
 ```
+
+`saneless doctor` has no `--json` mode; it prints a table for a person to read, and scripts gate on its exit code instead (see [Checking readiness before a scan](#checking-readiness-before-a-scan)).
 
 ### Device list JSON
 
@@ -85,6 +87,24 @@ Every failure prints one line to stderr (a configuration error prints a header n
 then one line per problem). [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md) explains
 what each code means and what to check.
 
+### `saneless doctor`'s exit code
+
+`saneless doctor` reports five health checks and collapses them to one code:
+
+- **0** — every check came out OK, **or** came out as a warning. A warning is a true statement
+  about a deployment that still scans and files: no fallback folder is configured, or the
+  generated profiles live only in memory. It is deliberately **not** a failure, because a gate
+  that goes red for tidiness is a gate people learn to ignore.
+- **2** — at least one check failed: scanner support is not installed, no scanner is reachable,
+  the paperless-ngx API token is unset or rejected, no scan profiles are configured, or a folder
+  saneless needs is not writable.
+- **5** and **130** behave as they do for every other command.
+
+`doctor` prints a human-readable table and has no `--json` mode, so a script should gate on the
+exit code rather than parse the output. Do not wire it to a container `HEALTHCHECK`: it probes
+the scanner and talks to paperless-ngx, so it would mark the container unhealthy during a routine
+paperless-ngx restart. Use the web server's `/health` endpoint for that.
+
 !!! warning "Manual duplex profiles cannot be scripted"
     A profile with `duplex = "manual"` needs a person to flip the stack between the two passes,
     and `saneless scan` asks for that confirmation at the terminal. When stdin is not a terminal
@@ -123,6 +143,19 @@ else
   esac
   exit $exit_code
 fi
+```
+
+### Checking readiness before a scan
+
+`saneless doctor` exits 0 while every check is OK or a warning, so it reads as a plain condition:
+
+```bash
+#!/bin/bash
+if ! saneless doctor; then
+  echo "saneless is not ready to scan -- see the failed rows above"
+  exit 2
+fi
+saneless scan --profile adf --title "Batch $(date +%Y-%m-%d)"
 ```
 
 ### Scan only if scanner is available
