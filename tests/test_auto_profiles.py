@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import tomllib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 from tomlkit.exceptions import ParseError, TOMLKitError
@@ -13,6 +13,8 @@ from tomlkit.exceptions import ParseError, TOMLKitError
 from saneless import auto_profiles
 from saneless.auto_profiles import (
     ProfileWriteResult,
+    _profile_description,
+    _profile_label,
     generate_profiles,
     is_bare_default,
     pick_closest_resolution,
@@ -22,12 +24,18 @@ from saneless.auto_profiles import (
 )
 from saneless.config import (
     DEFAULT_RESOLUTION,
+    PROFILE_DESCRIPTION_MAX_LENGTH,
+    PROFILE_LABEL_MAX_LENGTH,
     ProfileConfig,
     Settings,
     load_settings,
 )
 from saneless.exceptions import ConfigError
-from saneless.scanner.base import DeviceCapabilities
+from saneless.scanner.base import (
+    DeviceCapabilities,
+    SourceKind,
+    classify_source,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -836,6 +844,139 @@ class TestGenerateProfilesDuplex:
         write_profiles_to_config(config_file, profiles)
         settings = load_settings(str(config_file))
         assert all(profile.duplex != "manual" for profile in settings.profiles.values())
+
+
+class TestProfileLabels:
+    """
+    Generated profiles carry human text derived from the classifier (D-19).
+
+    The label and the description come from ``classify_source`` and nothing
+    else: no new probe, no new config key, and no vendor string. Every
+    returned value is a developer-authored constant, which is what keeps a
+    SANE source name from reaching the scan page through this path (T-30-17).
+    """
+
+    # One representative SANE source name per SourceKind. Parametrising over
+    # ``list(SourceKind)`` rather than over this mapping's keys is deliberate:
+    # a new member added to the enum fails here with a KeyError instead of
+    # being silently skipped.
+    _SAMPLE: ClassVar[dict[SourceKind, str]] = {
+        SourceKind.FLATBED: "Flatbed",
+        SourceKind.FEEDER: "ADF Front",
+        SourceKind.FEEDER_DUPLEX: "ADF Duplex",
+        SourceKind.AUTO: "Auto",
+        SourceKind.UNKNOWN: "Mystery Tray",
+    }
+
+    @pytest.mark.parametrize("kind", list(SourceKind))
+    def test_sample_source_names_classify_as_the_kind_they_stand_for(
+        self, kind: SourceKind
+    ) -> None:
+        """The mapping this class parametrises over is itself correct."""
+        assert classify_source(self._SAMPLE[kind]) is kind
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            ("ADF Front", "Feeder, single-sided"),
+            ("ADF Duplex", "Feeder, double-sided"),
+            ("Flatbed", "Glass (flatbed)"),
+        ],
+    )
+    def test_label_uses_the_three_d19_forms_verbatim(
+        self, source: str, expected: str
+    ) -> None:
+        """D-19 names these three strings exactly; they are locked copy."""
+        assert _profile_label(source) == expected
+
+    @pytest.mark.parametrize("source", ["Auto", "Some Unknown Source"])
+    def test_label_is_never_empty_for_an_unclassified_source(self, source: str) -> None:
+        """An Auto or unrecognised source still gets a name a human can read."""
+        assert _profile_label(source).strip()
+
+    @pytest.mark.parametrize("kind", list(SourceKind))
+    def test_label_is_non_empty_and_within_the_config_cap(
+        self, kind: SourceKind
+    ) -> None:
+        """Generation can never produce a label its own schema would reject."""
+        label = _profile_label(self._SAMPLE[kind])
+        assert label.strip()
+        assert len(label) <= PROFILE_LABEL_MAX_LENGTH
+
+    @pytest.mark.parametrize("kind", list(SourceKind))
+    def test_description_is_a_non_empty_sentence_within_the_config_cap(
+        self, kind: SourceKind
+    ) -> None:
+        """Every kind gets one plain sentence that fits the field's cap."""
+        description = _profile_description(self._SAMPLE[kind])
+        assert description.strip()
+        assert description.endswith(".")
+        assert len(description) <= PROFILE_DESCRIPTION_MAX_LENGTH
+
+    def test_every_source_kind_gets_a_distinct_label_and_description(self) -> None:
+        """No two kinds share text; the dropdown can tell them apart."""
+        kinds = list(SourceKind)
+        labels = {_profile_label(self._SAMPLE[kind]) for kind in kinds}
+        descriptions = {_profile_description(self._SAMPLE[kind]) for kind in kinds}
+        assert len(labels) == len(kinds)
+        assert len(descriptions) == len(kinds)
+
+    def test_duplex_feeder_description_names_both_sides_and_the_feeder(self) -> None:
+        """The FEEDER_DUPLEX sentence says both sides and says feeder."""
+        description = _profile_description("ADF Duplex").lower()
+        assert "both sides" in description
+        assert "feeder" in description
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "Flatbed",
+            "ADF Front",
+            "ADF Duplex",
+            "Auto",
+            "Mystery Tray",
+            "<script>alert(1)</script> Duplex",
+        ],
+    )
+    def test_no_returned_string_contains_the_source_name(self, source: str) -> None:
+        """
+        T-30-17: the vendor-controlled source name is never interpolated.
+
+        A source name is device-controlled input that ends up in a file the
+        web UI renders. Both functions select a constant instead of building
+        a string, so nothing from the device can ride along.
+        """
+        assert source not in _profile_label(source)
+        assert source not in _profile_description(source)
+
+    def test_generated_profiles_carry_the_derived_label_and_description(self) -> None:
+        """``generate_profiles`` sets both fields on every profile it builds."""
+        caps = DeviceCapabilities(
+            sources=["Flatbed", "ADF Front", "ADF Duplex"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["flatbed"].label == "Glass (flatbed)"
+        assert profiles["adf-front"].label == "Feeder, single-sided"
+        assert profiles["adf-duplex"].label == "Feeder, double-sided"
+        for slug, profile in profiles.items():
+            assert profile.label == _profile_label(profile.source), slug
+            assert profile.description == _profile_description(profile.source), slug
+
+    def test_the_default_profile_carries_the_text_of_the_source_it_copies(
+        self,
+    ) -> None:
+        """The default duplicates a source, so it must duplicate its wording."""
+        caps = DeviceCapabilities(
+            sources=["ADF Duplex", "ADF Front"],
+            resolutions=[300],
+            modes=["Color"],
+        )
+        profiles = generate_profiles(caps)
+        assert profiles["default"].source == "ADF Duplex"
+        assert profiles["default"].label == "Feeder, double-sided"
+        assert profiles["default"].description == _profile_description("ADF Duplex")
 
 
 class TestGenerateProfilesSlugCollision:
