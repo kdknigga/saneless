@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     from saneless.scanner.base import PageRecord, ScannerBackend
 
 __all__ = [
+    "SCAN_LABEL_BACK",
+    "SCAN_LABEL_FRONT",
     "FlipAnswerSlot",
     "FlipCoordinator",
     "PipelineEvent",
@@ -121,6 +123,20 @@ logger = logging.getLogger(__name__)
 _SPOOL_DIR_NAME: Final = "spool"
 _SPOOL_LABEL_A: Final = "a"
 _SPOOL_LABEL_B: Final = "b"
+
+# Which half of a manual-duplex run a ``pass_count_callback`` call is reporting.
+# Shared constants rather than a literal spelled once here and once in the
+# worker, so the two halves of the channel can never drift apart, and so a test
+# asserting on the ordering imports the label instead of retyping it.
+#
+# Public (no leading underscore) because ``worker.py`` compares against them,
+# and named ``SCAN_LABEL_*`` rather than the obvious ``PASS_FRONT`` for exactly
+# the lint reason recorded above ``_SPOOL_LABEL_A``: ruff's S105 reads any
+# variable whose own name contains "pass" as a possible hardcoded password, and
+# this project adds no suppressions.  Verified: ``PASS_FRONT: Final = "front"``
+# raises S105 under this configuration.
+SCAN_LABEL_FRONT: Final = "front"
+SCAN_LABEL_BACK: Final = "back"
 
 # The workspace subdirectory a preserved partial scan is assembled into, kept
 # apart from the finished PDF's own directory so a preservation can never be
@@ -353,6 +369,17 @@ class PipelineRequest:
     correspondent: int | None = None
     status_callback: Callable[[PipelineEvent], None] | None = None
     thumbnail_callback: Callable[[str], None] | None = None
+    # How many pages a manual-duplex pass produced, announced while the run is
+    # still going (Amendment A-4).  Its own channel, mirroring
+    # ``thumbnail_callback``, because the three alternatives are all worse:
+    # ``status_callback`` is ``Callable[[PipelineEvent], None]`` and carries no
+    # payload, so ``SCANNING_REVERSE`` cannot carry ``len(front_pages)``;
+    # widening it would touch every call site and hand the CLI an argument it
+    # does not want; and a ``PipelineEvent`` member carrying the number is
+    # rejected outright, because members of that enum are states, not payloads.
+    # ``ScanResult`` is no help either -- it is returned once, at the end, and
+    # the count is wanted while pass B is still feeding.
+    pass_count_callback: Callable[[str, int], None] | None = None
     # One field, one atomic answer.  This replaced a flip event and an abort
     # event, where an Abort set both so the waiter woke and then had to inspect
     # the second to learn why -- the two-step M-02's dead Abort lived in.
@@ -372,6 +399,44 @@ class ScanResult:
 
 def _noop_callback(_event: PipelineEvent) -> None:
     """Default no-op status callback."""
+
+
+def _note_pass_count(request: PipelineRequest, label: str, count: int) -> None:
+    """
+    Announce one manual-duplex pass's page count to the request's observer.
+
+    The None-check is the same one ``SpooledPageSink`` makes before firing
+    ``thumbnail_callback``: an absent observer is the normal case, and the CLI
+    supplies none.
+
+    The exception handling deliberately differs from the thumbnail's, which is
+    unguarded on purpose (``spool.py``: a blank strip is a visible failure the
+    operator should be told about).  This count is not an artefact -- it is a
+    transient number the status area shows for the length of pass B, and the
+    same figure arrives again in ``ScanResult.pages_scanned`` moments later.
+    Letting an observer's failure propagate from here would abort a run whose
+    sheets have already been fed, turning a cosmetic fault into lost pages, so
+    the observer's exception is logged with its traceback and the scan
+    continues.
+
+    Args:
+        request: The pipeline request, whose callback is fired if it has one.
+        label: ``SCAN_LABEL_FRONT`` or ``SCAN_LABEL_BACK``.
+        count: How many pages that pass produced.
+
+    """
+    callback = request.pass_count_callback
+    if callback is None:
+        return
+    try:
+        callback(label, count)
+    except Exception:
+        logger.exception(
+            "Pass-count observer failed for the %s pass of '%s'; the scan "
+            "continues and the count is simply not shown",
+            label,
+            request.title,
+        )
 
 
 def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
@@ -1649,6 +1714,10 @@ def _scan_manual_duplex(
     acquisition.ledger.note_resolution(front_batch.actual_resolution)
     front_pages = front_batch.pages
     logger.info("Pass A: scanned %d front page(s)", len(front_pages))
+    # Before AWAITING_FLIP, and so before SCANNING_REVERSE: an observer that
+    # re-renders on either of those events must already hold the number, or the
+    # render it triggers shows the count one transition late (D-33).
+    _note_pass_count(request, SCAN_LABEL_FRONT, len(front_pages))
 
     notify(PipelineEvent.AWAITING_FLIP)
     outcome = flip.coordinator.wait_for_flip(flip.timeout)
@@ -1715,6 +1784,11 @@ def _scan_manual_duplex(
         raise ScanError(msg)
     back_pages = back_batch.pages
     logger.info("Pass B: scanned %d back page(s)", len(back_pages))
+    # Announced for symmetry and for the log-like observers that want both
+    # halves; the worker deliberately ignores it, because by the time it lands
+    # the run is a moment away from its ScanResult and replacing the front
+    # count would change the number under the operator's eyes.
+    _note_pass_count(request, SCAN_LABEL_BACK, len(back_pages))
 
     dpi = _duplex_resolution(front_batch, back_batch)
     # Summed, not picked: a sheet lost on either pass is a sheet lost.
