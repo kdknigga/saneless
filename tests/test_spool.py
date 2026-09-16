@@ -228,6 +228,42 @@ class TestSpooledPageSinkThumbnail:
         sink.add(_inked_page())
         assert len(sink.records) == 2
 
+    def test_a_raising_thumbnail_callback_still_records_the_page(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A failed thumbnail cannot unsee a page that is already on disk (WR-01).
+
+        The callback is deliberately not wrapped -- a blank thumbnail strip is
+        a silence this project does not want -- but the record has to be
+        appended before it fires.  The web worker's callback writes to the job
+        store, which raises ``sqlite3.Error`` on a locked or closed database,
+        and the page it was describing is a sheet that really was fed.  With
+        the record appended afterwards, ``page_count()`` answered 0 and the
+        partial-scan guard took its "nothing reached the spool" branch, so the
+        workspace deleted the sheet on its way out.
+
+        The assertion on the file, not only on the record, is the part that
+        matters: what is being pinned is that the two agree.
+        """
+        thumbnails: list[str] = []
+
+        def explode(thumbnail: str) -> None:
+            thumbnails.append(thumbnail)
+            msg = "the job store was closed"
+            raise OSError(msg)
+
+        sink = SpooledPageSink(tmp_path, "a", 10, explode)
+
+        with pytest.raises(OSError, match="the job store was closed"):
+            sink.add(_inked_page())
+
+        assert len(thumbnails) == 1
+        assert len(sink.records) == 1
+        assert sink.records[0].sequence == 1
+        assert sink.records[0].path == tmp_path / "a-0001.png"
+        assert sink.records[0].path.stat().st_size > 0
+
 
 class TestSpooledPageSinkFailures:
     """No raw OSError escapes, and a shortfall names the page (D-07)."""
