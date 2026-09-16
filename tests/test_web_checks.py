@@ -38,6 +38,7 @@ from fastapi.testclient import TestClient
 
 from saneless.checks import (
     CHECKING_MESSAGE,
+    CHECKING_STATE_LABEL,
     CheckKey,
     CheckResult,
     CheckState,
@@ -51,6 +52,7 @@ from saneless.config import (
 )
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import ConnectionStatus, local_time
+from saneless.web import app as app_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from tests.conftest import StubScannerBackend
@@ -585,3 +587,271 @@ class TestRouteShape:
         """
         source = Path(routes_module.__file__).read_text(encoding="utf-8")
         assert source.count("run_checks(") == 1
+
+
+# The stylesheet and the templates, located the way the app locates them so a
+# moved package cannot make these source tests silently pass on nothing.
+_PACKAGE_DIR = Path(app_module.__file__).parent
+_APP_CSS = _PACKAGE_DIR / "static" / "app.css"
+_CHECKS_TEMPLATE = _PACKAGE_DIR / "templates" / "partials" / "checks.html"
+
+# Every six-digit colour literal app.css is allowed to contain, pinned as an
+# ordered list.  This phase introduces no new colour value: the strip's amber
+# is the fallback amber, read through the same custom property.  A new literal
+# would be an unmeasured colour on a LAN-visible page.
+_EXPECTED_HEX_LITERALS = ["#a16207", "#ca8a04", "#ca8a04"]
+
+# The three declarations Phase 26's coupling contract and tests/test_browser.py
+# both pin.  Renaming the property or changing either value breaks the
+# vendored-asset contract, so they are asserted byte for byte.
+_FALLBACK_DECLARATIONS = [
+    "--saneless-status-fallback: #a16207;",
+    "--saneless-status-fallback: #ca8a04;",
+    "--saneless-status-fallback: #ca8a04;",
+]
+
+_HEX_LITERAL = re.compile(r"#[0-9a-fA-F]{6}")
+_ROLE_ALERT = re.compile(r'role="alert"')
+_CHECKS_STRIP = re.compile(r'<div id="checks-strip"(?P<attrs>[^>]*)>')
+_REFRESH_BUTTON = re.compile(
+    r'<button type="button" class="check-refresh secondary"'
+    r"(?P<attrs>[^>]*)>(?P<text>[^<]*)</button>",
+    re.DOTALL,
+)
+
+
+def _css() -> str:
+    """
+    Read the shipped stylesheet.
+
+    Returns:
+        The whole of ``app.css``.
+
+    """
+    return _APP_CSS.read_text(encoding="utf-8")
+
+
+def _template() -> str:
+    """
+    Read the shipped strip partial.
+
+    Returns:
+        The whole of ``partials/checks.html``.
+
+    """
+    return _CHECKS_TEMPLATE.read_text(encoding="utf-8")
+
+
+class TestStripPlacement:
+    """UI-SPEC S1 § Placement, and the Phase 26 invariant it must not disturb."""
+
+    def test_the_card_is_the_first_article(self, client: TestClient) -> None:
+        """At a glance means first: the strip sits above the Scan card."""
+        markup = client.get("/").text
+        assert markup.index('id="checks-card"') < markup.index("<h2>Scan</h2>")
+
+    def test_the_status_message_still_precedes_the_status_area(
+        self, client: TestClient
+    ) -> None:
+        """
+        Phase 26's invariant survives untouched.
+
+        ``#status-message`` is the immediate sibling above ``#status-area``;
+        inserting a card at the top of the block must not have moved either.
+        """
+        markup = client.get("/").text
+        assert re.search(
+            r'<div id="status-message" role="alert"></div>\s*<div id="status-area"',
+            markup,
+        )
+
+    def test_the_form_gained_no_attribute(self, client: TestClient) -> None:
+        """
+        The C-10 ``hx-disinherit`` fix is exactly as it was.
+
+        The strip is deliberately outside the scan form so the
+        ``hx-disabled-elt`` landmine cannot reach it, which is what makes
+        touching the form unnecessary.
+        """
+        assert client.get("/").text.count('hx-disinherit="hx-disabled-elt"') == 1
+
+    def test_the_page_has_one_body_and_one_strip(self, client: TestClient) -> None:
+        """Duplicate ids would break both the swap target and the live region."""
+        markup = client.get("/").text
+        assert markup.count('id="checks-body"') == 1
+        assert markup.count('id="checks-strip"') == 1
+
+
+class TestStripAccessibility:
+    """T-30-51: a health list must never interrupt a screen reader."""
+
+    def test_the_strip_is_a_polite_live_region(self, client: TestClient) -> None:
+        """The persistent container is what carries the announcement."""
+        match = _CHECKS_STRIP.search(client.get("/").text)
+        assert match is not None
+        assert 'aria-live="polite"' in match.group("attrs")
+
+    def test_the_page_keeps_exactly_one_assertive_region(
+        self, client: TestClient
+    ) -> None:
+        """Phase 26 allows one ``role="alert"``, and it is #status-message."""
+        assert len(_ROLE_ALERT.findall(client.get("/").text)) == 1
+
+    def test_the_partial_declares_no_alert(self) -> None:
+        """Not even a future edit to the strip may add a second one."""
+        assert 'role="alert"' not in _template()
+
+    def test_every_row_carries_a_glyph_and_a_spoken_word(
+        self, client: TestClient
+    ) -> None:
+        """
+        Colour is never the only channel (WCAG 1.4.1).
+
+        The glyph is ``aria-hidden`` and an ``.sr-only`` word replaces it, so a
+        monochrome or listening reader loses nothing.
+        """
+        _warm_the_cache(client)
+        rows = _CHECK_ROW.findall(client.get("/").text)
+        assert len(rows) == len(CheckKey)
+        for row in rows:
+            assert 'aria-hidden="true"' in row
+            assert '<span class="sr-only">' in row
+            assert '<span class="check-name">' in row
+
+    def test_a_cold_row_is_spoken_too(self, client: TestClient) -> None:
+        """The cold-start marker has a word in the glyph's place as well."""
+        rows = _CHECK_ROW.findall(client.get("/api/checks").text)
+        assert rows
+        assert all(CHECKING_STATE_LABEL in row for row in rows)
+
+
+class TestStripVocabulary:
+    """Pattern C: the template owns no label, class, glyph or timestamp."""
+
+    def test_the_template_compares_no_state_to_a_string(self) -> None:
+        """
+        A ``{% if state == 'FAIL' %}`` would be a second source of truth.
+
+        The class, glyph and spoken word all come from filters implemented in
+        ``saneless.checks``, which is the only reason the strip and
+        ``saneless doctor`` cannot drift apart.
+        """
+        source = _template()
+        assert "== '" not in source
+        assert '== "' not in source
+
+    @pytest.mark.parametrize(
+        "filter_name",
+        ["check_name", "check_state_class", "check_state_glyph", "check_state_label"],
+    )
+    def test_the_template_reaches_for_each_filter(self, filter_name: str) -> None:
+        """All four registered filters are the ones the rows are drawn with."""
+        assert filter_name in _template()
+
+    def test_a_warn_row_renders_its_next_step(self, client: TestClient) -> None:
+        """
+        APPL-04: a row that is not green says what to do about it.
+
+        A red row a household member can only escalate is the failure this
+        element exists to prevent.
+        """
+        _app(client).state.checks.store(
+            (
+                CheckResult(
+                    key=CheckKey.FALLBACK,
+                    state=CheckState.WARN,
+                    message="Not configured.",
+                    next_step="Set a fallback folder.",
+                ),
+            )
+        )
+        markup = client.get("/").text
+        assert '<span class="check-next">Set a fallback folder.</span>' in markup
+
+    def test_an_ok_row_renders_no_next_step(self, client: TestClient) -> None:
+        """An ``OK`` row has nothing to act on, so it shows no second line."""
+        _warm_the_cache(client)
+        assert "check-next" not in client.get("/").text
+
+
+class TestCheckAgainButton:
+    """UI-SPEC S1 § `Check again` (D-09)."""
+
+    def test_the_button_is_readable_and_wired(self, client: TestClient) -> None:
+        """
+        Visible text, not an icon: a household member is the reader.
+
+        ``type="button"`` matters because the control would otherwise submit
+        the page's form if it ever moved inside one.
+        """
+        match = _REFRESH_BUTTON.search(client.get("/").text)
+        assert match is not None
+        assert match.group("text").strip() == "Check again"
+        assert 'hx-post="/api/checks/refresh"' in match.group("attrs")
+        assert 'hx-target="#checks-body"' in match.group("attrs")
+        assert 'hx-swap="outerHTML"' in match.group("attrs")
+
+
+class TestStripStyles:
+    """UI-SPEC § Color and § Spacing Scale: aliases only, no new value."""
+
+    @pytest.mark.parametrize(
+        "selector",
+        [".check-ok", ".check-warn", ".check-fail", ".check-checking"],
+    )
+    def test_the_four_state_classes_exist(self, selector: str) -> None:
+        """Every class ``check_state_class`` can return has a rule."""
+        assert f"{selector} {{" in _css()
+
+    @pytest.mark.parametrize(
+        "selector",
+        [
+            ".check-list",
+            ".check-row",
+            ".check-glyph",
+            ".check-name",
+            ".check-next",
+            ".check-meta",
+            ".check-refresh",
+        ],
+    )
+    def test_the_layout_classes_exist(self, selector: str) -> None:
+        """The seven layout rows of UI-SPEC's exhaustive class table."""
+        assert f"{selector} {{" in _css()
+
+    def test_the_warn_class_reads_the_existing_amber(self) -> None:
+        """
+        One amber serves two jobs, so it reads the same property.
+
+        A degraded success and a warning check are the same colour, and the
+        property is not renamed because the vendored-asset contract pins it.
+        """
+        assert _css().count("var(--saneless-status-fallback)") == 2
+
+    def test_no_colour_literal_was_added(self) -> None:
+        """
+        The stylesheet's hex literals are exactly the three it already had.
+
+        Every colour the strip renders is an existing token whose contrast is
+        already measured in both schemes; an unmeasured colour on a LAN-visible
+        page is what this pin prevents.
+        """
+        assert _HEX_LITERAL.findall(_css()) == _EXPECTED_HEX_LITERALS
+
+    def test_the_fallback_declarations_are_untouched(self) -> None:
+        """All three ``--saneless-status-fallback`` declarations, byte for byte."""
+        found = [
+            line.strip()
+            for line in _css().splitlines()
+            if "--saneless-status-fallback:" in line
+        ]
+        assert found == _FALLBACK_DECLARATIONS
+
+    def test_the_touch_target_floor_is_met(self) -> None:
+        """
+        WCAG 2.5.5: the button is at least 44 px tall (D-30).
+
+        Asserted as the declaration rather than as a measurement, because the
+        browser suite measures and this file pins what it measures.
+        """
+        assert "min-height: 2.75rem;" in _css()
