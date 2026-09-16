@@ -30,13 +30,14 @@ import socket
 import threading
 import time
 from typing import TYPE_CHECKING, Literal, NamedTuple
+from urllib.parse import parse_qs
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
 
     from fastapi import FastAPI
-    from playwright.sync_api import BrowserContext, Page, Response, Route
+    from playwright.sync_api import BrowserContext, Page, Request, Response, Route
     from starlette.types import ASGIApp, Receive, Scope, Send
 
     from saneless.job import Job, JobStore
@@ -664,16 +665,25 @@ class TestFlipPromptUI:
 
 _COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').length"
 
-# Counts htmx:afterRequest for the two selects that load on page load. htmx
-# 2.0.8 strips hx-disabled-elt's `disabled` inside the request's onload handler,
-# before it fires afterRequest, so once both events have fired the inheritance
-# trap has either sprung or it has not. Registered as an init script so the
-# listener exists before htmx issues the load requests.
+# Counts the two in-form controls that load themselves on page load. htmx 2.0.8
+# strips hx-disabled-elt's `disabled` inside the request's onload handler, after
+# the swap and before htmx:afterSettle, so once both events have fired the
+# inheritance trap has either sprung or it has not. Registered as an init script
+# so the listener exists before htmx issues the load requests.
+#
+# afterSettle, not afterRequest: the tag list is swapped outerHTML, and htmx
+# fires afterRequest on the element it requested *after* that swap has already
+# detached it, so the event never reaches this document-level listener. The
+# settle pass runs on the elements that are now in the document, on htmx's
+# default 20 ms settle delay -- which is later still, so it remains a sound
+# "the trap has had its chance" signal. The correspondent select is swapped
+# innerHTML and settles as itself; the new tag list settles under the same id
+# the old one carried, because the partial renders its own wrapper.
 _RECORD_LOAD_REQUESTS = """
 window.__selectLoadsFinished = 0;
-document.addEventListener("htmx:afterRequest", (event) => {
+document.addEventListener("htmx:afterSettle", (event) => {
     const id = event.detail.elt && event.detail.elt.id;
-    if (id === "tags-select" || id === "correspondent-select") {
+    if (id === "tags-list" || id === "correspondent-select") {
         window.__selectLoadsFinished += 1;
     }
 });
@@ -2279,3 +2289,171 @@ class TestProfileDescriptionSwap:
 
         expect(helps).to_have_count(1)
         expect(helps).to_have_id("profile-description")
+
+
+# The tags the filter tests run against. The shared browser server points at a
+# closed Paperless port, so its tag list is empty by design; these three are
+# patched in for the tests that need something to tick, and the ids are well
+# clear of any other number on the page so a value assertion cannot match by
+# accident.
+_BROWSER_TAGS: list[dict[str, object]] = [
+    {"id": 11, "name": "receipt"},
+    {"id": 12, "name": "invoice"},
+    {"id": 13, "name": "Recipes"},
+]
+
+
+@pytest.fixture
+def tagged_server(browser_server: _BrowserServer) -> Iterator[_BrowserServer]:
+    """
+    Serve a fixed tag list from the shared server for the length of one test.
+
+    The client is patched rather than a third server started: the tag list is
+    the one thing on this page that comes from Paperless at request time, so
+    changing what the client answers is enough. The cache is dropped on the way
+    in and on the way out, so neither this test nor the next one reads the
+    other's list.
+    """
+    paperless = browser_server.app.state.paperless
+    original = paperless.get_tags
+    paperless.get_tags = lambda: list(_BROWSER_TAGS)
+    browser_server.app.state.cache.invalidate("tags")
+    try:
+        yield browser_server
+    finally:
+        paperless.get_tags = original
+        browser_server.app.state.cache.invalidate("tags")
+
+
+@pytest.mark.browser
+class TestTagFilterInChromium:
+    """
+    The tag picker's two designed-out hazards, proven in a real browser.
+
+    Neither is reachable from a server-side test. A-5 is about what the DOM
+    holds after an htmx swap, and A-6 is about which form a browser considers
+    an input to belong to -- the HTML form-owner association, which only a
+    browser implements.
+    """
+
+    def _load_tags(self, page: Page, url: str) -> None:
+        """
+        Open the page and wait for the tag list to have loaded itself.
+
+        Args:
+            page: The browser page.
+            url: The test server's base URL.
+
+        """
+        page.goto(url)
+        expect(page.locator("label.tag-option")).to_have_count(len(_BROWSER_TAGS))
+
+    def test_filtering_keeps_a_ticked_tag_and_pins_it_above_the_list(
+        self, page: Page, tagged_server: _BrowserServer
+    ) -> None:
+        """
+        A tick the filter excludes stays in the DOM, above the list (A-5).
+
+        This is the hazard the research named. A swap that re-rendered only the
+        matches would take an already-chosen tag out of the document, and a tag
+        that is not in the document is not in the next submit either -- with
+        nothing to warn the user, who would simply find it was not applied.
+        """
+        self._load_tags(page, tagged_server.url)
+        page.check('#tags-list input[value="11"]')
+        page.check('#tags-list input[value="12"]')
+
+        with page.expect_response(lambda r: "q=rec" in r.url):
+            page.locator("#tag-filter").press_sequentially("rec")
+
+        # Three rows again: the two matches, plus "invoice" pinned above them
+        # because it is ticked and the filter excludes it.
+        expect(page.locator("label.tag-option")).to_have_count(3)
+        expect(page.locator('#tags-list input[value="12"]')).to_be_checked()
+        expect(page.locator('#tags-list input[value="11"]')).to_be_checked()
+        values = page.locator("#tags-list input[type=checkbox]").evaluate_all(
+            "boxes => boxes.map(box => box.value)"
+        )
+        assert values[0] == "12", values
+
+    def test_a_scan_submits_every_ticked_tag_and_never_the_filter_text(
+        self, page: Page, tagged_server: _BrowserServer
+    ) -> None:
+        """
+        The filtered-out tick rides along and the filter text does not (A-5, A-6).
+
+        The submit is intercepted rather than served, so this reads what the
+        browser actually put on the wire without starting a real scan on the
+        shared server. A page route takes precedence over the context's egress
+        gate, so the gate does not see this request at all.
+        """
+        submitted: list[str] = []
+
+        def _capture(route: Route) -> None:
+            submitted.append(route.request.post_data or "")
+            route.fulfill(status=200, body="")
+
+        self._load_tags(page, tagged_server.url)
+        page.check('#tags-list input[value="11"]')
+        page.check('#tags-list input[value="12"]')
+        with page.expect_response(lambda r: "q=rec" in r.url):
+            page.locator("#tag-filter").press_sequentially("rec")
+
+        page.route("**/api/scan", _capture)
+        with page.expect_request("**/api/scan"):
+            page.click("#scan-btn")
+
+        assert submitted, "no scan submit was captured"
+        fields = parse_qs(submitted[0])
+        assert sorted(fields.get("tags", [])) == ["11", "12"], fields
+        assert "q" not in fields, fields
+
+    def test_enter_in_the_filter_filters_the_list_and_starts_no_scan(
+        self, page: Page, tagged_server: _BrowserServer
+    ) -> None:
+        """
+        Enter performs implicit submission of the filter's own form (A-6).
+
+        Without the form attribute the input would belong to the scan form, and
+        a household member typing a filter and pressing Enter would start a
+        scan. The filter form is empty apart from this input and has no submit
+        button, which is exactly the shape the implicit-submission rules submit.
+        """
+        posted: list[str] = []
+
+        def _record(request: Request) -> None:
+            if request.method == "POST":
+                posted.append(request.url)
+
+        self._load_tags(page, tagged_server.url)
+        page.on("request", _record)
+
+        with page.expect_response(lambda r: "q=rec" in r.url):
+            page.locator("#tag-filter").press_sequentially("rec")
+            page.press("#tag-filter", "Enter")
+
+        expect(page.locator("label.tag-option")).to_have_count(2)
+        assert posted == [], posted
+
+    def test_every_tag_row_clears_the_touch_target_floor(
+        self, page: Page, tagged_server: _BrowserServer
+    ) -> None:
+        """
+        Every row is at least 44 px tall and spans the list (D-30, WCAG 2.5.5).
+
+        Measured in the browser, because this is a cascade outcome and not a
+        stylesheet fact: Pico shrinks a checkbox label to the width of its text
+        through `label:has([type=checkbox])`, a rule of exactly the same weight
+        as the app's own, so what decides it is that app.css loads second. A
+        source assertion on the rule would pass with that order reversed.
+        """
+        self._load_tags(page, tagged_server.url)
+        list_box = page.locator("#tags-list").bounding_box()
+        assert list_box is not None
+
+        rows = page.locator("label.tag-option")
+        for index in range(rows.count()):
+            box = rows.nth(index).bounding_box()
+            assert box is not None, index
+            assert box["height"] >= 44, box
+            assert box["width"] >= list_box["width"] - 2, (box, list_box)

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
     from saneless.job import Job
 
+import httpx
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -42,8 +43,10 @@ from saneless.config import (
     ProfileConfig,
     ScannerConfig,
     Settings,
+    WebConfig,
 )
 from saneless.job import JobState, JobStore
+from saneless.paperless import PaperlessClient
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     ErrorCategory,
@@ -1932,3 +1935,528 @@ class TestProfileSelectMarkup:
         assert response.status_code == 200
         job_store: JobStore = _app(client).state.job_store
         assert job_store.list_recent(limit=1)[0].profile == "duplex"
+
+
+# The tag rows every filter test runs against.  Three, not two: the cases need a
+# match, a non-match, and a second match whose capitalisation differs from the
+# query's -- "Recipes" against a lower-case "rec" is what makes the
+# case-insensitivity assertion mean anything at all.
+_TAG_ROWS: list[dict[str, object]] = [
+    {"id": 1, "name": "receipt"},
+    {"id": 2, "name": "invoice"},
+    {"id": 3, "name": "Recipes"},
+]
+
+# The documented cap on the tag filter is 100 characters.  The number is
+# written out here rather than imported so the two boundary tests pin it from
+# both sides: a value at the cap must be accepted and a value over it must be
+# refused, and a route that quietly moved the cap would fail one of them.
+_FILTER_AT_THE_CAP = "b" * 100
+_OVER_LONG_FILTER = "a" * 500
+
+# A filter value that would be an injected script if it were ever echoed.  It is
+# well under the cap, so it reaches the filter rather than the 422 path, which is
+# the case worth proving (T-30-74).
+_SCRIPT_FILTER = "<script>alert(1)</script>"
+
+
+class _RecordingTransport:
+    """An httpx handler that records every request and answers with no tags."""
+
+    def __init__(self) -> None:
+        """Start with an empty record."""
+        self.requests: list[httpx.Request] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Record the request and answer with an empty paperless-ngx page.
+
+        Args:
+            request: The request the client issued.
+
+        Returns:
+            A 200 carrying an empty collection page, so the client's
+            pagination loop terminates on the first page.
+
+        """
+        self.requests.append(request)
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+
+def _serve_tag_rows(client: TestClient) -> FastAPI:
+    """
+    Make `_TAG_ROWS` the tag list the app sees, cache included.
+
+    Args:
+        client: The client whose app is being wired.
+
+    Returns:
+        The app, for tests that need to reach further into its state.
+
+    """
+    app = _app(client)
+    app.state.paperless.get_tags = lambda: list(_TAG_ROWS)
+    app.state.cache.invalidate("tags")
+    return app
+
+
+def _count_upstream(app: FastAPI) -> _RecordingTransport:
+    """
+    Swap in a Paperless client whose every request is recorded, not sent.
+
+    Args:
+        app: The app whose client is replaced.
+
+    Returns:
+        The recorder the new client's transport writes to.
+
+    """
+    handler = _RecordingTransport()
+    app.state.paperless = PaperlessClient(
+        url="http://paperless.invalid:8000",
+        token="a-real-looking-token",
+        _transport=httpx.MockTransport(handler),
+    )
+    return handler
+
+
+def _checkbox(markup: str, tag_id: int) -> str:
+    """
+    Return the rendered checkbox input for one tag id, or an empty string.
+
+    Args:
+        markup: The rendered tag list.
+        tag_id: The paperless-ngx tag id to look for.
+
+    Returns:
+        The matching `<input>` tag, or `""` when the tag is not rendered.
+
+    """
+    match = re.search(
+        rf'<input type="checkbox" name="tags" value="{tag_id}"[^>]*>', markup
+    )
+    return match.group(0) if match else ""
+
+
+class TestTagFilter:
+    """
+    UI-SPEC S6: the server-side tag filter that can never drop a tick.
+
+    Two hazards are designed out rather than guarded against, and these tests
+    are what hold the design in place: a filter swap must not lose a ticked tag
+    (A-5), and the filter text must never reach paperless-ngx or the page
+    (T-30-74, T-30-75).
+    """
+
+    def test_tag_filter_absent_renders_every_tag_as_an_unchecked_checkbox(
+        self, client: TestClient
+    ) -> None:
+        """No query renders the whole list, in the wrapper the swap replaces."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags")
+
+        assert response.status_code == 200
+        assert 'id="tags-list"' in response.text
+        assert response.text.count('type="checkbox"') == 3
+        assert "checked" not in response.text
+        for name in ("receipt", "invoice", "Recipes"):
+            assert name in response.text
+
+    def test_tag_filter_narrows_the_list_case_insensitively(
+        self, client: TestClient
+    ) -> None:
+        """``rec`` matches ``receipt`` and ``Recipes`` but never ``invoice``."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec"})
+
+        assert response.status_code == 200
+        assert "receipt" in response.text
+        assert "Recipes" in response.text
+        assert "invoice" not in response.text
+
+    def test_tag_filter_renders_the_carried_selection_checked(
+        self, client: TestClient
+    ) -> None:
+        """A tag id the request carries comes back ticked (A-5)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec", "tags": [3]})
+
+        assert "checked" in _checkbox(response.text, 3)
+        assert "checked" not in _checkbox(response.text, 1)
+
+    def test_tag_filter_pins_a_selected_tag_the_filter_excludes(
+        self, client: TestClient
+    ) -> None:
+        """A tick outside the filter stays in the DOM, above the list (A-5)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec", "tags": [2, 3]})
+
+        pinned = _checkbox(response.text, 2)
+        assert "checked" in pinned
+        assert response.text.index('value="2"') < response.text.index('value="3"')
+
+    def test_tag_filter_renders_a_selected_and_matched_tag_exactly_once(
+        self, client: TestClient
+    ) -> None:
+        """A tag both ticked and matched is not rendered twice."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "rec", "tags": [3]})
+
+        assert response.text.count('value="3"') == 1
+
+    def test_tag_filter_never_echoes_the_query_into_the_response(
+        self, client: TestClient
+    ) -> None:
+        """The filter is a filter, never a label: it is not rendered (T-30-74)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": _SCRIPT_FILTER})
+
+        assert response.status_code == 200
+        assert _SCRIPT_FILTER not in response.text
+        assert html.escape(_SCRIPT_FILTER) not in response.text
+        assert "alert(1)" not in response.text
+
+    def test_tag_filter_accepts_a_query_at_the_documented_cap(
+        self, client: TestClient
+    ) -> None:
+        """A value exactly at the cap is filtered, not refused."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": _FILTER_AT_THE_CAP})
+
+        assert response.status_code == 200
+
+    def test_tag_filter_rejects_an_over_long_query_with_422(
+        self, client: TestClient
+    ) -> None:
+        """An unbounded filter is refused at the boundary (T-30-76)."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": _OVER_LONG_FILTER})
+
+        assert response.status_code == 422
+
+    def test_tag_filter_issues_no_upstream_request_when_the_cache_is_warm(
+        self, client: TestClient
+    ) -> None:
+        """Filtering reads the cache; it is not a new fetch (T-30-75)."""
+        app = _app(client)
+        handler = _count_upstream(app)
+        app.state.cache.set("tags", list(_TAG_ROWS))
+
+        response = client.get("/api/tags", params={"q": "rec"})
+
+        assert response.status_code == 200
+        assert "receipt" in response.text
+        assert handler.requests == []
+
+    def test_tag_filter_never_forwards_the_query_to_paperless(
+        self, client: TestClient
+    ) -> None:
+        """A cold cache fetches the whole list and carries no ``q`` (T-30-75)."""
+        app = _app(client)
+        handler = _count_upstream(app)
+        app.state.cache.invalidate("tags")
+
+        response = client.get("/api/tags", params={"q": "receipt"})
+
+        assert response.status_code == 200
+        assert handler.requests
+        for request in handler.requests:
+            assert "q" not in request.url.params
+            assert "receipt" not in str(request.url)
+
+    def test_tag_filter_empty_paperless_renders_the_empty_state(
+        self, client: TestClient
+    ) -> None:
+        """No tags at all is its own sentence, not a blank box."""
+        app = _app(client)
+        app.state.paperless.get_tags = list
+        app.state.cache.invalidate("tags")
+
+        response = client.get("/api/tags")
+
+        assert "No tags in paperless-ngx yet." in response.text
+        assert "No tags match that filter." not in response.text
+
+    def test_tag_filter_matching_nothing_renders_the_no_match_state(
+        self, client: TestClient
+    ) -> None:
+        """A filter that matches nothing says so, and says something else."""
+        _serve_tag_rows(client)
+
+        response = client.get("/api/tags", params={"q": "zzz"})
+
+        assert "No tags match that filter." in response.text
+        assert "No tags in paperless-ngx yet." not in response.text
+
+    def test_tag_filter_survives_a_cache_invalidate_with_the_selection(
+        self, client: TestClient
+    ) -> None:
+        """The refresh button re-renders the same wrapper, filter and ticks intact."""
+        _serve_tag_rows(client)
+
+        response = client.post(
+            "/api/cache/invalidate?resource=tags",
+            data={"q": "rec", "tags": ["3"]},
+        )
+
+        assert response.status_code == 200
+        assert 'id="tags-list"' in response.text
+        assert "checked" in _checkbox(response.text, 3)
+        assert "invoice" not in response.text
+
+    def test_tag_filter_text_on_a_scan_submit_does_not_refuse_the_scan(
+        self, client: TestClient
+    ) -> None:
+        """
+        The belt to the form-owner attribute's braces (A-6).
+
+        The filter input's HTML form owner is ``#tag-filter-form``, so a scan
+        cannot carry ``q`` at all.  This covers the residual case -- a scripted
+        client, or a browser that lost the attribute -- by proving the route
+        ignores the field rather than refusing the submit.
+        """
+        response = client.post(
+            "/api/scan",
+            data={"profile": "default", "title": "Stray Filter", "q": "rec"},
+        )
+
+        assert response.status_code == 200
+        job_store: JobStore = _app(client).state.job_store
+        assert job_store.list_recent(limit=1)[0].title == "Stray Filter"
+
+
+# The profile defaults the D-29 regression tests drive, chosen so neither can
+# be produced by accident: no fixture tag or correspondent uses these ids.
+_PROFILE_DEFAULT_TAGS = [41, 42]
+_PROFILE_DEFAULT_CORRESPONDENT = 43
+
+# The two rules UI-SPEC S6 adds to app.css, property by property. Written out
+# here rather than matched loosely, because "the tap target is 44 px" is the
+# whole of D-30 and a rule that lost one declaration would still look right.
+_TAG_OPTION_RULE = """label.tag-option {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    min-height: 2.75rem;
+    margin-bottom: 0;
+    cursor: pointer;
+}"""
+
+_TAG_LIST_RULE = """.tag-list {
+    max-height: 17.5rem;
+    overflow-y: auto;
+    margin-bottom: var(--pico-spacing);
+}"""
+
+# How many six-digit colour literals app.css held before this plan. A touch
+# target is a size, not a colour, so the count may not move.
+_APP_CSS_COLOURS_BEFORE_30_16 = 3
+
+
+def _simple_form_app(
+    tmp_path: Path,
+    *,
+    show_tags: bool = True,
+    show_correspondent: bool = True,
+) -> FastAPI:
+    """
+    Build an app whose scan form has the given shape, with two stub profiles.
+
+    Args:
+        tmp_path: Where the app writes its database and files.
+        show_tags: Whether the Tags fieldset is rendered at all.
+        show_correspondent: Whether the Correspondent control is rendered.
+
+    Returns:
+        The app, whose lifespan starts with its TestClient.
+
+    """
+    settings = Settings(
+        scanner=ScannerConfig(device="test:device:001"),
+        paperless=PaperlessConfig(
+            url="http://localhost:8000", token="a-real-looking-token"
+        ),
+        output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
+        web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
+        profiles={
+            "default": ProfileConfig(
+                default_tags=_PROFILE_DEFAULT_TAGS,
+                default_correspondent=_PROFILE_DEFAULT_CORRESPONDENT,
+            ),
+            "duplex": ProfileConfig(source="ADF Duplex"),
+        },
+    )
+    app = create_app(settings, StubScannerBackend())
+    app.state.paperless.get_tags = lambda: list(_TAG_ROWS)
+    app.state.paperless.get_correspondents = list
+    return app
+
+
+class TestSimpleForm:
+    """
+    D-28 and D-29: the owner can shrink the form without changing the scan.
+
+    Two separate claims, and the second is the one that could go wrong quietly.
+    Hiding a control changes what a household member is asked; it must not
+    change what the appliance does, so the profile's defaults still apply when
+    the control that would have overridden them is not on the page.
+    """
+
+    def test_simple_form_without_tags_renders_no_part_of_the_tag_block(
+        self, tmp_path: Path
+    ) -> None:
+        """The fieldset, the filter, its form and both help lines all go."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            page = client.get("/").text
+
+        for fragment in (
+            'id="tags-list"',
+            'id="tag-filter"',
+            'id="tag-filter-form"',
+            'id="tags-help"',
+            'aria-label="Refresh tags"',
+            'name="tags"',
+        ):
+            assert fragment not in page, fragment
+
+    def test_simple_form_without_correspondent_renders_no_part_of_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The select, its refresh button and its help line all go."""
+        with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
+            page = client.get("/").text
+
+        for fragment in (
+            'id="correspondent-select"',
+            'id="correspondent-help"',
+            'aria-label="Refresh correspondents"',
+            'name="correspondent"',
+        ):
+            assert fragment not in page, fragment
+
+    def test_simple_form_with_both_off_is_profile_title_and_scan(
+        self, tmp_path: Path
+    ) -> None:
+        """What is left is the shortest form the appliance has."""
+        with TestClient(
+            _simple_form_app(tmp_path, show_tags=False, show_correspondent=False)
+        ) as client:
+            page = client.get("/").text
+
+        assert 'name="profile"' in page
+        assert 'name="title"' in page
+        assert 'id="scan-btn"' in page
+        # Profile and Title keep their help lines; the two that went with the
+        # hidden controls are the only ones that leave.
+        assert re.findall(r'<small id="([^"]+)"', page) == [
+            "profile-description",
+            "title-help",
+        ]
+
+    def test_simple_form_keeps_every_control_when_both_are_on(
+        self, tmp_path: Path
+    ) -> None:
+        """The default shape is the full form, so an upgrade changes nothing."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            page = client.get("/").text
+
+        for fragment in (
+            'id="tags-list"',
+            'id="tag-filter"',
+            'id="tag-filter-form"',
+            'id="tags-help"',
+            'id="correspondent-select"',
+            'id="correspondent-help"',
+        ):
+            assert fragment in page, fragment
+
+    def test_simple_form_hides_by_absence_and_never_with_css(
+        self, tmp_path: Path
+    ) -> None:
+        """D-28: the controls are not rendered, not rendered-then-hidden."""
+        with TestClient(
+            _simple_form_app(tmp_path, show_tags=False, show_correspondent=False)
+        ) as client:
+            page = client.get("/").text
+
+        assert "display: none" not in page
+        assert "display:none" not in page
+        assert " hidden" not in page
+
+    def test_simple_form_without_tags_still_applies_the_profile_default_tags(
+        self, tmp_path: Path
+    ) -> None:
+        """D-29: hiding the control changes the form, never the scan."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
+            )
+            assert response.status_code == 200
+            job_store: JobStore = _app(client).state.job_store
+            assert job_store.list_recent(limit=1)[0].tags == _PROFILE_DEFAULT_TAGS
+
+    def test_simple_form_without_correspondent_still_applies_its_default(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of the same claim (D-29)."""
+        with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Defaults Apply"}
+            )
+            assert response.status_code == 200
+            job_store: JobStore = _app(client).state.job_store
+            job = job_store.list_recent(limit=1)[0]
+            assert job.correspondent == _PROFILE_DEFAULT_CORRESPONDENT
+
+    def test_simple_form_lets_a_visible_control_override_the_default(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The fallback is a fallback, not an override.
+
+        A profile default that won over what the user ticked would be a much
+        worse bug than no default at all, so the full form is asserted too.
+        """
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Chosen", "tags": ["7"]},
+            )
+            assert response.status_code == 200
+            job_store: JobStore = _app(client).state.job_store
+            assert job_store.list_recent(limit=1)[0].tags == [7]
+
+    def test_simple_form_tag_rows_are_a_thumb_sized_tap_target(self) -> None:
+        """D-30: the label is the target and it clears 44 px at a 16 px root."""
+        css = _web_asset("static", "app.css")
+
+        assert _TAG_OPTION_RULE in css
+        assert _TAG_LIST_RULE in css
+
+    def test_simple_form_tap_target_rule_outweighs_pico_by_load_order(self) -> None:
+        """
+        The selector is `label.tag-option`, never the bare class.
+
+        Pico's own `label:has([type=checkbox])` rule carries the same weight, so
+        the tie is what makes this win -- and a tie only wins because app.css
+        loads second.
+        """
+        css = _web_asset("static", "app.css")
+
+        assert "\n.tag-option {" not in css
+        assert css.count("label.tag-option {") == 1
+
+    def test_simple_form_touch_targets_add_no_colour_to_the_stylesheet(self) -> None:
+        """A tap target is a size; the palette may not move (UI-SPEC S6)."""
+        css = _web_asset("static", "app.css")
+
+        assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOURS_BEFORE_30_16
