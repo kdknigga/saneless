@@ -1488,6 +1488,17 @@ _DEGRADED_TEXT = (
 _UNKNOWN_PROFILE_TEXT = "That scan profile does not exist."
 """The start of the 422 UNKNOWN_PROFILE message."""
 
+_SLOT_MESSAGE = "#status-message p.status-error"
+"""
+The slot's message paragraph, named rather than taken as the slot's first p.
+
+Phase 30 put a collapsed "Technical details" disclosure beside the message
+(APPL-04, UI-SPEC S2), so the slot's own text is no longer only the message and
+its paragraphs are no longer only one.  Everything asserting what the user reads
+-- the exact text, the red, the left edge, the wrapped line count -- names this
+paragraph, so a later change to the disclosure cannot be measured by mistake.
+"""
+
 _FILL_ATTEMPTS = 15
 """Most submits the queue fill makes: one running job, ten queued, a 429, and slack."""
 
@@ -1512,10 +1523,25 @@ _READ_TEXT_LEFT_EDGE = """
 }
 """
 
+# Where an element's content box starts, border and padding included. Text-edge
+# probing is wrong for a <summary>, whose disclosure marker may or may not sit
+# before its first character depending on the display mode; the content box is
+# the same measurement the CSS inset actually controls.
+_READ_CONTENT_BOX_LEFT = """
+(selector) => {
+    const element = document.querySelector(selector);
+    if (element === null) return null;
+    const style = getComputedStyle(element);
+    return element.getBoundingClientRect().left
+        + parseFloat(style.borderLeftWidth)
+        + parseFloat(style.paddingLeft);
+}
+"""
+
 # How many line boxes the slot message's text occupies.
 _COUNT_SLOT_TEXT_LINES = """
 () => {
-    const paragraph = document.querySelector("#status-message p");
+    const paragraph = document.querySelector("#status-message p.status-error");
     const range = document.createRange();
     range.selectNodeContents(paragraph);
     const tops = new Set(
@@ -1593,7 +1619,7 @@ class TestRequestErrorSlot:
             expect(page.locator("#scan-btn")).to_be_enabled()
             _fill_queue_until_rejected(server.url)
             page.locator("#scan-btn").click()
-            expect(page.locator("#status-message")).to_have_text(_QUEUE_FULL_TEXT)
+            expect(page.locator(_SLOT_MESSAGE)).to_have_text(_QUEUE_FULL_TEXT)
             return page
 
         return _open
@@ -1638,7 +1664,7 @@ class TestRequestErrorSlot:
         ratio is measured against the layers the real paragraph sits on.
         """
         page = queue_full_page(scheme=scheme)
-        reading = page.evaluate(_READ_ELEMENT_CONTRAST, "#status-message p")
+        reading = page.evaluate(_READ_ELEMENT_CONTRAST, _SLOT_MESSAGE)
         colour = reading["colour"]
         background = _flatten(reading["backgroundStack"])
         ratio = _contrast_ratio(colour, background)
@@ -1658,11 +1684,33 @@ class TestRequestErrorSlot:
         """
         page = queue_full_page(width=width)
         expect(page.locator("#status-area p")).to_have_count(1)
-        slot_left = page.evaluate(_READ_TEXT_LEFT_EDGE, "#status-message p")
+        slot_left = page.evaluate(_READ_TEXT_LEFT_EDGE, _SLOT_MESSAGE)
         status_left = page.evaluate(_READ_TEXT_LEFT_EDGE, "#status-area p")
         assert slot_left is not None
         assert status_left is not None
         assert abs(slot_left - status_left) <= 1, (slot_left, status_left)
+
+    @pytest.mark.parametrize("width", [1280, 375])
+    def test_technical_details_aligns_with_the_message(
+        self, queue_full_page: Callable[..., Page], width: int
+    ) -> None:
+        """
+        The disclosure starts at the same x as the message it belongs to (B12).
+
+        ``app.css`` insets the slot's children by the status area's own border
+        and padding so the slot and the status area share a left edge. Phase 30
+        made the message a sibling rather than an only child, so the inset has
+        to cover the disclosure too, or "Technical details" hangs a rem to the
+        left of the sentence it explains.
+        """
+        page = queue_full_page(width=width)
+        message = page.evaluate(_READ_CONTENT_BOX_LEFT, _SLOT_MESSAGE)
+        details = page.evaluate(
+            _READ_CONTENT_BOX_LEFT, "#status-message > details.tech-details"
+        )
+        assert message is not None
+        assert details is not None
+        assert abs(details - message) <= 1, (details, message)
 
     def test_long_error_wraps_on_a_narrow_viewport(
         self,
@@ -1688,7 +1736,7 @@ class TestRequestErrorSlot:
 
         page.locator("#scan-btn").click()
 
-        expect(page.locator("#status-message")).to_have_text(_DEGRADED_TEXT)
+        expect(page.locator(_SLOT_MESSAGE)).to_have_text(_DEGRADED_TEXT)
         assert page.evaluate(_COUNT_SLOT_TEXT_LINES) > 1
         overflow = page.evaluate(
             "() => { const main = document.querySelector('main');"

@@ -1087,7 +1087,13 @@ def test_a_refused_attempt_whose_rejection_is_still_owed_is_not_shown_as_the_liv
 WEB_DIR = Path(__file__).parent.parent / "src" / "saneless" / "web"
 STATUS_MESSAGE_SLOT = '<div id="status-message" role="alert"></div>'
 _HTMX_CONFIG_META = re.compile(r"""<meta name="htmx-config"\s+content='([^']*)'>""")
-_CSS_RULE = re.compile(r"#status-message > p \{(?P<body>[^}]*)\}")
+# The slot's inset rule. Phase 30 gave the slot a second child -- the
+# "Technical details" disclosure -- so the one rule now names both children on
+# one selector list rather than only the paragraph: a disclosure that hung a rem
+# to the left of the sentence it explains would read as another element's.
+_CSS_RULE = re.compile(
+    r"#status-message > p,\s*#status-message > details \{(?P<body>[^}]*)\}"
+)
 
 
 def test_status_message_slot_is_one_empty_alert_above_the_status_area(
@@ -1141,8 +1147,8 @@ def test_htmx_config_meta_sits_between_color_scheme_and_title() -> None:
     assert color_scheme < htmx_config < title
 
 
-def test_status_message_paragraph_is_inset_like_the_status_area() -> None:
-    """An error paragraph lines up with the status area's text (D-03)."""
+def test_status_message_children_are_inset_like_the_status_area() -> None:
+    """The slot's message and disclosure line up with the status area (D-03)."""
     css = (WEB_DIR / "static" / "app.css").read_text()
     assert "!important" not in css
     rules = _CSS_RULE.findall(css)

@@ -10,8 +10,14 @@
 
 /* A request error sits just above the status area. Inset its text by the
    status area's own left border and padding so the two lines start at the
-   same x. The border is transparent: the error colour stays text-only. */
-#status-message > p {
+   same x. The border is transparent: the error colour stays text-only.
+
+   Both of the slot's children are inset, not just the paragraph: Phase 30 put
+   a "Technical details" disclosure beside the message (UI-SPEC S2), and a
+   disclosure that hung a rem to the left of the sentence it explains would
+   read as though it belonged to something else. */
+#status-message > p,
+#status-message > details {
     padding-left: 1rem;
     border-left: var(--pico-border-width) solid transparent;
 }
