@@ -76,22 +76,30 @@
         <input type="text" name="title" id="title-input" maxlength="{{ title_max_length }}"
                placeholder="Document title (auto-generated if empty)">
 
-        <label for="tags-select">
-            Tags
-            <button type="button"
-                    hx-post="/api/cache/invalidate?resource=tags"
-                    hx-target="#tags-select"
-                    hx-swap="innerHTML"
-                    class="refresh-btn"
-                    title="Refresh tags"
-                    aria-label="Refresh tags">&#x21bb;<span class="sr-only">Refresh tags</span></button>
-        </label>
-        <select name="tags" id="tags-select" multiple
-                hx-get="/api/tags" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
-            {% for tag in tags %}
-            <option value="{{ tag.id }}">{{ tag.name }}</option>
-            {% endfor %}
-        </select>
+        {# UI-SPEC S6.  The multi-select is gone: a checkbox list is one control
+           a thumb can actually hit, and the list is now a group of controls
+           rather than one, so it is a fieldset with a legend and no longer a
+           label pointing at a single element.  The wrapper the refresh targets
+           is rendered by the partial, because the swap is outerHTML and an
+           outerHTML swap replaces the element it is aimed at.  The refresh
+           carries the current ticks with it for the same reason the filter
+           does: what the server re-renders has to include what is already
+           chosen, or refreshing would silently untick it. #}
+        <fieldset>
+            <legend>
+                Tags
+                <button type="button"
+                        hx-post="/api/cache/invalidate?resource=tags"
+                        hx-target="#tags-list"
+                        hx-swap="outerHTML"
+                        hx-include="#tags-list"
+                        class="refresh-btn"
+                        title="Refresh tags"
+                        aria-label="Refresh tags">&#x21bb;<span class="sr-only">Refresh tags</span></button>
+            </legend>
+
+            {% include "partials/tags.html" %}
+        </fieldset>
 
         <label for="correspondent-select">
             Correspondent
