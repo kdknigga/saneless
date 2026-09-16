@@ -1184,6 +1184,33 @@ def _manual_duplex_settings(settings: Settings) -> Settings:
     return settings
 
 
+@pytest.fixture
+def isolated_duplex_settings(default_settings: Settings, tmp_path: Path) -> Settings:
+    """
+    Manual-duplex settings whose scratch and durable directories are per-test.
+
+    ``default_settings`` points both at a process-wide ``/tmp/saneless-test``
+    that nothing ever cleans, so any test whose job preserves something writes
+    a real artefact there once per run, for ever -- and once twenty have piled
+    up, ``_warn_if_failed_dir_growing`` starts emitting its WARNING inside
+    whichever unrelated test triggers the next preservation (WR-07). A fixture
+    rather than two lines in the test body, because those two lines plus
+    ``tmp_path`` put the test over ruff's argument limit.
+
+    Args:
+        default_settings: The shared fixture settings, mutated in place.
+        tmp_path: pytest's per-test temporary directory.
+
+    Returns:
+        The same settings, with a ``duplex`` profile and isolated directories.
+
+    """
+    settings = _manual_duplex_settings(default_settings)
+    settings.output.tmp_dir = str(tmp_path / "scratch")
+    settings.output.data_dir = str(tmp_path / "state")
+    return settings
+
+
 class TestWorkerPassB:
     """
     Pass B through the real pipeline, observed from outside the worker (DPLX-06).
@@ -1910,7 +1937,7 @@ class TestWorkerStopAndSubmit:
     def test_a_pass_a_failure_after_stop_claimed_the_flip_stays_a_failure(
         self,
         mock_paperless: MagicMock,
-        default_settings: Settings,
+        isolated_duplex_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
@@ -1923,11 +1950,18 @@ class TestWorkerStopAndSubmit:
         reaches the prompt.  Pass A then jams.  The job did not end at the flip,
         so the row keeps the scanner's text and category, and the failure is
         logged with its traceback rather than as a restart at INFO.
+
+        The settings are the isolated ones because the jam now keeps pass A's
+        fronts: with ``default_settings`` unmodified this wrote a real PDF into
+        the suite's shared ``/tmp/saneless-test/data/failed/``, where nothing
+        ever removes it, and where twenty accumulated artefacts start
+        ``_warn_if_failed_dir_growing``'s WARNING inside unrelated tests that
+        assert on captured log records (WR-07).
         """
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker.STOP_JOIN_SECONDS", 0.2)
         scanner = _JammingGatedScanner(frozenset({1}))
-        settings = _manual_duplex_settings(default_settings)
+        settings = isolated_duplex_settings
         store = JobStore()
         worker = ScanWorker(scanner, mock_paperless, settings, store)
         try:
@@ -1960,6 +1994,11 @@ class TestWorkerStopAndSubmit:
         exc_info = failures[0]
         assert exc_info is not None
         assert isinstance(exc_info[1], ScanError)
+        # The jam keeps pass A's fronts (D-10), and this pins where: inside
+        # this test's own directory, not the suite's shared one.
+        preserved = sorted(settings.output.failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        assert "fronts" in preserved[0].name
 
     def test_an_operator_abort_while_stopping_is_not_recorded_as_a_restart(
         self,
