@@ -1555,7 +1555,19 @@ class TestDarkModeEngagement:
     @pytest.mark.parametrize("placement", ["status-area", "history-cell", "card"])
     @pytest.mark.parametrize(
         "cls",
-        ["status-done", "status-error", "status-fallback", "status-cancelled"],
+        [
+            "status-done",
+            "status-error",
+            "status-fallback",
+            "status-cancelled",
+            # Phase 30's counts line renders in the status area and in the
+            # history Title cell alike (UI-SPEC S3), so it belongs in exactly
+            # the same three placements as the four status colours. It reads
+            # --pico-muted-color, the property .status-cancelled reads, which
+            # is why the value assertion below covers both from one constant:
+            # a drift in that token must be reported by both or by neither.
+            "page-counts",
+        ],
     )
     @pytest.mark.parametrize("scheme", ["light", "dark"])
     def test_status_colour_meets_aa_contrast(
@@ -1564,7 +1576,11 @@ class TestDarkModeEngagement:
         browser_server_url: str,
         scheme: Literal["light", "dark"],
         cls: Literal[
-            "status-done", "status-error", "status-fallback", "status-cancelled"
+            "status-done",
+            "status-error",
+            "status-fallback",
+            "status-cancelled",
+            "page-counts",
         ],
         placement: Literal["status-area", "history-cell", "card"],
     ) -> None:
@@ -1575,9 +1591,9 @@ class TestDarkModeEngagement:
         inside an ``<article>``; the dark card is lighter than the dark page,
         so it is the tighter of the two for the muted cancelled grey.
 
-        The fallback amber and the cancelled grey are also checked by value, so
-        a palette drift is reported by name rather than only as a ratio that
-        happens to pass.
+        The fallback amber, the cancelled grey and the counts line are also
+        checked by value, so a palette drift is reported by name rather than
+        only as a ratio that happens to pass.
         """
         self._goto(page, browser_server_url, scheme)
         probe = page.evaluate(
@@ -1589,7 +1605,7 @@ class TestDarkModeEngagement:
         assert ratio >= 4.5, (colour, background, ratio)
         if cls == "status-fallback":
             assert colour == _AMBER[scheme], (colour, background, ratio)
-        if cls == "status-cancelled":
+        if cls in {"status-cancelled", "page-counts"}:
             assert colour == _MUTED[scheme], (colour, background, ratio)
 
     def test_forced_dark_theme_gives_cancelled_the_dark_muted_colour(
@@ -2623,6 +2639,27 @@ _SCANNER_PAUSED_MESSAGE = "Not checked while a scan is running."
 """The Scanner row's message for the same situation."""
 
 
+# How many line boxes each strip row's message text occupies. The message is
+# the holder span's own text node; .check-next is a child element set to
+# display: block, so counting the holder's rects wholesale would report two
+# lines for every row that carries a next step and nothing about wrapping.
+_COUNT_CHECK_MESSAGE_LINES = """
+() => Array.from(document.querySelectorAll("#checks-body .check-row"), (row) => {
+    const holder = row.lastElementChild;
+    const text = Array.from(holder.childNodes).find(
+        (node) => node.nodeType === Node.TEXT_NODE && node.textContent.trim() !== ""
+    );
+    if (!text) return 0;
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    const tops = new Set(
+        Array.from(range.getClientRects(), (rect) => Math.round(rect.top))
+    );
+    return tops.size;
+})
+"""
+
+
 def _check_row(page: Page, name: str) -> Locator:
     """
     Return the strip row whose name column reads exactly ``name``.
@@ -2851,6 +2888,111 @@ class TestStatusStripInChromium:
         finally:
             worker._current_job_id = None
             job_store.delete_job(job.id)
+
+    def test_check_again_replaces_the_body_it_is_aimed_at(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        A real click on Check again swaps ``#checks-body`` ``outerHTML``.
+
+        Plan 30-17 drove this same route over HTTP on purpose, so that the swap
+        its cold-start test observed was the *poll's*; nobody had yet pressed
+        the button in a browser. The claim here is the opposite of P8's: the
+        description slot must survive its swap, and this body must not -- the
+        button replaces the element it targets, trigger attribute and all, and
+        the witness set from the test is what tells replacement from update.
+
+        The checks are probed before the page opens so the body arrives with no
+        poll trigger on it. That is what makes the click the only thing in the
+        run that can swap this element, and it is why the assertion below needs
+        no interval arithmetic.
+        """
+        server = cold_strip_server
+        _probe_now(server)
+        page.goto(server.url)
+
+        body = page.locator("#checks-body")
+        expect(body).to_have_count(1)
+        # No trigger on arrival: results are already stored, so the strip is in
+        # its settled state and the button is the only remaining swap source.
+        expect(page.locator("#checks-body:not([hx-trigger])")).to_have_count(1)
+        body.evaluate("(el) => el.setAttribute('data-witness', 'before-refresh')")
+
+        with page.expect_response(lambda r: r.url.endswith("/api/checks/refresh")):
+            page.click(".check-refresh")
+
+        # The witness is gone because the element carrying it is gone. An
+        # innerHTML swap would have left the attribute sitting on the surviving
+        # wrapper and every other assertion here would still have passed.
+        expect(page.locator("#checks-body:not([data-witness])")).to_have_count(1)
+        expect(page.locator("#checks-body")).to_have_count(1)
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+        expect(page.locator("#checks-body")).not_to_contain_text(CHECKING_MESSAGE)
+        # And the replacement carries its own button, so the strip can be
+        # refreshed twice; a swap that dropped it would look fine once.
+        expect(page.locator(".check-refresh")).to_have_count(1)
+
+    def test_the_strip_fits_a_320px_phone_without_a_sideways_scrollbar(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        At 320 px the rows wrap instead of widening the page (UI-SPEC S1).
+
+        320 px is the narrowest viewport the spec names and the narrowest this
+        module has ever measured -- every other responsive assertion here stops
+        at 375. The design is a wrapping flex row with a fixed 1 rem glyph
+        gutter and a 7 rem name column, so what has to be proved is that those
+        two fixed columns plus a message do not push the document wider than
+        the viewport, and that the message wrapped rather than overflowed.
+
+        The document width is the load-bearing assertion: a household member
+        who has to scroll sideways to read a health verdict has not been told
+        anything at a glance.
+        """
+        server = cold_strip_server
+        _probe_now(server)
+        page.set_viewport_size({"width": 320, "height": 640})
+        page.goto(server.url)
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+
+        overflow = page.evaluate(
+            "() => document.documentElement.scrollWidth "
+            "- document.documentElement.clientWidth"
+        )
+        assert overflow <= 0, f"the page scrolls sideways by {overflow}px at 320px"
+
+        viewport = page.viewport_size
+        assert viewport is not None
+        rows = page.locator("#checks-body .check-row")
+        name_columns: list[tuple[float, float]] = []
+        for index in range(rows.count()):
+            box = rows.nth(index).bounding_box()
+            assert box is not None, index
+            assert box["x"] >= 0, (index, box)
+            assert box["x"] + box["width"] <= viewport["width"], (index, box)
+            name_box = rows.nth(index).locator(".check-name").bounding_box()
+            assert name_box is not None, index
+            name_columns.append((name_box["x"], name_box["width"]))
+
+        # The fixed gutter and name column still hold at 320 px, so the five
+        # messages still start at one x. A layout that "fitted" by letting the
+        # name column collapse per row would clear the overflow check above and
+        # be unreadable.
+        assert len(set(name_columns)) == 1, name_columns
+
+        # And the fit is a wrap, not a squeeze: at least one message occupies
+        # more than one line box. .check-next is excluded by the probe, because
+        # it is display: block and would otherwise look like a wrap on every
+        # row that carries one.
+        lines = page.evaluate(_COUNT_CHECK_MESSAGE_LINES)
+        assert max(lines) >= 2, lines
+
+        # The refresh control keeps its touch target at the narrowest width,
+        # where a full-width Pico button would have been the easy regression.
+        refresh = page.locator(".check-refresh").bounding_box()
+        assert refresh is not None
+        assert refresh["height"] >= 44, refresh
+        assert refresh["x"] + refresh["width"] <= viewport["width"], refresh
 
 
 # The counts UI-SPEC S3 pins, for the three cases that behave differently: a
