@@ -24,6 +24,7 @@ import re
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -43,6 +44,7 @@ from saneless.config import (
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
+    TOKEN_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ErrorCategory,
@@ -55,6 +57,7 @@ from saneless.vocabulary import (
 )
 from saneless.web import errors
 from saneless.web.app import create_app
+from saneless.web.routes import OWNER_COOKIE
 from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend
 
@@ -1080,6 +1083,289 @@ def test_a_refused_attempt_whose_rejection_is_still_owed_is_not_shown_as_the_liv
     assert button is not None
     assert "disabled" not in button.group("attrs")
     assert refused.id in worker.owed_rejection_ids()
+
+
+# --- The placeholder-token refusal (APPL-07, D-14, D-15) ---------------------
+
+# The shipped stand-in: docker-compose.yml and the docker reference both carry
+# it, so it is the placeholder a real installation is most likely to be left
+# with.  Named rather than written inline at each call site so the three ways a
+# credential can be a placeholder are listed in one place.
+_SHIPPED_PLACEHOLDER = "changeme"
+
+# One credential per way a paperless-ngx token can fail ``is_placeholder_token``:
+# never set at all, set to whitespace by an edit that looked finished, and left
+# at the shipped literal.  ``config.is_placeholder_token`` owns the rule; these
+# are the three shapes the route has to refuse through it.
+_REFUSED_CREDENTIALS = ["", "   ", _SHIPPED_PLACEHOLDER]
+_REFUSED_CREDENTIAL_IDS = ["blank", "whitespace", "shipped_literal"]
+
+# A credential the predicate accepts.  Deliberately not a real-looking 40-char
+# hex string: the predicate is a fixed literal set, never a shape heuristic
+# (D-14), so anything outside the set is a real token as far as it is concerned.
+_ACCEPTED_CREDENTIAL = "a-token-nobody-shipped"
+
+# The phrase WORKER_DEGRADED puts on a job row.  D-15 forbids reusing that
+# member here -- "the scan service was unavailable" is untrue when the service
+# is fine and nobody set the token -- so this path asserts it absent.
+_DEGRADED_PHRASE = "the scan service was unavailable"
+
+
+@contextmanager
+def _appliance_with_credential(
+    settings: Settings,
+    scanner: StubScannerBackend,
+    credential: str,
+    *,
+    consume_dir: str = "",
+) -> Iterator[TestClient]:
+    """
+    Serve one app whose paperless-ngx credential is exactly ``credential``.
+
+    The module's ``app`` fixture is fixed at a real token, and the refusal
+    under test is decided from ``Settings``, which is read once at process
+    start: there is no runtime setter to monkeypatch, so a second app is the
+    only honest way to drive the blocked case.
+
+    Args:
+        settings: The module's test settings, copied rather than mutated.
+        scanner: The stub backend the served worker drives.
+        credential: The paperless-ngx token this appliance is configured with.
+        consume_dir: A configured consume directory, when the test needs one.
+
+    Yields:
+        A started TestClient over that app.
+
+    """
+    configured = settings.model_copy(
+        update={
+            "paperless": PaperlessConfig(
+                url=settings.paperless.url,
+                token=credential,
+                consume_dir=consume_dir,
+            )
+        }
+    )
+    application = create_app(configured, scanner)
+    application.state.paperless.get_tags = list
+    application.state.paperless.get_correspondents = list
+    with TestClient(application) as tc:
+        yield tc
+
+
+class TestPlaceholderTokenRefusal:
+    """
+    ``POST /api/scan`` refuses a scan that could never upload (APPL-07, D-15).
+
+    The one failure certain to waste paper is a paperless-ngx token nobody
+    set: the pages are pulled through the scanner and then have nowhere to go.
+    D-15 splits the response deliberately -- the route guard is the
+    enforcement, the disabled button is only a courtesy -- so every test here
+    drives the route directly, with no button in sight, and one of them sends
+    no htmx header at all.
+    """
+
+    @pytest.mark.parametrize(
+        "credential", _REFUSED_CREDENTIALS, ids=_REFUSED_CREDENTIAL_IDS
+    )
+    def test_placeholder_token_submit_is_503_with_the_unset_message(
+        self,
+        test_settings: Settings,
+        web_scanner: StubScannerBackend,
+        credential: str,
+    ) -> None:
+        """Every placeholder shape is one 503 carrying the unset-token sentence."""
+        with _appliance_with_credential(
+            test_settings, web_scanner, credential
+        ) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Unset Token"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+            assert "Retry-After" not in response.headers
+            assert response.headers["HX-Retarget"] == "#status-message"
+            body = _error_body(
+                RequestRejection.TOKEN_UNSET, 503, _newest_job_id(client)
+            )
+            assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+
+    @pytest.mark.parametrize(
+        "credential", _REFUSED_CREDENTIALS, ids=_REFUSED_CREDENTIAL_IDS
+    )
+    def test_placeholder_token_writes_the_rejected_row(
+        self,
+        test_settings: Settings,
+        web_scanner: StubScannerBackend,
+        credential: str,
+    ) -> None:
+        """The refused attempt is recorded, not silently dropped (D-05)."""
+        with _appliance_with_credential(
+            test_settings, web_scanner, credential
+        ) as client:
+            client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Unset Token"},
+                headers=HTMX_HEADERS,
+            )
+            _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
+
+    def test_placeholder_token_refusal_appears_in_job_history(
+        self, test_settings: Settings, web_scanner: StubScannerBackend
+    ) -> None:
+        """
+        The attempt is visible in Job History end to end (Phase 26 D-05).
+
+        Asserted through the history route rather than the store alone,
+        because "history shows the attempt" is a claim about the page a
+        household member actually looks at.
+        """
+        with _appliance_with_credential(
+            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+        ) as client:
+            client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Refused In History"},
+                headers=HTMX_HEADERS,
+            )
+            history = client.get("/api/jobs/history").text
+            assert "Refused In History" in history
+            assert '<td class="status-error">' in history
+            _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
+
+    def test_placeholder_token_refuses_before_any_job_is_offered_to_the_worker(
+        self,
+        test_settings: Settings,
+        web_scanner: StubScannerBackend,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The guard precedes ``create_job``: one row exists, and it is the refusal.
+
+        A guard placed after ``create_job`` would leave a PENDING row behind
+        as well as the REJECTED one, and the status area would report a scan
+        that never started.
+        """
+        with _appliance_with_credential(
+            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+        ) as client:
+            offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Never Offered"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+            assert offered == []
+            rows = _job_store(client).list_recent(limit=50)
+            assert len(rows) == 1
+            assert rows[0].state is JobState.ERROR
+            assert rows[0].error_category is ErrorCategory.REJECTED
+
+    def test_placeholder_token_refuses_even_with_a_consume_dir_configured(
+        self, test_settings: Settings, web_scanner: StubScannerBackend, tmp_path: Path
+    ) -> None:
+        """
+        The refusal is unconditional, not contingent on the upload route.
+
+        A configured consume directory is the one thing that could look like a
+        reason to let the scan run anyway.  D-15 does not carve that exception:
+        the predicate is the whole condition.
+        """
+        with _appliance_with_credential(
+            test_settings,
+            web_scanner,
+            _SHIPPED_PLACEHOLDER,
+            consume_dir=str(tmp_path),
+        ) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Consume Dir Set"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+            _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
+
+    def test_placeholder_token_never_says_the_scan_service_was_unavailable(
+        self, test_settings: Settings, web_scanner: StubScannerBackend
+    ) -> None:
+        """
+        WORKER_DEGRADED is not reused for this refusal (D-15, T-30-67).
+
+        Saying the scan service was unavailable when the service is fine and
+        nobody set the token would send a household member looking for a broken
+        server.  That untruth is what this milestone removes.
+        """
+        with _appliance_with_credential(
+            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+        ) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Not Degraded"},
+                headers=HTMX_HEADERS,
+            )
+            assert _DEGRADED_PHRASE not in response.text
+            assert WORKER_DEGRADED_JOB_ERROR not in response.text
+            degraded = rejection_message(RequestRejection.WORKER_DEGRADED)
+            assert degraded not in response.text
+            assert rejection_message(RequestRejection.TOKEN_UNSET) in response.text
+            newest = _job_store(client).list_recent(limit=1)[0]
+            assert newest.error == TOKEN_UNSET_JOB_ERROR
+            assert newest.error != WORKER_DEGRADED_JOB_ERROR
+
+    def test_placeholder_token_refuses_a_post_that_sends_no_htmx_header(
+        self, test_settings: Settings, web_scanner: StubScannerBackend
+    ) -> None:
+        """
+        curl, a script, and a browser with ``disabled`` stripped are all refused.
+
+        This request carries no htmx header and never touched a button, so it
+        stands in for every client the courtesy cannot reach (T-30-64).
+        """
+        with _appliance_with_credential(
+            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+        ) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Raw Post"}
+            )
+            _assert_json_error(response, RequestRejection.TOKEN_UNSET, 503)
+            _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
+
+    def test_placeholder_token_refusal_mints_no_owner_cookie(
+        self, test_settings: Settings, web_scanner: StubScannerBackend
+    ) -> None:
+        """
+        A refused submit owns no job, so it is handed no owner token (D-23).
+
+        The guard sits ahead of the mint, which is what keeps a browser that
+        never started anything from collecting a session cookie.
+        """
+        with _appliance_with_credential(
+            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+        ) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "No Cookie"},
+                headers=HTMX_HEADERS,
+            )
+            assert OWNER_COOKIE not in response.headers.get("set-cookie", "")
+
+    def test_a_real_token_is_no_placeholder_token_and_still_starts_the_scan(
+        self, test_settings: Settings, web_scanner: StubScannerBackend
+    ) -> None:
+        """A configured appliance is untouched, owner-cookie mint included."""
+        with _appliance_with_credential(
+            test_settings, web_scanner, _ACCEPTED_CREDENTIAL
+        ) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Real Token"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 200
+            assert 'id="status-area"' in response.text
+            assert OWNER_COOKIE in response.headers.get("set-cookie", "")
 
 
 # --- The client half: htmx-config meta and the #status-message slot ----------
