@@ -19,6 +19,9 @@ The Phase 28 tests pin the exit-code tables in the scripting how-to and the CLI
 reference, and the troubleshooting how-to, to ``ExitCode``: every documented
 code is a real one, and every real one is documented (D-07, D-13).
 
+The Phase 29 test pins the architecture page's "Memory, disk and timeouts"
+subsection, and the absence of the two claims that phase falsified (D-20).
+
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
 """
@@ -568,3 +571,88 @@ def test_troubleshooting_page_is_linked_and_covers_every_exit_code() -> None:
         assert "troubleshoot-a-failed-scan.md" in page_text, (
             f"{page_name} does not link to the troubleshooting how-to"
         )
+
+
+ARCHITECTURE_MEMORY_HEADING = "### Memory, disk and timeouts"
+
+# The Phase 29 claims the architecture page now makes, each with the substrings
+# that carry it.
+#
+# Substrings rather than whole sentences, deliberately: rewording the page for
+# clarity should not fail this test, but dropping a guarantee should. Each entry
+# is one thing an operator decides on -- how much RAM a long scan needs, what
+# `min_free_space_mb` is for, whether a hung scanner can be waited out or has to
+# be restarted -- so an assertion firing here means the page stopped answering a
+# question someone actually asks it.
+#
+# 29-RESEARCH.md Finding 11 enumerated fourteen doc sentences this phase
+# falsified and found that no doc-truth test pinned a single one of them, which
+# is why nothing would have caught a page left stale. This is that test.
+ARCHITECTURE_MEMORY_CLAIMS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "roughly one decoded page is held in memory while scanning",
+        ("one decoded page",),
+    ),
+    (
+        "disk is checked per page, against that page plus the reserve",
+        ("per page", "min_free_space_mb"),
+    ),
+    (
+        "one per-page timeout bounds the feeder and the flatbed alike",
+        ("120", "feeder", "flatbed"),
+    ),
+    (
+        "a timeout cancels the read and waits for it before closing the device",
+        ("cancel", "before closing"),
+    ),
+    (
+        "a read that never returns does not block shutdown",
+        ("daemon", "docker stop"),
+    ),
+    (
+        "a wedged scanner refuses the next scan and asks for a restart",
+        ("refus", "restart saneless"),
+    ),
+)
+
+
+def _subsection(text: str, heading: str, name: Path) -> str:
+    """Return the body of the one ``### `` section headed exactly ``heading``."""
+    marker = f"\n{heading}\n"
+    assert text.count(marker) == 1, f"{name}: expected one {heading!r} heading"
+    body = text.split(marker, 1)[1]
+    for following in ("\n## ", "\n### "):
+        body = body.split(following, 1)[0]
+    return body
+
+
+def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
+    """The architecture page pins Phase 29's memory, disk and timeout claims."""
+    text, name = _read(ARCHITECTURE)
+    assert ARCHITECTURE_MEMORY_HEADING in text, (
+        f"{name} has no {ARCHITECTURE_MEMORY_HEADING!r} subsection"
+    )
+    body = _subsection(text, ARCHITECTURE_MEMORY_HEADING, name).lower()
+    for claim, needles in ARCHITECTURE_MEMORY_CLAIMS:
+        for needle in needles:
+            assert needle in body, (
+                f"{name}: the memory, disk and timeouts subsection no longer "
+                f"says that {claim} (looked for {needle!r})"
+            )
+
+    # The two claims the page used to make and must not make again. A PNG
+    # re-encode is lossless, but the bytes in the PDF are not the bytes the
+    # scanner sent, and pages are no longer carried through the pipeline as
+    # in-memory images. Reverting either correction fails here.
+    lowered = text.lower()
+    assert "byte-for-byte" not in lowered, (
+        f"{name} claims the embedded image data is byte-for-byte identical to "
+        "what the scanner produced; it is lossless, not byte-identical"
+    )
+    assert "pil images" not in lowered, (
+        f"{name}'s pipeline diagram still carries pages as PIL Images; they are "
+        "spooled to disk as they arrive"
+    )
+    assert "lossless" in lowered, (
+        f"{name} no longer says the PNG-to-PDF embed is lossless"
+    )
