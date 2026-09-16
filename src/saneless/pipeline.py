@@ -13,7 +13,7 @@ import shutil
 import tempfile
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Final, assert_never
 from saneless.exceptions import (
     ConfigError,
     PaperlessError,
+    PdfError,
     SanelessError,
     ScanCancelledError,
     ScanError,
@@ -120,6 +121,21 @@ logger = logging.getLogger(__name__)
 _SPOOL_DIR_NAME: Final = "spool"
 _SPOOL_LABEL_A: Final = "a"
 _SPOOL_LABEL_B: Final = "b"
+
+# The workspace subdirectory a preserved partial scan is assembled into, kept
+# apart from the finished PDF's own directory so a preservation can never be
+# mistaken for, or collide with, the document the run was trying to deliver.
+_PARTIAL_DIR_NAME: Final = "partial"
+
+# What a preserved artefact's title says it is, appended to the operator's own
+# title before ``build_pdf_filename`` sanitises the whole thing.  The bracketed
+# spelling is the one ``_handle_duplex_mismatch`` already delivers, and the two
+# paths have to agree: an operator looking in ``failed/`` should not have to
+# learn that a pass-B failure and a page-count mismatch name their halves
+# differently (D-10).  ``(partial)`` is the simplex and single-pass form.
+_PARTIAL_SUFFIX: Final = "(partial)"
+_FRONTS_SUFFIX: Final = "(fronts)"
+_BACKS_SUFFIX: Final = "(backs)"
 
 FAILED_DIR_WARN_THRESHOLD = 20
 """
@@ -577,6 +593,236 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
         raise PaperlessError(msg) from exc
 
 
+@dataclass
+class _SpoolLedger:
+    """
+    What each acquisition pass has spooled so far, for the preservation guard.
+
+    The one mutable record in this module, and deliberately so. The guard that
+    keeps a partial scan lives in ``run_pipeline``, because it has to run
+    inside the workspace ``TemporaryDirectory``; the sinks are built one level
+    down, inside ``_scan_simplex`` and ``_scan_manual_duplex``, because only
+    they know how many passes a job has. A pass therefore has to be able to
+    report itself *upwards* while it is still running -- a frozen record could
+    only be built after the pass returned, which is precisely the case where
+    there is nothing to preserve.
+
+    Each pass registers itself **before** it starts, so a fault part-way
+    through it still finds the sink that has been collecting its pages.
+
+    Attributes:
+        dpi: The resolution a preserved partial is assembled at. It starts as
+            the resolution the profile asked for, because an interrupted pass
+            never returned a batch to read the device's own answer from, and
+            is replaced by that answer as soon as a pass does return one.
+        passes: One ``(title suffix, sink)`` pair per acquisition pass, in
+            pass order. The suffix is what the preserved PDF's name says the
+            half is: ``(partial)``, ``(fronts)`` or ``(backs)``.
+
+    """
+
+    dpi: int
+    passes: list[tuple[str, SpooledPageSink]] = field(default_factory=list)
+
+    def register(self, suffix: str, sink: SpooledPageSink) -> None:
+        """
+        Record a pass that is about to start, under the name it would be kept as.
+
+        Args:
+            suffix: The bracketed marker the preserved PDF's title carries.
+            sink: The sink this pass spools into.
+
+        """
+        self.passes.append((suffix, sink))
+
+    def note_resolution(self, dpi: int) -> None:
+        """
+        Adopt the resolution a completed pass reported the device actually used.
+
+        Args:
+            dpi: The batch's ``actual_resolution``.
+
+        """
+        self.dpi = dpi
+
+    def spooled(self) -> list[tuple[str, tuple[PageRecord, ...]]]:
+        """
+        Return the passes that actually put pages on the spool.
+
+        An empty pass is dropped rather than preserved as a zero-page PDF:
+        ``assemble_pdf`` cannot build one, and a pass B that fed nothing is
+        exactly the case D-10 answers by keeping the fronts alone.
+
+        Returns:
+            One ``(title suffix, records)`` pair per non-empty pass, in pass
+            order.
+
+        """
+        return [(suffix, sink.records) for suffix, sink in self.passes if sink.records]
+
+    def page_count(self) -> int:
+        """
+        Return how many pages reached the spool across every pass.
+
+        Returns:
+            The total, which is zero when there is nothing to preserve.
+
+        """
+        return sum(len(sink.records) for _, sink in self.passes)
+
+
+def _preserve_partial_passes(
+    ledger: _SpoolLedger,
+    tmp_path: Path,
+    request: PipelineRequest,
+    failed_dir: Path,
+) -> list[Path]:
+    """
+    Assemble every spooled pass, unfiltered, and move it into ``failed_dir``.
+
+    Nothing is blank-filtered, following the duplex-mismatch precedent (D-08 of
+    Phases 23 and 24): an anomaly is delivered whole for a human to look at,
+    and ``_drop_empty_pages`` would additionally raise "All pages were blank"
+    on an all-faint batch and destroy the very evidence being preserved.
+
+    Every move names an explicit destination path rather than the bare
+    directory, for the reason ``_preserving``'s docstring sets out at length:
+    handed a directory, ``shutil`` raises ``shutil.Error`` on a basename
+    collision, and ``shutil.Error`` does not inherit from ``OSError``, so it
+    would escape the caller's handler and mask the scan failure (T-29-35).
+    ``shutil`` rather than ``Path.rename`` because ``tmp_dir`` and ``data_dir``
+    are independent settings that may sit on different filesystems.
+
+    Args:
+        ledger: The passes to preserve, and the resolution to assemble at.
+        tmp_path: The job workspace. The partials are built in a subdirectory
+            of it and must leave it before it is unwound.
+        request: The job id and title the preserved names are composed from.
+        failed_dir: The durable directory to move them into, created here
+            because ``data_dir`` may have gone since it was validated.
+
+    Returns:
+        The destinations, in pass order.
+
+    Raises:
+        OSError: If the directory cannot be created or a move fails.
+        PdfError: If a partial cannot be assembled.
+
+    """
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    destinations: list[Path] = []
+    for suffix, records in ledger.spooled():
+        partial_pdf = assemble_pdf(
+            records,
+            tmp_path / _PARTIAL_DIR_NAME,
+            filename=build_pdf_filename(request.job_id, f"{request.title} {suffix}"),
+            dpi=ledger.dpi,
+        )
+        destination = failed_dir / partial_pdf.name
+        shutil.move(partial_pdf, destination)
+        destinations.append(destination)
+    return destinations
+
+
+@contextlib.contextmanager
+def _preserving_partial_scan(
+    ledger: _SpoolLedger,
+    tmp_path: Path,
+    request: PipelineRequest,
+    failed_dir: Path,
+) -> Iterator[None]:
+    """
+    Keep the pages an interrupted scan already spooled, then re-raise (D-09).
+
+    A jam on page 40 of a 50-sheet stack used to discard the 39 sheets the
+    operator had already fed. The spool holds them, so this guard assembles
+    them into a partial PDF under ``failed_dir`` and names the count and the
+    destination in the exception it re-raises. Nothing is uploaded: a partial
+    document landing in paperless-ngx marked green was N-02's alternative and
+    was rejected, because the user rescans the stack anyway.
+
+    **It is a separate helper and not a call to ``_preserving``, deliberately.**
+    ``_preserving`` re-raises a non-saneless exception as a ``PaperlessError``,
+    which is right for a guard spanning the upload and the poll and a lie for
+    one spanning acquisition: it would blame paperless-ngx for a jammed feeder.
+    The move-plus-message-plus-report-both-failures *shape* is copied from it
+    verbatim; only that one re-raise differs.
+
+    **The exception's type survives**, via ``type(exc)(msg) from exc``. That is
+    not a detail: ``classify_error`` reads the type, so a ``ScanError`` that
+    stayed a ``ScanError`` still yields ``ErrorCategory.SCANNER`` and still
+    exits 1 at the CLI (Phase 28 D-07). A partial scan is a failed scan with
+    its pages kept, not a new kind of failure.
+
+    **A cancel preserves nothing, and that is settled.** See the first handler
+    below. Please do not widen it into the general branch.
+
+    Args:
+        ledger: The passes this job has spooled, registered as they started.
+        tmp_path: The job workspace, which deletes the spool when it unwinds --
+            so this guard has to sit inside it.
+        request: The job id and title the preserved names are composed from.
+        failed_dir: Where the partials are moved to.
+
+    Yields:
+        Nothing. The block it wraps is the acquisition itself.
+
+    Raises:
+        ScanCancelledError: Re-raised untouched, before anything is preserved.
+        SanelessError: Otherwise the original exception's own type, re-raised
+            with the page count and the destination appended to its message --
+            or, if preserving failed too, naming both failures, because a user
+            told only that the feeder jammed while the pages were also
+            destroyed has been actively misinformed.
+        ScanError: When a non-saneless exception escaped acquisition.
+            Rebuilding an arbitrary third-party exception from a single string
+            is not safe, and from the job's point of view anything raised in
+            this window is a scan failure.
+
+    """
+    try:
+        yield
+    except ScanCancelledError:
+        # D-10, and the first thing this guard does, deliberately.
+        # ScanCancelledError is an ordinary Exception -- a direct SanelessError
+        # child rather than a ScanError -- so the broad `except Exception`
+        # below would otherwise file a scan the operator chose to abandon into
+        # a directory saneless never prunes automatically.  Nobody asked for
+        # those pages to be kept, so they are not.
+        #
+        # KeyboardInterrupt derives from BaseException and already passes
+        # through both handlers untouched; that is correct, and please do not
+        # "fix" it by widening either one.
+        raise
+    except Exception as exc:
+        pages = ledger.page_count()
+        if pages == 0:
+            # Nothing reached the spool, so there is nothing to keep and
+            # today's messages -- FeederEmptyError, "No pages were scanned" --
+            # stand exactly as they are.
+            raise
+        try:
+            destinations = _preserve_partial_passes(
+                ledger, tmp_path, request, failed_dir
+            )
+        except (OSError, PdfError) as keep_exc:
+            msg = f"{exc}. The scan could NOT be preserved to {failed_dir}: {keep_exc}"
+            if isinstance(exc, SanelessError):
+                raise type(exc)(msg) from exc
+            raise ScanError(msg) from exc
+        # Once, after every move, so the count reflects the finished state --
+        # the same reason _preserving calls it after its own loop.
+        _warn_if_failed_dir_growing(failed_dir)
+        preserved = ", ".join(str(destination) for destination in destinations)
+        msg = (
+            f"{exc}. The {pages} page(s) scanned before the error "
+            f"were preserved at {preserved}"
+        )
+        if isinstance(exc, SanelessError):
+            raise type(exc)(msg) from exc
+        raise ScanError(msg) from exc
+
+
 def _drop_empty_pages(
     pages: Sequence[PageRecord],
     profile: ProfileConfig,
@@ -702,6 +948,10 @@ class _AcquisitionContext:
         min_free_space_mb: The reserve each per-page disk check keeps free for
             assembly -- the operator's own ``min_free_space_mb``, the same
             value the up-front check uses (D-07).
+        ledger: Where each pass registers its sink before it starts, so a
+            mid-batch fault can still find the pages already spooled (D-09).
+            Mutable, unlike the rest of this record; ``frozen=True`` stops the
+            field being rebound, which is the guarantee that matters here.
 
     """
 
@@ -709,6 +959,7 @@ class _AcquisitionContext:
     settings: ScanSettings
     spool_dir: Path
     min_free_space_mb: int
+    ledger: _SpoolLedger
 
 
 @dataclass(frozen=True)
@@ -1257,10 +1508,87 @@ def _scan_simplex(
         min_free_space_mb=acquisition.min_free_space_mb,
         thumbnail_callback=request.thumbnail_callback,
     )
+    # Registered before the pass runs, not after it returns: the whole point is
+    # the case where it never returns, and a fault part-way through has to find
+    # the sink that has been collecting pages all along (D-09).
+    acquisition.ledger.register(_PARTIAL_SUFFIX, sink)
     batch = scanner.scan_pages(acquisition.device_id, acquisition.settings, sink)
     _require_pages(batch)
+    acquisition.ledger.note_resolution(batch.actual_resolution)
     logger.info("Scanned %d page(s)", len(batch.pages))
     return batch
+
+
+def _deliver(
+    pdf_path: Path,
+    paperless: PaperlessClient,
+    request: PipelineRequest,
+    settings: Settings,
+) -> tuple[ScanOutcome, str | None]:
+    """
+    Upload the assembled PDF, poll for its task, and report how delivery went.
+
+    The upload and the poll sit inside the preservation guard: it opens before
+    the upload and closes after the poll, and it runs **inside** the caller's
+    ``TemporaryDirectory``, because a guard placed outside would run after the
+    directory -- and the finished scan with it -- were already gone.
+
+    This is a separate function only because ``run_pipeline`` would otherwise
+    go over ruff's ``PLR0915`` statement limit, which is the same reason
+    ``_finish_duplex_mismatch`` exists, and CLAUDE.md forbids suppressing that
+    rule.
+
+    Args:
+        pdf_path: The assembled PDF, still inside the job workspace.
+        paperless: Paperless-ngx client for upload and polling.
+        request: Pipeline request with the title, tags, correspondent and
+            status callback.
+        settings: Application settings, for the preservation directory and the
+            task timeout.
+
+    Returns:
+        A (outcome, warning) pair: SUCCESS with no warning when the document
+        reached the API and its task finished, or FALLBACK with the
+        consume-directory warning when it took the other route.
+
+    Raises:
+        SanelessError: Whatever upload or polling raised, re-raised with the
+            preserved PDF's destination appended to its message.
+        PaperlessError: If preservation itself failed, or a non-saneless
+            exception escaped the delivery window.
+
+    """
+    notify = request.status_callback or _noop_callback
+    notify(PipelineEvent.UPLOADING)
+    created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
+    with _preserving([pdf_path], settings.output.failed_dir):
+        upload_result = paperless.upload_document(
+            pdf_path,
+            request.title,
+            request.tags,
+            request.correspondent,
+            created,
+        )
+
+        # Poll for the result.  UploadResult.__post_init__ guarantees a
+        # task_uuid iff the document reached the API, so this test is exactly
+        # `delivered_to_api` and additionally narrows the id to str.
+        task_uuid = upload_result.task_uuid
+        if task_uuid is not None:
+            # The return value is discarded on purpose, and that is now correct
+            # rather than a bug: since plan 23-04 a successful poll means "it
+            # returned" and a failed one means "it raised".  Do not re-add a
+            # status check on the result.
+            paperless.poll_task(
+                task_uuid,
+                timeout=settings.output.paperless_task_timeout,
+            )
+            return ScanOutcome.SUCCESS, None
+        # A state alone would leave the user to work out for themselves why the
+        # title and tags they chose never appeared in paperless-ngx (OUTC-02).
+        return ScanOutcome.FALLBACK, _consume_dir_warning(
+            upload_result.consume_dir_path
+        )
 
 
 def _resolve_device(scanner: ScannerBackend, settings: Settings) -> str:
@@ -1302,10 +1630,14 @@ def run_pipeline(
     uploads to paperless-ngx, and polls for task completion. All
     temporary files are cleaned up automatically via TemporaryDirectory.
 
-    The one thing that deliberately escapes that cleanup is the assembled PDF
-    when delivery fails: the upload and the poll run inside a preservation
-    guard that relocates the finished scan to ``settings.output.failed_dir``
-    and names the destination in the exception it re-raises.
+    What deliberately escapes that cleanup is whatever a failure leaves worth
+    keeping, and there are two kinds. The upload and the poll run inside a
+    preservation guard that relocates the finished scan to
+    ``settings.output.failed_dir``; acquisition runs inside a second guard that
+    assembles the pages already spooled into a partial PDF and relocates that
+    instead (D-09). Both name their destination in the exception they re-raise,
+    both keep that exception's own type, and neither one runs for a cancel --
+    the operator chose to stop, and ``failed/`` is never pruned (D-10).
 
     Args:
         scanner: Scanner backend instance.
@@ -1326,7 +1658,8 @@ def run_pipeline(
         ScanError: If scanning fails; ``No pages were scanned`` if a scan pass
             returned no pages; ``All pages were blank`` if empty-page detection
             removed every page; or if a manual duplex flip prompt fails or its
-            wait times out.
+            wait times out. When pages had already reached the spool, the
+            message additionally names how many were kept and where.
         PaperlessError: If upload or polling fails. The message names where
             the assembled PDF was preserved, or -- if preservation failed
             too -- reports both failures.
@@ -1389,6 +1722,9 @@ def run_pipeline(
             settings=scan_settings,
             spool_dir=spool_dir,
             min_free_space_mb=settings.output.min_free_space_mb,
+            # Seeded with the resolution the profile asked for: an interrupted
+            # pass never returned a batch to read the device's own answer from.
+            ledger=_SpoolLedger(dpi=profile.resolution),
         )
 
         # Step 1: Scan
@@ -1399,31 +1735,40 @@ def run_pipeline(
             device_id,
         )
 
-        if flip is None:
-            batch = _scan_simplex(scanner, acquisition, request)
-        else:
-            duplex_result = _scan_manual_duplex(scanner, acquisition, request, flip)
-            # A match with assert_never, not a dict or an isinstance chain, on
-            # purpose: a variant missing from a dict draws no diagnostic from
-            # either ty or pyrefly, while the same omission in a match is
-            # caught by both, at edit time, before a third result type can fall
-            # silently through an else.
-            #
-            # This dispatch is what closes N-07.  N-07's other half -- "replace
-            # the tuple with a result dataclass" -- was already done in an
-            # earlier phase, when the (fronts, backs) tuple became
-            # _DuplexMismatch.
-            match duplex_result:
-                case ScanBatch():
-                    batch = duplex_result
-                case _DuplexMismatch():
-                    # Returns early and deliberately skips _drop_empty_pages
-                    # below -- see _finish_duplex_mismatch for why (D-08).
-                    return _finish_duplex_mismatch(
-                        duplex_result, tmp_path, paperless, request, settings
-                    )
-                case _:
-                    assert_never(duplex_result)
+        # The partial-scan guard spans acquisition and nothing else, and sits
+        # INSIDE the TemporaryDirectory for the reason the spool comment above
+        # gives.  It deliberately stops short of the duplex-mismatch delivery
+        # below, which carries its own _preserving guard: nesting the two would
+        # preserve the same two halves twice.
+        acquired: ScanBatch | _DuplexMismatch
+        with _preserving_partial_scan(
+            acquisition.ledger, tmp_path, request, settings.output.failed_dir
+        ):
+            if flip is None:
+                acquired = _scan_simplex(scanner, acquisition, request)
+            else:
+                acquired = _scan_manual_duplex(scanner, acquisition, request, flip)
+
+        # A match with assert_never, not a dict or an isinstance chain, on
+        # purpose: a variant missing from a dict draws no diagnostic from
+        # either ty or pyrefly, while the same omission in a match is caught by
+        # both, at edit time, before a third result type can fall silently
+        # through an else.
+        #
+        # This dispatch is what closes N-07.  N-07's other half -- "replace the
+        # tuple with a result dataclass" -- was already done in an earlier
+        # phase, when the (fronts, backs) tuple became _DuplexMismatch.
+        match acquired:
+            case ScanBatch():
+                batch = acquired
+            case _DuplexMismatch():
+                # Returns early and deliberately skips _drop_empty_pages
+                # below -- see _finish_duplex_mismatch for why (D-08).
+                return _finish_duplex_mismatch(
+                    acquired, tmp_path, paperless, request, settings
+                )
+            case _:
+                assert_never(acquired)
 
         records = batch.pages
         actual_dpi = batch.actual_resolution
@@ -1456,42 +1801,8 @@ def run_pipeline(
         )
         logger.info("PDF assembled: %s", pdf_path)
 
-        # Step 4: Upload and poll, both inside the preservation guard.  The
-        # guard opens before the upload and closes after the poll, and it sits
-        # INSIDE the TemporaryDirectory: a guard placed outside would run after
-        # the directory -- and the finished scan with it -- were already gone.
-        notify(PipelineEvent.UPLOADING)
-        created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
-        with _preserving([pdf_path], settings.output.failed_dir):
-            upload_result = paperless.upload_document(
-                pdf_path,
-                request.title,
-                request.tags,
-                request.correspondent,
-                created,
-            )
-
-            # Step 5: Poll for result.  UploadResult.__post_init__ guarantees a
-            # task_uuid iff the document reached the API, so this test is
-            # exactly `delivered_to_api` and additionally narrows the id to str.
-            task_uuid = upload_result.task_uuid
-            if task_uuid is not None:
-                # The return value is discarded on purpose, and that is now
-                # correct rather than a bug: since plan 23-04 a successful poll
-                # means "it returned" and a failed one means "it raised".  Do
-                # not re-add a status check on the result.
-                paperless.poll_task(
-                    task_uuid,
-                    timeout=settings.output.paperless_task_timeout,
-                )
-                outcome = ScanOutcome.SUCCESS
-                warning = None
-            else:
-                outcome = ScanOutcome.FALLBACK
-                # A state alone would leave the user to work out for
-                # themselves why the title and tags they chose never appeared
-                # in paperless-ngx (OUTC-02).
-                warning = _consume_dir_warning(upload_result.consume_dir_path)
+        # Steps 4 and 5: upload and poll, both inside the preservation guard.
+        outcome, warning = _deliver(pdf_path, paperless, request, settings)
 
         result = ScanResult(
             outcome=outcome,
