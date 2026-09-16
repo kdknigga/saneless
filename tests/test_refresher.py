@@ -21,12 +21,12 @@ import threading
 from typing import TYPE_CHECKING
 
 import pytest
-from saneless.web.refresher import WATCH_WINDOW_SECONDS, CheckRefresher
 
 from saneless.checks import CheckContext, CheckKey, CheckResult, CheckState
 from saneless.vocabulary import ProfileStorage
 from saneless.web import refresher as refresher_module
 from saneless.web.checks_cache import CheckCache
+from saneless.web.refresher import WATCH_WINDOW_SECONDS, CheckRefresher
 from saneless.worker import STOP_JOIN_SECONDS
 
 if TYPE_CHECKING:
