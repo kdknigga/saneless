@@ -9,8 +9,9 @@ permitted is ``saneless.exceptions``, which is itself a leaf.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
-from typing import Final, assert_never
+from typing import TYPE_CHECKING, Final, Literal, Protocol, assert_never
 
 from saneless.exceptions import (
     ConfigError,
@@ -20,30 +21,46 @@ from saneless.exceptions import (
     ScanError,
 )
 
+if TYPE_CHECKING:
+    # Annotation-only, so the leaf rule is untouched either way -- ``datetime``
+    # is stdlib and importing it would not make this module depend on a
+    # consumer.
+    from datetime import datetime
+
 __all__ = [
     "ACTIVE_STATES",
     "BUSY_STATES",
+    "LOCAL_TIME_FORMAT",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
+    "TOKEN_UNSET_JOB_ERROR",
     "WORKER_DEGRADED_JOB_ERROR",
     "WORKER_DOWN_JOB_ERROR",
     "ConnectionStatus",
+    "ErrorAdvice",
     "ErrorCategory",
     "ExitCode",
     "FlipOutcome",
     "JobState",
+    "PageCounted",
+    "ProfileStorage",
     "RequestRejection",
     "ScanOutcome",
     "SubmitResult",
     "WorkerHealth",
+    "busy_line",
     "classify_error",
     "connection_status_message",
+    "error_advice",
     "error_message",
+    "error_next_step",
     "exit_code_for",
     "flip_answer_label",
     "job_state_for",
+    "local_time",
+    "page_counts",
     "progress_label",
     "rejection_message",
     "rejection_status_code",
@@ -91,6 +108,77 @@ class ErrorCategory(StrEnum):
     UNKNOWN = "UNKNOWN"
     REJECTED = "REJECTED"
     ASSEMBLY = "ASSEMBLY"
+
+
+@dataclass(frozen=True, slots=True)
+class ErrorAdvice:
+    """
+    What a reader is told about an error category, and what to do next.
+
+    The two halves travel together because they are always rendered together
+    (APPL-04): a message without a next step leaves the reader stuck, and a
+    next step without a message leaves them guessing what went wrong.  Frozen
+    and slotted so a renderer cannot edit approved copy in place, and so a
+    typo cannot quietly add a third field that nothing renders.
+    """
+
+    message: str
+    next_step: str
+
+
+class PageCounted(Protocol):
+    """
+    Anything carrying a job's three page counts.
+
+    It exists so this leaf module can format the counts sentence without
+    importing ``job.py``, which imports from here.  ``Job`` and ``JobResult``
+    satisfy it structurally; neither has to know the protocol exists.
+
+    All three are ``int | None`` because they are NULL on every row that never
+    counted anything -- ERROR, CANCELLED, REJECTED and every row written before
+    the columns existed.
+    """
+
+    @property
+    def pages_scanned(self) -> int | None:
+        """Pages the scanner produced, or None if nothing counted them."""
+
+    @property
+    def pages_removed(self) -> int | None:
+        """Pages discarded as blank, or None if nothing counted them."""
+
+    @property
+    def pages_uploaded(self) -> int | None:
+        """Pages sent to paperless-ngx, or None if nothing counted them."""
+
+
+class ProfileStorage(StrEnum):
+    """
+    What became of the generated scan profiles at startup.
+
+    The worker makes exactly one attempt to persist generated profiles when it
+    starts, and records the outcome here.  It has to be recorded rather than
+    recomputed because ``_persist_generated_profiles`` returns ``None`` for two
+    genuinely different situations -- no config file was loaded at all, and a
+    config file was loaded but could not be written -- and the status strip's
+    Profiles row must tell a household member which one happened (Amendment
+    A-2, D-22).  One is "saneless has no config file to save to"; the other is
+    "saneless has one and cannot write it", and only the second is worth
+    investigating.
+
+    A fresh ``os.access()`` probe at check time cannot substitute for the
+    record.  Phase 27 D-09's motivating failure is EBUSY on a single-file bind
+    mount, where the directory is writable, ``os.access`` says yes, and only
+    the rename fails.  The check reads what the write actually did.
+
+    ``PERSISTED`` means the profiles are in the config file and will survive a
+    restart.  Both ``IN_MEMORY_`` members mean they are in memory for this run
+    only.
+    """
+
+    PERSISTED = "PERSISTED"
+    IN_MEMORY_NO_CONFIG_FILE = "IN_MEMORY_NO_CONFIG_FILE"
+    IN_MEMORY_UNWRITABLE = "IN_MEMORY_UNWRITABLE"
 
 
 class ExitCode(IntEnum):
@@ -224,6 +312,15 @@ class SubmitResult(StrEnum):
     DEGRADED = "DEGRADED"
 
 
+# The member value for the unset-token refusal, named rather than written
+# inline, for the same reason ``_REJECTED_WIRE_VALUE`` is: ruff's S105 reads any
+# string literal assigned to a name containing "token" as a hardcoded
+# credential.  The member name is fixed by APPL-07 and every StrEnum in this
+# module has value == name, so the literal gets a name S105 does not flag rather
+# than the convention getting an exception.
+_UNSET_REJECTION_VALUE = "TOKEN_UNSET"
+
+
 class RequestRejection(StrEnum):
     """
     Every error the web layer renders, one member per message.
@@ -238,6 +335,11 @@ class RequestRejection(StrEnum):
     QUEUE_FULL = "QUEUE_FULL"
     WORKER_DOWN = "WORKER_DOWN"
     WORKER_DEGRADED = "WORKER_DEGRADED"
+    # Its own member rather than a reuse of WORKER_DEGRADED (D-15).  Degraded
+    # says "the scan service was unavailable", which is untrue here: the
+    # service is fine and nobody set the paperless-ngx API token.  Sharing the
+    # member would send a household member looking for a broken server.
+    TOKEN_UNSET = _UNSET_REJECTION_VALUE
     UNKNOWN_PROFILE = "UNKNOWN_PROFILE"
     TITLE_TOO_LONG = "TITLE_TOO_LONG"
     INVALID_REQUEST = "INVALID_REQUEST"
@@ -254,18 +356,41 @@ class RequestRejection(StrEnum):
 # UI-SPEC S5).
 TITLE_MAX_LENGTH: Final = 256
 
-# Job-row error texts.  A submit refused because the queue was full or the
-# worker was down or degraded still writes a job row, so history shows the
-# attempt (D-05); these are that row's ``error``.  Like every other
-# ``job.error`` they carry no trailing period.
+# Job-row error texts.  A submit refused because the queue was full, the
+# worker was down or degraded, or the paperless-ngx API token was never set
+# still writes a job row, so history shows the attempt (D-05); these are that
+# row's ``error``.  Like every other ``job.error`` they carry no trailing
+# period.
 QUEUE_FULL_JOB_ERROR: Final = "Not started: the scan queue was full"
 WORKER_DOWN_JOB_ERROR: Final = "Not started: the scan service was not running"
 WORKER_DEGRADED_JOB_ERROR: Final = "Not started: the scan service was unavailable"
+# The literal is named first, and the exported constant aliases it, for the
+# same reason ``_REJECTED_WIRE_VALUE`` is: ruff's S105 reads any string literal
+# assigned to a name containing "token" as a hardcoded credential.  This is
+# job-row copy *about* a token nobody set, not a token, and the exported name
+# is fixed by APPL-07, so the literal gets a name S105 does not flag.
+_UNSET_CREDENTIAL_JOB_ERROR = (
+    "Not started: the paperless-ngx API token has not been set"
+)
+TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
 
 # What startup recovery passes to ``JobStore.fail_active_jobs`` for a job the
 # previous process left in flight (D-13), and what a flip wait aborted by
 # shutdown records.
 RESTART_REASON: Final = "The server restarted before this scan finished"
+
+# How every user-facing timestamp is spelled, on the web page and in the CLI
+# table alike (D-34, D-35).  ``%Z`` is on the format rather than in a column
+# caption so the zone is named on every line and a copy-pasted timestamp is
+# self-describing.  One constant, read by the Jinja filter and by ``cli.py``,
+# is what stops the two surfaces from disagreeing.  Seconds are deliberately
+# absent: they buy nothing a reader wants and they cost the CLI table three
+# columns of title at 80 columns.
+LOCAL_TIME_FORMAT: Final = "%Y-%m-%d %H:%M %Z"
+
+# The separator between the pass-A front count and the progress prose on the
+# manual-duplex busy line (D-33).  U+00B7 MIDDLE DOT with a space either side.
+_BUSY_SEPARATOR: Final = "·"
 
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
@@ -401,6 +526,120 @@ def progress_label(state: JobState) -> str:
     return label
 
 
+def busy_line(
+    state: JobState,
+    *,
+    queue_title: str | None = None,
+    queue_ahead: int | None = None,
+    front_pages: int | None = None,
+) -> str:
+    """
+    Return the one line the status area shows while a job is in flight.
+
+    Three branches in strict precedence (D-33, APPL-08):
+
+    1. The job is queued behind another one, so it is told what it is waiting
+       for and how many jobs are ahead.  This wins outright: a job that has not
+       started has nothing else worth saying.
+    2. The job is on the second manual-duplex pass and the front count is
+       known, so the count leads the progress prose.
+    3. Otherwise the progress prose alone, exactly as before.
+
+    ``(0 ahead of you)`` is never produced.  It is technically true and reads
+    like a bug, so the last job in the queue is told it is ``next in line``
+    (D-25).
+
+    The trailing phrase in branch 2 is ``progress_label(SCANNING_REVERSE)`` --
+    master-pinned copy with its own tests -- and not the history table's
+    ``state_label``, which is a different owner with a different string.  This
+    is a deliberate, recorded deviation from D-33's specimen wording; the
+    count, the separator and the live behaviour are as D-33 specifies.
+
+    ``queue_title`` is the only user data any string here carries.  It is
+    returned as plain text, escaped by Jinja's autoescape at render time, and
+    is never logged from this module.
+
+    Args:
+        state: The state of the job being followed.
+        queue_title: The title of the job ahead, when there is one.
+        queue_ahead: How many jobs are ahead of the followed job.
+        front_pages: Pages counted on the first manual-duplex pass, when that
+            count is known.
+
+    Returns:
+        One line of plain text.
+
+    """
+    if queue_title is not None and queue_ahead is not None:
+        position = "next in line" if queue_ahead == 0 else f"{queue_ahead} ahead of you"
+        return f"Waiting for '{queue_title}' to finish ({position})"
+    label = progress_label(state)
+    if state is JobState.SCANNING_REVERSE and front_pages is not None:
+        noun = "page" if front_pages == 1 else "pages"
+        return f"Front: {front_pages} {noun} {_BUSY_SEPARATOR} {label}"
+    return label
+
+
+def local_time(value: datetime) -> str:
+    """
+    Render a timestamp in the server's local zone, with the zone named.
+
+    The argument must be timezone-aware.  Every timestamp saneless persists is
+    (``JobStore`` writes ``datetime.now(tz=UTC)`` and ``_row_to_job`` parses it
+    back from the isoformat string), so a naive value reaching here is a bug in
+    the caller, not a case to guess at.
+
+    ``astimezone()`` is called with no argument, so the zone is the process's
+    own whatever zone the value carries.  That makes ``TZ`` load-bearing: a
+    container reports UTC unless it is set, which satisfies APPL-12 on paper
+    and helps nobody.  No ``zoneinfo`` import and no new config key is
+    involved -- the operator's ``TZ`` is the single source.
+
+    Args:
+        value: A timezone-aware timestamp.
+
+    Returns:
+        The timestamp as ``2026-09-16 14:03 CDT``.
+
+    """
+    return value.astimezone().strftime(LOCAL_TIME_FORMAT)
+
+
+def page_counts(job: PageCounted) -> str | None:
+    """
+    Return the page-count sentence for a job, or None if it has no counts.
+
+    A NULL count renders nothing at all -- no element, no empty line -- and one
+    NULL is enough to suppress the whole sentence, because a sentence naming
+    two of three counts invites the reader to wonder about the third (D-32).
+    This is the common path, not an edge: four of the six terminal cases have
+    no counts by construction (ERROR, CANCELLED, REJECTED and every row written
+    before the columns existed).
+
+    A measured ``0`` is not a NULL and renders as ``0``.  A scan where nothing
+    was blank really did remove 0 pages.  Consumers must therefore guard on
+    ``is not None`` and never on truthiness, in Python and in Jinja alike
+    (``is not none``), or a real zero disappears.
+
+    Only the first clause carries a noun, so only the first clause pluralises.
+
+    Args:
+        job: Anything carrying the three page counts.
+
+    Returns:
+        ``"12 pages scanned, 2 blank removed, 10 uploaded"``, or None if any
+        of the three counts is NULL.
+
+    """
+    scanned = job.pages_scanned
+    removed = job.pages_removed
+    uploaded = job.pages_uploaded
+    if scanned is None or removed is None or uploaded is None:
+        return None
+    noun = "page" if scanned == 1 else "pages"
+    return f"{scanned} {noun} scanned, {removed} blank removed, {uploaded} uploaded"
+
+
 def flip_answer_label(outcome: FlipOutcome) -> str:
     """
     Return the acknowledgment the status area shows for an answered flip wait.
@@ -473,19 +712,109 @@ def job_state_for(outcome: ScanOutcome) -> JobState:
     return state
 
 
+def error_advice(category: ErrorCategory) -> ErrorAdvice:
+    """
+    Return what to tell a reader about an error category, and what to do next.
+
+    This is the one ``match`` over ``ErrorCategory`` in this module (D-10,
+    D-11).  ``error_message`` and ``error_next_step`` are one-line accessors
+    over it rather than lookups of their own, so a category can never end up
+    with a message and no next step, or with two lookups that drift apart.
+
+    The wording is surface-neutral.  Both the web page and the CLI render the
+    same string, so a next step never says "press Scan" (the CLI has no
+    button) and never says "run the command" (the page has no command line);
+    it says "start the scan again", which is true on both.
+
+    Every string is a developer-authored constant.  None of them interpolates
+    exception text, request input, a URL, a token or a filesystem path, so
+    nothing internal can reach a screen through this path (ASVS V7).
+
+    Args:
+        category: The error category to describe.
+
+    Returns:
+        The plain-language message and the next step, paired.
+
+    Raises:
+        AssertionError: If the value is not an ErrorCategory member.
+
+    """
+    match category:
+        case ErrorCategory.FEEDER:
+            advice = ErrorAdvice(
+                message="The document feeder is empty or jammed.",
+                next_step=(
+                    "Load the pages squarely in the feeder, clear any jam, "
+                    "then start the scan again."
+                ),
+            )
+        case ErrorCategory.CONFIG:
+            advice = ErrorAdvice(
+                message="The saneless configuration is invalid.",
+                next_step=(
+                    "Correct the saneless configuration file, then restart saneless."
+                ),
+            )
+        case ErrorCategory.SCANNER:
+            advice = ErrorAdvice(
+                message="The scanner could not complete the scan.",
+                next_step=(
+                    "Check the scanner is switched on and connected, then "
+                    "start the scan again."
+                ),
+            )
+        case ErrorCategory.UPLOAD:
+            advice = ErrorAdvice(
+                message="The document could not be sent to paperless-ngx.",
+                next_step=(
+                    "Check paperless-ngx is running and the API token is "
+                    "correct, then start the scan again."
+                ),
+            )
+        case ErrorCategory.UNKNOWN:
+            advice = ErrorAdvice(
+                message="Something went wrong.",
+                next_step=(
+                    "Start the scan again. If it keeps failing, check the saneless log."
+                ),
+            )
+        case ErrorCategory.ASSEMBLY:
+            advice = ErrorAdvice(
+                message="The scanned pages could not be assembled into a PDF.",
+                next_step=(
+                    "Start the scan again. If it keeps failing, check the "
+                    "server's free disk space."
+                ),
+            )
+        case ErrorCategory.REJECTED:
+            advice = ErrorAdvice(
+                # Neutral on purpose: REJECTED also covers down and degraded
+                # refusals, where no scan is running to wait for (IN-02).
+                message=(
+                    "This scan was not started. Check that saneless is ready "
+                    "to scan, then try again."
+                ),
+                next_step=(
+                    "Check the system status list for anything marked Failed, "
+                    "then start the scan again."
+                ),
+            )
+        case _:
+            assert_never(category)
+    return advice
+
+
 def error_message(category: ErrorCategory) -> str:
     """
     Return the plain-language user message for an error category.
 
-    Every message is a developer-authored constant: no exception text is
-    interpolated, so nothing internal leaks through this path.
-
-    This function is deliberately NOT wired to any template, route, or CLI
-    output yet.  The status partial keeps rendering ``job.error`` verbatim,
-    because the specific messages are more truthful today than a generic
-    category sentence would be -- swapping them now would be a user-visible
-    regression.  The plain-language display arrives with the error-message
-    rework; until then the completeness test is this function's only consumer.
+    APPL-04 is the arrival this function's docstring used to promise: the
+    plain-language display is wired, and the message is now half of an
+    ``ErrorAdvice`` rather than a lookup of its own.  The D-10 rule is that
+    there is exactly one ``match`` over ``ErrorCategory`` in this module, in
+    ``error_advice``; this accessor reads it so the message and the next step
+    cannot drift apart.
 
     Args:
         category: The error category to describe.
@@ -497,29 +826,28 @@ def error_message(category: ErrorCategory) -> str:
         AssertionError: If the value is not an ErrorCategory member.
 
     """
-    match category:
-        case ErrorCategory.FEEDER:
-            message = "The document feeder is empty or jammed."
-        case ErrorCategory.CONFIG:
-            message = "The saneless configuration is invalid."
-        case ErrorCategory.SCANNER:
-            message = "The scanner could not complete the scan."
-        case ErrorCategory.UPLOAD:
-            message = "The document could not be sent to paperless-ngx."
-        case ErrorCategory.UNKNOWN:
-            message = "Something went wrong."
-        case ErrorCategory.ASSEMBLY:
-            message = "The scanned pages could not be assembled into a PDF."
-        case ErrorCategory.REJECTED:
-            message = (
-                # Neutral on purpose: REJECTED also covers down and degraded
-                # refusals, where no scan is running to wait for (IN-02).
-                "This scan was not started. Check that saneless is ready to scan, "
-                "then try again."
-            )
-        case _:
-            assert_never(category)
-    return message
+    return error_advice(category).message
+
+
+def error_next_step(category: ErrorCategory) -> str:
+    """
+    Return the action a reader should take after an error category.
+
+    The companion of ``error_message`` and, like it, a one-line accessor over
+    ``error_advice`` (D-10, D-11).
+
+    Args:
+        category: The error category to advise on.
+
+    Returns:
+        One imperative sentence -- two for ASSEMBLY and UNKNOWN -- that names
+        what to do next without naming the web page or the command line.
+
+    Raises:
+        AssertionError: If the value is not an ErrorCategory member.
+
+    """
+    return error_advice(category).next_step
 
 
 def connection_status_message(status: ConnectionStatus) -> str:
@@ -585,6 +913,56 @@ def worker_health_detail(health: WorkerHealth) -> str:
     return detail
 
 
+def _reload_page_message(
+    rejection: Literal[
+        RequestRejection.INVALID_REQUEST,
+        RequestRejection.NOT_FOUND,
+        RequestRejection.METHOD_NOT_ALLOWED,
+        RequestRejection.CLIENT_ERROR,
+    ],
+) -> str:
+    """
+    Return the message for a rejection whose remedy is "reload the page".
+
+    These four are one group, not four unrelated arms: each names a different
+    thing the browser got wrong and all four end in the same sentence, because
+    reloading is the only thing a reader can usefully do about any of them.
+    Grouping them keeps ``rejection_message`` readable as the twelfth member
+    joins it.
+
+    The parameter is typed as the four members this arm can pass, so the
+    ``assert_never`` below still fails the type gate if the group ever grows,
+    and ``rejection_message``'s own ``assert_never`` still fails it if
+    ``RequestRejection`` grows.
+
+    Args:
+        rejection: One of the four reload-remedy rejections.
+
+    Returns:
+        The approved sentence for that rejection.
+
+    Raises:
+        AssertionError: If the value is outside the four-member group.
+
+    """
+    match rejection:
+        case RequestRejection.INVALID_REQUEST:
+            message = "The request was not valid. Reload the page, then try again."
+        case RequestRejection.NOT_FOUND:
+            message = (
+                "That page or action does not exist. Reload the page, then try again."
+            )
+        case RequestRejection.METHOD_NOT_ALLOWED:
+            message = "That action is not allowed. Reload the page, then try again."
+        case RequestRejection.CLIENT_ERROR:
+            message = (
+                "The request could not be completed. Reload the page, then try again."
+            )
+        case _:
+            assert_never(rejection)
+    return message
+
+
 def rejection_message(rejection: RequestRejection) -> str:
     """
     Return the user-facing message for a web-layer rejection.
@@ -620,6 +998,15 @@ def rejection_message(rejection: RequestRejection) -> str:
                 "started. Check the server's free disk space and log, then try "
                 "again."
             )
+        case RequestRejection.TOKEN_UNSET:
+            message = (
+                # Names the problem and the file to edit, never the token
+                # value and never the paperless-ngx URL, which may carry
+                # ``user:pass@`` credentials (ASVS V7).
+                "The paperless-ngx API token has not been set, so the scan was "
+                "not started. Put a real API token in the saneless config "
+                "file, then restart saneless."
+            )
         case RequestRejection.UNKNOWN_PROFILE:
             message = (
                 "That scan profile does not exist. Reload the page to see the "
@@ -630,28 +1017,23 @@ def rejection_message(rejection: RequestRejection) -> str:
                 "The title is too long. Shorten it to "
                 f"{TITLE_MAX_LENGTH} characters or fewer."
             )
-        case RequestRejection.INVALID_REQUEST:
-            message = "The request was not valid. Reload the page, then try again."
+        case (
+            RequestRejection.INVALID_REQUEST
+            | RequestRejection.NOT_FOUND
+            | RequestRejection.METHOD_NOT_ALLOWED
+            | RequestRejection.CLIENT_ERROR
+        ):
+            message = _reload_page_message(rejection)
         case RequestRejection.CROSS_SITE:
             message = (
                 "This request was blocked because it did not come from the "
                 "saneless page. If saneless is behind a reverse proxy, make sure "
                 "the proxy passes the original Host header."
             )
-        case RequestRejection.NOT_FOUND:
-            message = (
-                "That page or action does not exist. Reload the page, then try again."
-            )
-        case RequestRejection.METHOD_NOT_ALLOWED:
-            message = "That action is not allowed. Reload the page, then try again."
         case RequestRejection.INTERNAL:
             message = (
                 "Something went wrong on the server. Check the server log for "
                 "details, then try again."
-            )
-        case RequestRejection.CLIENT_ERROR:
-            message = (
-                "The request could not be completed. Reload the page, then try again."
             )
         case _:
             assert_never(rejection)
@@ -675,7 +1057,11 @@ def rejection_status_code(rejection: RequestRejection) -> int:
     match rejection:
         case RequestRejection.QUEUE_FULL:
             status_code = 429
-        case RequestRejection.WORKER_DOWN | RequestRejection.WORKER_DEGRADED:
+        case (
+            RequestRejection.WORKER_DOWN
+            | RequestRejection.WORKER_DEGRADED
+            | RequestRejection.TOKEN_UNSET
+        ):
             status_code = 503
         case (
             RequestRejection.UNKNOWN_PROFILE

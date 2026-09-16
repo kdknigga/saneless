@@ -7,8 +7,10 @@ Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
 from __future__ import annotations
 
 import json
-from dataclasses import fields
-from typing import cast
+import time
+from dataclasses import FrozenInstanceError, fields
+from datetime import UTC, datetime, timedelta, timezone
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -29,33 +31,45 @@ from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    LOCAL_TIME_FORMAT,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
+    TOKEN_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ConnectionStatus,
+    ErrorAdvice,
     ErrorCategory,
     ExitCode,
     FlipOutcome,
     JobState,
+    ProfileStorage,
     RequestRejection,
     ScanOutcome,
     SubmitResult,
     WorkerHealth,
+    busy_line,
     classify_error,
     connection_status_message,
+    error_advice,
     error_message,
+    error_next_step,
     exit_code_for,
     flip_answer_label,
     job_state_for,
+    local_time,
+    page_counts,
     progress_label,
     rejection_message,
     rejection_status_code,
     state_label,
     worker_health_detail,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 
 class TestJobStateMembers:
@@ -124,6 +138,34 @@ class TestScanOutcomeMembers:
     def test_scan_outcome_value_equals_name(self, outcome: ScanOutcome) -> None:
         """Every ScanOutcome value is identical to its member name (CTR-02)."""
         assert outcome.value == outcome.name
+
+
+class TestProfileStorage:
+    """ProfileStorage membership tests (APPL-06, Amendment A-2, D-22)."""
+
+    def test_profile_storage_member_names(self) -> None:
+        """
+        ProfileStorage names the three outcomes of the startup persist (A-2).
+
+        ``_persist_generated_profiles`` returns None for two genuinely
+        different situations -- no config file was loaded, and the file could
+        not be written -- and the status strip's Profiles row has to tell them
+        apart.  Compared as a set: declaration order is not a contract.
+        """
+        assert {member.name for member in ProfileStorage} == {
+            "PERSISTED",
+            "IN_MEMORY_NO_CONFIG_FILE",
+            "IN_MEMORY_UNWRITABLE",
+        }
+
+    @pytest.mark.parametrize("storage", list(ProfileStorage))
+    def test_profile_storage_value_equals_name(self, storage: ProfileStorage) -> None:
+        """Every ProfileStorage value is identical to its member name (A-2)."""
+        assert storage.value == storage.name
+
+    def test_profile_storage_is_a_str_enum(self) -> None:
+        """ProfileStorage compares equal to its own string, like its siblings."""
+        assert ProfileStorage.PERSISTED == "PERSISTED"
 
 
 class TestStateClassifications:
@@ -281,18 +323,122 @@ class TestFlipAnswerLabel:
         assert "…" not in label
 
 
-class TestErrorMessage:
-    """error_message category-message lookup tests."""
+class TestErrorAdvice:
+    """error_advice category-to-advice lookup tests (APPL-04, D-10, D-11)."""
+
+    def test_error_advice_fields(self) -> None:
+        """ErrorAdvice carries exactly a message and a next step (APPL-04)."""
+        assert [field.name for field in fields(ErrorAdvice)] == [
+            "message",
+            "next_step",
+        ]
+
+    def test_error_advice_is_immutable(self) -> None:
+        """
+        ErrorAdvice is frozen, so a renderer cannot edit the approved copy.
+
+        The attribute name is a local rather than a literal so this exercises
+        the dataclass's own runtime guard rather than a linter's rule about
+        constant ``setattr`` targets.
+        """
+        advice = error_advice(ErrorCategory.FEEDER)
+        attribute = "message"
+        with pytest.raises(FrozenInstanceError):
+            setattr(advice, attribute, "tampered")
+
+    def test_error_advice_is_slotted(self) -> None:
+        """ErrorAdvice is slotted, so a typo cannot add a silent third field."""
+        assert not hasattr(error_advice(ErrorCategory.FEEDER), "__dict__")
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
-    def test_error_message_is_complete(self, category: ErrorCategory) -> None:
-        """Every ErrorCategory has a plain-language message (CTR-05)."""
-        message = error_message(category)
-        assert message
-        assert message != category.value
+    def test_error_advice_is_complete(self, category: ErrorCategory) -> None:
+        """Every ErrorCategory has a message and a next step (APPL-04, CTR-05)."""
+        advice = error_advice(category)
+        assert advice.message
+        assert advice.next_step
+        assert advice.message != category.value
+        assert advice.next_step != category.value
+        assert advice.message.endswith(".")
+        assert advice.next_step.endswith(".")
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_advice_accessors_agree(self, category: ErrorCategory) -> None:
+        """
+        error_message and error_next_step read the one lookup (D-10, D-11).
+
+        There is exactly one ``match`` over ErrorCategory in the module and the
+        two accessors are one-liners over it, so the pair cannot drift apart
+        the way two parallel lookups would.
+        """
+        advice = error_advice(category)
+        assert error_message(category) == advice.message
+        assert error_next_step(category) == advice.next_step
+
+    def test_error_advice_raises_on_unrecognised_value(self) -> None:
+        """error_advice raises on a value outside ErrorCategory (CTR-05)."""
+        bad = cast("ErrorCategory", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            error_advice(bad)
+
+    @pytest.mark.parametrize(
+        ("category", "expected"),
+        [
+            (
+                ErrorCategory.FEEDER,
+                "Load the pages squarely in the feeder, clear any jam, then "
+                "start the scan again.",
+            ),
+            (
+                ErrorCategory.CONFIG,
+                "Correct the saneless configuration file, then restart saneless.",
+            ),
+            (
+                ErrorCategory.SCANNER,
+                "Check the scanner is switched on and connected, then start the "
+                "scan again.",
+            ),
+            (
+                ErrorCategory.UPLOAD,
+                "Check paperless-ngx is running and the API token is correct, "
+                "then start the scan again.",
+            ),
+            (
+                ErrorCategory.ASSEMBLY,
+                "Start the scan again. If it keeps failing, check the server's "
+                "free disk space.",
+            ),
+            (
+                ErrorCategory.REJECTED,
+                "Check the system status list for anything marked Failed, then "
+                "start the scan again.",
+            ),
+            (
+                ErrorCategory.UNKNOWN,
+                "Start the scan again. If it keeps failing, check the saneless log.",
+            ),
+        ],
+    )
+    def test_error_next_step_strings(
+        self, category: ErrorCategory, expected: str
+    ) -> None:
+        """The seven next steps are the approved UI-SPEC S2 copy (APPL-04)."""
+        assert error_next_step(category) == expected
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_next_step_is_surface_neutral(self, category: ErrorCategory) -> None:
+        """
+        No next step names a surface, because both surfaces render it (D-12).
+
+        The web page has no command line and the CLI has no Scan button, so a
+        string naming either would be wrong on the other.
+        """
+        next_step = error_next_step(category).lower()
+        assert "press scan" not in next_step
+        assert "click" not in next_step
+        assert "run the command" not in next_step
 
     def test_error_message_strings(self) -> None:
-        """error_message returns developer-authored prose, not exception text (CTR-05)."""
+        """The messages are byte identical to what shipped before (APPL-04, D-10)."""
         assert error_message(ErrorCategory.FEEDER) == (
             "The document feeder is empty or jammed."
         )
@@ -316,6 +462,278 @@ class TestErrorMessage:
             "This scan was not started. Check that saneless is ready to scan, "
             "then try again."
         )
+
+
+class TestTokenUnsetRejection:
+    """RequestRejection.TOKEN_UNSET vocabulary tests (APPL-07, D-15)."""
+
+    def test_token_unset_member_exists(self) -> None:
+        """TOKEN_UNSET is a RequestRejection member of its own (D-15)."""
+        assert RequestRejection.TOKEN_UNSET.value == "TOKEN_UNSET"
+        assert RequestRejection.TOKEN_UNSET.name == "TOKEN_UNSET"
+
+    def test_token_unset_is_service_unavailable(self) -> None:
+        """An unset token refuses with 503, beside the other not-ready arms."""
+        assert rejection_status_code(RequestRejection.TOKEN_UNSET) == 503
+
+    def test_token_unset_message(self) -> None:
+        """The TOKEN_UNSET sentence is the approved UI-SPEC S8 copy (APPL-07)."""
+        assert rejection_message(RequestRejection.TOKEN_UNSET) == (
+            "The paperless-ngx API token has not been set, so the scan was not "
+            "started. Put a real API token in the saneless config file, then "
+            "restart saneless."
+        )
+
+    def test_token_unset_does_not_reuse_worker_degraded_copy(self) -> None:
+        """
+        WORKER_DEGRADED is deliberately not reused for an unset token (D-15).
+
+        "The scan service was unavailable" is untrue when the truth is that
+        nobody ever set the token, so the two carry different words.
+        """
+        assert rejection_message(RequestRejection.TOKEN_UNSET) != rejection_message(
+            RequestRejection.WORKER_DEGRADED
+        )
+        assert TOKEN_UNSET_JOB_ERROR != WORKER_DEGRADED_JOB_ERROR
+
+    def test_token_unset_job_error(self) -> None:
+        """The job-row error carries no trailing period, like its siblings (D-05)."""
+        assert TOKEN_UNSET_JOB_ERROR == (
+            "Not started: the paperless-ngx API token has not been set"
+        )
+        assert not TOKEN_UNSET_JOB_ERROR.endswith(".")
+
+
+class TestDeveloperConstantStrings:
+    """Every user-facing string in this module is a developer constant (V7)."""
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_rejection_message_carries_no_internals(
+        self, rejection: RequestRejection
+    ) -> None:
+        """No rejection message can carry input, a URL or exception text (V7)."""
+        message = rejection_message(rejection)
+        assert "{" not in message
+        assert "%s" not in message
+        assert "http" not in message.lower()
+        assert "traceback" not in message.lower()
+
+    @pytest.mark.parametrize("category", list(ErrorCategory))
+    def test_error_advice_carries_no_internals(self, category: ErrorCategory) -> None:
+        """No ErrorAdvice field can carry input, a URL or exception text (V7)."""
+        advice = error_advice(category)
+        for text in (advice.message, advice.next_step):
+            assert "{" not in text
+            assert "%s" not in text
+            assert "http" not in text.lower()
+            assert "traceback" not in text.lower()
+
+
+@pytest.fixture
+def local_zone(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[str], None]]:
+    """
+    Give one test control of the process's local zone, then restore it.
+
+    ``local_time`` renders whatever zone the C library reports, so pinning
+    ``TZ`` and calling ``time.tzset()`` is the only way to assert an exact
+    string on a host in an unknown zone.  monkeypatch removes the env var at
+    teardown; the trailing ``tzset`` is what makes the C library notice.
+    """
+
+    def _use(zone: str) -> None:
+        monkeypatch.setenv("TZ", zone)
+        time.tzset()
+
+    yield _use
+    time.tzset()
+
+
+class TestLocalTime:
+    """local_time shared timestamp formatter tests (APPL-12, D-34, D-35)."""
+
+    def test_local_time_format_is_the_one_shared_format(self) -> None:
+        """The web filter and the CLI table read one format constant (D-35)."""
+        assert LOCAL_TIME_FORMAT == "%Y-%m-%d %H:%M %Z"
+
+    def test_local_time_renders_the_servers_zone(
+        self, local_zone: Callable[[str], None]
+    ) -> None:
+        """A UTC instant renders in the server's local zone, named (D-34)."""
+        local_zone("America/Chicago")
+        assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC)) == (
+            "2026-09-16 14:03 CDT"
+        )
+
+    def test_local_time_names_utc_when_the_server_is_utc(
+        self, local_zone: Callable[[str], None]
+    ) -> None:
+        """A UTC server still gets the zone named on the line (D-35)."""
+        local_zone("UTC")
+        assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC)) == (
+            "2026-09-16 19:03 UTC"
+        )
+
+    def test_local_time_ignores_the_values_own_zone(
+        self, local_zone: Callable[[str], None]
+    ) -> None:
+        """
+        A value carrying another zone still renders the server's (D-34).
+
+        ``astimezone()`` is called with no argument, so the answer is the
+        process's zone whatever the argument's tzinfo happens to be.
+        """
+        local_zone("America/Chicago")
+        tokyo = timezone(timedelta(hours=9))
+        assert local_time(datetime(2026, 9, 16, 19, 3, tzinfo=tokyo)) == (
+            "2026-09-16 05:03 CDT"
+        )
+
+
+class TestPageCounts:
+    """page_counts sentence tests (APPL-03, D-32)."""
+
+    def test_page_counts_sentence(self) -> None:
+        """The three counts render as one sentence (APPL-03)."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=12,
+            pages_removed=2,
+            pages_uploaded=10,
+        )
+        assert page_counts(job) == "12 pages scanned, 2 blank removed, 10 uploaded"
+
+    def test_page_counts_pluralises_only_the_first_clause(self) -> None:
+        """Only the scanned clause carries a noun, so only it pluralises."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=1,
+            pages_removed=0,
+            pages_uploaded=1,
+        )
+        assert page_counts(job) == "1 page scanned, 0 blank removed, 1 uploaded"
+
+    def test_page_counts_renders_a_measured_zero(self) -> None:
+        """
+        A measured 0 is a measurement and renders as 0 (D-32, Pitfall 4).
+
+        D-32's "never render 0" is about NULL.  A scan where nothing was blank
+        really did remove 0 pages, and saying so is the truth.
+        """
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=0,
+            pages_removed=0,
+            pages_uploaded=0,
+        )
+        assert page_counts(job) == "0 pages scanned, 0 blank removed, 0 uploaded"
+
+    @pytest.mark.parametrize(
+        ("scanned", "removed", "uploaded"),
+        [
+            (None, 2, 10),
+            (12, None, 10),
+            (12, 2, None),
+            (None, None, None),
+        ],
+    )
+    def test_page_counts_is_none_when_any_count_is_null(
+        self, scanned: int | None, removed: int | None, uploaded: int | None
+    ) -> None:
+        """One NULL count means nothing at all is rendered (D-32)."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=scanned,
+            pages_removed=removed,
+            pages_uploaded=uploaded,
+        )
+        assert page_counts(job) is None
+
+    def test_page_counts_is_none_for_an_uncounted_job(self) -> None:
+        """An ERROR or pre-Phase-23 row has no counts, so renders none (D-32)."""
+        job = Job(id="j", profile="default", title="t", state=JobState.ERROR)
+        assert page_counts(job) is None
+
+
+class TestBusyLine:
+    """busy_line in-progress line tests (APPL-08, D-25, D-33)."""
+
+    @pytest.mark.parametrize("state", sorted(BUSY_STATES))
+    def test_busy_line_falls_back_to_progress_label(self, state: JobState) -> None:
+        """With nothing extra known, the busy line is today's prose (D-33)."""
+        assert busy_line(state) == progress_label(state)
+
+    def test_busy_line_names_the_job_ahead(self) -> None:
+        """A queued job is told what it is waiting for (APPL-08, D-25)."""
+        assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=1) == (
+            "Waiting for 'Tax return' to finish (1 ahead of you)"
+        )
+
+    def test_busy_line_counts_more_than_one_ahead(self) -> None:
+        """The count is the number of jobs ahead, not a fixed word (APPL-08)."""
+        assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=2) == (
+            "Waiting for 'Tax return' to finish (2 ahead of you)"
+        )
+
+    def test_busy_line_says_next_in_line_instead_of_zero_ahead(self) -> None:
+        """
+        "(0 ahead of you)" is never rendered (D-25).
+
+        It is technically true and reads like a bug.
+        """
+        assert busy_line(JobState.PENDING, queue_title="Tax return", queue_ahead=0) == (
+            "Waiting for 'Tax return' to finish (next in line)"
+        )
+
+    def test_busy_line_needs_both_halves_of_the_queue_position(self) -> None:
+        """A title with no count is not enough to claim a position (D-25)."""
+        assert busy_line(JobState.PENDING, queue_title="Tax return") == progress_label(
+            JobState.PENDING
+        )
+
+    def test_busy_line_shows_the_front_count(self) -> None:
+        """Pass B names how many fronts are already scanned (D-33, APPL-03)."""
+        assert busy_line(JobState.SCANNING_REVERSE, front_pages=12) == (
+            "Front: 12 pages · " + progress_label(JobState.SCANNING_REVERSE)
+        )
+
+    def test_busy_line_pluralises_the_front_count(self) -> None:
+        """One front page is a page, not pages (D-33)."""
+        assert busy_line(JobState.SCANNING_REVERSE, front_pages=1) == (
+            "Front: 1 page · " + progress_label(JobState.SCANNING_REVERSE)
+        )
+
+    def test_busy_line_omits_an_unknown_front_count(self) -> None:
+        """An unknown front count renders no count at all (D-33)."""
+        assert busy_line(JobState.SCANNING_REVERSE, front_pages=None) == (
+            progress_label(JobState.SCANNING_REVERSE)
+        )
+
+    def test_busy_line_shows_the_front_count_only_on_pass_b(self) -> None:
+        """The front count belongs to SCANNING_REVERSE and no other state."""
+        assert busy_line(JobState.SCANNING, front_pages=12) == progress_label(
+            JobState.SCANNING
+        )
+
+    def test_busy_line_queue_position_wins_over_the_front_count(self) -> None:
+        """The queue line is the first branch, whatever else is known (D-33)."""
+        assert busy_line(
+            JobState.SCANNING_REVERSE,
+            front_pages=12,
+            queue_title="Tax return",
+            queue_ahead=2,
+        ) == ("Waiting for 'Tax return' to finish (2 ahead of you)")
 
 
 class TestWorkerHealth:
@@ -394,6 +812,12 @@ _REJECTION_MESSAGES: list[tuple[RequestRejection, str]] = [
         "Check the server's free disk space and log, then try again.",
     ),
     (
+        RequestRejection.TOKEN_UNSET,
+        "The paperless-ngx API token has not been set, so the scan was not "
+        "started. Put a real API token in the saneless config file, then "
+        "restart saneless.",
+    ),
+    (
         RequestRejection.UNKNOWN_PROFILE,
         "That scan profile does not exist. Reload the page to see the current "
         "profiles.",
@@ -435,6 +859,7 @@ _REJECTION_STATUS_CODES: list[tuple[RequestRejection, int]] = [
     (RequestRejection.QUEUE_FULL, 429),
     (RequestRejection.WORKER_DOWN, 503),
     (RequestRejection.WORKER_DEGRADED, 503),
+    (RequestRejection.TOKEN_UNSET, 503),
     (RequestRejection.UNKNOWN_PROFILE, 422),
     (RequestRejection.TITLE_TOO_LONG, 422),
     (RequestRejection.INVALID_REQUEST, 422),
@@ -449,6 +874,7 @@ _JOB_ROW_TEXTS: list[str] = [
     QUEUE_FULL_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
+    TOKEN_UNSET_JOB_ERROR,
     RESTART_REASON,
 ]
 
@@ -462,6 +888,7 @@ class TestRequestRejection:
             "QUEUE_FULL",
             "WORKER_DOWN",
             "WORKER_DEGRADED",
+            "TOKEN_UNSET",
             "UNKNOWN_PROFILE",
             "TITLE_TOO_LONG",
             "INVALID_REQUEST",
