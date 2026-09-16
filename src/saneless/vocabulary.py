@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
-from typing import Final, Literal, assert_never
+from typing import TYPE_CHECKING, Final, Literal, Protocol, assert_never
 
 from saneless.exceptions import (
     ConfigError,
@@ -21,9 +21,16 @@ from saneless.exceptions import (
     ScanError,
 )
 
+if TYPE_CHECKING:
+    # Annotation-only, so the leaf rule is untouched either way -- ``datetime``
+    # is stdlib and importing it would not make this module depend on a
+    # consumer.
+    from datetime import datetime
+
 __all__ = [
     "ACTIVE_STATES",
     "BUSY_STATES",
+    "LOCAL_TIME_FORMAT",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
     "TERMINAL_STATES",
@@ -37,10 +44,12 @@ __all__ = [
     "ExitCode",
     "FlipOutcome",
     "JobState",
+    "PageCounted",
     "RequestRejection",
     "ScanOutcome",
     "SubmitResult",
     "WorkerHealth",
+    "busy_line",
     "classify_error",
     "connection_status_message",
     "error_advice",
@@ -49,6 +58,8 @@ __all__ = [
     "exit_code_for",
     "flip_answer_label",
     "job_state_for",
+    "local_time",
+    "page_counts",
     "progress_label",
     "rejection_message",
     "rejection_status_code",
@@ -112,6 +123,32 @@ class ErrorAdvice:
 
     message: str
     next_step: str
+
+
+class PageCounted(Protocol):
+    """
+    Anything carrying a job's three page counts.
+
+    It exists so this leaf module can format the counts sentence without
+    importing ``job.py``, which imports from here.  ``Job`` and ``JobResult``
+    satisfy it structurally; neither has to know the protocol exists.
+
+    All three are ``int | None`` because they are NULL on every row that never
+    counted anything -- ERROR, CANCELLED, REJECTED and every row written before
+    the columns existed.
+    """
+
+    @property
+    def pages_scanned(self) -> int | None:
+        """Pages the scanner produced, or None if nothing counted them."""
+
+    @property
+    def pages_removed(self) -> int | None:
+        """Pages discarded as blank, or None if nothing counted them."""
+
+    @property
+    def pages_uploaded(self) -> int | None:
+        """Pages sent to paperless-ngx, or None if nothing counted them."""
 
 
 class ExitCode(IntEnum):
@@ -312,6 +349,19 @@ TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
 # shutdown records.
 RESTART_REASON: Final = "The server restarted before this scan finished"
 
+# How every user-facing timestamp is spelled, on the web page and in the CLI
+# table alike (D-34, D-35).  ``%Z`` is on the format rather than in a column
+# caption so the zone is named on every line and a copy-pasted timestamp is
+# self-describing.  One constant, read by the Jinja filter and by ``cli.py``,
+# is what stops the two surfaces from disagreeing.  Seconds are deliberately
+# absent: they buy nothing a reader wants and they cost the CLI table three
+# columns of title at 80 columns.
+LOCAL_TIME_FORMAT: Final = "%Y-%m-%d %H:%M %Z"
+
+# The separator between the pass-A front count and the progress prose on the
+# manual-duplex busy line (D-33).  U+00B7 MIDDLE DOT with a space either side.
+_BUSY_SEPARATOR: Final = "·"
+
 
 ACTIVE_STATES: frozenset[JobState] = frozenset(
     {
@@ -444,6 +494,120 @@ def progress_label(state: JobState) -> str:
         case _:
             assert_never(state)
     return label
+
+
+def busy_line(
+    state: JobState,
+    *,
+    queue_title: str | None = None,
+    queue_ahead: int | None = None,
+    front_pages: int | None = None,
+) -> str:
+    """
+    Return the one line the status area shows while a job is in flight.
+
+    Three branches in strict precedence (D-33, APPL-08):
+
+    1. The job is queued behind another one, so it is told what it is waiting
+       for and how many jobs are ahead.  This wins outright: a job that has not
+       started has nothing else worth saying.
+    2. The job is on the second manual-duplex pass and the front count is
+       known, so the count leads the progress prose.
+    3. Otherwise the progress prose alone, exactly as before.
+
+    ``(0 ahead of you)`` is never produced.  It is technically true and reads
+    like a bug, so the last job in the queue is told it is ``next in line``
+    (D-25).
+
+    The trailing phrase in branch 2 is ``progress_label(SCANNING_REVERSE)`` --
+    master-pinned copy with its own tests -- and not the history table's
+    ``state_label``, which is a different owner with a different string.  This
+    is a deliberate, recorded deviation from D-33's specimen wording; the
+    count, the separator and the live behaviour are as D-33 specifies.
+
+    ``queue_title`` is the only user data any string here carries.  It is
+    returned as plain text, escaped by Jinja's autoescape at render time, and
+    is never logged from this module.
+
+    Args:
+        state: The state of the job being followed.
+        queue_title: The title of the job ahead, when there is one.
+        queue_ahead: How many jobs are ahead of the followed job.
+        front_pages: Pages counted on the first manual-duplex pass, when that
+            count is known.
+
+    Returns:
+        One line of plain text.
+
+    """
+    if queue_title is not None and queue_ahead is not None:
+        position = "next in line" if queue_ahead == 0 else f"{queue_ahead} ahead of you"
+        return f"Waiting for '{queue_title}' to finish ({position})"
+    label = progress_label(state)
+    if state is JobState.SCANNING_REVERSE and front_pages is not None:
+        noun = "page" if front_pages == 1 else "pages"
+        return f"Front: {front_pages} {noun} {_BUSY_SEPARATOR} {label}"
+    return label
+
+
+def local_time(value: datetime) -> str:
+    """
+    Render a timestamp in the server's local zone, with the zone named.
+
+    The argument must be timezone-aware.  Every timestamp saneless persists is
+    (``JobStore`` writes ``datetime.now(tz=UTC)`` and ``_row_to_job`` parses it
+    back from the isoformat string), so a naive value reaching here is a bug in
+    the caller, not a case to guess at.
+
+    ``astimezone()`` is called with no argument, so the zone is the process's
+    own whatever zone the value carries.  That makes ``TZ`` load-bearing: a
+    container reports UTC unless it is set, which satisfies APPL-12 on paper
+    and helps nobody.  No ``zoneinfo`` import and no new config key is
+    involved -- the operator's ``TZ`` is the single source.
+
+    Args:
+        value: A timezone-aware timestamp.
+
+    Returns:
+        The timestamp as ``2026-09-16 14:03 CDT``.
+
+    """
+    return value.astimezone().strftime(LOCAL_TIME_FORMAT)
+
+
+def page_counts(job: PageCounted) -> str | None:
+    """
+    Return the page-count sentence for a job, or None if it has no counts.
+
+    A NULL count renders nothing at all -- no element, no empty line -- and one
+    NULL is enough to suppress the whole sentence, because a sentence naming
+    two of three counts invites the reader to wonder about the third (D-32).
+    This is the common path, not an edge: four of the six terminal cases have
+    no counts by construction (ERROR, CANCELLED, REJECTED and every row written
+    before the columns existed).
+
+    A measured ``0`` is not a NULL and renders as ``0``.  A scan where nothing
+    was blank really did remove 0 pages.  Consumers must therefore guard on
+    ``is not None`` and never on truthiness, in Python and in Jinja alike
+    (``is not none``), or a real zero disappears.
+
+    Only the first clause carries a noun, so only the first clause pluralises.
+
+    Args:
+        job: Anything carrying the three page counts.
+
+    Returns:
+        ``"12 pages scanned, 2 blank removed, 10 uploaded"``, or None if any
+        of the three counts is NULL.
+
+    """
+    scanned = job.pages_scanned
+    removed = job.pages_removed
+    uploaded = job.pages_uploaded
+    if scanned is None or removed is None or uploaded is None:
+        return None
+    noun = "page" if scanned == 1 else "pages"
+    return f"{scanned} {noun} scanned, {removed} blank removed, {uploaded} uploaded"
 
 
 def flip_answer_label(outcome: FlipOutcome) -> str:
