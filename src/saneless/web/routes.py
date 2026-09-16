@@ -19,10 +19,11 @@ from saneless.checks import (
     CheckKey,
     run_checks,
 )
-from saneless.config import resolve_job_title
+from saneless.config import is_placeholder_token, resolve_job_title
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
+    TOKEN_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ErrorCategory,
@@ -703,8 +704,11 @@ def start_scan(
     ``#status-message`` slot out-of-band, so an error left there by an earlier
     rejected submit disappears (D-03).  A refused submit records a
     REJECTED error row and raises: 429 with ``Retry-After`` when the queue is
-    full, 503 when the worker is down or degraded (ROBU-02, D-05, D-11).  The
-    rendered error reloads Job History only when that row was written.
+    full, 503 when the worker is down or degraded (ROBU-02, D-05, D-11), and
+    503 with its own message when the paperless-ngx API token is a placeholder
+    nobody replaced, which is the one failure certain to waste paper because
+    the pages would be scanned and then have nowhere to go (APPL-07, D-15).
+    The rendered error reloads Job History only when that row was written.
 
     Args:
         request: The incoming HTTP request.
@@ -728,6 +732,33 @@ def start_scan(
     form = _ScanForm(
         profile=profile, title=title, tags=tags, correspondent=correspondent
     )
+
+    # D-15: the route guard is the enforcement and the disabled Scan button is
+    # only a courtesy, so this refusal holds for curl, for a script, and for a
+    # browser whose ``disabled`` attribute was removed in devtools.  It is
+    # unconditional -- a configured consume directory does not buy an exception
+    # -- and it sits ahead of ``create_job`` so a scan that could never upload
+    # leaves exactly one row: the REJECTED one, which Job History shows so the
+    # attempt is visible rather than silently swallowed (Phase 26 D-05).
+    # The degraded-worker rejection is deliberately not reused here, and this
+    # comment names it in prose rather than as the symbol so a grep for that
+    # member still counts only the places that raise it: "the scan service was
+    # unavailable" is untrue when the service is fine and nobody set the token,
+    # and it would send a household member looking for a broken server.  The
+    # status is 503, matching the two existing refuse-to-start rejections, so
+    # htmx response handling and the history reload behave identically; a 4xx
+    # would imply the request was at fault, which it was not.
+    #
+    # This is the web layer's third place that unwraps the configured token,
+    # after the PaperlessClient build in ``web/app.py`` and the Paperless check
+    # in ``checks.py``.  The value goes to the predicate and nowhere else: it is
+    # never logged, rendered, echoed or put in the job row, whose text names the
+    # problem and the file to edit and never the secret (ASVS V7, CFG-05).
+    if is_placeholder_token(state.settings.paperless.token.get_secret_value()):
+        written = _record_refused_submit(
+            state.job_store, form, error=TOKEN_UNSET_JOB_ERROR
+        )
+        raise RequestRejected(RequestRejection.TOKEN_UNSET, job_id=written)
 
     unhealthy = _unhealthy_rejection(state.worker.health)
     if unhealthy is not None:
