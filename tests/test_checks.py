@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
+
+from saneless import checks
 from saneless.checks import (
     PROBE_CONNECT_SECONDS,
     SANED_PORT,
@@ -42,8 +44,6 @@ from saneless.checks import (
     check_state_label,
     worst_state,
 )
-
-from saneless import checks
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
