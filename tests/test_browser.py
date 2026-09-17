@@ -59,7 +59,12 @@ import uvicorn
 from PIL import Image
 from playwright.sync_api import expect
 
-from saneless.checks import CHECKING_MESSAGE, CheckKey
+from saneless.checks import (
+    CHECKING_MESSAGE,
+    POLL_ATTEMPT_CAP,
+    POLL_GAVE_UP_LINE,
+    CheckKey,
+)
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -2993,6 +2998,169 @@ class TestStatusStripInChromium:
         assert refresh is not None
         assert refresh["height"] >= 44, refresh
         assert refresh["x"] + refresh["width"] <= viewport["width"], refresh
+
+
+# How long the strip is watched after it has stopped, in milliseconds. Three of
+# the 2 s intervals the markup names, so a poll that had merely paused would
+# have fired at least once inside it and been caught.
+_POLL_SETTLE_MS = 6000
+
+# The longest the give-up is waited for. The chain is POLL_ATTEMPT_CAP requests
+# two seconds apart, so it ends around 2 * (cap - 1) seconds; the bound is
+# generous enough to survive a slow CI machine and still well inside pytest's
+# own 60 s timeout.
+_POLL_GIVE_UP_MS = 40_000
+
+# The longest a cold start that really fills is given to reach its results. A
+# private server's probe is a stub scanner plus a refused connection to a
+# closed Paperless port, so it is a small multiple of one tick; the bound
+# exists so a hung probe is reported as a timeout rather than as a test that
+# waits out pytest's own 60 s limit.
+_COLD_START_FILL_MS = 30_000
+
+
+def _record_checks_requests(page: Page) -> list[str]:
+    """
+    Start recording every ``GET /api/checks`` the page issues.
+
+    Registered as a page event rather than through ``context.route``: the
+    module's egress gate is the one handler allowed to decide a request's fate,
+    and a second route handler installed here would silently take priority over
+    it. This only watches.
+
+    ``/api/checks/refresh`` is excluded because it shares the path prefix and is
+    never the poll -- it is a click, and counting it would let a test that
+    presses the button look like a test that measured a poll.
+
+    Args:
+        page: The page to watch. Call this before navigating: a handler
+            registered after ``goto`` misses the page's first requests.
+
+    Returns:
+        The list each polled URL is appended to, as the requests arrive.
+
+    """
+    polled: list[str] = []
+
+    def _record(request: Request) -> None:
+        url = request.url
+        if "/api/checks" in url and "/refresh" not in url:
+            polled.append(url)
+
+    page.on("request", _record)
+    return polled
+
+
+@pytest.fixture
+def storing_strip_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app whose refresher is alive and will fill the cache.
+
+    The mirror image of ``cold_strip_server``: the refresher is left running,
+    so the first tick after the page stamps a watcher probes and stores. That
+    makes the strip genuinely cold when the page arrives -- the refresher does
+    nothing until somebody is looking -- and genuinely warm a tick later,
+    without the test touching the cache or the probe path itself.
+
+    It cannot be the session server: that one's cache is warm within a second
+    of the first page load, so a cold start cannot be observed against it.
+    """
+    with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.mark.browser
+class TestColdStartPollIsBounded:
+    """
+    What the cold-start poll really costs a tab nobody closes (IN-07).
+
+    The markup says ``every 2s``, and every assertion in the suite until now
+    read that claim off the attribute. Whether the browser *obeys* it is a
+    different question: htmx fires the ``load`` trigger on content it has just
+    swapped in, and this body swaps in a copy of itself, so a trigger list
+    naming both ``load`` and an interval can run at the round-trip rate rather
+    than at the advertised one. Only a request count says which.
+
+    That count was measured before the cap existed: 254 requests in six
+    seconds, 42 a second, eighty-five times the advertised rate. It is why the
+    fix is two things rather than one -- a server-side attempt cap, and ``load``
+    dropped from every polled body so that the interval in the markup is the
+    interval the browser really uses. A cap counted in attempts is only a cap in
+    time if the interval is honest.
+    """
+
+    def test_an_abandoned_cold_strip_stops_asking(
+        self,
+        page: Page,
+        cold_strip_server: _BrowserServer,
+        record_property: Callable[[str, object], None],
+    ) -> None:
+        """
+        A cache that is never filled runs the poll out of attempts (IN-07).
+
+        ``cold_strip_server`` stops the refresher, which is the appliance whose
+        background thread has died -- the case IN-07 is about, and the one where
+        the poll's original terminating condition can never fire. The count is
+        asserted against the cap now rather than merely recorded, and the
+        stillness afterwards is asserted separately: a poll that had paused
+        rather than stopped would have fired at least three times inside the
+        settle window.
+
+        The three things the give-up state must not lose are checked on the
+        page itself, because "stops asking" would be a bad trade for a strip
+        that had gone blank.
+        """
+        polled = _record_checks_requests(page)
+        page.goto(cold_strip_server.url)
+        expect(page.locator("#checks-body[hx-trigger]")).to_have_count(1)
+
+        # ":not([hx-trigger])" rather than a negated attribute assertion: it is
+        # the attribute's absence that ends the poll, and a locator matching
+        # only the trigger-less body auto-waits for exactly that.
+        expect(page.locator("#checks-body:not([hx-trigger])")).to_have_count(
+            1, timeout=_POLL_GIVE_UP_MS
+        )
+        at_give_up = len(polled)
+        record_property("cold_start_poll_requests", at_give_up)
+        record_property("cold_start_poll_attempt_cap", POLL_ATTEMPT_CAP)
+        assert at_give_up == POLL_ATTEMPT_CAP, polled
+
+        page.wait_for_timeout(_POLL_SETTLE_MS)
+        assert len(polled) == at_give_up, polled[at_give_up:]
+
+        # Still a strip, and still a way forward.
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+        expect(page.locator(".check-refresh")).to_have_count(1)
+        expect(page.locator(".check-meta")).to_have_text(POLL_GAVE_UP_LINE)
+
+    def test_a_cold_start_that_fills_reaches_its_results_unaided(
+        self,
+        page: Page,
+        storing_strip_server: _BrowserServer,
+        record_property: Callable[[str, object], None],
+    ) -> None:
+        """
+        The legitimate cold start ends in results with nobody touching the page.
+
+        This is the property the cap must leave alone, and it is the reason the
+        cap is ten rather than two: the strip has to be allowed to keep asking
+        for as long as a real appliance could plausibly take to answer.
+        Measured before the fix it cost 39 requests, because every swapped-in
+        body re-fired ``load``; after it, the same cold start costs a couple at
+        the honest interval and still settles on its own.
+        """
+        polled = _record_checks_requests(page)
+        page.goto(storing_strip_server.url)
+
+        expect(page.locator("#checks-body:not([hx-trigger])")).to_have_count(
+            1, timeout=_COLD_START_FILL_MS
+        )
+        expect(page.locator("#checks-body")).not_to_contain_text(CHECKING_MESSAGE)
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+        record_property("cold_start_requests_until_results", len(polled))
 
 
 # The counts UI-SPEC S3 pins, for the three cases that behave differently: a

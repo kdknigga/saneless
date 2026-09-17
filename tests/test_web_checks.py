@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from html import unescape
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from saneless import checks as checks_module
 from saneless.checks import (
     CHECKING_MESSAGE,
     CHECKING_STATE_LABEL,
@@ -63,7 +65,7 @@ from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     import threading
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from saneless.checks import CheckContext
     from saneless.web.refresher import CheckRefresher
@@ -77,6 +79,7 @@ PAUSED_PREFIX = "Paused during scan — "
 # match rather than against the whole response, so "the page contains
 # hx-trigger somewhere" can never pass for "the strip polls".
 _CHECKS_BODY = re.compile(r'<div id="checks-body"(?P<attrs>[^>]*)>', re.DOTALL)
+_HX_GET = re.compile(r'hx-get="(?P<url>[^"]+)"')
 _CHECK_ROW = re.compile(r'<li class="check-row">(?P<row>.*?)</li>', re.DOTALL)
 _CHECK_META = re.compile(r'<p class="check-meta">(?P<text>.*?)</p>', re.DOTALL)
 
@@ -443,6 +446,66 @@ def _body_attrs(markup: str) -> str:
     return match.group("attrs")
 
 
+# How far a poll chain is followed before it is called unbounded.  Comfortably
+# past any cap the strip could sanely carry, so a chain that reaches this many
+# links has not been capped, it has been left running.
+_POLL_CHAIN_LIMIT = 60
+
+
+def _poll_target(markup: str) -> str | None:
+    """
+    Return the URL this body's poll would request next, or ``None`` if it has none.
+
+    Reads the rendered attributes rather than the template source, so a poll
+    that a comment describes but the markup does not emit cannot satisfy it.
+
+    Args:
+        markup: A rendered response carrying exactly one ``#checks-body``.
+
+    Returns:
+        The ``hx-get`` URL, unescaped, or ``None`` when no trigger is emitted.
+
+    """
+    attrs = _body_attrs(markup)
+    if "hx-trigger" not in attrs:
+        return None
+    match = _HX_GET.search(attrs)
+    assert match is not None, attrs
+    return unescape(match.group("url"))
+
+
+def _follow_the_poll(client: TestClient, limit: int) -> list[str]:
+    """
+    Walk the cold-start poll from one body to the next, the way a browser does.
+
+    Each response names the URL the next request goes to, so following the
+    chain is the only faithful way to ask "how many times can this strip be
+    made to ask".  Re-requesting the bare route would answer a different
+    question: the route is stateless, so a bare request is always the *first*
+    link of a fresh chain and would look unbounded forever.
+
+    Args:
+        client: The client to request through.
+        limit: The most links to follow before giving up on the chain ending.
+
+    Returns:
+        The URLs requested, in order.  Shorter than ``limit`` only if a
+        response carried no trigger, which is the chain ending on its own.
+
+    """
+    requested: list[str] = []
+    url = "/api/checks"
+    while len(requested) < limit:
+        requested.append(url)
+        response = client.get(url)
+        assert response.status_code == 200, (url, response.status_code)
+        following = _poll_target(response.text)
+        if following is None:
+            break
+        url = following
+    return requested
+
+
 class TestNoProbeInARequest:
     """D-04: rendering reads the cache; only Refresh is allowed to probe."""
 
@@ -531,7 +594,9 @@ class TestColdStart:
         attrs = _body_attrs(client.get("/api/checks").text)
         assert 'aria-busy="true"' in attrs
         assert "every 2s" in attrs
-        assert 'hx-get="/api/checks"' in attrs
+        # The URL carries the attempt number the cap is counted against, so the
+        # spelling here is the whole first link of the chain, not the bare route.
+        assert 'hx-get="/api/checks?attempt=1"' in attrs
 
     def test_a_body_with_results_does_not_poll(self, client: TestClient) -> None:
         """The swapped-in replacement has no trigger, so the poll stops (D-06)."""
@@ -544,6 +609,248 @@ class TestColdStart:
         """A warm page load carries no steady-state poll either (T-30-48)."""
         _warm_the_cache(client)
         assert "hx-trigger" not in _body_attrs(client.get("/").text)
+
+
+class TestColdStartPollChain:
+    """
+    IN-07: how many times a cold strip can be made to ask (the before-state).
+
+    ``TestColdStart`` above asserts that *a* cold body polls and that *a* warm
+    body does not.  Neither says anything about the case IN-07 is about: a
+    cache that is never filled, where the only terminating condition the strip
+    has can never fire.  These follow the chain instead of looking at one link
+    of it, which is what makes "does this ever stop" a question the suite can
+    answer.
+    """
+
+    def test_the_cold_poll_chain_ends_at_the_cap(
+        self, client: TestClient, record_property: Callable[[str, object], None]
+    ) -> None:
+        """
+        Followed link by link, the cold poll runs out of attempts and stops.
+
+        The chain is one longer than the cap because its first link is the bare
+        route -- attempt 0, the body a page render already carries -- and the
+        attempts it then walks are 1 through the cap.  A browser therefore
+        issues exactly ``POLL_ATTEMPT_CAP`` requests; this loop, which starts by
+        asking for the body the page would have been served, issues one more.
+        """
+        followed = _follow_the_poll(client, _POLL_CHAIN_LIMIT)
+        record_property("cold_poll_chain_length", len(followed))
+        record_property("cold_poll_attempt_cap", checks_module.POLL_ATTEMPT_CAP)
+        assert len(followed) == checks_module.POLL_ATTEMPT_CAP + 1, followed
+        assert followed[-1].endswith(f"attempt={checks_module.POLL_ATTEMPT_CAP}")
+
+    def test_results_end_the_poll_chain_at_its_first_link(
+        self, client: TestClient
+    ) -> None:
+        """
+        A cache with results ends the chain immediately, which is D-06 unchanged.
+
+        Stated as a chain rather than as one attribute so that it stays the
+        *primary* terminating condition: whatever else is added, results
+        arriving must still stop the poll on the very next response.
+        """
+        _warm_the_cache(client)
+        assert _follow_the_poll(client, _POLL_CHAIN_LIMIT) == ["/api/checks"]
+
+
+class TestBoundedPoll:
+    """
+    IN-07: the cold-start poll's second ending, and what it leaves behind.
+
+    Until now the poll had exactly one terminating condition -- results landing
+    in the cache -- so an appliance whose refresher thread had died left every
+    open tab asking forever.  Measured in Chromium before this cap existed,
+    "forever" was 42 requests a second, not the one every two seconds the
+    markup claimed: htmx fires ``load`` on content it has just swapped in, and
+    this body swaps in a copy of itself carrying ``load, every 2s``.
+
+    So the fix is two things and both are pinned here.  The server counts the
+    attempts and stops emitting the trigger, and the polling body no longer
+    carries ``load`` -- the interval in the markup is now the interval the
+    browser uses.  Results arriving stays the *primary* ending; the cap is the
+    one that fires when nothing ever arrives.
+    """
+
+    def test_a_poll_below_the_cap_names_the_next_attempt(
+        self, client: TestClient
+    ) -> None:
+        """Each cold body asks for the one after it, so the count can advance."""
+        cap = checks_module.POLL_ATTEMPT_CAP
+        for attempt in (0, 1, cap - 1):
+            attrs = unescape(
+                _body_attrs(client.get(f"/api/checks?attempt={attempt}").text)
+            )
+            assert f"/api/checks?attempt={attempt + 1}" in attrs, (attempt, attrs)
+
+    def test_the_capped_body_carries_no_request_attribute_and_the_first_one_does(
+        self, client: TestClient
+    ) -> None:
+        """
+        At the cap the swap target is inert; at attempt 0 it is not (T-30-27-04).
+
+        Asserted against the attributes the server really rendered rather than
+        against the template source, because a conditional a comment describes
+        and the markup does not honour would satisfy a source grep and leave
+        the loop running.  Both halves live in one test on purpose: an
+        assertion that something is absent is worth nothing without the paired
+        assertion that the same reading finds it when it is present.
+
+        ``hx-`` and not merely ``hx-trigger``: an ``outerHTML`` swap target
+        that carries any unconditional htmx request attribute re-arms itself,
+        which is the trap this file's template comment exists to prevent.
+        """
+        first = _body_attrs(client.get("/api/checks?attempt=0").text)
+        assert "hx-get" in first
+        assert "hx-trigger" in first
+        assert 'aria-busy="true"' in first
+
+        capped = _body_attrs(
+            client.get(f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}").text
+        )
+        assert "hx-" not in capped, capped
+        assert "aria-busy" not in capped, capped
+
+    def test_only_the_first_body_asks_the_browser_to_load_at_once(
+        self, client: TestClient
+    ) -> None:
+        """
+        ``load`` rides only on the body a page first parses, never on a polled one.
+
+        This is the half of the fix the attempt counter alone would not give.
+        htmx re-fires ``load`` for content it has swapped in, so a polled body
+        carrying it requests again the moment it arrives -- measured at 42
+        requests a second against the 0.5 the markup advertises.  With the cap
+        in place that would spend every attempt in a quarter of a second, and
+        the legitimate cold start would be cut off before the refresher's first
+        tick.
+        """
+        first = _body_attrs(client.get("/api/checks?attempt=0").text)
+        assert "load," in first
+        assert "every 2s" in first
+
+        polled = _body_attrs(client.get("/api/checks?attempt=1").text)
+        assert "load" not in polled, polled
+        assert "every 2s" in polled
+
+    def test_the_capped_body_still_shows_the_rows_and_the_button(
+        self, client: TestClient
+    ) -> None:
+        """
+        Giving up is not going blank: the way forward is still on the page.
+
+        A strip that stopped polling and also lost its rows or its button would
+        have turned a dead background thread into a dead page.
+        """
+        markup = client.get(
+            f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+        ).text
+        rows = _CHECK_ROW.findall(markup)
+        assert len(rows) == len(CheckKey)
+        assert all(CHECKING_MESSAGE in row for row in rows)
+        assert 'hx-post="/api/checks/refresh"' in markup
+        assert "Check again" in markup
+
+    def test_the_capped_body_says_the_checks_have_not_run_yet(
+        self, client: TestClient
+    ) -> None:
+        """
+        The meta line becomes the give-up sentence, and it comes from ``checks``.
+
+        Compared against the constant rather than against a quoted string, so
+        the template still owns no vocabulary: a sentence written into the
+        markup instead would fail here even if it read identically.
+        """
+        markup = client.get(
+            f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+        ).text
+        meta = _CHECK_META.search(markup)
+        assert meta is not None, markup
+        assert meta.group("text").strip() == checks_module.POLL_GAVE_UP_LINE
+
+    def test_results_end_the_poll_whatever_the_attempt_claims(
+        self, client: TestClient
+    ) -> None:
+        """
+        A warm cache carries no trigger at any attempt: D-06 is still primary.
+
+        The cap is a second ending, not a replacement for the first one, and a
+        change that made the attempt number decide instead of the cache would
+        pass every other test in this class.
+        """
+        _warm_the_cache(client)
+        for attempt in (0, 3, checks_module.POLL_ATTEMPT_CAP):
+            attrs = _body_attrs(client.get(f"/api/checks?attempt={attempt}").text)
+            assert "hx-trigger" not in attrs, (attempt, attrs)
+            meta = _CHECK_META.search(client.get(f"/api/checks?attempt={attempt}").text)
+            assert meta is not None
+            assert meta.group("text").strip() != checks_module.POLL_GAVE_UP_LINE
+
+    def test_an_attempt_outside_the_bound_is_rejected_before_the_context(
+        self, client: TestClient
+    ) -> None:
+        """
+        A crafted ``attempt`` is a 422 at the route boundary (T-30-27-02).
+
+        The same ``Query`` bound the tag filter's ``max_length`` uses, for the
+        same reason: request input that reaches a render is input that has to
+        be trusted, and this one never does.
+        """
+        cap = checks_module.POLL_ATTEMPT_CAP
+        assert client.get(f"/api/checks?attempt={cap + 1}").status_code == 422
+        assert client.get("/api/checks?attempt=-1").status_code == 422
+        assert client.get("/api/checks?attempt=nine").status_code == 422
+        assert client.get("/api/checks?attempt=1e9").status_code == 422
+
+    def test_the_full_page_starts_the_poll_at_its_first_attempt(
+        self, client: TestClient
+    ) -> None:
+        """A page load begins a fresh chain, not one inherited from anywhere."""
+        attrs = unescape(_body_attrs(client.get("/").text))
+        assert "/api/checks?attempt=1" in attrs
+        assert "load," in attrs
+
+    def test_the_out_of_band_strip_starts_the_poll_at_its_first_attempt(
+        self, client: TestClient
+    ) -> None:
+        """
+        The strip a scan submit carries out of band starts counting from zero too.
+
+        It is newly parsed content, so it is the one other place ``load``
+        belongs, and a scan submit must not hand the browser a chain that is
+        already half spent.
+        """
+        response = client.post(
+            "/api/scan", data={"profile": "default", "title": "Poll start"}
+        )
+        assert response.status_code == 200
+        attrs = unescape(_body_attrs(response.text))
+        assert 'hx-swap-oob="true"' in attrs
+        assert "/api/checks?attempt=1" in attrs
+        assert "load," in attrs
+
+    def test_check_again_after_the_cap_still_probes_and_still_renders(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The button the give-up state points at really is still the way forward.
+
+        Asserted after the capped body has been served, because the cap is
+        server-side arithmetic over a query parameter and a refresh that had
+        been made to inherit it would be a button that did nothing on the one
+        page that needs it.
+        """
+        spy = _spy(monkeypatch)
+        capped = client.get(f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}")
+        assert capped.status_code == 200
+
+        response = client.post("/api/checks/refresh")
+        assert response.status_code == 200
+        assert spy.calls == 1
+        assert len(_CHECK_ROW.findall(response.text)) == len(CheckKey)
+        # Results landed, so the strip is settled rather than polling again.
+        assert "hx-trigger" not in _body_attrs(response.text)
 
 
 class TestRefreshButton:
