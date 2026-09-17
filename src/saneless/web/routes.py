@@ -16,6 +16,8 @@ from saneless.checks import (
     CHECKING_MESSAGE,
     CHECKING_STATE_CLASS,
     CHECKING_STATE_LABEL,
+    POLL_ATTEMPT_CAP,
+    POLL_GAVE_UP_LINE,
     CheckKey,
 )
 from saneless.config import is_placeholder_token, resolve_job_title
@@ -259,7 +261,7 @@ def _freshness_line(cached: CachedChecks, *, scan_active: bool) -> str:
     return f"Last checked {stamp}."
 
 
-def _checks_context(state: State) -> dict[str, object]:
+def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     """
     Build the context ``partials/checks.html`` renders from, without probing.
 
@@ -270,16 +272,30 @@ def _checks_context(state: State) -> dict[str, object]:
     that never arrives.  The background refresher is what fills the cache; this
     only reads what is already there.
 
-    ``checks`` is ``None`` on a cold cache, and that is the single fact the
-    template branches on: no results means the poll trigger is emitted and the
-    placeholder rows are drawn, results means neither.  Nothing else in the
-    strip is conditional.
+    ``checks`` is ``None`` on a cold cache, and that is the primary fact the
+    template branches on: no results means the placeholder rows are drawn,
+    results means the real ones.
+
+    ``poll_attempt`` is the second.  It is the number the *next* request should
+    carry, or ``None`` when there is to be no next request -- either because
+    results have arrived, which is D-06's ending and still the one that matters,
+    or because ``POLL_ATTEMPT_CAP`` attempts have gone by without any, which is
+    the ending IN-07 needed.  The template emits its request attributes only
+    when this is set, so "should the browser ask again" is decided here and
+    never in the markup.
+
+    At the cap the freshness line is replaced rather than augmented: there is no
+    freshness to report, because nothing has ever been checked.
 
     Args:
         state: The application state holding the cache and the worker.
+        attempt: Which attempt produced this render.  Zero for a page render
+            and for the out-of-band strip, both of which start a fresh chain;
+            the browser carries the rest back in the query string.
 
     Returns:
-        ``checks``, ``checking_rows``, ``freshness_line`` and ``scan_active``.
+        ``checks``, ``checking_rows``, ``freshness_line``, ``scan_active`` and
+        ``poll_attempt``.
 
     """
     cached: CachedChecks = state.checks.current()
@@ -287,11 +303,19 @@ def _checks_context(state: State) -> dict[str, object]:
     # the gate would mean acquiring it, and a render is not allowed to contend
     # for the lock a live scan holds.
     scan_active = state.worker.current_job_id is not None
+    gave_up = cached.results is None and attempt >= POLL_ATTEMPT_CAP
     return {
         "checks": cached.results,
         "checking_rows": _CHECKING_ROWS,
-        "freshness_line": _freshness_line(cached, scan_active=scan_active),
+        "freshness_line": (
+            POLL_GAVE_UP_LINE
+            if gave_up
+            else _freshness_line(cached, scan_active=scan_active)
+        ),
         "scan_active": scan_active,
+        "poll_attempt": (
+            None if cached.results is not None or gave_up else attempt + 1
+        ),
     }
 
 
@@ -1219,7 +1243,10 @@ def followed_job_status(request: Request, job_id: str) -> Response:
 
 
 @router.get("/api/checks")
-def get_checks(request: Request) -> Response:
+def get_checks(
+    request: Request,
+    attempt: Annotated[int, Query(ge=0, le=POLL_ATTEMPT_CAP)] = 0,
+) -> Response:
     """
     Render the status strip from the cache.
 
@@ -1228,13 +1255,32 @@ def get_checks(request: Request) -> Response:
     the cache's TTL (D-04, T-30-26).  The poll ends itself -- the body this
     returns once results exist carries no ``hx-trigger``, so the swap that
     installs it is the last one.
+
+    ``attempt`` is how the poll ends when results never arrive (IN-07).  Each
+    body names the number the next request should carry, so the count lives in
+    the URL rather than on the server: the strip is one shared cache read and
+    there is nothing per-tab to keep, and a browser that goes away takes its
+    count with it.  It is bounded at the route by ``Query``, the same idiom the
+    tag filter's ``max_length`` uses, so a crafted value is a 422 and never
+    reaches the context.  The value is never rendered into the visible body --
+    only into the next request's URL.
+
+    Args:
+        request: The incoming request.
+        attempt: Which attempt this is, counted from the zero a page render
+            starts at.  At ``POLL_ATTEMPT_CAP`` the response carries no request
+            attribute at all and the strip stops asking.
+
+    Returns:
+        The strip body, for an ``outerHTML`` swap.
+
     """
     state = request.app.state
     state.refresher.note_watcher()
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",
-        _checks_context(state),
+        _checks_context(state, attempt=attempt),
     )
 
 
