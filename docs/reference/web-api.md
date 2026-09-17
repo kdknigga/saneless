@@ -146,6 +146,8 @@ During a scan, the checks that would touch the scanner are skipped -- an explici
 
 Simultaneous refreshes are collapsed into one. A request that arrives while a refresh is already under way -- another click, or the background refresh the page keeps warm -- re-renders the strip as it currently stands instead of running every check a second time. The answer the in-flight refresh is about to produce is the same answer, seconds away, and repeating the work would mean a second request to paperless-ngx and a second pair of write tests for the sake of it.
 
+There is also a floor under how often this can probe at all: a refresh is honoured at most once every couple of seconds. A request arriving sooner re-renders the current strip without probing -- the same status code and the same partial as an honoured one, because an early click is not an error and there is nothing to report about it. So holding the button down, or scripting the endpoint in a loop, cannot generate additional scanner or paperless-ngx traffic beyond that rate, and cannot delay a scan by contending for the scanner. Waiting the couple of seconds out restores the full bypass: the button still ignores the cache's own, much longer freshness window, which is the whole reason it exists.
+
 If the check registry itself fails, the previous results stay on the page rather than blanking, and the failure is logged.
 
 ---
