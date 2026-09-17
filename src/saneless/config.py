@@ -36,7 +36,7 @@ from pydantic_settings import (
 from pydantic_settings.exceptions import SettingsError
 
 from saneless.exceptions import ConfigError
-from saneless.vocabulary import TITLE_MAX_LENGTH, local_time
+from saneless.vocabulary import TITLE_MAX_LENGTH, ProfileStorage, local_time
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -62,6 +62,7 @@ __all__ = [
     "is_placeholder_token",
     "load_settings",
     "log_config_sources",
+    "profile_storage_for_loaded",
     "resolve_job_title",
     "validate_settings_dirs",
     "warn_on_legacy_duplex_sources",
@@ -237,7 +238,10 @@ class ScannerConfig(BaseModel):
 # obvious hand-written ones.  Compared exactly, never as substrings (D-14).
 PLACEHOLDER_TOKENS: Final[frozenset[str]] = frozenset(
     {
-        # Shipped today at docker-compose.yml:30 and docs/reference/docker.md:178.
+        # Kept for the upgrade path, not because this tree ships it: an
+        # operator whose compose file predates the commented-out token line
+        # still has this value in their environment, and the appliance has to
+        # recognise it the first time they start the new image.
         "changeme",
         "change-me",
         "change_me",
@@ -664,6 +668,45 @@ class Settings(BaseSettings):
             msg = "A 'default' profile must be defined in config"
             raise ValueError(msg)
         return v
+
+
+def profile_storage_for_loaded(settings: Settings) -> ProfileStorage:
+    """
+    Say where the profiles live when no write to the config file was attempted.
+
+    This is the one derivation of that fact, and it exists because D-02
+    requires ``saneless doctor`` and the web status strip to report the *same*
+    Profiles row for the same appliance.  CR-01 was this rule written twice
+    with only one copy correct: ``doctor`` said ``[ OK ] Profiles`` while the
+    strip printed a permanent amber "Generated in memory -- no configuration
+    file is in use", for one machine, at the same moment.  Two callers, one
+    function, and a third copy has nowhere to hide.
+
+    Settings that carry a ``config_path`` were loaded from that file, so the
+    profiles in hand are in it and survive a restart; settings without one came
+    from defaults and the environment, and there is nothing to have saved them
+    to.
+
+    It deliberately cannot report ``IN_MEMORY_UNWRITABLE``.  That member is
+    what the *worker* records when its one startup attempt to persist generated
+    profiles was refused -- an outcome only an attempted write can produce.  A
+    caller that has attempted no write has no such outcome to report and must
+    not invent one by probing: Phase 27 D-09's motivating failure is EBUSY on a
+    single-file bind mount, where the directory is writable, ``os.access`` says
+    yes, and only the rename fails, so no probe short of the write itself can
+    see it.
+
+    Args:
+        settings: The settings in hand, loaded and unwritten.
+
+    Returns:
+        ``PERSISTED`` when a config file was loaded, otherwise
+        ``IN_MEMORY_NO_CONFIG_FILE``.
+
+    """
+    if settings.config_path is not None:
+        return ProfileStorage.PERSISTED
+    return ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
 
 
 def warn_on_legacy_duplex_sources(settings: Settings) -> None:
