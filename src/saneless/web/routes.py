@@ -1276,10 +1276,25 @@ def refresh_checks(request: Request) -> Response:
     A registry that raised is logged by the probe and stores nothing, leaving
     the previous entry in place -- and a strip that blanked would be worse than
     one still showing what was true a moment ago.
+
+    The bypass has a floor under it.  This is the one handler permitted to
+    probe and it is unauthenticated by design on a LAN -- ``CrossOriginGuard``
+    allows a request carrying neither ``Sec-Fetch-Site`` nor ``Origin``, which
+    is what a non-browser client sends -- so without a minimum interval a loop
+    turns one click into unbounded Paperless requests, saned dials and
+    filesystem writes.  Single flight does not cover it: that collapses
+    *concurrent* callers, and a serial loop is not concurrent.  The cost is
+    not only traffic; ``ScanWorker._scan_job`` blocks on a scanner gate that is
+    not a fair lock, so an unbounded loop can park a submitted job whose row
+    already reads ``SCANNING`` (WR-05).  A too-soon click re-renders the
+    current strip instead of erroring, because the click is not wrong, only
+    early: there is nothing to tell the person at the appliance, and the
+    response is the same partial from the same cache read either way.
     """
     state = request.app.state
     state.refresher.note_watcher()
-    state.refresher.probe_now()
+    if state.checks.claim_manual_refresh():
+        state.refresher.probe_now()
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",
