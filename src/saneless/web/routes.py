@@ -998,16 +998,29 @@ def start_scan(
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
     title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
-    # D-29.  Hiding a control changes the form, never the scan: with
-    # ``[web] show_tags`` or ``show_correspondent`` off, the submit carries
-    # nothing for that field and the profile's own default is what applies,
-    # exactly as a blank title already falls back to the profile's title on the
-    # line above.  It is a fallback and not an override -- a submit that names
-    # tags or a correspondent keeps them -- so an operator who turns a control
-    # off gets the profile's answer rather than none at all, and the CLI, which
-    # has always applied these defaults, stops being the odd one out.
-    tags = tags or found.default_tags
-    if correspondent is None:
+    # D-29, as WR-06 corrected it.  Hiding a control changes the form, never
+    # the scan: with ``[web] show_tags`` or ``show_correspondent`` off, the
+    # submit carries nothing for that field and the profile's own default is
+    # what applies, exactly as a blank title already falls back to the
+    # profile's title on the line above.  An operator who turns a control off
+    # gets the profile's answer rather than none at all, and the CLI, which has
+    # always applied these defaults, stops being the odd one out.
+    #
+    # The gate is the config key and never the submitted value, because the
+    # submitted value cannot carry the distinction this needs: an empty tag
+    # list and an absent correspondent arrive here identically whether the
+    # control was never rendered or was rendered and the user cleared it.  Only
+    # the setting that decided which page was served knows which happened.
+    # Reading the value instead took away an ability the appliance had -- the
+    # web path applied no profile defaults at all before this phase, so
+    # ``tags or found.default_tags`` silently re-tagged a submit from somebody
+    # who had deliberately unticked every box.  With the control on the page
+    # the submit is now the whole answer, cleared list included; with it off
+    # the submit's value for that field is meaningless, which is why the
+    # assignment inside each gate is unconditional rather than a fallback.
+    if not state.settings.web.show_tags:
+        tags = found.default_tags
+    if not state.settings.web.show_correspondent:
         correspondent = found.default_correspondent
     form = _ScanForm(
         profile=profile, title=title, tags=tags, correspondent=correspondent
