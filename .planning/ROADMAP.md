@@ -556,7 +556,7 @@ Plans:
   4. Every user-facing error shows a plain-language message and a suggested next step, with the raw technical detail inside a collapsed disclosure
   5. Two browser contexts show the owner the Continue/Abort flip prompt (with confirmation on Abort) and the non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels with descriptions, feeder-first on sheet-fed scanners, and say so on the strip when the config mount is read-only
 
-**Plans**: 27 plans (19 shipped, 8 gap-closure from `30-REVIEW.md`)
+**Plans**: 30 plans (19 shipped, 8 gap-closure round 1, 3 gap-closure round 2 from `30-REVIEW.md` 2026-09-17)
 
 Plans:
 **Wave 1**
@@ -638,6 +638,17 @@ Plans:
 **Gap wave 4** *(blocked on gap wave 3)*
 
 - [x] 30-27-PLAN.md — IN-07: the cold-start status poll gives up instead of polling forever
+
+**Gap closure round 2** *(from `30-REVIEW.md` dated 2026-09-17: 1 critical, 3 warning, 5 info — finding ids are disambiguated `R2-*` because this round reuses the previous round's ids for different defects)*
+
+**Gap wave 5**
+
+- [ ] 30-28-PLAN.md — R2-CR-01/R2-WR-01/R2-IN-01: the saned probe tries every resolved address under one deadline; the parser refuses IPv6 literals and never dials a number
+- [ ] 30-29-PLAN.md — R2-WR-03/R2-IN-04: a collapsed Check again click still delivers its answer and keeps its claim; the poll's error path is measured, not fixed
+
+**Gap wave 6** *(blocked on gap wave 5)*
+
+- [ ] 30-30-PLAN.md — R2-WR-02/R2-IN-03: gate contention gets its own row; the pre-probe leaves the scanner gate
 
 **UI hint**: yes
 
