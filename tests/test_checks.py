@@ -365,6 +365,83 @@ class TestSanedHostParsing:
         """A stray or doubled colon contributes no host to probe."""
         assert _saned_hosts(" : host-a : ") == (("host-a", SANED_PORT),)
 
+    def test_a_bare_ipv6_literal_produces_no_entries_to_probe(self) -> None:
+        """
+        ``fe80::1`` is refused rather than read as a host and a port.
+
+        An IPv6 literal is exactly the input where "colon-separated list of
+        hosts" and "one address" are indistinguishable.  Before the refusal
+        this parsed to ``(("fe80", 1),)`` -- host ``fe80`` on port 1 -- so
+        every dial failed and, through the pre-probe's short circuit, a
+        perfectly healthy appliance went red (WR-01 feeding CR-02).
+        """
+        assert _saned_hosts("fe80::1") == ()
+
+    def test_a_bracketed_ipv6_literal_produces_no_entries_to_probe(self) -> None:
+        """
+        ``[fe80::1]:6566`` is refused rather than read as three host names.
+
+        Before the refusal this parsed to ``(("[fe80", 6566), ("1]", 6566),
+        ("6566", 6566))`` -- three names no resolver can answer, and three
+        connect budgets spent to learn nothing.
+        """
+        assert _saned_hosts("[fe80::1]:6566") == ()
+
+    def test_the_ipv6_loopback_produces_no_entries_to_probe(self) -> None:
+        """
+        ``::1`` is refused rather than read as the host name ``1``.
+
+        Before the refusal this parsed to ``(("1", 6566),)``.
+        """
+        assert _saned_hosts("::1") == ()
+
+    def test_a_dotted_name_is_still_one_host_on_the_default_port(self) -> None:
+        """The refusal does not touch the unambiguous single-entry reading."""
+        assert _saned_hosts("scanner.local") == (("scanner.local", SANED_PORT),)
+
+    def test_a_dotted_name_with_a_trailing_port_is_still_one_entry(self) -> None:
+        """The refusal does not touch the unambiguous ``host:port`` reading."""
+        assert _saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
+
+    def test_two_short_names_are_still_two_hosts(self) -> None:
+        """``a:b`` keeps the documented two-host reading."""
+        assert _saned_hosts("a:b") == (("a", SANED_PORT), ("b", SANED_PORT))
+
+    def test_three_plausible_segments_are_still_three_hosts(self) -> None:
+        """Every segment of ``a:b:c`` is a plausible host name, so all are kept."""
+        assert _saned_hosts("a:b:c") == (
+            ("a", SANED_PORT),
+            ("b", SANED_PORT),
+            ("c", SANED_PORT),
+        )
+
+    def test_an_ipv4_literal_with_a_trailing_port_is_one_entry(self) -> None:
+        """
+        Dots and digits are a plausible host name, so IPv4 literals survive.
+
+        The refusal is aimed at the colon, not at address literals in general.
+        """
+        assert _saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
+
+    def test_two_ipv4_literals_are_two_hosts(self) -> None:
+        """Two IPv4 literals read as sane-net's two-host list, unchanged."""
+        assert _saned_hosts("192.0.2.10:192.0.2.11") == (
+            ("192.0.2.10", SANED_PORT),
+            ("192.0.2.11", SANED_PORT),
+        )
+
+    def test_a_dotted_name_with_an_out_of_range_port_is_two_hosts(self) -> None:
+        """
+        The ``OverflowError`` guard is not weakened by the refusal.
+
+        ``99999`` is not a port a socket could reach, so both segments are read
+        as host names, exactly as they were before.
+        """
+        assert _saned_hosts("scanner.local:99999") == (
+            ("scanner.local", SANED_PORT),
+            ("99999", SANED_PORT),
+        )
+
 
 class TestSanedReachable:
     """The only bounded reachability probe in the tree."""
