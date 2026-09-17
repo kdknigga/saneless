@@ -203,3 +203,146 @@ def test_concurrent_stores_leave_a_consistent_entry() -> None:
     assert entry.results in (first, second)
     assert entry.checked_at is not None
     assert entry.stale is False
+
+
+class TestClaimManualRefresh:
+    """WR-05: a floor under the Refresh button's deliberate TTL bypass."""
+
+    def test_the_first_claim_on_a_cold_appliance_is_granted(self) -> None:
+        """The first click after a boot must work, or the floor is a wall."""
+        cache = CheckCache(clock=_FakeClock())
+        assert cache.claim_manual_refresh() is True
+
+    def test_a_second_claim_at_the_same_instant_is_refused(self) -> None:
+        """Two clicks the clock cannot tell apart are one honoured probe."""
+        cache = CheckCache(clock=_FakeClock())
+        assert cache.claim_manual_refresh() is True
+        assert cache.claim_manual_refresh() is False
+
+    def test_a_claim_after_the_interval_is_granted_again(self) -> None:
+        """The floor is a rate, not a one-shot: waiting it out re-opens it."""
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh() is True
+        clock.advance(3.0)
+        assert cache.claim_manual_refresh() is True
+
+    def test_the_default_interval_is_two_seconds(self) -> None:
+        """2.0 s is below a human's click rate and above a loop's (WR-05)."""
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh() is True
+        clock.advance(1.9)
+        assert cache.claim_manual_refresh() is False
+        clock.advance(0.2)
+        assert cache.claim_manual_refresh() is True
+
+    def test_the_interval_is_a_call_time_parameter(self) -> None:
+        """A caller may shorten it; the boundary follows the value given."""
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh(min_interval=0.5) is True
+        clock.advance(0.4)
+        assert cache.claim_manual_refresh(min_interval=0.5) is False
+        clock.advance(0.2)
+        assert cache.claim_manual_refresh(min_interval=0.5) is True
+
+    def test_a_refused_claim_does_not_move_the_stamp_forward(self) -> None:
+        """
+        A loop cannot starve a legitimate click by resetting the interval.
+
+        If a refusal stamped, a caller hammering the endpoint every half
+        second would hold the floor shut for ever and the household member at
+        the appliance would never get their probe.  The stamp moves on a grant
+        and only on a grant.
+        """
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh() is True
+        for _ in range(3):
+            clock.advance(0.5)
+            assert cache.claim_manual_refresh() is False
+        clock.advance(0.6)
+        assert cache.claim_manual_refresh() is True
+
+    def test_a_store_does_not_grant_a_claim(self) -> None:
+        """The floor is not the TTL: filling the cache does not re-open it."""
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh() is True
+        cache.store(_results())
+        assert cache.claim_manual_refresh() is False
+
+    def test_a_granted_claim_stores_nothing(self) -> None:
+        """A claim is permission to probe, never a record of results."""
+        cache = CheckCache(clock=_FakeClock())
+        assert cache.claim_manual_refresh() is True
+        entry = cache.current()
+        assert entry.results is None
+        assert entry.checked_at is None
+        assert cache.is_fresh() is False
+
+    def test_an_expired_ttl_does_not_grant_a_claim(self) -> None:
+        """
+        The two intervals are independent, and deliberately so.
+
+        Conflating them would make a refused click reset the freshness of
+        results it never produced, and would tie a 2 s floor to a 30 s TTL for
+        no reason beyond them both being durations.
+        """
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(ttl=1.0, clock=clock)
+        cache.store(_results())
+        assert cache.claim_manual_refresh() is True
+        clock.advance(1.5)
+        assert cache.is_fresh() is False
+        assert cache.claim_manual_refresh() is False
+
+    def test_a_reentrant_second_caller_is_refused(self) -> None:
+        """
+        Two overlapping claims grant one probe, pinned without thread timing.
+
+        The clock double claims once from inside the first claim's own clock
+        read, so the overlap is a fact of the call stack rather than of
+        scheduling luck -- the idiom plan 30-25 used for the probe lock.  It
+        also pins that the clock is read *outside* the lock: a claim that read
+        it inside would deadlock here rather than fail.
+        """
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        inner: list[bool] = []
+        entered = False
+
+        def reentrant_clock() -> float:
+            nonlocal entered
+            if not entered:
+                entered = True
+                inner.append(cache.claim_manual_refresh())
+            return clock.now
+
+        cache._clock = reentrant_clock
+        outer = cache.claim_manual_refresh()
+        assert inner == [True]
+        assert outer is False
+
+    def test_concurrent_claims_grant_exactly_one(self) -> None:
+        """Two request threads arriving together are one honoured probe."""
+        cache = CheckCache(clock=_FakeClock(start=100.0))
+        barrier = threading.Barrier(2, timeout=_BARRIER_TIMEOUT_SECONDS)
+        granted: list[bool] = []
+        granted_lock = threading.Lock()
+
+        def claim() -> None:
+            barrier.wait()
+            outcome = cache.claim_manual_refresh()
+            with granted_lock:
+                granted.append(outcome)
+
+        threads = [threading.Thread(target=claim) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=_BARRIER_TIMEOUT_SECONDS)
+            assert not thread.is_alive()
+
+        assert sorted(granted) == [False, True]
