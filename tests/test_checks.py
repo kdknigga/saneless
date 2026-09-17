@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import socket
+import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -2020,3 +2021,344 @@ class TestRunChecks:
         for row in healthy:
             if row.state is CheckState.OK:
                 assert row.next_step == "", row.key
+
+
+class _RecordingLock:
+    """A stand-in for the worker's scanner gate that counts every attempt on it."""
+
+    def __init__(self) -> None:
+        """Wrap a real lock, with nothing recorded yet."""
+        self.lock = threading.Lock()
+        self.acquires = 0
+        self.releases = 0
+
+    def acquire(self, *, blocking: bool = True) -> bool:
+        """
+        Take the underlying lock and record the attempt.
+
+        Keyword-only because the one permitted move on a scanner gate is
+        ``acquire(blocking=False)``; a positional call is not a move this
+        stand-in needs to model.
+
+        Args:
+            blocking: Whether to wait for the lock.
+
+        Returns:
+            Whether the lock was taken.
+
+        """
+        self.acquires += 1
+        return self.lock.acquire(blocking=blocking)
+
+    def release(self) -> None:
+        """Hand the underlying lock back and record it."""
+        self.releases += 1
+        self.lock.release()
+
+    def is_free(self) -> bool:
+        """
+        Say whether the lock is free right now, without recording the peek.
+
+        Returns:
+            True when nothing holds the lock at this instant.
+
+        """
+        if self.lock.acquire(blocking=False):
+            self.lock.release()
+            return True
+        return False
+
+
+class _GateProbe:
+    """Records, from inside each check, whether the scanner gate was free."""
+
+    def __init__(self, gate: _RecordingLock) -> None:
+        """
+        Sample ``gate`` whenever a check asks it to.
+
+        Args:
+            gate: The gate whose state is being sampled.
+
+        """
+        self.gate = gate
+        self.free_during: dict[str, bool] = {}
+
+    def sample(self, where: str) -> None:
+        """
+        Record whether the gate is free while ``where`` is executing.
+
+        Args:
+            where: The name of the check taking the sample.
+
+        """
+        self.free_during[where] = self.gate.is_free()
+
+
+class _GateSamplingBackend(StubScannerBackend):
+    """A backend that samples the scanner gate from inside its own enumeration."""
+
+    def __init__(self, probe: _GateProbe, devices: list[DeviceInfo]) -> None:
+        """
+        Report ``devices``, sampling the gate on the way.
+
+        Args:
+            probe: The recorder the sample goes to.
+            devices: What ``get_devices`` should return.
+
+        """
+        self.probe = probe
+        self.devices = devices
+        self.calls = 0
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Sample the gate, then report the configured devices.
+
+        Returns:
+            The devices this stub was built with.
+
+        """
+        self.calls += 1
+        self.probe.sample("scanner")
+        return self.devices
+
+
+def _gate_sampling_context(
+    tmp_path: Path, probe: _GateProbe, monkeypatch: pytest.MonkeyPatch
+) -> tuple[CheckContext, PaperlessClient, _GateSamplingBackend]:
+    """
+    Build a healthy context whose slow checks all sample the scanner gate.
+
+    Args:
+        tmp_path: The test's own directory.
+        probe: The recorder every sample goes to.
+        monkeypatch: Used to make the directory writes sample the gate.
+
+    Returns:
+        The context, the Paperless client the caller must close, and the
+        backend, so a test can assert how often SANE was entered.
+
+    """
+    consume_dir = tmp_path / "consume"
+    consume_dir.mkdir(exist_ok=True)
+
+    def sampling_write(_path: Path) -> bool:
+        probe.sample("directories")
+        return True
+
+    monkeypatch.setattr(checks, "_directory_accepts_a_write", sampling_write)
+
+    def sampling_response(request: httpx.Request) -> httpx.Response:
+        probe.sample("paperless")
+        return _ok_response(request)
+
+    client = _paperless(_RequestCounter(sampling_response))
+    backend = _GateSamplingBackend(probe, [_device()])
+    context = _context(
+        _settings(tmp_path, consume_dir=str(consume_dir)),
+        scanner=backend,
+        paperless=client,
+    )
+    return context, client, backend
+
+
+class TestRunChecksUnderTheScannerGate:
+    """WR-03: the gate is held around the scanner check and around nothing else."""
+
+    def test_an_ungated_run_still_produces_every_row(self, tmp_path: Path) -> None:
+        """
+        ``doctor`` passes no gate, and nothing about its run changes.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        results = run_checks(
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()]))
+        )
+        assert [result.key for result in results] == list(CheckKey)
+        assert _row(results, CheckKey.SCANNER).skipped is False
+
+    def test_a_gated_run_returns_what_an_ungated_run_returns(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Handing in a free gate changes the rows not at all.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        ungated = run_checks(
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()]))
+        )
+        gated = run_checks(
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()])),
+            scanner_gate=cast("threading.Lock", _RecordingLock()),
+        )
+        assert [result.key for result in gated] == list(CheckKey)
+        assert gated == ungated
+
+    def test_the_gate_is_held_while_the_scanner_check_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Entering libsane is exactly what the gate exists to make exclusive.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to make the directory writes sample the gate.
+
+        """
+        gate = _RecordingLock()
+        probe = _GateProbe(gate)
+        context, client, _backend = _gate_sampling_context(tmp_path, probe, monkeypatch)
+        try:
+            run_checks(context, scanner_gate=cast("threading.Lock", gate))
+        finally:
+            client.close()
+        assert probe.free_during["scanner"] is False
+
+    def test_the_gate_is_free_while_the_paperless_check_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        WR-03: a multi-second HTTP budget must not park a scan start.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to make the directory writes sample the gate.
+
+        """
+        gate = _RecordingLock()
+        probe = _GateProbe(gate)
+        context, client, _backend = _gate_sampling_context(tmp_path, probe, monkeypatch)
+        try:
+            run_checks(context, scanner_gate=cast("threading.Lock", gate))
+        finally:
+            client.close()
+        assert probe.free_during["paperless"] is True
+
+    def test_the_gate_is_free_while_the_directory_writes_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Creating and deleting two real files touches no scanner.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to make the directory writes sample the gate.
+
+        """
+        gate = _RecordingLock()
+        probe = _GateProbe(gate)
+        context, client, _backend = _gate_sampling_context(tmp_path, probe, monkeypatch)
+        try:
+            run_checks(context, scanner_gate=cast("threading.Lock", gate))
+        finally:
+            client.close()
+        assert probe.free_during["directories"] is True
+
+    def test_the_gate_is_free_once_the_run_returns(self, tmp_path: Path) -> None:
+        """
+        Every acquire is matched by a release before the tuple comes back.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        run_checks(
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()])),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        assert gate.acquires == 1
+        assert gate.releases == 1
+        assert gate.is_free() is True
+
+    def test_a_raising_scanner_check_still_releases_the_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A wedged check must never leave the worker locked out of its scanner.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to break the scanner check on purpose.
+
+        """
+
+        def boom(_context: CheckContext) -> CheckResult:
+            msg = "the scanner check exploded"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(checks, "_check_scanner", boom)
+        gate = _RecordingLock()
+        results = run_checks(
+            _context(_settings(tmp_path)),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        assert _row(results, CheckKey.SCANNER).state is CheckState.FAIL
+        assert gate.releases == 1
+        assert gate.is_free() is True
+
+    def test_a_gate_held_elsewhere_skips_the_scanner_without_entering_sane(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A failed non-blocking attempt is a skipped row, never a second caller.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        backend = _CountingBackend([_device()])
+        assert gate.lock.acquire(blocking=False) is True
+        try:
+            results = run_checks(
+                _context(_settings(tmp_path), scanner=backend),
+                scanner_gate=cast("threading.Lock", gate),
+            )
+        finally:
+            gate.lock.release()
+        assert _row(results, CheckKey.SCANNER).skipped is True
+        assert backend.calls == 0
+        assert gate.releases == 0
+
+    def test_skip_scanner_never_touches_the_gate(self, tmp_path: Path) -> None:
+        """
+        A caller that already knows a scan is running has no reason to probe.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        backend = _CountingBackend([_device()])
+        results = run_checks(
+            _context(_settings(tmp_path), scanner=backend, skip_scanner=True),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        assert _row(results, CheckKey.SCANNER).skipped is True
+        assert backend.calls == 0
+        assert gate.acquires == 0
+
+    def test_a_gated_run_keeps_member_order(self, tmp_path: Path) -> None:
+        """
+        The gate does not reorder or drop a row, whether taken or not.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        assert gate.lock.acquire(blocking=False) is True
+        try:
+            results = run_checks(
+                _context(_settings(tmp_path)),
+                scanner_gate=cast("threading.Lock", gate),
+            )
+        finally:
+            gate.lock.release()
+        assert [result.key for result in results] == list(CheckKey)
