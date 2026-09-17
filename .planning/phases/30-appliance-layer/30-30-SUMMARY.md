@@ -198,3 +198,10 @@ Both tasks followed RED → GREEN, and the gate sequence is visible in `git log`
 | REFACTOR | none needed | the GREEN commit is the refactor |
 
 Each RED commit was verified to fail for the intended reason before the implementation was written, and the failure text is recorded under Task Commits above.
+
+## Self-Check: PASSED
+
+- Files claimed modified — all present: `src/saneless/checks.py`, `src/saneless/worker.py`, `tests/test_checks.py`, `tests/test_refresher.py`, `docs/reference/web-api.md`, and this summary.
+- Commits claimed — all four present in `git log` on the worktree branch: `d0aa0b7`, `5f1a214`, `8d3984e`, `75ba56b`, plus `c59fb1c` for this file.
+- `git status --short` clean; nothing uncommitted and nothing untracked.
+- Shared orchestrator artifacts untouched: no change to `.planning/STATE.md`, `.planning/ROADMAP.md` or `.planning/REQUIREMENTS.md`.
