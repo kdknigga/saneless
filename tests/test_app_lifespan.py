@@ -596,12 +596,16 @@ def test_the_refreshers_scan_fact_is_the_workers_own_job_id(
 
     """
     app = _build_app(settings)
-    worker = app.state.worker
-    scan_active = app.state.refresher._scan_active
-    assert worker.current_job_id is None
-    assert scan_active() is False
-    worker._current_job_id = "job-1"
-    assert scan_active() is True
+    with TestClient(app):
+        worker = app.state.worker
+        scan_active = app.state.refresher._scan_active
+        assert worker.current_job_id is None
+        assert scan_active() is False
+        worker._current_job_id = "job-1"
+        try:
+            assert scan_active() is True
+        finally:
+            worker._current_job_id = None
 
 
 def test_startup_runs_no_check_probe(
