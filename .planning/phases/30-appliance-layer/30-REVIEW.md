@@ -2,465 +2,525 @@
 phase: 30-appliance-layer
 reviewed: 2026-09-17T00:00:00Z
 depth: deep
-files_reviewed: 24
+round: 3
+diff_base: d3f20a6c70fac1ff324589352ff0663806af85c3
+files_reviewed: 12
 files_reviewed_list:
   - docs/reference/web-api.md
   - src/saneless/checks.py
-  - src/saneless/cli.py
-  - src/saneless/config.py
-  - src/saneless/pipeline.py
-  - src/saneless/vocabulary.py
-  - src/saneless/web/app.py
   - src/saneless/web/checks_cache.py
   - src/saneless/web/refresher.py
   - src/saneless/web/routes.py
   - src/saneless/web/templates/partials/checks.html
   - src/saneless/worker.py
-  - tests/test_app_lifespan.py
   - tests/test_browser.py
   - tests/test_checks_cache.py
   - tests/test_checks.py
-  - tests/test_config.py
-  - tests/test_doctor.py
-  - tests/test_pipeline.py
   - tests/test_refresher.py
-  - tests/test_vocabulary.py
   - tests/test_web_checks.py
-  - tests/test_web.py
-  - pyproject.toml
 findings:
-  critical: 1
-  warning: 3
-  info: 5
-  total: 9
+  critical: 2
+  warning: 4
+  info: 6
+  total: 12
 status: issues_found
 ---
 
-# Phase 30 gap closure: Code Review Report
+# Phase 30 (round 3): Code Review Report
 
 **Reviewed:** 2026-09-17
-**Depth:** deep (cross-file: import graph, call chains, lock-ordering, template/route contract)
-**Diff base:** `3199941..HEAD` (plans 30-20 .. 30-27)
+**Depth:** deep (cross-file: `checks.py` → `refresher.py` → `routes.py` → template → `errors.py` → vendored htmx)
+**Files Reviewed:** 12
 **Status:** issues_found
 
 ## Summary
 
-Thirteen of the sixteen prior findings are genuinely closed, with real tests behind
-each one rather than a claim in a SUMMARY. The three that are not fully closed
-(CR-02, WR-01, WR-04) are closed *in the direction* the prior review asked for and
-leave a narrower residual in each case, and one of them (WR-04) is contradicted by a
-sentence the same round added to `docs/reference/web-api.md`.
+The eight round-2 findings are, with two exceptions, genuinely closed. The
+deadline walk in `_saned_reachable` holds its bound (verified by construction
+and by the scripted-clock test), the empty-resolver path cannot raise, the
+gate-boundary split releases on every path including the exception path, a
+preflight that settles the row takes the gate zero times, `probe_now`'s
+"did I get the lock" contract is read correctly by its one caller, and the
+manual-refresh floor cannot be defeated by the new `release_manual_claim`
+(the first grant after an honoured probe is still ≥ `MIN_MANUAL_REFRESH_SECONDS`
+away, because a release can only follow a grant that itself required the
+interval to have elapsed). `POLL_ATTEMPT_CAP` is enforced at the route via
+`Query(ge=0, le=POLL_ATTEMPT_CAP)`, and a crafted `attempt` is a 422 before
+`_checks_context` sees it. `_scanner_busy`'s `CheckState.OK` cannot break an
+exit code: `doctor` never passes a gate, so that row is unreachable from the
+CLI, and `/health` does not consult the registry at all.
 
-The concurrency work is the strongest part of the round and the review could not break
-it. Lock ordering is acyclic: `_probe_lock` → `scanner_gate` (non-blocking) →
-`cache._lock`, with the cache lock never held across a probe and `_tick`'s
-`is_fresh()` releasing before `_probe_and_store` takes the probe lock. The worker takes
-only `scanner_gate` and never `_probe_lock`, so no deadlock is constructible. Every
-acquire of `scanner_gate` outside the worker is `blocking=False` with a `finally`
-release. `claim_manual_refresh`'s read-then-rebind is correct under interleaving,
-including the stale-clock case (a thread whose `now` predates the stored stamp is
-refused and, importantly, does not stamp — so a refusal can never move the floor
-backwards). The shutdown arithmetic is correct: `max(0.0, deadline - monotonic())`
-cannot go negative, `stop(timeout=0.0)` uses `is None` rather than falsiness so a
-spent budget is a poll and not `join(None)`, and the leave-resources-open branch is
-untouched. The htmx poll cannot self-re-arm: `load` rides only on `poll_attempt == 1`,
-which is only ever produced by an `attempt=0` request, and every polled body carries
-`every 2s` alone. A refused refresh is byte-identical to a served one (same handler,
-same partial, same 200).
+Two things do not hold.
 
-`junit_family = "legacy"` is genuinely inert: no workflow in `.github/workflows/` and
-no script passes `--junitxml`, and a manual `pytest --junitxml=…` run over
-`tests/test_checks_cache.py` completes with no warning and no error. It changes the
-XML schema only, and masks nothing — `filterwarnings = ["error"]` is untouched.
+The host parser has an **uncaught `ValueError`**: `_saned_hosts("host:²")`
+raises, because `str.isdigit()` is true for Unicode digit characters that
+`int()` refuses. It escapes the preflight into `run_checks`' generic handler,
+so a single malformed `scanner.host` (or `SANE_NET_HOSTS`) value makes the
+Scanner row a permanent red "This check could not be completed." and
+`saneless doctor` exit 2. This is the same defect *class* as R2-IN-01 — a
+non-`OSError` escaping the probe into the generic red row — reintroduced two
+lines away from where R2-IN-01 was fixed. Reproduced end to end.
 
-Toolchain is clean on the tree as it stands: `ruff check` (no issues), `ruff format
---check` (63 files formatted), `ty check` (all checks passed), `pyrefly check src
-tests` (0 errors), and 2896 non-browser tests pass. There are zero `# noqa`,
-`# type: ignore` or rule-disabling suppressions anywhere in the diff.
+And **R2-IN-04's closure is invalid**. The new browser tests conclude "there is
+no defect" by fabricating the failure response client-side with
+`route.fulfill()`. Every error this application actually sends to an htmx
+request goes through `render_error`, which sets `HX-Retarget: #status-message`
+and `HX-Reswap: innerHTML`. htmx 2.0.8 applies `HX-Retarget` *before* the swap,
+so the error partial lands in the scan-status slot and `#checks-body` — with
+its `every 2s` trigger — is never replaced. The poll therefore does not end,
+which is exactly what R2-IN-04 said, and `docs/reference/web-api.md` now
+asserts the opposite in shipped prose. Verified against the real app and
+against the vendored htmx source.
 
-What the review did find is one new functional regression introduced by the WR-02 fix
-— the saned pre-probe now dials only the *first* resolved address, which is enshrined
-in a test — plus two residuals that the round's own documentation overclaims about.
-
----
-
-## Prior Findings Verification
-
-| ID | Verdict | Evidence |
-|----|---------|----------|
-| CR-01 | **CLOSED** | `config.py:673` `profile_storage_for_loaded` is now the single derivation; called from `worker.py:911` (generation skipped), `worker.py:917` (SANE failure) and `cli.py:1154`. Six worker tests pin it (`tests/test_worker.py:5921-6060`), including a test that renders the row from the worker's value and compares it with `doctor`'s. |
-| CR-02 | **CLOSED-WITH-CONCERN** | The false **red** row and `doctor` exit 2 are gone: a refused pre-probe now returns the amber `_scanner_host_unanswered()` (`checks.py:744`, used at `checks.py:853`). The env-var divergence is closed by `_saned_host_setting` (`checks.py:469`, used at `checks.py:850`). **Concern:** the prior review asked for the probe to stop *replacing* `get_devices()`'s answer; it still does. A machine with a working USB scanner and a stale `scanner.host` never enumerates and reports amber "the scanner could not be checked". This is a recorded, reasoned trade (see the docstring at `checks.py:744-770`), not an oversight — logged below as IN-02. |
-| WR-01 | **CLOSED-WITH-CONCERN** | `::`-bearing and bracketed literals are now refused (`checks.py:587-591`, `_looks_like_a_host_name` at `checks.py:499`); verified `_saned_hosts("fe80::1") == ()` and `_saned_hosts("[fe80::1]:6566") == ()`. **Concern:** a *fully expanded* IPv6 literal has no blank segment and only hex-safe characters, so it is not refused — see WR-01 below. |
-| WR-02 | **CLOSED-WITH-CONCERN** | The unbounded-DNS and per-address multiplication are both now stated honestly (`checks.py:80-92`, `checks.py:616-633`) and the multiplication is removed in code (`checks.py:657-662`). **Concern:** the removal was done by dialling only `getaddrinfo(...)[0]`, which is a new correctness regression — see CR-01 below. |
-| WR-03 | **CLOSED** | `run_checks(context, *, scanner_gate=None)` (`checks.py:1186`) holds the gate for `_check_scanner` alone via `_scanner_result` (`checks.py:1154-1183`, release in `finally`). Both call sites pass it rather than wrapping (`refresher.py:274`; the route's own copy of the block is deleted). `tests/test_refresher.py:363` asserts the gate is free during `run_checks`. Minor residual logged as IN-03. |
-| WR-04 | **CLOSED-WITH-CONCERN** | `skip_scanner` now comes from the worker's job id (`refresher.py:273`, wired at `app.py:162`), the same fact `_checks_context` renders (`routes.py:305`), and two checkers can no longer contend at all (`_probe_lock`, `refresher.py:270`). **Concern:** gate contention is still *rendered* as "a scan is running" (`checks.py:1178-1179` returns `_scanner_skipped()`), and the worker's startup capability read holds the gate with no job in flight (`worker.py:947`) — see WR-02 below. `docs/reference/web-api.md:147` now asserts this cannot happen. |
-| WR-05 | **CLOSED** | `MIN_MANUAL_REFRESH_SECONDS = 2.0` and `claim_manual_refresh` (`checks_cache.py:198-243`), gating the probe at `routes.py:1342`. A refusal re-renders the same partial with the same status. Eleven cache tests (`tests/test_checks_cache.py:214-272`) plus route tests. Documented at `docs/reference/web-api.md:151`. Interaction defect logged as WR-03 below. |
-| WR-06 | **CLOSED** | The fallback is now gated on the config key, never the submitted value (`routes.py:1073-1076`). Covered from both directions in `tests/test_web.py:2323-2592` (control on + cleared list → `[]`; control off → profile default). |
-| WR-07 | **CLOSED** | One shared deadline (`app.py:196-201`), `stop(timeout=…)` with `max(0.0, …)` clamping and an `is None` default (`refresher.py:173, 198-199`), and both docstrings corrected (`app.py:170-177`, `refresher.py:154-165`). Four budget tests at `tests/test_app_lifespan.py:505-543` including the overspent case. |
-| IN-01 | **CLOSED** | `_tag_list_context` returns the normal key set emptied when `show_tags` is off (`routes.py:401-407`) — key-for-key identical to the normal return, so no template name goes undefined — and the correspondents fetch is gated at `routes.py:789-793`. |
-| IN-02 | **CLOSED** | `routes.py:874` now logs `type(exc).__name__`; `grep` finds no remaining `%s`-with-exception-object in the module. |
-| IN-03 | **CLOSED** | `%r` at `pipeline.py:440`, `pipeline.py:1572`, `pipeline.py:2118-2119` and `pipeline.py:2216`; `grep -n "'%s'" src/saneless/pipeline.py` returns nothing. |
-| IN-04 | **CLOSED** | Resolved the second way the prior review permitted: the property docstring now states the discipline explicitly (`worker.py:771-782`) and a pointer sits at the attribute (`worker.py:409-412`). |
-| IN-05 | **CLOSED** | `config.py:241-244` no longer cites deleted lines and states the upgrade-path justification instead. |
-| IN-06 | **CLOSED** | `vocabulary.py:632` `.rstrip()`, with the trailing-only reasoning in the docstring; `tests/test_vocabulary.py` covers the empty-`%Z` host. |
-| IN-07 | **CLOSED** | `POLL_ATTEMPT_CAP = 10` (`checks.py:144`), `poll_attempt` computed server-side (`routes.py:306-318`), bounded at the route (`routes.py:1248`), emitted only inside the conditional and with `load` only on the first link (`partials/checks.html:53-58`). A Chromium test asserts exactly `POLL_ATTEMPT_CAP` requests and then stillness (`tests/test_browser.py:3096-3136`). Narrow residual logged as IN-04. |
+Beyond those: the "no all-digit segment is ever dialled" defence is incomplete
+(glibc's short dotted, hex and octal IPv4 forms all contain a `.` and so pass
+the guard — `0.0` and `0x0.0` still resolve to `0.0.0.0`), the refresher thread
+has no per-tick exception backstop where `ScanWorker` does, and
+`CheckResult.skipped` is dead data that two docstrings claim is rendered.
 
 ---
 
 ## Critical Issues
 
-### CR-01: The saned probe dials only the first resolved address, so a name that resolves IPv6-first is reported "not answering" while it serves fine over IPv4
+### R3-CR-01: `_saned_hosts` raises `ValueError` on a Unicode-digit port, making the Scanner row permanently red
 
-**File:** `src/saneless/checks.py:657-663`
+**File:** `src/saneless/checks.py:671-680` (the `len(present) == 2` port branch)
 
-**Issue:** WR-02's fix replaced `socket.create_connection((host, port), timeout=…)`
-with a single resolve-and-dial:
+**Issue:** The port branch gates `int(maybe_port)` on `maybe_port.isdigit()`.
+`str.isdigit()` is `True` for Unicode category `No` characters — `²` (U+00B2),
+`①` (U+2460) and friends — for which `int()` raises `ValueError`.
+`_saned_hosts` catches nothing, `_scanner_preflight` catches nothing, and the
+probe's `except OSError` is not reached (the raise happens before any socket
+call). The exception escapes into `run_checks`' generic per-check handler.
+
+Reproduced on this tree:
+
+```
+$ SANE_NET_HOSTS='scanbox:²' python -c '...run_checks(ctx)...'
+Check SCANNER raised ValueError
+SCANNER FAIL | This check could not be completed. | Restart saneless, then press Check again.
+```
+
+Consequences, all of them the ones this module's own docstrings promise cannot
+happen:
+
+- The Scanner row is red **permanently** — nothing about restarting changes the
+  setting, so the next step printed can never help.
+- `worst_state` is `FAIL`, so `saneless doctor` exits `ExitCode.CONFIG` (2) and
+  a scripted health gate goes red on an appliance that scans fine.
+- `_saned_hosts`' own docstring: "An operator who typed an IPv6 literal loses
+  the pre-probe's latency saving and **never gets a wrong verdict**, which is
+  the trade the whole module is built on." That trade is broken here.
+- It is reachable from the environment, not only the config file:
+  `_saned_host_setting` prefers `SANE_NET_HOSTS`.
+
+Note also `'٦٥٦٦'` (Arabic-Indic digits) is accepted and yields port 6566 — no
+crash, but the probe then dials a port libsane's C-side parsing would never
+derive from that string, which is the precise divergence
+`_saned_host_setting` exists to prevent.
+
+**Fix:** restrict the digit test to ASCII decimal. `digits` is already imported
+from `string` in this module:
 
 ```python
-family, socket_type, protocol, _canonical_name, address = socket.getaddrinfo(
-    host, port, type=socket.SOCK_STREAM
-)[0]
-with socket.socket(family, socket_type, protocol) as probe:
-    probe.settimeout(timeout)
-    probe.connect(address)
-    return True
+    if len(present) == 2:
+        host, maybe_port = present
+        # `str.isdigit()` is True for Unicode digits `int()` refuses (`²`,
+        # `①`), and True for non-ASCII decimals libsane's C-side parsing
+        # would read as a name.  ASCII decimal only, therefore.
+        if (
+            _looks_like_a_host_name(host)
+            and maybe_port
+            and set(maybe_port) <= frozenset(digits)
+            and 0 < int(maybe_port) <= 65535
+        ):
+            return ((host, int(maybe_port)),)
 ```
 
-`create_connection` tries *every* resolved address and succeeds if any one connects.
-This tries exactly one and calls the host dead if that one fails. `socket.getaddrinfo`
-is called with `flags=0`, so `AI_ADDRCONFIG` is **not** set and glibc returns AAAA
-records even on a host with no IPv6 route — and RFC 6724 puts the IPv6 address first.
-Measured on this machine:
+`_looks_like_a_host_name`'s own `segment.isdigit()` needs no change — it only
+ever *rejects*, and the charset check behind it already excludes non-ASCII — but
+a test case pinning `_saned_hosts("host:²") == ()` and one pinning
+`_saned_hosts("host:٦٥٦٦") == (("host", 6566),) is False` belong with it.
+
+---
+
+### R3-CR-02: the poll does **not** end on a failed request — R2-IN-04 is closed against a response the app never sends
+
+**Files:**
+`tests/test_browser.py:3167-3300` (`TestPollEndsOnAnErrorResponse`,
+`_fail_the_checks_poll`),
+`docs/reference/web-api.md:136`,
+`src/saneless/web/templates/partials/checks.html:1-13`,
+`src/saneless/web/errors.py:176-190` (`render_error`)
+
+**Issue:** The new browser class asserts, and its docstring states outright,
+that "Nothing in the source changes for this finding, and nothing should: there
+is no defect", on the strength of `base.html`'s
+`{"code":"[45]..","swap":true,"error":true}` rule. The measurement does not
+exercise the application's error path. `_fail_the_checks_poll` answers the poll
+with `route.fulfill(status=..., content_type="text/html", body=_CHECKS_ERROR_BODY)`
+— a bare body with **no response headers**.
+
+Every error this app returns to an htmx request is built by `render_error`,
+which unconditionally sets, for `HX-Request: true`:
 
 ```
-localhost -> [(AF_INET6, …, ('::1', 6566, 0, 0)), (AF_INET, …, ('127.0.0.1', 6566))]
+HX-Retarget: #status-message
+HX-Reswap: innerHTML
 ```
 
-So for any `scanner.host` that is a *name* with both record types — `scanner.local` via
-Avahi (link-local AAAA first, which cannot even be dialled without a scope id), a LAN
-DNS name, `localhost` for a co-located saned, or any container whose v6 path to the
-scanner is unrouted — the probe fails on address one, `any(...)` yields `False`, and
-`_check_scanner` returns `_scanner_host_unanswered()` **without ever calling
-`get_devices()`**. The appliance's primary check is then permanently amber, saying the
-host is not answering, on a deployment where it answers and scans.
+Confirmed against the real app (`GET /api/checks?attempt=99`, the 422 the
+route's own `Query(le=POLL_ATTEMPT_CAP)` bound produces):
 
-This is strictly a regression: the pre-gap-closure code would have fallen through to
-`127.0.0.1` and connected. The documented deployments in `docs/` all use IPv4 literals
-(one address, no impact), which is what limits the blast radius — but nothing in the
-config validation or the docs requires a literal, and a hostname is the natural thing
-to type.
-
-The behaviour is also pinned by a test, so it will not be caught later:
-`tests/test_checks.py:608-661` feeds an IPv6 address followed by two working IPv4
-addresses and asserts `recorder.events.count("connect") == 1`.
-
-The docstring's justification — "the answer for a host that is switched off is the
-same on every address it has" (`checks.py:620-623`) — is true for a host that is off
-and false for exactly the case that matters here: a host that is on, reachable on one
-family and not the other.
-
-**Fix:** keep WR-02's real bound (total ≤ `timeout` for one host) while restoring
-multi-address behaviour, by sharing one deadline across the addresses instead of
-discarding them:
-
-```python
-try:
-    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-except OSError as exc:
-    logger.debug("saned probe failed: %s", type(exc).__name__)
-    return False
-deadline = time.monotonic() + timeout
-for family, socket_type, protocol, _canonical_name, address in infos:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        return False
-    try:
-        with socket.socket(family, socket_type, protocol) as probe:
-            probe.settimeout(remaining)
-            probe.connect(address)
-    except OSError as exc:
-        logger.debug("saned probe failed: %s", type(exc).__name__)
-        continue
-    else:
-        return True
-return False
+```
+422 {'hx-retarget': '#status-message', 'hx-reswap': 'innerHTML', ...}
 ```
 
-The WR-02 property is preserved and testable as stated ("three addresses cost one
-*budget*"), so `tests/test_checks.py:608-661` should be rewritten to assert elapsed
-budget rather than attempt count, plus a new case: first address refuses, second
-connects, result is `True`.
+And confirmed in the vendored `static/vendor/htmx-2.0.8.min.js`: `HX-Retarget`
+rewrites `responseInfo.target` **before** `shouldSwap` is acted on, and only
+`status === 286` cancels polling. So on any 4xx/5xx from `/api/checks`:
+
+1. the error partial is swapped into `#status-message` (innerHTML);
+2. `#checks-body` is **not** replaced, keeps `hx-trigger="every 2s"`, and keeps
+   polling for as long as the tab is open — the unbounded poll IN-07 and
+   R2-IN-04 are both about, and the one thing `POLL_ATTEMPT_CAP` cannot bound
+   because the attempt counter only advances through bodies the server swaps in;
+3. every 2 s the failing poll overwrites `#status-message`, which is the scan
+   status slot the strip routes are explicitly documented to leave alone (D-03).
+   A scan in progress has its progress line replaced by "The request was not
+   valid. Reload the page, then try again." twice a minute.
+
+The shipped documentation now states the false half as fact:
+
+> "A poll whose request fails also ends, and for a simpler reason: the failure
+> response replaces the strip, and the replacement carries no poll, so there is
+> nothing left to fire."
+
+Two passing browser tests plus a doc sentence that both point away from a live
+defect are worse than the open finding was, because the next round is told to
+read a number instead of re-running the argument.
+
+**Fix (pick one, then re-point the tests at the real response):**
+
+- Make the poll self-limiting on the client, so it does not depend on the swap
+  target at all — on the conditional block in `checks.html`:
+  ```html
+  hx-on::response-error="this.removeAttribute('hx-trigger')"
+  hx-on::send-error="this.removeAttribute('hx-trigger')"
+  ```
+- or exempt this route from the retarget, so the failure genuinely does replace
+  the strip: have `get_checks` catch its own failure and return the strip
+  partial with `poll_attempt=None` (a 200 carrying the last-known-good rows and
+  no trigger), which also keeps the `Check again` button on the page;
+- or suppress `HX-Retarget`/`HX-Reswap` for requests whose target is
+  `#checks-body`.
+
+For the test: drive the failure from the **server** (e.g. monkeypatch
+`_checks_context` to raise, or request a tampered `attempt`) so the response
+carries the headers the application really sends, and assert on
+`#checks-body`'s survival and the request count over the window. `route.fulfill`
+with hand-written bodies must not stand in for the app's own error rendering
+anywhere in this class.
 
 ---
 
 ## Warnings
 
-### WR-01: A fully expanded IPv6 literal still fans out into junk hosts, and digit-only segments resolve to arbitrary IPv4 addresses
+### R3-WR-01: the all-digit guard is a partial defence — `0.0`, `0x0.0`, `127.1` all pass it and all reach loopback
 
-**File:** `src/saneless/checks.py:587-596`
+**File:** `src/saneless/checks.py:503-547` (`_looks_like_a_host_name`),
+`src/saneless/checks.py:681-683` (the filtered return)
 
-**Issue:** the refusal fires only when a blank segment sits in the interior or a
-segment contains a character `_looks_like_a_host_name` rejects. A fully expanded IPv6
-literal has neither. Verified against the shipped function:
+**Issue:** `_looks_like_a_host_name` rejects a segment only when
+`segment.isdigit()`. The hazard it was written for is glibc's non-dotted-quad
+numeric parsing, and that parsing accepts far more than all-digit strings.
+Measured on this machine:
 
-```
-'fe80::1'               -> ()                      # refused, correct
-'[fe80::1]:6566'        -> ()                      # refused, correct
-'2001:db8:0:0:0:0:0:1'  -> (('2001', 6566), ('db8', 6566), ('0', 6566), … 8 entries)
-'host-a:99999'          -> (('host-a', 6566), ('99999', 6566))
-```
+| segment | `_looks_like_a_host_name` | `getaddrinfo(..., 6566)` |
+|---|---|---|
+| `0.0` | True | `0.0.0.0` |
+| `0x0.0` | True | `0.0.0.0` |
+| `0x7f.1` | True | `127.0.0.1` |
+| `127.1` | True | `127.0.0.1` |
+| `6566.0` | True | NXDOMAIN (one unbounded lookup) |
 
-The second row matters more than it looks, because those "host names" are all digits
-and glibc's resolver accepts the single-integer form of an IPv4 address:
+So the sentence the docstring builds its case on — "on Linux a `connect()` to
+`0.0.0.0` reaches loopback, so a `0` in the dial list lets the probe report the
+configured scanner host 'reachable' off any unrelated local process listening on
+6566 (R2-WR-01, T-30-28-01)" — is still true of the shipped parser; only the
+spelling changed. And the parser can still *invent* such a segment from a
+mistyped port rather than requiring the operator to type an address:
+`_saned_hosts("host:0.0")` returns `(("host", 6566), ("0.0", 6566))`, so a
+stray `.` in a port dials `0.0.0.0`.
 
-```
-getaddrinfo('2001', 6566) -> 0.0.7.209:6566
-getaddrinfo('99999', 6566) -> 0.1.134.159:6566
-getaddrinfo('0', 6566)     -> 0.0.0.0:6566     # connect(0.0.0.0) reaches localhost
-```
+Impact is the loss of the amber row rather than a false green: a spurious
+"reachable" makes `any(...)` true, suppresses `_scanner_host_unanswered`, and
+falls through to `get_devices()` — i.e. it reinstates the ~127 s uninterruptible
+hang the pre-probe exists to avoid, on an appliance whose configured host is in
+fact dead.
 
-So an operator who types an expanded IPv6 address makes the appliance open TCP
-connections to `0.0.7.209` and friends — addresses nobody configured — and, through
-CR-01's short circuit, never enumerates the scanner. The `0.0.0.0` entry is worse in a
-different direction: on Linux `connect()` to `0.0.0.0` reaches loopback, so the probe
-can report "reachable" because something unrelated listens on port 6566 locally.
-
-The `host-a:99999` case also falsifies the docstring's own safety claim
-(`checks.py:550-556`): "passed to `getaddrinfo` it is truncated modulo 65536 …
-a real probe of an address nobody configured. Reading such a segment as a host name
-avoids both." It does not avoid it — it dials `0.1.134.159:6566` instead of
-`host-a:34463`. Both are addresses nobody configured.
-
-**Fix:** two small additions, both stdlib.
-
-1. Refuse anything the stdlib recognises as an IPv6 address, before splitting:
+**Fix:** require a segment to be either a real IPv4 literal or to contain at
+least one ASCII letter, which is what separates a name from every numeric form
+glibc accepts:
 
 ```python
-import ipaddress
-
-stripped = host_setting.strip()
-with suppress(ValueError):
-    if ipaddress.ip_address(stripped.strip("[]").partition("%")[0]).version == 6:
-        return ()
-```
-
-2. Make `_looks_like_a_host_name` reject all-digit segments (no legal hostname is
-   all digits, and every all-digit segment here is either a mis-parsed port or half an
-   IPv6 literal):
-
-```python
-if segment.isdigit():
+def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
+    """True for the short dotted, hex and octal forms glibc reads as IPv4."""
+    if any(character in ascii_letters for character in segment):
+        return "x" in segment or "X" in segment  # 0x7f.1 and friends
+    try:
+        ipaddress.IPv4Address(segment)
+    except ValueError:
+        return True   # digits and dots that are not a legal literal: 0.0, 127.1
     return False
 ```
 
-Then `host-a:99999` yields `(("host-a", SANED_PORT),)` and the `99999` segment is
-dropped rather than dialled; update `tests/test_checks.py:371-383` accordingly, and add
-`_saned_hosts("2001:db8:0:0:0:0:0:1") == ()`.
+and reject in `_looks_like_a_host_name` when it answers True. The safe
+direction is unchanged: a false "no" costs only the pre-probe's latency saving.
 
----
+### R3-WR-02: `CheckRefresher._run` has no per-tick exception backstop, so one raise kills the thread for the life of the process
 
-### WR-02: Gate contention is still rendered as "a scan is running", and the worker's own startup capability read is a contender with no job in flight
+**File:** `src/saneless/web/refresher.py:207-218`, `src/saneless/web/refresher.py:313-326`
 
-**File:** `src/saneless/checks.py:1178-1179`, `src/saneless/worker.py:947`, `docs/reference/web-api.md:147`
-
-**Issue:** WR-04's fix corrected where `skip_scanner` comes from, and single-flighted
-the two web checkers so they cannot contend. It did not change what a *failed gate
-acquire* renders as:
+**Issue:** The loop is
 
 ```python
-if not scanner_gate.acquire(blocking=False):
-    return _scanner_skipped()
+while not self._stopping.wait(TICK_SECONDS):
+    self._tick()
 ```
 
-and `_scanner_skipped()` is the row whose message is literally
-`"Not checked while a scan is running."` (`checks.py:809`). So the question is only
-whether anything other than a scan can hold that gate. It can:
-`ScanWorker._read_generated_profiles` takes `with self._scanner_gate:` around
-`get_devices()` **and** `get_capabilities()` (`worker.py:947`) as the worker thread's
-first act at startup, while `_current_job_id` is still `None` (it is set at
-`worker.py:1394`, inside `_process_job`).
+with no `try`. `ScanWorker._run` (`worker.py:1076-1101`) wraps each iteration
+in `try/except Exception` precisely so "nothing ends the loop but stopping
+(ROBU-01)", and `CheckRefresher`'s own class docstring claims it "follows
+`ScanWorker` in every structural respect D-07 names" — it does not follow this
+one.
 
-That window is not hypothetical — it is the *most* likely contention window in the
-product, because it coincides exactly with the cold-start poll:
-
-1. Lifespan starts the worker, then the refresher (`app.py:290-295`).
-2. A browser on the appliance loads the page; the cold cache emits the poll.
-3. `note_watcher` stamps, the refresher's next tick probes, `_check_scanner` tries the
-   gate, the startup capability read owns it (a real scanner's `get_devices` +
-   `get_capabilities` is seconds; an unreachable net host is up to ~127 s).
-4. `_scanner_skipped()` is stored. The strip renders "Not checked while a scan is
-   running." with `scan_active=False`, i.e. beside `Last checked 14:02.` — the exact
-   self-contradicting body WR-04 described, on an appliance that has never scanned.
-
-The same round also added a sentence to `docs/reference/web-api.md:147` claiming this
-is impossible: "the decision is taken from the job the scan worker reports it is
-running, not from whether some other health check happened to be busy at the same
-moment, so it cannot show up beside a last-checked time on an idle appliance." It can,
-by the path above — and, by the refresher's own admitted residual
-(`refresher.py:253-258`), also for up to one TTL after any scan ends. Two independent
-falsifications of one user-facing guarantee.
-
-The existing regression test does not catch it because it stubs `run_checks` and
-asserts only the flag: `tests/test_refresher.py:340-359` checks
-`spy.calls[0].skip_scanner is False` and never renders the row the real registry would
-have produced under a held gate.
-
-**Fix:** stop overloading one row with two facts. `_scanner_result` knows it lost a
-race; only `context.skip_scanner` knows a scan is running. Give contention its own
-neutral outcome:
+There is a live path to a raise. In `_probe_and_store`, the store is in the
+`else` arm:
 
 ```python
-def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> CheckResult:
-    if not scanner_gate.acquire(blocking=False):
-        # Not _scanner_skipped(): that row names a running scan, and run_checks
-        # has already handled that case above.  Something else holds the gate --
-        # today, the worker's startup capability read -- and the honest report is
-        # that this cycle did not look.
-        return _scanner_busy()
+try:
     ...
+    results = run_checks(...)
+except Exception:
+    logger.exception("Check refresh failed; keeping the previous results")
+else:
+    self._cache.store(results)       # <-- not covered by the except above
+finally:
+    self._probe_lock.release()
 ```
 
-where `_scanner_busy()` is `CheckState.OK, skipped=True` with a message that names no
-scan ("The scanner was busy; not checked this time."). Alternatively, have the probe
-store nothing for the scanner row when it lost the gate and no scan is running, so the
-previous row survives. Either way, correct
-`docs/reference/web-api.md:147` so it does not promise a property the code does not
-have, and extend `tests/test_refresher.py:340` to assert the *rendered row*, not the
-flag.
+Python does not route an exception raised in `else` to that `try`'s handlers, so
+a raise from `store` (or from anything added to that arm later) propagates out
+of `_probe_and_store`, out of `_tick`, and ends `_run`. The consequence is the
+one `POLL_ATTEMPT_CAP`'s own comment names as the motivating case: "an appliance
+whose refresher thread has died". The cache then never updates again, silently,
+for the life of the process, and the strip's only remaining way to get results
+is the `Check again` button.
 
----
+The same raise out of `probe_now()` also 500s `POST /api/checks/refresh` with
+the manual claim spent.
 
-### WR-03: A Check again click that collides with the background probe is swallowed, leaves the strip showing pre-probe results, and burns the 2 s claim
-
-**File:** `src/saneless/web/routes.py:1341-1348`, `src/saneless/web/refresher.py:270-271`
-
-**Issue:**
+**Fix:** both halves.
 
 ```python
-state.refresher.note_watcher()
-if state.checks.claim_manual_refresh():
-    state.refresher.probe_now()
-return state.templates.TemplateResponse(request, "partials/checks.html",
-                                        _checks_context(state))
+    def _run(self) -> None:
+        while not self._stopping.wait(TICK_SECONDS):
+            try:
+                self._tick()
+            except Exception:
+                # The backstop ScanWorker._run has: a surprise must not end the
+                # thread, because a dead refresher is a strip that never
+                # updates again and says nothing about it.
+                logger.exception("Check refresher tick failed; continuing")
 ```
 
-`probe_now` → `_probe_and_store` returns silently when `_probe_lock` is already held
-(`refresher.py:270`). Three consequences compose badly:
-
-1. The claim is **consumed** even though no probe ran — `claim_manual_refresh` stamped
-   before `probe_now` discovered it had nothing to do. The user's next click within
-   2 s is refused.
-2. The response renders `_checks_context(state)` from the cache *as it stands now*,
-   which is the pre-probe entry: the in-flight probe has not called `store()` yet.
-3. Once results exist, `poll_attempt` is `None` (`routes.py:316-318`), so the body
-   carries **no** htmx trigger. Nothing on the page will ever pick up the result the
-   in-flight probe lands a second later. The strip is only refetched by another click,
-   the terminal-state reload, or a page load.
-
-So the appliance's one manual control can visibly do nothing, twice in a row, with no
-indication — and `docs/reference/web-api.md:149` tells the user the opposite: "The
-answer the in-flight refresh is about to produce is the same answer, seconds away."
-It is, but nothing delivers it.
-
-The window is one background probe's duration (the Paperless budget alone is up to
-5 s, `PROBE_READ_SECONDS`) out of every TTL, while somebody is watching — which is
-precisely when the button gets pressed.
-
-**Fix:** let the collapse be visible to the caller and to the page. Make `probe_now`
-report whether it probed, and do not spend the claim on a collapse:
+and move the store inside the guarded region:
 
 ```python
-def probe_now(self) -> bool:
-    """Returns whether this call actually probed."""
-    return self._probe_and_store()   # False when the probe lock was held
+        try:
+            context = replace(self.build_context(), skip_scanner=self._scan_active())
+            self._cache.store(run_checks(context, scanner_gate=self._scanner_gate()))
+        except Exception:
+            logger.exception("Check refresh failed; keeping the previous results")
+        finally:
+            self._probe_lock.release()
 ```
 
-```python
-state.refresher.note_watcher()
-if state.checks.claim_manual_refresh() and not state.refresher.probe_now():
-    # Another checker owns the probe; its store is imminent and this body would
-    # otherwise be the last word.  Give the claim back and let the strip ask once.
-    state.checks.release_manual_claim()
-    return state.templates.TemplateResponse(
-        request, "partials/checks.html", _checks_context(state, attempt=0, poll_once=True)
-    )
+### R3-WR-03: `CheckResult.skipped` is dead data, and two docstrings claim it is what the surfaces render
+
+**File:** `src/saneless/checks.py:908-972` (`_scanner_skipped`, `_scanner_busy`),
+`src/saneless/web/templates/partials/checks.html:50-82`,
+`src/saneless/cli.py:1161-1167`
+
+**Issue:** `grep -rn skipped src/saneless/web/templates src/saneless/cli.py`
+returns nothing. The template's `check_row` macro takes
+`(name, state_class, glyph, state_label, message, next_step)` and `doctor`
+prints `_state_marker(result.state)`. Neither surface reads the flag. So both
+skipped rows render as a **green ✓** with the screen-reader word "OK" in front
+of a sentence that says nothing was checked:
+
+```
+✓  Scanner   The scanner was busy, so it was not checked this time.
+✓  Scanner   Not checked while a scan is running.
 ```
 
-The minimum viable fix is smaller: have the collapsed branch render with a one-shot
-`hx-trigger="load delay:1s"` body so the imminent result reaches the page. Add a route
-test that holds `_probe_lock`, POSTs the refresh, and asserts the response body still
-asks for itself.
+`_scanner_skipped`'s docstring says "The `skipped` flag, **not the state**, is
+what the two surfaces render", and `_scanner_busy`'s says "The `skipped` flag
+discloses that nothing was checked." Both are false. The 30-30 summary records
+the correct fact ("`CheckResult.skipped` is stored but nothing in the templates
+or the CLI branches on it"), so the knowledge exists — it just never reached the
+source, where the next maintainer will read it and rely on it.
+
+This is a correctness problem in its own right, not only a comment problem: a
+neutral cold-start glyph (`CHECKING_GLYPH`, `check-checking`,
+`CHECKING_STATE_LABEL`) already exists for exactly "we did not look", and a
+green tick claiming OK for an unprobed row is the same lie-by-marker the phase
+rejects elsewhere.
+
+**Fix:** either render the flag — pass `c.skipped` into `check_row` and select
+the neutral glyph/class/label when it is set (and print a neutral marker in
+`doctor`) — or delete the field and both claims. Rendering it is the smaller
+change and the one the docstrings already promise; it needs no new colour token,
+because the cold-start trio is already defined and already used by
+`_CheckingRow`.
+
+### R3-WR-04: the 20 s poll window is shorter than the worst-case probe the same module documents, so the give-up line can print over a probe that is still running
+
+**File:** `src/saneless/checks.py:126-157` (`POLL_ATTEMPT_CAP`, `POLL_GAVE_UP_LINE`),
+`src/saneless/web/routes.py:327-340`
+
+**Issue:** The cap's justification is arithmetic: "about two and a half times
+the worst probe budget a cold start can cost -- `PROBE_CONNECT_SECONDS` for
+saned plus `PROBE_READ_SECONDS` for Paperless", i.e. 7 s against a 20 s window.
+Three things this module documents elsewhere make that understate the worst
+case by more than an order of magnitude:
+
+- `getaddrinfo` is outside every budget — `PROBE_CONNECT_SECONDS`' own comment
+  says "an unreachable resolver costs whatever `resolv.conf` says";
+- the pre-probe is per configured host, and `_saned_hosts` puts no cap on the
+  number of entries, so the budget is N × (resolution + 2 s);
+- when there is **no** parseable host — the ordinary local-USB deployment —
+  there is no pre-probe at all and `_scanner_enumeration` calls
+  `get_devices()`, which the same file costs at "roughly 127 s for a silently
+  unreachable host".
+
+So a cold start on a wedged scanner reaches `attempt == POLL_ATTEMPT_CAP` at
+~20 s with `results is None`, prints "The checks have not run yet. Press Check
+again to try now.", and stops asking while the first probe is still legitimately
+in flight. Pressing the button then collapses into that probe, emits a fresh
+chain, and gives up again 20 s later — so the appliance can say "the checks have
+not run yet" indefinitely while they are running. The settling poll
+(`keep_asking = ... or probe_in_flight`) has the same shape: on a probe longer
+than ~20 s the chain expires before the store, which reproduces exactly the
+"Check again visibly does nothing" symptom R2-WR-03 was raised to close.
+
+**Fix:** decide which bound is authoritative and make the other follow. Either
+raise the cap so the window exceeds the probe's real worst case (and correct the
+comment's arithmetic to name `getaddrinfo`, N hosts and `get_devices()`), or
+keep 10 attempts and distinguish the two endings in `_checks_context` — a chain
+that ran out **while `probe_in_flight`** should not print
+`POLL_GAVE_UP_LINE`, because a probe is demonstrably running; give it a sentence
+that says so, or let `probe_in_flight` extend the chain past the cap with its
+own (larger) bound. At minimum the comment must stop asserting a 7 s worst case
+it can compute is wrong.
 
 ---
 
 ## Info
 
-### IN-01: `getaddrinfo(...)[0]` can raise `IndexError`, which the probe's `except OSError` does not catch
+### R3-IN-01: the one test named as the guarantee that `doctor` and the strip agree covers one of four scenarios
 
-**File:** `src/saneless/checks.py:657-659`
-`socket.getaddrinfo` normally raises `gaierror` (an `OSError`) rather than returning an
-empty list, so this is defensive rather than observed — but the failure mode is worth
-closing since the surrounding code is written to never raise: an `IndexError` escapes
-`_saned_reachable`, escapes `_check_scanner`, and is caught only by `run_checks`'
-per-check handler, turning a resolver oddity into a red Scanner row with the generic
-"check failed" text. The CR-01 fix above (iterating `infos`) removes the subscript and
-therefore this case at the same time. If CR-01 is fixed differently, guard with
-`if not infos: return False`.
+**File:** `tests/test_checks.py:2432-2450`, `src/saneless/checks.py:1421-1428`
 
-### IN-02: The pre-probe still replaces `get_devices()`'s answer rather than cheapening it
+`_scanner_result`'s docstring names
+`test_a_gated_run_returns_what_an_ungated_run_returns` as the replacement for
+the uniform-dispatch seam the split removed, and the 30-30 summary calls it
+"the **only** guarantee that doctor and the strip agree". The test runs both
+paths with a free `_RecordingLock`, no configured host and a backend reporting
+one device — the single scenario where the gate is irrelevant. It would not
+catch a divergence in the no-python-sane row, the host-unanswered row, or an
+enumeration failure. **Fix:** parametrise it over those four contexts
+(scanner `None`; host configured and refusing; host configured and answering;
+enumeration raising) and assert `gated == ungated` for each.
 
-**File:** `src/saneless/checks.py:850-854`
-CR-02's prior fix suggestion — "let it degrade the *cost* of `get_devices()`, never
-replace its answer" — was not taken; the verdict was softened from red to amber
-instead. The consequence is recorded honestly in `_scanner_host_unanswered`'s docstring
-(`checks.py:744-770`) and accepted by design, so this is not re-raised as a defect.
-Flagged only so the residual stays visible: an appliance with a working local scanner
-and a stale `scanner.host` reports amber "the scanner could not be checked" for ever,
-and an appliance with *no* scanner at all reports amber rather than red whenever a
-configured host is down, so `doctor` exits 0 for it. Both are behaviours a later reader
-will find surprising without this note.
+### R3-IN-02: `test_three_resolved_addresses_share_one_budget` cannot fail for the property it is named after
 
-### IN-03: The scanner gate is now held across an unbounded `getaddrinfo`
+**File:** `tests/test_checks.py:769-795`
 
-**File:** `src/saneless/checks.py:1178-1183` with `checks.py:850-854`
-WR-03 narrowed the gate to `_check_scanner`, which is right — but `_check_scanner`'s
-first act is the saned pre-probe, whose name resolution is explicitly outside every
-budget (`checks.py:80-86`). So `ScanWorker._scan_job`'s `with self._scanner_gate:` can
-still park, with the job row already written `SCANNING`, for as long as a broken
-resolver takes — and `POST /api/checks/refresh` can re-arm that every 2 s. The
-exposure is far smaller than before the fix (the Paperless budget and the two
-filesystem writes are out of the gate) and the pre-probe is genuinely SANE-adjacent
-work, so this is a note rather than a defect. If it is ever worth closing, resolve the
-host list *before* taking the gate and pass addresses in.
+The assertions are `timeouts[0] <= budget`, `all(t > 0)` and
+`timeouts == sorted(timeouts, reverse=True)`. A per-socket implementation
+(`probe.settimeout(timeout)`) produces `[2.0, 2.0, 2.0]`, which is equal to its
+own reverse-sort, so all three assertions pass on the code this test exists to
+forbid. The property is in fact pinned — by
+`test_the_deadline_stops_the_walk`'s scripted clock — but this case is decorative.
+**Fix:** assert the sum, e.g. `sum(recorder.timeouts) <= _PROBE_BUDGET * 1.01`,
+or script the clock to advance a known amount per attempt and assert the exact
+remainders.
 
-### IN-04: The attempt cap does not bound the poll when `/api/checks` returns a non-2xx
+### R3-IN-03: `release_manual_claim` clears unconditionally, and its safety argument has no test
 
-**File:** `src/saneless/web/templates/partials/checks.html:53-58`
-The cap works by the *response body* omitting the trigger, and htmx does not swap on an
-error response. If `GET /api/checks` starts returning 5xx (or 422, for a hand-crafted
-`attempt` outside the bound), the existing body is never replaced, keeps its
-`every 2s`, and polls for ever at the same attempt number — IN-07's failure mode
-restored for a different cause. IN-07's motivating case (a dead refresher thread) is
-fully closed, since that path still returns 200, so this is a narrow residual. If it is
-worth closing, add `hx-on::response-error="this.removeAttribute('hx-trigger')"` or
-switch the give-up ending to `HX-Reswap`/286 once the htmx-config meta can change.
+**File:** `src/saneless/web/checks_cache.py:245-275`
 
-### IN-05: `junit_family = "legacy"` is a repo-wide schema change made for two tests
+The clear is `self._last_manual_claim = None` with no check that the stamp being
+cleared is the caller's own. The docstring's argument holds today — the only
+caller releases microseconds after its grant, on the same thread, and a
+competing claimer inside that window is refused without writing — but it is a
+narrative invariant about one call site, not an enforced one, and none of the
+five new `TestReleaseManualClaim` cases exercises two threads. **Fix:** make it
+a compare-and-clear (`claim_manual_refresh` returns the stamp it wrote, or
+`release_manual_claim(stamp)` clears only if `self._last_manual_claim == stamp`),
+which costs one parameter and removes the reasoning entirely.
 
-**File:** `pyproject.toml:161-168`
-Verified inert and non-masking: no `--junitxml` appears in `.github/workflows/ci.yml`,
-`.github/workflows/release.yml` or any script, `filterwarnings = ["error"]` is
-untouched, and `pytest --junitxml=… tests/test_checks_cache.py` runs clean under
-pytest 9.0.2. The only effect is that *if* somebody later asks for JUnit XML they get
-xunit1 rather than xunit2, which some CI consumers (and the schema most tooling
-validates against) no longer prefer. A narrower alternative exists — record the two
-measurements through the `record_testsuite_property` fixture, or attach them to the
-test's own report — if the repo ever wants xunit2 back. Not a defect today; noted so
-the coupling between two measurement tests and the whole repo's XML schema is
-discoverable.
+### R3-IN-04: three `_saned_hosts` behaviours diverge from its docstring
+
+**File:** `src/saneless/checks.py:590-683`
+
+- "The stray colon at either edge stays tolerated, because `: host-a :` has only
+  ever meant one host" — true for a bare name, false in combination with a port:
+  `_saned_hosts("localhost:6566:")` and `_saned_hosts(":localhost:6566")` both
+  return `()`, because the `len(segments) > 2` refusal sees `6566` and rejects
+  the whole setting.
+- `_saned_hosts("host:065")` returns `(("host", 65))` — a leading-zero port is
+  read as decimal 65 with no comment on whether libsane agrees.
+- `_saned_hosts("scanner.local.")` returns `()`: a legal fully-qualified name
+  with a root dot is dropped by the leading/trailing-dot rule.
+
+All three are the safe direction (a lost pre-probe, never a wrong verdict), so
+this is a docstring correction plus, optionally, tolerating the root dot.
+
+### R3-IN-05: the dial list has no length cap, so one refresh POST can hold a request thread for minutes
+
+**File:** `src/saneless/checks.py:590-683`, `src/saneless/checks.py:1030-1037`
+
+`_saned_hosts("h1:h2:...:h40")` yields 40 entries when every segment looks like
+a name, and `_scanner_preflight` walks them with `any(...)`, paying
+`getaddrinfo` (unbounded) plus `PROBE_CONNECT_SECONDS` for each. That whole walk
+runs inside the `POST /api/checks/refresh` request thread (via
+`probe_now`), so a 40-host setting is a request that can take minutes. The
+scanner gate is correctly free throughout (R2-IN-03's fix), so no scan is
+parked — but the manual-refresh floor does not bound duration, only rate.
+**Fix:** cap the entries (`[:_MAX_PROBE_HOSTS]`, 4 or so) and say in the
+docstring that a longer list loses the pre-probe for its tail.
+
+### R3-IN-06: a scan that starts between `_scan_active()` and the gate acquire renders the contention row, which the docs say names only contention
+
+**File:** `src/saneless/web/refresher.py:316-317`, `src/saneless/checks.py:1441-1442`,
+`docs/reference/web-api.md:148`
+
+`skip_scanner` is sampled once, before `run_checks`; `_process_job` sets
+`_current_job_id` before `_scan_job` takes the gate. In the window between the
+sample and the acquire a real scan can take the gate, and the row rendered is
+then `_scanner_busy()` — while `_checks_context` reads `scan_active` at render
+time and prints "Paused during scan — last checked …" above it. The message is
+not false, but the docs state the busy row appears "when another check is
+holding the scanner briefly -- the capability read saneless does at start-up,
+for instance", which reads as exhaustive. A sentence acknowledging the race
+would keep the docs honest; no code change is needed.
 
 ---
 
 _Reviewed: 2026-09-17_
 _Reviewer: Claude (gsd-code-reviewer)_
 _Depth: deep_
+_Round: 3 (diff base d3f20a6)_
