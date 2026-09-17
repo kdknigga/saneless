@@ -3,18 +3,27 @@
    1. The poll trigger is emitted ONLY while the poll is wanted, and `poll_attempt`
       is the server saying so.  The route sets it to the number the next request
       should carry, or to none when there is to be no next request -- and there
-      are now two ways for that to happen.  Results landing in the cache is the
-      first and still the primary one: the body that replaces this one has them,
+      are now two ways for that to happen.  Nothing left in flight is the first
+      and still the primary one: the body that replaces this one has the answer,
       carries no trigger, and so ends the poll.  Running out of attempts
       (checks.POLL_ATTEMPT_CAP) is the second, and it exists because the first
       one cannot fire at all on an appliance whose refresher thread has died --
       before it, an abandoned tab asked forever.  That is the in-tree idiom
       (partials/status.html lines 1-6) and it is deliberately NOT HTTP 286,
       which would need a change to the tuned htmx-config meta in base.html.
-   2. There is never a steady-state poll.  Once results land the strip is
-      refetched only by Check again, by the terminal-state reload, or by a page
-      load.  A permanent poll would keep D-05's lazy refresher awake for every
-      abandoned browser tab, which is the exact cost D-05 exists to avoid.
+   2. The strip asks only while something in flight will change the answer, and
+      never otherwise.  There are two such things, and the route (`_checks_context`)
+      is where both are read.  A cold cache is the first: no results yet, so a
+      probe is coming.  A probe holding the refresher's single-flight lock is the
+      second: results exist, but this render is of the pre-probe entry and the
+      probe's own `store` is seconds away, so without the ask nothing on the page
+      would ever collect it and Check again could visibly do nothing (WR-03).
+      Once both are false the strip is refetched only by Check again, by the
+      terminal-state reload, or by a page load.  Every chain of asks is bounded
+      by checks.POLL_ATTEMPT_CAP whichever condition started it, so neither one
+      is a steady-state poll: a permanent poll would keep D-05's lazy refresher
+      awake for every abandoned browser tab, which is the exact cost D-05 exists
+      to avoid.
 
    The attributes stay INSIDE the conditional.  This is an outerHTML swap target,
    so an unconditional htmx request attribute here is a body that re-arms itself
