@@ -7,6 +7,7 @@ HLTH-01, HLTH-02, LOG-03.
 
 from __future__ import annotations
 
+import ast
 import html
 import inspect
 import json
@@ -63,6 +64,7 @@ from saneless.vocabulary import (
     rejection_message,
 )
 from saneless.web import app as app_module
+from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
@@ -2753,3 +2755,69 @@ class TestHiddenControlsCostNoMetadataFetch:
         assert response.status_code == 200
         assert 'name="tags"' not in response.text
         assert counter.count(_TAGS_ENDPOINT) == 0
+
+
+# A Paperless URL configured behind a reverse proxy may carry Basic-auth
+# userinfo, and httpx puts the URL it could not reach into the exception's
+# string form.  Both halves are asserted absent from the log.
+_CREDENTIALLED_URL = "https://user:pass@paperless.example/api/tags/"
+
+
+class TestRouteLogsNameExceptionsOnly:
+    """
+    IN-02: no handler in ``web/routes.py`` renders an exception into a log.
+
+    The Paperless URL may carry ``user:pass@`` (``checks.py`` says so in as
+    many words), so an exception object interpolated with ``%s`` is a
+    credential in the log file.  Every other handler in the module already
+    logs the class name; the guard below is what stops a future one drifting
+    back, which a single behavioural test could not do.
+    """
+
+    def test_a_failed_connection_test_logs_only_the_class_name(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The userinfo and the host both stay out of the record (ASVS V7)."""
+
+        def _raise_with_the_url() -> str:
+            raise httpx.ConnectError(_CREDENTIALLED_URL)
+
+        app = _simple_form_app(tmp_path)
+        app.state.paperless.test_connection = _raise_with_the_url
+        with TestClient(app) as client, caplog.at_level(logging.WARNING):
+            response = client.get("/api/paperless/test")
+
+        assert response.status_code == 502
+        assert response.json() == {"status": "error", "detail": "ConnectError"}
+        for record in caplog.records:
+            message = record.getMessage()
+            assert "user:pass" not in message
+            assert "paperless.example" not in message
+        assert "ConnectError" in caplog.records[-1].getMessage()
+
+    def test_no_logger_call_in_routes_takes_a_bare_exception(self) -> None:
+        """
+        Read the source: no ``logger`` call is handed the exception itself.
+
+        Parsed rather than grepped, so a call spread over several lines is
+        caught too -- the shape this forbids is easiest to reintroduce when
+        the arguments have been wrapped.
+        """
+        source = Path(routes_module.__file__).read_text(encoding="utf-8")
+        offenders = [
+            node.lineno
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "logger"
+            and any(
+                isinstance(argument, ast.Name) and argument.id == "exc"
+                for argument in [
+                    *node.args,
+                    *(keyword.value for keyword in node.keywords),
+                ]
+            )
+        ]
+
+        assert offenders == []
