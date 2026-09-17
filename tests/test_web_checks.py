@@ -32,6 +32,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -50,12 +51,14 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.paperless import PaperlessClient
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import ConnectionStatus, JobState, local_time
 from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
+from saneless.web.checks_cache import CheckCache
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
@@ -209,7 +212,9 @@ def _synthetic_results() -> tuple[CheckResult, ...]:
     )
 
 
-def _make_app(tmp_path: Path, *, stub_refresher: bool = True) -> FastAPI:
+def _make_app(
+    tmp_path: Path, *, stub_refresher: bool = True, stub_connection: bool = True
+) -> FastAPI:
     """
     Build a real app with a stub scanner and no network calls, not yet started.
 
@@ -219,6 +224,10 @@ def _make_app(tmp_path: Path, *, stub_refresher: bool = True) -> FastAPI:
             real one.  True for every test but the wiring test, because a real
             refresher that has been stamped will probe on its next tick and
             fill a cache a cold-start assertion just emptied.
+        stub_connection: Whether to replace ``test_connection`` with a constant
+            ``CONNECTED``.  False only for the test that counts Paperless
+            requests at the transport, which needs the real method to reach the
+            mock transport it would otherwise step over.
 
     Returns:
         The app, whose lifespan (and so its worker) starts with its TestClient.
@@ -238,10 +247,12 @@ def _make_app(tmp_path: Path, *, stub_refresher: bool = True) -> FastAPI:
     app = create_app(settings, _StubScanner())
     app.state.paperless.get_tags = list
     app.state.paperless.get_correspondents = list
-    # Offline, and CONNECTED so the Paperless row is not the one that varies.
-    app.state.paperless.test_connection = lambda timeout=None: (
-        ConnectionStatus.CONNECTED
-    )
+    if stub_connection:
+        # Offline, and CONNECTED so the Paperless row is not the one that
+        # varies.
+        app.state.paperless.test_connection = lambda timeout=None: (
+            ConnectionStatus.CONNECTED
+        )
     if stub_refresher:
         app.state.refresher = _RecordingRefresher(app.state.refresher)
     return app
@@ -252,6 +263,104 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
     """TestClient over a real app with a stub scanner and no network calls."""
     with TestClient(_make_app(tmp_path)) as tc:
         yield tc
+
+
+class _FakeClock:
+    """
+    A monotonic clock the test moves by hand instead of waiting for.
+
+    A local copy of ``tests/test_checks_cache.py``'s, rather than an import
+    from another test module: ten lines of duplication costs less than a
+    dependency between two test files, and nothing here may sleep -- the whole
+    reason ``CheckCache`` takes its clock as a parameter is that a suite
+    waiting on the wall clock to watch an interval elapse is slow and flaky.
+    """
+
+    def __init__(self, start: float = 100.0) -> None:
+        """Start the clock at ``start`` seconds."""
+        self.now = start
+
+    def __call__(self) -> float:
+        """Return the current fake monotonic reading."""
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward, the way a real one would move on its own."""
+        self.now += seconds
+
+
+class _PaperlessRequestCounter:
+    """
+    Counts the HTTP requests the Paperless check issues, at the transport.
+
+    A probe spy counts calls into ``run_checks``; this counts what would
+    really have left the appliance, which is the quantity WR-05 is about.
+    """
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.count = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Record the request and answer it successfully.
+
+        Args:
+            request: The request the client issued.
+
+        Returns:
+            An empty, successful page, which the check reads as CONNECTED.
+
+        """
+        self.count += 1
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+
+# What the two fixtures below hand a test.  Named because the alternative is
+# an unreadable tuple annotation repeated on every signature.
+type _Clocked = tuple[TestClient, _FakeClock]
+type _Counting = tuple[TestClient, _PaperlessRequestCounter]
+
+
+@pytest.fixture
+def clocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Clocked]:
+    """
+    Build a client whose check cache measures intervals on a movable clock.
+
+    The cache is substituted at the point the app builds it, so the refresher
+    and the routes share the one instance exactly as they do in production;
+    replacing ``app.state.checks`` afterwards would leave the refresher holding
+    the original.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(app_module, "CheckCache", lambda: CheckCache(clock=clock))
+    with TestClient(_make_app(tmp_path)) as tc:
+        yield tc, clock
+
+
+@pytest.fixture
+def counting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Counting]:
+    """Build a client whose Paperless client answers from a counting transport."""
+    counter = _PaperlessRequestCounter()
+
+    def build_client(*, url: str, token: str, consume_dir: str = "") -> PaperlessClient:
+        """
+        Build the app's Paperless client over a mock transport.
+
+        Returns:
+            A client that issues no real network traffic.
+
+        """
+        return PaperlessClient(
+            url=url,
+            token=token,
+            consume_dir=consume_dir,
+            _transport=httpx.MockTransport(counter),
+        )
+
+    monkeypatch.setattr(app_module, "PaperlessClient", build_client)
+    with TestClient(_make_app(tmp_path, stub_connection=False)) as tc:
+        yield tc, counter
 
 
 def _app(client: TestClient) -> FastAPI:
@@ -559,6 +668,117 @@ class TestRefreshButton:
         finally:
             lock.release()
         assert spy.calls == 0
+
+
+class TestRefreshMinimumInterval:
+    """WR-05: the one handler allowed to probe has a floor under it."""
+
+    def test_the_first_refresh_probes(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A floor is not a wall: the first click always gets its probe."""
+        client, _clock = clocked
+        spy = _spy(monkeypatch)
+        assert client.post("/api/checks/refresh").status_code == 200
+        assert spy.calls == 1
+
+    def test_an_immediate_second_refresh_does_not_probe(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two clicks inside the interval are one Paperless request."""
+        client, _clock = clocked
+        spy = _spy(monkeypatch)
+        client.post("/api/checks/refresh")
+        client.post("/api/checks/refresh")
+        assert spy.calls == 1
+
+    def test_a_refused_refresh_is_a_200_carrying_the_strip(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The refusal is invisible: same status, same partial, no error.
+
+        The click is not wrong, only early, so there is nothing to tell the
+        household member about -- and UI-SPEC S1 has no row for an error here.
+        """
+        client, _clock = clocked
+        _spy(monkeypatch)
+        client.post("/api/checks/refresh")
+        refused = client.post("/api/checks/refresh")
+        assert refused.status_code == 200
+        assert len(_CHECK_ROW.findall(refused.text)) == len(CheckKey)
+        assert "hx-trigger" not in _body_attrs(refused.text)
+        assert "check-refresh" in refused.text
+
+    def test_a_refused_refresh_renders_what_a_cache_read_would(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Byte for byte the strip as it stands: nothing a user could notice."""
+        client, _clock = clocked
+        _spy(monkeypatch)
+        client.post("/api/checks/refresh")
+        refused = client.post("/api/checks/refresh")
+        assert refused.text == client.get("/api/checks").text
+
+    def test_twenty_refreshes_in_a_loop_cost_one_probe(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The review's amplifier, shut: 20 requests, one run of the registry."""
+        client, _clock = clocked
+        spy = _spy(monkeypatch)
+        for _ in range(20):
+            assert client.post("/api/checks/refresh").status_code == 200
+        assert spy.calls == 1
+
+    def test_twenty_refreshes_issue_one_paperless_request(
+        self, counting: _Counting
+    ) -> None:
+        """
+        Counted where it costs something: at the wire, not at the spy.
+
+        No spy here -- this drives the real registry against a Paperless
+        client whose transport records every request, so the assertion is
+        about traffic that would really have left the appliance.
+        """
+        client, counter = counting
+        before = counter.count
+        for _ in range(20):
+            assert client.post("/api/checks/refresh").status_code == 200
+        assert counter.count - before == 1
+
+    def test_a_refresh_after_the_interval_probes_again(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D-09 survives: nobody has to wait out a TTL, only a moment."""
+        client, clock = clocked
+        spy = _spy(monkeypatch)
+        client.post("/api/checks/refresh")
+        clock.advance(3.0)
+        client.post("/api/checks/refresh")
+        assert spy.calls == 2
+
+    def test_a_refused_refresh_still_stamps_the_watcher(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Clicking repeatedly is watching, so the lazy refresher stays awake."""
+        client, _clock = clocked
+        _spy(monkeypatch)
+        before = _refresher(client).watch_count
+        client.post("/api/checks/refresh")
+        client.post("/api/checks/refresh")
+        assert _refresher(client).watch_count == before + 2
+
+    def test_the_read_only_route_neither_claims_nor_probes(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``GET /api/checks`` is untouched: it takes no claim from the click."""
+        client, _clock = clocked
+        spy = _spy(monkeypatch)
+        for _ in range(5):
+            assert client.get("/api/checks").status_code == 200
+        assert spy.calls == 0
+        assert client.post("/api/checks/refresh").status_code == 200
+        assert spy.calls == 1
 
 
 class TestFreshnessLine:
