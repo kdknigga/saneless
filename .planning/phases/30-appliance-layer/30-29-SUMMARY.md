@@ -202,3 +202,7 @@ None — no external service configuration required.
 ---
 *Phase: 30-appliance-layer*
 *Completed: 2026-09-17*
+
+## Self-Check: PASSED
+
+All nine modified files exist on disk. All six commits exist in this worktree's history on top of `d3f20a6`: `f92a706`, `bbf4547`, `14c0799`, `06beff6`, `716e84e`, `e1cc09c`. Working tree clean — no modified or untracked files left behind.
