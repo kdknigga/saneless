@@ -621,11 +621,11 @@ Plans:
 
 **Gap wave 1**
 
-- [ ] 30-20-PLAN.md — CR-01/IN-04/IN-05: the Profiles row tells the truth, one derivation for both surfaces
-- [ ] 30-21-PLAN.md — CR-02/WR-01/WR-02: the saned probe stops lying, refuses to guess, and holds its bound
-- [ ] 30-22-PLAN.md — IN-03/IN-06: escaped titles in pipeline logs, no trailing space in a generated title
-- [ ] 30-23-PLAN.md — WR-06/IN-01/IN-02: profile defaults follow the form shape; no fetch or exception object
-- [ ] 30-24-PLAN.md — WR-07: one shared shutdown deadline instead of one join bound per thread
+- [x] 30-20-PLAN.md — CR-01/IN-04/IN-05: the Profiles row tells the truth, one derivation for both surfaces
+- [x] 30-21-PLAN.md — CR-02/WR-01/WR-02: the saned probe stops lying, refuses to guess, and holds its bound
+- [x] 30-22-PLAN.md — IN-03/IN-06: escaped titles in pipeline logs, no trailing space in a generated title
+- [x] 30-23-PLAN.md — WR-06/IN-01/IN-02: profile defaults follow the form shape; no fetch or exception object
+- [x] 30-24-PLAN.md — WR-07: one shared shutdown deadline instead of one join bound per thread
 
 **Gap wave 2** *(blocked on gap wave 1)*
 
@@ -700,7 +700,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 19/19 | Complete   | 2026-09-16 |
+| 30. Appliance Layer | 24/27 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
