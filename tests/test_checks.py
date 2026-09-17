@@ -23,6 +23,7 @@ already proven.  No test here sleeps.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 from dataclasses import FrozenInstanceError
@@ -2372,6 +2373,15 @@ def _gate_sampling_context(
     return context, client, backend
 
 
+# Matches a row that talks about a *scan*, and deliberately not one that talks
+# about the *scanner*: "scanner" is the row's own name and every scanner
+# message is entitled to say it.  Word boundaries are what make the difference,
+# so a plain substring test would not do.
+_NAMES_A_SCAN = re.compile(r"\bscan(s|ning)?\b", re.IGNORECASE)
+
+_SCAN_RUNNING_MESSAGE = "Not checked while a scan is running."
+
+
 class TestRunChecksUnderTheScannerGate:
     """WR-03: the gate is held around the scanner check and around nothing else."""
 
@@ -2535,6 +2545,72 @@ class TestRunChecksUnderTheScannerGate:
         assert _row(results, CheckKey.SCANNER).skipped is True
         assert backend.calls == 0
         assert gate.releases == 0
+
+    def test_a_gate_held_elsewhere_does_not_claim_a_scan_is_running(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        R2-WR-02: losing the gate is not a scan, and the row must not say it is.
+
+        ``run_checks`` honours ``skip_scanner`` *before* it looks at the gate,
+        so by the time a non-blocking acquire fails a running scan has already
+        been excluded.  What holds the gate in that window today is
+        ``ScanWorker._read_generated_profiles``, the worker thread's first act
+        at startup, taken while ``_current_job_id`` is still ``None`` -- which
+        is exactly when the cold-start poll probes.
+
+        The row is asserted, not the constructor that built it: the sentence a
+        household member reads is the contract.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        backend = _CountingBackend([_device()])
+        assert gate.lock.acquire(blocking=False) is True
+        try:
+            results = run_checks(
+                _context(_settings(tmp_path), scanner=backend),
+                scanner_gate=cast("threading.Lock", gate),
+            )
+        finally:
+            gate.lock.release()
+        row = _row(results, CheckKey.SCANNER)
+        assert _NAMES_A_SCAN.search(row.message) is None, row.message
+        assert row.message != _SCAN_RUNNING_MESSAGE
+        assert row.state is CheckState.OK
+        assert row.skipped is True
+        assert row.next_step == ""
+        assert backend.calls == 0
+
+    def test_the_skip_scanner_row_still_names_the_running_scan(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        D-08's sentence is unchanged, and it stays the only row that says it.
+
+        Its companion above proves the two branches are distinguishable by
+        message alone, which is what lets either surface be trusted.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        results = run_checks(
+            _context(
+                _settings(tmp_path),
+                scanner=_CountingBackend([_device()]),
+                skip_scanner=True,
+            ),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        row = _row(results, CheckKey.SCANNER)
+        assert row.message == _SCAN_RUNNING_MESSAGE
+        assert row.state is CheckState.OK
+        assert row.skipped is True
+        assert gate.acquires == 0
 
     def test_skip_scanner_never_touches_the_gate(self, tmp_path: Path) -> None:
         """
