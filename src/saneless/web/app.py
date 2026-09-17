@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -160,6 +161,43 @@ def _build_check_machinery(
     return checks_cache, refresher
 
 
+def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, bool]:
+    """
+    Bring both background threads down against one shared deadline.
+
+    The deadline is taken before either join and the two joins spend it
+    between them, so whatever the worker's join used is gone from the
+    refresher's share and the worst case stays one ``STOP_JOIN_SECONDS``
+    rather than one per thread (A-7, as corrected by WR-07: the joins are
+    sequential, so signalling both events first does not make them overlap).
+    The total is what matters because a refresher parked in an unbounded
+    ``getaddrinfo`` or inside ``sane_get_devices`` is exactly the case the
+    bound exists for, and exactly the case a per-thread bound would double --
+    and a container's stop grace period is sized on the documented number.
+
+    ``request_stop()`` before the worker's join is still worth doing: a
+    refresher merely between ticks wakes on the event during that join and
+    exits for free, so its own join is skipped entirely.  The worker goes
+    first because it is the thread that must be confirmed stopped before any
+    resource closes (D-09), and its own stop blocks the event loop for at most
+    ``STOP_JOIN_SECONDS``, during lifespan shutdown, after uvicorn has stopped
+    serving (D-08).
+
+    Args:
+        worker: The scan worker to stop first.
+        refresher: The check refresher, joined with what is left of the bound.
+
+    Returns:
+        Whether the worker stopped, and whether the refresher stopped.
+
+    """
+    refresher.request_stop()
+    deadline = time.monotonic() + STOP_JOIN_SECONDS
+    worker_stopped = worker.stop()
+    refresher_stopped = refresher.stop(timeout=max(0.0, deadline - time.monotonic()))
+    return worker_stopped, refresher_stopped
+
+
 def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     """
     Create and configure the FastAPI application.
@@ -251,16 +289,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         refresher.start()
         logger.info("App started")
         yield
-        # Both stop events are set before either join begins, so the two
-        # bounded joins overlap and the worst case stays STOP_JOIN_SECONDS
-        # instead of doubling to one bound per thread (A-7).  request_stop()
-        # is the signal half of the refresher's stop; worker.stop() sets its
-        # own event as its first act and only then joins.
-        refresher.request_stop()
-        # worker.stop() blocks the event loop for at most STOP_JOIN_SECONDS,
-        # during lifespan shutdown, after uvicorn has stopped serving (D-08).
-        worker_stopped = worker.stop()
-        refresher_stopped = refresher.stop()
+        worker_stopped, refresher_stopped = _stop_threads(worker, refresher)
         if not (worker_stopped and refresher_stopped):
             # D-09: the store closes only after a confirmed stop, so a stuck
             # thread never hits "Cannot operate on a closed database".  D-07:
