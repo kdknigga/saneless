@@ -49,6 +49,7 @@ from saneless.job import JobState, JobStore
 from saneless.paperless import PaperlessClient
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
+    TOKEN_UNSET_JOB_ERROR,
     ErrorCategory,
     FlipOutcome,
     RequestRejection,
@@ -2267,6 +2268,7 @@ def _simple_form_app(
     *,
     show_tags: bool = True,
     show_correspondent: bool = True,
+    credential: str = "a-real-looking-token",
 ) -> FastAPI:
     """
     Build an app whose scan form has the given shape, with two stub profiles.
@@ -2275,6 +2277,9 @@ def _simple_form_app(
         tmp_path: Where the app writes its database and files.
         show_tags: Whether the Tags fieldset is rendered at all.
         show_correspondent: Whether the Correspondent control is rendered.
+        credential: The configured paperless-ngx token; a placeholder here is
+            how a caller reaches ``start_scan``'s refusal without a second
+            fixture.
 
     Returns:
         The app, whose lifespan starts with its TestClient.
@@ -2282,9 +2287,7 @@ def _simple_form_app(
     """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(
-            url="http://localhost:8000", token="a-real-looking-token"
-        ),
+        paperless=PaperlessConfig(url="http://localhost:8000", token=credential),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
         profiles={
@@ -2460,3 +2463,134 @@ class TestSimpleForm:
         css = _web_asset("static", "app.css")
 
         assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOURS_BEFORE_30_16
+
+
+def _newest_job(client: TestClient) -> Job:
+    """
+    Return the job row the submit under test just created.
+
+    The fact these tests are about is what was *stored*, not what the response
+    said, so every assertion reads the row back rather than the body.
+
+    Args:
+        client: The client whose app holds the job store.
+
+    Returns:
+        The most recent job row.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    rows = job_store.list_recent(limit=1)
+    assert len(rows) == 1
+    return rows[0]
+
+
+class TestProfileDefaultsFollowTheFormShape:
+    """
+    WR-06: a profile default fills in for a control nobody was shown.
+
+    An empty tag list and an absent correspondent reach ``start_scan``
+    identically whether the control was never rendered or was rendered and
+    then cleared, so the submit on its own cannot tell the two apart.  The
+    config key that decided whether to render the control is the only fact
+    that can, and gating on it is what lets a household member untick every
+    box and get a job with no tags -- something the appliance could do before
+    this phase and lost to an ungated fallback.
+    """
+
+    def test_a_cleared_tag_list_submits_no_tags(self, tmp_path: Path) -> None:
+        """The review's named regression test: unticking every box means none."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Cleared"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).tags == []
+
+    def test_a_hidden_tag_control_still_applies_the_profile_default(
+        self, tmp_path: Path
+    ) -> None:
+        """D-29's half: with no control on the page the profile answers."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Hidden"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).tags == _PROFILE_DEFAULT_TAGS
+
+    def test_a_ticked_tag_beats_the_profile_default(self, tmp_path: Path) -> None:
+        """A submit that names tags keeps them, with the control on the page."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Ticked", "tags": ["7"]},
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).tags == [7]
+
+    def test_a_cleared_correspondent_submits_no_correspondent(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of the same regression."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Cleared"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).correspondent is None
+
+    def test_a_hidden_correspondent_control_still_applies_the_default(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of D-29."""
+        with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Hidden"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).correspondent == _PROFILE_DEFAULT_CORRESPONDENT
+
+    def test_the_two_flags_are_read_independently(self, tmp_path: Path) -> None:
+        """One control off and the other on resolves one default and not both."""
+        app = _simple_form_app(tmp_path, show_tags=False, show_correspondent=True)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Mixed"}
+            )
+
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == _PROFILE_DEFAULT_TAGS
+            assert job.correspondent is None
+
+    def test_the_placeholder_token_refusal_still_runs_after_the_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        """The gate moves nothing else: one REJECTED row, exactly as before."""
+        with TestClient(_simple_form_app(tmp_path, credential="changeme")) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Unset Token"}
+            )
+
+            assert response.status_code == 503
+            job = _newest_job(client)
+            assert job.state is JobState.ERROR
+            assert job.error == TOKEN_UNSET_JOB_ERROR
+            assert job.error_category is ErrorCategory.REJECTED
+
+    def test_a_blank_title_still_falls_back_the_way_it_did(
+        self, tmp_path: Path
+    ) -> None:
+        """``resolve_job_title`` runs on the line above and is untouched."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "   "}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).title.startswith("Scan ")
