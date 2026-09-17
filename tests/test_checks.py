@@ -83,6 +83,25 @@ _NOT_ROOT = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the developer's own ``SANE_NET_HOSTS`` out of every test in this file.
+
+    The scanner check reads the environment before it reads ``scanner.host``,
+    because ``_ensure_initialised`` does (``sane_backend.py:876-883``).  That
+    is the behaviour under test, and it is also a way for the suite's verdict
+    to depend on the machine it runs on: a developer or CI image with the
+    variable exported would silently redirect every pre-probe here.  The cases
+    that want it set say so with ``monkeypatch.setenv`` in their own body.
+
+    Args:
+        monkeypatch: pytest's environment patcher.
+
+    """
+    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+
+
 @pytest.fixture
 def listening_port() -> Iterator[int]:
     """
@@ -352,9 +371,10 @@ class TestSanedHostParsing:
         """
         A number no socket could bind is read as a host name, not a port.
 
-        ``socket.create_connection`` raises ``OverflowError`` -- not
-        ``OSError`` -- for a port outside 0..65535, so accepting one here would
-        put an exception the probe does not catch inside the probe.
+        Neither way of using such a port is safe: ``connect`` raises
+        ``OverflowError``, which is not an ``OSError`` and so is not caught by
+        the probe, and ``getaddrinfo`` truncates it modulo 65536 instead, which
+        would have ``host-a:99999`` quietly dial port 34463.
         """
         assert _saned_hosts("host-a:99999") == (
             ("host-a", SANED_PORT),
@@ -364,6 +384,83 @@ class TestSanedHostParsing:
     def test_blank_segments_are_dropped(self) -> None:
         """A stray or doubled colon contributes no host to probe."""
         assert _saned_hosts(" : host-a : ") == (("host-a", SANED_PORT),)
+
+    def test_a_bare_ipv6_literal_produces_no_entries_to_probe(self) -> None:
+        """
+        ``fe80::1`` is refused rather than read as a host and a port.
+
+        An IPv6 literal is exactly the input where "colon-separated list of
+        hosts" and "one address" are indistinguishable.  Before the refusal
+        this parsed to ``(("fe80", 1),)`` -- host ``fe80`` on port 1 -- so
+        every dial failed and, through the pre-probe's short circuit, a
+        perfectly healthy appliance went red (WR-01 feeding CR-02).
+        """
+        assert _saned_hosts("fe80::1") == ()
+
+    def test_a_bracketed_ipv6_literal_produces_no_entries_to_probe(self) -> None:
+        """
+        ``[fe80::1]:6566`` is refused rather than read as three host names.
+
+        Before the refusal this parsed to ``(("[fe80", 6566), ("1]", 6566),
+        ("6566", 6566))`` -- three names no resolver can answer, and three
+        connect budgets spent to learn nothing.
+        """
+        assert _saned_hosts("[fe80::1]:6566") == ()
+
+    def test_the_ipv6_loopback_produces_no_entries_to_probe(self) -> None:
+        """
+        ``::1`` is refused rather than read as the host name ``1``.
+
+        Before the refusal this parsed to ``(("1", 6566),)``.
+        """
+        assert _saned_hosts("::1") == ()
+
+    def test_a_dotted_name_is_still_one_host_on_the_default_port(self) -> None:
+        """The refusal does not touch the unambiguous single-entry reading."""
+        assert _saned_hosts("scanner.local") == (("scanner.local", SANED_PORT),)
+
+    def test_a_dotted_name_with_a_trailing_port_is_still_one_entry(self) -> None:
+        """The refusal does not touch the unambiguous ``host:port`` reading."""
+        assert _saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
+
+    def test_two_short_names_are_still_two_hosts(self) -> None:
+        """``a:b`` keeps the documented two-host reading."""
+        assert _saned_hosts("a:b") == (("a", SANED_PORT), ("b", SANED_PORT))
+
+    def test_three_plausible_segments_are_still_three_hosts(self) -> None:
+        """Every segment of ``a:b:c`` is a plausible host name, so all are kept."""
+        assert _saned_hosts("a:b:c") == (
+            ("a", SANED_PORT),
+            ("b", SANED_PORT),
+            ("c", SANED_PORT),
+        )
+
+    def test_an_ipv4_literal_with_a_trailing_port_is_one_entry(self) -> None:
+        """
+        Dots and digits are a plausible host name, so IPv4 literals survive.
+
+        The refusal is aimed at the colon, not at address literals in general.
+        """
+        assert _saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
+
+    def test_two_ipv4_literals_are_two_hosts(self) -> None:
+        """Two IPv4 literals read as sane-net's two-host list, unchanged."""
+        assert _saned_hosts("192.0.2.10:192.0.2.11") == (
+            ("192.0.2.10", SANED_PORT),
+            ("192.0.2.11", SANED_PORT),
+        )
+
+    def test_a_dotted_name_with_an_out_of_range_port_is_two_hosts(self) -> None:
+        """
+        The ``OverflowError`` guard is not weakened by the refusal.
+
+        ``99999`` is not a port a socket could reach, so both segments are read
+        as host names, exactly as they were before.
+        """
+        assert _saned_hosts("scanner.local:99999") == (
+            ("scanner.local", SANED_PORT),
+            ("99999", SANED_PORT),
+        )
 
 
 class TestSanedReachable:
@@ -412,6 +509,206 @@ class TestSanedReachable:
         the constant is pinned so a future edit has to argue with this test.
         """
         assert SANED_PORT == 6566
+
+
+class _ProbeRecorder:
+    """Records what the saned probe did, in place of doing any of it."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.constructions: list[tuple[int, int, int]] = []
+        self.events: list[str] = []
+        self.timeouts: list[float] = []
+        self.addresses: list[object] = []
+
+    def socket(self, family: int, socktype: int, proto: int) -> _RecordingSocket:
+        """
+        Stand in for ``socket.socket`` and record the construction.
+
+        Args:
+            family: The address family the probe chose.
+            socktype: The socket type the probe chose.
+            proto: The protocol the probe chose.
+
+        Returns:
+            A socket double wired back to this recorder.
+
+        """
+        self.constructions.append((family, socktype, proto))
+        return _RecordingSocket(self)
+
+
+class _RecordingSocket:
+    """A socket that records the calls made to it and always refuses."""
+
+    def __init__(self, recorder: _ProbeRecorder) -> None:
+        """
+        Wire this double to the recorder collecting the run.
+
+        Args:
+            recorder: Where every call is appended.
+
+        """
+        self.recorder = recorder
+
+    def __enter__(self) -> _RecordingSocket:
+        """
+        Enter the ``with`` block the probe opens.
+
+        Returns:
+            This double.
+
+        """
+        self.recorder.events.append("enter")
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        """
+        Leave the ``with`` block, recording that the socket was closed.
+
+        Args:
+            _exc_info: Ignored; nothing is suppressed.
+
+        """
+        self.recorder.events.append("exit")
+
+    def settimeout(self, timeout: float) -> None:
+        """
+        Record the budget the probe applied.
+
+        Args:
+            timeout: The budget, in seconds.
+
+        """
+        self.recorder.events.append("settimeout")
+        self.recorder.timeouts.append(timeout)
+
+    def close(self) -> None:
+        """Record an explicit close, which a failed dial performs."""
+        self.recorder.events.append("close")
+
+    def connect(self, address: object) -> None:
+        """
+        Record the address dialled and refuse, the way a closed port does.
+
+        Args:
+            address: The sockaddr the probe passed.
+
+        Raises:
+            OSError: Always.
+
+        """
+        self.recorder.events.append("connect")
+        self.recorder.addresses.append(address)
+        msg = "Connection refused"
+        raise OSError(msg)
+
+
+# Three addresses for one name: the shape a dual-stack scanner host has, and
+# the one WR-02 costed at three connect budgets instead of one.
+_THREE_ADDRESSES = [
+    (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 6566, 0, 0)),
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 6566)),
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.11", 6566)),
+]
+
+
+def _install_probe_recorder(monkeypatch: pytest.MonkeyPatch) -> _ProbeRecorder:
+    """
+    Replace resolution and socket construction with recording doubles.
+
+    Nothing leaves the process: ``getaddrinfo`` answers from a constant and
+    every socket refuses, so the cost being measured is the count of attempts
+    rather than any real handshake, and the test still sleeps for nothing.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+
+    Returns:
+        The recorder the probe's calls land in.
+
+    """
+    recorder = _ProbeRecorder()
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *_args, **_kwargs: _THREE_ADDRESSES
+    )
+    monkeypatch.setattr(socket, "socket", recorder.socket)
+    return recorder
+
+
+class TestSanedProbeBound:
+    """One configured host costs one connect budget, not one per address (WR-02)."""
+
+    def test_three_resolved_addresses_cost_one_connect_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A dual-stack host is dialled once, so the bound is the budget itself.
+
+        Dialling every resolved address multiplied the documented 2 s by
+        however many addresses the resolver happened to return -- a number
+        nothing in this tree controls.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert len(recorder.constructions) == 1
+        assert recorder.events.count("connect") == 1
+
+    def test_the_address_dialled_is_the_first_the_resolver_returned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Resolution order is the resolver's business, and the probe respects it.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
+        family, socktype, proto, _canonical, sockaddr = _THREE_ADDRESSES[0]
+        assert recorder.constructions == [(family, socktype, proto)]
+        assert recorder.addresses == [sockaddr]
+
+    def test_the_budget_is_applied_before_the_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A timeout set after the connect would bound nothing at all.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
+        assert recorder.timeouts == [_PROBE_BUDGET]
+        assert recorder.events.index("settimeout") < recorder.events.index("connect")
+
+    def test_a_resolver_that_raises_is_not_reachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A name that cannot be resolved answers False rather than raising.
+
+        ``socket.gaierror`` subclasses ``OSError``, so the one ``except`` arm
+        covers resolution as well as the handshake.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+
+        def _fail(*_args: object, **_kwargs: object) -> list[object]:
+            msg = "Name or service not known"
+            raise socket.gaierror(msg)
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fail)
+        assert _saned_reachable("scanbox.invalid", SANED_PORT, _PROBE_BUDGET) is False
 
 
 class TestImportHygiene:
@@ -678,6 +975,51 @@ def _row(results: tuple[CheckResult, ...], key: CheckKey) -> CheckResult:
     return next(result for result in results if result.key is key)
 
 
+def _recording_dialler(
+    monkeypatch: pytest.MonkeyPatch, *, reachable: bool
+) -> list[tuple[str, int]]:
+    """
+    Replace the probe's dialler with one that records what it was asked for.
+
+    Nothing connects: the point of these cases is *which address* the check
+    decided to dial, which is a decision made before any socket exists.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+        reachable: What the stubbed dialler should answer.
+
+    Returns:
+        The list the stub appends each ``(host, port)`` pair to.
+
+    """
+    dialled: list[tuple[str, int]] = []
+
+    def _dial(host: str, port: int, _timeout: float) -> bool:
+        dialled.append((host, port))
+        return reachable
+
+    monkeypatch.setattr(checks, "_saned_reachable", _dial)
+    return dialled
+
+
+def _healthy_settings(tmp_path: Path, *, host: str) -> Settings:
+    """
+    Build settings whose only imperfection is the configured scanner host.
+
+    Args:
+        tmp_path: The test's own directory.
+        host: The ``scanner.host`` to configure.
+
+    Returns:
+        Settings with a writable data folder and a real fallback folder, so
+        every row but the Scanner one is green.
+
+    """
+    folder = tmp_path / "consume"
+    folder.mkdir(exist_ok=True)
+    return _settings(tmp_path, host=host, consume_dir=str(folder))
+
+
 class TestScannerCheck:
     """The Scanner row, including the pre-probe that keeps it fast (APPL-02)."""
 
@@ -832,8 +1174,11 @@ class TestScannerCheck:
         results = run_checks(_context(settings, scanner=backend))
         row = _row(results, CheckKey.SCANNER)
         assert backend.calls == 0
-        assert row.state is CheckState.FAIL
-        assert row.message == "Not reachable."
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "The configured scanner host is not answering, "
+            "so the scanner could not be checked."
+        )
 
     def test_a_listening_saned_port_reaches_the_backend(
         self, tmp_path: Path, listening_port: int
@@ -868,6 +1213,218 @@ class TestScannerCheck:
         results = run_checks(_context(_settings(tmp_path, host=""), scanner=backend))
         assert backend.calls == 1
         assert _row(results, CheckKey.SCANNER).state is CheckState.OK
+
+    def test_the_configured_host_is_dialled_when_the_environment_is_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With no ``SANE_NET_HOSTS``, ``scanner.host`` is what SANE will use.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        dialled = _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="config-host")
+        run_checks(_context(settings, scanner=_CountingBackend([_device()])))
+        assert dialled == [("config-host", SANED_PORT)]
+
+    def test_the_environment_variable_wins_over_the_configured_host(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The probe dials the host SANE dials, not the one the file names.
+
+        ``_ensure_initialised`` (``sane_backend.py:876-883``) honours a
+        pre-existing ``SANE_NET_HOSTS`` and logs that it is ignoring
+        ``scanner.host``.  A probe reading only the setting can therefore
+        describe a host that is not in play at all: a down config host
+        producing a row while the live environment host serves devices.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "env-host")
+        dialled = _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="config-host")
+        run_checks(_context(settings, scanner=_CountingBackend([_device()])))
+        assert dialled == [("env-host", SANED_PORT)]
+
+    def test_an_empty_environment_variable_leaves_the_setting_in_charge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An exported-but-empty variable is not a configured host.
+
+        ``sane_backend.py`` only treats a *set* variable as a host list, and an
+        empty one names nothing, so the setting is what remains.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "")
+        dialled = _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="config-host")
+        run_checks(_context(settings, scanner=_CountingBackend([_device()])))
+        assert dialled == [("config-host", SANED_PORT)]
+
+    def test_an_unanswered_host_is_amber_and_says_what_to_do(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        CR-02: a refused dial is a fact about the host, not about the appliance.
+
+        ``SANE_NET_HOSTS`` *adds* net devices; it does not replace local
+        backend enumeration, so "every configured host refused TCP" never
+        implied "there is no scanner".  D-01 calls a true statement about a
+        deployment that still works amber.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _healthy_settings(tmp_path, host=f"127.0.0.1:{_closed_port()}")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert row.state is CheckState.WARN
+        assert row.skipped is False
+        assert row.next_step == (
+            "Check the scanner is switched on and connected, then press Check again."
+        )
+
+    def test_an_unanswered_host_does_not_turn_a_health_gate_red(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A machine with a working local scanner and a stale host exits 0.
+
+        ``CheckState``'s own rule is that a healthy appliance must never go
+        red.  ``saneless doctor`` exits non-zero on ``FAIL`` only, so no row
+        being ``FAIL`` is the exit code.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _healthy_settings(tmp_path, host=f"127.0.0.1:{_closed_port()}")
+        results = run_checks(
+            _context(
+                settings,
+                scanner=backend,
+                paperless=_paperless(_RequestCounter(_ok_response)),
+            )
+        )
+        assert [row.key for row in results if row.state is CheckState.FAIL] == []
+        assert worst_state(results) is CheckState.WARN
+
+    @pytest.mark.parametrize(
+        ("environment", "setting"),
+        [
+            pytest.param(None, "scanbox.lan", id="setting-only"),
+            pytest.param("scanbox.lan:6566", "", id="environment-only"),
+            pytest.param("192.0.2.10", "scanbox.lan", id="both"),
+        ],
+    )
+    def test_the_unanswered_row_names_no_host_address_or_port(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        environment: str | None,
+        setting: str,
+    ) -> None:
+        """
+        ASVS V7: a LAN address never reaches a LAN-visible page through this row.
+
+        Same class of fact, and the same refusal, as ``_device_label``
+        declining to print a ``net:<host>`` identifier.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            environment: What ``SANE_NET_HOSTS`` is set to, or None for unset.
+            setting: What ``scanner.host`` is configured as.
+
+        """
+        if environment is not None:
+            monkeypatch.setenv("SANE_NET_HOSTS", environment)
+        _recording_dialler(monkeypatch, reachable=False)
+        settings = _settings(tmp_path, host=setting)
+        row = _row(
+            run_checks(_context(settings, scanner=_CountingBackend([_device()]))),
+            CheckKey.SCANNER,
+        )
+        assert row.state is CheckState.WARN
+        for text in (row.message, row.next_step):
+            assert ":" not in text
+            assert "scanbox" not in text
+            assert "192.0.2.10" not in text
+            assert "6566" not in text
+
+    def test_an_enumeration_that_found_nothing_is_still_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The amber row is only for the case where the probe replaced the enumeration.
+
+        A probe that answered, followed by a backend reporting no devices, is
+        an enumeration that actually ran, so its verdict stands.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        _recording_dialler(monkeypatch, reachable=True)
+        backend = _CountingBackend()
+        settings = _settings(tmp_path, host="scanbox.lan")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 1
+        assert row.state is CheckState.FAIL
+        assert row.message == "Not reachable."
+
+    def test_a_reachable_host_whose_backend_raises_is_still_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An enumeration that threw is still a red row, not the amber one.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="scanbox.lan")
+        row = _row(
+            run_checks(_context(settings, scanner=_RaisingBackend())), CheckKey.SCANNER
+        )
+        assert row.state is CheckState.FAIL
+        assert row.message == "Not reachable."
+
+    def test_an_unparseable_host_still_reaches_the_backend(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        WR-01 and CR-02 together: an IPv6 literal produces no probe and no row.
+
+        Before the refusal, ``fe80::1`` dialled host ``fe80`` on port 1, every
+        dial failed, and the short circuit turned that into a verdict.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host="fe80::1")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 1
+        assert row.state is CheckState.OK
 
 
 _PROBE_OUTCOMES = [

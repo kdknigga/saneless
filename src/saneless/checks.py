@@ -26,11 +26,13 @@ for the same reason D-13 omits the log path.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from string import ascii_letters, digits
 from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx
@@ -72,11 +74,16 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# How long a saned pre-probe waits for a TCP handshake before giving up.  Two
-# seconds is the whole of success criterion 2 on the SANE side: without it an
-# unplugged sane-net host costs roughly 127 s inside a blocking C call, because
-# Linux retries a SYN six times by default.  Read at call time, so tests can
-# shorten it.
+# How long a saned pre-probe waits for a TCP handshake before giving up.  This
+# bounds one handshake per configured host, and nothing else.  Name resolution
+# runs before it and is not inside it -- `getaddrinfo` takes no timeout, so an
+# unreachable resolver costs whatever `resolv.conf` says -- and with N
+# configured hosts the probe's worst case is N times (resolution plus this
+# budget).  The bound still matters for the reason it always did: what it
+# replaces is `get_devices()`, which has no timeout at any layer and costs
+# roughly 127 s for a silently unreachable host, because Linux retries a SYN
+# six times by default, inside a blocking C call nothing can interrupt.  Read
+# at call time, so tests can shorten it.
 PROBE_CONNECT_SECONDS: Final = 2.0
 
 # How long the Paperless probe waits for a response body once connected.  The
@@ -88,6 +95,12 @@ PROBE_READ_SECONDS: Final = 5.0
 # ``/etc/services`` agrees, which settles RESEARCH assumption A1.  Read at call
 # time.
 SANED_PORT: Final = 6566
+
+# Every character a segment of ``scanner.host`` may contain and still be read
+# as a host name.  Deliberately narrower than any hostname RFC: this is not a
+# validator, it is the smallest set that tells a name apart from the halves an
+# IPv6 literal falls into when it is split on ``:``.
+_HOST_NAME_CHARACTERS: Final = frozenset(ascii_letters + digits + "-.")
 
 # The cold-start row, before any check has run (D-06).  It lives here rather
 # than in the template for the same reason the state glyphs do: templates own
@@ -417,6 +430,69 @@ def worst_state(results: Iterable[CheckResult]) -> CheckState:
     return worst
 
 
+def _saned_host_setting(settings: Settings) -> str:
+    """
+    Return the host list SANE will actually use, not merely the configured one.
+
+    ``_ensure_initialised`` (``sane_backend.py:876-883``) writes
+    ``scanner.host`` into ``SANE_NET_HOSTS`` only when the variable is not
+    already set, and logs "already set externally … ignoring scanner.host
+    config" when it is.  A probe that read the setting alone could therefore
+    dial a host SANE is not using: a configured host that is switched off
+    would produce a row while the live environment host quietly served
+    devices.  Reading the environment first makes the probe's subject and
+    SANE's subject the same machine.
+
+    This places no new trust in the variable.  It is already the value libsane
+    reads; the alternative is describing a host nothing is dialling.
+
+    The ``or`` rather than a two-argument ``get`` is deliberate: an exported
+    but empty variable names no host, and ``sane_backend.py`` only treats a
+    non-empty host as a host list, so the setting is what remains.
+
+    Args:
+        settings: The injected configuration.
+
+    Returns:
+        The colon-separated host list to parse, possibly empty.
+
+    """
+    return os.environ.get("SANE_NET_HOSTS") or settings.scanner.host
+
+
+def _looks_like_a_host_name(segment: str) -> bool:
+    """
+    Say whether one colon-separated segment could be a host name at all.
+
+    This is deliberately not a hostname RFC implementation and must not grow
+    into one.  It answers a single narrower question -- "could sane-net have
+    meant this as a name?" -- and the only inputs it has to tell apart are the
+    names an operator types and the fragments an IPv6 literal falls into when
+    it is split on ``:``.  ``[fe80`` and ``1]`` fail on their brackets, and the
+    empty string fails on being empty, which is all that is needed.
+
+    Being narrow is the safe direction.  A false "no" costs the pre-probe's
+    latency saving and nothing else, because ``_saned_hosts`` then returns no
+    entries and the scanner check falls through to ``get_devices()``.  A false
+    "yes" is what WR-01 was: three junk dials and, through the pre-probe's
+    short circuit, a wrong verdict.
+
+    Args:
+        segment: One stripped segment of the ``scanner.host`` setting.
+
+    Returns:
+        True when the segment is non-empty, made only of ASCII letters,
+        digits, hyphens and dots, and neither starts nor ends with a hyphen or
+        a dot.
+
+    """
+    if not segment:
+        return False
+    if segment[0] in "-." or segment[-1] in "-.":
+        return False
+    return set(segment) <= _HOST_NAME_CHARACTERS
+
+
 def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     """
     Parse ``scanner.host`` into the ``(host, port)`` pairs saned would be dialled on.
@@ -435,22 +511,47 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     that does not resolve and then falls through to the behaviour that existed
     before this module.
 
-    The range check is not cosmetic: ``socket.create_connection`` raises
-    ``OverflowError`` -- which is not an ``OSError`` -- for a port outside
-    0..65535, so accepting ``host:99999`` as a port would put an exception the
-    probe does not catch inside the probe.
+    The range check is not cosmetic, and it is not a tidiness rule either.  A
+    port outside 0..65535 does not fail loudly on the way to a socket: passed
+    to ``connect`` it raises ``OverflowError``, which is not an ``OSError`` and
+    so is not caught by the probe, and passed to ``getaddrinfo`` it is
+    truncated modulo 65536 instead, which means ``host:99999`` would quietly
+    dial port 34463 -- a real probe of an address nobody configured.  Reading
+    such a segment as a host name avoids both.
+
+    **The refusal.**  With more than one colon present, the setting is refused
+    outright -- no entries, no probe -- unless every segment could be a host
+    name and no blank segment sits anywhere but the first or last position.
+    An IPv6 literal is exactly the input where "colon-separated list of hosts"
+    and "one address" are indistinguishable: ``fe80::1`` split on ``:`` used to
+    read as host ``fe80`` on port 1, and ``[fe80::1]:6566`` as three names no
+    resolver can answer (WR-01).  The stray colon at either edge stays
+    tolerated, because ``: host-a :`` has only ever meant one host.
+
+    Returning ``()`` is not a silent failure; it is the fallback this module
+    documents everywhere else.  No entries means no probe, which means the
+    scanner check calls ``get_devices()`` and behaves exactly as it did before
+    the probe existed.  An operator who typed an IPv6 literal loses the
+    pre-probe's latency saving and never gets a wrong verdict, which is the
+    trade the whole module is built on.
 
     Args:
         host_setting: The configured ``scanner.host``, possibly empty.
 
     Returns:
         One ``(host, port)`` pair per entry, in the configured order.  Empty
-        when nothing is configured or every segment is blank.
+        when nothing is configured, every segment is blank, or the setting is
+        one this module refuses to guess at.
 
     """
     segments = [segment.strip() for segment in host_setting.split(":")]
     present = [segment for segment in segments if segment]
     if not present:
+        return ()
+    if len(segments) > 2 and (
+        "" in segments[1:-1]
+        or not all(_looks_like_a_host_name(segment) for segment in present)
+    ):
         return ()
     if len(present) == 2:
         host, maybe_port = present
@@ -476,16 +577,36 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     The port is 6566, IANA's ``sane-port``, verified in ``/etc/services``.
 
+    **What the budget covers.**  One handshake, to one address.  The name is
+    resolved once and only the first result is dialled, because dialling every
+    resolved address would multiply the budget by a number nothing here
+    controls -- a dual-stack scanner host resolves to three, so the documented
+    two seconds silently became six (WR-02).  One address is enough for the
+    question being asked, which is whether the host is answering at all, and
+    the answer for a host that is switched off is the same on every address it
+    has.
+
+    Resolution itself is outside the budget and is left that way deliberately.
+    ``getaddrinfo`` takes no timeout, so bounding it means running it on a
+    thread and abandoning the thread when the deadline passes.  That is the
+    same trade plan 30-21's decision record refuses for the enumeration: a
+    thread parked in a C call that nothing can interrupt is worse than a slow
+    answer, because it is still in there after the caller has moved on.  An
+    unreachable resolver therefore costs whatever ``resolv.conf`` says, and
+    that is stated rather than claimed away.
+
     **Failure policy.**  This returns ``False`` for every ``OSError`` --
     refused, timed out, unresolvable, no route -- and raises nothing.  It is
     the *caller* that decides what a ``False`` means, and the caller never
-    turns "the probe could not be run at all" into a red row: when
+    turns "the probe could not be run at all" into a bad row: when
     ``_saned_hosts`` yields no entries to dial, no probe happens and the
     scanner check falls back to ``get_devices()``, which is exactly the
-    behaviour that existed before this module.  Only a probe that actually ran
-    and was refused on every configured entry produces ``FAIL``, and in that
-    state ``get_devices()`` would spend two minutes reaching the same
-    conclusion.
+    behaviour that existed before this module.  A probe that actually ran and
+    was refused on every configured entry produces ``WARN``, not ``FAIL`` --
+    it establishes that the configured host did not answer, which is not the
+    same claim as "there is no scanner" (CR-02, ``_scanner_host_unanswered``)
+    -- and in that state ``get_devices()`` would spend two minutes reaching a
+    less useful version of the same observation.
 
     Args:
         host: The host name or address to dial.
@@ -497,7 +618,12 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        family, socket_type, protocol, _canonical_name, address = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )[0]
+        with socket.socket(family, socket_type, protocol) as probe:
+            probe.settimeout(timeout)
+            probe.connect(address)
             return True
     except OSError as exc:
         # Logged at DEBUG, not WARNING: a closed scanner port is the ordinary
@@ -579,6 +705,54 @@ def _scanner_unreachable() -> CheckResult:
     )
 
 
+def _scanner_host_unanswered() -> CheckResult:
+    """
+    Build the "the configured scanner host did not answer" row (CR-02).
+
+    Amber, not red, and the distinction is the whole point.  What the
+    pre-probe observed is a fact about the *configured host*, not about the
+    appliance: ``SANE_NET_HOSTS`` **adds** net devices to what the dll backend
+    enumerates, it does not replace local backend enumeration
+    (``sane_backend.py:876`` only sets the variable), so "every configured
+    sane-net host refused TCP" never implied "there is no scanner".  A machine
+    with a working USB scanner and a switched-off network one scans perfectly,
+    and D-01 calls a true statement about a deployment that still works amber
+    -- the same shape as D-22's read-only-configuration row.  Reporting it red
+    would break the rule ``CheckState``'s own docstring states outright: a
+    healthy appliance must never go red.
+
+    The cost is recorded rather than hidden.  An appliance whose *only*
+    scanner is an unreachable network host now reports amber, so ``saneless
+    doctor`` exits 0 for it.  That is accepted: D-01 already keys a scripted
+    gate on red alone, the row is still visible, it still names the scanner
+    host as the thing that did not answer, and it still carries the same next
+    step, so a human loses nothing.  Getting the red back means bounding
+    ``get_devices()`` on a second thread, which cannot be done safely while
+    ``sane_get_devices`` is uninterruptible -- the reasoning is in plan
+    30-21's decision record and should be read before anyone tries.
+
+    Neither string names the host, its address or its port.  A LAN address on
+    a LAN-visible page is the same class of disclosure as the SANE device id
+    ``_device_label`` refuses to print (ASVS V7).
+
+    Returns:
+        The amber Scanner row, with ``skipped`` false -- the probe was run,
+        and it answered.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.WARN,
+        message=(
+            "The configured scanner host is not answering, "
+            "so the scanner could not be checked."
+        ),
+        next_step=(
+            "Check the scanner is switched on and connected, then press Check again."
+        ),
+    )
+
+
 def _scanner_skipped() -> CheckResult:
     """
     Build the row shown while a scan is running (D-08).
@@ -606,15 +780,21 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     Report whether a scanner is there to scan with.
 
     The order is deliberate.  A machine with no python-sane is its own row
-    (Amendment A-1) and is decided without touching anything.  A configured
-    sane-net host is then pre-probed, and every configured entry refusing a TCP
-    connection ends the check right there: ``get_devices()`` would spend about
-    two minutes reaching the same conclusion inside a C call nothing can
-    interrupt (T-30-22).  Only when there is no host to probe, or one of them
-    answered, is the backend entered at all -- which is also the fallback that
-    cannot produce a false red row, because a setting this module cannot parse
-    into an entry leaves the check behaving exactly as it did before the probe
-    existed.
+    (Amendment A-1) and is decided without touching anything.  The host SANE
+    will actually dial is then pre-probed, and every configured entry refusing
+    a TCP connection ends the check right there, with the amber
+    ``_scanner_host_unanswered`` row: ``get_devices()`` would spend about two
+    minutes reaching a conclusion inside a C call nothing can interrupt
+    (T-30-22), and the conclusion it would reach is not the one the probe is
+    entitled to report.  A refused dial says the configured host did not
+    answer; it does not say there is no scanner, because ``SANE_NET_HOSTS``
+    adds net devices rather than replacing local enumeration (CR-02).  Only
+    when there is no host to probe, or one of them answered, is the backend
+    entered at all -- and then whatever the enumeration reports stands, red
+    included, because an enumeration that actually ran has earned its verdict.
+    That fallback is also the one that cannot produce a false row, because a
+    setting this module cannot parse into an entry leaves the check behaving
+    exactly as it did before the probe existed.
 
     Args:
         context: The injected dependencies and configuration.
@@ -631,11 +811,11 @@ def _check_scanner(context: CheckContext) -> CheckResult:
             message="Scanner support is not installed on this machine.",
             next_step="Install saneless with scanner support, then restart it.",
         )
-    entries = _saned_hosts(context.settings.scanner.host)
+    entries = _saned_hosts(_saned_host_setting(context.settings))
     if entries and not any(
         _saned_reachable(host, port, PROBE_CONNECT_SECONDS) for host, port in entries
     ):
-        return _scanner_unreachable()
+        return _scanner_host_unanswered()
     try:
         devices = scanner.get_devices()
     except Exception as exc:
