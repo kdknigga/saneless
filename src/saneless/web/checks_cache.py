@@ -241,3 +241,35 @@ class CheckCache:
                 return False
             self._last_manual_claim = now
             return True
+
+    def release_manual_claim(self) -> None:
+        """
+        Give a granted claim back, because the probe it bought never happened.
+
+        ``POST /api/checks/refresh`` claims before it probes, and it has to:
+        the claim is what decides whether it may probe at all.  But
+        ``CheckRefresher.probe_now`` collapses into an in-flight probe and
+        does nothing, and a click that collapsed spent the floor for no probe
+        -- so the clicker's very next press, inside two seconds, was refused
+        for traffic nobody generated.  That is WR-03's second consequence: the
+        button appearing to do nothing, twice in a row.  This hands the claim
+        back on exactly that branch.
+
+        The clear is unconditional, which is not obviously safe, so here is
+        the argument.  Only a caller that was *granted* a claim calls this, it
+        calls it microseconds later on the same thread, and any competing
+        claimer arriving inside that window is refused by the interval --
+        and :meth:`claim_manual_refresh` states that a refusal changes no
+        state.  No other thread can therefore have overwritten the stamp this
+        caller wrote, so clearing it clears only its own grant.
+
+        It cannot be abused to defeat the floor (WR-05, T-30-29-01).  The
+        release happens only where ``probe_now`` returned False, and that
+        branch issued no Paperless request, no saned TCP dial and no
+        filesystem write, so a scripted loop that always collides always gets
+        its claim back and still generates zero probe traffic.  The moment a
+        probe is actually granted, the stamp stands and the next call inside
+        the interval is refused like any other.
+        """
+        with self._lock:
+            self._last_manual_claim = None
