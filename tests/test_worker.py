@@ -21,6 +21,7 @@ from saneless.auto_profiles import (
     generate_profiles,
     is_bare_default,
 )
+from saneless.checks import CheckContext, CheckKey, CheckState, run_checks
 from saneless.config import ProfileConfig, Settings, config_search_paths
 from saneless.exceptions import (
     ConfigError,
@@ -5897,3 +5898,181 @@ class TestProfileStorage:
 
         assert generated
         assert storage is ProfileStorage.IN_MEMORY_UNWRITABLE
+
+    @staticmethod
+    def _second_profile(settings: Settings) -> None:
+        """
+        Take the settings out of the bare default, the way a config file does.
+
+        A second profile is what every real deployment has once
+        ``saneless auto-profiles`` has run once and written the file, and it is
+        the shape ``docker-compose.yml``'s mounted ``./config`` produces. It
+        makes ``is_bare_default`` False, so startup generation is skipped.
+
+        Args:
+            settings: The settings to customise in place.
+
+        """
+        settings.profiles = {
+            "default": ProfileConfig(),
+            "adf": ProfileConfig(source="ADF"),
+        }
+
+    def test_profile_storage_is_persisted_when_generation_was_skipped(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        CR-01: the production shape reported a permanent falsehood.
+
+        An operator with a real config file holding profiles that are not the
+        bare default never reaches a branch that records the storage outcome --
+        ``_generate_startup_profiles`` returns at ``if not bare``. The seed said
+        no config file was in use, for the life of the process, on the one
+        deployment shape the compose file ships.
+        """
+        self._caps_scanner(mock_scanner)
+        self._second_profile(default_settings)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("# loaded by --config\n")
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            assert not is_bare_default(default_settings)
+            worker.start()
+            stopped = worker.stop()
+            storage = worker.profile_storage
+        finally:
+            worker.stop()
+            store.close()
+
+        assert stopped
+        assert storage is ProfileStorage.PERSISTED
+
+    def test_profile_storage_is_no_config_file_when_generation_was_skipped(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> None:
+        """Customised profiles from the environment alone still have no file."""
+        self._caps_scanner(mock_scanner)
+        self._second_profile(default_settings)
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            assert default_settings.config_path is None
+            worker.start()
+            stopped = worker.stop()
+            storage = worker.profile_storage
+        finally:
+            worker.stop()
+            store.close()
+
+        assert stopped
+        assert storage is ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
+
+    def test_profile_storage_is_persisted_when_no_scanner_was_found(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        D-15: a SANE failure leaves the loaded profiles exactly where they were.
+
+        The autouse fixture answers ``get_devices`` with ``[]``, so
+        ``_read_generated_profiles`` returns ``None`` and generation gives up.
+        Nothing was written, but nothing moved either: the bare default came out
+        of the config file and is still in it.
+        """
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("# loaded by --config\n")
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            stopped = worker.stop()
+            storage = worker.profile_storage
+        finally:
+            worker.stop()
+            store.close()
+
+        assert stopped
+        assert mock_scanner.get_devices.called
+        assert storage is ProfileStorage.PERSISTED
+
+    def test_profile_storage_is_no_config_file_when_no_scanner_was_found(
+        self,
+        mock_scanner: MagicMock,
+        worker_for: Callable[[JobStore], ScanWorker],
+    ) -> None:
+        """A failed generation with no file loaded is still the no-file answer."""
+        store = JobStore()
+        worker = worker_for(store)
+        try:
+            assert worker._settings.config_path is None
+            worker.start()
+            stopped = worker.stop()
+            storage = worker.profile_storage
+        finally:
+            worker.stop()
+            store.close()
+
+        assert stopped
+        assert mock_scanner.get_devices.called
+        assert storage is ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
+
+    def test_profile_storage_renders_a_green_profiles_row_with_a_config_file(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        D-02 is about the words, so assert the rendered row, not just the enum.
+
+        The amber row CR-01 produced told a household member to create a
+        configuration file they already had. Asserting the enum alone would not
+        have caught that the sentence was false.
+        """
+        self._caps_scanner(mock_scanner)
+        self._second_profile(default_settings)
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("# loaded by --config\n")
+        default_settings._config_path = config_file
+
+        store = JobStore()
+        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        try:
+            worker.start()
+            stopped = worker.stop()
+            storage = worker.profile_storage
+        finally:
+            worker.stop()
+            store.close()
+
+        results = run_checks(
+            CheckContext(
+                settings=default_settings,
+                scanner=None,
+                paperless=None,
+                profile_storage=storage,
+            )
+        )
+        row = next(result for result in results if result.key is CheckKey.PROFILES)
+
+        assert stopped
+        assert row.state is CheckState.OK
+        assert "in memory" not in row.message.lower()
+        assert not row.next_step
