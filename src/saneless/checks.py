@@ -25,6 +25,7 @@ for the same reason D-13 omits the log path.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import socket
@@ -516,20 +517,74 @@ def _looks_like_a_host_name(segment: str) -> bool:
     "yes" is what WR-01 was: three junk dials and, through the pre-probe's
     short circuit, a wrong verdict.
 
+    An all-digit segment is rejected for that reason and not for tidiness.  No
+    legal host name is entirely digits, and every all-digit segment arriving
+    here is either a mis-parsed port or half an IPv6 literal -- but glibc
+    *accepts* such strings, reading them as the single-integer IPv4 form.
+    Measured on this machine, ``getaddrinfo('2001', 6566)`` answers
+    ``0.0.7.209``, ``getaddrinfo('99999', 6566)`` answers ``0.1.134.159`` and
+    ``getaddrinfo('0', 6566)`` answers ``0.0.0.0``.  The last one is the worst
+    of the three: on Linux a ``connect()`` to ``0.0.0.0`` reaches loopback, so
+    a ``0`` in the dial list lets the probe report the configured scanner host
+    "reachable" off any unrelated local process listening on 6566 (R2-WR-01,
+    T-30-28-01).
+
     Args:
         segment: One stripped segment of the ``scanner.host`` setting.
 
     Returns:
-        True when the segment is non-empty, made only of ASCII letters,
-        digits, hyphens and dots, and neither starts nor ends with a hyphen or
-        a dot.
+        True when the segment is non-empty, is not entirely digits, is made
+        only of ASCII letters, digits, hyphens and dots, and neither starts
+        nor ends with a hyphen or a dot.
 
     """
     if not segment:
         return False
+    if segment.isdigit():
+        return False
     if segment[0] in "-." or segment[-1] in "-.":
         return False
     return set(segment) <= _HOST_NAME_CHARACTERS
+
+
+def _looks_like_an_ipv6_literal(host_setting: str) -> bool:
+    """
+    Say whether the whole setting is one IPv6 address rather than a host list.
+
+    This asks the stdlib, and it asks *before* anything is split on ``:``,
+    because splitting is precisely what destroys a literal.  Brackets are
+    removed rather than stripped from the ends, so ``[fe80::1]:6566`` reaches
+    the parser as ``fe80::1:6566`` -- a legal address, since ``6566`` is legal
+    hex -- instead of as a name with a stray ``]`` in it.  Mangling the input
+    that way is safe here because the answer is only ever used to *refuse*: a
+    false "yes" costs the pre-probe's latency saving, and there is no path from
+    this function to an address that gets dialled.
+
+    A zone suffix needs no handling of its own.  ``ipaddress.ip_address`` has
+    accepted scoped literals since Python 3.9, and it was verified against the
+    interpreter this project pins that ``fe80::1%eth0`` parses as version 6.
+
+    An IPv4 literal answers False deliberately.  Dots are not ambiguous, so
+    ``192.0.2.10`` and ``192.0.2.10:6566`` each have exactly one reading and
+    the caller's segment rules get them both right.
+
+    Args:
+        host_setting: The configured ``scanner.host``, possibly empty.
+
+    Returns:
+        True when the setting, with brackets removed, is an IPv6 address.
+
+    """
+    try:
+        parsed = ipaddress.ip_address(
+            host_setting.strip().replace("[", "").replace("]", "")
+        )
+    except ValueError:
+        # Not an address at all: a name, a list of names, or a literal too
+        # mangled to parse.  The caller's segment rules are the reading for
+        # all three.
+        return False
+    return parsed.version == 6
 
 
 def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
@@ -544,28 +599,46 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
 
     The reading taken here is the narrow one: a trailing segment is a port only
     when the setting has exactly two segments and that segment is all digits
-    within 1..65535.  Anything else is a list of host names.  It is narrow on
-    purpose -- misreading a host as a port would probe the wrong address
-    entirely, while misreading a port as a host costs one connect to a name
-    that does not resolve and then falls through to the behaviour that existed
-    before this module.
+    within 1..65535.  Anything else is a list of host names, minus any segment
+    that could not be a name.  It is narrow on purpose -- misreading a host as
+    a port would probe the wrong address entirely, and misreading a port as a
+    host dials whatever glibc makes of the number, which is why neither
+    reading is applied to a segment that is all digits.
 
     The range check is not cosmetic, and it is not a tidiness rule either.  A
     port outside 0..65535 does not fail loudly on the way to a socket: passed
     to ``connect`` it raises ``OverflowError``, which is not an ``OSError`` and
     so is not caught by the probe, and passed to ``getaddrinfo`` it is
     truncated modulo 65536 instead, which means ``host:99999`` would quietly
-    dial port 34463 -- a real probe of an address nobody configured.  Reading
-    such a segment as a host name avoids both.
+    dial port 34463 -- a real probe of an address nobody configured.
 
-    **The refusal.**  With more than one colon present, the setting is refused
-    outright -- no entries, no probe -- unless every segment could be a host
-    name and no blank segment sits anywhere but the first or last position.
-    An IPv6 literal is exactly the input where "colon-separated list of hosts"
-    and "one address" are indistinguishable: ``fe80::1`` split on ``:`` used to
-    read as host ``fe80`` on port 1, and ``[fe80::1]:6566`` as three names no
-    resolver can answer (WR-01).  The stray colon at either edge stays
-    tolerated, because ``: host-a :`` has only ever meant one host.
+    Reading such a segment as a host name does *not* avoid that, which is what
+    R2-WR-01 established and what this docstring used to claim.  Measured on
+    this machine, ``getaddrinfo('99999', 6566)`` answers ``0.1.134.159``:
+    glibc's single-integer IPv4 form means the junk dial happens anyway, at a
+    different address nobody configured.  The segment is therefore *dropped* --
+    ``_looks_like_a_host_name`` refuses all-digit segments and the returned
+    tuple is filtered through it -- so ``host:99999`` yields ``host`` alone,
+    and dropping is what avoids the dial.
+
+    **The refusal.**  An IPv6 literal is exactly the input where
+    "colon-separated list of hosts" and "one address" are indistinguishable, so
+    the stdlib is asked first: when the whole setting parses as an IPv6
+    address, there are no entries and no probe
+    (``_looks_like_an_ipv6_literal``).  That covers the compressed spelling and
+    the expanded one alike, which the segment rules alone did not -- before it,
+    ``2001:db8:0:0:0:0:0:1`` produced eight entries, five of them ``0``
+    (R2-WR-01).
+
+    The segment rules stay on top of it, because the stdlib will not parse
+    every spelling an operator can type.  With more than one colon present the
+    setting is refused outright unless every segment could be a host name and
+    no blank segment sits anywhere but the first or last position.  The blank
+    half catches ``[fe80::1]:6566`` if it ever reaches here, and the
+    host-name half catches ``[2001:db8:0:0:0:0:0:1]:6566``, which has no blank
+    segment at all and whose bracket-stripped form is nine groups the stdlib
+    rejects.  The stray colon at either edge stays tolerated, because
+    ``: host-a :`` has only ever meant one host.
 
     Returning ``()`` is not a silent failure; it is the fallback this module
     documents everywhere else.  No entries means no probe, which means the
@@ -578,11 +651,14 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
         host_setting: The configured ``scanner.host``, possibly empty.
 
     Returns:
-        One ``(host, port)`` pair per entry, in the configured order.  Empty
-        when nothing is configured, every segment is blank, or the setting is
-        one this module refuses to guess at.
+        One ``(host, port)`` pair per entry that could be a host name, in the
+        configured order.  Empty when nothing is configured, every segment is
+        blank or was dropped, or the setting is one this module refuses to
+        guess at.
 
     """
+    if _looks_like_an_ipv6_literal(host_setting):
+        return ()
     segments = [segment.strip() for segment in host_setting.split(":")]
     present = [segment for segment in segments if segment]
     if not present:
@@ -594,9 +670,17 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
         return ()
     if len(present) == 2:
         host, maybe_port = present
-        if maybe_port.isdigit() and 0 < int(maybe_port) <= 65535:
+        # The host half is checked too, so ``0:6566`` cannot slip an all-digit
+        # host through the one branch that does not reach the filter below.
+        if (
+            _looks_like_a_host_name(host)
+            and maybe_port.isdigit()
+            and 0 < int(maybe_port) <= 65535
+        ):
             return ((host, int(maybe_port)),)
-    return tuple((host, SANED_PORT) for host in present)
+    return tuple(
+        (host, SANED_PORT) for host in present if _looks_like_a_host_name(host)
+    )
 
 
 def _saned_reachable(host: str, port: int, timeout: float) -> bool:
