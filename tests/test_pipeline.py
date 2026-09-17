@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import errno
+import inspect
 import logging
 import shutil
 import threading
@@ -43,6 +44,7 @@ from saneless.pipeline import (
     ScanResult,
     _check_disk_space,
     _interleave_duplex,
+    _note_pass_count,
     _preserving,
     _warn_if_failed_dir_growing,
     run_pipeline,
@@ -4916,3 +4918,241 @@ class TestRejectedPagesAreNotBlankPages:
 
         assert result.pages_removed == 0
         assert result.warning is None
+
+
+class TestTitleLogEscaping:
+    """
+    A job title in a pipeline log line is escaped, not pasted (IN-03).
+
+    ``web/errors.py``'s module docstring states the discipline: request input
+    goes into a log line with ``%r`` "so a control character in them is escaped
+    and cannot forge a log line".  A job title is request input, is bounded
+    only in length (``TITLE_MAX_LENGTH``) and never in character set, so a
+    title carrying a newline could otherwise append a record of the operator's
+    own choosing to the log an operator and any log shipper reads.
+
+    Every assertion here is on ``record.getMessage()`` -- the formatted line --
+    rather than on ``record.args``, because the raw argument is the unescaped
+    title by design and asserting on it would pass whatever the format string
+    said.
+    """
+
+    #: A title whose newline would start a plausible-looking second record.
+    FORGING_TITLE = "a\nINFO forged"
+
+    @staticmethod
+    def _pass_count_message(title: str, caplog: pytest.LogCaptureFixture) -> str:
+        """
+        Drive ``_note_pass_count``'s failure path and return its log line.
+
+        Args:
+            title: The request title to put through the log line.
+            caplog: pytest's log capture fixture.
+
+        Returns:
+            The formatted message of the pass-count failure record.
+
+        """
+
+        def exploding(label: str, count: int) -> None:
+            """
+            Fail the way an observer might.
+
+            Args:
+                label: Ignored.
+                count: Ignored.
+
+            Raises:
+                RuntimeError: Always.
+
+            """
+            msg = f"observer refused {label}={count}"
+            raise RuntimeError(msg)
+
+        request = PipelineRequest(
+            profile_name="default", title=title, pass_count_callback=exploding
+        )
+
+        with caplog.at_level(logging.ERROR, logger="saneless.pipeline"):
+            _note_pass_count(request, SCAN_LABEL_FRONT, 3)
+
+        records = [
+            record
+            for record in caplog.records
+            if "Pass-count observer failed" in str(record.msg)
+        ]
+        assert len(records) == 1
+        return records[0].getMessage()
+
+    @classmethod
+    def _forging_request(cls) -> PipelineRequest:
+        """
+        Build a request whose title carries a newline.
+
+        Returns:
+            A request usable on both the simplex and the mismatch path.
+
+        """
+        return PipelineRequest(
+            profile_name="default",
+            title=cls.FORGING_TITLE,
+            flip_coordinator=AlwaysContinueFlipCoordinator(),
+        )
+
+    @staticmethod
+    def _completion_message(
+        caplog: pytest.LogCaptureFixture,
+        scanner: MagicMock,
+        request: PipelineRequest,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+    ) -> str:
+        """
+        Run a pipeline to completion and return its "Pipeline complete" line.
+
+        Args:
+            caplog: pytest's log capture fixture.
+            scanner: A scanner whose pages the run consumes.
+            request: The request whose title reaches the log line.
+            mock_paperless: The stub Paperless client.
+            default_settings: The fixture settings, already pointed at a
+                temporary spool directory by the caller.
+
+        Returns:
+            The formatted message of the completion record.
+
+        """
+        with caplog.at_level(logging.INFO, logger="saneless.pipeline"):
+            run_pipeline(
+                scanner=scanner,
+                paperless=mock_paperless,
+                settings=default_settings,
+                request=request,
+            )
+
+        records = [
+            record
+            for record in caplog.records
+            if "Pipeline complete" in str(record.msg)
+        ]
+        assert len(records) == 1
+        return records[0].getMessage()
+
+    def test_a_newline_in_a_title_cannot_forge_a_pass_count_log_line(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The call this phase added escapes the title it logs (IN-03).
+
+        Args:
+            caplog: pytest's log capture fixture.
+
+        """
+        message = self._pass_count_message(self.FORGING_TITLE, caplog)
+
+        assert "\n" not in message
+        assert "\\n" in message
+
+    def test_a_newline_in_a_title_cannot_forge_the_completion_log_line(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The simplex completion line gets the same treatment.
+
+        Args:
+            caplog: pytest's log capture fixture.
+            mock_paperless: The stub Paperless client.
+            default_settings: The fixture settings.
+            tmp_path: pytest's per-test temporary directory.
+
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [_make_content_image() for _ in range(2)]
+        )
+
+        message = self._completion_message(
+            caplog,
+            scanner,
+            self._forging_request(),
+            mock_paperless,
+            default_settings,
+        )
+
+        assert "\n" not in message
+        assert "\\n" in message
+
+    def test_a_newline_in_a_title_cannot_forge_the_mismatch_log_line(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        So does the duplex-mismatch recovery's completion line.
+
+        Args:
+            caplog: pytest's log capture fixture.
+            mock_paperless: The stub Paperless client.
+            default_settings: The fixture settings.
+            tmp_path: pytest's per-test temporary directory.
+
+        """
+        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image() for _ in range(3)],
+            [_make_content_image() for _ in range(2)],
+        )
+
+        message = self._completion_message(
+            caplog,
+            scanner,
+            self._forging_request(),
+            mock_paperless,
+            default_settings,
+        )
+
+        assert "duplex mismatch recovery" in message
+        assert "\n" not in message
+        assert "\\n" in message
+
+    def test_a_quoted_title_still_renders_readably(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        Escaping a title does not make it unreadable to the operator.
+
+        Asserted as "the words are still there and the line is still one
+        line", not as an exact repr, so a future change to Python's repr
+        quoting does not fail this test.
+
+        Args:
+            caplog: pytest's log capture fixture.
+
+        """
+        message = self._pass_count_message('Q4 "final" it\'s done', caplog)
+
+        assert "\n" not in message
+        for word in ("Q4", "final", "done"):
+            assert word in message
+
+    def test_no_quoted_percent_s_interpolation_remains(self) -> None:
+        """
+        No ``'%s'``-shaped interpolation is left to paste input into a line.
+
+        A source-level guard rather than a behaviour one: it catches a new
+        call site added later that follows the old style, which no per-call
+        test would notice.
+        """
+        source = inspect.getsource(pipeline_module)
+
+        assert "'%s'" not in source
