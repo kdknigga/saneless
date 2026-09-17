@@ -611,14 +611,25 @@ def local_time(value: datetime) -> str:
     and helps nobody.  No ``zoneinfo`` import and no new config key is
     involved -- the operator's ``TZ`` is the single source.
 
+    ``%Z`` renders as the empty string when the platform reports no zone
+    abbreviation, which leaves the separator before it dangling at the end of
+    the value.  ``resolve_job_title`` interpolates this result directly into
+    ``f"Scan {local_time(now)}"``, so an unstripped value would file a
+    paperless-ngx document whose title ends in a space -- an invisible
+    difference from every other host's titles, in an artefact that leaves the
+    appliance.  Hence the strip.  It is deliberately trailing-only: the space
+    between the date and the time is part of the format and stays, which is
+    why this is ``rstrip`` and not ``" ".join(value.split())``.
+
     Args:
         value: A timezone-aware timestamp.
 
     Returns:
-        The timestamp as ``2026-09-16 14:03 CDT``.
+        The timestamp as ``2026-09-16 14:03 CDT``, with no trailing
+        whitespace.
 
     """
-    return value.astimezone().strftime(LOCAL_TIME_FORMAT)
+    return value.astimezone().strftime(LOCAL_TIME_FORMAT).rstrip()
 
 
 def page_counts(job: PageCounted) -> str | None:

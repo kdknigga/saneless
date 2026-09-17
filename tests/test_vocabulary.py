@@ -589,6 +589,113 @@ class TestLocalTime:
         )
 
 
+class TestLocalTimeTrailingSpace:
+    """
+    local_time never emits trailing whitespace (IN-06, APPL-12).
+
+    ``LOCAL_TIME_FORMAT`` ends in ``%Z``, which ``strftime`` renders as the
+    empty string on a platform that reports no zone abbreviation, leaving the
+    separator before it dangling.  ``resolve_job_title`` interpolates the
+    result straight into ``f"Scan {local_time(now)}"``, so such a host files a
+    paperless-ngx document whose title ends in a space.
+
+    That platform cannot be reproduced portably -- POSIX requires a zone
+    abbreviation of at least three characters, so no ``TZ`` value produces an
+    empty ``%Z`` on glibc -- so these tests pin the *property* instead, by
+    monkeypatching the module's format to one that ends in whitespace.  Read
+    together with ``test_the_shared_format_still_names_the_zone`` they say: the
+    zone stays on the line, and whatever it renders as, the result is clean.
+    """
+
+    #: Stand-ins for a format whose final ``%Z`` rendered empty.  A literal
+    #: space is the real case; the tab and the double space are there so the
+    #: fix cannot be a special case for one character.
+    WHITESPACE_FORMATS = ("%Y-%m-%d %H:%M ", "%Y-%m-%d %H:%M\t", "%Y-%m-%d %H:%M  ")
+
+    def test_the_shared_format_still_names_the_zone(self) -> None:
+        """
+        The fix must not reach its goal by dropping ``%Z`` (D-34).
+
+        A doc truth: D-34 pins the ``2026-09-16 14:03 CDT`` shape, so removing
+        the zone would satisfy the trailing-space property and break the
+        contract the constant exists to hold.
+        """
+        assert LOCAL_TIME_FORMAT.endswith("%Z")
+
+    @pytest.mark.parametrize("fmt", WHITESPACE_FORMATS)
+    def test_a_format_ending_in_whitespace_renders_clean(
+        self, monkeypatch: pytest.MonkeyPatch, fmt: str
+    ) -> None:
+        """
+        Whatever whitespace the format leaves dangling is not returned.
+
+        Args:
+            monkeypatch: pytest's patcher, used on the module global that
+                ``local_time`` looks up at call time.
+            fmt: A format standing in for one whose ``%Z`` rendered empty.
+
+        """
+        monkeypatch.setattr("saneless.vocabulary.LOCAL_TIME_FORMAT", fmt)
+
+        rendered = local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC))
+
+        assert rendered == rendered.rstrip()
+
+    def test_the_rest_of_the_rendering_is_untouched(
+        self, monkeypatch: pytest.MonkeyPatch, local_zone: Callable[[str], None]
+    ) -> None:
+        """
+        Only the trailing run goes: the date, the time and their separator stay.
+
+        Args:
+            monkeypatch: pytest's patcher, used on the module global.
+            local_zone: The fixture that pins the process's zone, so the exact
+                string below does not depend on the host's zone.
+
+        """
+        local_zone("UTC")
+        monkeypatch.setattr("saneless.vocabulary.LOCAL_TIME_FORMAT", "%Y-%m-%d %H:%M ")
+
+        rendered = local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC))
+
+        assert rendered == "2026-09-16 19:03"
+
+    def test_a_leading_character_is_never_stripped(
+        self, monkeypatch: pytest.MonkeyPatch, local_zone: Callable[[str], None]
+    ) -> None:
+        """
+        The strip is trailing-only, so a leading space in a format survives.
+
+        Args:
+            monkeypatch: pytest's patcher, used on the module global.
+            local_zone: The fixture that pins the process's zone.
+
+        """
+        local_zone("UTC")
+        monkeypatch.setattr("saneless.vocabulary.LOCAL_TIME_FORMAT", " %Y-%m-%d %H:%M ")
+
+        rendered = local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC))
+
+        assert rendered == " 2026-09-16 19:03"
+
+    def test_a_real_render_is_never_empty(
+        self, local_zone: Callable[[str], None]
+    ) -> None:
+        """
+        A valid aware datetime always renders something on a real host.
+
+        Args:
+            local_zone: The fixture that pins the process's zone.
+
+        """
+        local_zone("America/Chicago")
+
+        rendered = local_time(datetime(2026, 9, 16, 19, 3, tzinfo=UTC))
+
+        assert rendered
+        assert rendered == rendered.rstrip()
+
+
 class TestPageCounts:
     """page_counts sentence tests (APPL-03, D-32)."""
 
