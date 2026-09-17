@@ -45,6 +45,7 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Iterable
 
     from saneless.config import Settings
@@ -1115,7 +1116,41 @@ def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
     return result
 
 
-def run_checks(context: CheckContext) -> tuple[CheckResult, ...]:
+def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> CheckResult:
+    """
+    Run the scanner check holding the worker's gate, or report it skipped.
+
+    This is the only place in the registry that takes the gate, because
+    ``_check_scanner`` is the only check that enters libsane.  The attempt is
+    non-blocking and a failure is reported rather than waited out, which is the
+    single move ``ScanWorker.scanner_gate`` documents as permitted: blocking
+    here would queue behind a scan that can legitimately run for minutes and
+    then enter SANE at some arbitrary later moment.
+
+    The release is in a ``finally``, so a check that raises still hands the
+    scanner back before the exception reaches ``run_checks``' per-check
+    handler.  A registry that left the gate held would lock the worker out of
+    its own scanner for the life of the process.
+
+    Args:
+        context: The injected dependencies and configuration.
+        scanner_gate: The worker's gate, tried without blocking.
+
+    Returns:
+        The scanner row, or the paused row when the gate was not free.
+
+    """
+    if not scanner_gate.acquire(blocking=False):
+        return _scanner_skipped()
+    try:
+        return _dispatch(CheckKey.SCANNER, context)
+    finally:
+        scanner_gate.release()
+
+
+def run_checks(
+    context: CheckContext, *, scanner_gate: threading.Lock | None = None
+) -> tuple[CheckResult, ...]:
     """
     Run every check once, in member order, and never raise.
 
@@ -1128,16 +1163,39 @@ def run_checks(context: CheckContext) -> tuple[CheckResult, ...]:
     it returns the paused row without entering the backend at all.  That is
     correctness, not politeness: nothing in ``sane_backend.py`` mutually
     excludes two SANE calls, so a status probe landing on the device mid-scan
-    is a second caller into the same C library (Pitfall 2).  The caller derives
-    the flag from the worker's scanner gate.
+    is a second caller into the same C library (Pitfall 2).  It is honoured
+    *first*, before the gate is looked at: a caller that already knows a scan
+    is running has no reason to touch the gate at all.
+
+    The gate is a parameter rather than something the caller holds around this
+    call, and that is the whole of WR-03's fix.  Only ``_check_scanner`` enters
+    libsane.  ``_check_paperless`` carries a multi-second HTTP budget, and
+    ``_check_fallback`` and ``_check_data_dir`` each create and delete a real
+    file.  A caller that wrapped all five made the lock that exists to keep two
+    callers out of libsane into the lock a scan start waits on: ``ScanWorker``
+    would sit in ``with self._scanner_gate:`` with the job row already written
+    ``SCANNING`` while a health probe waited on a Paperless timeout.  Passing
+    the gate in lets the registry hold it for the one check that needs it.
+
+    The attempt on the gate is non-blocking and a failure produces the paused
+    row, which is the one move ``ScanWorker.scanner_gate`` documents as
+    permitted for a caller.  A blocking acquire would be wrong here for the
+    reason that docstring gives: the probe would queue behind a scan that can
+    run for minutes and then enter SANE with the freshness its own caller
+    assumed long gone.
 
     A check that raises is caught and rendered as a red row with a
     developer-constant message.  A registry that could raise would take the
     whole strip down and with it the four checks that were fine, and the
     exception text is exactly the thing that must not reach a LAN-visible page.
+    That handler covers the gated scanner branch too, and the gate is released
+    on the way out of it.
 
     Args:
         context: The injected dependencies and configuration.
+        scanner_gate: The worker's scanner gate, held around the scanner check
+            and nothing else, or ``None`` for a caller with no worker to
+            exclude -- which is what ``saneless doctor`` is.
 
     Returns:
         One result per ``CheckKey`` member, in member order.
@@ -1149,7 +1207,10 @@ def run_checks(context: CheckContext) -> tuple[CheckResult, ...]:
             results.append(_scanner_skipped())
             continue
         try:
-            results.append(_dispatch(key, context))
+            if key is CheckKey.SCANNER and scanner_gate is not None:
+                results.append(_scanner_result(context, scanner_gate))
+            else:
+                results.append(_dispatch(key, context))
         except Exception as exc:
             logger.warning("Check %s raised %s", key.value, type(exc).__name__)
             results.append(
