@@ -431,8 +431,13 @@ def _note_pass_count(request: PipelineRequest, label: str, count: int) -> None:
     try:
         callback(label, count)
     except Exception:
+        # The title is request input, bounded only in length and never in
+        # character set, so it can contain newlines -- it goes into a log line
+        # with %r, which is the discipline web/errors.py's module docstring
+        # states, applied here because this module logs the same class of
+        # value.  %r supplies its own quoting; the format string adds none.
         logger.exception(
-            "Pass-count observer failed for the %s pass of '%s'; the scan "
+            "Pass-count observer failed for the %s pass of %r; the scan "
             "continues and the count is simply not shown",
             label,
             request.title,
@@ -1564,7 +1569,7 @@ def _finish_duplex_mismatch(
     )
     notify = request.status_callback or _noop_callback
     notify(PipelineEvent.DONE)
-    logger.info("Pipeline complete for '%s' (duplex mismatch recovery)", request.title)
+    logger.info("Pipeline complete for %r (duplex mismatch recovery)", request.title)
     mismatch_pages = len(mismatch.fronts) + len(mismatch.backs)
     # The mismatch path does not run _drop_empty_pages, on purpose (D-08), so
     # pages_removed is a hardcoded 0.  A mismatched run is an anomaly sent to a
@@ -2110,7 +2115,7 @@ def run_pipeline(
         # Step 1: Scan
         notify(PipelineEvent.SCANNING)
         logger.info(
-            "Scanning with profile '%s' on device '%s'",
+            "Scanning with profile %r on device %r",
             request.profile_name,
             device_id,
         )
@@ -2208,6 +2213,6 @@ def run_pipeline(
         )
 
         notify(PipelineEvent.DONE)
-        logger.info("Pipeline complete for '%s'", request.title)
+        logger.info("Pipeline complete for %r", request.title)
 
     return result
