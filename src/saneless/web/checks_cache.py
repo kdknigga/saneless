@@ -6,14 +6,24 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from saneless.checks import CheckResult
 
-__all__ = ["CachedChecks", "CheckCache"]
+__all__ = ["MIN_MANUAL_REFRESH_SECONDS", "CachedChecks", "CheckCache"]
+
+# The shortest gap between two honoured Refresh clicks (WR-05).  Two seconds is
+# below the interval a human clicks at -- nobody presses Check again twice in
+# the same two seconds and expects two different answers -- and far above the
+# rate at which a scripted loop is a problem, which is the only case this
+# exists for.  It does not break D-09's promise either: that promise is "do not
+# make somebody wait out a 30 s TTL after plugging the scanner back in", and a
+# 2 s floor leaves it intact.  Deliberately not configurable, and read at call
+# time, so a test can shorten it.
+MIN_MANUAL_REFRESH_SECONDS: Final = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,13 +120,22 @@ class CheckCache:
         """Initialize an empty cache with the given TTL and clock."""
         self._ttl = ttl
         self._clock = clock
-        # Guards every read and every rebind of self._entry, and nothing else;
-        # never a probe.  The entry is a frozen _Entry rebound as a whole, so
-        # holding this for the rebind is what makes "results, stamp and
-        # checked_at always belong to the same store" true for a concurrent
-        # reader (T-30-30).
+        # Guards every read and every rebind of self._entry and of
+        # self._last_manual_claim, and nothing else; never a probe.  The entry
+        # is a frozen _Entry rebound as a whole, so holding this for the rebind
+        # is what makes "results, stamp and checked_at always belong to the
+        # same store" true for a concurrent reader (T-30-30).  The claim stamp
+        # shares it because its read-and-rebind has to be one step for two
+        # request threads arriving together to get one grant between them
+        # (T-30-26-01); the two pieces of state are otherwise unrelated.
         self._lock = threading.Lock()
         self._entry: _Entry | None = None
+        # When a manual refresh was last granted, or None for "never".  None
+        # rather than 0.0 for the reason CheckRefresher._last_watched is None:
+        # time.monotonic() on Linux counts from boot, so 0.0 would sit inside
+        # the interval and refuse the first click on a freshly booted
+        # appliance -- the one click that certainly deserves a probe.
+        self._last_manual_claim: float | None = None
 
     def current(self) -> CachedChecks:
         """
@@ -175,3 +194,50 @@ class CheckCache:
         """
         entry = self.current()
         return entry.results is not None and not entry.stale
+
+    def claim_manual_refresh(
+        self, min_interval: float = MIN_MANUAL_REFRESH_SECONDS
+    ) -> bool:
+        """
+        Say whether a manual refresh may probe right now, and record that it did.
+
+        This is a floor under a deliberate bypass, not a second TTL.  D-09's
+        Refresh button exists precisely to ignore :meth:`is_fresh`, so the TTL
+        cannot bound its cost; without something that can, a click is an
+        unbounded probe.  ``POST /api/checks/refresh`` is unauthenticated by
+        design on a LAN and ``CrossOriginGuard`` allows a request carrying
+        neither ``Sec-Fetch-Site`` nor ``Origin`` -- documented, and exactly
+        what ``curl`` in a loop sends -- so every call issues a Paperless
+        request, up to N saned TCP dials and two filesystem writes.  The worst
+        of that is not the traffic: ``ScanWorker._scan_job`` blocks on a
+        scanner gate that is not a fair lock, so an unbounded loop can park a
+        submitted job whose row already reads ``SCANNING`` (WR-05).
+
+        The claim stamp is deliberately not the entry's own timestamp.
+        Conflating them would let a refused click reset the freshness of
+        results it never produced, and would tie a 2 s floor to a 30 s TTL for
+        no better reason than both being durations.  So a :meth:`store` grants
+        nothing, a grant stores nothing, and an expired entry grants nothing.
+
+        A refusal changes no state.  That matters: if a refusal stamped, a
+        caller hammering the endpoint just inside the interval would hold the
+        floor shut for ever and the household member standing at the appliance
+        would never get their probe.
+
+        The clock is read before the lock is taken, so this never calls out
+        while holding it -- the same discipline the lock's comment states.
+
+        Args:
+            min_interval: The shortest gap between two grants, in seconds.
+
+        Returns:
+            True when the caller may probe, and False when it is too soon.
+
+        """
+        now = self._clock()
+        with self._lock:
+            last = self._last_manual_claim
+            if last is not None and now - last < min_interval:
+                return False
+            self._last_manual_claim = now
+            return True
