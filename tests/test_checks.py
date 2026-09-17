@@ -2532,9 +2532,15 @@ class TestRunChecksUnderTheScannerGate:
         """
         A wedged check must never leave the worker locked out of its scanner.
 
+        What is broken here is the enumeration, because that is the region the
+        gate is held around: the pre-probe now runs before the acquire, so a
+        stand-in for the whole check would never reach the gate to leave it
+        held.  A scanner is supplied for the same reason -- without one the
+        pre-probe settles the row and the gate is never taken.
+
         Args:
             tmp_path: The test's own directory.
-            monkeypatch: Used to break the scanner check on purpose.
+            monkeypatch: Used to break the enumeration on purpose.
 
         """
 
@@ -2542,10 +2548,10 @@ class TestRunChecksUnderTheScannerGate:
             msg = "the scanner check exploded"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(checks, "_check_scanner", boom)
+        monkeypatch.setattr(checks, "_scanner_enumeration", boom)
         gate = _RecordingLock()
         results = run_checks(
-            _context(_settings(tmp_path)),
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()])),
             scanner_gate=cast("threading.Lock", gate),
         )
         assert _row(results, CheckKey.SCANNER).state is CheckState.FAIL
