@@ -844,7 +844,11 @@ def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
         status = request.app.state.paperless.test_connection()
         return {"status": status}
     except Exception as exc:
-        logger.warning("Paperless connection test failed: %s", exc)
+        # The class name and not the exception: a configured paperless.url may
+        # carry ``user:pass@`` and httpx puts the URL it could not reach in the
+        # exception's string form, which is why every handler in this module
+        # names the class instead (ASVS V7, IN-02).
+        logger.warning("Paperless connection test failed: %s", type(exc).__name__)
         return JSONResponse(
             status_code=502,
             content={"status": "error", "detail": type(exc).__name__},
