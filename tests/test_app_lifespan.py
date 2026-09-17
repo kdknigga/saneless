@@ -41,8 +41,10 @@ from saneless.vocabulary import (
     JobState,
     WorkerHealth,
 )
+from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web.app import create_app
+from saneless.worker import STOP_JOIN_SECONDS
 from tests.conftest import StubScannerBackend, wait_for_state
 from tests.fake_sane import FakeSaneModule
 
@@ -424,6 +426,117 @@ def test_both_stop_events_are_set_before_either_join_begins(
     # already signalled before it began.  That is the overlap.
     assert "worker.join" in events
     assert events.index("refresher.set") < events.index("worker.join")
+
+
+class _FakeMonotonic:
+    """
+    A stand-in for ``app``'s ``time`` module whose clock the test moves by hand.
+
+    Only ``monotonic`` is needed: the lifespan reads it twice, once for the
+    deadline and once for what is left of it.  Moving it by hand is how a
+    worker can be made to cost the whole join bound without anything sleeping.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        """Start the fake clock at ``start`` seconds."""
+        self.now = start
+
+    def monotonic(self) -> float:
+        """Return the current fake monotonic reading."""
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Move the clock forward, the way a slow join would move a real one."""
+        self.now += seconds
+
+
+def _recorded_refresher_budget(
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_cost: float,
+) -> float | None:
+    """
+    Run one whole lifespan and report the bound ``refresher.stop`` was given.
+
+    ``worker.stop`` is wrapped so it really stops the worker and then advances
+    the fake clock by ``worker_cost``, which is how much of the shared deadline
+    a slow worker is made to spend.  ``refresher.stop`` is wrapped so it records
+    the bound and then joins with its own default, so the real thread always
+    stops and this test leaks neither a thread nor an open store.
+    """
+    app = _build_app(settings)
+    worker = app.state.worker
+    refresher = app.state.refresher
+    clock = _FakeMonotonic()
+    budgets: list[float | None] = []
+    original_worker_stop = worker.stop
+    original_refresher_stop = refresher.stop
+
+    def costly_worker_stop() -> bool:
+        stopped = original_worker_stop()
+        clock.advance(worker_cost)
+        return stopped
+
+    def recording_refresher_stop(timeout: float | None = None) -> bool:
+        budgets.append(timeout)
+        return original_refresher_stop()
+
+    monkeypatch.setattr(app_module, "time", clock, raising=False)
+    monkeypatch.setattr(worker, "stop", costly_worker_stop)
+    monkeypatch.setattr(refresher, "stop", recording_refresher_stop)
+    with TestClient(app):
+        pass
+    assert len(budgets) == 1
+    return budgets[0]
+
+
+class TestShutdownSharesOneJoinBudget:
+    """
+    One deadline is taken before either join, and the two joins spend it (WR-07).
+
+    Without this, two threads parked in an unbounded ``getaddrinfo`` cost
+    ``2 * STOP_JOIN_SECONDS``, and a container stop grace period sized on the
+    documented bound is half of what it needs to be.
+    """
+
+    def test_an_instant_worker_leaves_the_refresher_the_whole_budget(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker that stops at once spends none of the shared deadline."""
+        budget = _recorded_refresher_budget(settings, monkeypatch, worker_cost=0.0)
+        assert budget == pytest.approx(STOP_JOIN_SECONDS)
+
+    def test_a_worker_that_spends_half_the_budget_leaves_half(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What the worker's join took is gone from the refresher's share."""
+        budget = _recorded_refresher_budget(
+            settings, monkeypatch, worker_cost=STOP_JOIN_SECONDS / 2
+        )
+        assert budget == pytest.approx(STOP_JOIN_SECONDS / 2)
+
+    def test_a_worker_that_spends_the_whole_budget_leaves_nothing(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The assertion that makes the doubling impossible.
+
+        A worker that spent the whole deadline leaves the refresher a poll,
+        not a second full bound.
+        """
+        budget = _recorded_refresher_budget(
+            settings, monkeypatch, worker_cost=STOP_JOIN_SECONDS
+        )
+        assert budget == 0.0
+
+    def test_an_overspent_budget_never_reaches_stop_as_a_negative(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker slower than the whole bound still yields zero, not below."""
+        budget = _recorded_refresher_budget(
+            settings, monkeypatch, worker_cost=STOP_JOIN_SECONDS * 2
+        )
+        assert budget == 0.0
 
 
 def test_the_refresher_starts_after_the_worker(
