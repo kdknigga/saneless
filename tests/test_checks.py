@@ -68,7 +68,7 @@ from saneless.vocabulary import (
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
 # Loopback connects resolve or refuse immediately, so a short budget keeps a
 # hung test from burning the suite's 60 s timeout.
@@ -515,12 +515,22 @@ class TestSanedReachable:
 class _ProbeRecorder:
     """Records what the saned probe did, in place of doing any of it."""
 
-    def __init__(self) -> None:
-        """Start with nothing recorded."""
+    def __init__(self, connectable: Iterable[object] = ()) -> None:
+        """
+        Start with nothing recorded.
+
+        Args:
+            connectable: The sockaddrs whose ``connect`` is allowed to
+                succeed.  Empty by default, so every address refuses unless a
+                case says otherwise and the cases that measure the budget are
+                untouched by the option existing.
+
+        """
         self.constructions: list[tuple[int, int, int]] = []
         self.events: list[str] = []
         self.timeouts: list[float] = []
         self.addresses: list[object] = []
+        self.connectable = frozenset(connectable)
 
     def socket(self, family: int, socktype: int, proto: int) -> _RecordingSocket:
         """
@@ -540,7 +550,7 @@ class _ProbeRecorder:
 
 
 class _RecordingSocket:
-    """A socket that records the calls made to it and always refuses."""
+    """A socket that records the calls made to it and refuses by default."""
 
     def __init__(self, recorder: _ProbeRecorder) -> None:
         """
@@ -590,17 +600,21 @@ class _RecordingSocket:
 
     def connect(self, address: object) -> None:
         """
-        Record the address dialled and refuse, the way a closed port does.
+        Record the address dialled, and refuse unless the case allows it.
 
         Args:
             address: The sockaddr the probe passed.
 
         Raises:
-            OSError: Always.
+            OSError: Whenever the address is not one the recorder was told to
+                accept, the way a closed port does.  That is every address
+                unless a case named one.
 
         """
         self.recorder.events.append("connect")
         self.recorder.addresses.append(address)
+        if address in self.recorder.connectable:
+            return
         msg = "Connection refused"
         raise OSError(msg)
 
@@ -614,22 +628,26 @@ _THREE_ADDRESSES = [
 ]
 
 
-def _install_probe_recorder(monkeypatch: pytest.MonkeyPatch) -> _ProbeRecorder:
+def _install_probe_recorder(
+    monkeypatch: pytest.MonkeyPatch, *, connectable: Iterable[object] = ()
+) -> _ProbeRecorder:
     """
     Replace resolution and socket construction with recording doubles.
 
     Nothing leaves the process: ``getaddrinfo`` answers from a constant and
-    every socket refuses, so the cost being measured is the count of attempts
-    rather than any real handshake, and the test still sleeps for nothing.
+    every socket refuses unless the case names one that may answer, so what is
+    measured is the shape of the walk rather than any real handshake, and the
+    test still sleeps for nothing.
 
     Args:
         monkeypatch: pytest's attribute patcher.
+        connectable: The sockaddrs whose ``connect`` succeeds.
 
     Returns:
         The recorder the probe's calls land in.
 
     """
-    recorder = _ProbeRecorder()
+    recorder = _ProbeRecorder(connectable)
     monkeypatch.setattr(
         socket, "getaddrinfo", lambda *_args, **_kwargs: _THREE_ADDRESSES
     )
@@ -637,18 +655,50 @@ def _install_probe_recorder(monkeypatch: pytest.MonkeyPatch) -> _ProbeRecorder:
     return recorder
 
 
+def _install_a_clock_that_jumps(
+    monkeypatch: pytest.MonkeyPatch, readings: Sequence[float]
+) -> None:
+    """
+    Substitute the probe's monotonic clock with a scripted one.
+
+    The deadline is read from ``checks.monotonic``, imported by bare name
+    precisely so it can be replaced here without touching ``time`` globally.
+    Each call takes the next scripted reading and the last one repeats, so a
+    script can jump the clock past the deadline without any test sleeping.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+        readings: The values successive calls return, in order.
+
+    """
+    remaining = list(readings)
+    final = remaining[-1]
+
+    def _monotonic() -> float:
+        return remaining.pop(0) if remaining else final
+
+    monkeypatch.setattr(checks, "monotonic", _monotonic)
+
+
 class TestSanedProbeBound:
     """One configured host costs one connect budget, not one per address (WR-02)."""
 
-    def test_three_resolved_addresses_cost_one_connect_attempt(
+    def test_three_resolved_addresses_share_one_budget(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A dual-stack host is dialled once, so the bound is the budget itself.
+        Every resolved address is dialled, and all of them share one budget.
 
-        Dialling every resolved address multiplied the documented 2 s by
-        however many addresses the resolver happened to return -- a number
-        nothing in this tree controls.
+        This is the property plan 30-21 wanted.  What it asserted instead was
+        an attempt *count* of one, which is a stronger and different claim,
+        and is the cause of R2-CR-01: the single address dialled was the
+        resolver's first, and RFC 6724 puts IPv6 first.  The bound is a
+        deadline taken once before the walk rather than a per-socket timeout,
+        so three addresses cost at most what one address used to.
+
+        The first timeout is asserted as a bound rather than an equality: it
+        is computed from a real clock read and so lands a hair under the
+        budget.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -656,10 +706,12 @@ class TestSanedProbeBound:
         """
         recorder = _install_probe_recorder(monkeypatch)
         assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
-        assert len(recorder.constructions) == 1
-        assert recorder.events.count("connect") == 1
+        assert len(recorder.constructions) == 3
+        assert recorder.timeouts[0] <= _PROBE_BUDGET
+        assert all(timeout > 0 for timeout in recorder.timeouts)
+        assert recorder.timeouts == sorted(recorder.timeouts, reverse=True)
 
-    def test_the_address_dialled_is_the_first_the_resolver_returned(
+    def test_the_addresses_dialled_are_the_ones_the_resolver_returned(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
@@ -671,15 +723,20 @@ class TestSanedProbeBound:
         """
         recorder = _install_probe_recorder(monkeypatch)
         _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
-        family, socktype, proto, _canonical, sockaddr = _THREE_ADDRESSES[0]
-        assert recorder.constructions == [(family, socktype, proto)]
-        assert recorder.addresses == [sockaddr]
+        assert recorder.addresses == [info[4] for info in _THREE_ADDRESSES]
+        assert recorder.constructions == [info[:3] for info in _THREE_ADDRESSES]
 
-    def test_the_budget_is_applied_before_the_connect(
+    def test_the_budget_is_applied_before_every_connect(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
         A timeout set after the connect would bound nothing at all.
+
+        Comparing the first index of each event is no longer enough now that
+        there are three attempts -- one ``settimeout`` before the first
+        ``connect`` would satisfy that while leaving the other two attempts
+        unbounded.  The event list is walked instead, so every ``connect`` has
+        to be preceded by a ``settimeout`` of its own.
 
         Args:
             monkeypatch: pytest's patcher.
@@ -687,8 +744,79 @@ class TestSanedProbeBound:
         """
         recorder = _install_probe_recorder(monkeypatch)
         _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
-        assert recorder.timeouts == [_PROBE_BUDGET]
-        assert recorder.events.index("settimeout") < recorder.events.index("connect")
+        unspent_budgets = 0
+        for event in recorder.events:
+            if event == "settimeout":
+                unspent_budgets += 1
+            elif event == "connect":
+                assert unspent_budgets > 0, "a connect was dialled with no budget set"
+                unspent_budgets -= 1
+        assert recorder.events.count("connect") == 3
+
+    def test_a_later_address_that_answers_makes_the_host_reachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A host answering on its second address is reachable, not dead (R2-CR-01).
+
+        Measured on this machine, ``localhost`` resolves to ``::1`` and then
+        ``127.0.0.1``: ``getaddrinfo`` is called without ``AI_ADDRCONFIG``, so
+        glibc returns AAAA records even with no IPv6 route, and RFC 6724 puts
+        the IPv6 address first.  saned commonly binds v4-only.  Dialling only
+        the resolver's first answer therefore called every such host dead, and
+        the pre-probe's short circuit turned that into a permanent amber row
+        on an appliance that scans perfectly well.
+
+        The third address is never dialled, because the walk stops at the
+        first address that answers.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        answering = _THREE_ADDRESSES[1][4]
+        recorder = _install_probe_recorder(monkeypatch, connectable=[answering])
+        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is True
+        assert recorder.addresses == [_THREE_ADDRESSES[0][4], answering]
+
+    def test_the_deadline_stops_the_walk(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """
+        A clock past the deadline ends the walk instead of dialling on.
+
+        This is what keeps the multi-address walk inside the bound rather than
+        multiplying it: a first attempt that spends the whole budget leaves
+        nothing for the second, so the second is not attempted at all.  The
+        clock is scripted rather than waited on -- no test in this file sleeps.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        _install_a_clock_that_jumps(monkeypatch, [0.0, 0.0, 99.0])
+        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert len(recorder.constructions) == 1
+
+    def test_a_resolver_that_returns_nothing_is_not_reachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An empty resolver answer is False, not an ``IndexError`` (R2-IN-01).
+
+        ``getaddrinfo(...)[0]`` on an empty list raises ``IndexError``, which
+        is not an ``OSError`` and so escaped the probe's one ``except`` arm
+        into ``run_checks``' generic red row.  The walk has no subscript, so
+        an empty answer is simply a loop body that never runs.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _ProbeRecorder()
+        monkeypatch.setattr(socket, "getaddrinfo", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(socket, "socket", recorder.socket)
+        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert recorder.constructions == []
 
     def test_a_resolver_that_raises_is_not_reachable(
         self, monkeypatch: pytest.MonkeyPatch
