@@ -927,6 +927,51 @@ def _scanner_skipped() -> CheckResult:
     )
 
 
+def _scanner_busy() -> CheckResult:
+    """
+    Build the row shown when something else held the scanner gate (R2-WR-02).
+
+    This exists separately from ``_scanner_skipped`` because the distinction is
+    the whole of the fix.  ``run_checks`` honours ``context.skip_scanner``
+    *before* the gate is consulted, so by the time a non-blocking acquire fails
+    a running scan has already been excluded: whatever holds the gate is not a
+    scan, and a row that says one is running is simply false.  Today there is
+    one known contender, and it is not hypothetical --
+    ``ScanWorker._read_generated_profiles`` takes the gate around
+    ``get_devices()`` and ``get_capabilities()`` as the worker thread's first
+    act at startup (``worker.py:947``), while ``_current_job_id`` is still
+    ``None`` (it is set at ``worker.py:1394``).  The lifespan starts the worker
+    and then the refresher, so that window coincides exactly with the
+    cold-start poll -- which is how ``_scanner_skipped``'s sentence came to sit
+    beside a last-checked time on an appliance that had never scanned.
+
+    The state is ``OK`` for the same reason ``_scanner_skipped``'s is, restated
+    because it is easy to read as a bug: "we did not look" is a fact about the
+    probe, not a verdict about the appliance, and a scripted health gate keyed
+    on red (D-01) must not fail because two threads wanted the scanner in the
+    same instant.  The ``skipped`` flag discloses that nothing was checked.
+
+    There is deliberately **no** next step.  ``_scanner_skipped`` carries none
+    either, and for the same reason: the next probe fixes this by itself,
+    within one refresh interval, so telling a household member to do something
+    would be asking them to act on a condition that is already clearing.
+
+    The message names no scan, and it names no host, address, port, path or
+    exception either (ASVS V7), which is the same omission
+    ``_scanner_host_unanswered`` makes on purpose.
+
+    Returns:
+        The neutral contention row, ``skipped`` true because no probe ran.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.OK,
+        message="The scanner was busy, so it was not checked this time.",
+        skipped=True,
+    )
+
+
 def _check_scanner(context: CheckContext) -> CheckResult:
     """
     Report whether a scanner is there to scan with.
@@ -1283,16 +1328,23 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     handler.  A registry that left the gate held would lock the worker out of
     its own scanner for the life of the process.
 
+    A failed acquire is reported as ``_scanner_busy()`` and not as
+    ``_scanner_skipped()``.  The latter names a running scan, and ``run_checks``
+    has already dealt with that case before this function is reached, so the
+    only thing a lost gate establishes is that somebody else is in SANE --
+    today, the worker's startup capability read, which runs before any job
+    exists (R2-WR-02).
+
     Args:
         context: The injected dependencies and configuration.
         scanner_gate: The worker's gate, tried without blocking.
 
     Returns:
-        The scanner row, or the paused row when the gate was not free.
+        The scanner row, or the neutral busy row when the gate was not free.
 
     """
     if not scanner_gate.acquire(blocking=False):
-        return _scanner_skipped()
+        return _scanner_busy()
     try:
         return _dispatch(CheckKey.SCANNER, context)
     finally:
