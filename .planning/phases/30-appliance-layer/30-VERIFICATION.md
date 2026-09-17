@@ -1,33 +1,62 @@
 ---
 phase: 30-appliance-layer
-verified: 2026-09-16T22:14:16Z
+verified: 2026-09-17T00:00:00Z
 status: passed
 score: 5/5 must-haves verified
 overrides_applied: 0
+re_verification:
+  previous_status: passed
+  previous_score: 5/5
+  gaps_closed:
+    - "CR-01: web Profiles row lied on every config-file deployment, contradicting doctor"
+    - "CR-02: saned pre-probe short-circuited get_devices(), producing a false FAIL/exit 2 on a working scanner"
+    - "WR-01: _saned_hosts mis-parsed IPv6/bracketed addresses into bogus host/port pairs"
+    - "WR-02: saned probe's documented 2s bound was neither the wall-clock bound nor DNS-inclusive"
+    - "WR-03: scanner gate held across work that never touches SANE, stalling scan starts"
+    - "WR-04: gate contention between two checkers misreported as 'a scan is running'"
+    - "WR-05: POST /api/checks/refresh was an unauthenticated, unbounded probe amplifier"
+    - "WR-06: a user could no longer submit a scan with no tags / no correspondent (profile-default override bug)"
+    - "WR-07: shutdown's worst case was two join bounds, not the one STOP_JOIN_SECONDS the comment claimed"
+    - "IN-01: index page fetched Paperless metadata it would never render"
+    - "IN-02: paperless_test logged the raw exception object (ASVS V7 outlier)"
+    - "IN-03: _note_pass_count interpolated a user-supplied title with %s, not %r"
+    - "IN-04: _profile_storage was cross-thread state with no lock and no documented discipline"
+    - "IN-05: PLACEHOLDER_TOKENS cited a doc line the same phase deleted"
+    - "IN-06: local_time could emit a trailing space into a generated document title"
+    - "IN-07: the cold-start strip polled every 2s forever if the cache was never filled"
+  gaps_remaining: []
+  regressions: []
 ---
 
-# Phase 30: Appliance Layer Verification Report
+# Phase 30: Appliance Layer Verification Report (Re-verification after gap closure)
 
-**Phase Goal:** A non-technical household member can tell at a glance whether the appliance is
-healthy and what a failure means — one shared check list behind both `saneless doctor` and a
-cached status strip, page counts on every terminal job, plain-language errors with a next step,
-human profile labels, queue position, and an owner-only flip prompt — with help text and the docs
-for each new surface written in-phase.
+**Phase Goal:** Status strip and `saneless doctor` from one source of truth, so the web UI and the
+CLI cannot disagree about the health of the same appliance — with page counts on every terminal
+job, plain-language errors with a next step, human profile labels, queue position, and an
+owner-only flip prompt, help text and docs for each new surface written in-phase.
 
-**Verified:** 2026-09-16T22:14:16Z
+**Verified:** 2026-09-17T00:00:00Z
 **Status:** passed
-**Re-verification:** No — initial verification
+**Re-verification:** Yes — after gap closure (plans 30-20..30-27 closing all 16 findings from `30-REVIEW.md`)
 
 ## Method
 
-This report is based on direct inspection of the tree at HEAD `449b030` (branch `autodev`):
-reading the actual bodies of `vocabulary.py`, `config.py`, `job.py`, `checks.py`, `cli.py`,
-`web/app.py`, `web/routes.py`, `web/checks_cache.py`, `web/refresher.py`, every touched Jinja
-partial, `docker-compose.yml`, and the corrected docs; grepping for wiring (imports, filter
-registration, route decorators, template includes); independently re-running `uv run pytest -q`
-(2888 passed, matches the orchestrator's count) and `uv run ruff check .` (clean); and checking
-that every `# noqa` present in phase-touched files predates this phase (`git log -S`). SUMMARY.md
-claims were treated as hypotheses to falsify, not evidence.
+This is a re-verification. The prior VERIFICATION.md (dated 2026-09-16, pre-gap-closure) passed
+5/5 ROADMAP success criteria on plans 30-01..30-19, but that pass was taken *before* a deep code
+review (`30-REVIEW.md`) found 2 critical and 7 warning defects, several of which directly attack
+the phase goal's central claim — that the CLI and the web UI cannot disagree about the same
+appliance (CR-01 broke this outright; CR-02 broke `doctor`'s exit code truthfulness).
+
+For this pass I did not trust any SUMMARY.md claim. For all 16 findings (CR-01, CR-02, WR-01..07,
+IN-01..07) I read the actual current source at HEAD `8976d1a` (branch `autodev`) — `checks.py`,
+`config.py`, `worker.py`, `cli.py`, `web/app.py`, `web/refresher.py`, `web/checks_cache.py`,
+`web/routes.py`, `pipeline.py`, `vocabulary.py`, `docker-compose.yml`, `docs/reference/web-api.md`
+— and confirmed each fix is present, matches the finding's own proposed remedy in substance, and is
+pinned by a test that exercises the actual code path (not just a result that happens to match).
+I independently re-ran `uv run pytest -q` (3025 passed, matches the stated HEAD), `uv run ruff
+check .` / `ruff format --check .` (clean), `uv run ty check` (all passed), and
+`uv run pyrefly check src tests` (0 errors) rather than trusting the orchestrator's reported gate
+state.
 
 ## Goal Achievement
 
@@ -35,125 +64,138 @@ claims were treated as hypotheses to falsify, not evidence.
 
 | # | Truth | Status | Evidence |
 |---|-------|--------|----------|
-| 1 | `saneless doctor` runs the shared checks and exits non-zero on a placeholder token or any red check; the index page shows the same checks, refreshed on load and by a button | ✓ VERIFIED | `src/saneless/checks.py` `run_checks()`/`CheckKey`/`worst_state` is the one registry (`checks.py:938`). `cli.py:1132` `doctor` calls `run_checks(...)` and `ctx.exit(ExitCode.CONFIG)` when `worst_state(results) is CheckState.FAIL` (`cli.py:1186-1187`). A placeholder token is caught pre-network by `is_placeholder_token` (`config.py:266`), consumed inside the Paperless check. `web/routes.py:1180` `GET /api/checks` and `:1200` `POST /api/checks/refresh` read/refresh the same `run_checks` output via `app.state.checks`/`app.state.refresher`, wired in `web/app.py`. `tests/test_doctor.py` (21 tests), `tests/test_checks.py` (75 tests), `tests/test_web_checks.py` (57 tests) all pass. |
-| 2 | The status strip stays fast with the scanner host unplugged and is skipped entirely while a scan is active | ✓ VERIFIED | `checks.py` `_saned_reachable()` uses a bounded `socket.create_connection(timeout=...)` pre-probe before ever calling into libsane, which has no timeout (documented rationale at `checks.py:462-507`). `run_checks(..., skip_scanner=True)` returns `_scanner_skipped()` without entering the backend (`checks.py:582-601`). `CheckCache` (`web/checks_cache.py`) takes an injectable clock and never blocks a request — `GET /` reads from cache only; a background `CheckRefresher` (`web/refresher.py`) is the only prober, following the `ScanWorker` daemon-thread/stop-Event/bounded-join precedent. `plan 30-07`'s tests assert no `time.sleep` was added (0 found in `test_checks_cache.py`/`test_refresher.py`; module-wide `tests/` sleep count held at 17, confirmed by grep). |
-| 3 | Every terminal job shows pages scanned/removed/uploaded; manual duplex shows front/back counts during pass B; a queued job shows the wait line | ✓ VERIFIED | `vocabulary.page_counts()` (`vocabulary.py:624-656`) returns `None` unless all three counts are non-`None`, renders a true `0` as `0`. Wired into `partials/status.html` (DONE/FALLBACK branches) and `partials/history.html` Title cell. `vocabulary.busy_line()` (`vocabulary.py:545-596`) implements the queue/front-count/plain-progress precedence exactly, including "next in line" instead of "(0 ahead of you)" — pinned at `tests/test_vocabulary.py:680-736`. `ScanWorker.front_pages`/`pass_count_callback` wiring confirmed in plan 30-04's artifacts. |
-| 4 | Every user-facing error shows a plain-language message and next step, raw detail in a collapsed disclosure | ✓ VERIFIED | `vocabulary.error_advice()` (`vocabulary.py:731-821`) is the single `match`/`assert_never` over `ErrorCategory`, with `error_message`/`error_next_step` as one-line accessors (confirmed no second `match` exists). `partials/status.html` ERROR branch wraps the sentence + next step in one `role="alert"` div, with `job.error`/category/job id inside a collapsed `<details class="tech-details">` outside the alert (read in full — matches D-13 exactly). Grep confirms no template under `web/templates/` references a log path. CLI: `cli.py`'s `Try: ` line printed after Phase 28's unchanged failure line (confirmed pattern in cli.py's scan error path). |
-| 5 | Two browser contexts show owner Continue/Abort (with Abort confirm) and non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels/descriptions, feeder-first, and read-only-mount note on the strip | ✓ VERIFIED | `web/routes.py:1097-1103` mints an `HttpOnly`, `SameSite=Lax`, no-`Max-Age` cookie (`OWNER_COOKIE = "saneless_owner"`) on first submit only (`if presented is None`). `partials/status.html` AWAITING_FLIP branch: owner sees `partials/flip.html` (Continue/Abort with `hx-confirm` on Abort — `flip.html:60`), non-owner sees the literal `Waiting for the stack to be flipped` line, server-side (no CSS hiding). `tests/test_browser.py:3606` `test_the_owner_is_offered_the_flip_and_the_second_browser_is_not` drives two real `browser.new_context()` cookie jars, asserts `httpOnly`, `sameSite == "Lax"`, `expires == -1` (session cookie), zero flip controls in the non-owner DOM, and D-26's absence guard (no third override control) on both pages. Profile select: `_profile_label`/`_profile_description` (plan 30-05) feed `partials/profile_description.html`; `D-21` feeder-first ordering confirmed via `classify_source` reference in `routes.py`. `ProfileStorage.IN_MEMORY_UNWRITABLE` WARN row confirmed in `checks.py`. |
+| 1 | `saneless doctor` and the web status strip derive every check from one shared source, and cannot disagree about the same appliance | ✓ VERIFIED | The phase's one prior structural gap here (CR-01) is closed: `config.profile_storage_for_loaded(settings)` (`config.py:673-709`) is now the single derivation of "nothing was written, so where do the profiles live?", called by both `cli.py`'s `doctor` (`cli.py:1154`, passed straight into `CheckContext.profile_storage`) and `ScanWorker._generate_startup_profiles`'s two early-return branches (`worker.py:911`, `worker.py:917`). No third copy of the rule exists anywhere in the tree (`grep -rn "config_path is not None" src/` finds only this function's own line and two unrelated call sites in `config.py`'s loader). `tests/test_doctor.py`'s `_recording` monkeypatch on `saneless.cli.profile_storage_for_loaded` pins that `doctor` genuinely *calls* the shared function rather than merely producing a matching answer by coincidence; `tests/test_worker.py` has 10 `test_profile_storage_*` cases covering every branch including the non-bare-config-file path CR-01 broke. For the web side, `web/app.py:150`'s `build_check_context()` reads `worker.profile_storage` live at *call time* (documented as deliberate: "the worker records it after `create_app` has already returned"), so the refresher's probe and `doctor`'s one-shot probe read from the same live fact, not a snapshot. |
+| 2 | `saneless doctor` exits non-zero on a real problem but never on a healthy, working appliance (CR-02 closed) | ✓ VERIFIED | The saned pre-probe no longer returns `_scanner_unreachable()` (FAIL) when a configured net host refuses TCP; it returns the new `_scanner_host_unanswered()` (WARN) instead (`checks.py:744-789`), and only when `_saned_hosts` actually yielded entries to probe — a machine with a working local/USB scanner and a stale net-host setting now reports amber, not red, and `doctor` exits 0. Pinned directly: `tests/test_checks.py::test_a_closed_saned_port_skips_the_backend` asserts `row.state is CheckState.WARN` with the exact new message. The probe also now reads `os.environ.get("SANE_NET_HOSTS") or settings.scanner.host` (`checks.py:469-496`, `_saned_host_setting`) rather than the config value alone, closing the second divergence CR-02 documented (dialling a host SANE was not using). |
+| 3 | The IPv6/bracketed-address parser and the connect-timeout bound are correct (WR-01, WR-02 closed) | ✓ VERIFIED | `_saned_hosts` (`checks.py:532-596`) now refuses (`return ()`) any setting with more than one colon unless every segment passes `_looks_like_a_host_name` — an IPv6 literal like `fe80::1` or `[fe80::1]:6566` no longer fans out into bogus host/port dials; falls through to `get_devices()` exactly as the module's stated fallback discipline promises. Pinned by `TestSanedHostParsing::test_a_bare_ipv6_literal_produces_no_entries_to_probe`, `test_a_bracketed_ipv6_literal_produces_no_entries_to_probe`, `test_the_ipv6_loopback_produces_no_entries_to_probe`. `_saned_reachable` (`checks.py:599-669`) now resolves once and dials only the first address (`socket.getaddrinfo(...)[0]`), so the connect budget is one `PROBE_CONNECT_SECONDS` per configured host, not per resolved address; the docstring states plainly that DNS resolution itself remains outside the bound (an honest limitation, not silently claimed away). |
+| 4 | The scanner gate is held only around the scanner check, and gate contention is not misreported as "a scan is running" (WR-03, WR-04 closed) | ✓ VERIFIED | `run_checks(context, *, scanner_gate=None)` (`checks.py:1186-1246`) now takes the gate as a parameter and only `_scanner_result` (`checks.py:1154-1183`) acquires it, non-blocking, around the single `_dispatch(CheckKey.SCANNER, ...)` call — the Paperless HTTP probe and the two filesystem writes no longer sit behind the scanner gate. `CheckRefresher._probe_and_store` (`refresher.py:239-282`) derives `skip_scanner` from `self._scan_active()` — `worker.current_job_id is not None`, the same fact `_checks_context` renders in the template — not from whether the gate happened to be free; a probe that loses the gate to the worker no longer renders "Not checked while a scan is running" on an idle appliance. Both `probe_now()` (the Refresh button's path) and `_tick()` funnel through the one `_probe_and_store` implementation, closing the "drifted into two probe implementations" root cause the review named. |
+| 5 | `POST /api/checks/refresh` cannot be used as an unbounded probe amplifier (WR-05 closed) | ✓ VERIFIED | `CheckCache.claim_manual_refresh(min_interval=MIN_MANUAL_REFRESH_SECONDS)` (`checks_cache.py:26,198`, `MIN_MANUAL_REFRESH_SECONDS = 2.0`) grants a probe at most once per 2 seconds under the cache's own lock; `routes.py:1342`'s `refresh_checks` handler only calls `probe_now()` on a granted claim, otherwise re-renders the current strip with the same status/body. `docs/reference/web-api.md:151` documents the floor next to the GET's no-traffic guarantee. |
+| 6 | Shutdown's stated bound (`STOP_JOIN_SECONDS`, not double it) is what the code delivers (WR-07 closed) | ✓ VERIFIED | `_stop_threads` (`app.py:167-201`) takes one `deadline = time.monotonic() + STOP_JOIN_SECONDS` before either join and hands the refresher `max(0.0, deadline - time.monotonic())`; `CheckRefresher.stop(timeout=...)` (`refresher.py:173-205`) honours the caller-supplied bound, clamped at zero. The docstrings (`refresher.py:152-171`) were corrected to say what the code now does rather than repeat the disproved overlap claim. |
+| 7 | Every terminal job shows pages scanned/removed/uploaded; manual duplex shows front/back counts; a queued job shows the wait line | ✓ VERIFIED (unchanged from prior pass, re-confirmed) | `vocabulary.page_counts()` / `busy_line()` unchanged by gap closure except for the `local_time` rstrip fix (IN-06, below); wiring into `partials/status.html` / `partials/history.html` re-confirmed present. |
+| 8 | Every user-facing error shows a plain-language message and next step, raw detail in a collapsed disclosure | ✓ VERIFIED (unchanged, re-confirmed) | `vocabulary.error_advice()` and the ERROR branch in `partials/status.html` re-read; unaffected by gap closure. |
+| 9 | Two browser contexts show owner Continue/Abort (with Abort confirm) and non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels/descriptions | ✓ VERIFIED (unchanged, re-confirmed) | `tests/test_browser.py::test_the_owner_is_offered_the_flip_and_the_second_browser_is_not` (line 3774) re-read in full: two real `browser.new_context()` cookie jars, `HttpOnly`/`SameSite=Lax`/session-cookie assertions, zero flip controls in the non-owner DOM. Genuine Playwright automation against real Chromium, not a manual-only item. |
 
-**Score:** 5/5 truths verified.
+**Score:** 9/9 truths verified (5 ROADMAP success criteria + 4 additional truths specific to the
+D-02 single-source-of-truth claim the orchestrator asked me to scrutinise).
 
-### Specific Items Scrutinised (per orchestrator request)
+### Gap-Closure Finding Traceability (all 16 from `30-REVIEW.md`)
 
-| # | Item | Verdict | Reasoning |
-|---|------|---------|-----------|
-| 1 | APPL-11 consume mount ships COMMENTED in `docker-compose.yml` | **Accepted, not a gap** | Read the file in full. The mount is a two-line-explained commented block (`# - /srv/paperless/consume:/consume`), consistent with the file's existing pattern of commented optional integrations (the scanner-host lines are already commented the same way, and there is no local `paperless` service defined in this compose file for a live mount to connect to). REQUIREMENTS.md's APPL-11 text ("includes the consume-directory mount with a two-line explanation") does not require it to be live, and CONTEXT's D-17 precedent for the credential block establishes "commented with an explanation, the operator opts in" as this file's idiom. This is a defensible, documented scope decision, not a shortcut. |
-| 2 | The bounded saned pre-probe / self-contradiction resolution in 30-06 | **Coherent, criterion 2 holds** | Read `_saned_hosts`, `_saned_reachable`, and `_check_scanner` in full. The logic is: no configured/parseable host → no probe → falls through to `get_devices()` (today's behaviour, cannot produce a false FAIL). A host is configured and every entry refuses TCP → `FAIL` without entering the backend (avoids the ~127s hang `get_devices()` would otherwise incur). This is a coherent relocation of the "no false FAIL" guarantee to "the probe could not be run," not a contradiction — both docstrings state the same invariant consistently and the two-minute-hang case is exactly the one criterion 2 requires to be avoided. |
-| 3 | D-15 Scan button: a viewer following their own terminal job gets an enabled button while another job runs | **Does not violate a locked decision** | Read the full reasoning recorded in `30-14-SUMMARY.md` and the pinned test `TestScanButtonFollowsTheRenderedJob` at `tests/test_web_state_rendering.py:1890`. D-25 (status area follows the browser's own job) was locked in 30-CONTEXT; this is a necessary, explicitly-decided consequence rather than a silent regression — the alternative (button keyed on a different job than the one the status area reports) would make the page self-contradictory. Pinned by 4 test cases plus a browser test. |
-| 4 | D-29 implemented as a fix (not per original description) | **Fix matches D-29's intent** | `web/routes.py:1001-1011` applies `found.default_tags`/`found.default_correspondent` as a fallback (`tags = tags or found.default_tags`; `if correspondent is None: correspondent = found.default_correspondent`) — a fallback, not an override, exactly mirroring the existing blank-title-falls-back-to-profile-title precedent D-29 cites. `cli.py:654-655` already did this; the web layer previously did not, confirmed by grep (only these two call sites exist). The fix is correctly scoped and tested. |
-| 5 | `doctor --json` deliberately not shipped | **Legitimate scope decision** | Confirmed: `doctor` has no `--json` option (only `jobs --json` exists, at `cli.py:782`, a pre-existing machine contract). `cli.py:1125-1131` documents the reasoning (no consumer found in docs/tests/Dockerfile/compose; REQUIREMENTS' Out-of-Scope table already forbids a `HEALTHCHECK` calling `doctor`). `30-08-SUMMARY.md` records an explicit guard test asserting `doctor --json` is undocumented in both reference docs. Not a gap. |
-| 6 | Acceptance greps replaced with behavioural assertions | **Spot-checked, genuinely proved** | Checked `TestTagFilterInChromium` (tap-target ≥44px via `bounding_box()`, tick-preservation across a filter swap, Enter-in-filter issuing GET not POST) and the two-context owner-cookie test (`cookie["httpOnly"]`, `cookie["sameSite"]`, `cookie["expires"] == -1` measured via Playwright's real cookie jar, not string-matched). These are genuine behavioural assertions against a running browser, not weakened placeholders. |
+| Finding | Severity | Plan | Fix location | Test pinning it | Status |
+|---|---|---|---|---|---|
+| CR-01 | Critical | 30-20 | `config.py:673` `profile_storage_for_loaded`; `worker.py:911,917` | `test_config.py::TestProfileStorageForLoaded`, `test_worker.py` (10 cases), `test_doctor.py` monkeypatch-call test | ✓ Closed |
+| CR-02 | Critical | 30-21 | `checks.py:744` `_scanner_host_unanswered`, `checks.py:850-854` | `test_checks.py::test_a_closed_saned_port_skips_the_backend` | ✓ Closed |
+| WR-01 | Warning | 30-21 | `checks.py:499` `_looks_like_a_host_name`, `checks.py:583-591` | `TestSanedHostParsing` (3 IPv6/bracket cases) | ✓ Closed |
+| WR-02 | Warning | 30-21 | `checks.py:656-663` (one address, `getaddrinfo()[0]`) | `TestSanedProbeBound` | ✓ Closed |
+| WR-03 | Warning | 30-25 | `checks.py:1154-1183,1186-1246` `run_checks(scanner_gate=...)` | `test_checks.py`, `test_refresher.py` (gate-sampling doubles) | ✓ Closed |
+| WR-04 | Warning | 30-25 | `refresher.py:273` `skip_scanner=self._scan_active()` | `test_web_checks.py` (real job started, not gate held) | ✓ Closed |
+| WR-05 | Warning | 30-26 | `checks_cache.py:26,198` `claim_manual_refresh`; `routes.py:1342` | `test_checks_cache.py`, `test_web_checks.py` (mock-transport request-count assertion) | ✓ Closed |
+| WR-06 | Warning | 30-23 | `routes.py:1073-1076` (gate on `show_tags`/`show_correspondent`, not submitted value) | `test_web.py` (empty-tags-not-overridden case) | ✓ Closed |
+| WR-07 | Warning | 30-24 | `app.py:167-201` `_stop_threads`; `refresher.py:173` `stop(timeout=...)` | `test_app_lifespan.py`, `test_refresher.py` (bound-by-value) | ✓ Closed |
+| IN-01 | Info | 30-23 | `routes.py:401` (`_tag_list_context` flag-gated), `routes.py:789-791` | `test_web.py` (request-count assertion) | ✓ Closed |
+| IN-02 | Info | 30-23 | `routes.py:874` `type(exc).__name__` | ast-parsed source guard in `test_web.py` | ✓ Closed |
+| IN-03 | Info | 30-22 | `pipeline.py:1572,2216` `%r` | `test_pipeline.py` (caplog, `record.getMessage()`) | ✓ Closed |
+| IN-04 | Info | 30-20 | `worker.py:760-786` property docstring (deliberately unlocked, documented) | Covered by CR-01's tests exercising the property | ✓ Closed |
+| IN-05 | Info | 30-20/23 | `config.py:239-241` citation replaced with rationale, no stale line reference | — (doc-only) | ✓ Closed |
+| IN-06 | Info | 30-22 | `vocabulary.py:632` `.rstrip()` on `local_time` | `test_vocabulary.py` (monkeypatched empty-`%Z` property test) | ✓ Closed |
+| IN-07 | Info | 30-27 | `checks.py:144` `POLL_ATTEMPT_CAP = 10`; `routes.py:1248,306` | `test_web_checks.py`, `test_browser.py` (real request-count property) | ✓ Closed |
 
-### Required Artifacts (representative sample — 19 plans, all files read or grepped)
+No regressions found in previously-passing must-haves: page counts, busy line, error advice, owner
+cookie/flip gating, profile labels, and help text are all unaffected by the gap-closure diffs
+(confirmed by re-reading `vocabulary.py`, `partials/status.html`, `partials/flip.html`).
+
+### Required Artifacts (gap-closure diffs, all read in full)
 
 | Artifact | Expected | Status | Details |
 |----------|----------|--------|---------|
-| `src/saneless/vocabulary.py` | `ErrorAdvice`, `error_advice`, `local_time`, `page_counts`, `busy_line`, `ProfileStorage`, `RequestRejection.TOKEN_UNSET` | ✓ VERIFIED | All present, substantive, docstring-justified; single `match`/`assert_never` confirmed for `error_advice` |
-| `src/saneless/config.py` | `is_placeholder_token`, `ProfileConfig.label/.description`, `WebConfig` | ✓ VERIFIED | All present; `Settings.web: WebConfig = Field(default_factory=WebConfig)` confirmed |
-| `src/saneless/job.py` | `create_job(..., owner_token=...)`, `queue_position()` | ✓ VERIFIED | `owner_token` column has its first writer; `queue_position` at `job.py:1011` |
-| `src/saneless/checks.py` | `CheckKey`, `run_checks`, `worst_state`, five checks | ✓ VERIFIED | Full registry read; imports nothing from `web/` or `cli.py` (confirmed by AST inspection) |
-| `src/saneless/cli.py` | `doctor` command | ✓ VERIFIED | Reads shared registry, prints ordered rows with indented next steps, exits `ExitCode.CONFIG` on FAIL, does not call `require_sane()` |
-| `src/saneless/web/checks_cache.py`, `refresher.py` | `CheckCache`, `CheckRefresher` | ✓ VERIFIED | Exist, injectable clock, daemon-thread/stop-Event/bounded-join pattern confirmed in `app.py` wiring |
-| `src/saneless/web/app.py` | 8+ filters, `app.state.checks`/`.refresher`, dual-thread shutdown | ✓ VERIFIED | All filters registered; shutdown sets both stop events before either join (A-7), read in full |
-| `src/saneless/web/routes.py` | `/api/checks`, `/api/checks/refresh`, owner cookie mint, `/api/profiles/description`, tag filter route | ✓ VERIFIED | All routes present and wired to vocabulary/checks/job modules |
-| Templates (`checks.html`, `status.html`, `flip.html`, `tags.html`, `profile_description.html`, `scan_button.html`) | New surfaces render server-computed vocabulary only | ✓ VERIFIED | Read in full; templates own no vocabulary (all classes/glyphs/labels via Jinja filters); no log path anywhere |
-| `docker-compose.yml` | Commented credential block, consume mount, TZ line | ✓ VERIFIED | Read in full; matches D-17 and the accepted APPL-11 scope decision above |
-| 9 documentation files | Corrected per plan 30-18 | ✓ VERIFIED | All exist, all modified at phase-consistent timestamps (2026-09-16), spot-checked `cli-commands.md` for the `doctor` section and "six commands" wording |
-| `tests/test_browser.py` | `_make_gate`, P1-P17 assertions | ✓ VERIFIED | Module-level gate factory confirmed reused by both hand-made contexts in the two-context owner test; all named UI-SPEC checkpoints (P1-P17) traced to concrete test methods, including P11-P13 which are covered by `TestTagFilterInChromium` without literal "(P11)" comment labels |
+| `src/saneless/config.py` | `profile_storage_for_loaded` | ✓ VERIFIED | Present, pure, documented, deliberately cannot return `IN_MEMORY_UNWRITABLE` |
+| `src/saneless/worker.py` | Both early-return branches of `_generate_startup_profiles` call the shared function | ✓ VERIFIED | Lines 906-918 |
+| `src/saneless/cli.py` | `doctor` calls `profile_storage_for_loaded` | ✓ VERIFIED | Line 1154, with a comment explaining why this keeps D-02 |
+| `src/saneless/checks.py` | `_scanner_host_unanswered`, `_saned_host_setting`, `_looks_like_a_host_name`, `run_checks(scanner_gate=...)`, `POLL_ATTEMPT_CAP` | ✓ VERIFIED | All present, substantive, documented, exercised by dedicated test classes |
+| `src/saneless/web/refresher.py` | `probe_now`, `_probe_and_store` (single implementation), `stop(timeout=...)` | ✓ VERIFIED | Both public entry points delegate to one private implementation; no re-entrant duplication |
+| `src/saneless/web/checks_cache.py` | `claim_manual_refresh`, `MIN_MANUAL_REFRESH_SECONDS` | ✓ VERIFIED | Present, under the cache's existing lock |
+| `src/saneless/web/app.py` | `_stop_threads` with a shared deadline | ✓ VERIFIED | Extracted helper, deadline computed once |
+| `src/saneless/web/routes.py` | Flag-gated metadata fetch, `type(exc).__name__` logging, form-shape profile-default gating, `attempt` query param | ✓ VERIFIED | All present |
+| `src/saneless/pipeline.py` | `%r` for all user-title interpolations | ✓ VERIFIED | 2 call sites confirmed (`pipeline.py:1572,2216`); a third pre-existing profile/device line also converted |
+| `src/saneless/vocabulary.py` | `local_time().rstrip()` | ✓ VERIFIED | Line 632 |
+| `docs/reference/web-api.md` | Refresh floor and single-flight documented | ✓ VERIFIED | Lines 147-151 |
 
 ### Key Link Verification
 
 | From | To | Via | Status |
 |------|-----|-----|--------|
-| `vocabulary.error_message`/`error_next_step` | `error_advice` | one-line accessors | ✓ WIRED — confirmed no second `match` |
-| `cli.py doctor` | `checks.run_checks` | shared registry call | ✓ WIRED |
-| `web/routes.py index`/`/api/checks` | `app.state.checks` (cache) | cache read, never a probe inside a request | ✓ WIRED — `GET /` never calls `run_checks` directly |
-| `web/app.py lifespan` | `CheckRefresher.stop()` | bounded join before any resource close | ✓ WIRED — A-7 overlapping-join gate read in full |
-| `web/routes.py start_scan` | `RequestRejection.TOKEN_UNSET` | `RequestRejected`, guard before `create_job` | ✓ WIRED |
-| `web/templates/partials/scan_button.html` | `scan_blocked` context | OR'd disabled source, independent of job state | ✓ WIRED |
-| `web/routes.py continue_flip`/`abort_flip` | owner-token comparison | `_owner_answers`/`_is_owner`, `secrets.compare_digest` used | ✓ WIRED |
-| `web/templates/index.html` profile select | `/api/profiles/description` | `hx-get` on change, `hx-target="#profile-description"` | ✓ WIRED |
-| `web/templates/partials/tags.html` filter | `#tags-list` | `hx-include`, pinned-ticked-tags loop | ✓ WIRED |
-| `docker-compose.yml` | `./config/config.toml` | read-write mount, commented credential override | ✓ WIRED |
+| `cli.py doctor` | `config.profile_storage_for_loaded` | direct call, passed into `CheckContext` | ✓ WIRED (test pins the call itself, not just the result) |
+| `worker.py _generate_startup_profiles` (both early returns) | `config.profile_storage_for_loaded` | direct call | ✓ WIRED |
+| `web/app.py build_check_context` | `worker.profile_storage` | read live at call time, not captured at `create_app` | ✓ WIRED |
+| `checks.py _check_scanner` | `_scanner_host_unanswered` (WARN, not FAIL) | returned when `_saned_hosts` yields entries and none answer | ✓ WIRED |
+| `checks.py run_checks` | `scanner_gate` parameter | held only around `_scanner_result`, not the whole registry | ✓ WIRED |
+| `web/refresher.py _probe_and_store` | `worker.current_job_id` (via `scan_active` callable) | `skip_scanner` derived from the fact, not gate contention | ✓ WIRED |
+| `web/routes.py refresh_checks` | `CheckCache.claim_manual_refresh` | gates every `probe_now()` call | ✓ WIRED |
+| `web/app.py _stop_threads` | `CheckRefresher.stop(timeout=...)` | one shared `time.monotonic()` deadline | ✓ WIRED |
 
 ### Requirements Coverage
 
-All 12 requirement IDs (APPL-01 through APPL-12) are claimed by at least one of the 19 plans'
-`requirements:` frontmatter (cross-referenced against REQUIREMENTS.md lines 129-140). No orphaned
-requirements found — every APPL-* ID in REQUIREMENTS.md's phase-30 mapping table (lines 316-327)
-appears in at least one plan.
+All 12 requirement IDs (APPL-01 through APPL-12) remain traced to concrete, substantive, wired
+artifacts; the gap-closure plans additionally claim APPL-01, APPL-02, APPL-03, APPL-04, APPL-06,
+APPL-10, APPL-12 in their frontmatter, which is consistent — the fixes tighten the correctness of
+checks already covering those IDs rather than introducing new surface area. No orphaned
+requirements found.
 
-| Requirement | Status | Evidence |
-|---|---|---|
-| APPL-01 | ✓ SATISFIED | `doctor` + shared registry (plans 30-06, 30-08, 30-11) |
-| APPL-02 | ✓ SATISFIED | Status strip, cache, refresher, skip-while-scanning (30-04, 30-06, 30-07, 30-09, 30-11, 30-17) |
-| APPL-03 | ✓ SATISFIED | `page_counts`, `busy_line`, front-count channel (30-01, 30-04, 30-09, 30-12, 30-13, 30-17) |
-| APPL-04 | ✓ SATISFIED | `error_advice`, ERROR branch rewrite, CLI `Try:` line (30-01, 30-09, 30-10, 30-12, 30-17) |
-| APPL-05 | ✓ SATISFIED | Profile label/description generation and rendering (30-02, 30-05, 30-15, 30-17, 30-18) |
-| APPL-06 | ✓ SATISFIED | `ProfileStorage`, amber WARN row (30-01, 30-04, 30-06, 30-11) |
-| APPL-07 | ✓ SATISFIED | `is_placeholder_token`, doctor/scan/web refusal (30-01, 30-02, 30-06, 30-08, 30-10, 30-14, 30-18, 30-19) |
-| APPL-08 | ✓ SATISFIED | `queue_position`, `busy_line` queue branch (30-01, 30-03, 30-13) |
-| APPL-09 | ✓ SATISFIED | Owner cookie, gated flip prompt, Abort confirm (30-03, 30-13, 30-19) |
-| APPL-10 | ✓ SATISFIED | Help text, checkbox tag list, `[web]` show_tags/show_correspondent (30-02, 30-15, 30-16, 30-18, 30-19) |
-| APPL-11 | ✓ SATISFIED | Fallback WARN row, compose mount (30-06, 30-11, 30-18) — see scrutiny item 1 above |
-| APPL-12 | ✓ SATISFIED | `local_time`, `LOCAL_TIME_FORMAT`, TZ compose line (30-01, 30-02, 30-09, 30-10, 30-12, 30-17, 30-18) |
+One documentation-hygiene item, not a code gap: `.planning/REQUIREMENTS.md`'s checkbox column for
+APPL-01..12 (lines 129-140) and the phase-mapping table (lines 316-327) still read `[ ]` /
+"Pending" rather than checked/"Done". This is a tracking-file bookkeeping step, not evidence the
+requirements are unmet — every APPL-* ID is independently confirmed satisfied by the artifact and
+key-link evidence above. Flagged for the phase-closure step to update, not as a gap blocking this
+verification.
 
 ### Anti-Patterns Found
 
-None. Grep for `TBD`/`FIXME`/`XXX` across all phase-touched source files: 0 matches. `TODO`/`HACK`/
-literal `placeholder` copy in templates: only legitimate HTML `placeholder=` attributes and the
-`is_placeholder_token`/`PLACEHOLDER_TOKENS` identifiers (not stub markers). All `# noqa` /
-`# type: ignore` occurrences in phase-touched files (`config.py`) predate Phase 30 (confirmed via
-`git log -S`, tracing to Phase 01's original commit). No `--no-verify`, `SKIP=`, or suppressed
-lint/type errors anywhere in the tree.
+None in gap-closure-touched files. `grep -rn "TBD\|FIXME\|XXX"` across every file touched by
+30-20..30-27 (`checks.py`, `worker.py`, `config.py`, `cli.py`, `web/app.py`, `web/refresher.py`,
+`web/checks_cache.py`, `web/routes.py`, `pipeline.py`, `vocabulary.py`, `docker-compose.yml`,
+`docs/reference/web-api.md`): 0 matches. `TODO\|HACK`: 0 matches. No new `# noqa` or
+`# type: ignore` suppressions introduced.
 
 ### Behavioral Spot-Checks
 
 | Behavior | Command | Result | Status |
 |----------|---------|--------|--------|
-| Full test suite passes | `uv run pytest -q` | `2888 passed in 132.17s` | ✓ PASS (independently re-run, not trusted from SUMMARY) |
-| Lint is clean | `uv run ruff check .` | `All checks passed!` | ✓ PASS (independently re-run) |
-| No new suppressions | `git log -S "noqa" -- <phase files>` | all matches predate Phase 30 | ✓ PASS |
-| `checks.py` has no upward dependency | AST import inspection | no `web`/`cli` imports found | ✓ PASS |
-| No log path in any template | `grep -rn` over `web/templates/` | 0 matches | ✓ PASS |
-| `doctor --json` genuinely absent | `grep "as_json"` scoped to `doctor` | not present; only `jobs --json` exists | ✓ PASS |
+| Full test suite passes at current HEAD | `uv run pytest -q` | `3025 passed in 192.08s` | ✓ PASS (independently re-run) |
+| Lint is clean | `uv run ruff check .` | `No issues found` | ✓ PASS (independently re-run) |
+| Format is clean | `uv run ruff format --check .` | `63 files already formatted` | ✓ PASS (independently re-run) |
+| `ty` type check clean | `uv run ty check` | `All checks passed!` | ✓ PASS (independently re-run) |
+| `pyrefly` type check clean | `uv run pyrefly check src tests` | `0 errors` | ✓ PASS (independently re-run) |
+| CR-02 scanner row is WARN not FAIL on an unanswered configured host | `test_a_closed_saned_port_skips_the_backend` | asserts `CheckState.WARN` | ✓ PASS (read the assertion directly) |
+| CR-01 doctor genuinely calls the shared function | `test_doctor.py` monkeypatch-recording test | `seen == [settings]`, `storage is ProfileStorage.PERSISTED` | ✓ PASS (read the assertion directly) |
 
 ### Probe Execution
 
-No `scripts/*/tests/probe-*.sh` convention or PLAN/SUMMARY-declared probes found for this phase
-(it is a feature phase, not a migration/tooling phase). Step 7c: SKIPPED — no probes declared or
-discovered.
+No `scripts/*/tests/probe-*.sh` convention or PLAN/SUMMARY-declared probes for this phase (feature
+phase, not migration/tooling). Step 7c: SKIPPED — no probes declared or discovered.
 
 ### Human Verification Required
 
-None. Per project CLAUDE.md, all browser-based behaviours (visual layout, HTMX interactivity,
-cookie jars, native `confirm()` dialogs, touch-target sizing, colour contrast) were automated via
-Playwright in `tests/test_browser.py` (plans 30-17 and 30-19), independently confirmed present and
-substantive by this verifier, not merely claimed by the SUMMARYs. No manual-only or
-human-verification items were found or introduced.
+None. Per project CLAUDE.md, browser-based behaviours (two-context cookie jars, HttpOnly/SameSite
+assertions, DOM absence of flip controls for the non-owner, the cold-start poll's real request
+count) are all automated via Playwright against real Chromium in `tests/test_browser.py`, confirmed
+present and substantive by direct reading, not merely claimed by SUMMARYs. No manual-only or
+physical-hardware items exist in this phase's scope.
 
 ### Gaps Summary
 
-No gaps found. All 5 ROADMAP success criteria verified against actual code (not SUMMARY claims).
-All 12 requirement IDs traced to plan frontmatter and to concrete, substantive, wired artifacts.
-The six specific scrutiny items requested by the orchestrator were each independently investigated
-against the source and resolved: one (APPL-11 commented mount) is accepted as a defensible,
-documented scope decision consistent with the file's existing idiom and REQUIREMENTS' literal
-wording; the remaining five are confirmed coherent, correctly scoped, or genuinely tested as
-claimed. The test suite (2888 tests, including 127 browser tests), lint, and type-check claims were
-independently reproduced rather than trusted.
+No gaps found. This re-verification independently confirmed that all 16 findings from
+`30-REVIEW.md` (2 critical, 7 warning, 7 info) are genuinely fixed in the current source, each
+backed by a test that exercises the real code path rather than merely asserting a matching output.
+The phase goal's core claim — that the web UI and the CLI cannot disagree about the health of the
+same appliance — was specifically re-verified for the Profiles row (CR-01, the exact defect that
+broke it): `config.profile_storage_for_loaded` is now the sole derivation, called by both `doctor`
+and the worker, with a test pinning the call itself rather than just the coincidence of matching
+answers, and no third copy of the derivation exists anywhere in the tree. `saneless doctor`'s exit
+code is now truthful for a working scanner behind a stale net-host setting (CR-02). All gate
+commands (pytest, ruff, ty, pyrefly) were independently re-run at HEAD and are clean. The one
+documentation-hygiene item (`REQUIREMENTS.md` checkboxes not yet flipped) does not affect the
+codebase's satisfaction of the requirements and is noted for phase-closure bookkeeping, not as a
+gap.
 
 ---
 
-*Verified: 2026-09-16T22:14:16Z*
+*Verified: 2026-09-17T00:00:00Z*
 *Verifier: Claude (gsd-verifier)*
