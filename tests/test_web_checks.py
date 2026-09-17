@@ -53,11 +53,13 @@ from saneless.config import (
 from saneless.scanner.base import DeviceInfo
 from saneless.vocabulary import ConnectionStatus, JobState, local_time
 from saneless.web import app as app_module
+from saneless.web import refresher as refresher_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
+    import threading
     from collections.abc import Iterator
 
     from saneless.checks import CheckContext
@@ -138,6 +140,21 @@ class _RecordingRefresher:
         """
         return self._real.build_context()
 
+    def probe_now(self) -> None:
+        """Probe through the real refresher, which owns the one probe path."""
+        self._real.probe_now()
+
+    @property
+    def probe_lock(self) -> threading.Lock:
+        """
+        The real refresher's single-flight lock, so a test can hold it.
+
+        Returns:
+            The lock one checker takes for the length of one probe.
+
+        """
+        return self._real._probe_lock
+
 
 class _ProbeSpy:
     """
@@ -152,13 +169,17 @@ class _ProbeSpy:
         """Start with no recorded calls."""
         self.calls = 0
         self.contexts: list[CheckContext] = []
+        self.gates: list[threading.Lock | None] = []
 
-    def __call__(self, context: CheckContext) -> tuple[CheckResult, ...]:
+    def __call__(
+        self, context: CheckContext, *, scanner_gate: threading.Lock | None = None
+    ) -> tuple[CheckResult, ...]:
         """
         Record the call and return one synthetic row per check.
 
         Args:
             context: The context the route built for this probe.
+            scanner_gate: The gate the probe handed in rather than held.
 
         Returns:
             One ``OK`` result per ``CheckKey`` member, in member order.
@@ -166,6 +187,7 @@ class _ProbeSpy:
         """
         self.calls += 1
         self.contexts.append(context)
+        self.gates.append(scanner_gate)
         return _synthetic_results()
 
 
@@ -252,18 +274,19 @@ def _refresher(client: TestClient) -> _RecordingRefresher:
 
 def _spy(monkeypatch: pytest.MonkeyPatch) -> _ProbeSpy:
     """
-    Replace the route module's ``run_checks`` with a counting stand-in.
+    Replace the refresher module's ``run_checks`` with a counting stand-in.
 
-    The route module's own reference is the one patched, because that is the
-    name the handler resolves at call time.  The refresher holds a separate
-    reference and is never driven here.
+    The refresher module's reference is the one patched, because the refresh
+    handler no longer runs the registry itself: it goes through
+    ``CheckRefresher.probe_now``, which is the single probe implementation both
+    the button and the background thread share.
 
     Returns:
         The spy, whose ``calls`` is the number of probes the request made.
 
     """
     spy = _ProbeSpy()
-    monkeypatch.setattr(routes_module, "run_checks", spy)
+    monkeypatch.setattr(refresher_module, "run_checks", spy)
     return spy
 
 
@@ -464,22 +487,26 @@ class TestRefreshButton:
     ) -> None:
         """An explicit click does not get to enter SANE behind a live scan."""
         spy = _spy(monkeypatch)
-        gate = _app(client).state.worker.scanner_gate
-        gate.acquire()
-        try:
-            client.post("/api/checks/refresh")
-        finally:
-            gate.release()
+        _start_a_scan(client)
+        client.post("/api/checks/refresh")
         assert spy.calls == 1
         assert spy.contexts[0].skip_scanner is True
 
     def test_refresh_when_idle_does_not_skip_the_scanner(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With the gate free the scanner row is probed like any other."""
+        """With no job in flight the scanner row is probed like any other."""
         spy = _spy(monkeypatch)
         client.post("/api/checks/refresh")
         assert spy.contexts[0].skip_scanner is False
+
+    def test_refresh_hands_the_scanner_gate_to_the_registry(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """WR-03: the gate reaches ``run_checks``, and the handler holds none."""
+        spy = _spy(monkeypatch)
+        client.post("/api/checks/refresh")
+        assert spy.gates == [_app(client).state.worker.scanner_gate]
 
     def test_refresh_during_a_scan_renders_the_paused_row(
         self, client: TestClient
@@ -492,13 +519,46 @@ class TestRefreshButton:
         made up.  Every probe it runs is local -- the stub scanner, a stubbed
         Paperless client and two temp directories.
         """
-        gate = _app(client).state.worker.scanner_gate
-        gate.acquire()
+        _start_a_scan(client)
+        markup = client.post("/api/checks/refresh").text
+        assert PAUSED_SCANNER_MESSAGE in markup
+
+    def test_a_refresh_landing_mid_probe_renders_no_paused_row(
+        self, client: TestClient
+    ) -> None:
+        """
+        WR-04: checker contention on an idle appliance is not "a scan".
+
+        A click landing while a refresher tick is in flight used to fail its
+        non-blocking attempt on the scanner gate, and the handler read that
+        failure as a running scan -- so the strip rendered "not checked while a
+        scan is running" beside "Last checked 14:02" on an appliance with no
+        job at all.  The probe lock now turns the second checker away before it
+        reaches the gate, and the strip re-renders what the first one found.
+        """
+        _warm_the_cache(client)
+        assert _app(client).state.worker.current_job_id is None
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
         try:
             markup = client.post("/api/checks/refresh").text
         finally:
-            gate.release()
-        assert PAUSED_SCANNER_MESSAGE in markup
+            lock.release()
+        assert PAUSED_SCANNER_MESSAGE not in markup
+        assert PAUSED_PREFIX not in markup
+
+    def test_a_refresh_landing_mid_probe_stores_nothing_new(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Concurrent refreshes collapse to one probe, not one probe each."""
+        spy = _spy(monkeypatch)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            assert client.post("/api/checks/refresh").status_code == 200
+        finally:
+            lock.release()
+        assert spy.calls == 0
 
 
 class TestFreshnessLine:
@@ -579,14 +639,34 @@ class TestRouteShape:
 
     def test_routes_py_probes_in_exactly_one_place(self) -> None:
         """
-        ``run_checks`` is called from the refresh handler and nowhere else.
+        The refresh handler reaches the one probe path, and nothing else does.
 
         A second call site in this module would be a second way for a render
         to probe, which is the failure D-04 exists to prevent; a grep is the
         only thing that can see it.
         """
         source = Path(routes_module.__file__).read_text(encoding="utf-8")
-        assert source.count("run_checks(") == 1
+        assert source.count("probe_now()") == 1
+
+    def test_routes_py_runs_no_registry_of_its_own(self) -> None:
+        """
+        The handler owns no probe implementation, so none can drift from the other.
+
+        WR-03, WR-04 and WR-05 were all consequences of the same
+        acquire/run/store block existing in both ``_tick`` and this module.
+        """
+        source = Path(routes_module.__file__).read_text(encoding="utf-8")
+        assert "run_checks" not in source
+
+    def test_routes_py_touches_no_scanner_gate(self) -> None:
+        """
+        A request handler has no business holding the lock a live scan wants.
+
+        The gate now lives in exactly one probe path, and that path is the
+        refresher's.
+        """
+        source = Path(routes_module.__file__).read_text(encoding="utf-8")
+        assert "scanner_gate" not in source
 
 
 # The stylesheet and the templates, located the way the app locates them so a
