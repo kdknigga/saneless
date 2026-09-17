@@ -304,9 +304,11 @@ def test_request_stop_signals_without_joining(
     """
     The signal half of stop(), so a caller can set two events then join two.
 
-    The lifespan owns two bounded joins.  Doing them one whole ``stop()`` at a
-    time would cost ``2 * STOP_JOIN_SECONDS`` in the worst case; signalling both
-    first makes the joins overlap and keeps the bound at one (A-7).
+    The lifespan owns two sequential joins, so the early signal is not what
+    bounds the total -- the shared deadline it passes to ``stop(timeout=...)``
+    is (WR-07).  Signalling first is still worth doing: a refresher merely
+    between ticks wakes during the worker's join and exits for free, so its
+    own join is skipped entirely.
     """
     _spy(monkeypatch)
     cache = CheckCache()
