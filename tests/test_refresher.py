@@ -376,3 +376,101 @@ def test_stop_joins_within_the_shared_bound(
     assert refresher.stop() is True
     refresher._thread.join(timeout=_JOIN_TIMEOUT_SECONDS)
     assert refresher._thread.is_alive() is False
+
+
+class _RecordingThread:
+    """
+    A stand-in for the refresher's thread that records the bound it was joined with.
+
+    The point of ``stop(timeout=...)`` is the *value* handed to ``join``, not
+    how long anything actually takes, so this reports liveness the way a test
+    dictates and remembers every timeout it was given.  No real thread has to
+    be slow, and nothing here waits on the wall clock.
+    """
+
+    def __init__(self, *, alive: bool, alive_after_join: bool = False) -> None:
+        """Report ``alive`` until joined, then ``alive_after_join``."""
+        self.join_timeouts: list[float | None] = []
+        self._alive = alive
+        self._alive_after_join = alive_after_join
+        self._joined = False
+
+    def is_alive(self) -> bool:
+        """Whether this pretend thread is still running."""
+        return self._alive_after_join if self._joined else self._alive
+
+    def join(self, timeout: float | None = None) -> None:
+        """Record the bound the caller asked for, and return at once."""
+        self.join_timeouts.append(timeout)
+        self._joined = True
+
+
+def _with_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    default_settings: Settings,
+    thread: _RecordingThread,
+) -> CheckRefresher:
+    """Build an unstarted refresher whose thread is the recording double."""
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    monkeypatch.setattr(refresher, "_thread", thread)
+    return refresher
+
+
+def test_stop_without_a_timeout_joins_with_the_shared_bound(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default is still the worker's bound, so every existing caller is unmoved."""
+    thread = _RecordingThread(alive=True, alive_after_join=True)
+    refresher = _with_thread(monkeypatch, default_settings, thread)
+    assert refresher.stop() is False
+    assert thread.join_timeouts == [STOP_JOIN_SECONDS]
+
+
+def test_stop_passes_the_callers_bound_to_the_join(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller part-way through a shared deadline joins for what is left of it."""
+    thread = _RecordingThread(alive=True, alive_after_join=False)
+    refresher = _with_thread(monkeypatch, default_settings, thread)
+    assert refresher.stop(timeout=2.5) is True
+    assert thread.join_timeouts == [2.5]
+
+
+def test_stop_with_a_spent_budget_polls_instead_of_waiting(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A caller whose budget is gone gets a poll and a ``False``, not another wait.
+
+    WR-07: this is the case the shared deadline exists for -- a worker that ate
+    the whole bound must not hand the refresher a fresh one.
+    """
+    thread = _RecordingThread(alive=True, alive_after_join=True)
+    refresher = _with_thread(monkeypatch, default_settings, thread)
+    assert refresher.stop(timeout=0.0) is False
+    assert thread.join_timeouts == [0.0]
+
+
+def test_stop_clamps_a_negative_timeout_to_zero(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative bound must never become ``join(None)``, an unbounded wait."""
+    thread = _RecordingThread(alive=True, alive_after_join=True)
+    refresher = _with_thread(monkeypatch, default_settings, thread)
+    assert refresher.stop(timeout=-1.0) is False
+    assert thread.join_timeouts == [0.0]
+
+
+def test_stop_with_a_timeout_does_not_join_a_finished_thread(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread that already exited costs the caller none of its budget."""
+    thread = _RecordingThread(alive=False)
+    refresher = _with_thread(monkeypatch, default_settings, thread)
+    assert refresher.stop(timeout=1.0) is True
+    assert thread.join_timeouts == []
