@@ -629,7 +629,7 @@ Plans:
 
 **Gap wave 2** *(blocked on gap wave 1)*
 
-- [ ] 30-25-PLAN.md — WR-03/WR-04: the scanner gate narrowed to the scanner check; one single-flighted probe
+- [x] 30-25-PLAN.md — WR-03/WR-04: the scanner gate narrowed to the scanner check; one single-flighted probe
 
 **Gap wave 3** *(blocked on gap wave 2)*
 
@@ -700,7 +700,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 24/27 | In Progress|  |
+| 30. Appliance Layer | 25/27 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
