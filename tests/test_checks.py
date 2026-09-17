@@ -83,6 +83,25 @@ _NOT_ROOT = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_sane_net_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Keep the developer's own ``SANE_NET_HOSTS`` out of every test in this file.
+
+    The scanner check reads the environment before it reads ``scanner.host``,
+    because ``_ensure_initialised`` does (``sane_backend.py:876-883``).  That
+    is the behaviour under test, and it is also a way for the suite's verdict
+    to depend on the machine it runs on: a developer or CI image with the
+    variable exported would silently redirect every pre-probe here.  The cases
+    that want it set say so with ``monkeypatch.setenv`` in their own body.
+
+    Args:
+        monkeypatch: pytest's environment patcher.
+
+    """
+    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+
+
 @pytest.fixture
 def listening_port() -> Iterator[int]:
     """
@@ -755,6 +774,51 @@ def _row(results: tuple[CheckResult, ...], key: CheckKey) -> CheckResult:
     return next(result for result in results if result.key is key)
 
 
+def _recording_dialler(
+    monkeypatch: pytest.MonkeyPatch, *, reachable: bool
+) -> list[tuple[str, int]]:
+    """
+    Replace the probe's dialler with one that records what it was asked for.
+
+    Nothing connects: the point of these cases is *which address* the check
+    decided to dial, which is a decision made before any socket exists.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+        reachable: What the stubbed dialler should answer.
+
+    Returns:
+        The list the stub appends each ``(host, port)`` pair to.
+
+    """
+    dialled: list[tuple[str, int]] = []
+
+    def _dial(host: str, port: int, _timeout: float) -> bool:
+        dialled.append((host, port))
+        return reachable
+
+    monkeypatch.setattr(checks, "_saned_reachable", _dial)
+    return dialled
+
+
+def _healthy_settings(tmp_path: Path, *, host: str) -> Settings:
+    """
+    Build settings whose only imperfection is the configured scanner host.
+
+    Args:
+        tmp_path: The test's own directory.
+        host: The ``scanner.host`` to configure.
+
+    Returns:
+        Settings with a writable data folder and a real fallback folder, so
+        every row but the Scanner one is green.
+
+    """
+    folder = tmp_path / "consume"
+    folder.mkdir(exist_ok=True)
+    return _settings(tmp_path, host=host, consume_dir=str(folder))
+
+
 class TestScannerCheck:
     """The Scanner row, including the pre-probe that keeps it fast (APPL-02)."""
 
@@ -909,8 +973,11 @@ class TestScannerCheck:
         results = run_checks(_context(settings, scanner=backend))
         row = _row(results, CheckKey.SCANNER)
         assert backend.calls == 0
-        assert row.state is CheckState.FAIL
-        assert row.message == "Not reachable."
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "The configured scanner host is not answering, "
+            "so the scanner could not be checked."
+        )
 
     def test_a_listening_saned_port_reaches_the_backend(
         self, tmp_path: Path, listening_port: int
@@ -945,6 +1012,218 @@ class TestScannerCheck:
         results = run_checks(_context(_settings(tmp_path, host=""), scanner=backend))
         assert backend.calls == 1
         assert _row(results, CheckKey.SCANNER).state is CheckState.OK
+
+    def test_the_configured_host_is_dialled_when_the_environment_is_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With no ``SANE_NET_HOSTS``, ``scanner.host`` is what SANE will use.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        dialled = _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="config-host")
+        run_checks(_context(settings, scanner=_CountingBackend([_device()])))
+        assert dialled == [("config-host", SANED_PORT)]
+
+    def test_the_environment_variable_wins_over_the_configured_host(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The probe dials the host SANE dials, not the one the file names.
+
+        ``_ensure_initialised`` (``sane_backend.py:876-883``) honours a
+        pre-existing ``SANE_NET_HOSTS`` and logs that it is ignoring
+        ``scanner.host``.  A probe reading only the setting can therefore
+        describe a host that is not in play at all: a down config host
+        producing a row while the live environment host serves devices.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "env-host")
+        dialled = _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="config-host")
+        run_checks(_context(settings, scanner=_CountingBackend([_device()])))
+        assert dialled == [("env-host", SANED_PORT)]
+
+    def test_an_empty_environment_variable_leaves_the_setting_in_charge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An exported-but-empty variable is not a configured host.
+
+        ``sane_backend.py`` only treats a *set* variable as a host list, and an
+        empty one names nothing, so the setting is what remains.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "")
+        dialled = _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="config-host")
+        run_checks(_context(settings, scanner=_CountingBackend([_device()])))
+        assert dialled == [("config-host", SANED_PORT)]
+
+    def test_an_unanswered_host_is_amber_and_says_what_to_do(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        CR-02: a refused dial is a fact about the host, not about the appliance.
+
+        ``SANE_NET_HOSTS`` *adds* net devices; it does not replace local
+        backend enumeration, so "every configured host refused TCP" never
+        implied "there is no scanner".  D-01 calls a true statement about a
+        deployment that still works amber.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _healthy_settings(tmp_path, host=f"127.0.0.1:{_closed_port()}")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert row.state is CheckState.WARN
+        assert row.skipped is False
+        assert row.next_step == (
+            "Check the scanner is switched on and connected, then press Check again."
+        )
+
+    def test_an_unanswered_host_does_not_turn_a_health_gate_red(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A machine with a working local scanner and a stale host exits 0.
+
+        ``CheckState``'s own rule is that a healthy appliance must never go
+        red.  ``saneless doctor`` exits non-zero on ``FAIL`` only, so no row
+        being ``FAIL`` is the exit code.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _healthy_settings(tmp_path, host=f"127.0.0.1:{_closed_port()}")
+        results = run_checks(
+            _context(
+                settings,
+                scanner=backend,
+                paperless=_paperless(_RequestCounter(_ok_response)),
+            )
+        )
+        assert [row.key for row in results if row.state is CheckState.FAIL] == []
+        assert worst_state(results) is CheckState.WARN
+
+    @pytest.mark.parametrize(
+        ("environment", "setting"),
+        [
+            pytest.param(None, "scanbox.lan", id="setting-only"),
+            pytest.param("scanbox.lan:6566", "", id="environment-only"),
+            pytest.param("192.0.2.10", "scanbox.lan", id="both"),
+        ],
+    )
+    def test_the_unanswered_row_names_no_host_address_or_port(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        environment: str | None,
+        setting: str,
+    ) -> None:
+        """
+        ASVS V7: a LAN address never reaches a LAN-visible page through this row.
+
+        Same class of fact, and the same refusal, as ``_device_label``
+        declining to print a ``net:<host>`` identifier.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+            environment: What ``SANE_NET_HOSTS`` is set to, or None for unset.
+            setting: What ``scanner.host`` is configured as.
+
+        """
+        if environment is not None:
+            monkeypatch.setenv("SANE_NET_HOSTS", environment)
+        _recording_dialler(monkeypatch, reachable=False)
+        settings = _settings(tmp_path, host=setting)
+        row = _row(
+            run_checks(_context(settings, scanner=_CountingBackend([_device()]))),
+            CheckKey.SCANNER,
+        )
+        assert row.state is CheckState.WARN
+        for text in (row.message, row.next_step):
+            assert ":" not in text
+            assert "scanbox" not in text
+            assert "192.0.2.10" not in text
+            assert "6566" not in text
+
+    def test_an_enumeration_that_found_nothing_is_still_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The amber row is only for the case where the probe replaced the enumeration.
+
+        A probe that answered, followed by a backend reporting no devices, is
+        an enumeration that actually ran, so its verdict stands.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        _recording_dialler(monkeypatch, reachable=True)
+        backend = _CountingBackend()
+        settings = _settings(tmp_path, host="scanbox.lan")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 1
+        assert row.state is CheckState.FAIL
+        assert row.message == "Not reachable."
+
+    def test_a_reachable_host_whose_backend_raises_is_still_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        An enumeration that threw is still a red row, not the amber one.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: pytest's patcher.
+
+        """
+        _recording_dialler(monkeypatch, reachable=True)
+        settings = _settings(tmp_path, host="scanbox.lan")
+        row = _row(
+            run_checks(_context(settings, scanner=_RaisingBackend())), CheckKey.SCANNER
+        )
+        assert row.state is CheckState.FAIL
+        assert row.message == "Not reachable."
+
+    def test_an_unparseable_host_still_reaches_the_backend(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        WR-01 and CR-02 together: an IPv6 literal produces no probe and no row.
+
+        Before the refusal, ``fe80::1`` dialled host ``fe80`` on port 1, every
+        dial failed, and the short circuit turned that into a verdict.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        backend = _CountingBackend([_device()])
+        settings = _settings(tmp_path, host="fe80::1")
+        row = _row(run_checks(_context(settings, scanner=backend)), CheckKey.SCANNER)
+        assert backend.calls == 1
+        assert row.state is CheckState.OK
 
 
 _PROBE_OUTCOMES = [
