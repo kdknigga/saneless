@@ -633,7 +633,7 @@ Plans:
 
 **Gap wave 3** *(blocked on gap wave 2)*
 
-- [ ] 30-26-PLAN.md — WR-05: a minimum interval under the manual check refresh
+- [x] 30-26-PLAN.md — WR-05: a minimum interval under the manual check refresh
 
 **Gap wave 4** *(blocked on gap wave 3)*
 
@@ -700,7 +700,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 25/27 | In Progress|  |
+| 30. Appliance Layer | 26/27 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
