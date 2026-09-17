@@ -366,6 +366,23 @@ def _tag_list_context(
         whether the wrapper should ask for itself once it is parsed.
 
     """
+    # IN-01.  With ``[web] show_tags`` off the tag markup is never emitted, so
+    # a fetch here buys nothing and costs a paperless-ngx round trip on every
+    # cold-cache page load -- and the flag that would hide the list is the same
+    # flag that decides whether the data can ever be seen.  The guard sits in
+    # this function rather than in ``index`` so it covers all three call sites,
+    # including the filter and refresh routes, which have the same reason to
+    # skip.  The key set below is the normal path's, emptied: ``index`` spreads
+    # this with ``**``, so a missing key would leave an undefined name in a
+    # template that has nothing to do with tags.
+    if not state.settings.web.show_tags:
+        return {
+            "pinned": [],
+            "tags": [],
+            "selected_tags": set(),
+            "any_tags": False,
+            "tags_load_on_render": False,
+        }
     everything = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     needle = q.casefold()
     ticked = set(selected)
@@ -740,8 +757,16 @@ def index(request: Request) -> Response:
     # context the filter route builds, so it goes through the same function
     # rather than a second shape the two could drift apart on.
     tag_list = _tag_list_context(state, q="", selected=[], on_page_load=True)
-    correspondents = _get_cached_or_fetch(
-        state.cache, state.paperless, "correspondents"
+    # The correspondent half of the same saving (IN-01).  ``show_correspondent``
+    # off means the select is left out of the markup, so this fetch would be a
+    # second cold-cache round trip for a list nobody can be shown.  The key
+    # stays in the context either way: the template reaches for it inside its
+    # own ``{% if %}``, and an absent key would be a different kind of bug from
+    # an empty one.
+    correspondents = (
+        _get_cached_or_fetch(state.cache, state.paperless, "correspondents")
+        if state.settings.web.show_correspondent
+        else []
     )
 
     status = _status_context(state.worker, state.job_store, _status_facts(request))
@@ -819,7 +844,11 @@ def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
         status = request.app.state.paperless.test_connection()
         return {"status": status}
     except Exception as exc:
-        logger.warning("Paperless connection test failed: %s", exc)
+        # The class name and not the exception: a configured paperless.url may
+        # carry ``user:pass@`` and httpx puts the URL it could not reach in the
+        # exception's string form, which is why every handler in this module
+        # names the class instead (ASVS V7, IN-02).
+        logger.warning("Paperless connection test failed: %s", type(exc).__name__)
         return JSONResponse(
             status_code=502,
             content={"status": "error", "detail": type(exc).__name__},
@@ -998,16 +1027,29 @@ def start_scan(
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
     title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
-    # D-29.  Hiding a control changes the form, never the scan: with
-    # ``[web] show_tags`` or ``show_correspondent`` off, the submit carries
-    # nothing for that field and the profile's own default is what applies,
-    # exactly as a blank title already falls back to the profile's title on the
-    # line above.  It is a fallback and not an override -- a submit that names
-    # tags or a correspondent keeps them -- so an operator who turns a control
-    # off gets the profile's answer rather than none at all, and the CLI, which
-    # has always applied these defaults, stops being the odd one out.
-    tags = tags or found.default_tags
-    if correspondent is None:
+    # D-29, as WR-06 corrected it.  Hiding a control changes the form, never
+    # the scan: with ``[web] show_tags`` or ``show_correspondent`` off, the
+    # submit carries nothing for that field and the profile's own default is
+    # what applies, exactly as a blank title already falls back to the
+    # profile's title on the line above.  An operator who turns a control off
+    # gets the profile's answer rather than none at all, and the CLI, which has
+    # always applied these defaults, stops being the odd one out.
+    #
+    # The gate is the config key and never the submitted value, because the
+    # submitted value cannot carry the distinction this needs: an empty tag
+    # list and an absent correspondent arrive here identically whether the
+    # control was never rendered or was rendered and the user cleared it.  Only
+    # the setting that decided which page was served knows which happened.
+    # Reading the value instead took away an ability the appliance had -- the
+    # web path applied no profile defaults at all before this phase, so
+    # ``tags or found.default_tags`` silently re-tagged a submit from somebody
+    # who had deliberately unticked every box.  With the control on the page
+    # the submit is now the whole answer, cleared list included; with it off
+    # the submit's value for that field is meaningless, which is why the
+    # assignment inside each gate is unconditional rather than a fallback.
+    if not state.settings.web.show_tags:
+        tags = found.default_tags
+    if not state.settings.web.show_correspondent:
         correspondent = found.default_correspondent
     form = _ScanForm(
         profile=profile, title=title, tags=tags, correspondent=correspondent

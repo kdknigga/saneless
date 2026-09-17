@@ -7,6 +7,7 @@ HLTH-01, HLTH-02, LOG-03.
 
 from __future__ import annotations
 
+import ast
 import html
 import inspect
 import json
@@ -49,6 +50,7 @@ from saneless.job import JobState, JobStore
 from saneless.paperless import PaperlessClient
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
+    TOKEN_UNSET_JOB_ERROR,
     ErrorCategory,
     FlipOutcome,
     RequestRejection,
@@ -62,6 +64,7 @@ from saneless.vocabulary import (
     rejection_message,
 )
 from saneless.web import app as app_module
+from saneless.web import routes as routes_module
 from saneless.web.app import create_app
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
@@ -2267,6 +2270,7 @@ def _simple_form_app(
     *,
     show_tags: bool = True,
     show_correspondent: bool = True,
+    credential: str = "a-real-looking-token",
 ) -> FastAPI:
     """
     Build an app whose scan form has the given shape, with two stub profiles.
@@ -2275,6 +2279,9 @@ def _simple_form_app(
         tmp_path: Where the app writes its database and files.
         show_tags: Whether the Tags fieldset is rendered at all.
         show_correspondent: Whether the Correspondent control is rendered.
+        credential: The configured paperless-ngx token; a placeholder here is
+            how a caller reaches ``start_scan``'s refusal without a second
+            fixture.
 
     Returns:
         The app, whose lifespan starts with its TestClient.
@@ -2282,9 +2289,7 @@ def _simple_form_app(
     """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(
-            url="http://localhost:8000", token="a-real-looking-token"
-        ),
+        paperless=PaperlessConfig(url="http://localhost:8000", token=credential),
         output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
         web=WebConfig(show_tags=show_tags, show_correspondent=show_correspondent),
         profiles={
@@ -2460,3 +2465,359 @@ class TestSimpleForm:
         css = _web_asset("static", "app.css")
 
         assert len(re.findall(r"#[0-9a-fA-F]{6}", css)) == _APP_CSS_COLOURS_BEFORE_30_16
+
+
+def _newest_job(client: TestClient) -> Job:
+    """
+    Return the job row the submit under test just created.
+
+    The fact these tests are about is what was *stored*, not what the response
+    said, so every assertion reads the row back rather than the body.
+
+    Args:
+        client: The client whose app holds the job store.
+
+    Returns:
+        The most recent job row.
+
+    """
+    job_store: JobStore = _app(client).state.job_store
+    rows = job_store.list_recent(limit=1)
+    assert len(rows) == 1
+    return rows[0]
+
+
+class TestProfileDefaultsFollowTheFormShape:
+    """
+    WR-06: a profile default fills in for a control nobody was shown.
+
+    An empty tag list and an absent correspondent reach ``start_scan``
+    identically whether the control was never rendered or was rendered and
+    then cleared, so the submit on its own cannot tell the two apart.  The
+    config key that decided whether to render the control is the only fact
+    that can, and gating on it is what lets a household member untick every
+    box and get a job with no tags -- something the appliance could do before
+    this phase and lost to an ungated fallback.
+    """
+
+    def test_a_cleared_tag_list_submits_no_tags(self, tmp_path: Path) -> None:
+        """The review's named regression test: unticking every box means none."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Cleared"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).tags == []
+
+    def test_a_hidden_tag_control_still_applies_the_profile_default(
+        self, tmp_path: Path
+    ) -> None:
+        """D-29's half: with no control on the page the profile answers."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Hidden"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).tags == _PROFILE_DEFAULT_TAGS
+
+    def test_a_ticked_tag_beats_the_profile_default(self, tmp_path: Path) -> None:
+        """A submit that names tags keeps them, with the control on the page."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Ticked", "tags": ["7"]},
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).tags == [7]
+
+    def test_a_cleared_correspondent_submits_no_correspondent(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of the same regression."""
+        with TestClient(_simple_form_app(tmp_path)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Cleared"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).correspondent is None
+
+    def test_a_hidden_correspondent_control_still_applies_the_default(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of D-29."""
+        with TestClient(_simple_form_app(tmp_path, show_correspondent=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Hidden"}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).correspondent == _PROFILE_DEFAULT_CORRESPONDENT
+
+    def test_the_two_flags_are_read_independently(self, tmp_path: Path) -> None:
+        """One control off and the other on resolves one default and not both."""
+        app = _simple_form_app(tmp_path, show_tags=False, show_correspondent=True)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Mixed"}
+            )
+
+            assert response.status_code == 200
+            job = _newest_job(client)
+            assert job.tags == _PROFILE_DEFAULT_TAGS
+            assert job.correspondent is None
+
+    def test_the_placeholder_token_refusal_still_runs_after_the_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        """The gate moves nothing else: one REJECTED row, exactly as before."""
+        with TestClient(_simple_form_app(tmp_path, credential="changeme")) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Unset Token"}
+            )
+
+            assert response.status_code == 503
+            job = _newest_job(client)
+            assert job.state is JobState.ERROR
+            assert job.error == TOKEN_UNSET_JOB_ERROR
+            assert job.error_category is ErrorCategory.REJECTED
+
+    def test_a_blank_title_still_falls_back_the_way_it_did(
+        self, tmp_path: Path
+    ) -> None:
+        """``resolve_job_title`` runs on the line above and is untouched."""
+        with TestClient(_simple_form_app(tmp_path, show_tags=False)) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "   "}
+            )
+
+            assert response.status_code == 200
+            assert _newest_job(client).title.startswith("Scan ")
+
+
+# The two collection endpoints a page load can reach, as paperless.py spells
+# them.  Counting by path is what separates "no tag request" from "no request
+# at all", which are different claims and fail differently.
+_TAGS_ENDPOINT = "/api/tags/"
+_CORRESPONDENTS_ENDPOINT = "/api/correspondents/"
+
+
+class _MetadataRequestCounter:
+    """Records every paperless-ngx request a request under test issues."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.paths: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Record the request's path and answer with an empty collection.
+
+        Args:
+            request: The request the client issued.
+
+        Returns:
+            A 200 carrying a paginated response with no results, so a fetch
+            that does happen succeeds and the count is the only difference.
+
+        """
+        self.paths.append(request.url.path)
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+    def count(self, path: str) -> int:
+        """
+        Say how many requests reached one endpoint.
+
+        Args:
+            path: The endpoint path to count.
+
+        Returns:
+            The number of recorded requests for that path.
+
+        """
+        return self.paths.count(path)
+
+
+def _counted_app(
+    tmp_path: Path,
+    *,
+    show_tags: bool = True,
+    show_correspondent: bool = True,
+) -> tuple[FastAPI, _MetadataRequestCounter]:
+    """
+    Build a form-shaped app whose Paperless traffic is counted, not stubbed.
+
+    The stub client ``_simple_form_app`` installs answers without going near
+    the transport, which is exactly what makes it useless for counting, so the
+    client is replaced here by a real one over a mock transport.  The metadata
+    cache is untouched and therefore cold: every fetch the route decides to
+    make shows up.
+
+    Args:
+        tmp_path: Where the app writes its database and files.
+        show_tags: Whether the Tags fieldset is rendered at all.
+        show_correspondent: Whether the Correspondent control is rendered.
+
+    Returns:
+        The app and the counter its Paperless client reports to.
+
+    """
+    app = _simple_form_app(
+        tmp_path, show_tags=show_tags, show_correspondent=show_correspondent
+    )
+    counter = _MetadataRequestCounter()
+    credential = "a-real-looking-token"
+    app.state.paperless = PaperlessClient(
+        url="http://localhost:8000",
+        token=credential,
+        _transport=httpx.MockTransport(counter),
+    )
+    return app, counter
+
+
+class TestHiddenControlsCostNoMetadataFetch:
+    """
+    IN-01: an appliance does not pay for data its markup leaves out.
+
+    On a cold metadata cache a page load costs one paperless-ngx round trip per
+    optional control, and the flags the template branches on are the same flags
+    that decide whether that data can ever be seen.  With both controls off the
+    page is the profile, the title and the Scan button, and it should reach
+    paperless-ngx not at all.
+    """
+
+    def test_a_hidden_tag_control_costs_no_tag_request(self, tmp_path: Path) -> None:
+        """A cold cache and no Tags fieldset means no ``/api/tags/`` fetch."""
+        app, counter = _counted_app(tmp_path, show_tags=False)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.count(_TAGS_ENDPOINT) == 0
+
+    def test_a_hidden_correspondent_control_costs_no_fetch(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of the same claim."""
+        app, counter = _counted_app(tmp_path, show_correspondent=False)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.count(_CORRESPONDENTS_ENDPOINT) == 0
+
+    def test_the_shortest_form_costs_no_paperless_request_at_all(
+        self, tmp_path: Path
+    ) -> None:
+        """Both controls off: the page load reaches paperless-ngx never."""
+        app, counter = _counted_app(tmp_path, show_tags=False, show_correspondent=False)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.paths == []
+
+    def test_the_full_form_still_fetches_both(self, tmp_path: Path) -> None:
+        """No fetch is lost: the default shape costs exactly what it did."""
+        app, counter = _counted_app(tmp_path)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.count(_TAGS_ENDPOINT) == 1
+        assert counter.count(_CORRESPONDENTS_ENDPOINT) == 1
+
+    def test_a_hidden_tag_control_still_renders_a_whole_page(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The guarded context is complete enough to render, not just to type.
+
+        ``index`` spreads the tag context into its own, so a key the guard
+        forgot would be an ``UndefinedError`` or a silently empty branch on a
+        page that has nothing to do with tags.  Rendering is the assertion.
+        """
+        app, _ = _counted_app(tmp_path, show_tags=False)
+        with TestClient(app) as client:
+            page = client.get("/").text
+
+        assert 'id="tags-list"' not in page
+        assert 'id="scan-btn"' in page
+        assert 'id="correspondent-select"' in page
+
+    def test_the_tag_route_answers_an_empty_list_when_the_control_is_off(
+        self, tmp_path: Path
+    ) -> None:
+        """``/api/tags`` is reachable with the control off and costs nothing."""
+        app, counter = _counted_app(tmp_path, show_tags=False)
+        with TestClient(app) as client:
+            response = client.get("/api/tags")
+
+        assert response.status_code == 200
+        assert 'name="tags"' not in response.text
+        assert counter.count(_TAGS_ENDPOINT) == 0
+
+
+# A Paperless URL configured behind a reverse proxy may carry Basic-auth
+# userinfo, and httpx puts the URL it could not reach into the exception's
+# string form.  Both halves are asserted absent from the log.
+_CREDENTIALLED_URL = "https://user:pass@paperless.example/api/tags/"
+
+
+class TestRouteLogsNameExceptionsOnly:
+    """
+    IN-02: no handler in ``web/routes.py`` renders an exception into a log.
+
+    The Paperless URL may carry ``user:pass@`` (``checks.py`` says so in as
+    many words), so an exception object interpolated with ``%s`` is a
+    credential in the log file.  Every other handler in the module already
+    logs the class name; the guard below is what stops a future one drifting
+    back, which a single behavioural test could not do.
+    """
+
+    def test_a_failed_connection_test_logs_only_the_class_name(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The userinfo and the host both stay out of the record (ASVS V7)."""
+
+        def _raise_with_the_url() -> str:
+            raise httpx.ConnectError(_CREDENTIALLED_URL)
+
+        app = _simple_form_app(tmp_path)
+        app.state.paperless.test_connection = _raise_with_the_url
+        with TestClient(app) as client, caplog.at_level(logging.WARNING):
+            response = client.get("/api/paperless/test")
+
+        assert response.status_code == 502
+        assert response.json() == {"status": "error", "detail": "ConnectError"}
+        for record in caplog.records:
+            message = record.getMessage()
+            assert "user:pass" not in message
+            assert "paperless.example" not in message
+        assert "ConnectError" in caplog.records[-1].getMessage()
+
+    def test_no_logger_call_in_routes_takes_a_bare_exception(self) -> None:
+        """
+        Read the source: no ``logger`` call is handed the exception itself.
+
+        Parsed rather than grepped, so a call spread over several lines is
+        caught too -- the shape this forbids is easiest to reintroduce when
+        the arguments have been wrapped.
+        """
+        source = Path(routes_module.__file__).read_text(encoding="utf-8")
+        offenders = [
+            node.lineno
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "logger"
+            and any(
+                isinstance(argument, ast.Name) and argument.id == "exc"
+                for argument in [
+                    *node.args,
+                    *(keyword.value for keyword in node.keywords),
+                ]
+            )
+        ]
+
+        assert offenders == []
