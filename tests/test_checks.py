@@ -23,6 +23,7 @@ already proven.  No test here sleeps.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 from dataclasses import FrozenInstanceError
@@ -2333,6 +2334,36 @@ class _GateSamplingBackend(StubScannerBackend):
         return self.devices
 
 
+def _gate_sampling_dialler(
+    monkeypatch: pytest.MonkeyPatch, probe: _GateProbe, *, reachable: bool
+) -> list[tuple[str, int]]:
+    """
+    Replace the saned dialler with one that samples the gate before answering.
+
+    Nothing connects, the same way ``_recording_dialler`` connects to nothing:
+    what is under test is whether the *gate* is free while the pre-probe runs,
+    which is decided before any socket exists.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+        probe: The recorder the gate sample goes to.
+        reachable: What the stubbed dialler should answer.
+
+    Returns:
+        The list the stub appends each ``(host, port)`` pair to.
+
+    """
+    dialled: list[tuple[str, int]] = []
+
+    def _dial(host: str, port: int, _timeout: float) -> bool:
+        dialled.append((host, port))
+        probe.sample("pre-probe")
+        return reachable
+
+    monkeypatch.setattr(checks, "_saned_reachable", _dial)
+    return dialled
+
+
 def _gate_sampling_context(
     tmp_path: Path, probe: _GateProbe, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[CheckContext, PaperlessClient, _GateSamplingBackend]:
@@ -2370,6 +2401,15 @@ def _gate_sampling_context(
         paperless=client,
     )
     return context, client, backend
+
+
+# Matches a row that talks about a *scan*, and deliberately not one that talks
+# about the *scanner*: "scanner" is the row's own name and every scanner
+# message is entitled to say it.  Word boundaries are what make the difference,
+# so a plain substring test would not do.
+_NAMES_A_SCAN = re.compile(r"\bscan(s|ning)?\b", re.IGNORECASE)
+
+_SCAN_RUNNING_MESSAGE = "Not checked while a scan is running."
 
 
 class TestRunChecksUnderTheScannerGate:
@@ -2492,9 +2532,15 @@ class TestRunChecksUnderTheScannerGate:
         """
         A wedged check must never leave the worker locked out of its scanner.
 
+        What is broken here is the enumeration, because that is the region the
+        gate is held around: the pre-probe now runs before the acquire, so a
+        stand-in for the whole check would never reach the gate to leave it
+        held.  A scanner is supplied for the same reason -- without one the
+        pre-probe settles the row and the gate is never taken.
+
         Args:
             tmp_path: The test's own directory.
-            monkeypatch: Used to break the scanner check on purpose.
+            monkeypatch: Used to break the enumeration on purpose.
 
         """
 
@@ -2502,10 +2548,10 @@ class TestRunChecksUnderTheScannerGate:
             msg = "the scanner check exploded"
             raise RuntimeError(msg)
 
-        monkeypatch.setattr(checks, "_check_scanner", boom)
+        monkeypatch.setattr(checks, "_scanner_enumeration", boom)
         gate = _RecordingLock()
         results = run_checks(
-            _context(_settings(tmp_path)),
+            _context(_settings(tmp_path), scanner=_CountingBackend([_device()])),
             scanner_gate=cast("threading.Lock", gate),
         )
         assert _row(results, CheckKey.SCANNER).state is CheckState.FAIL
@@ -2535,6 +2581,154 @@ class TestRunChecksUnderTheScannerGate:
         assert _row(results, CheckKey.SCANNER).skipped is True
         assert backend.calls == 0
         assert gate.releases == 0
+
+    def test_the_gate_is_free_while_the_saned_pre_probe_runs(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        R2-IN-03: name resolution must not be able to park a scan start.
+
+        The pre-probe is not SANE work -- it is a DNS lookup and a TCP
+        handshake -- and its resolution step is outside every budget this
+        module states, because ``getaddrinfo`` takes no timeout.  Holding the
+        scanner gate across it means ``ScanWorker._scan_job`` can sit in
+        ``with self._scanner_gate:`` with the job row already written
+        ``SCANNING`` for as long as a broken resolver takes.
+
+        A host is configured on purpose: with none, ``_saned_hosts`` yields
+        nothing, the pre-probe never runs, and the case would pass vacuously
+        while proving nothing.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to make the pre-probe sample the gate.
+
+        """
+        gate = _RecordingLock()
+        probe = _GateProbe(gate)
+        dialled = _gate_sampling_dialler(monkeypatch, probe, reachable=True)
+        backend = _GateSamplingBackend(probe, [_device()])
+        results = run_checks(
+            _context(_settings(tmp_path, host="scanbox"), scanner=backend),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        assert dialled == [("scanbox", SANED_PORT)]
+        assert probe.free_during["pre-probe"] is True
+        assert probe.free_during["scanner"] is False
+        assert _row(results, CheckKey.SCANNER).state is CheckState.OK
+        assert gate.is_free() is True
+
+    def test_a_refused_pre_probe_never_touches_the_gate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A check that decides before SANE has no business taking SANE's lock.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Used to make every configured host refuse.
+
+        """
+        gate = _RecordingLock()
+        backend = _CountingBackend([_device()])
+        dialled = _recording_dialler(monkeypatch, reachable=False)
+        results = run_checks(
+            _context(_settings(tmp_path, host="scanbox"), scanner=backend),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        assert dialled == [("scanbox", SANED_PORT)]
+        assert gate.acquires == 0
+        assert backend.calls == 0
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "The configured scanner host is not answering, "
+            "so the scanner could not be checked."
+        )
+
+    def test_an_absent_backend_never_touches_the_gate(self, tmp_path: Path) -> None:
+        """
+        A machine with no python-sane is its own row, decided before the lock.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        results = run_checks(
+            _context(_settings(tmp_path)),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        row = _row(results, CheckKey.SCANNER)
+        assert row.state is CheckState.FAIL
+        assert row.message == "Scanner support is not installed on this machine."
+        assert gate.acquires == 0
+
+    def test_a_gate_held_elsewhere_does_not_claim_a_scan_is_running(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        R2-WR-02: losing the gate is not a scan, and the row must not say it is.
+
+        ``run_checks`` honours ``skip_scanner`` *before* it looks at the gate,
+        so by the time a non-blocking acquire fails a running scan has already
+        been excluded.  What holds the gate in that window today is
+        ``ScanWorker._read_generated_profiles``, the worker thread's first act
+        at startup, taken while ``_current_job_id`` is still ``None`` -- which
+        is exactly when the cold-start poll probes.
+
+        The row is asserted, not the constructor that built it: the sentence a
+        household member reads is the contract.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        backend = _CountingBackend([_device()])
+        assert gate.lock.acquire(blocking=False) is True
+        try:
+            results = run_checks(
+                _context(_settings(tmp_path), scanner=backend),
+                scanner_gate=cast("threading.Lock", gate),
+            )
+        finally:
+            gate.lock.release()
+        row = _row(results, CheckKey.SCANNER)
+        assert _NAMES_A_SCAN.search(row.message) is None, row.message
+        assert row.message != _SCAN_RUNNING_MESSAGE
+        assert row.state is CheckState.OK
+        assert row.skipped is True
+        assert row.next_step == ""
+        assert backend.calls == 0
+
+    def test_the_skip_scanner_row_still_names_the_running_scan(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        D-08's sentence is unchanged, and it stays the only row that says it.
+
+        Its companion above proves the two branches are distinguishable by
+        message alone, which is what lets either surface be trusted.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        gate = _RecordingLock()
+        results = run_checks(
+            _context(
+                _settings(tmp_path),
+                scanner=_CountingBackend([_device()]),
+                skip_scanner=True,
+            ),
+            scanner_gate=cast("threading.Lock", gate),
+        )
+        row = _row(results, CheckKey.SCANNER)
+        assert row.message == _SCAN_RUNNING_MESSAGE
+        assert row.state is CheckState.OK
+        assert row.skipped is True
+        assert gate.acquires == 0
 
     def test_skip_scanner_never_touches_the_gate(self, tmp_path: Path) -> None:
         """

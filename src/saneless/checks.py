@@ -927,26 +927,126 @@ def _scanner_skipped() -> CheckResult:
     )
 
 
-def _check_scanner(context: CheckContext) -> CheckResult:
+def _scanner_busy() -> CheckResult:
     """
-    Report whether a scanner is there to scan with.
+    Build the row shown when something else held the scanner gate (R2-WR-02).
 
-    The order is deliberate.  A machine with no python-sane is its own row
-    (Amendment A-1) and is decided without touching anything.  The host SANE
-    will actually dial is then pre-probed, and every configured entry refusing
-    a TCP connection ends the check right there, with the amber
-    ``_scanner_host_unanswered`` row: ``get_devices()`` would spend about two
-    minutes reaching a conclusion inside a C call nothing can interrupt
-    (T-30-22), and the conclusion it would reach is not the one the probe is
-    entitled to report.  A refused dial says the configured host did not
-    answer; it does not say there is no scanner, because ``SANE_NET_HOSTS``
-    adds net devices rather than replacing local enumeration (CR-02).  Only
-    when there is no host to probe, or one of them answered, is the backend
-    entered at all -- and then whatever the enumeration reports stands, red
-    included, because an enumeration that actually ran has earned its verdict.
-    That fallback is also the one that cannot produce a false row, because a
-    setting this module cannot parse into an entry leaves the check behaving
-    exactly as it did before the probe existed.
+    This exists separately from ``_scanner_skipped`` because the distinction is
+    the whole of the fix.  ``run_checks`` honours ``context.skip_scanner``
+    *before* the gate is consulted, so by the time a non-blocking acquire fails
+    a running scan has already been excluded: whatever holds the gate is not a
+    scan, and a row that says one is running is simply false.  Today there is
+    one known contender, and it is not hypothetical --
+    ``ScanWorker._read_generated_profiles`` takes the gate around
+    ``get_devices()`` and ``get_capabilities()`` as the worker thread's first
+    act at startup (``worker.py:947``), while ``_current_job_id`` is still
+    ``None`` (it is set at ``worker.py:1394``).  The lifespan starts the worker
+    and then the refresher, so that window coincides exactly with the
+    cold-start poll -- which is how ``_scanner_skipped``'s sentence came to sit
+    beside a last-checked time on an appliance that had never scanned.
+
+    The state is ``OK`` for the same reason ``_scanner_skipped``'s is, restated
+    because it is easy to read as a bug: "we did not look" is a fact about the
+    probe, not a verdict about the appliance, and a scripted health gate keyed
+    on red (D-01) must not fail because two threads wanted the scanner in the
+    same instant.  The ``skipped`` flag discloses that nothing was checked.
+
+    There is deliberately **no** next step.  ``_scanner_skipped`` carries none
+    either, and for the same reason: the next probe fixes this by itself,
+    within one refresh interval, so telling a household member to do something
+    would be asking them to act on a condition that is already clearing.
+
+    The message names no scan, and it names no host, address, port, path or
+    exception either (ASVS V7), which is the same omission
+    ``_scanner_host_unanswered`` makes on purpose.
+
+    Returns:
+        The neutral contention row, ``skipped`` true because no probe ran.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.OK,
+        message="The scanner was busy, so it was not checked this time.",
+        skipped=True,
+    )
+
+
+def _scanner_support_missing() -> CheckResult:
+    """
+    Build the "there is no python-sane on this machine" row (Amendment A-1).
+
+    Its own constructor because two callers need the same row and a row
+    written twice is a row that can drift.
+
+    Returns:
+        The UI-SPEC S1 no-scanner-support row.
+
+    """
+    return CheckResult(
+        key=CheckKey.SCANNER,
+        state=CheckState.FAIL,
+        message="Scanner support is not installed on this machine.",
+        next_step="Install saneless with scanner support, then restart it.",
+    )
+
+
+def _scanner_preflight(context: CheckContext) -> CheckResult | None:
+    """
+    Decide the scanner row without entering SANE, or say the backend is needed.
+
+    This is everything the scanner check can settle before libsane is touched,
+    and it is a separate function so it can run with the worker's scanner gate
+    **free** (R2-IN-03).  Nothing here is SANE work: it is a settings read, a
+    name resolution and a TCP handshake.  That matters because resolution is
+    outside every budget this module states -- ``getaddrinfo`` takes no
+    timeout, as ``PROBE_CONNECT_SECONDS`` says at length -- so a check holding
+    the gate across it can park a ``ScanWorker._scan_job`` whose job row
+    already reads ``SCANNING`` for as long as a broken resolver takes, and
+    ``POST /api/checks/refresh`` can re-arm that parking every couple of
+    seconds.
+
+    The order inside it is the order ``_check_scanner`` always had.  A machine
+    with no python-sane is its own row (Amendment A-1) and is decided without
+    touching anything.  The host SANE will actually dial is then pre-probed,
+    and every configured entry refusing a TCP connection ends the check right
+    there, with the amber ``_scanner_host_unanswered`` row: ``get_devices()``
+    would spend about two minutes reaching a conclusion inside a C call
+    nothing can interrupt (T-30-22), and the conclusion it would reach is not
+    the one the probe is entitled to report.  A refused dial says the
+    configured host did not answer; it does not say there is no scanner,
+    because ``SANE_NET_HOSTS`` adds net devices rather than replacing local
+    enumeration (CR-02).
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        The row, when it can be decided here; ``None`` to mean "go and
+        enumerate", which is the case where there is no host to probe or one
+        of them answered.
+
+    """
+    if context.scanner is None:
+        return _scanner_support_missing()
+    entries = _saned_hosts(_saned_host_setting(context.settings))
+    if entries and not any(
+        _saned_reachable(host, port, PROBE_CONNECT_SECONDS) for host, port in entries
+    ):
+        return _scanner_host_unanswered()
+    return None
+
+
+def _scanner_enumeration(context: CheckContext) -> CheckResult:
+    """
+    Ask the backend what it can see, which is the part that enters SANE.
+
+    This is the region the scanner gate exists to make exclusive, and the only
+    region: whatever the enumeration reports stands, red included, because an
+    enumeration that actually ran has earned its verdict.  It is also the
+    branch that cannot produce a false row, because a host setting this module
+    cannot parse into an entry leaves the check behaving exactly as it did
+    before the pre-probe existed.
 
     Args:
         context: The injected dependencies and configuration.
@@ -957,17 +1057,12 @@ def _check_scanner(context: CheckContext) -> CheckResult:
     """
     scanner = context.scanner
     if scanner is None:
-        return CheckResult(
-            key=CheckKey.SCANNER,
-            state=CheckState.FAIL,
-            message="Scanner support is not installed on this machine.",
-            next_step="Install saneless with scanner support, then restart it.",
-        )
-    entries = _saned_hosts(_saned_host_setting(context.settings))
-    if entries and not any(
-        _saned_reachable(host, port, PROBE_CONNECT_SECONDS) for host, port in entries
-    ):
-        return _scanner_host_unanswered()
+        # Unreachable through both real callers: each runs the preflight
+        # first, and the preflight answers this case itself.  Re-narrowing it
+        # here is how the type checkers learn that, without a cast and without
+        # a suppression, and it returns the one shared row rather than a
+        # second copy of it.
+        return _scanner_support_missing()
     try:
         devices = scanner.get_devices()
     except Exception as exc:
@@ -985,6 +1080,33 @@ def _check_scanner(context: CheckContext) -> CheckResult:
         state=CheckState.OK,
         message=f"{label} is ready." if label else "Ready.",
     )
+
+
+def _check_scanner(context: CheckContext) -> CheckResult:
+    """
+    Report whether a scanner is there to scan with.
+
+    The ungated path: this is what ``_dispatch`` calls, and therefore what
+    ``saneless doctor`` runs.  It is the preflight followed by the
+    enumeration, in that order, which is the order this check has always had
+    -- the split changed where the gate sits, not what any caller sees.
+
+    ``if pre is not None`` rather than a truthiness shortcut: ``CheckResult``
+    is a frozen dataclass and therefore always truthy, so ``pre or
+    _scanner_enumeration(context)`` would read as a bug even though it would
+    work.
+
+    Args:
+        context: The injected dependencies and configuration.
+
+    Returns:
+        Exactly one result for ``CheckKey.SCANNER``.
+
+    """
+    pre = _scanner_preflight(context)
+    if pre is not None:
+        return pre
+    return _scanner_enumeration(context)
 
 
 def _paperless_next_step(status: ConnectionStatus) -> str:
@@ -1269,32 +1391,57 @@ def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
 
 def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> CheckResult:
     """
-    Run the scanner check holding the worker's gate, or report it skipped.
+    Run the scanner check, holding the worker's gate for the part that needs it.
 
-    This is the only place in the registry that takes the gate, because
-    ``_check_scanner`` is the only check that enters libsane.  The attempt is
-    non-blocking and a failure is reported rather than waited out, which is the
-    single move ``ScanWorker.scanner_gate`` documents as permitted: blocking
-    here would queue behind a scan that can legitimately run for minutes and
-    then enter SANE at some arbitrary later moment.
+    This is the only place in the registry that takes the gate, because the
+    enumeration is the only thing any check does inside libsane.  What changed
+    with R2-IN-03 is the size of the gated region: the pre-probe runs *first*,
+    with the gate free, and only ``_scanner_enumeration`` is held.  The
+    pre-probe is a name resolution and a TCP handshake, and resolution is
+    outside every budget this module states, so holding the gate across it
+    could park a ``ScanWorker._scan_job`` whose job row already reads
+    ``SCANNING`` for as long as a broken resolver takes.  A pre-probe that
+    settles the row -- no python-sane, or every configured host refusing --
+    therefore never touches the gate at all.
+
+    The attempt is non-blocking and a failure is reported rather than waited
+    out, which is the single move ``ScanWorker.scanner_gate`` documents as
+    permitted: blocking here would queue behind a scan that can legitimately
+    run for minutes and then enter SANE at some arbitrary later moment.  A
+    failed acquire is ``_scanner_busy()`` and not ``_scanner_skipped()``: the
+    latter names a running scan, and ``run_checks`` has already dealt with that
+    case before this function is reached, so the only thing a lost gate
+    establishes is that somebody else is in SANE -- today, the worker's startup
+    capability read, which runs before any job exists (R2-WR-02).
 
     The release is in a ``finally``, so a check that raises still hands the
     scanner back before the exception reaches ``run_checks``' per-check
     handler.  A registry that left the gate held would lock the worker out of
     its own scanner for the life of the process.
 
+    What the split costs is worth recording: this function no longer routes
+    through ``_dispatch``, so the uniform-dispatch seam no longer guarantees
+    that the gated path and ``saneless doctor``'s ungated ``_check_scanner``
+    agree.  A test guarantees it instead --
+    ``test_a_gated_run_returns_what_an_ungated_run_returns`` in
+    ``tests/test_checks.py`` -- and that is where anyone changing either half
+    should look.
+
     Args:
         context: The injected dependencies and configuration.
         scanner_gate: The worker's gate, tried without blocking.
 
     Returns:
-        The scanner row, or the paused row when the gate was not free.
+        The scanner row, or the neutral busy row when the gate was not free.
 
     """
+    pre = _scanner_preflight(context)
+    if pre is not None:
+        return pre
     if not scanner_gate.acquire(blocking=False):
-        return _scanner_skipped()
+        return _scanner_busy()
     try:
-        return _dispatch(CheckKey.SCANNER, context)
+        return _scanner_enumeration(context)
     finally:
         scanner_gate.release()
 

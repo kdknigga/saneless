@@ -18,6 +18,7 @@ Covers requirements: APPL-02.
 from __future__ import annotations
 
 import inspect
+import re
 import threading
 from typing import TYPE_CHECKING
 
@@ -29,13 +30,21 @@ from saneless.web import refresher as refresher_module
 from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import WATCH_WINDOW_SECONDS, CheckRefresher
 from saneless.worker import STOP_JOIN_SECONDS
+from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from saneless.config import Settings
+    from saneless.scanner.base import ScannerBackend
 
 _JOIN_TIMEOUT_SECONDS = 5.0
+
+# Matches a row that talks about a *scan*, and deliberately not one that talks
+# about the *scanner*: "scanner" is the row's own name and every scanner
+# message is entitled to say it.  The word boundaries are the whole point, so a
+# plain substring test would not do.
+_NAMES_A_SCAN = re.compile(r"\bscan(s|ning)?\b", re.IGNORECASE)
 
 
 class _FakeClock:
@@ -184,11 +193,24 @@ def _results(message: str = "All good.") -> tuple[CheckResult, ...]:
     )
 
 
-def _context(settings: Settings) -> CheckContext:
-    """Build the context the refresher's factory hands back."""
+def _context(settings: Settings, scanner: ScannerBackend | None = None) -> CheckContext:
+    """
+    Build the context the refresher's factory hands back.
+
+    Args:
+        settings: The settings the checks read.
+        scanner: The backend, or ``None`` for "python-sane is not installed",
+            which is what the policy cases want because they stub the registry
+            out entirely.  The one case that drives the *real* registry passes
+            a stub, so the scanner check gets as far as the gate.
+
+    Returns:
+        A context that touches no network of its own.
+
+    """
     return CheckContext(
         settings=settings,
-        scanner=None,
+        scanner=scanner,
         paperless=None,
         profile_storage=ProfileStorage.PERSISTED,
     )
@@ -199,6 +221,7 @@ def _build(
     clock: _FakeClock,
     gate: threading.Lock,
     scan: _ScanState | None = None,
+    scanner: ScannerBackend | None = None,
 ) -> tuple[CheckRefresher, CheckCache]:
     """
     Assemble a refresher over a cache that shares the same fake clock.
@@ -208,6 +231,7 @@ def _build(
         clock: The monotonic source shared by the cache and the refresher.
         gate: The scanner gate the refresher passes to ``run_checks``.
         scan: The worker's job-in-flight fact, idle when omitted.
+        scanner: The backend the context carries, absent when omitted.
 
     Returns:
         The refresher and the cache it fills.
@@ -216,7 +240,7 @@ def _build(
     cache = CheckCache(clock=clock)
     refresher = CheckRefresher(
         cache=cache,
-        context_factory=lambda: _context(settings),
+        context_factory=lambda: _context(settings, scanner),
         scanner_gate=lambda: gate,
         scan_active=scan if scan is not None else _ScanState(),
         clock=clock,
@@ -358,6 +382,56 @@ def test_a_gate_held_by_another_checker_is_not_a_running_scan(
         gate.release()
     assert len(spy.calls) == 1
     assert spy.calls[0].skip_scanner is False
+
+
+def test_a_gate_held_by_another_checker_stores_a_row_naming_no_scan(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    R2-WR-02: the row a lost gate actually stores, from the real registry.
+
+    No ``run_checks`` stand-in here, and that is the point.  Its companion
+    above stubs the registry and asserts the ``skip_scanner`` flag, which was
+    true all along and never rendered the row -- so the flag assertion passed
+    while the strip said "Not checked while a scan is running." beside a
+    last-checked time on an appliance that had never scanned.
+
+    The concrete path: ``ScanWorker._read_generated_profiles`` takes this gate
+    around ``get_devices()`` and ``get_capabilities()`` as the worker thread's
+    first act at startup, strictly before ``_current_job_id`` is ever set
+    (``worker.py:947``, set at ``worker.py:1394``).  The lifespan starts the
+    worker and then the refresher, so that window coincides exactly with the
+    cold-start poll: no job is in flight, ``skip_scanner`` is false, and the
+    gate is held by something that is not a scan.
+
+    The context carries a stub backend deliberately.  With no scanner at all
+    the check would decide the row before the gate was ever reached, and the
+    case would pass vacuously.  ``SANE_NET_HOSTS`` is cleared for the same
+    reason ``test_checks.py`` clears it: an exported value on the developer's
+    machine would redirect the pre-probe and make the verdict depend on the
+    host the suite runs on.
+
+    Args:
+        default_settings: Settings whose every path is test-safe.
+        monkeypatch: Used to clear the ambient ``SANE_NET_HOSTS``.
+
+    """
+    monkeypatch.delenv("SANE_NET_HOSTS", raising=False)
+    gate = threading.Lock()
+    refresher, cache = _build(
+        default_settings, _FakeClock(), gate, scanner=StubScannerBackend()
+    )
+    refresher.note_watcher()
+    gate.acquire()
+    try:
+        refresher._tick()
+    finally:
+        gate.release()
+    results = cache.current().results
+    assert results is not None
+    row = next(result for result in results if result.key is CheckKey.SCANNER)
+    assert _NAMES_A_SCAN.search(row.message) is None, row.message
+    assert row.state is CheckState.OK
 
 
 def test_tick_hands_the_gate_to_run_checks_instead_of_holding_it(
