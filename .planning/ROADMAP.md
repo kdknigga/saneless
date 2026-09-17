@@ -648,7 +648,7 @@ Plans:
 
 **Gap wave 6** *(blocked on gap wave 5)*
 
-- [ ] 30-30-PLAN.md — R2-WR-02/R2-IN-03: gate contention gets its own row; the pre-probe leaves the scanner gate
+- [x] 30-30-PLAN.md — R2-WR-02/R2-IN-03: gate contention gets its own row; the pre-probe leaves the scanner gate
 
 **UI hint**: yes
 
@@ -711,7 +711,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 29/30 | In Progress|  |
+| 30. Appliance Layer | 30/30 | Complete   | 2026-09-17 |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
