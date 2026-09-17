@@ -353,34 +353,115 @@ class TestSanedHostParsing:
         """The port rule is about the shape of the segment, not its value."""
         assert _saned_hosts("host-a:7000") == (("host-a", 7000),)
 
-    def test_three_segments_are_all_hosts(self) -> None:
+    def test_three_segments_holding_a_number_are_refused(self) -> None:
         """
-        The two-segment rule is deliberately narrow.
+        A number among three or more segments refuses the whole setting.
 
-        With three or more segments there is no reading that is safe to guess,
-        so every segment is treated as a host name.  A segment that is really a
-        port then simply fails to resolve, which costs one refused connect and
-        no wrong answer.
+        This asserted three entries until plan 30-28, on the reasoning that a
+        segment which is really a port "simply fails to resolve, which costs
+        one refused connect and no wrong answer".  Both halves of that were
+        false.  glibc reads a bare integer as the single-integer IPv4 form, so
+        ``getaddrinfo('6566', 6566)`` resolves rather than failing; and through
+        the pre-probe's short circuit a junk dial that happens to answer is a
+        wrong answer, not merely a wasted one.
+
+        With no all-digit segment allowed to be a host name, ``6566`` is no
+        longer a plausible one, so the existing more-than-two-segment guard
+        fires and the setting is refused.  Refusal is this module's documented
+        safe fallback: no entries means no probe, which means the scanner
+        check calls ``get_devices()`` and behaves exactly as it did before the
+        probe existed.
         """
-        assert _saned_hosts("host-a:6566:host-b") == (
-            ("host-a", SANED_PORT),
-            ("6566", SANED_PORT),
-            ("host-b", SANED_PORT),
-        )
+        assert _saned_hosts("host-a:6566:host-b") == ()
 
-    def test_an_out_of_range_port_is_not_a_port(self) -> None:
+    def test_an_out_of_range_port_is_dropped_rather_than_dialled(self) -> None:
         """
-        A number no socket could bind is read as a host name, not a port.
+        A number no socket could bind is dropped, leaving the host beside it.
 
-        Neither way of using such a port is safe: ``connect`` raises
+        No reading of such a segment as a *port* is safe: ``connect`` raises
         ``OverflowError``, which is not an ``OSError`` and so is not caught by
-        the probe, and ``getaddrinfo`` truncates it modulo 65536 instead, which
-        would have ``host-a:99999`` quietly dial port 34463.
+        the probe, and ``getaddrinfo`` truncates it modulo 65536 instead,
+        which would have ``host-a:99999`` quietly dial port 34463.
+
+        Reading it as a *host name* is not safe either, which is what R2-WR-01
+        established and what this case asserted until plan 30-28.  Measured on
+        this machine, ``getaddrinfo('99999', 6566)`` answers
+        ``0.1.134.159:6566`` -- glibc's single-integer IPv4 form.  Dialling
+        ``host-a:34463`` and dialling ``0.1.134.159:6566`` are both connections
+        to an address nobody configured; dropping the segment is what actually
+        avoids one.
         """
-        assert _saned_hosts("host-a:99999") == (
-            ("host-a", SANED_PORT),
-            ("99999", SANED_PORT),
-        )
+        assert _saned_hosts("host-a:99999") == (("host-a", SANED_PORT),)
+
+    def test_an_expanded_ipv6_literal_produces_no_entries_to_probe(self) -> None:
+        """
+        A fully written-out literal is refused, like its compressed form.
+
+        The blank-segment rule 30-21 added fires on an empty interior segment
+        or a rejected character, and an expanded literal has neither, so this
+        slipped straight through: measured before the fix,
+        ``_saned_hosts('2001:db8:0:0:0:0:0:1')`` returned eight entries --
+        ``('2001', 6566)``, ``('db8', 6566)``, ``('0', 6566)`` five times and
+        ``('1', 6566)``.  The stdlib is asked first now, and it recognises
+        both spellings.
+        """
+        assert _saned_hosts("2001:db8:0:0:0:0:0:1") == ()
+
+    def test_a_bracketed_expanded_ipv6_literal_produces_no_entries(self) -> None:
+        """
+        ``[2001:db8:0:0:0:0:0:1]:6566`` is refused as well.
+
+        Bracket-stripped it is nine groups, which the stdlib will not parse,
+        so this one is caught by the segment rules rather than by
+        ``ipaddress``: ``2001`` is all digits, so it is not a plausible host
+        name and the more-than-two-segment guard refuses the setting.  Both
+        halves of the defence are load-bearing, which is why neither was
+        removed.
+        """
+        assert _saned_hosts("[2001:db8:0:0:0:0:0:1]:6566") == ()
+
+    def test_a_zone_suffixed_ipv6_literal_produces_no_entries(self) -> None:
+        """
+        A link-local literal carrying its interface is refused too.
+
+        ``ipaddress.ip_address`` has accepted scoped literals since Python
+        3.9, so ``fe80::1%eth0`` parses as version 6 with no help from this
+        module -- verified against the interpreter this project pins.
+        """
+        assert _saned_hosts("fe80::1%eth0") == ()
+
+    def test_a_bare_zero_produces_no_entries_to_probe(self) -> None:
+        """
+        ``0`` is dropped, because dialling it reaches this machine.
+
+        Measured on this machine, ``getaddrinfo('0', 6566)`` answers
+        ``0.0.0.0:6566``, and on Linux a ``connect()`` to ``0.0.0.0`` reaches
+        loopback.  So an all-digit segment is not merely untidy: a ``0``
+        reaching the dial list lets the probe report the configured scanner
+        host "reachable" off any unrelated local process that happens to
+        listen on 6566.
+        """
+        assert _saned_hosts("0") == ()
+
+    def test_a_bare_number_is_not_a_host_name(self) -> None:
+        """
+        ``2001`` is dropped rather than resolved as an address.
+
+        Measured on this machine, ``getaddrinfo('2001', 6566)`` answers
+        ``0.0.7.209:6566``.  glibc *accepts* these strings, which is why the
+        all-digit rejection is a security rule and not a cosmetic one: half an
+        IPv6 literal resolves to a routable address nobody typed.
+        """
+        assert _saned_hosts("2001") == ()
+
+    def test_a_bare_out_of_range_number_produces_no_entries(self) -> None:
+        """
+        ``99999`` on its own is dropped, the same as beside a host.
+
+        Measured on this machine, ``getaddrinfo('99999', 6566)`` answers
+        ``0.1.134.159:6566``.
+        """
+        assert _saned_hosts("99999") == ()
 
     def test_blank_segments_are_dropped(self) -> None:
         """A stray or doubled colon contributes no host to probe."""
@@ -451,17 +532,18 @@ class TestSanedHostParsing:
             ("192.0.2.11", SANED_PORT),
         )
 
-    def test_a_dotted_name_with_an_out_of_range_port_is_two_hosts(self) -> None:
+    def test_a_dotted_name_with_an_out_of_range_port_keeps_only_the_name(self) -> None:
         """
-        The ``OverflowError`` guard is not weakened by the refusal.
+        The ``OverflowError`` guard is not weakened by the drop.
 
-        ``99999`` is not a port a socket could reach, so both segments are read
-        as host names, exactly as they were before.
+        ``99999`` is still not a port a socket could reach, so it is still not
+        read as one.  This asserted two entries until plan 30-28, for the same
+        reason ``test_an_out_of_range_port_is_dropped_rather_than_dialled``
+        did, and it changed for the same reason: glibc resolves ``99999`` to
+        ``0.1.134.159``, so keeping it as a host name dialled an address nobody
+        configured (R2-WR-01).
         """
-        assert _saned_hosts("scanner.local:99999") == (
-            ("scanner.local", SANED_PORT),
-            ("99999", SANED_PORT),
-        )
+        assert _saned_hosts("scanner.local:99999") == (("scanner.local", SANED_PORT),)
 
 
 class TestSanedReachable:
