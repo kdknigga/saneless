@@ -17,6 +17,7 @@ Covers requirements: APPL-02.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from typing import TYPE_CHECKING
 
@@ -59,15 +60,120 @@ class _RunChecksSpy:
     def __init__(self, error: Exception | None = None) -> None:
         """Record nothing yet; raise ``error`` on every call when given one."""
         self.calls: list[CheckContext] = []
+        self.gates: list[threading.Lock | None] = []
         self.results = _results()
         self._error = error
 
-    def __call__(self, context: CheckContext) -> tuple[CheckResult, ...]:
-        """Record the context and either raise or return canned results."""
+    def __call__(
+        self, context: CheckContext, *, scanner_gate: threading.Lock | None = None
+    ) -> tuple[CheckResult, ...]:
+        """
+        Record the context and the gate, then either raise or return results.
+
+        Args:
+            context: The context the refresher assembled.
+            scanner_gate: The gate the refresher handed in rather than held.
+
+        Returns:
+            The canned results.
+
+        """
         self.calls.append(context)
+        self.gates.append(scanner_gate)
         if self._error is not None:
             raise self._error
         return self.results
+
+
+class _ReentrantRunChecksSpy:
+    """A ``run_checks`` stand-in that probes again from inside its own call."""
+
+    def __init__(self, refresher_box: list[CheckRefresher]) -> None:
+        """
+        Re-enter the probe path of whatever refresher ``refresher_box`` holds.
+
+        A box rather than the refresher itself, because the spy has to exist
+        before the refresher that calls it does.
+
+        Args:
+            refresher_box: A list the caller fills with the one refresher.
+
+        """
+        self.calls: list[CheckContext] = []
+        self.results = _results()
+        self._box = refresher_box
+
+    def __call__(
+        self, context: CheckContext, *, scanner_gate: threading.Lock | None = None
+    ) -> tuple[CheckResult, ...]:
+        """
+        Record the call, probe again from inside it, and return results.
+
+        The nested probe is the whole point: it is a second checker arriving
+        while the first is mid-flight, with no thread scheduling luck involved.
+
+        Args:
+            context: The context the refresher assembled.
+            scanner_gate: The gate the refresher handed in rather than held.
+
+        Returns:
+            The canned results.
+
+        """
+        self.calls.append(context)
+        for refresher in self._box:
+            refresher.probe_now()
+        return self.results
+
+
+class _StoreCounter:
+    """Counts the cache writes a probe makes, and forwards each one."""
+
+    def __init__(self, cache: CheckCache) -> None:
+        """
+        Wrap ``cache``'s ``store`` so every write is recorded.
+
+        Args:
+            cache: The cache whose writes are being counted.
+
+        """
+        self.cache = cache
+        self.count = 0
+
+    def __call__(self, results: tuple[CheckResult, ...]) -> None:
+        """
+        Record the write and let it through.
+
+        Args:
+            results: What the probe produced.
+
+        """
+        self.count += 1
+        CheckCache.store(self.cache, results)
+
+
+class _ScanState:
+    """The worker's job-in-flight fact, as the refresher reads it."""
+
+    def __init__(self, *, active: bool = False) -> None:
+        """
+        Start with a job in flight or not.
+
+        Args:
+            active: Whether the worker has a job in flight.
+
+        """
+        self.active = active
+
+    def __call__(self) -> bool:
+        """
+        Report whether a scan is running right now.
+
+        Returns:
+            The current flag.
+
+        """
+        return self.active
 
 
 def _results(message: str = "All good.") -> tuple[CheckResult, ...]:
@@ -92,13 +198,27 @@ def _build(
     settings: Settings,
     clock: _FakeClock,
     gate: threading.Lock,
+    scan: _ScanState | None = None,
 ) -> tuple[CheckRefresher, CheckCache]:
-    """Assemble a refresher over a cache that shares the same fake clock."""
+    """
+    Assemble a refresher over a cache that shares the same fake clock.
+
+    Args:
+        settings: The settings the context factory hands back.
+        clock: The monotonic source shared by the cache and the refresher.
+        gate: The scanner gate the refresher passes to ``run_checks``.
+        scan: The worker's job-in-flight fact, idle when omitted.
+
+    Returns:
+        The refresher and the cache it fills.
+
+    """
     cache = CheckCache(clock=clock)
     refresher = CheckRefresher(
         cache=cache,
         context_factory=lambda: _context(settings),
         scanner_gate=lambda: gate,
+        scan_active=scan if scan is not None else _ScanState(),
         clock=clock,
     )
     return refresher, cache
@@ -202,10 +322,31 @@ def test_note_watcher_moves_the_window(
     assert len(spy.calls) == 1
 
 
-def test_tick_skips_the_scanner_while_the_gate_is_held(
+def test_tick_skips_the_scanner_while_a_job_is_in_flight(
     default_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A scan in flight means skip_scanner, never a second caller in SANE (D-08)."""
+    spy = _spy(monkeypatch)
+    gate = threading.Lock()
+    refresher, _cache = _build(
+        default_settings, _FakeClock(), gate, _ScanState(active=True)
+    )
+    refresher.note_watcher()
+    refresher._tick()
+    assert len(spy.calls) == 1
+    assert spy.calls[0].skip_scanner is True
+
+
+def test_a_gate_held_by_another_checker_is_not_a_running_scan(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    WR-04: checker-versus-checker contention must not read as "a scan is running".
+
+    The gate is held by somebody who is not the worker and no job is in
+    flight, which is exactly the shape that put "Not checked while a scan is
+    running" beside "Last checked 14:02" on an idle appliance.
+    """
     spy = _spy(monkeypatch)
     gate = threading.Lock()
     refresher, _cache = _build(default_settings, _FakeClock(), gate)
@@ -216,34 +357,156 @@ def test_tick_skips_the_scanner_while_the_gate_is_held(
     finally:
         gate.release()
     assert len(spy.calls) == 1
-    assert spy.calls[0].skip_scanner is True
+    assert spy.calls[0].skip_scanner is False
 
 
-def test_tick_takes_and_releases_a_free_gate(
+def test_tick_hands_the_gate_to_run_checks_instead_of_holding_it(
     default_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With no scan running the scanner is checked and the gate handed back."""
+    """WR-03: the registry holds the gate for the one check that needs it."""
     spy = _spy(monkeypatch)
     gate = threading.Lock()
     refresher, _cache = _build(default_settings, _FakeClock(), gate)
     refresher.note_watcher()
     refresher._tick()
-    assert spy.calls[0].skip_scanner is False
+    assert spy.gates == [gate]
     assert gate.acquire(blocking=False) is True
     gate.release()
 
 
-def test_tick_releases_the_gate_when_the_checks_raise(
+def test_a_failing_probe_releases_the_probe_lock(
     default_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failing probe must not leave the worker's scanner gate held."""
+    """A probe that raised must not lock every later checker out for ever."""
     _spy(monkeypatch, error=RuntimeError("probe exploded"))
     gate = threading.Lock()
     refresher, _cache = _build(default_settings, _FakeClock(), gate)
     refresher.note_watcher()
     refresher._tick()
-    assert gate.acquire(blocking=False) is True
-    gate.release()
+    good = _spy(monkeypatch)
+    refresher.probe_now()
+    assert len(good.calls) == 1
+
+
+def test_two_overlapping_probes_run_the_checks_once(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Single flight: a second checker arriving mid-probe costs nothing.
+
+    The second probe is issued from *inside* the first one's ``run_checks``,
+    so the overlap is a fact of the call stack rather than of thread
+    scheduling luck.
+    """
+    box: list[CheckRefresher] = []
+    spy = _ReentrantRunChecksSpy(box)
+    monkeypatch.setattr("saneless.web.refresher.run_checks", spy)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    box.append(refresher)
+    refresher.note_watcher()
+    refresher._tick()
+    assert len(spy.calls) == 1
+
+
+def test_the_second_of_two_overlapping_probes_stores_nothing(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One probe means one cache write, however many checkers wanted it."""
+    box: list[CheckRefresher] = []
+    spy = _ReentrantRunChecksSpy(box)
+    monkeypatch.setattr("saneless.web.refresher.run_checks", spy)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    box.append(refresher)
+    counter = _StoreCounter(cache)
+    monkeypatch.setattr(cache, "store", counter)
+    refresher.note_watcher()
+    refresher._tick()
+    assert counter.count == 1
+
+
+def test_probe_now_ignores_a_fresh_cache(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D-09: an explicit click does not wait out the TTL."""
+    spy = _spy(monkeypatch)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.note_watcher()
+    refresher._tick()
+    refresher.probe_now()
+    assert len(spy.calls) == 2
+
+
+def test_probe_now_ignores_a_closed_watch_window(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Somebody pressing the button is, by definition, somebody watching."""
+    spy = _spy(monkeypatch)
+    clock = _FakeClock()
+    refresher, _cache = _build(default_settings, clock, threading.Lock())
+    clock.advance(WATCH_WINDOW_SECONDS + 1.0)
+    refresher.probe_now()
+    assert len(spy.calls) == 1
+
+
+def test_probe_now_stores_what_the_checks_returned(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The button's probe fills the same cache the thread's probe fills."""
+    spy = _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.probe_now()
+    assert cache.current().results == spy.results
+
+
+def test_a_failing_probe_now_leaves_the_previous_entry_in_place(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Last-known-good is still last-known-good on the button's path."""
+    good = _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.probe_now()
+    _spy(monkeypatch, error=RuntimeError("probe exploded"))
+    refresher.probe_now()
+    assert cache.current().results == good.results
+
+
+def test_probe_now_skips_the_scanner_while_a_job_is_in_flight(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit click does not get to defeat the exclusive-scanner rule."""
+    spy = _spy(monkeypatch)
+    scan = _ScanState(active=True)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock(), scan)
+    refresher.probe_now()
+    assert spy.calls[0].skip_scanner is True
+
+
+def test_the_scan_fact_is_read_at_probe_time(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A job that ends between probes unskips the scanner on the next one."""
+    spy = _spy(monkeypatch)
+    scan = _ScanState(active=True)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock(), scan)
+    refresher.probe_now()
+    scan.active = False
+    refresher.probe_now()
+    assert [call.skip_scanner for call in spy.calls] == [True, False]
+
+
+def test_the_refresher_takes_five_injected_dependencies(
+    default_settings: Settings,
+) -> None:
+    """
+    ``PLR0913`` caps ``__init__`` at five non-self parameters, and this is five.
+
+    Args:
+        default_settings: The shared settings fixture.
+
+    """
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    parameters = inspect.signature(type(refresher).__init__).parameters
+    assert len(parameters) == 6
 
 
 def test_a_failing_run_leaves_the_previous_entry_in_place(
@@ -279,6 +542,7 @@ def test_start_then_stop_reports_a_stopped_daemon_thread(
         cache=cache,
         context_factory=lambda: _context(default_settings),
         scanner_gate=lambda: gate,
+        scan_active=_ScanState(),
     )
     started_refreshers.append(refresher)
     refresher.start()
@@ -317,6 +581,7 @@ def test_request_stop_signals_without_joining(
         cache=cache,
         context_factory=lambda: _context(default_settings),
         scanner_gate=lambda: gate,
+        scan_active=_ScanState(),
     )
     started_refreshers.append(refresher)
     refresher.start()
@@ -348,6 +613,7 @@ def test_stop_is_safe_to_call_twice(
         cache=cache,
         context_factory=lambda: _context(default_settings),
         scanner_gate=lambda: gate,
+        scan_active=_ScanState(),
     )
     started_refreshers.append(refresher)
     refresher.start()
@@ -372,6 +638,7 @@ def test_stop_joins_within_the_shared_bound(
         cache=cache,
         context_factory=lambda: _context(default_settings),
         scanner_gate=lambda: gate,
+        scan_active=_ScanState(),
     )
     started_refreshers.append(refresher)
     refresher.start()
