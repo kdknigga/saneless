@@ -63,6 +63,11 @@ class CheckRefresher:
         context_factory: Builds the ``CheckContext`` for one refresh.
         scanner_gate: Returns the worker's scanner gate at call time, because
             the worker may be rebuilt independently of the refresher.
+        scan_active: Reports whether the worker has a job in flight, read at
+            call time for the same reason ``scanner_gate`` is a callable -- the
+            worker may be rebuilt independently of the refresher.  This, and
+            not a failed acquire on the gate, is what decides whether the
+            scanner check is skipped (WR-04).
         clock: The monotonic source the watch window is measured with.
 
     """
@@ -72,14 +77,23 @@ class CheckRefresher:
         cache: CheckCache,
         context_factory: Callable[[], CheckContext],
         scanner_gate: Callable[[], threading.Lock],
+        scan_active: Callable[[], bool],
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Build the thread and its synchronisation, without starting it."""
         self._cache = cache
         self._context_factory = context_factory
         self._scanner_gate = scanner_gate
+        self._scan_active = scan_active
         self._clock = clock
         self._thread = threading.Thread(target=self._run, daemon=True)
+        # Admits one checker at a time to _probe_and_store, and guards nothing
+        # else.  Two checkers contending for the *scanner* gate is what made
+        # gate contention indistinguishable from a running scan (WR-04), so the
+        # second checker is turned away here instead, before it ever reaches
+        # the gate.  Taken without blocking, always, and never held across a
+        # cache read.
+        self._probe_lock = threading.Lock()
         # Set once by stop(); read by the idle wait, which it wakes at once.
         self._stopping = threading.Event()
         # Guards every read and every write of self._last_watched, and nothing
@@ -128,9 +142,9 @@ class CheckRefresher:
         lock, so calling it from a request thread costs nothing.
 
         Returns:
-            A context with ``skip_scanner`` unset.  The caller sets that from
-            its own non-blocking attempt on the scanner gate, because only the
-            caller knows whether it got the gate.
+            A context with ``skip_scanner`` unset.  :meth:`_probe_and_store`
+            sets it from the worker's own record of a job in flight, which is
+            the fact the flag claims (WR-04).
 
         """
         return self._context_factory()
@@ -203,30 +217,82 @@ class CheckRefresher:
         while not self._stopping.wait(TICK_SECONDS):
             self._tick()
 
-    def _tick(self) -> None:
+    def probe_now(self) -> None:
         """
-        Refresh the cache if a refresh is due, and do nothing otherwise.
+        Probe at once, whatever the TTL and the watch window say (D-09).
 
-        The whole refresh policy lives here and only here, and it is a plain
-        synchronous method so the tests can call it with no thread running.
+        This is the Refresh button's path.  It bypasses both guards
+        deliberately: ``_tick`` returns early on a fresh cache, which is
+        precisely the first thirty seconds after a page load -- exactly when
+        somebody who has just plugged the scanner back in presses the button --
+        and somebody pressing a button is, by definition, somebody watching.
 
-        Two guards come first, in this order: nobody is watching (D-05), and
-        the cache is still fresh (D-03).  Either one means no probe, which is
-        what bounds the probe rate no matter how many page loads land.
+        It exists so the route and the refresher thread cannot drift into two
+        probe implementations.  They had drifted, and WR-03, WR-04 and WR-05
+        are all consequences of the same block existing twice.  Both callers
+        now go through :meth:`_probe_and_store`; neither this nor ``_tick``
+        calls the other, which is the discipline ``job.py``'s
+        ``TestLockDiscipline`` enforces for public-to-public self-calls.
+        """
+        self._probe_and_store()
 
-        The scanner gate is then tried without blocking.  Failing to take it
-        means a scan is running, and the refresh goes ahead for the four checks
-        that never needed the scanner with ``skip_scanner`` set -- D-08's
-        "paused during scan".  Blocking on the gate instead would queue behind
-        a scan that can legitimately run for minutes and then enter SANE at
-        some arbitrary later moment, which is why ``ScanWorker.scanner_gate``
-        documents the non-blocking attempt as the only permitted move.
+    def _probe_and_store(self) -> None:
+        """
+        Run one probe and store what it found, or let an in-flight one do it.
+
+        The probe lock is taken without blocking and a second checker simply
+        leaves: the first one's ``store`` is imminent, and a duplicate probe
+        would buy an identical answer for the price of a Paperless request and
+        two filesystem writes.  Collapsing them is also what stops two checkers
+        contending for the *scanner* gate, which is the contention WR-04 was
+        rendering to a household member as "a scan is running".
+
+        ``skip_scanner`` comes from the worker's own record of a job in flight,
+        the same fact ``_checks_context`` renders as ``scan_active``, so the
+        strip's words and its colour cannot disagree.  The scanner gate is
+        *passed* to ``run_checks`` rather than held around it, because only the
+        scanner check enters libsane and the Paperless budget and the two
+        directory writes have no business parking a scan start (WR-03).
+
+        Residual, stated plainly: a skipped row stored during a scan stays on
+        the strip until the next probe, so for up to one TTL after a scan ends
+        the strip can still say "not checked while a scan is running" beside an
+        idle appliance.  That window is closed in practice by the
+        terminal-state reload the status area already issues, and unlike
+        WR-04's case the row was true when it was written.
 
         A failing ``run_checks`` is logged and stores nothing, which leaves the
         previous entry in the cache.  That is the whole point of last-known-good:
         a probe that could not be taken must not blank a strip that was correct
         thirty seconds ago.  ``run_checks`` catches its own per-check failures,
         so reaching this handler means the registry itself broke.
+        """
+        if not self._probe_lock.acquire(blocking=False):
+            return
+        try:
+            context = replace(self.build_context(), skip_scanner=self._scan_active())
+            results = run_checks(context, scanner_gate=self._scanner_gate())
+        except Exception:
+            # No exception text goes anywhere near the cache or the page; the
+            # strip keeps showing the developer-authored rows it already had.
+            logger.exception("Check refresh failed; keeping the previous results")
+        else:
+            self._cache.store(results)
+        finally:
+            self._probe_lock.release()
+
+    def _tick(self) -> None:
+        """
+        Refresh the cache if a refresh is due, and do nothing otherwise.
+
+        The refresh *policy* lives here and only here, and it is a plain
+        synchronous method so the tests can call it with no thread running.
+        The probe itself lives in :meth:`_probe_and_store`, which the Refresh
+        button reaches through :meth:`probe_now`.
+
+        Two guards come first, in this order: nobody is watching (D-05), and
+        the cache is still fresh (D-03).  Either one means no probe, which is
+        what bounds the probe rate no matter how many page loads land.
         """
         now = self._clock()
         with self._watch_lock:
@@ -235,18 +301,4 @@ class CheckRefresher:
             return
         if self._cache.is_fresh():
             return
-
-        gate = self._scanner_gate()
-        acquired = gate.acquire(blocking=False)
-        try:
-            context = replace(self.build_context(), skip_scanner=not acquired)
-            results = run_checks(context)
-        except Exception:
-            # No exception text goes anywhere near the cache or the page; the
-            # strip keeps showing the developer-authored rows it already had.
-            logger.exception("Check refresh failed; keeping the previous results")
-        else:
-            self._cache.store(results)
-        finally:
-            if acquired:
-                gate.release()
+        self._probe_and_store()
