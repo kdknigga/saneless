@@ -161,6 +161,14 @@ xfail_strict = true
 filterwarnings = ["error"]
 timeout = 60
 timeout_method = "signal"
+# Two tests measure rather than assert -- how many requests an abandoned status
+# strip really issues, and how long its poll chain gets -- and report the number
+# through `record_property`. pytest's default junit_family, "xunit2", has no
+# place to put a per-test property and raises a PytestWarning when one is
+# recorded; `filterwarnings = ["error"]` above turns that into a collection
+# error, so a `--junitxml` run would fail on the very tests whose output it was
+# asked to capture. "legacy" is the family that carries them.
+junit_family = "legacy"
 
 [dependency-groups]
 dev = [
