@@ -366,6 +366,23 @@ def _tag_list_context(
         whether the wrapper should ask for itself once it is parsed.
 
     """
+    # IN-01.  With ``[web] show_tags`` off the tag markup is never emitted, so
+    # a fetch here buys nothing and costs a paperless-ngx round trip on every
+    # cold-cache page load -- and the flag that would hide the list is the same
+    # flag that decides whether the data can ever be seen.  The guard sits in
+    # this function rather than in ``index`` so it covers all three call sites,
+    # including the filter and refresh routes, which have the same reason to
+    # skip.  The key set below is the normal path's, emptied: ``index`` spreads
+    # this with ``**``, so a missing key would leave an undefined name in a
+    # template that has nothing to do with tags.
+    if not state.settings.web.show_tags:
+        return {
+            "pinned": [],
+            "tags": [],
+            "selected_tags": set(),
+            "any_tags": False,
+            "tags_load_on_render": False,
+        }
     everything = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     needle = q.casefold()
     ticked = set(selected)
@@ -740,8 +757,16 @@ def index(request: Request) -> Response:
     # context the filter route builds, so it goes through the same function
     # rather than a second shape the two could drift apart on.
     tag_list = _tag_list_context(state, q="", selected=[], on_page_load=True)
-    correspondents = _get_cached_or_fetch(
-        state.cache, state.paperless, "correspondents"
+    # The correspondent half of the same saving (IN-01).  ``show_correspondent``
+    # off means the select is left out of the markup, so this fetch would be a
+    # second cold-cache round trip for a list nobody can be shown.  The key
+    # stays in the context either way: the template reaches for it inside its
+    # own ``{% if %}``, and an absent key would be a different kind of bug from
+    # an empty one.
+    correspondents = (
+        _get_cached_or_fetch(state.cache, state.paperless, "correspondents")
+        if state.settings.web.show_correspondent
+        else []
     )
 
     status = _status_context(state.worker, state.job_store, _status_facts(request))
