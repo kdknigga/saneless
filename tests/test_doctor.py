@@ -36,11 +36,19 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
 from click.testing import CliRunner
 
-from saneless.checks import CheckKey, CheckResult, CheckState, check_name
+from saneless.checks import (
+    CheckContext,
+    CheckKey,
+    CheckResult,
+    CheckState,
+    check_name,
+    run_checks,
+)
 from saneless.cli import cli
 from saneless.config import (
     OutputConfig,
@@ -48,10 +56,13 @@ from saneless.config import (
     ProfileConfig,
     ScannerConfig,
     Settings,
+    profile_storage_for_loaded,
 )
 from saneless.exceptions import ConfigError, PaperlessError
+from saneless.job import JobStore
 from saneless.scanner.base import DeviceInfo
-from saneless.vocabulary import ConnectionStatus, ExitCode
+from saneless.vocabulary import ConnectionStatus, ExitCode, ProfileStorage
+from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
@@ -592,3 +603,217 @@ class TestDoctorKeepsItsDocumentedExitCodes:
         assert len(rows) == len(CheckKey)
         assert "The paperless-ngx API was not found at that URL." in result.output
         assert result.exit_code == ExitCode.CONFIG
+
+
+class TestProfilesRowAgreement:
+    """
+    ``doctor`` and a started ``ScanWorker`` give the Profiles row one answer.
+
+    D-02 promises the two surfaces report the same checks in the same words,
+    and ``profile_storage`` is the one field ``checks.py`` is handed rather than
+    computing for itself. CR-01 was that field derived twice, with only one copy
+    correct: ``doctor`` printed ``[ OK ] Profiles  2 scan profiles configured.``
+    while the status strip printed a permanent amber "Generated in memory -- no
+    configuration file is in use, so they are lost on restart", for one machine,
+    at the same moment.
+
+    The rendered ``CheckResult`` is compared rather than the enum alone,
+    because the promise is about the words a household member reads. The enum
+    is compared too, so a failure says which half of the contract broke.
+    """
+
+    @staticmethod
+    def _doctors_storage(
+        monkeypatch: pytest.MonkeyPatch, settings: Settings, config_path: Path | None
+    ) -> ProfileStorage:
+        """
+        Run ``doctor`` and hand back the storage value it passed to the registry.
+
+        Read out of the real command rather than recomputed here, so this
+        asserts what ``doctor`` does and not what a test thinks it does.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            settings: The settings ``load_settings`` should return.
+            config_path: What to pass as ``--config``, or None for no file.
+
+        Returns:
+            The ``ProfileStorage`` member ``doctor`` built its context from.
+
+        """
+        captured: list[CheckContext] = []
+
+        def _capture(context: CheckContext) -> tuple[CheckResult, ...]:
+            """
+            Record the context and answer with five green rows.
+
+            Args:
+                context: What ``doctor`` built.
+
+            Returns:
+                One OK result per check, so D-01's exit code stays 0.
+
+            """
+            captured.append(context)
+            return _all_ok()
+
+        runner = _patch_doctor(monkeypatch, settings)
+        monkeypatch.setattr("saneless.cli.run_checks", _capture)
+        argv = (
+            ["doctor"]
+            if config_path is None
+            else ["--config", str(config_path), "doctor"]
+        )
+        result = runner.invoke(cli, argv)
+
+        assert result.exit_code == 0
+        assert len(captured) == 1
+        return captured[0].profile_storage
+
+    @staticmethod
+    def _workers_storage(settings: Settings) -> ProfileStorage:
+        """
+        Start a worker over the same settings and hand back what it recorded.
+
+        Args:
+            settings: The settings the worker runs on.
+
+        Returns:
+            The ``ProfileStorage`` member the started worker reports.
+
+        """
+        store = JobStore()
+        worker = ScanWorker(_ReadyScanner(), MagicMock(), settings, store)
+        try:
+            worker.start()
+            stopped = worker.stop()
+            assert stopped
+            return worker.profile_storage
+        finally:
+            worker.stop()
+            store.close()
+
+    @staticmethod
+    def _profiles_row(settings: Settings, storage: ProfileStorage) -> CheckResult:
+        """
+        Render the Profiles row one surface would show for this storage value.
+
+        Args:
+            settings: The loaded configuration.
+            storage: What that surface says became of the profiles.
+
+        Returns:
+            The single ``CheckKey.PROFILES`` result.
+
+        """
+        results = run_checks(
+            CheckContext(
+                settings=settings,
+                scanner=None,
+                paperless=None,
+                profile_storage=storage,
+            )
+        )
+        return next(result for result in results if result.key is CheckKey.PROFILES)
+
+    @pytest.mark.parametrize("with_config_file", ["yes", "no"])
+    def test_both_surfaces_render_the_same_profiles_row(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        with_config_file: str,
+    ) -> None:
+        """
+        One appliance, one Profiles row, whichever surface a reader asks.
+
+        The settings are taken out of the bare default, which is what every
+        deployment looks like once ``saneless auto-profiles`` has written the
+        file once -- and the exact shape that made the strip lie.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            with_config_file: "yes" to load a config file, "no" for none.
+
+        """
+        settings = _make_settings(tmp_path)
+        settings.profiles = {
+            "default": ProfileConfig(),
+            "adf": ProfileConfig(source="ADF"),
+        }
+        config_path: Path | None = None
+        if with_config_file == "yes":
+            config_path = tmp_path / "saneless.toml"
+            config_path.write_text("# loaded by --config\n")
+
+        doctors = self._doctors_storage(monkeypatch, settings, config_path)
+        workers = self._workers_storage(settings)
+        doctors_row = self._profiles_row(settings, doctors)
+        workers_row = self._profiles_row(settings, workers)
+
+        assert doctors is workers
+        assert doctors_row.state is workers_row.state
+        assert doctors_row.message == workers_row.message
+        assert doctors_row.next_step == workers_row.next_step
+
+    def test_a_loaded_config_file_is_the_green_row_on_both(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The row CR-01 got wrong, named rather than merely agreed upon.
+
+        Two surfaces can agree and both be wrong, so the value itself is
+        pinned: a config file is in use, and the row must say so.
+        """
+        settings = _make_settings(tmp_path)
+        settings.profiles = {
+            "default": ProfileConfig(),
+            "adf": ProfileConfig(source="ADF"),
+        }
+        config_path = tmp_path / "saneless.toml"
+        config_path.write_text("# loaded by --config\n")
+
+        doctors = self._doctors_storage(monkeypatch, settings, config_path)
+        workers = self._workers_storage(settings)
+        row = self._profiles_row(settings, workers)
+
+        assert doctors is ProfileStorage.PERSISTED
+        assert workers is ProfileStorage.PERSISTED
+        assert row.state is CheckState.OK
+        assert "in memory" not in row.message.lower()
+
+    def test_doctor_derives_the_row_through_the_shared_function(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A third copy of the rule has nowhere to hide.
+
+        Agreement alone would still be satisfied by two hand-written
+        conditionals that happen to match today, which is exactly the shape
+        CR-01 grew out of. This asserts the call, so the rule can only be
+        changed in one place.
+        """
+        settings = _make_settings(tmp_path)
+        config_path = tmp_path / "saneless.toml"
+        config_path.write_text("# loaded by --config\n")
+        seen: list[Settings] = []
+
+        def _recording(given: Settings) -> ProfileStorage:
+            """
+            Record the call and answer as the real derivation does.
+
+            Args:
+                given: The settings ``doctor`` asked about.
+
+            Returns:
+                Whatever ``profile_storage_for_loaded`` returns.
+
+            """
+            seen.append(given)
+            return profile_storage_for_loaded(given)
+
+        monkeypatch.setattr("saneless.cli.profile_storage_for_loaded", _recording)
+        storage = self._doctors_storage(monkeypatch, settings, config_path)
+
+        assert seen == [settings]
+        assert storage is ProfileStorage.PERSISTED
