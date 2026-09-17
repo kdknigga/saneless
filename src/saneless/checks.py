@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from string import ascii_letters, digits
+from time import monotonic
 from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx
@@ -77,12 +78,14 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# How long a saned pre-probe waits for a TCP handshake before giving up.  This
-# bounds one handshake per configured host, and nothing else.  Name resolution
-# runs before it and is not inside it -- `getaddrinfo` takes no timeout, so an
-# unreachable resolver costs whatever `resolv.conf` says -- and with N
-# configured hosts the probe's worst case is N times (resolution plus this
-# budget).  The bound still matters for the reason it always did: what it
+# How long a saned pre-probe waits before giving up on a configured host.  It
+# is a deadline, not a per-socket timeout: every address the host resolves to
+# is dialled, and all of them together get this much.  So it bounds one
+# configured host, and nothing else.  Name resolution runs before it and is
+# not inside it -- `getaddrinfo` takes no timeout, so an unreachable resolver
+# costs whatever `resolv.conf` says -- and with N configured hosts the probe's
+# worst case is N times (resolution plus this budget).  The bound still
+# matters for the reason it always did: what it
 # replaces is `get_devices()`, which has no timeout at any layer and costs
 # roughly 127 s for a silently unreachable host, because Linux retries a SYN
 # six times by default, inside a blocking C call nothing can interrupt.  Read
@@ -613,14 +616,25 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     The port is 6566, IANA's ``sane-port``, verified in ``/etc/services``.
 
-    **What the budget covers.**  One handshake, to one address.  The name is
-    resolved once and only the first result is dialled, because dialling every
-    resolved address would multiply the budget by a number nothing here
-    controls -- a dual-stack scanner host resolves to three, so the documented
-    two seconds silently became six (WR-02).  One address is enough for the
-    question being asked, which is whether the host is answering at all, and
-    the answer for a host that is switched off is the same on every address it
-    has.
+    **What the budget covers.**  Every address the name resolved to, in
+    resolver order, and all of them together.  The budget is a *deadline*,
+    read once before the walk rather than handed to each socket, so every
+    attempt gets only what the attempts before it left over and a host with
+    three addresses costs no more than a host with one.  That is the property
+    WR-02 asked for, and it is kept.
+
+    What WR-02's fix did instead was dial only the resolver's first answer,
+    and that was a strict regression, for a reason that lives in the resolver
+    rather than in the handshake.  ``getaddrinfo`` is called with no
+    ``AI_ADDRCONFIG``, so glibc returns AAAA records even on a host with no
+    IPv6 route, and RFC 6724 orders the IPv6 address first -- measured on this
+    machine, ``localhost`` resolves to ``::1`` and then ``127.0.0.1``.  saned
+    commonly binds v4-only.  So the justification offered for one address --
+    "the answer for a host that is switched off is the same on every address
+    it has" -- was true of the case that does not matter and false of the one
+    that does: a host that is *on*, answering over one family and not the
+    other, was reported dead, permanently, on an appliance that scans
+    perfectly well (R2-CR-01).
 
     Resolution itself is outside the budget and is left that way deliberately.
     ``getaddrinfo`` takes no timeout, so bounding it means running it on a
@@ -632,7 +646,12 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
     that is stated rather than claimed away.
 
     **Failure policy.**  This returns ``False`` for every ``OSError`` --
-    refused, timed out, unresolvable, no route -- and raises nothing.  It is
+    refused, timed out, unresolvable, no route -- and raises nothing.  An
+    empty resolver answer is covered by the same promise without a guard of
+    its own: the walk holds no subscript, so nothing to dial is a loop body
+    that never runs.  Subscripting the resolver's first answer raised
+    ``IndexError`` there, which is not an ``OSError`` and so escaped into
+    ``run_checks``' generic red row (R2-IN-01).  It is
     the *caller* that decides what a ``False`` means, and the caller never
     turns "the probe could not be run at all" into a bad row: when
     ``_saned_hosts`` yields no entries to dial, no probe happens and the
@@ -654,19 +673,32 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     """
     try:
-        family, socket_type, protocol, _canonical_name, address = socket.getaddrinfo(
-            host, port, type=socket.SOCK_STREAM
-        )[0]
-        with socket.socket(family, socket_type, protocol) as probe:
-            probe.settimeout(timeout)
-            probe.connect(address)
-            return True
+        candidates = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
-        # Logged at DEBUG, not WARNING: a closed scanner port is the ordinary
-        # state of an appliance whose scanner is switched off, and the row the
-        # caller renders is where an operator is told about it.
-        logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
+        # Logged at DEBUG, not WARNING: a name that does not resolve is the
+        # ordinary state of an appliance whose scanner host is switched off or
+        # misspelled, and the row the caller renders is where an operator is
+        # told about it.  ``type(exc).__name__`` only -- no host, no address
+        # and no exception text reaches a log line or a row (ASVS V7).
+        logger.debug("saned pre-probe did not resolve: %s", type(exc).__name__)
         return False
+    deadline = monotonic() + timeout
+    for family, socket_type, protocol, _canonical_name, address in candidates:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            # The budget is spent, so the addresses left over do not get one.
+            return False
+        try:
+            with socket.socket(family, socket_type, protocol) as probe:
+                probe.settimeout(remaining)
+                probe.connect(address)
+                return True
+        except OSError as exc:
+            # One address refusing says nothing about the next one: this is
+            # exactly the dual-stack case where the IPv6 address the resolver
+            # put first has no listener and the IPv4 address does.
+            logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
+    return False
 
 
 def _directory_accepts_a_write(path: Path) -> bool:
