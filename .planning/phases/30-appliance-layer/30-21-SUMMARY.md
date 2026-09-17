@@ -231,6 +231,13 @@ None — no external service configuration required.
 - Nothing is blocked. The one open item this plan deliberately leaves is the bounded-enumeration thread that would let the Scanner row be red again for a net-only appliance; the reasoning against building it now, and what building it would require, is under "Decisions Made".
 - `tests/test_doctor.py` was not touched, per the plan's wave note that plan 30-20 owns it. A `CliRunner` exit-code case for the amber-scanner shape would sit naturally there if 30-20 wants it; the behaviour it would assert is already pinned here via `worst_state`.
 
+## Self-Check: PASSED
+
+- `src/saneless/checks.py` — present
+- `tests/test_checks.py` — present
+- `.planning/phases/30-appliance-layer/30-21-SUMMARY.md` — present
+- Commits `0f42050`, `efa0b05`, `13fe181`, `052b403`, `75a9ac1`, `4872756`, `fef042a` — all present in `git log 3199941..HEAD`
+
 ---
 *Phase: 30-appliance-layer*
 *Completed: 2026-09-17*
