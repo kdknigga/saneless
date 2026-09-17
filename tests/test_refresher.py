@@ -743,3 +743,138 @@ def test_stop_with_a_timeout_does_not_join_a_finished_thread(
     refresher = _with_thread(monkeypatch, default_settings, thread)
     assert refresher.stop(timeout=1.0) is True
     assert thread.join_timeouts == []
+
+
+def test_probe_now_reports_that_it_probed(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The route has to tell a probe from a collapse, so the probe says which."""
+    _spy(monkeypatch)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    assert refresher.probe_now() is True
+
+
+def test_probe_now_reports_a_collapse_while_another_checker_holds_the_lock(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    WR-03: a collapsed click must be visible to the handler that made it.
+
+    The lock is taken by the test rather than by a thread, which is the same
+    idiom ``tests/test_web_checks.py::_RecordingRefresher.probe_lock`` exists
+    for: the overlap is a fact of the call, with no scheduling luck in it.
+    """
+    spy = _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    assert refresher._probe_lock.acquire(blocking=False) is True
+    try:
+        assert refresher.probe_now() is False
+    finally:
+        refresher._probe_lock.release()
+    assert spy.calls == []
+    assert cache.current().results is None
+
+
+def test_a_probe_that_raised_still_reports_that_it_probed(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    "Did it probe" is "did it get the lock", never "did it store".
+
+    A caller that read a raising probe as a collapse would ask the page to
+    wait for a result that is never coming.
+    """
+    spy = _spy(monkeypatch, error=RuntimeError("probe exploded"))
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    assert refresher.probe_now() is True
+    assert len(spy.calls) == 1
+    assert cache.current().results is None
+
+
+def test_a_tick_still_returns_nothing(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The thread's contract is unchanged; only the button's caller reads it."""
+    _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.note_watcher()
+    assert refresher._tick() is None
+    assert cache.current().results is not None
+
+
+def test_probe_in_flight_is_false_on_an_idle_refresher(
+    default_settings: Settings,
+) -> None:
+    """Nothing is in flight before anybody probes, so the page need not ask."""
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    assert refresher.probe_in_flight is False
+
+
+def test_probe_in_flight_is_true_while_a_checker_holds_the_probe_lock(
+    default_settings: Settings,
+) -> None:
+    """The reader's answer is exactly "does somebody own the probe right now"."""
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    assert refresher._probe_lock.acquire(blocking=False) is True
+    try:
+        assert refresher.probe_in_flight is True
+    finally:
+        refresher._probe_lock.release()
+    assert refresher.probe_in_flight is False
+
+
+def test_probe_in_flight_is_true_inside_the_probe_and_false_after_it(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The window the settling poll rides on is the probe's own duration.
+
+    Read from inside ``run_checks`` -- which is where the in-flight window
+    actually is -- rather than inferred from the lock by the test.
+    """
+    box: list[CheckRefresher] = []
+    seen: list[bool] = []
+
+    def _record(
+        context: CheckContext, *, scanner_gate: threading.Lock | None = None
+    ) -> tuple[CheckResult, ...]:
+        """
+        Record the in-flight reading mid-probe and return canned results.
+
+        Args:
+            context: The context the refresher assembled.
+            scanner_gate: The gate the refresher handed in rather than held.
+
+        Returns:
+            The canned results.
+
+        """
+        seen.append(box[0].probe_in_flight)
+        return _results()
+
+    monkeypatch.setattr("saneless.web.refresher.run_checks", _record)
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    box.append(refresher)
+    assert refresher.probe_now() is True
+    assert seen == [True]
+    assert refresher.probe_in_flight is False
+
+
+def test_reading_probe_in_flight_does_not_take_the_probe_lock(
+    default_settings: Settings,
+) -> None:
+    """
+    T-30-29-03: a render observes the lock and never contends for it.
+
+    Two reads on an idle refresher leave the lock free for a probe to take,
+    and a read while it is held returns rather than blocking -- a reader that
+    acquired would either hang here or strand the lock for the next probe.
+    """
+    refresher, _cache = _build(default_settings, _FakeClock(), threading.Lock())
+    assert refresher.probe_in_flight is False
+    assert refresher.probe_in_flight is False
+    assert refresher._probe_lock.acquire(blocking=False) is True
+    assert refresher.probe_in_flight is True
+    refresher._probe_lock.release()
+    assert refresher._probe_lock.acquire(blocking=False) is True
+    refresher._probe_lock.release()
