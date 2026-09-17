@@ -134,6 +134,8 @@ Renders the system status strip -- the Scanner, Paperless, Profiles, Fallback an
 
 Before any results exist the response is five `Checking...` rows carrying a self-poll; once results exist the body it returns carries no poll trigger, so the polling stops on its own. While a scan is running the scanner check is skipped and the strip says so rather than probing a device that is in use.
 
+A poll whose request fails also ends, and for a simpler reason: the failure response replaces the strip, and the replacement carries no poll, so there is nothing left to fire.
+
 That poll also has a second ending, for the case where the first one never comes. If the checks never run at all -- because the background refresher has stopped, say -- the strip gives up after a bounded number of attempts, a little under half a minute, and stops asking. A tab left open on a hallway tablet in front of a half-broken appliance therefore goes quiet instead of asking forever. Giving up costs nothing that was on the page: the five rows stay, the `Check again` button stays, and the line beneath them says the checks have not run yet and points at that button. Pressing it starts a fresh attempt, and a fresh count, whenever somebody comes back to it.
 
 ---
@@ -148,7 +150,11 @@ During a scan, the checks that would touch the scanner are skipped -- an explici
 
 Simultaneous refreshes are collapsed into one. A request that arrives while a refresh is already under way -- another click, or the background refresh the page keeps warm -- re-renders the strip as it currently stands instead of running every check a second time. The answer the in-flight refresh is about to produce is the same answer, seconds away, and repeating the work would mean a second request to paperless-ngx and a second pair of write tests for the sake of it.
 
-There is also a floor under how often this can probe at all: a refresh is honoured at most once every couple of seconds. A request arriving sooner re-renders the current strip without probing -- the same status code and the same partial as an honoured one, because an early click is not an error and there is nothing to report about it. So holding the button down, or scripting the endpoint in a loop, cannot generate additional scanner or paperless-ngx traffic beyond that rate, and cannot delay a scan by contending for the scanner. Waiting the couple of seconds out restores the full bypass: the button still ignores the cache's own, much longer freshness window, which is the whole reason it exists.
+That answer is delivered without a second click. The strip returned by a collapsed refresh asks for itself once more, so the in-flight result appears on the page as soon as it lands -- pressing the button always produces an answer, even when the press happened to land on top of a refresh already running. The asking is bounded the same way the start-up poll is: a handful of attempts and then it stops, so a check wedged against an unreachable host cannot leave a tab asking forever.
+
+A refresh collapsed this way also does not consume the floor described next. Nothing was probed, so nothing was spent, and the very next press is honoured immediately rather than refused as too soon.
+
+There is also a floor under how often this can probe at all: a refresh is honoured at most once every couple of seconds. A request arriving sooner re-renders the current strip without probing -- the same status code and the same partial as an honoured one, because an early click is not an error and there is nothing to report about it. So holding the button down, or scripting the endpoint in a loop, cannot generate additional scanner or paperless-ngx traffic beyond that rate, and cannot delay a scan by contending for the scanner -- and neither can a loop that always collides with a running refresh, because a collapsed request performs no check of any kind. Waiting the couple of seconds out restores the full bypass: the button still ignores the cache's own, much longer freshness window, which is the whole reason it exists.
 
 If the check registry itself fails, the previous results stay on the page rather than blanking, and the failure is logged.
 
