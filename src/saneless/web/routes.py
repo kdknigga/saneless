@@ -17,7 +17,6 @@ from saneless.checks import (
     CHECKING_STATE_CLASS,
     CHECKING_STATE_LABEL,
     CheckKey,
-    run_checks,
 )
 from saneless.config import is_placeholder_token, resolve_job_title
 from saneless.scanner.base import SourceKind, classify_source
@@ -264,7 +263,7 @@ def _checks_context(state: State) -> dict[str, object]:
     """
     Build the context ``partials/checks.html`` renders from, without probing.
 
-    D-04: this reads the cache and never calls ``run_checks``.  Probing inside
+    D-04: this reads the cache and never probes.  Probing inside
     a request handler is what an unplugged scanner host would make hang -- a
     sane-net connect that Linux retries six times costs roughly two minutes
     inside a blocking C call, and a page that waited for it would be a page
@@ -1246,42 +1245,41 @@ def refresh_checks(request: Request) -> Response:
 
     This is the one handler in this module allowed to probe, and the bypass is
     the whole point of the button.  Routing the click through the refresher's
-    policy instead would do nothing for the first thirty seconds after a page
-    load -- ``_tick`` returns early on a fresh cache -- which is precisely when
-    somebody who has just plugged the scanner back in presses it.
+    *policy* would do nothing for the first thirty seconds after a page load --
+    ``_tick`` returns early on a fresh cache -- which is precisely when
+    somebody who has just plugged the scanner back in presses it.  So it goes
+    through the refresher's *probe* instead: ``probe_now`` is the same
+    implementation the background thread runs, reached without the two guards,
+    which is what keeps the button and the thread from drifting into two
+    probes that disagree.
 
-    During a scan it re-runs only the checks that do not touch the scanner: the
-    gate is tried without blocking exactly as the refresher tries it, and a
-    failed attempt sets ``skip_scanner``.  An explicit click does not get to
+    Concurrent clicks collapse.  ``probe_now`` admits one checker at a time and
+    a click landing while a probe is in flight re-renders the current strip
+    rather than probing again: the answer is seconds away, and a second probe
+    would cost a Paperless request and two filesystem writes to produce it
+    twice.
+
+    During a scan it re-runs only the checks that do not touch the scanner, and
+    that decision comes from the worker's own record of a job in flight rather
+    than from a failed attempt on a lock.  An explicit click does not get to
     defeat the exclusive-scanner rule, because nothing in the SANE backend
     mutually excludes two callers and a status probe landing mid-scan is a
-    second caller into the same C library.
+    second caller into the same C library.  Deriving it from the job state is
+    also what stops two checkers contending from being rendered to a household
+    member as a running scan (WR-04).
 
     ``CrossOriginGuard`` is app-wide middleware on every non-safe method
     (``web/app.py``), so this POST inherits the cross-site check and must
     **not** add a per-route dependency: a dependency is something a route added
     later can forget, and the middleware is not (T-30-46, D-23).
 
-    A registry that raised is logged and stores nothing, leaving the previous
-    entry in place.  ``run_checks`` catches its own per-check failures, so
-    reaching that handler means the registry itself broke -- and a strip that
-    blanked would be worse than one still showing what was true a moment ago.
+    A registry that raised is logged by the probe and stores nothing, leaving
+    the previous entry in place -- and a strip that blanked would be worse than
+    one still showing what was true a moment ago.
     """
     state = request.app.state
     state.refresher.note_watcher()
-    gate = state.worker.scanner_gate
-    acquired = gate.acquire(blocking=False)
-    try:
-        context = replace(state.refresher.build_context(), skip_scanner=not acquired)
-        results = run_checks(context)
-    except Exception:
-        # No exception text goes near the cache or the page (ASVS V7).
-        logger.exception("Check refresh failed; keeping the previous results")
-    else:
-        state.checks.store(results)
-    finally:
-        if acquired:
-            gate.release()
+    state.refresher.probe_now()
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",

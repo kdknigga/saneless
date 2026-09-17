@@ -142,7 +142,11 @@ Re-runs every check immediately, ignoring the cache, and returns the refreshed s
 
 **Response:** HTML partial (the strip body, for `outerHTML` swap).
 
-During a scan, the checks that would touch the scanner are skipped -- an explicit click does not get to interrupt a scan in progress -- and the Scanner row keeps its "not checked while a scan is running" message. If the check registry itself fails, the previous results stay on the page rather than blanking, and the failure is logged.
+During a scan, the checks that would touch the scanner are skipped -- an explicit click does not get to interrupt a scan in progress -- and the Scanner row keeps its "not checked while a scan is running" message. That message appears only while a scan really is in progress: the decision is taken from the job the scan worker reports it is running, not from whether some other health check happened to be busy at the same moment, so it cannot show up beside a last-checked time on an idle appliance.
+
+Simultaneous refreshes are collapsed into one. A request that arrives while a refresh is already under way -- another click, or the background refresh the page keeps warm -- re-renders the strip as it currently stands instead of running every check a second time. The answer the in-flight refresh is about to produce is the same answer, seconds away, and repeating the work would mean a second request to paperless-ngx and a second pair of write tests for the sake of it.
+
+If the check registry itself fails, the previous results stay on the page rather than blanking, and the failure is logged.
 
 ---
 
