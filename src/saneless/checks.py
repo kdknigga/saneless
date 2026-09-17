@@ -57,6 +57,8 @@ __all__ = [
     "CHECKING_MESSAGE",
     "CHECKING_STATE_CLASS",
     "CHECKING_STATE_LABEL",
+    "POLL_ATTEMPT_CAP",
+    "POLL_GAVE_UP_LINE",
     "PROBE_CONNECT_SECONDS",
     "PROBE_READ_SECONDS",
     "SANED_PORT",
@@ -116,6 +118,39 @@ CHECKING_MESSAGE: Final = "Checking…"
 # rather than the ellipsis for the same reason ``check_state_label`` says
 # "Failed" instead of "FAIL": the glyph's meaning has to survive as speech.
 CHECKING_STATE_LABEL: Final = "Checking"
+
+# How many times the cold-start strip may ask for results before it stops
+# asking (IN-07).  The poll's only other terminating condition is results
+# landing in the cache, so an appliance whose refresher thread has died -- or
+# one where the watch window and scanner-gate contention keep every tick from
+# storing -- leaves every open tab asking indefinitely, and this is a machine
+# meant to be left open on a tablet in a hallway.
+#
+# Measured in Chromium before the cap existed: a cold strip on a stopped
+# refresher issued 254 requests in six seconds -- 42 a second, eighty-five
+# times the "every 2s" the markup advertised.  htmx re-fires ``load`` on
+# content it has just swapped in and that body swapped in a copy of itself
+# carrying ``load, every 2s``, so the poll ran at the round-trip rate.  The
+# same measurement is why the polling body no longer carries ``load``: a cap
+# counted in attempts is only a cap in *time* if the interval is real, and at
+# 42 requests a second ten attempts would have been a quarter of a second.
+#
+# Ten attempts at the real two-second interval is about twenty seconds of
+# asking, which is roughly twenty refresher ticks (``TICK_SECONDS`` is 1 s) and
+# about two and a half times the worst probe budget a cold start can cost --
+# ``PROBE_CONNECT_SECONDS`` for saned plus ``PROBE_READ_SECONDS`` for
+# Paperless.  A healthy cold start settles on its second request; this leaves
+# it eight it will never need.
+POLL_ATTEMPT_CAP: Final = 10
+
+# What the strip says once it has stopped asking.  It replaces the freshness
+# line, because there is no freshness to report -- nothing has ever been
+# checked -- and it lives here rather than in the template for the same reason
+# ``CHECKING_MESSAGE`` does: templates own no vocabulary.  It names the button
+# that is still on the page and nothing else: no path, no URL, no host and no
+# exception text, because this sentence is rendered on a page the whole LAN can
+# read.
+POLL_GAVE_UP_LINE: Final = "The checks have not run yet. Press Check again to try now."
 
 # How much of a device's own description a row will print.  Nothing else bounds
 # what a scanner can call itself, and the row is rendered into HTML next to

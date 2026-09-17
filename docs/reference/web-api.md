@@ -134,6 +134,8 @@ Renders the system status strip -- the Scanner, Paperless, Profiles, Fallback an
 
 Before any results exist the response is five `Checking...` rows carrying a self-poll; once results exist the body it returns carries no poll trigger, so the polling stops on its own. While a scan is running the scanner check is skipped and the strip says so rather than probing a device that is in use.
 
+That poll also has a second ending, for the case where the first one never comes. If the checks never run at all -- because the background refresher has stopped, say -- the strip gives up after a bounded number of attempts, a little under half a minute, and stops asking. A tab left open on a hallway tablet in front of a half-broken appliance therefore goes quiet instead of asking forever. Giving up costs nothing that was on the page: the five rows stay, the `Check again` button stays, and the line beneath them says the checks have not run yet and points at that button. Pressing it starts a fresh attempt, and a fresh count, whenever somebody comes back to it.
+
 ---
 
 ### `POST /api/checks/refresh`

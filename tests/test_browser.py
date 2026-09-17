@@ -59,7 +59,12 @@ import uvicorn
 from PIL import Image
 from playwright.sync_api import expect
 
-from saneless.checks import CHECKING_MESSAGE, CheckKey
+from saneless.checks import (
+    CHECKING_MESSAGE,
+    POLL_ATTEMPT_CAP,
+    POLL_GAVE_UP_LINE,
+    CheckKey,
+)
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -2995,11 +3000,16 @@ class TestStatusStripInChromium:
         assert refresh["x"] + refresh["width"] <= viewport["width"], refresh
 
 
-# How long an abandoned cold strip is watched, in milliseconds. Six refresher
-# ticks (TICK_SECONDS is 1 s), which is three of the 2 s intervals the markup
-# claims -- long enough that a poll running at the advertised rate is several
-# requests and a poll running faster is unmistakably faster.
-_POLL_OBSERVATION_MS = 6000
+# How long the strip is watched after it has stopped, in milliseconds. Three of
+# the 2 s intervals the markup names, so a poll that had merely paused would
+# have fired at least once inside it and been caught.
+_POLL_SETTLE_MS = 6000
+
+# The longest the give-up is waited for. The chain is POLL_ATTEMPT_CAP requests
+# two seconds apart, so it ends around 2 * (cap - 1) seconds; the bound is
+# generous enough to survive a slow CI machine and still well inside pytest's
+# own 60 s timeout.
+_POLL_GIVE_UP_MS = 40_000
 
 # The longest a cold start that really fills is given to reach its results. A
 # private server's probe is a stub scanner plus a refused connection to a
@@ -3074,42 +3084,57 @@ class TestColdStartPollIsBounded:
     naming both ``load`` and an interval can run at the round-trip rate rather
     than at the advertised one. Only a request count says which.
 
-    The count matters because IN-07's fix is a cap, and a cap chosen against
-    the interval in the markup would be wrong by whatever factor the markup is
-    wrong by. So the number is measured here, recorded as a test property, and
-    the cap is chosen from it.
+    That count was measured before the cap existed: 254 requests in six
+    seconds, 42 a second, eighty-five times the advertised rate. It is why the
+    fix is two things rather than one -- a server-side attempt cap, and ``load``
+    dropped from every polled body so that the interval in the markup is the
+    interval the browser really uses. A cap counted in attempts is only a cap in
+    time if the interval is honest.
     """
 
-    def test_an_abandoned_cold_strip_keeps_asking(
+    def test_an_abandoned_cold_strip_stops_asking(
         self,
         page: Page,
         cold_strip_server: _BrowserServer,
         record_property: Callable[[str, object], None],
     ) -> None:
         """
-        A cache that is never filled leaves the poll running, at a measured rate.
+        A cache that is never filled runs the poll out of attempts (IN-07).
 
         ``cold_strip_server`` stops the refresher, which is the appliance whose
-        background thread has died -- the case IN-07 is about. Nothing here
-        asserts the count against a guess; it asserts only that the poll is
-        still going and records how hard it was going, because the honest
-        before-state is a number and not a prediction.
+        background thread has died -- the case IN-07 is about, and the one where
+        the poll's original terminating condition can never fire. The count is
+        asserted against the cap now rather than merely recorded, and the
+        stillness afterwards is asserted separately: a poll that had paused
+        rather than stopped would have fired at least three times inside the
+        settle window.
+
+        The three things the give-up state must not lose are checked on the
+        page itself, because "stops asking" would be a bad trade for a strip
+        that had gone blank.
         """
         polled = _record_checks_requests(page)
         page.goto(cold_strip_server.url)
         expect(page.locator("#checks-body[hx-trigger]")).to_have_count(1)
 
-        page.wait_for_timeout(_POLL_OBSERVATION_MS)
-        observed = len(polled)
-        record_property("cold_start_poll_requests", observed)
-        record_property("cold_start_poll_observation_ms", _POLL_OBSERVATION_MS)
-        record_property(
-            "cold_start_poll_per_second", observed / (_POLL_OBSERVATION_MS / 1000)
+        # ":not([hx-trigger])" rather than a negated attribute assertion: it is
+        # the attribute's absence that ends the poll, and a locator matching
+        # only the trigger-less body auto-waits for exactly that.
+        expect(page.locator("#checks-body:not([hx-trigger])")).to_have_count(
+            1, timeout=_POLL_GIVE_UP_MS
         )
+        at_give_up = len(polled)
+        record_property("cold_start_poll_requests", at_give_up)
+        record_property("cold_start_poll_attempt_cap", POLL_ATTEMPT_CAP)
+        assert at_give_up == POLL_ATTEMPT_CAP, polled
 
-        # Still polling, and more than the one request the first trigger makes.
-        assert observed > 1, observed
-        expect(page.locator("#checks-body[hx-trigger]")).to_have_count(1)
+        page.wait_for_timeout(_POLL_SETTLE_MS)
+        assert len(polled) == at_give_up, polled[at_give_up:]
+
+        # Still a strip, and still a way forward.
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+        expect(page.locator(".check-refresh")).to_have_count(1)
+        expect(page.locator(".check-meta")).to_have_text(POLL_GAVE_UP_LINE)
 
     def test_a_cold_start_that_fills_reaches_its_results_unaided(
         self,
@@ -3120,10 +3145,12 @@ class TestColdStartPollIsBounded:
         """
         The legitimate cold start ends in results with nobody touching the page.
 
-        This is the property any cap has to leave alone, so it is measured
-        before the cap exists and re-measured after: how many requests a
-        healthy appliance's cold start costs, and that the strip settles on its
-        own.
+        This is the property the cap must leave alone, and it is the reason the
+        cap is ten rather than two: the strip has to be allowed to keep asking
+        for as long as a real appliance could plausibly take to answer.
+        Measured before the fix it cost 39 requests, because every swapped-in
+        body re-fired ``load``; after it, the same cold start costs a couple at
+        the honest interval and still settles on its own.
         """
         polled = _record_checks_requests(page)
         page.goto(storing_strip_server.url)
