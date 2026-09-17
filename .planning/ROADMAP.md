@@ -556,7 +556,7 @@ Plans:
   4. Every user-facing error shows a plain-language message and a suggested next step, with the raw technical detail inside a collapsed disclosure
   5. Two browser contexts show the owner the Continue/Abort flip prompt (with confirmation on Abort) and the non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels with descriptions, feeder-first on sheet-fed scanners, and say so on the strip when the config mount is read-only
 
-**Plans**: 19 plans
+**Plans**: 27 plans (19 shipped, 8 gap-closure from `30-REVIEW.md`)
 
 Plans:
 **Wave 1**
@@ -616,6 +616,28 @@ Plans:
 **Wave 13** *(blocked on Wave 12 completion)*
 
 - [x] 30-19-PLAN.md — Browser verification part 2: two contexts, tag picker, blocked Scan button
+
+**Gap closure** *(from `30-REVIEW.md`: 2 critical, 7 warning, 7 info — additive, waves restart)*
+
+**Gap wave 1**
+
+- [ ] 30-20-PLAN.md — CR-01/IN-04/IN-05: the Profiles row tells the truth, one derivation for both surfaces
+- [ ] 30-21-PLAN.md — CR-02/WR-01/WR-02: the saned probe stops lying, refuses to guess, and holds its bound
+- [ ] 30-22-PLAN.md — IN-03/IN-06: escaped titles in pipeline logs, no trailing space in a generated title
+- [ ] 30-23-PLAN.md — WR-06/IN-01/IN-02: profile defaults follow the form shape; no fetch or exception object
+- [ ] 30-24-PLAN.md — WR-07: one shared shutdown deadline instead of one join bound per thread
+
+**Gap wave 2** *(blocked on gap wave 1)*
+
+- [ ] 30-25-PLAN.md — WR-03/WR-04: the scanner gate narrowed to the scanner check; one single-flighted probe
+
+**Gap wave 3** *(blocked on gap wave 2)*
+
+- [ ] 30-26-PLAN.md — WR-05: a minimum interval under the manual check refresh
+
+**Gap wave 4** *(blocked on gap wave 3)*
+
+- [ ] 30-27-PLAN.md — IN-07: the cold-start status poll gives up instead of polling forever
 
 **UI hint**: yes
 
