@@ -371,9 +371,10 @@ class TestSanedHostParsing:
         """
         A number no socket could bind is read as a host name, not a port.
 
-        ``socket.create_connection`` raises ``OverflowError`` -- not
-        ``OSError`` -- for a port outside 0..65535, so accepting one here would
-        put an exception the probe does not catch inside the probe.
+        Neither way of using such a port is safe: ``connect`` raises
+        ``OverflowError``, which is not an ``OSError`` and so is not caught by
+        the probe, and ``getaddrinfo`` truncates it modulo 65536 instead, which
+        would have ``host-a:99999`` quietly dial port 34463.
         """
         assert _saned_hosts("host-a:99999") == (
             ("host-a", SANED_PORT),
