@@ -510,6 +510,206 @@ class TestSanedReachable:
         assert SANED_PORT == 6566
 
 
+class _ProbeRecorder:
+    """Records what the saned probe did, in place of doing any of it."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.constructions: list[tuple[int, int, int]] = []
+        self.events: list[str] = []
+        self.timeouts: list[float] = []
+        self.addresses: list[object] = []
+
+    def socket(self, family: int, socktype: int, proto: int) -> _RecordingSocket:
+        """
+        Stand in for ``socket.socket`` and record the construction.
+
+        Args:
+            family: The address family the probe chose.
+            socktype: The socket type the probe chose.
+            proto: The protocol the probe chose.
+
+        Returns:
+            A socket double wired back to this recorder.
+
+        """
+        self.constructions.append((family, socktype, proto))
+        return _RecordingSocket(self)
+
+
+class _RecordingSocket:
+    """A socket that records the calls made to it and always refuses."""
+
+    def __init__(self, recorder: _ProbeRecorder) -> None:
+        """
+        Wire this double to the recorder collecting the run.
+
+        Args:
+            recorder: Where every call is appended.
+
+        """
+        self.recorder = recorder
+
+    def __enter__(self) -> _RecordingSocket:
+        """
+        Enter the ``with`` block the probe opens.
+
+        Returns:
+            This double.
+
+        """
+        self.recorder.events.append("enter")
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        """
+        Leave the ``with`` block, recording that the socket was closed.
+
+        Args:
+            _exc_info: Ignored; nothing is suppressed.
+
+        """
+        self.recorder.events.append("exit")
+
+    def settimeout(self, timeout: float) -> None:
+        """
+        Record the budget the probe applied.
+
+        Args:
+            timeout: The budget, in seconds.
+
+        """
+        self.recorder.events.append("settimeout")
+        self.recorder.timeouts.append(timeout)
+
+    def close(self) -> None:
+        """Record an explicit close, which a failed dial performs."""
+        self.recorder.events.append("close")
+
+    def connect(self, address: object) -> None:
+        """
+        Record the address dialled and refuse, the way a closed port does.
+
+        Args:
+            address: The sockaddr the probe passed.
+
+        Raises:
+            OSError: Always.
+
+        """
+        self.recorder.events.append("connect")
+        self.recorder.addresses.append(address)
+        msg = "Connection refused"
+        raise OSError(msg)
+
+
+# Three addresses for one name: the shape a dual-stack scanner host has, and
+# the one WR-02 costed at three connect budgets instead of one.
+_THREE_ADDRESSES = [
+    (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", 6566, 0, 0)),
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.10", 6566)),
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.11", 6566)),
+]
+
+
+def _install_probe_recorder(monkeypatch: pytest.MonkeyPatch) -> _ProbeRecorder:
+    """
+    Replace resolution and socket construction with recording doubles.
+
+    Nothing leaves the process: ``getaddrinfo`` answers from a constant and
+    every socket refuses, so the cost being measured is the count of attempts
+    rather than any real handshake, and the test still sleeps for nothing.
+
+    Args:
+        monkeypatch: pytest's attribute patcher.
+
+    Returns:
+        The recorder the probe's calls land in.
+
+    """
+    recorder = _ProbeRecorder()
+    monkeypatch.setattr(
+        socket, "getaddrinfo", lambda *_args, **_kwargs: _THREE_ADDRESSES
+    )
+    monkeypatch.setattr(socket, "socket", recorder.socket)
+    return recorder
+
+
+class TestSanedProbeBound:
+    """One configured host costs one connect budget, not one per address (WR-02)."""
+
+    def test_three_resolved_addresses_cost_one_connect_attempt(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A dual-stack host is dialled once, so the bound is the budget itself.
+
+        Dialling every resolved address multiplied the documented 2 s by
+        however many addresses the resolver happened to return -- a number
+        nothing in this tree controls.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert len(recorder.constructions) == 1
+        assert recorder.events.count("connect") == 1
+
+    def test_the_address_dialled_is_the_first_the_resolver_returned(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Resolution order is the resolver's business, and the probe respects it.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
+        family, socktype, proto, _canonical, sockaddr = _THREE_ADDRESSES[0]
+        assert recorder.constructions == [(family, socktype, proto)]
+        assert recorder.addresses == [sockaddr]
+
+    def test_the_budget_is_applied_before_the_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A timeout set after the connect would bound nothing at all.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+        recorder = _install_probe_recorder(monkeypatch)
+        _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET)
+        assert recorder.timeouts == [_PROBE_BUDGET]
+        assert recorder.events.index("settimeout") < recorder.events.index("connect")
+
+    def test_a_resolver_that_raises_is_not_reachable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A name that cannot be resolved answers False rather than raising.
+
+        ``socket.gaierror`` subclasses ``OSError``, so the one ``except`` arm
+        covers resolution as well as the handshake.
+
+        Args:
+            monkeypatch: pytest's patcher.
+
+        """
+
+        def _fail(*_args: object, **_kwargs: object) -> list[object]:
+            msg = "Name or service not known"
+            raise socket.gaierror(msg)
+
+        monkeypatch.setattr(socket, "getaddrinfo", _fail)
+        assert _saned_reachable("scanbox.invalid", SANED_PORT, _PROBE_BUDGET) is False
+
+
 class TestImportHygiene:
     """``checks.py`` is read by both surfaces, so it may depend on neither."""
 
