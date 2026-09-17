@@ -39,6 +39,7 @@ from .config import (
     is_placeholder_token,
     load_settings,
     log_config_sources,
+    profile_storage_for_loaded,
     resolve_job_title,
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
@@ -68,7 +69,6 @@ from .vocabulary import (
     ExitCode,
     FlipOutcome,
     JobState,
-    ProfileStorage,
     classify_error,
     error_next_step,
     exit_code_for,
@@ -1146,19 +1146,12 @@ def doctor(ctx: click.Context) -> None:
                 settings=settings,
                 scanner=scanner,
                 paperless=paperless,
-                # The CLI can report two of the three storage outcomes and
-                # never the third. IN_MEMORY_UNWRITABLE is what the *worker*
-                # records when its one startup attempt to persist generated
-                # profiles was refused; a one-shot command attempts no persist,
-                # so it has no such outcome to report and must not invent one
-                # by probing -- Phase 27 D-09's motivating failure is a bind
-                # mount where the directory is writable and only the rename
-                # fails, which no probe short of the write itself can see.
-                profile_storage=(
-                    ProfileStorage.PERSISTED
-                    if settings.config_path is not None
-                    else ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
-                ),
+                # A one-shot command attempts no persist, so this is the
+                # derivation it is entitled to; the function's docstring has
+                # the reasoning, including why it cannot report the third
+                # outcome. The status strip calls the same function, which is
+                # what keeps the two surfaces on one Profiles row (D-02).
+                profile_storage=profile_storage_for_loaded(settings),
             )
         )
     finally:
