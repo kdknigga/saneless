@@ -25,6 +25,7 @@ for the same reason D-13 omits the log path.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import socket
@@ -33,6 +34,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from string import ascii_letters, digits
+from time import monotonic
 from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx
@@ -77,12 +79,14 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# How long a saned pre-probe waits for a TCP handshake before giving up.  This
-# bounds one handshake per configured host, and nothing else.  Name resolution
-# runs before it and is not inside it -- `getaddrinfo` takes no timeout, so an
-# unreachable resolver costs whatever `resolv.conf` says -- and with N
-# configured hosts the probe's worst case is N times (resolution plus this
-# budget).  The bound still matters for the reason it always did: what it
+# How long a saned pre-probe waits before giving up on a configured host.  It
+# is a deadline, not a per-socket timeout: every address the host resolves to
+# is dialled, and all of them together get this much.  So it bounds one
+# configured host, and nothing else.  Name resolution runs before it and is
+# not inside it -- `getaddrinfo` takes no timeout, so an unreachable resolver
+# costs whatever `resolv.conf` says -- and with N configured hosts the probe's
+# worst case is N times (resolution plus this budget).  The bound still
+# matters for the reason it always did: what it
 # replaces is `get_devices()`, which has no timeout at any layer and costs
 # roughly 127 s for a silently unreachable host, because Linux retries a SYN
 # six times by default, inside a blocking C call nothing can interrupt.  Read
@@ -513,20 +517,74 @@ def _looks_like_a_host_name(segment: str) -> bool:
     "yes" is what WR-01 was: three junk dials and, through the pre-probe's
     short circuit, a wrong verdict.
 
+    An all-digit segment is rejected for that reason and not for tidiness.  No
+    legal host name is entirely digits, and every all-digit segment arriving
+    here is either a mis-parsed port or half an IPv6 literal -- but glibc
+    *accepts* such strings, reading them as the single-integer IPv4 form.
+    Measured on this machine, ``getaddrinfo('2001', 6566)`` answers
+    ``0.0.7.209``, ``getaddrinfo('99999', 6566)`` answers ``0.1.134.159`` and
+    ``getaddrinfo('0', 6566)`` answers ``0.0.0.0``.  The last one is the worst
+    of the three: on Linux a ``connect()`` to ``0.0.0.0`` reaches loopback, so
+    a ``0`` in the dial list lets the probe report the configured scanner host
+    "reachable" off any unrelated local process listening on 6566 (R2-WR-01,
+    T-30-28-01).
+
     Args:
         segment: One stripped segment of the ``scanner.host`` setting.
 
     Returns:
-        True when the segment is non-empty, made only of ASCII letters,
-        digits, hyphens and dots, and neither starts nor ends with a hyphen or
-        a dot.
+        True when the segment is non-empty, is not entirely digits, is made
+        only of ASCII letters, digits, hyphens and dots, and neither starts
+        nor ends with a hyphen or a dot.
 
     """
     if not segment:
         return False
+    if segment.isdigit():
+        return False
     if segment[0] in "-." or segment[-1] in "-.":
         return False
     return set(segment) <= _HOST_NAME_CHARACTERS
+
+
+def _looks_like_an_ipv6_literal(host_setting: str) -> bool:
+    """
+    Say whether the whole setting is one IPv6 address rather than a host list.
+
+    This asks the stdlib, and it asks *before* anything is split on ``:``,
+    because splitting is precisely what destroys a literal.  Brackets are
+    removed rather than stripped from the ends, so ``[fe80::1]:6566`` reaches
+    the parser as ``fe80::1:6566`` -- a legal address, since ``6566`` is legal
+    hex -- instead of as a name with a stray ``]`` in it.  Mangling the input
+    that way is safe here because the answer is only ever used to *refuse*: a
+    false "yes" costs the pre-probe's latency saving, and there is no path from
+    this function to an address that gets dialled.
+
+    A zone suffix needs no handling of its own.  ``ipaddress.ip_address`` has
+    accepted scoped literals since Python 3.9, and it was verified against the
+    interpreter this project pins that ``fe80::1%eth0`` parses as version 6.
+
+    An IPv4 literal answers False deliberately.  Dots are not ambiguous, so
+    ``192.0.2.10`` and ``192.0.2.10:6566`` each have exactly one reading and
+    the caller's segment rules get them both right.
+
+    Args:
+        host_setting: The configured ``scanner.host``, possibly empty.
+
+    Returns:
+        True when the setting, with brackets removed, is an IPv6 address.
+
+    """
+    try:
+        parsed = ipaddress.ip_address(
+            host_setting.strip().replace("[", "").replace("]", "")
+        )
+    except ValueError:
+        # Not an address at all: a name, a list of names, or a literal too
+        # mangled to parse.  The caller's segment rules are the reading for
+        # all three.
+        return False
+    return parsed.version == 6
 
 
 def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
@@ -541,28 +599,46 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
 
     The reading taken here is the narrow one: a trailing segment is a port only
     when the setting has exactly two segments and that segment is all digits
-    within 1..65535.  Anything else is a list of host names.  It is narrow on
-    purpose -- misreading a host as a port would probe the wrong address
-    entirely, while misreading a port as a host costs one connect to a name
-    that does not resolve and then falls through to the behaviour that existed
-    before this module.
+    within 1..65535.  Anything else is a list of host names, minus any segment
+    that could not be a name.  It is narrow on purpose -- misreading a host as
+    a port would probe the wrong address entirely, and misreading a port as a
+    host dials whatever glibc makes of the number, which is why neither
+    reading is applied to a segment that is all digits.
 
     The range check is not cosmetic, and it is not a tidiness rule either.  A
     port outside 0..65535 does not fail loudly on the way to a socket: passed
     to ``connect`` it raises ``OverflowError``, which is not an ``OSError`` and
     so is not caught by the probe, and passed to ``getaddrinfo`` it is
     truncated modulo 65536 instead, which means ``host:99999`` would quietly
-    dial port 34463 -- a real probe of an address nobody configured.  Reading
-    such a segment as a host name avoids both.
+    dial port 34463 -- a real probe of an address nobody configured.
 
-    **The refusal.**  With more than one colon present, the setting is refused
-    outright -- no entries, no probe -- unless every segment could be a host
-    name and no blank segment sits anywhere but the first or last position.
-    An IPv6 literal is exactly the input where "colon-separated list of hosts"
-    and "one address" are indistinguishable: ``fe80::1`` split on ``:`` used to
-    read as host ``fe80`` on port 1, and ``[fe80::1]:6566`` as three names no
-    resolver can answer (WR-01).  The stray colon at either edge stays
-    tolerated, because ``: host-a :`` has only ever meant one host.
+    Reading such a segment as a host name does *not* avoid that, which is what
+    R2-WR-01 established and what this docstring used to claim.  Measured on
+    this machine, ``getaddrinfo('99999', 6566)`` answers ``0.1.134.159``:
+    glibc's single-integer IPv4 form means the junk dial happens anyway, at a
+    different address nobody configured.  The segment is therefore *dropped* --
+    ``_looks_like_a_host_name`` refuses all-digit segments and the returned
+    tuple is filtered through it -- so ``host:99999`` yields ``host`` alone,
+    and dropping is what avoids the dial.
+
+    **The refusal.**  An IPv6 literal is exactly the input where
+    "colon-separated list of hosts" and "one address" are indistinguishable, so
+    the stdlib is asked first: when the whole setting parses as an IPv6
+    address, there are no entries and no probe
+    (``_looks_like_an_ipv6_literal``).  That covers the compressed spelling and
+    the expanded one alike, which the segment rules alone did not -- before it,
+    ``2001:db8:0:0:0:0:0:1`` produced eight entries, five of them ``0``
+    (R2-WR-01).
+
+    The segment rules stay on top of it, because the stdlib will not parse
+    every spelling an operator can type.  With more than one colon present the
+    setting is refused outright unless every segment could be a host name and
+    no blank segment sits anywhere but the first or last position.  The blank
+    half catches ``[fe80::1]:6566`` if it ever reaches here, and the
+    host-name half catches ``[2001:db8:0:0:0:0:0:1]:6566``, which has no blank
+    segment at all and whose bracket-stripped form is nine groups the stdlib
+    rejects.  The stray colon at either edge stays tolerated, because
+    ``: host-a :`` has only ever meant one host.
 
     Returning ``()`` is not a silent failure; it is the fallback this module
     documents everywhere else.  No entries means no probe, which means the
@@ -575,11 +651,14 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
         host_setting: The configured ``scanner.host``, possibly empty.
 
     Returns:
-        One ``(host, port)`` pair per entry, in the configured order.  Empty
-        when nothing is configured, every segment is blank, or the setting is
-        one this module refuses to guess at.
+        One ``(host, port)`` pair per entry that could be a host name, in the
+        configured order.  Empty when nothing is configured, every segment is
+        blank or was dropped, or the setting is one this module refuses to
+        guess at.
 
     """
+    if _looks_like_an_ipv6_literal(host_setting):
+        return ()
     segments = [segment.strip() for segment in host_setting.split(":")]
     present = [segment for segment in segments if segment]
     if not present:
@@ -591,9 +670,17 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
         return ()
     if len(present) == 2:
         host, maybe_port = present
-        if maybe_port.isdigit() and 0 < int(maybe_port) <= 65535:
+        # The host half is checked too, so ``0:6566`` cannot slip an all-digit
+        # host through the one branch that does not reach the filter below.
+        if (
+            _looks_like_a_host_name(host)
+            and maybe_port.isdigit()
+            and 0 < int(maybe_port) <= 65535
+        ):
             return ((host, int(maybe_port)),)
-    return tuple((host, SANED_PORT) for host in present)
+    return tuple(
+        (host, SANED_PORT) for host in present if _looks_like_a_host_name(host)
+    )
 
 
 def _saned_reachable(host: str, port: int, timeout: float) -> bool:
@@ -613,14 +700,25 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     The port is 6566, IANA's ``sane-port``, verified in ``/etc/services``.
 
-    **What the budget covers.**  One handshake, to one address.  The name is
-    resolved once and only the first result is dialled, because dialling every
-    resolved address would multiply the budget by a number nothing here
-    controls -- a dual-stack scanner host resolves to three, so the documented
-    two seconds silently became six (WR-02).  One address is enough for the
-    question being asked, which is whether the host is answering at all, and
-    the answer for a host that is switched off is the same on every address it
-    has.
+    **What the budget covers.**  Every address the name resolved to, in
+    resolver order, and all of them together.  The budget is a *deadline*,
+    read once before the walk rather than handed to each socket, so every
+    attempt gets only what the attempts before it left over and a host with
+    three addresses costs no more than a host with one.  That is the property
+    WR-02 asked for, and it is kept.
+
+    What WR-02's fix did instead was dial only the resolver's first answer,
+    and that was a strict regression, for a reason that lives in the resolver
+    rather than in the handshake.  ``getaddrinfo`` is called with no
+    ``AI_ADDRCONFIG``, so glibc returns AAAA records even on a host with no
+    IPv6 route, and RFC 6724 orders the IPv6 address first -- measured on this
+    machine, ``localhost`` resolves to ``::1`` and then ``127.0.0.1``.  saned
+    commonly binds v4-only.  So the justification offered for one address --
+    "the answer for a host that is switched off is the same on every address
+    it has" -- was true of the case that does not matter and false of the one
+    that does: a host that is *on*, answering over one family and not the
+    other, was reported dead, permanently, on an appliance that scans
+    perfectly well (R2-CR-01).
 
     Resolution itself is outside the budget and is left that way deliberately.
     ``getaddrinfo`` takes no timeout, so bounding it means running it on a
@@ -632,7 +730,12 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
     that is stated rather than claimed away.
 
     **Failure policy.**  This returns ``False`` for every ``OSError`` --
-    refused, timed out, unresolvable, no route -- and raises nothing.  It is
+    refused, timed out, unresolvable, no route -- and raises nothing.  An
+    empty resolver answer is covered by the same promise without a guard of
+    its own: the walk holds no subscript, so nothing to dial is a loop body
+    that never runs.  Subscripting the resolver's first answer raised
+    ``IndexError`` there, which is not an ``OSError`` and so escaped into
+    ``run_checks``' generic red row (R2-IN-01).  It is
     the *caller* that decides what a ``False`` means, and the caller never
     turns "the probe could not be run at all" into a bad row: when
     ``_saned_hosts`` yields no entries to dial, no probe happens and the
@@ -654,19 +757,32 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     """
     try:
-        family, socket_type, protocol, _canonical_name, address = socket.getaddrinfo(
-            host, port, type=socket.SOCK_STREAM
-        )[0]
-        with socket.socket(family, socket_type, protocol) as probe:
-            probe.settimeout(timeout)
-            probe.connect(address)
-            return True
+        candidates = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError as exc:
-        # Logged at DEBUG, not WARNING: a closed scanner port is the ordinary
-        # state of an appliance whose scanner is switched off, and the row the
-        # caller renders is where an operator is told about it.
-        logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
+        # Logged at DEBUG, not WARNING: a name that does not resolve is the
+        # ordinary state of an appliance whose scanner host is switched off or
+        # misspelled, and the row the caller renders is where an operator is
+        # told about it.  ``type(exc).__name__`` only -- no host, no address
+        # and no exception text reaches a log line or a row (ASVS V7).
+        logger.debug("saned pre-probe did not resolve: %s", type(exc).__name__)
         return False
+    deadline = monotonic() + timeout
+    for family, socket_type, protocol, _canonical_name, address in candidates:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            # The budget is spent, so the addresses left over do not get one.
+            return False
+        try:
+            with socket.socket(family, socket_type, protocol) as probe:
+                probe.settimeout(remaining)
+                probe.connect(address)
+                return True
+        except OSError as exc:
+            # One address refusing says nothing about the next one: this is
+            # exactly the dual-stack case where the IPv6 address the resolver
+            # put first has no listener and the IPv4 address does.
+            logger.debug("saned pre-probe did not connect: %s", type(exc).__name__)
+    return False
 
 
 def _directory_accepts_a_write(path: Path) -> bool:
