@@ -146,9 +146,30 @@ class _RecordingRefresher:
         """
         return self._real.build_context()
 
-    def probe_now(self) -> None:
-        """Probe through the real refresher, which owns the one probe path."""
-        self._real.probe_now()
+    def probe_now(self) -> bool:
+        """
+        Probe through the real refresher, which owns the one probe path.
+
+        The boolean is forwarded rather than invented.  A stub returning
+        ``None`` would make the handler read every call as a collapse, and the
+        collapse tests below would pass for entirely the wrong reason.
+
+        Returns:
+            Whether this call took the probe or collapsed into one in flight.
+
+        """
+        return self._real.probe_now()
+
+    @property
+    def probe_in_flight(self) -> bool:
+        """
+        Delegate to the real refresher's reader, which owns the one lock.
+
+        Returns:
+            Whether a probe holds the single-flight lock right now.
+
+        """
+        return self._real.probe_in_flight
 
     @property
     def probe_lock(self) -> threading.Lock:
@@ -1086,6 +1107,191 @@ class TestRefreshMinimumInterval:
         assert spy.calls == 0
         assert client.post("/api/checks/refresh").status_code == 200
         assert spy.calls == 1
+
+
+class TestCollapsedRefreshStillDelivers:
+    """
+    WR-03: the one manual control must always put an answer on the page.
+
+    ``POST /api/checks/refresh`` did three things in sequence and they composed
+    badly.  A click landing while a background probe held the lock collapsed,
+    rendered the cache *as it stood* -- the pre-probe entry, because the probe
+    in flight had not stored yet -- and, because results already existed,
+    carried no trigger.  Nothing on the page was ever going to pick up the
+    result that probe landed a second later.  And the claim had already been
+    stamped before the collapse was discovered, so the next click inside two
+    seconds was refused as well: the button visibly doing nothing, twice.
+
+    The window is one background probe's duration out of every TTL, and the
+    Paperless read budget alone is five seconds, so it is not a narrow one.
+    """
+
+    def test_a_collapsed_refresh_asks_the_page_to_come_back_for_the_result(
+        self, client: TestClient
+    ) -> None:
+        """
+        The review's own case: the collapsed body carries a trigger.
+
+        Asserted against the rendered attributes, not the template source: a
+        conditional a comment describes and the markup does not honour would
+        satisfy a source grep and still leave the answer undelivered.
+        """
+        _warm_the_cache(client)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            attrs = _body_attrs(client.post("/api/checks/refresh").text)
+        finally:
+            lock.release()
+        assert 'hx-get="/api/checks' in attrs
+        assert "every 2s" in attrs
+
+    def test_a_collapsed_refresh_does_not_spend_the_manual_floor(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Two collapsed clicks cost no claim, so the next real one is honoured.
+
+        The clock never moves, so all three clicks land inside the 2 s floor.
+        Before the release existed, the first collapse stamped and the third
+        click -- the one with the lock free and a probe genuinely available --
+        was refused: ``spy.calls`` would be 0.
+        """
+        client, _clock = clocked
+        spy = _spy(monkeypatch)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            assert client.post("/api/checks/refresh").status_code == 200
+            assert client.post("/api/checks/refresh").status_code == 200
+        finally:
+            lock.release()
+        assert spy.calls == 0
+        assert client.post("/api/checks/refresh").status_code == 200
+        assert spy.calls == 1
+
+    def test_both_collapsed_refreshes_ask_for_the_result(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A second collapsed click is honoured and asks again, as the first did."""
+        client, _clock = clocked
+        _spy(monkeypatch)
+        _warm_the_cache(client)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            first = client.post("/api/checks/refresh").text
+            second = client.post("/api/checks/refresh").text
+        finally:
+            lock.release()
+        assert 'hx-get="/api/checks' in _body_attrs(first)
+        assert _body_attrs(second) == _body_attrs(first)
+
+    def test_an_honoured_refresh_with_nothing_in_flight_carries_no_trigger(
+        self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The uncollided click is unchanged: same status, same partial, no poll.
+
+        This is the property 30-27 established and the reason the new disjunct
+        is a disjunct rather than a replacement.  By the time the handler
+        renders, its own probe has released the lock and stored, so there is
+        nothing left to wait for.
+        """
+        client, _clock = clocked
+        spy = _spy(monkeypatch)
+        response = client.post("/api/checks/refresh")
+        assert response.status_code == 200
+        assert spy.calls == 1
+        assert "hx-" not in _body_attrs(response.text)
+        assert len(_CHECK_ROW.findall(response.text)) == len(CheckKey)
+
+    def test_the_strip_asks_again_while_a_probe_is_in_flight(
+        self, client: TestClient
+    ) -> None:
+        """``GET /api/checks`` mid-probe names the next attempt, results or not."""
+        _warm_the_cache(client)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            attrs = unescape(_body_attrs(client.get("/api/checks?attempt=3").text))
+        finally:
+            lock.release()
+        assert "/api/checks?attempt=4" in attrs
+
+    def test_the_settling_poll_stops_at_the_same_cap_the_cold_start_uses(
+        self, client: TestClient
+    ) -> None:
+        """
+        T-30-29-02: a probe wedged in a getaddrinfo cannot make a tab ask forever.
+
+        The settling poll rides the same ``attempt`` parameter, already bounded
+        at the route by ``Query(le=POLL_ATTEMPT_CAP)``, so it ends where the
+        cold start's does.
+        """
+        _warm_the_cache(client)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            markup = client.get(
+                f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+            ).text
+        finally:
+            lock.release()
+        assert "hx-" not in _body_attrs(markup)
+
+    def test_a_settling_poll_that_runs_out_keeps_its_last_checked_line(
+        self, client: TestClient
+    ) -> None:
+        """
+        The give-up line stays cold-start-only: there are results, and they hold.
+
+        ``POLL_GAVE_UP_LINE`` says the checks have not run yet.  Printing it
+        beside five rows that did run would be a lie the strip tells about
+        itself, so ``gave_up`` still requires an empty cache.
+        """
+        _warm_the_cache(client)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            markup = client.get(
+                f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+            ).text
+        finally:
+            lock.release()
+        match = _CHECK_META.search(markup)
+        assert match is not None, markup
+        meta = match.group("text").strip()
+        assert meta != checks_module.POLL_GAVE_UP_LINE
+        assert meta.startswith("Last checked ")
+
+    def test_the_settling_poll_chain_is_bounded_even_with_a_probe_stuck(
+        self, client: TestClient, record_property: Callable[[str, object], None]
+    ) -> None:
+        """
+        Followed link by link with the lock never released, the chain still ends.
+
+        One longer than the cap, for the same reason the cold chain is: its
+        first link is the bare route, the body a page render already carries.
+        """
+        _warm_the_cache(client)
+        lock = _refresher(client).probe_lock
+        assert lock.acquire(blocking=False) is True
+        try:
+            followed = _follow_the_poll(client, _POLL_CHAIN_LIMIT)
+        finally:
+            lock.release()
+        record_property("settling_poll_chain_length", len(followed))
+        assert len(followed) == checks_module.POLL_ATTEMPT_CAP + 1, followed
+
+    def test_results_and_an_idle_probe_still_carry_no_trigger(
+        self, client: TestClient
+    ) -> None:
+        """The strip asks only while something in flight will change the answer."""
+        _warm_the_cache(client)
+        assert _refresher(client).probe_in_flight is False
+        assert "hx-" not in _body_attrs(client.get("/api/checks").text)
+        assert "hx-" not in _body_attrs(client.get("/").text)
 
 
 class TestFreshnessLine:
