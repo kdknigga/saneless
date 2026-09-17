@@ -331,9 +331,9 @@ def test_shutdown_closes_resources_after_both_threads_stop(
         calls.append("worker.stop")
         return original_stop()
 
-    def recording_refresher_stop() -> bool:
+    def recording_refresher_stop(timeout: float | None = None) -> bool:
         calls.append("refresher.stop")
-        return original_refresher_stop()
+        return original_refresher_stop(timeout=timeout)
 
     def recording_paperless_close() -> None:
         calls.append("paperless.close")
@@ -373,18 +373,21 @@ def test_both_stop_events_are_set_before_either_join_begins(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    The two bounded joins overlap, so the worst case is one bound, not two.
+    Signalling both threads first is what lets an idle one exit before its join.
 
-    Asserted on the recorded order of the internal event sets and joins rather
-    than on elapsed time: a timing assertion here would be a flake on a loaded
-    machine and would still not say *why* the shutdown was quick.
+    It is not what bounds the total -- the joins are sequential, and the shared
+    deadline is what keeps the worst case at one bound (WR-07, and
+    ``TestShutdownSharesOneJoinBudget`` below).  What the early signal buys is
+    asserted here instead, on the recorded order of the internal event sets and
+    joins rather than on elapsed time: a timing assertion would be a flake on a
+    loaded machine and would still not say *why* the shutdown was quick.
 
     ``refresher.join`` usually does not appear at all.  By the time the worker's
     bounded join returns, the refresher's one-second ``Event.wait`` has woken on
     the event set before it and the thread has already exited, so ``stop()``
-    skips the join entirely.  That absence *is* the overlap, which is why this
-    asserts over the joins that happened rather than over a fixed four-element
-    list.
+    skips the join entirely.  That absence is the whole benefit, which is why
+    this asserts over the joins that happened rather than over a fixed
+    four-element list.
     """
     app = _build_app(settings)
     worker = app.state.worker
@@ -423,7 +426,7 @@ def test_both_stop_events_are_set_before_either_join_begins(
     assert joins
     assert all(index > last_set for index in joins)
     # Non-vacuous: the worker's join is always reached, and the refresher was
-    # already signalled before it began.  That is the overlap.
+    # already signalled before it began.  That is the free exit.
     assert "worker.join" in events
     assert events.index("refresher.set") < events.index("worker.join")
 
@@ -626,7 +629,7 @@ def test_shutdown_leaves_resources_open_when_the_refresher_does_not_stop(
     real_store_close = store.close
     real_paperless_close = paperless.close
 
-    def stuck_stop() -> bool:
+    def stuck_stop(timeout: float | None = None) -> bool:
         return False
 
     def spy_paperless_close() -> None:
