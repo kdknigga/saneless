@@ -580,6 +580,30 @@ def test_the_refresher_thread_runs_only_inside_the_lifespan(
     assert refresher._thread.is_alive() is False
 
 
+def test_the_refreshers_scan_fact_is_the_workers_own_job_id(
+    settings: Settings,
+) -> None:
+    """
+    WR-04: the strip's words and its colour read the same fact.
+
+    ``_checks_context`` renders ``scan_active`` from ``worker.current_job_id``,
+    and the refresher's scanner skip has to come from there too -- deriving it
+    from a failed lock acquisition is what let "not checked while a scan is
+    running" appear on an idle appliance.
+
+    Args:
+        settings: The test's own configuration.
+
+    """
+    app = _build_app(settings)
+    worker = app.state.worker
+    scan_active = app.state.refresher._scan_active
+    assert worker.current_job_id is None
+    assert scan_active() is False
+    worker._current_job_id = "job-1"
+    assert scan_active() is True
+
+
 def test_startup_runs_no_check_probe(
     settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -592,7 +616,7 @@ def test_startup_runs_no_check_probe(
     """
     calls: list[object] = []
 
-    def spy_run_checks(context: object) -> tuple[()]:
+    def spy_run_checks(context: object, **_kwargs: object) -> tuple[()]:
         calls.append(context)
         return ()
 
