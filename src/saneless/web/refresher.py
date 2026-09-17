@@ -51,7 +51,8 @@ class CheckRefresher:
     a ``_stopping`` :class:`threading.Event` set once by :meth:`stop`, an
     ``Event.wait`` idle sleep rather than a blocking one so stopping wakes it
     at once, and a join bounded by the same ``STOP_JOIN_SECONDS`` imported from
-    that module rather than redefined.
+    that module rather than redefined -- or, when the lifespan brings both
+    threads down against one deadline, by whatever is left of it (WR-07).
 
     Every dependency is injected, and the context arrives from a factory rather
     than from ``app.state``, so the policy can be exercised by calling
@@ -139,10 +140,15 @@ class CheckRefresher:
         Ask the refresher to stop, without waiting for the thread.
 
         This is the signal half of :meth:`stop`, split out for a caller that
-        has more than one thread to bring down.  The lifespan has two, each
-        with a join bounded by ``STOP_JOIN_SECONDS``: signalling both before
-        joining either makes the two joins overlap, so the worst-case shutdown
-        stays one bound instead of two (Amendment A-7).
+        has more than one thread to bring down.  The lifespan has two, and it
+        joins them one after the other, so signalling both before joining
+        either does not by itself bound the total -- an earlier version of this
+        docstring claimed it did, which WR-07 corrects.  What the early signal
+        actually buys is that a refresher merely between ticks wakes on the
+        event during the worker's join and exits for free, so its own join is
+        skipped.  What holds the worst case at one ``STOP_JOIN_SECONDS``
+        instead of one per thread is the single deadline the lifespan takes
+        before either join and passes to :meth:`stop` (Amendment A-7).
 
         Setting the event is the whole of it, so this never blocks, and calling
         it on a refresher that was never started -- a lifespan that failed
@@ -150,17 +156,26 @@ class CheckRefresher:
         """
         self._stopping.set()
 
-    def stop(self) -> bool:
+    def stop(self, timeout: float | None = None) -> bool:
         """
         Stop the refresher and report whether the thread actually stopped.
 
         The event is set first, so a loop already awake finishes its tick and
         then exits rather than starting another.  The join is bounded by the
-        worker's ``STOP_JOIN_SECONDS``; when this returns ``False`` the thread
-        is still inside a probe and may still write to the cache, so the
-        lifespan must leave the Paperless client and the scanner open (A-7).
-        Calling it again, or on a refresher never started, is safe -- including
-        after :meth:`request_stop`, which sets the same event.
+        worker's ``STOP_JOIN_SECONDS``, or by the caller's remaining share of
+        it: the lifespan takes one deadline for both threads, so what the
+        worker's join already spent is not spent again here (WR-07).  When this
+        returns ``False`` the thread is still inside a probe and may still
+        write to the cache, so the lifespan must leave the Paperless client and
+        the scanner open (A-7).  Calling it again, or on a refresher never
+        started, is safe -- including after :meth:`request_stop`, which sets
+        the same event.
+
+        Args:
+            timeout: Seconds to wait for the thread, or ``None`` for the whole
+                of ``STOP_JOIN_SECONDS``.  A negative value is clamped to
+                zero, so a caller arriving with its budget already spent gets
+                a poll rather than the unbounded wait ``join(None)`` would be.
 
         Returns:
             Whether the refresher thread has stopped.
@@ -168,7 +183,8 @@ class CheckRefresher:
         """
         self.request_stop()
         if self._thread.is_alive():
-            self._thread.join(timeout=STOP_JOIN_SECONDS)
+            budget = STOP_JOIN_SECONDS if timeout is None else max(0.0, timeout)
+            self._thread.join(timeout=budget)
         stopped = not self._thread.is_alive()
         if stopped:
             logger.info("CheckRefresher stopped")
