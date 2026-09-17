@@ -944,6 +944,14 @@ class ScanWorker:
             # No re-entrancy hazard: this runs once, as the worker thread's
             # first act, strictly before any job -- so the gate is never
             # already held by this thread when it arrives here.
+            #
+            # That same fact makes this the health checks' one known gate
+            # contender with no scan anywhere in sight: _current_job_id is
+            # still None here, and the lifespan starts the refresher right
+            # after the worker, so this window is exactly the cold-start poll's
+            # window.  A check that loses this gate has therefore *not* lost it
+            # to a scan and must not report one -- which is why checks.py has
+            # _scanner_busy() beside _scanner_skipped() (R2-WR-02).
             with self._scanner_gate:
                 devices = self._scanner.get_devices()
                 if not devices:
