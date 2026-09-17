@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import inspect
 import re
+from html import unescape
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -63,7 +64,7 @@ from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     import threading
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from saneless.checks import CheckContext
     from saneless.web.refresher import CheckRefresher
@@ -77,6 +78,7 @@ PAUSED_PREFIX = "Paused during scan — "
 # match rather than against the whole response, so "the page contains
 # hx-trigger somewhere" can never pass for "the strip polls".
 _CHECKS_BODY = re.compile(r'<div id="checks-body"(?P<attrs>[^>]*)>', re.DOTALL)
+_HX_GET = re.compile(r'hx-get="(?P<url>[^"]+)"')
 _CHECK_ROW = re.compile(r'<li class="check-row">(?P<row>.*?)</li>', re.DOTALL)
 _CHECK_META = re.compile(r'<p class="check-meta">(?P<text>.*?)</p>', re.DOTALL)
 
@@ -443,6 +445,66 @@ def _body_attrs(markup: str) -> str:
     return match.group("attrs")
 
 
+# How far a poll chain is followed before it is called unbounded.  Comfortably
+# past any cap the strip could sanely carry, so a chain that reaches this many
+# links has not been capped, it has been left running.
+_POLL_CHAIN_LIMIT = 60
+
+
+def _poll_target(markup: str) -> str | None:
+    """
+    Return the URL this body's poll would request next, or ``None`` if it has none.
+
+    Reads the rendered attributes rather than the template source, so a poll
+    that a comment describes but the markup does not emit cannot satisfy it.
+
+    Args:
+        markup: A rendered response carrying exactly one ``#checks-body``.
+
+    Returns:
+        The ``hx-get`` URL, unescaped, or ``None`` when no trigger is emitted.
+
+    """
+    attrs = _body_attrs(markup)
+    if "hx-trigger" not in attrs:
+        return None
+    match = _HX_GET.search(attrs)
+    assert match is not None, attrs
+    return unescape(match.group("url"))
+
+
+def _follow_the_poll(client: TestClient, limit: int) -> list[str]:
+    """
+    Walk the cold-start poll from one body to the next, the way a browser does.
+
+    Each response names the URL the next request goes to, so following the
+    chain is the only faithful way to ask "how many times can this strip be
+    made to ask".  Re-requesting the bare route would answer a different
+    question: the route is stateless, so a bare request is always the *first*
+    link of a fresh chain and would look unbounded forever.
+
+    Args:
+        client: The client to request through.
+        limit: The most links to follow before giving up on the chain ending.
+
+    Returns:
+        The URLs requested, in order.  Shorter than ``limit`` only if a
+        response carried no trigger, which is the chain ending on its own.
+
+    """
+    requested: list[str] = []
+    url = "/api/checks"
+    while len(requested) < limit:
+        requested.append(url)
+        response = client.get(url)
+        assert response.status_code == 200, (url, response.status_code)
+        following = _poll_target(response.text)
+        if following is None:
+            break
+        url = following
+    return requested
+
+
 class TestNoProbeInARequest:
     """D-04: rendering reads the cache; only Refresh is allowed to probe."""
 
@@ -544,6 +606,47 @@ class TestColdStart:
         """A warm page load carries no steady-state poll either (T-30-48)."""
         _warm_the_cache(client)
         assert "hx-trigger" not in _body_attrs(client.get("/").text)
+
+
+class TestColdStartPollChain:
+    """
+    IN-07: how many times a cold strip can be made to ask (the before-state).
+
+    ``TestColdStart`` above asserts that *a* cold body polls and that *a* warm
+    body does not.  Neither says anything about the case IN-07 is about: a
+    cache that is never filled, where the only terminating condition the strip
+    has can never fire.  These follow the chain instead of looking at one link
+    of it, which is what makes "does this ever stop" a question the suite can
+    answer.
+    """
+
+    def test_the_cold_poll_chain_does_not_end_on_its_own(
+        self, client: TestClient, record_property: Callable[[str, object], None]
+    ) -> None:
+        """
+        Followed link by link, the cold poll never hands back a trigger-less body.
+
+        The measured length is recorded rather than asserted against a chosen
+        number, because the number this test reports is not a design decision
+        -- it is the limit the loop gave up at.
+        """
+        followed = _follow_the_poll(client, _POLL_CHAIN_LIMIT)
+        record_property("cold_poll_chain_length", len(followed))
+        record_property("cold_poll_chain_limit", _POLL_CHAIN_LIMIT)
+        assert len(followed) == _POLL_CHAIN_LIMIT, len(followed)
+
+    def test_results_end_the_poll_chain_at_its_first_link(
+        self, client: TestClient
+    ) -> None:
+        """
+        A cache with results ends the chain immediately, which is D-06 unchanged.
+
+        Stated as a chain rather than as one attribute so that it stays the
+        *primary* terminating condition: whatever else is added, results
+        arriving must still stop the poll on the very next response.
+        """
+        _warm_the_cache(client)
+        assert _follow_the_poll(client, _POLL_CHAIN_LIMIT) == ["/api/checks"]
 
 
 class TestRefreshButton:
