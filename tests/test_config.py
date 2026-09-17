@@ -28,6 +28,7 @@ from saneless.config import (
     WebConfig,
     is_placeholder_token,
     load_settings,
+    profile_storage_for_loaded,
     resolve_job_title,
     validate_settings_dirs,
     warn_on_legacy_duplex_sources,
@@ -39,7 +40,7 @@ from saneless.exceptions import (
     SanelessError,
     ScanError,
 )
-from saneless.vocabulary import TITLE_MAX_LENGTH, local_time
+from saneless.vocabulary import TITLE_MAX_LENGTH, ProfileStorage, local_time
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -2404,3 +2405,87 @@ class TestEverySectionRendersUnknownKeys:
         ]
         assert len(matching) == 1
         assert "valid keys: " in matching[0]
+
+
+class TestProfileStorageForLoaded:
+    """
+    ``profile_storage_for_loaded`` is the one rule for "nothing was written".
+
+    CR-01 was this rule written twice -- spelled out in ``saneless doctor`` and
+    left out by omission in ``ScanWorker`` -- with only one copy correct, so the
+    web status strip printed a permanent amber Profiles row contradicting what
+    ``doctor`` printed for the very same appliance. D-02 promises both surfaces
+    report the same checks in the same words, so there may be exactly one
+    derivation and both must call it.
+    """
+
+    def test_a_loaded_config_file_means_persisted(self, tmp_path: Path) -> None:
+        """Settings that came from a file have a file to have come from."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text("# loaded by --config\n")
+        settings = Settings()
+        settings._config_path = config_file
+
+        assert profile_storage_for_loaded(settings) is ProfileStorage.PERSISTED
+
+    def test_no_loaded_config_file_means_in_memory(self) -> None:
+        """Defaults and environment variables only: there is nothing to save to."""
+        assert (
+            profile_storage_for_loaded(Settings())
+            is ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
+        )
+
+    @pytest.mark.parametrize("filename", ["saneless.toml", None])
+    def test_it_never_reports_the_unwritable_member(
+        self, tmp_path: Path, filename: str | None
+    ) -> None:
+        """
+        No write was attempted, so the refused-write outcome is unreachable.
+
+        ``IN_MEMORY_UNWRITABLE`` is what the *worker* records when its one
+        startup persist attempt was refused. A caller that attempted no write
+        has no such outcome and must not invent one by probing: Phase 27 D-09's
+        motivating failure is EBUSY on a single-file bind mount, where the
+        directory is writable and only the rename fails.
+
+        Args:
+            tmp_path: pytest's per-test directory.
+            filename: The config file to record, or None for no loaded file.
+
+        """
+        settings = Settings()
+        if filename is not None:
+            settings._config_path = tmp_path / filename
+
+        assert profile_storage_for_loaded(settings) is not (
+            ProfileStorage.IN_MEMORY_UNWRITABLE
+        )
+
+    def test_a_config_path_that_does_not_exist_is_still_persisted(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The question is about the loaded settings, not about the disk.
+
+        Reaching for the filesystem here would make the answer depend on
+        whatever happened to the file after it was read, which is a different
+        question from the one the Profiles row asks.
+        """
+        missing = tmp_path / "gone.toml"
+        settings = Settings()
+        settings._config_path = missing
+
+        assert not missing.exists()
+        assert profile_storage_for_loaded(settings) is ProfileStorage.PERSISTED
+
+    def test_it_is_pure_and_touches_no_filesystem(self, tmp_path: Path) -> None:
+        """Called twice with the same settings it gives the same answer twice."""
+        missing = tmp_path / "gone.toml"
+        settings = Settings()
+        settings._config_path = missing
+
+        first = profile_storage_for_loaded(settings)
+        second = profile_storage_for_loaded(settings)
+
+        assert first is second
+        assert list(tmp_path.iterdir()) == []
