@@ -146,7 +146,9 @@ Re-runs every check immediately, ignoring the cache, and returns the refreshed s
 
 **Response:** HTML partial (the strip body, for `outerHTML` swap).
 
-During a scan, the checks that would touch the scanner are skipped -- an explicit click does not get to interrupt a scan in progress -- and the Scanner row keeps its "not checked while a scan is running" message. That message appears only while a scan really is in progress: the decision is taken from the job the scan worker reports it is running, not from whether some other health check happened to be busy at the same moment, so it cannot show up beside a last-checked time on an idle appliance.
+During a scan, the checks that would touch the scanner are skipped -- an explicit click does not get to interrupt a scan in progress -- and the Scanner row keeps its "not checked while a scan is running" message. That decision is taken from the job the scan worker reports it is running, and not from whether some other health check happened to be busy at the same moment: when another check is holding the scanner briefly -- the capability read saneless does at start-up, for instance -- the row says the scanner was busy and names no scan at all.
+
+One case remains where that message outlives the scan that earned it. A skipped row stored *during* a real scan stays on the strip until the next probe replaces it, so for up to one refresh interval after a scan finishes the strip can still say a scan is running. Unlike a row produced by contention, that one was true when it was written; it is stale rather than wrong, and pressing `Check again` replaces it at once.
 
 Simultaneous refreshes are collapsed into one. A request that arrives while a refresh is already under way -- another click, or the background refresh the page keeps warm -- re-renders the strip as it currently stands instead of running every check a second time. The answer the in-flight refresh is about to produce is the same answer, seconds away, and repeating the work would mean a second request to paperless-ngx and a second pair of write tests for the sake of it.
 
