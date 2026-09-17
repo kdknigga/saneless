@@ -217,7 +217,31 @@ class CheckRefresher:
         while not self._stopping.wait(TICK_SECONDS):
             self._tick()
 
-    def probe_now(self) -> None:
+    @property
+    def probe_in_flight(self) -> bool:
+        """
+        Say whether some caller owns the probe right now.
+
+        This is a *read* and never an acquire.  A render is not allowed to
+        contend for a lock a probe holds -- the probe can be inside a
+        ``getaddrinfo`` that Linux retries for two minutes, and a request
+        thread parked behind it is a page that never arrives.  It is the same
+        rule ``_checks_context`` already applies to the scanner gate, where it
+        reads the worker's job record rather than trying the gate.
+
+        The answer is a snapshot that may be false the instant it is returned,
+        and that is fine, because the only thing it decides is whether the page
+        asks once more.  A stale ``True`` costs one extra cache read; a stale
+        ``False`` costs nothing, because the probe that just finished has
+        already stored and the next body carries its results.
+
+        Returns:
+            True while a probe holds the single-flight lock.
+
+        """
+        return self._probe_lock.locked()
+
+    def probe_now(self) -> bool:
         """
         Probe at once, whatever the TTL and the watch window say (D-09).
 
@@ -233,10 +257,21 @@ class CheckRefresher:
         now go through :meth:`_probe_and_store`; neither this nor ``_tick``
         calls the other, which is the discipline ``job.py``'s
         ``TestLockDiscipline`` enforces for public-to-public self-calls.
-        """
-        self._probe_and_store()
 
-    def _probe_and_store(self) -> None:
+        Returns:
+            True when this call took the probe and ran it, and False when it
+            collapsed into one already in flight.  ``False`` tells the one
+            caller that reads it -- ``routes.refresh_checks`` -- three things:
+            another checker owns the probe, that checker's ``store`` is
+            imminent, and this call did nothing at all.  The handler owes the
+            page a way to collect the imminent answer, and owes the clicker
+            their manual-refresh claim back, because a collapse cost no
+            Paperless request, no saned dial and no filesystem write (WR-03).
+
+        """
+        return self._probe_and_store()
+
+    def _probe_and_store(self) -> bool:
         """
         Run one probe and store what it found, or let an in-flight one do it.
 
@@ -266,9 +301,17 @@ class CheckRefresher:
         a probe that could not be taken must not blank a strip that was correct
         thirty seconds ago.  ``run_checks`` catches its own per-check failures,
         so reaching this handler means the registry itself broke.
+
+        Returns:
+            "Did this call probe", which is deliberately *not* "did this call
+            store".  The ``except`` arm probed and stored nothing, and it
+            returns True: a caller that read a raising probe as a collapse
+            would ask the page to wait for a result that is never coming.  The
+            one False is the early return, where the lock was already held.
+
         """
         if not self._probe_lock.acquire(blocking=False):
-            return
+            return False
         try:
             context = replace(self.build_context(), skip_scanner=self._scan_active())
             results = run_checks(context, scanner_gate=self._scanner_gate())
@@ -280,6 +323,7 @@ class CheckRefresher:
             self._cache.store(results)
         finally:
             self._probe_lock.release()
+        return True
 
     def _tick(self) -> None:
         """
@@ -301,4 +345,7 @@ class CheckRefresher:
             return
         if self._cache.is_fresh():
             return
-        self._probe_and_store()
+        # The boolean is dropped deliberately.  It exists for the request
+        # handler, which owes an answer to a page; the thread has nobody
+        # waiting on this tick and will come round again on the next one.
+        _ = self._probe_and_store()
