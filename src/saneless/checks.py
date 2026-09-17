@@ -31,6 +31,7 @@ import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from string import ascii_letters, digits
 from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx
@@ -88,6 +89,12 @@ PROBE_READ_SECONDS: Final = 5.0
 # ``/etc/services`` agrees, which settles RESEARCH assumption A1.  Read at call
 # time.
 SANED_PORT: Final = 6566
+
+# Every character a segment of ``scanner.host`` may contain and still be read
+# as a host name.  Deliberately narrower than any hostname RFC: this is not a
+# validator, it is the smallest set that tells a name apart from the halves an
+# IPv6 literal falls into when it is split on ``:``.
+_HOST_NAME_CHARACTERS: Final = frozenset(ascii_letters + digits + "-.")
 
 # The cold-start row, before any check has run (D-06).  It lives here rather
 # than in the template for the same reason the state glyphs do: templates own
@@ -417,6 +424,39 @@ def worst_state(results: Iterable[CheckResult]) -> CheckState:
     return worst
 
 
+def _looks_like_a_host_name(segment: str) -> bool:
+    """
+    Say whether one colon-separated segment could be a host name at all.
+
+    This is deliberately not a hostname RFC implementation and must not grow
+    into one.  It answers a single narrower question -- "could sane-net have
+    meant this as a name?" -- and the only inputs it has to tell apart are the
+    names an operator types and the fragments an IPv6 literal falls into when
+    it is split on ``:``.  ``[fe80`` and ``1]`` fail on their brackets, and the
+    empty string fails on being empty, which is all that is needed.
+
+    Being narrow is the safe direction.  A false "no" costs the pre-probe's
+    latency saving and nothing else, because ``_saned_hosts`` then returns no
+    entries and the scanner check falls through to ``get_devices()``.  A false
+    "yes" is what WR-01 was: three junk dials and, through the pre-probe's
+    short circuit, a wrong verdict.
+
+    Args:
+        segment: One stripped segment of the ``scanner.host`` setting.
+
+    Returns:
+        True when the segment is non-empty, made only of ASCII letters,
+        digits, hyphens and dots, and neither starts nor ends with a hyphen or
+        a dot.
+
+    """
+    if not segment:
+        return False
+    if segment[0] in "-." or segment[-1] in "-.":
+        return False
+    return set(segment) <= _HOST_NAME_CHARACTERS
+
+
 def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     """
     Parse ``scanner.host`` into the ``(host, port)`` pairs saned would be dialled on.
@@ -440,17 +480,39 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     0..65535, so accepting ``host:99999`` as a port would put an exception the
     probe does not catch inside the probe.
 
+    **The refusal.**  With more than one colon present, the setting is refused
+    outright -- no entries, no probe -- unless every segment could be a host
+    name and no blank segment sits anywhere but the first or last position.
+    An IPv6 literal is exactly the input where "colon-separated list of hosts"
+    and "one address" are indistinguishable: ``fe80::1`` split on ``:`` used to
+    read as host ``fe80`` on port 1, and ``[fe80::1]:6566`` as three names no
+    resolver can answer (WR-01).  The stray colon at either edge stays
+    tolerated, because ``: host-a :`` has only ever meant one host.
+
+    Returning ``()`` is not a silent failure; it is the fallback this module
+    documents everywhere else.  No entries means no probe, which means the
+    scanner check calls ``get_devices()`` and behaves exactly as it did before
+    the probe existed.  An operator who typed an IPv6 literal loses the
+    pre-probe's latency saving and never gets a wrong verdict, which is the
+    trade the whole module is built on.
+
     Args:
         host_setting: The configured ``scanner.host``, possibly empty.
 
     Returns:
         One ``(host, port)`` pair per entry, in the configured order.  Empty
-        when nothing is configured or every segment is blank.
+        when nothing is configured, every segment is blank, or the setting is
+        one this module refuses to guess at.
 
     """
     segments = [segment.strip() for segment in host_setting.split(":")]
     present = [segment for segment in segments if segment]
     if not present:
+        return ()
+    if len(segments) > 2 and (
+        "" in segments[1:-1]
+        or not all(_looks_like_a_host_name(segment) for segment in present)
+    ):
         return ()
     if len(present) == 2:
         host, maybe_port = present
