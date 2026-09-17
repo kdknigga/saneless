@@ -643,8 +643,8 @@ Plans:
 
 **Gap wave 5**
 
-- [ ] 30-28-PLAN.md — R2-CR-01/R2-WR-01/R2-IN-01: the saned probe tries every resolved address under one deadline; the parser refuses IPv6 literals and never dials a number
-- [ ] 30-29-PLAN.md — R2-WR-03/R2-IN-04: a collapsed Check again click still delivers its answer and keeps its claim; the poll's error path is measured, not fixed
+- [x] 30-28-PLAN.md — R2-CR-01/R2-WR-01/R2-IN-01: the saned probe tries every resolved address under one deadline; the parser refuses IPv6 literals and never dials a number
+- [x] 30-29-PLAN.md — R2-WR-03/R2-IN-04: a collapsed Check again click still delivers its answer and keeps its claim; the poll's error path is measured, not fixed
 
 **Gap wave 6** *(blocked on gap wave 5)*
 
@@ -711,7 +711,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 27/27 | Complete   | 2026-09-17 |
+| 30. Appliance Layer | 29/30 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
