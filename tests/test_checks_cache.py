@@ -346,3 +346,66 @@ class TestClaimManualRefresh:
             assert not thread.is_alive()
 
         assert sorted(granted) == [False, True]
+
+
+class TestReleaseManualClaim:
+    """WR-03: a click whose probe collapsed must not spend the floor."""
+
+    def test_a_released_claim_is_granted_again_at_once(self) -> None:
+        """
+        The floor exists to bound probe traffic, and a collapse made none.
+
+        ``probe_now`` returning False means another checker already owned the
+        probe, so this call issued no Paperless request, no saned dial and no
+        filesystem write.  Charging it the interval would refuse the very next
+        click for no traffic saved -- which is the second consequence WR-03
+        named, the button appearing to do nothing twice in a row.
+        """
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh() is True
+        cache.release_manual_claim()
+        assert cache.claim_manual_refresh() is True
+
+    def test_releasing_a_claim_that_was_never_granted_is_a_no_op(self) -> None:
+        """A release on a cold appliance must not raise or open anything new."""
+        cache = CheckCache(clock=_FakeClock())
+        cache.release_manual_claim()
+        assert cache.claim_manual_refresh() is True
+
+    def test_releasing_twice_leaves_the_floor_where_one_release_left_it(self) -> None:
+        """The clear is idempotent: a doubled release is not a doubled grant."""
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh() is True
+        cache.release_manual_claim()
+        cache.release_manual_claim()
+        assert cache.claim_manual_refresh() is True
+        assert cache.claim_manual_refresh() is False
+
+    def test_a_release_then_a_grant_leaves_the_new_grants_floor_standing(self) -> None:
+        """
+        T-30-29-01: the release gives a claim back, it does not disable the floor.
+
+        Grant, release, grant: the second grant stamps like any other, so a
+        third call inside the interval is still refused and a scripted loop
+        that does get a probe granted still pays for it.
+        """
+        clock = _FakeClock(start=100.0)
+        cache = CheckCache(clock=clock)
+        assert cache.claim_manual_refresh() is True
+        cache.release_manual_claim()
+        assert cache.claim_manual_refresh() is True
+        assert cache.claim_manual_refresh() is False
+        clock.advance(2.1)
+        assert cache.claim_manual_refresh() is True
+
+    def test_a_release_stores_nothing(self) -> None:
+        """Giving the floor back is not a record of results, as a claim is not."""
+        cache = CheckCache(clock=_FakeClock())
+        assert cache.claim_manual_refresh() is True
+        cache.release_manual_claim()
+        entry = cache.current()
+        assert entry.results is None
+        assert entry.checked_at is None
+        assert cache.is_fresh() is False

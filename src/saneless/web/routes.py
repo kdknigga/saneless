@@ -278,14 +278,32 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
 
     ``poll_attempt`` is the second.  It is the number the *next* request should
     carry, or ``None`` when there is to be no next request -- either because
-    results have arrived, which is D-06's ending and still the one that matters,
-    or because ``POLL_ATTEMPT_CAP`` attempts have gone by without any, which is
-    the ending IN-07 needed.  The template emits its request attributes only
+    there is nothing left to wait for, which is D-06's ending and still the one
+    that matters, or because ``POLL_ATTEMPT_CAP`` attempts have gone by, which
+    is the ending IN-07 needed.  The template emits its request attributes only
     when this is set, so "should the browser ask again" is decided here and
     never in the markup.
 
-    At the cap the freshness line is replaced rather than augmented: there is no
-    freshness to report, because nothing has ever been checked.
+    "Nothing left to wait for" is two facts, not one, and the second is WR-03's.
+    An empty cache is the cold start.  A probe in flight is the case where
+    results *do* exist but the answer on the page is about to be superseded: the
+    probe has not stored yet, so this render is of the pre-probe entry, and with
+    only the first fact nothing on the page was ever going to fetch the result
+    the probe lands a second later.  The strip was refetched by another click,
+    the terminal-state reload, or a page load -- so the Check again button could
+    visibly do nothing.  What the disjunct costs: a render landing during a
+    background probe issues a small, capped number of extra cache reads before
+    it settles.  Each is a cache read and never a probe, and the count is
+    bounded by ``POLL_ATTEMPT_CAP`` exactly as the cold start's is (T-30-29-02).
+    ``probe_in_flight`` is a ``locked()`` read and never an acquire, so no
+    request thread can be parked behind the probe it is asking about.
+
+    ``gave_up`` deliberately does *not* take the new fact into account.  Its
+    line says the checks have not run yet, which would be a lie printed beside
+    five rows that did run, so a settling poll that runs out of attempts leaves
+    the normal last-checked line alone.  At the cap on a cold cache the
+    freshness line is replaced rather than augmented: there is no freshness to
+    report, because nothing has ever been checked.
 
     Args:
         state: The application state holding the cache and the worker.
@@ -303,7 +321,11 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     # the gate would mean acquiring it, and a render is not allowed to contend
     # for the lock a live scan holds.
     scan_active = state.worker.current_job_id is not None
+    # Read once, so the two decisions below cannot disagree about it.  This is
+    # `Lock.locked()`: an observation, never an acquire (T-30-29-03).
+    probe_in_flight = state.refresher.probe_in_flight
     gave_up = cached.results is None and attempt >= POLL_ATTEMPT_CAP
+    keep_asking = cached.results is None or probe_in_flight
     return {
         "checks": cached.results,
         "checking_rows": _CHECKING_ROWS,
@@ -314,7 +336,7 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
         ),
         "scan_active": scan_active,
         "poll_attempt": (
-            None if cached.results is not None or gave_up else attempt + 1
+            attempt + 1 if keep_asking and attempt < POLL_ATTEMPT_CAP else None
         ),
     }
 
@@ -1305,6 +1327,26 @@ def refresh_checks(request: Request) -> Response:
     would cost a Paperless request and two filesystem writes to produce it
     twice.
 
+    The collapse used to cost the clicker three things, and WR-03 named each.
+    The strip rendered was the cache *as it stood* -- the pre-probe entry,
+    because the in-flight probe had not stored yet.  Because results already
+    existed the body carried no trigger, so nothing on the page was ever going
+    to pick up the result that probe landed a second later; the button could
+    visibly do nothing.  And the claim was stamped before the collapse was
+    discovered, so the next click inside two seconds was refused too: nothing,
+    twice in a row.  All three close here.  ``probe_now`` now reports whether
+    it probed, so a collapse is a fact rather than a guess; on a collapse the
+    claim goes back, because a collapse issued no Paperless request, no saned
+    dial and no filesystem write and so bought none of the traffic the floor
+    exists to bound; and ``_checks_context`` sees the same lock still held and
+    emits a trigger, so the page collects the answer on its own.
+
+    There is one render path and it is the last statement.  The context decides
+    the trigger from ``probe_in_flight``, which is still ``True`` on the
+    collapse branch -- the other checker has not released yet -- so the one
+    render covers both outcomes, and there is no second response and no
+    "poll once" flag for a later reader to keep in step with the template.
+
     During a scan it re-runs only the checks that do not touch the scanner, and
     that decision comes from the worker's own record of a job in flight rather
     than from a failed attempt on a lock.  An explicit click does not get to
@@ -1339,8 +1381,8 @@ def refresh_checks(request: Request) -> Response:
     """
     state = request.app.state
     state.refresher.note_watcher()
-    if state.checks.claim_manual_refresh():
-        state.refresher.probe_now()
+    if state.checks.claim_manual_refresh() and not state.refresher.probe_now():
+        state.checks.release_manual_claim()
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",
