@@ -74,11 +74,16 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-# How long a saned pre-probe waits for a TCP handshake before giving up.  Two
-# seconds is the whole of success criterion 2 on the SANE side: without it an
-# unplugged sane-net host costs roughly 127 s inside a blocking C call, because
-# Linux retries a SYN six times by default.  Read at call time, so tests can
-# shorten it.
+# How long a saned pre-probe waits for a TCP handshake before giving up.  This
+# bounds one handshake per configured host, and nothing else.  Name resolution
+# runs before it and is not inside it -- `getaddrinfo` takes no timeout, so an
+# unreachable resolver costs whatever `resolv.conf` says -- and with N
+# configured hosts the probe's worst case is N times (resolution plus this
+# budget).  The bound still matters for the reason it always did: what it
+# replaces is `get_devices()`, which has no timeout at any layer and costs
+# roughly 127 s for a silently unreachable host, because Linux retries a SYN
+# six times by default, inside a blocking C call nothing can interrupt.  Read
+# at call time, so tests can shorten it.
 PROBE_CONNECT_SECONDS: Final = 2.0
 
 # How long the Paperless probe waits for a response body once connected.  The
@@ -506,10 +511,13 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     that does not resolve and then falls through to the behaviour that existed
     before this module.
 
-    The range check is not cosmetic: ``socket.create_connection`` raises
-    ``OverflowError`` -- which is not an ``OSError`` -- for a port outside
-    0..65535, so accepting ``host:99999`` as a port would put an exception the
-    probe does not catch inside the probe.
+    The range check is not cosmetic, and it is not a tidiness rule either.  A
+    port outside 0..65535 does not fail loudly on the way to a socket: passed
+    to ``connect`` it raises ``OverflowError``, which is not an ``OSError`` and
+    so is not caught by the probe, and passed to ``getaddrinfo`` it is
+    truncated modulo 65536 instead, which means ``host:99999`` would quietly
+    dial port 34463 -- a real probe of an address nobody configured.  Reading
+    such a segment as a host name avoids both.
 
     **The refusal.**  With more than one colon present, the setting is refused
     outright -- no entries, no probe -- unless every segment could be a host
@@ -569,6 +577,24 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     The port is 6566, IANA's ``sane-port``, verified in ``/etc/services``.
 
+    **What the budget covers.**  One handshake, to one address.  The name is
+    resolved once and only the first result is dialled, because dialling every
+    resolved address would multiply the budget by a number nothing here
+    controls -- a dual-stack scanner host resolves to three, so the documented
+    two seconds silently became six (WR-02).  One address is enough for the
+    question being asked, which is whether the host is answering at all, and
+    the answer for a host that is switched off is the same on every address it
+    has.
+
+    Resolution itself is outside the budget and is left that way deliberately.
+    ``getaddrinfo`` takes no timeout, so bounding it means running it on a
+    thread and abandoning the thread when the deadline passes.  That is the
+    same trade plan 30-21's decision record refuses for the enumeration: a
+    thread parked in a C call that nothing can interrupt is worse than a slow
+    answer, because it is still in there after the caller has moved on.  An
+    unreachable resolver therefore costs whatever ``resolv.conf`` says, and
+    that is stated rather than claimed away.
+
     **Failure policy.**  This returns ``False`` for every ``OSError`` --
     refused, timed out, unresolvable, no route -- and raises nothing.  It is
     the *caller* that decides what a ``False`` means, and the caller never
@@ -592,7 +618,12 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
 
     """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        family, socket_type, protocol, _canonical_name, address = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM
+        )[0]
+        with socket.socket(family, socket_type, protocol) as probe:
+            probe.settimeout(timeout)
+            probe.connect(address)
             return True
     except OSError as exc:
         # Logged at DEBUG, not WARNING: a closed scanner port is the ordinary
