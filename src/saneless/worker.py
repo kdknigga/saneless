@@ -20,7 +20,7 @@ from .auto_profiles import (
     is_bare_default,
     write_profiles_to_config,
 )
-from .config import config_search_paths
+from .config import config_search_paths, profile_storage_for_loaded
 from .exceptions import ConfigError, ScanCancelledError
 from .job import JobResult
 from .pipeline import (
@@ -408,6 +408,10 @@ class ScanWorker:
         #
         # The default is an in-memory member, not PERSISTED: before any attempt
         # nothing is on disk, and that is the one answer that could mislead.
+        #
+        # Written on the worker thread, read on request threads, and no lock:
+        # see the profile_storage property's docstring for why that is a
+        # decision rather than an omission.
         self._profile_storage: ProfileStorage = ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
         # Loop-level failures in a row.  Touched only by the worker thread.
         self._consecutive_loop_failures = 0
@@ -764,12 +768,25 @@ class ScanWorker:
         investigate) and ``IN_MEMORY_UNWRITABLE`` (saneless has one and could
         not write it -- worth looking at).
 
-        A worker whose startup generation never ran, because the settings were
-        not the bare default, reports the no-config-file value: nothing was
-        written, which is exactly what that member says.
+        A worker whose startup generation never ran -- because the settings
+        were not the bare default, or because the scanner could not be read --
+        attempted no write, so it reports what
+        ``config.profile_storage_for_loaded`` says about the settings it
+        loaded.  That is the same function ``saneless doctor`` calls, which is
+        what keeps the strip and the command on one Profiles row (D-02).
+
+        Thread discipline, stated because the silence would otherwise read as
+        an oversight: the attribute behind this property is rebound only on the
+        worker thread, only during the single startup generation step, and is
+        then read unchanged by request threads for the life of the process.  A
+        single enum rebind is atomic under the GIL, so there is no torn read to
+        protect against, and it is deliberately left unlocked.  Its sibling
+        ``front_pages`` has a dedicated lock for the opposite reason: that
+        value is rewritten repeatedly while a job runs.
 
         Returns:
-            The recorded outcome of the single startup persist attempt.
+            The recorded outcome of the single startup persist attempt, or the
+            loaded-settings fact when no attempt was made.
 
         """
         return self._profile_storage
@@ -887,9 +904,17 @@ class ScanWorker:
             bare = is_bare_default(self._settings)
             loaded = self._settings.profiles
         if not bare:
+            # Nothing was generated, so nothing was persisted -- but the
+            # profiles in hand came from the loaded file, and the Profiles row
+            # must not tell a household member they are in memory and lost on
+            # restart when they are in the file they just edited (CR-01).
+            self._profile_storage = profile_storage_for_loaded(self._settings)
             return
         profiles = self._read_generated_profiles()
         if profiles is None:
+            # A SANE failure during generation leaves the loaded profiles in
+            # place; they are no more in-memory than they were a moment ago.
+            self._profile_storage = profile_storage_for_loaded(self._settings)
             return
         result = self._persist_generated_profiles(profiles)
         # Re-checked under the lock: only the exact bare default is ever
