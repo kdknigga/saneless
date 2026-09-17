@@ -2594,3 +2594,162 @@ class TestProfileDefaultsFollowTheFormShape:
 
             assert response.status_code == 200
             assert _newest_job(client).title.startswith("Scan ")
+
+
+# The two collection endpoints a page load can reach, as paperless.py spells
+# them.  Counting by path is what separates "no tag request" from "no request
+# at all", which are different claims and fail differently.
+_TAGS_ENDPOINT = "/api/tags/"
+_CORRESPONDENTS_ENDPOINT = "/api/correspondents/"
+
+
+class _MetadataRequestCounter:
+    """Records every paperless-ngx request a request under test issues."""
+
+    def __init__(self) -> None:
+        """Start with nothing recorded."""
+        self.paths: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """
+        Record the request's path and answer with an empty collection.
+
+        Args:
+            request: The request the client issued.
+
+        Returns:
+            A 200 carrying a paginated response with no results, so a fetch
+            that does happen succeeds and the count is the only difference.
+
+        """
+        self.paths.append(request.url.path)
+        return httpx.Response(200, json={"count": 0, "results": []})
+
+    def count(self, path: str) -> int:
+        """
+        Say how many requests reached one endpoint.
+
+        Args:
+            path: The endpoint path to count.
+
+        Returns:
+            The number of recorded requests for that path.
+
+        """
+        return self.paths.count(path)
+
+
+def _counted_app(
+    tmp_path: Path,
+    *,
+    show_tags: bool = True,
+    show_correspondent: bool = True,
+) -> tuple[FastAPI, _MetadataRequestCounter]:
+    """
+    Build a form-shaped app whose Paperless traffic is counted, not stubbed.
+
+    The stub client ``_simple_form_app`` installs answers without going near
+    the transport, which is exactly what makes it useless for counting, so the
+    client is replaced here by a real one over a mock transport.  The metadata
+    cache is untouched and therefore cold: every fetch the route decides to
+    make shows up.
+
+    Args:
+        tmp_path: Where the app writes its database and files.
+        show_tags: Whether the Tags fieldset is rendered at all.
+        show_correspondent: Whether the Correspondent control is rendered.
+
+    Returns:
+        The app and the counter its Paperless client reports to.
+
+    """
+    app = _simple_form_app(
+        tmp_path, show_tags=show_tags, show_correspondent=show_correspondent
+    )
+    counter = _MetadataRequestCounter()
+    credential = "a-real-looking-token"
+    app.state.paperless = PaperlessClient(
+        url="http://localhost:8000",
+        token=credential,
+        _transport=httpx.MockTransport(counter),
+    )
+    return app, counter
+
+
+class TestHiddenControlsCostNoMetadataFetch:
+    """
+    IN-01: an appliance does not pay for data its markup leaves out.
+
+    On a cold metadata cache a page load costs one paperless-ngx round trip per
+    optional control, and the flags the template branches on are the same flags
+    that decide whether that data can ever be seen.  With both controls off the
+    page is the profile, the title and the Scan button, and it should reach
+    paperless-ngx not at all.
+    """
+
+    def test_a_hidden_tag_control_costs_no_tag_request(self, tmp_path: Path) -> None:
+        """A cold cache and no Tags fieldset means no ``/api/tags/`` fetch."""
+        app, counter = _counted_app(tmp_path, show_tags=False)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.count(_TAGS_ENDPOINT) == 0
+
+    def test_a_hidden_correspondent_control_costs_no_fetch(
+        self, tmp_path: Path
+    ) -> None:
+        """The correspondent half of the same claim."""
+        app, counter = _counted_app(tmp_path, show_correspondent=False)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.count(_CORRESPONDENTS_ENDPOINT) == 0
+
+    def test_the_shortest_form_costs_no_paperless_request_at_all(
+        self, tmp_path: Path
+    ) -> None:
+        """Both controls off: the page load reaches paperless-ngx never."""
+        app, counter = _counted_app(tmp_path, show_tags=False, show_correspondent=False)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.paths == []
+
+    def test_the_full_form_still_fetches_both(self, tmp_path: Path) -> None:
+        """No fetch is lost: the default shape costs exactly what it did."""
+        app, counter = _counted_app(tmp_path)
+        with TestClient(app) as client:
+            assert client.get("/").status_code == 200
+
+        assert counter.count(_TAGS_ENDPOINT) == 1
+        assert counter.count(_CORRESPONDENTS_ENDPOINT) == 1
+
+    def test_a_hidden_tag_control_still_renders_a_whole_page(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The guarded context is complete enough to render, not just to type.
+
+        ``index`` spreads the tag context into its own, so a key the guard
+        forgot would be an ``UndefinedError`` or a silently empty branch on a
+        page that has nothing to do with tags.  Rendering is the assertion.
+        """
+        app, _ = _counted_app(tmp_path, show_tags=False)
+        with TestClient(app) as client:
+            page = client.get("/").text
+
+        assert 'id="tags-list"' not in page
+        assert 'id="scan-btn"' in page
+        assert 'id="correspondent-select"' in page
+
+    def test_the_tag_route_answers_an_empty_list_when_the_control_is_off(
+        self, tmp_path: Path
+    ) -> None:
+        """``/api/tags`` is reachable with the control off and costs nothing."""
+        app, counter = _counted_app(tmp_path, show_tags=False)
+        with TestClient(app) as client:
+            response = client.get("/api/tags")
+
+        assert response.status_code == 200
+        assert 'name="tags"' not in response.text
+        assert counter.count(_TAGS_ENDPOINT) == 0
