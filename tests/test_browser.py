@@ -25,6 +25,7 @@ Requires: pytest-playwright, chromium browser (uv run playwright install chromiu
 
 from __future__ import annotations
 
+import json
 import re
 import socket
 import threading
@@ -86,7 +87,7 @@ from saneless.vocabulary import (
     error_message,
     error_next_step,
 )
-from saneless.web.app import create_app
+from saneless.web.app import TEMPLATE_DIR, create_app
 from saneless.worker import WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend, scan_batch
 
@@ -3161,6 +3162,138 @@ class TestColdStartPollIsBounded:
         expect(page.locator("#checks-body")).not_to_contain_text(CHECKING_MESSAGE)
         expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
         record_property("cold_start_requests_until_results", len(polled))
+
+
+# How long the error-path poll is watched after the failure has been swapped
+# in, in milliseconds. Four and a half of the 2 s intervals the markup names,
+# which is the window the planner's standalone measurement used, so a poll that
+# had survived its own failed request would have fired four more times inside
+# it and been caught.
+_ERROR_POLL_WINDOW_MS = 9000
+
+# The body a forced failure answers with. It carries a different id on purpose:
+# the swap that ends the poll is an outerHTML swap of #checks-body, so "the
+# error body is on the page and #checks-body is not" is the mechanism itself,
+# observed rather than inferred from a request count.
+_CHECKS_ERROR_BODY = '<div id="checks-error">The checks could not be loaded.</div>'
+
+# base.html's htmx-config, captured whole. Single-quoted in the template
+# because its value is JSON, so the group ends at the next apostrophe.
+_HTMX_CONFIG_META = re.compile(
+    r'<meta name="htmx-config"\s+content=\'(?P<json>[^\']+)\'', re.DOTALL
+)
+
+BASE_HTML = TEMPLATE_DIR / "base.html"
+"""The layout whose htmx-config decides what an error response does to the strip."""
+
+
+def _fail_the_checks_poll(page: Page, status: int) -> None:
+    """
+    Answer every ``GET /api/checks`` with ``status``, and nothing else.
+
+    Forced from the browser side rather than by adding a failing route to the
+    application, because the application has to stay exactly as it ships for
+    this measurement to mean anything.
+
+    A page-level handler takes priority over the module's context-level egress
+    gate for the URLs it matches, which ``_record_checks_requests`` explains is
+    normally forbidden here. It is admissible for exactly these requests and no
+    others: they are same-origin requests to the private test server, which is
+    what the gate would have continued anyway, so no egress an assertion would
+    have caught can hide behind this handler. Everything else -- including
+    ``/api/checks/refresh``, which shares the path prefix -- is handed back
+    with ``route.fallback()`` and still meets the gate.
+
+    Args:
+        page: The page whose poll is to fail.
+        status: The HTTP status every poll request is answered with.
+
+    """
+
+    def _handler(route: Route) -> None:
+        request = route.request
+        if request.method != "GET" or "/api/checks/refresh" in request.url:
+            route.fallback()
+            return
+        route.fulfill(status=status, content_type="text/html", body=_CHECKS_ERROR_BODY)
+
+    page.route("**/api/checks*", _handler)
+
+
+@pytest.mark.browser
+class TestPollEndsOnAnErrorResponse:
+    """
+    R2-IN-04, measured: a poll whose endpoint fails ends, and this is why.
+
+    The review reasoned that ``POLL_ATTEMPT_CAP`` cannot bound the poll when
+    ``/api/checks`` answers a non-2xx, because "htmx does not swap on an error
+    response" and the old body therefore keeps its ``every 2s`` for as long as
+    the tab stays open. That is true of htmx's *default* ``responseHandling``
+    and false here. ``base.html`` ships a customised ``htmx-config`` meta whose
+    third rule is ``{"code":"[45]..","swap":true,"error":true}``, so this
+    application swaps 4xx and 5xx: the error response replaces the polling body
+    and takes the trigger with it. The same rule covers the 422 the review
+    posits for a hand-crafted ``attempt``.
+
+    Nothing in the source changes for this finding, and nothing should: there is
+    no defect. These tests measure the property against the application exactly
+    as it ships and leave a guard on the mechanism -- the meta rule below --
+    so the next review round has a number and a named dependency to read rather
+    than an argument to re-run.
+    """
+
+    @pytest.mark.parametrize("status", [500, 422])
+    def test_a_failed_poll_request_replaces_the_strip_and_stops(
+        self,
+        page: Page,
+        cold_strip_server: _BrowserServer,
+        record_property: Callable[[str, object], None],
+        status: int,
+    ) -> None:
+        """
+        One request, then the error body, then stillness for nine seconds.
+
+        ``cold_strip_server`` is the appliance whose cache never fills, so the
+        poll's own terminating conditions cannot fire inside the window and the
+        only thing that can end the chain is the failure itself.
+
+        The stillness is asserted separately from the count, the way
+        ``TestColdStartPollIsBounded`` does it: a poll that had merely paused
+        would have fired four more times inside ``_ERROR_POLL_WINDOW_MS``.
+        """
+        polled = _record_checks_requests(page)
+        _fail_the_checks_poll(page, status)
+        page.goto(cold_strip_server.url)
+
+        expect(page.locator("#checks-error")).to_have_count(1, timeout=_POLL_SETTLE_MS)
+        expect(page.locator("#checks-body")).to_have_count(0)
+        at_swap = len(polled)
+
+        page.wait_for_timeout(_ERROR_POLL_WINDOW_MS)
+        record_property(f"error_poll_requests_{status}", len(polled))
+        record_property("error_poll_window_ms", _ERROR_POLL_WINDOW_MS)
+        assert len(polled) == at_swap, polled[at_swap:]
+        assert len(polled) < POLL_ATTEMPT_CAP, polled
+
+    def test_the_htmx_config_meta_swaps_error_responses(self) -> None:
+        """
+        The rule the two measurements above depend on, asserted on its own.
+
+        The strip's poll has a dependency on a meta tag two files away, and
+        this is the assertion that says so out loud. Flipping this rule back to
+        htmx's default -- ``swap`` false for ``[45]..`` -- would restore
+        exactly the unbounded error-path poll R2-IN-04 described: the polling
+        body would survive its own failed request and keep re-firing its
+        ``every 2s`` for as long as the tab stayed open, with no swap to end
+        the chain and no attempt count able to reach the server.
+        """
+        match = _HTMX_CONFIG_META.search(BASE_HTML.read_text(encoding="utf-8"))
+        assert match is not None
+        handling = json.loads(match.group("json"))["responseHandling"]
+        errors = [rule for rule in handling if rule["code"] == "[45].."]
+        assert len(errors) == 1, handling
+        assert errors[0]["swap"] is True
+        assert errors[0]["error"] is True
 
 
 # The counts UI-SPEC S3 pins, for the three cases that behave differently: a
