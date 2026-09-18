@@ -5,10 +5,15 @@
       should carry, or to none when there is to be no next request -- and there
       are now two ways for that to happen.  Nothing left in flight is the first
       and still the primary one: the body that replaces this one has the answer,
-      carries no trigger, and so ends the poll.  Running out of attempts
-      (checks.POLL_ATTEMPT_CAP) is the second, and it exists because the first
-      one cannot fire at all on an appliance whose refresher thread has died --
-      before it, an abandoned tab asked forever.  That is the in-tree idiom
+      carries no trigger, and so ends the poll.  Running out of attempts is the
+      second, and it exists because the first one cannot fire at all on an
+      appliance whose refresher thread has died -- before it, an abandoned tab
+      asked forever.  There are two attempt bounds and the route picks between
+      them: checks.POLL_ATTEMPT_CAP with nothing in flight, and the larger
+      checks.POLL_PROBE_ATTEMPT_CAP while a probe demonstrably holds the
+      refresher's single-flight lock, because the probe's own worst case is
+      minutes and a chain that ended first never collected it.  That is the
+      in-tree idiom
       (partials/status.html lines 1-6) and it is deliberately NOT HTTP 286,
       which would need a change to the tuned htmx-config meta in base.html.
    2. The strip asks only while something in flight will change the answer, and
@@ -20,8 +25,8 @@
       would ever collect it and Check again could visibly do nothing (WR-03).
       Once both are false the strip is refetched only by Check again, by the
       terminal-state reload, or by a page load.  Every chain of asks is bounded
-      by checks.POLL_ATTEMPT_CAP whichever condition started it, so neither one
-      is a steady-state poll: a permanent poll would keep D-05's lazy refresher
+      by one of the two caps above whichever condition started it, so neither
+      one is a steady-state poll: a permanent poll would keep D-05's lazy refresher
       awake for every abandoned browser tab, which is the exact cost D-05 exists
       to avoid.
 

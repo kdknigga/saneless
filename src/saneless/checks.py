@@ -61,6 +61,8 @@ __all__ = [
     "CHECKING_STATE_LABEL",
     "POLL_ATTEMPT_CAP",
     "POLL_GAVE_UP_LINE",
+    "POLL_PROBE_ATTEMPT_CAP",
+    "POLL_STILL_CHECKING_LINE",
     "PROBE_CONNECT_SECONDS",
     "PROBE_READ_SECONDS",
     "SANED_PORT",
@@ -183,12 +185,48 @@ SKIPPED_STATE_LABEL: Final = "Not checked"
 # 42 requests a second ten attempts would have been a quarter of a second.
 #
 # Ten attempts at the real two-second interval is about twenty seconds of
-# asking, which is roughly twenty refresher ticks (``TICK_SECONDS`` is 1 s) and
-# about two and a half times the worst probe budget a cold start can cost --
-# ``PROBE_CONNECT_SECONDS`` for saned plus ``PROBE_READ_SECONDS`` for
-# Paperless.  A healthy cold start settles on its second request; this leaves
-# it eight it will never need.
+# asking, which is roughly twenty refresher ticks (``TICK_SECONDS`` is 1 s).
+# That is *not* sized against the worst probe a cold start can cost, and the
+# arithmetic that once claimed it was -- two and a half times
+# ``PROBE_CONNECT_SECONDS`` plus ``PROBE_READ_SECONDS``, so about 7 s -- is
+# disproved by three things this same module documents (R3-WR-04).
+# ``getaddrinfo`` is outside every budget here: ``PROBE_CONNECT_SECONDS`` says
+# at length that an unreachable resolver costs whatever ``resolv.conf`` says,
+# and nothing bounds it.  The saned pre-probe pays that once per configured
+# host, up to ``_MAX_PROBE_HOSTS`` of them.  And the ordinary local-USB
+# deployment has no parseable host at all, so ``_scanner_preflight`` returns
+# ``None`` without dialling anything and ``_scanner_enumeration`` enters
+# ``get_devices()``, which this file costs at roughly 127 s for a silently
+# unreachable host, inside a blocking C call nothing can interrupt.
+#
+# So what this cap means is narrower than it used to claim: ten attempts is the
+# bound for a chain with **nothing in flight**, which is the case it was always
+# really sized for -- a refresher thread that has died, and a tab left open in
+# front of it.  A chain that is waiting on a probe somebody demonstrably holds
+# is bounded by ``POLL_PROBE_ATTEMPT_CAP`` instead.  A healthy cold start
+# settles on its second request either way; this leaves it eight it will never
+# need.
 POLL_ATTEMPT_CAP: Final = 10
+
+# How many times a strip may ask while a probe is demonstrably in flight --
+# that is, while some checker holds the refresher's single-flight lock
+# (R3-WR-04).  Ninety attempts at the real two-second interval is about 180 s,
+# which exceeds the ~127 s worst-case ``get_devices()`` this file documents
+# plus both probe budgets (``PROBE_CONNECT_SECONDS`` for saned and
+# ``PROBE_READ_SECONDS`` for Paperless) with room left over for the pre-probe's
+# unbounded resolutions.  Below it, a cold start on a wedged scanner stopped
+# asking while its first probe was still running and told a household member to
+# press a button that starts the thing already running.
+#
+# It is a second cap and not an exemption, and that is deliberate.
+# ``Lock.locked()`` stays true forever if the holder dies, and a thread that
+# died inside the lock is precisely the failure mode this area keeps hitting,
+# so an unbounded "keep asking while the lock is held" would reintroduce
+# IN-07's unbounded poll through a narrower door.  A refresher that died
+# holding the lock therefore still makes the asking stop; it just takes about
+# three minutes instead of twenty seconds.  That cost lands only on the tab
+# that was already waiting on a probe, never on the healthy-idle case.
+POLL_PROBE_ATTEMPT_CAP: Final = 90
 
 # What the strip says once it has stopped asking.  It replaces the freshness
 # line, because there is no freshness to report -- nothing has ever been
@@ -198,6 +236,21 @@ POLL_ATTEMPT_CAP: Final = 10
 # exception text, because this sentence is rendered on a page the whole LAN can
 # read.
 POLL_GAVE_UP_LINE: Final = "The checks have not run yet. Press Check again to try now."
+
+# What the strip says instead, while it is still asking because a probe is
+# demonstrably in flight (R3-WR-04).  ``POLL_GAVE_UP_LINE`` points at the
+# ``Check again`` button, and beside a running probe that is advice that cannot
+# help: the click collapses into the probe already running.  So this sentence
+# says what is true -- the first check has not finished -- and sets an
+# expectation for how long that can take, which is the ~127 s ``get_devices()``
+# figure rounded into words a household member reads.  Held to exactly
+# ``POLL_GAVE_UP_LINE``'s rule: no host, no address, no port, no path, no URL
+# and no exception text, because it renders on a page the whole LAN can read
+# (ASVS V7).
+POLL_STILL_CHECKING_LINE: Final = (
+    "The first check is still running. This can take a couple of minutes "
+    "if the scanner is not reachable."
+)
 
 # How much of a device's own description a row will print.  Nothing else bounds
 # what a scanner can call itself, and the row is rendered into HTML next to
