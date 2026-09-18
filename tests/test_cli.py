@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import importlib.metadata
 import json
 import logging
 import os
@@ -281,6 +282,91 @@ class TestCliHelp:
         assert result.exit_code == 0
         assert "--json" in result.output
         assert "--capabilities" in result.output
+
+
+class TestVersionOption:
+    """
+    ``saneless --version`` reports the installed distribution version.
+
+    D-03/D-04, DLVR-10. The number comes from ``importlib.metadata``, so
+    ``pyproject.toml`` stays its single source, and the line is click's default
+    ``%(prog)s, version %(version)s`` with no Python or platform block --
+    ``saneless doctor`` already covers the diagnostics such a block would
+    duplicate.
+    """
+
+    def test_version_option_prints_the_installed_version(self) -> None:
+        """
+        ``--version`` exits 0 printing ``saneless, version <installed>``.
+
+        The expectation is read from ``importlib.metadata``, never from
+        parsing ``pyproject.toml``. A pyproject-derived expectation fails in
+        every venv whose installed metadata lags an edited ``pyproject.toml``
+        -- which is every venv between the edit and the next ``uv sync`` --
+        and it fails for a reason that has nothing to do with this option.
+        ``prog_name="saneless"`` is equally mandatory: ``CliRunner`` otherwise
+        reports the program as ``cli``, and the assertion then fails on the
+        wrong half of the line.
+        """
+        installed = importlib.metadata.version("saneless")
+
+        result = CliRunner().invoke(cli, ["--version"], prog_name="saneless")
+
+        assert result.exit_code == 0, result.output
+        assert result.output == f"saneless, version {installed}\n"
+
+    def test_version_option_needs_no_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--version`` loads no settings and configures no logging (CFG-10)."""
+        calls: list[str] = []
+
+        def failing_load(*_args: object, **_kwargs: object) -> Settings:
+            """Fail as loading a nonexistent config would."""
+            calls.append("load_settings")
+            msg = "Configuration error in /nonexistent/saneless.toml:\n  missing"
+            raise ConfigError(msg)
+
+        def recording_logging(*_args: object, **_kwargs: object) -> None:
+            """Record that logging configuration was attempted."""
+            calls.append("configure_logging")
+
+        monkeypatch.setattr("saneless.cli.load_settings", failing_load)
+        monkeypatch.setattr("saneless.cli.configure_logging", recording_logging)
+
+        result = CliRunner().invoke(
+            cli,
+            ["--config", "/nonexistent/saneless.toml", "--version"],
+            prog_name="saneless",
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [], f"--version went through {calls}"
+
+    def test_verbose_short_flag_is_still_verbose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``-v`` still means ``--verbose``, not ``--version``.
+
+        The version option is deliberately declared without a short flag:
+        ``-v`` is already ``--verbose`` on the same group, and click binds the
+        short flag to whichever decorator declared it last, silently.
+        """
+        captured: dict[str, object] = {}
+
+        def capture_logging(*_args: object, **kwargs: object) -> None:
+            """Record whether verbose was passed."""
+            captured["verbose"] = kwargs.get("verbose", False)
+
+        runner, _ = _patch_cli(monkeypatch)
+        monkeypatch.setattr("saneless.cli.configure_logging", capture_logging)
+
+        result = runner.invoke(cli, ["-v", "devices"], prog_name="saneless")
+
+        assert result.exit_code == 0, result.output
+        assert captured.get("verbose") is True, "-v no longer reaches configure_logging"
+        assert "saneless, version" not in result.output
 
 
 class TestScanCommand:
