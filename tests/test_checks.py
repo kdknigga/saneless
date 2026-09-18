@@ -547,6 +547,209 @@ class TestSanedHostParsing:
         assert _saned_hosts("scanner.local:99999") == (("scanner.local", SANED_PORT),)
 
 
+class TestUnicodeDigitPorts:
+    """R3-CR-01: ``str.isdigit()`` is True for characters ``int()`` refuses."""
+
+    def test_a_superscript_two_port_does_not_raise(self) -> None:
+        """
+        ``host:²`` parses instead of raising ``ValueError``.
+
+        ``"²".isdigit()`` is True -- U+00B2 is Unicode category ``No`` --
+        and ``int("²")`` raises.  Nothing between here and ``run_checks``
+        catches it: ``_saned_hosts`` catches nothing, ``_scanner_preflight``
+        catches nothing, and the probe's ``except OSError`` is never reached
+        because the raise happens before any socket call.  So the exception
+        escaped into ``run_checks``' generic per-check handler, which rendered
+        the Scanner row as "This check could not be completed." with state
+        FAIL -- and ``saneless doctor`` then exited 2 on an appliance whose
+        scanner works.
+
+        The value asserted is the reading this module already gives an
+        unparseable port: the port branch declines and the final filter keeps
+        the host, exactly as ``host:99999`` yields ``host`` alone.
+        """
+        assert _saned_hosts("host:²") == (("host", SANED_PORT),)
+
+    def test_a_circled_one_port_does_not_raise(self) -> None:
+        """
+        ``host:①`` parses too, so the property is pinned on the class.
+
+        A second Unicode category ``No`` character, so what is pinned is "no
+        character ``str.isdigit()`` accepts and ``int()`` refuses can reach
+        ``int()``" rather than one code point.
+        """
+        assert _saned_hosts("host:①") == (("host", SANED_PORT),)
+
+    def test_an_arabic_indic_port_is_never_read_as_a_number(self) -> None:
+        """
+        ``host:١٢٣٤`` never becomes port 1234.
+
+        This is the half of R3-CR-01 that does not raise: ``int()`` accepts
+        non-ASCII decimals, so the old gate read Arabic-Indic 1234 as port
+        1234 -- a number libsane's C-side parsing would never derive from that
+        string, which is the exact divergence ``_saned_host_setting`` exists to
+        prevent.  1234 rather than 6566 is deliberate: with 6566 the wrong
+        answer and the right answer are the same tuple.
+        """
+        assert _saned_hosts("host:١٢٣٤") == (("host", SANED_PORT),)
+
+    def test_an_ascii_port_is_untouched(self) -> None:
+        """The ASCII-decimal reading is exactly what it always was."""
+        assert _saned_hosts("host:6566") == (("host", 6566),)
+
+    def test_the_lowest_ascii_port_is_untouched(self) -> None:
+        """A one-character ASCII port still parses, so the gate is not a length rule."""
+        assert _saned_hosts("host:1") == (("host", 1),)
+
+
+class TestNumericAddressShorthand:
+    """R3-WR-01: glibc reads far more than all-digit strings as an address."""
+
+    @pytest.mark.parametrize(
+        "setting",
+        ["0.0", "0x0.0", "0x7f.1", "127.1", "6566.0", "0xdeadbeef", "01.02.03.04"],
+    )
+    def test_a_numeric_shorthand_segment_is_never_dialled(self, setting: str) -> None:
+        """
+        No segment glibc reads as a number reaches the dial list.
+
+        Measured by round 3 on this machine: ``0.0`` and ``0x0.0`` resolve to
+        ``0.0.0.0``, ``0x7f.1`` and ``127.1`` resolve to ``127.0.0.1``, and
+        ``6566.0`` costs one unbounded lookup before NXDOMAIN.  All five passed
+        the old all-digit guard because they contain a ``.``.  On Linux a
+        ``connect()`` to ``0.0.0.0`` reaches loopback, so any unrelated local
+        process listening on 6566 made ``any(...)`` true, suppressed
+        ``_scanner_host_unanswered`` and let the check fall through to
+        ``get_devices()`` -- reinstating the ~127 s uninterruptible hang the
+        pre-probe exists to avoid.
+
+        ``0xdeadbeef`` covers the bare hex form and ``01.02.03.04`` the octal
+        one: leading-zero parts are octal to glibc, so the four numbers it
+        dials are not the four an operator reading the setting would expect.
+
+        Args:
+            setting: One numeric spelling glibc accepts as an address.
+
+        """
+        assert _saned_hosts(setting) == ()
+
+    def test_a_mistyped_port_no_longer_invents_a_loopback_entry(self) -> None:
+        """
+        ``host:0.0`` drops the invented segment rather than dialling it.
+
+        The operator never typed an address here.  A stray ``.`` in a port was
+        enough: before the fix this returned ``(("host", 6566), ("0.0", 6566))``
+        and the second entry reached loopback.
+        """
+        assert _saned_hosts("host:0.0") == (("host", SANED_PORT),)
+
+    def test_a_legal_dotted_quad_is_still_dialled(self) -> None:
+        """A static-IP scanner keeps its pre-probe and its ~127 s saving."""
+        assert _saned_hosts("192.0.2.10") == (("192.0.2.10", SANED_PORT),)
+
+    def test_a_legal_dotted_quad_with_a_port_is_still_dialled(self) -> None:
+        """The wider refusal does not touch the ``host:port`` reading either."""
+        assert _saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
+
+    def test_a_name_containing_an_x_is_not_mistaken_for_a_hex_literal(self) -> None:
+        """
+        ``box-x1.lan`` is a name, not ``0x``-prefixed anything.
+
+        The hex arm of the refusal matches a literal ``0x`` or ``0X`` prefix,
+        not the presence of the letter somewhere in the segment, so an ordinary
+        appliance name survives.
+        """
+        assert _saned_hosts("box-x1.lan") == (("box-x1.lan", SANED_PORT),)
+
+
+class TestProbeHostCap:
+    """R3-IN-05: the walk over the entries runs inside a request thread."""
+
+    def test_a_long_host_list_is_capped(self) -> None:
+        """
+        Forty configured segments yield ``_MAX_PROBE_HOSTS`` entries.
+
+        ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
+        unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` for each, and
+        that walk runs inside the ``POST /api/checks/refresh`` request thread.
+        The manual-refresh floor bounds the *rate* of those requests, not the
+        duration of one, so without a cap a forty-host setting is a request
+        that can take minutes.
+        """
+        entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
+        assert len(entries) == checks._MAX_PROBE_HOSTS
+
+    def test_the_capped_list_keeps_the_first_entries_in_configured_order(self) -> None:
+        """
+        The tail is what is dropped, so the first-named host is still probed.
+
+        Losing the tail is this module's standard safe direction: no entry
+        means no probe for that host, and the scanner check falls through to
+        ``get_devices()`` exactly as it did before the probe existed.
+        """
+        entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
+        assert entries[0] == ("h1", SANED_PORT)
+        assert all(host != "h40" for host, _port in entries)
+
+    def test_a_short_host_list_is_unchanged_entry_for_entry(self) -> None:
+        """A setting under the cap is not touched by it."""
+        assert _saned_hosts("a:b:c") == (
+            ("a", SANED_PORT),
+            ("b", SANED_PORT),
+            ("c", SANED_PORT),
+        )
+
+    def test_the_host_port_reading_is_unaffected_by_the_cap(self) -> None:
+        """``host:port`` returns a single entry, so no cap can bite it."""
+        assert _saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
+
+
+class TestTheParserDocstringIsTrue:
+    """R3-IN-04: one test per sentence of ``_saned_hosts``' contract."""
+
+    def test_a_stray_colon_after_a_port_refuses_the_setting(self) -> None:
+        """
+        ``localhost:6566:`` yields ``()``, not one host on a port.
+
+        The docstring claimed a stray colon at either edge "stays tolerated,
+        because ``: host-a :`` has only ever meant one host".  That is true of
+        a bare name and false in combination with a port: the trailing colon
+        takes the setting to three segments, so the more-than-two-segment
+        refusal fires on ``6566`` not being a plausible host name and the whole
+        setting is refused.  Refusal is the safe direction -- it costs the
+        pre-probe's latency saving and never produces a wrong verdict -- but it
+        is not what the sentence said.
+        """
+        assert _saned_hosts("localhost:6566:") == ()
+
+    def test_a_stray_colon_before_a_port_refuses_the_setting(self) -> None:
+        """``:localhost:6566`` is refused for the same reason as its mirror."""
+        assert _saned_hosts(":localhost:6566") == ()
+
+    def test_a_leading_zero_port_is_read_as_decimal(self) -> None:
+        """
+        ``host:065`` is port 65, and the docstring now says so.
+
+        Nothing here claims libsane reads ``065`` the same way.  The range test
+        and the ASCII-decimal test are the whole of what this module
+        guarantees about a port segment, and this case pins the reading rather
+        than the agreement.
+        """
+        assert _saned_hosts("host:065") == (("host", 65),)
+
+    def test_a_root_dot_fully_qualified_name_yields_no_entries(self) -> None:
+        """
+        ``scanner.local.`` is legal DNS and is still refused.
+
+        ``_looks_like_a_host_name``'s trailing-dot rule rejects it, so the name
+        loses its pre-probe.  The behaviour is documented and pinned rather
+        than fixed: widening the accept surface for a spelling that appears
+        nowhere in this project's config examples buys nothing, and the cost of
+        leaving it is one latency saving.
+        """
+        assert _saned_hosts("scanner.local.") == ()
+
+
 class TestSanedReachable:
     """The only bounded reachability probe in the tree."""
 
@@ -1534,6 +1737,40 @@ class TestScannerCheck:
         )
         assert [row.key for row in results if row.state is CheckState.FAIL] == []
         assert worst_state(results) is CheckState.WARN
+
+    def test_a_unicode_digit_port_does_not_redden_the_whole_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        R3-CR-01 end to end: a U+00B2 in the port leaves the run green.
+
+        The reachable half of this is stubbed -- ``_recording_dialler``
+        replaces ``checks._saned_reachable``, so the test resolves no name and
+        opens no socket.  What is measured is the row the *parser* produces:
+        before the fix the ``ValueError`` escaped into ``run_checks``' generic
+        per-check handler, so the Scanner row carried
+        ``_CHECK_FAILED_MESSAGE`` with state FAIL, ``worst_state`` was FAIL and
+        ``saneless doctor`` exited 2 on an appliance that scans fine.  The
+        setting is put in the environment rather than the config file because
+        ``_saned_host_setting`` prefers ``SANE_NET_HOSTS``, which is where a
+        container operator would hit this.
+
+        Args:
+            tmp_path: The test's own directory.
+            monkeypatch: Sets the environment and stubs the dialler.
+
+        """
+        monkeypatch.setenv("SANE_NET_HOSTS", "scanbox:²")
+        _recording_dialler(monkeypatch, reachable=True)
+        results = run_checks(
+            _context(
+                _healthy_settings(tmp_path, host=""),
+                scanner=_CountingBackend([_device()]),
+                paperless=_paperless(_RequestCounter(_ok_response)),
+            )
+        )
+        assert _row(results, CheckKey.SCANNER).message != checks._CHECK_FAILED_MESSAGE
+        assert worst_state(results) is not CheckState.FAIL
 
     @pytest.mark.parametrize(
         ("environment", "setting"),
