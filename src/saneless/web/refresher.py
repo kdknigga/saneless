@@ -300,14 +300,23 @@ class CheckRefresher:
         previous entry in the cache.  That is the whole point of last-known-good:
         a probe that could not be taken must not blank a strip that was correct
         thirty seconds ago.  ``run_checks`` catches its own per-check failures,
-        so reaching this handler means the registry itself broke.
+        so reaching this handler means the registry itself broke.  The ``store``
+        is inside the same guard for the same reason: a write that raises also
+        leaves the previous entry in place, and neither failure reaches the
+        caller.  The store used to sit in an ``else`` arm, and an exception
+        raised in an ``else`` arm is not routed to that ``try``'s handlers --
+        which is how it came to be outside the guard it looked like it was
+        inside, and how a raising write ended the refresher thread for the life
+        of the process (R3-WR-02).
 
         Returns:
             "Did this call probe", which is deliberately *not* "did this call
             store".  The ``except`` arm probed and stored nothing, and it
             returns True: a caller that read a raising probe as a collapse
-            would ask the page to wait for a result that is never coming.  The
-            one False is the early return, where the lock was already held.
+            would ask the page to wait for a result that is never coming.  A
+            store that raised is that same case and returns True too -- it
+            probed.  The one False is the early return, where the lock was
+            already held.
 
         """
         if not self._probe_lock.acquire(blocking=False):
@@ -315,12 +324,11 @@ class CheckRefresher:
         try:
             context = replace(self.build_context(), skip_scanner=self._scan_active())
             results = run_checks(context, scanner_gate=self._scanner_gate())
+            self._cache.store(results)
         except Exception:
             # No exception text goes anywhere near the cache or the page; the
             # strip keeps showing the developer-authored rows it already had.
             logger.exception("Check refresh failed; keeping the previous results")
-        else:
-            self._cache.store(results)
         finally:
             self._probe_lock.release()
         return True
