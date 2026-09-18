@@ -2270,3 +2270,57 @@ def test_the_job_json_example_shows_a_real_id_shape() -> None:
         f"{name} shows a job id that no saneless release can produce: {wrong}. "
         "Job ids are UUID4 strings"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: the deploy guide links rather than copies (row 32, DOCS-06)
+# ---------------------------------------------------------------------------
+
+# The one setting the guide's half-a-service used to declare.
+PAPERLESS_SERVICE_MARKER = "PAPERLESS_" + "SECRET_KEY"
+
+# An image line whose value names the other project.
+PAPERLESS_IMAGE_LINE = re.compile(
+    r"^\s*(?:#\s*)?image:\s*\S*paperless\S*", re.MULTILINE
+)
+
+# Any absolute link into the other project's own material -- its documentation
+# site or its repository. Which of the two is a choice for the page, not a
+# contract.
+PAPERLESS_NGX_HOME = "paperless-ngx"
+
+
+def test_the_deploy_guide_does_not_ship_a_partial_paperless_stack() -> None:
+    """
+    The compose guide points at the other project's own file, never copies it.
+
+    The example used to define half a service for it: one setting, no message
+    broker, no database. The stack it described could not come up, so a reader
+    who followed the guide ended with a container that restarts forever and
+    nothing saying why.
+
+    Completing it was the other option and was rejected (D-49). A copy of
+    someone else's stack is a claim this project would have to keep true
+    forever, against requirements that change without notice -- the bundled
+    files currently ship Valkey as the broker, which is not what the copy
+    here would have said.
+    """
+    text, name = _read(DEPLOY_HOWTO)
+    assert PAPERLESS_SERVICE_MARKER not in text, (
+        f"{name} still declares the other project's service settings itself"
+    )
+    images = PAPERLESS_IMAGE_LINE.findall(text)
+    assert not images, (
+        f"{name} still names the other project's image in a compose example: "
+        f"{images}. Link to its own compose file instead"
+    )
+    linked = [
+        target
+        for match in MARKDOWN_LINK.finditer(text)
+        if (target := match.group("target")).startswith(("http://", "https://"))
+        and PAPERLESS_NGX_HOME in target
+    ]
+    assert linked, (
+        f"{name} removed the half-a-service but tells the reader nowhere to "
+        "get a working one. Link to the official compose documentation"
+    )
