@@ -221,13 +221,15 @@ mode = "Color"
 enable_empty_page_detection = false
 ```
 
-To adjust sensitivity, lower the thresholds to detect pages with faint content as non-empty:
+A page counts as empty only when its mean luminance is **above** `empty_page_mean_threshold` *and* its standard deviation is **below** `empty_page_stddev_threshold`. So to keep pages with faint content -- pencil, a light stamp, a pale carbon copy -- raise the mean threshold and lower the stddev threshold. Moving either one the other way discards more pages, not fewer:
 
 ```toml
 [profiles.pencil-notes]
 source = "ADF"
 resolution = 300
 mode = "Gray"
-empty_page_mean_threshold = 240.0
+empty_page_mean_threshold = 253.0
 empty_page_stddev_threshold = 3.0
 ```
+
+See [How Empty Page Detection Works](../explanation/empty-page-detection.md#tuning-the-thresholds) for both directions written out.
