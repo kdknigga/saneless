@@ -556,7 +556,7 @@ Plans:
   4. Every user-facing error shows a plain-language message and a suggested next step, with the raw technical detail inside a collapsed disclosure
   5. Two browser contexts show the owner the Continue/Abort flip prompt (with confirmation on Abort) and the non-owner "Waiting for the stack to be flipped"; profile dropdowns show human labels with descriptions, feeder-first on sheet-fed scanners, and say so on the strip when the config mount is read-only
 
-**Plans**: 30 plans (19 shipped, 8 gap-closure round 1, 3 gap-closure round 2 from `30-REVIEW.md` 2026-09-17)
+**Plans**: 36 plans (19 shipped, 8 gap-closure round 1, 3 gap-closure round 2, 6 gap-closure round 3 from `30-REVIEW.md` 2026-09-17)
 
 Plans:
 **Wave 1**
@@ -649,6 +649,26 @@ Plans:
 **Gap wave 6** *(blocked on gap wave 5)*
 
 - [x] 30-30-PLAN.md — R2-WR-02/R2-IN-03: gate contention gets its own row; the pre-probe leaves the scanner gate
+
+**Gap closure round 3** *(from `30-REVIEW.md` round 3 dated 2026-09-17: 2 critical, 4 warning, 6 info — finding ids are prefixed `R3-*`)*
+
+**Gap wave 7**
+
+- [ ] 30-31-PLAN.md — R3-CR-01/R3-WR-01/R3-IN-04/R3-IN-05: the host parser stops raising on a Unicode-digit port, stops dialling glibc's numeric shorthands, and bounds its dial list
+- [ ] 30-32-PLAN.md — R3-CR-02: a failing checks poll ends the poll instead of overwriting the scan-status slot every 2 s, measured against the response the app really sends
+- [ ] 30-33-PLAN.md — R3-WR-02: one raise no longer kills the background refresh thread for the life of the process
+
+**Gap wave 8** *(blocked on gap wave 7)*
+
+- [ ] 30-34-PLAN.md — R3-WR-03: a skipped check renders as not-checked on both surfaces instead of a green OK
+
+**Gap wave 9** *(blocked on gap wave 8)*
+
+- [ ] 30-35-PLAN.md — R3-WR-04/R3-IN-01/R3-IN-02/R3-IN-06: the poll window follows the probe's real worst case; two decorative tests become load-bearing
+
+**Gap wave 10** *(blocked on gap wave 9)*
+
+- [ ] 30-36-PLAN.md — R3-IN-03: the manual-refresh claim is released by compare-and-clear, not by an argument
 
 **UI hint**: yes
 
