@@ -18,9 +18,6 @@ from saneless.checks import (
     check_row_class,
     check_row_glyph,
     check_row_label,
-    check_state_class,
-    check_state_glyph,
-    check_state_label,
 )
 from saneless.config import validate_settings_dirs
 from saneless.job import JobStore
@@ -84,18 +81,18 @@ def _build_templates() -> Jinja2Templates:
     templates.env.filters["progress_label"] = progress_label
     templates.env.filters["flip_answer_label"] = flip_answer_label
     templates.env.filters["check_name"] = check_name
-    # The strip draws its rows with these three rather than with the state
-    # lookups below: a row the registry skipped carries `CheckState.OK` so that
-    # `saneless doctor` keeps exiting 0, and a marker derived from the state
-    # alone therefore ticked a row nothing had looked at (R3-WR-03).  The state
-    # lookups stay registered because they are what these three delegate to and
-    # because dropping a filter name is a separate decision from adding one.
+    # The strip draws its rows with these three and not with the state lookups
+    # they delegate to: a row the registry skipped carries `CheckState.OK` so
+    # that `saneless doctor` keeps exiting 0, and a marker derived from the
+    # state alone therefore ticked a row nothing had looked at (R3-WR-03).
+    # `check_state_class`, `check_state_glyph` and `check_state_label` are
+    # deliberately NOT registered as filters: no template uses them, the
+    # delegation is in Python and needs no filter name, and a name in the
+    # template namespace that draws a skipped row green is a trap for the next
+    # row's author (R4-IN-03).
     templates.env.filters["check_row_class"] = check_row_class
     templates.env.filters["check_row_glyph"] = check_row_glyph
     templates.env.filters["check_row_label"] = check_row_label
-    templates.env.filters["check_state_class"] = check_state_class
-    templates.env.filters["check_state_glyph"] = check_state_glyph
-    templates.env.filters["check_state_label"] = check_state_label
     templates.env.filters["error_message"] = error_message
     templates.env.filters["error_next_step"] = error_next_step
     templates.env.filters["local_time"] = local_time

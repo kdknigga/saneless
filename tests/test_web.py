@@ -37,9 +37,6 @@ from saneless.checks import (
     check_row_class,
     check_row_glyph,
     check_row_label,
-    check_state_class,
-    check_state_glyph,
-    check_state_label,
 )
 from saneless.config import (
     OutputConfig,
@@ -924,16 +921,15 @@ class TestAppComposition:
             built.state.paperless.close()
             built.state.job_store.close()
 
-    def test_registers_the_eleven_new_filters(self, unstarted_app: FastAPI) -> None:
+    def test_registers_the_filters_the_templates_reach_for(
+        self, unstarted_app: FastAPI
+    ) -> None:
         """Every name this phase's templates reach for is registered (APPL-03)."""
         filters = unstarted_app.state.templates.env.filters
         expected = {
             "check_row_class",
             "check_row_glyph",
             "check_row_label",
-            "check_state_class",
-            "check_state_glyph",
-            "check_state_label",
             "check_name",
             "error_message",
             "error_next_step",
@@ -956,14 +952,26 @@ class TestAppComposition:
         assert filters["check_row_class"] is check_row_class
         assert filters["check_row_glyph"] is check_row_glyph
         assert filters["check_row_label"] is check_row_label
-        assert filters["check_state_class"] is check_state_class
-        assert filters["check_state_glyph"] is check_state_glyph
-        assert filters["check_state_label"] is check_state_label
         assert filters["check_name"] is check_name
         assert filters["error_message"] is error_message
         assert filters["error_next_step"] is error_next_step
         assert filters["page_counts"] is page_counts
         assert filters["local_time"] is local_time
+
+    def test_the_state_lookups_are_not_filters(self, unstarted_app: FastAPI) -> None:
+        """
+        R4-IN-03: a filter no template may correctly use is not registered.
+
+        ``check_state_class`` and its two siblings draw a marker from the
+        state alone, which is what rendered a skipped row as a green tick
+        (R3-WR-03).  The strip reaches for the ``check_row_*`` filters, and
+        leaving the state lookups in the template namespace handed the next
+        row's author two plausible names of which only one is right.  The
+        Python functions stay; it is the filter names that are gone.
+        """
+        filters = unstarted_app.state.templates.env.filters
+        state_lookups = {"check_state_class", "check_state_glyph", "check_state_label"}
+        assert not state_lookups & set(filters)
 
     def test_exposes_the_cache_and_the_refresher_on_app_state(
         self, unstarted_app: FastAPI
