@@ -121,6 +121,21 @@ _ASCII_DIGITS: Final = frozenset(digits)
 # segment as a number, so a name may not look like one (R3-WR-01).
 _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 
+# How many hosts one setting may put in front of the pre-probe (R3-IN-05).
+# ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
+# unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` for each, and that
+# walk runs inside the ``POST /api/checks/refresh`` request thread.  The
+# manual-refresh floor in ``checks_cache.claim_manual_refresh`` bounds the
+# *rate* of those requests and says so; it cannot bound the duration of one, so
+# without this an uncapped setting is a request that can take minutes.
+#
+# Four is chosen against the deployment rather than against the clock: this is
+# a household appliance bridging scanners to paperless-ngx, and a LAN with more
+# than four network scanners is not the machine this project is for.  The cost
+# of being wrong about that is small and is the module's usual one -- the fifth
+# host onwards loses the pre-probe, not the check.
+_MAX_PROBE_HOSTS: Final = 4
+
 # The cold-start row, before any check has run (D-06).  It lives here rather
 # than in the template for the same reason the state glyphs do: templates own
 # no vocabulary.  U+00B7 is neutral -- it says "not yet", not "bad" -- and
@@ -750,6 +765,18 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     rejects.  The stray colon at either edge stays tolerated, because
     ``: host-a :`` has only ever meant one host.
 
+    **The cap.**  At most ``_MAX_PROBE_HOSTS`` -- four -- entries are returned,
+    taken from the front of the configured order.  ``_scanner_preflight`` walks
+    them with ``any(...)``, paying an unbounded ``getaddrinfo`` plus
+    ``PROBE_CONNECT_SECONDS`` for each, inside the ``POST /api/checks/refresh``
+    request thread; the manual-refresh floor bounds how often that request may
+    be made and not how long one of them takes, so the length of this tuple is
+    the only place the duration can be bounded (R3-IN-05).  A longer setting
+    loses the pre-probe for its tail rather than losing the bound, which is the
+    module's standard safe direction: no entry means no probe for that host,
+    and the scanner check falls through to ``get_devices()`` exactly as it did
+    before the probe existed.
+
     Returning ``()`` is not a silent failure; it is the fallback this module
     documents everywhere else.  No entries means no probe, which means the
     scanner check calls ``get_devices()`` and behaves exactly as it did before
@@ -801,9 +828,12 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
             and 0 < int(maybe_port) <= 65535
         ):
             return ((host, int(maybe_port)),)
+    # Filter first, then cap: the cap is on entries that would really be
+    # dialled, not on segments that were dropped before anything reached a
+    # socket.
     return tuple(
         (host, SANED_PORT) for host in present if _looks_like_a_host_name(host)
-    )
+    )[:_MAX_PROBE_HOSTS]
 
 
 def _saned_reachable(host: str, port: int, timeout: float) -> bool:
