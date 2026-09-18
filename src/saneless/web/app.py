@@ -15,6 +15,9 @@ from fastapi.templating import Jinja2Templates
 from saneless.checks import (
     CheckContext,
     check_name,
+    check_row_class,
+    check_row_glyph,
+    check_row_label,
     check_state_class,
     check_state_glyph,
     check_state_label,
@@ -81,6 +84,15 @@ def _build_templates() -> Jinja2Templates:
     templates.env.filters["progress_label"] = progress_label
     templates.env.filters["flip_answer_label"] = flip_answer_label
     templates.env.filters["check_name"] = check_name
+    # The strip draws its rows with these three rather than with the state
+    # lookups below: a row the registry skipped carries `CheckState.OK` so that
+    # `saneless doctor` keeps exiting 0, and a marker derived from the state
+    # alone therefore ticked a row nothing had looked at (R3-WR-03).  The state
+    # lookups stay registered because they are what these three delegate to and
+    # because dropping a filter name is a separate decision from adding one.
+    templates.env.filters["check_row_class"] = check_row_class
+    templates.env.filters["check_row_glyph"] = check_row_glyph
+    templates.env.filters["check_row_label"] = check_row_label
     templates.env.filters["check_state_class"] = check_state_class
     templates.env.filters["check_state_glyph"] = check_state_glyph
     templates.env.filters["check_state_label"] = check_state_label
