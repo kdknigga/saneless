@@ -1,10 +1,24 @@
-# SHAs resolved 2026-09-09 via gh api; comments must carry the full version.
+# SHAs resolved 2026-09-18 via gh api; comments must carry the full version.
 name: CI
 
 on:
   push:
     branches: [master]
   pull_request:
+  # `release.yml` calls this workflow, so the release gate and the CI gate are
+  # one definition of green and can never drift apart (D-16). Three
+  # consequences worth knowing before you edit anything below:
+  #
+  #   * `concurrency.group` interpolates `github.workflow`, which under a
+  #     reusable call is the CALLER's workflow name -- a release run groups as
+  #     `Release-refs/tags/vX.Y.Z`, not `CI-...`. `cancel-in-progress` tests
+  #     `github.event_name == 'pull_request'`, which is false there, so a
+  #     release run is never cancelled by this block.
+  #   * The `browser` job becomes part of the release gate, costing one
+  #     Chromium download per release. That is D-16's intent, not an accident.
+  #   * This workflow reads no secrets, so no caller ever needs
+  #     `secrets: inherit`. Keep it that way.
+  workflow_call:
 
 permissions:
   contents: read
@@ -14,34 +28,58 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Every job declares its own token scope rather than inheriting the
+  # workflow-level block. A called workflow's `GITHUB_TOKEN` scope can only be
+  # the same as or more restrictive than the calling job's, so the callee has
+  # to state what it needs explicitly for the reusable call to resolve.
+  #
+  # Every checkout disables credential persistence, so no job leaves a usable
+  # token in `.git/config` for a later step (or an uploaded artifact) to pick
+  # up. Checkout still produces a full `.git`, so the naming guard's
+  # `git ls-files` sweep keeps working in CI -- only the credential goes away.
   lint:
     name: lint
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install SANE development headers
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsane-dev
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run ty check
       - run: uv run pyrefly check src tests
+      # The workflow audit, in the same bare shape as its four neighbours: a
+      # clean run exits 0 and any finding exits 14, so a plain `run:` already
+      # fails the build on the first finding. No severity or confidence floor,
+      # no persona flag (the default `regular` persona is the contract), no
+      # `continue-on-error`, no `|| true`. Findings are fixed, never suppressed
+      # -- an inline audit-ignore comment is as forbidden here as `# noqa`.
+      - run: uv run zizmor .
 
   test:
     name: test
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install SANE development headers
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsane-dev
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
       - run: uv run pytest -m "not browser and not sane_hardware"
       # Drives the real SANE `test` backend. It ships with the SANE runtime
@@ -57,13 +95,17 @@ jobs:
     name: browser
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install SANE development headers
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsane-dev
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
       - run: uv run playwright install --with-deps chromium
       - run: uv run pytest -m browser
