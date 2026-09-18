@@ -18,6 +18,8 @@ from saneless.checks import (
     CHECKING_STATE_LABEL,
     POLL_ATTEMPT_CAP,
     POLL_GAVE_UP_LINE,
+    POLL_PROBE_ATTEMPT_CAP,
+    POLL_STILL_CHECKING_LINE,
     CheckKey,
 )
 from saneless.config import is_placeholder_token, resolve_job_title
@@ -261,6 +263,52 @@ def _freshness_line(cached: CachedChecks, *, scan_active: bool) -> str:
     return f"Last checked {stamp}."
 
 
+def _poll_line(
+    cached: CachedChecks,
+    *,
+    scan_active: bool,
+    gave_up: bool,
+    still_checking: bool,
+) -> str:
+    """
+    Pick the sentence under the rows once the poll's own endings are counted.
+
+    ``_freshness_line`` answers "how fresh is what is on the page", which is
+    the question whenever the poll is still an ordinary one.  Two endings
+    replace it, and neither is about freshness at all.
+
+    A chain that ran out of attempts with nothing in flight says so and points
+    at the ``Check again`` button, which is the one way forward left.  A chain
+    that is still asking because a probe demonstrably holds the single-flight
+    lock says the first check is still running instead: the button that
+    ``POLL_GAVE_UP_LINE`` names starts the very probe that is already running,
+    so naming it there would be advice that cannot help (R3-WR-04).  Once the
+    larger cap is reached the give-up line comes back even over a probe that is
+    still held, because the chain has stopped: the button is again the only
+    thing that can put an answer on the page, and a lock a dead thread holds
+    stays held forever.  The two flags are mutually exclusive by construction
+    -- ``still_checking`` is false whenever ``gave_up`` is true -- so the order
+    here does not decide between them.
+
+    Args:
+        cached: The cache snapshot this render is showing.
+        scan_active: Whether the worker currently has a job in flight.
+        gave_up: Whether the chain ended with nothing in flight and nothing
+            ever checked.
+        still_checking: Whether the chain is past ``POLL_ATTEMPT_CAP`` on a
+            cold cache with a probe demonstrably in flight.
+
+    Returns:
+        The exact sentence this render puts under the rows.
+
+    """
+    if gave_up:
+        return POLL_GAVE_UP_LINE
+    if still_checking:
+        return POLL_STILL_CHECKING_LINE
+    return _freshness_line(cached, scan_active=scan_active)
+
+
 def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     """
     Build the context ``partials/checks.html`` renders from, without probing.
@@ -279,10 +327,23 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     ``poll_attempt`` is the second.  It is the number the *next* request should
     carry, or ``None`` when there is to be no next request -- either because
     there is nothing left to wait for, which is D-06's ending and still the one
-    that matters, or because ``POLL_ATTEMPT_CAP`` attempts have gone by, which
-    is the ending IN-07 needed.  The template emits its request attributes only
-    when this is set, so "should the browser ask again" is decided here and
-    never in the markup.
+    that matters, or because the applicable cap has been reached, which is the
+    ending IN-07 needed.  The template emits its request attributes only when
+    this is set, so "should the browser ask again" is decided here and never in
+    the markup.
+
+    There are two caps, and which one applies is decided by the same
+    ``probe_in_flight`` read the disjunct below uses (R3-WR-04).  With nothing
+    in flight the bound is ``POLL_ATTEMPT_CAP`` -- ten attempts, about twenty
+    seconds -- which is the case that cap was sized for: a refresher thread
+    that has died and a tab left open in front of it.  While a checker
+    demonstrably holds the single-flight lock the bound is
+    ``POLL_PROBE_ATTEMPT_CAP`` instead, about three minutes, because the worst
+    case this application's own probe can cost is the ~127 s ``get_devices()``
+    ``checks.py`` documents plus unbounded name resolution, and a chain that
+    stopped at twenty seconds never collected the answer it was waiting for.
+    The larger window is still a cap: ``Lock.locked()`` stays true forever if
+    the holder dies.
 
     "Nothing left to wait for" is two facts, not one, and the second is WR-03's.
     An empty cache is the cold start.  A probe in flight is the case where
@@ -294,14 +355,24 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     visibly do nothing.  What the disjunct costs: a render landing during a
     background probe issues a small, capped number of extra cache reads before
     it settles.  Each is a cache read and never a probe, and the count is
-    bounded by ``POLL_ATTEMPT_CAP`` exactly as the cold start's is (T-30-29-02).
+    bounded by ``POLL_PROBE_ATTEMPT_CAP`` (T-30-29-02, T-30-35-01).
     ``probe_in_flight`` is a ``locked()`` read and never an acquire, so no
     request thread can be parked behind the probe it is asking about.
 
-    ``gave_up`` deliberately does *not* take the new fact into account.  Its
-    line says the checks have not run yet, which would be a lie printed beside
-    five rows that did run, so a settling poll that runs out of attempts leaves
-    the normal last-checked line alone.  At the cap on a cold cache the
+    ``gave_up`` means "this cold chain has stopped", and it is measured against
+    the *applicable* cap rather than always against ``POLL_ATTEMPT_CAP``.  It
+    still requires a cold cache, because its line says the checks have not run
+    yet and that would be a lie printed beside five rows that did run -- so a
+    settling poll that runs out of attempts leaves the normal last-checked line
+    alone.  What changed is that a cold chain at ``POLL_ATTEMPT_CAP`` with a
+    probe in flight has *not* stopped: it keeps asking up to
+    ``POLL_PROBE_ATTEMPT_CAP`` and shows ``POLL_STILL_CHECKING_LINE`` in place
+    of the cold-start ``Checking…`` line (R3-WR-04).  The give-up line is
+    withheld there because it points at the ``Check again`` button, and a click
+    on that button while a probe holds the lock collapses into the probe
+    already running -- advice that cannot help.  At the larger cap it comes
+    back, because by then the chain really has stopped and the button really is
+    the only way forward.  At whichever cap ends the chain on a cold cache the
     freshness line is replaced rather than augmented: there is no freshness to
     report, because nothing has ever been checked.
 
@@ -324,19 +395,27 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     # Read once, so the two decisions below cannot disagree about it.  This is
     # `Lock.locked()`: an observation, never an acquire (T-30-29-03).
     probe_in_flight = state.refresher.probe_in_flight
-    gave_up = cached.results is None and attempt >= POLL_ATTEMPT_CAP
-    keep_asking = cached.results is None or probe_in_flight
+    # Which cap applies is the probe's decision, and it is taken once from the
+    # one read above so the line and the trigger cannot disagree about it.
+    applicable_cap = POLL_PROBE_ATTEMPT_CAP if probe_in_flight else POLL_ATTEMPT_CAP
+    cold = cached.results is None
+    gave_up = cold and attempt >= applicable_cap
+    still_checking = (
+        cold and probe_in_flight and not gave_up and attempt >= POLL_ATTEMPT_CAP
+    )
+    keep_asking = cold or probe_in_flight
     return {
         "checks": cached.results,
         "checking_rows": _CHECKING_ROWS,
-        "freshness_line": (
-            POLL_GAVE_UP_LINE
-            if gave_up
-            else _freshness_line(cached, scan_active=scan_active)
+        "freshness_line": _poll_line(
+            cached,
+            scan_active=scan_active,
+            gave_up=gave_up,
+            still_checking=still_checking,
         ),
         "scan_active": scan_active,
         "poll_attempt": (
-            attempt + 1 if keep_asking and attempt < POLL_ATTEMPT_CAP else None
+            attempt + 1 if keep_asking and attempt < applicable_cap else None
         ),
     }
 
@@ -1322,7 +1401,7 @@ def get_checks(
     usefully receive, so both of the failures this handler can see end as a
     trigger-free strip at 200 instead.  An out-of-range counter is clamped
     rather than refused: the ``Query`` bound that used to make it a 422 is
-    gone, and the clamp into ``0..POLL_ATTEMPT_CAP`` runs before anything
+    gone, and the clamp into ``0..POLL_PROBE_ATTEMPT_CAP`` runs before anything
     else reads the value.  The property that bound was defending is unchanged
     -- a crafted number still never reaches ``_checks_context`` and is still
     never rendered into the visible body, because only the clamped number is
@@ -1337,17 +1416,20 @@ def get_checks(
     Args:
         request: The incoming request.
         attempt: Which attempt this is, counted from the zero a page render
-            starts at.  Clamped into ``0..POLL_ATTEMPT_CAP`` here, so a value
-            below zero is read as the start of a fresh chain and a value above
-            the cap is read as the cap, where the response carries no request
-            attribute at all and the strip stops asking.
+            starts at.  Clamped into ``0..POLL_PROBE_ATTEMPT_CAP`` here, so a
+            value below zero is read as the start of a fresh chain and a value
+            above the larger cap is read as that cap, where the response
+            carries no request attribute at all and the strip stops asking.
+            The bound is the *larger* of the two caps on purpose (R3-WR-04):
+            clamping at ``POLL_ATTEMPT_CAP`` would cut a legitimate chain that
+            is waiting on a live probe down to an ending it never reached.
 
     Returns:
         The strip body, for an ``outerHTML`` swap.
 
     """
     state = request.app.state
-    counted = min(max(attempt, 0), POLL_ATTEMPT_CAP)
+    counted = min(max(attempt, 0), POLL_PROBE_ATTEMPT_CAP)
     try:
         state.refresher.note_watcher()
         context = _checks_context(state, attempt=counted)
