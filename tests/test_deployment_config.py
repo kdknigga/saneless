@@ -2038,3 +2038,153 @@ def test_scanner_host_documentation_carries_the_container_caveat() -> None:
         "the container cannot see a local scanner and reaches one through "
         f"`saned`:\n{' '.join(rows).strip()}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: the setup chooser link and the no-auth note (D-47, D-50, DOCS-04,
+# DOCS-05)
+# ---------------------------------------------------------------------------
+
+PREREQUISITES_HEADING = "## Prerequisites"
+SETUP_CHOOSER_LINK_TARGET = "which-setup.md"
+
+MARKDOWN_LINK = re.compile(r"\[[^\]]*\]\((?P<target>[^)\s]+)\)")
+
+# Either of the two places the trust posture is already written down. D-50
+# rejected a page of its own: a sentence that links to one of these is what
+# criterion 5 asks for, and a third partial copy is what it does not.
+TRUST_LINK_TARGETS = (
+    DOCS_DIR / "how-to" / "deploy-docker-compose.md",
+    DOCS_DIR / "reference" / "web-api.md",
+)
+
+NO_AUTH_PHRASES = ("no login", "no authentication")
+ALL_INTERFACES_PHRASES = ("all network interfaces", "0.0.0.0")
+
+TRUST_NOTE_SURFACES = (QUICK_START, DOCKER_REFERENCE)
+
+
+def _section_lines(path: Path, heading: str) -> list[str]:
+    """
+    Return the lines under one ``##`` heading, up to the next one.
+
+    Args:
+        path: The page to read.
+        heading: The heading line to start at, matched after stripping.
+
+    Returns:
+        The section's lines, heading excluded. Empty when the heading is absent.
+
+    """
+    lines = path.read_text(encoding="utf-8").splitlines()
+    try:
+        start = next(
+            index for index, line in enumerate(lines) if line.strip() == heading
+        )
+    except StopIteration:
+        return []
+    rest = lines[start + 1 :]
+    end = next(
+        (index for index, line in enumerate(rest) if line.startswith(("## ", "# "))),
+        len(rest),
+    )
+    return rest[:end]
+
+
+def _resolved_link_targets(path: Path, lines: list[str]) -> list[tuple[str, Path]]:
+    """
+    Return each relative Markdown link in ``lines`` with the file it names.
+
+    Anchors are stripped, and the target is resolved against the linking page's
+    own directory, which is what MkDocs does. Absolute URLs are skipped: this
+    exists to catch a dangling in-tree link, and nothing here can tell whether
+    someone else's site still serves a path.
+
+    Args:
+        path: The page the links were read from, used as the resolution base.
+        lines: The lines to scan.
+
+    Returns:
+        ``(target as written, resolved path)`` pairs, in order.
+
+    """
+    return [
+        (target, (path.parent / target.split("#", 1)[0]).resolve())
+        for line in lines
+        for match in MARKDOWN_LINK.finditer(line)
+        if not (target := match.group("target")).startswith(
+            ("http://", "https://", "#")
+        )
+    ]
+
+
+def test_quick_start_prerequisites_link_to_the_setup_chooser() -> None:
+    """
+    The quick-start prerequisites send an unsure reader to the chooser first.
+
+    DOCS-04 puts the link here rather than further down on purpose. The three
+    deployment shapes differ in whether a SANE daemon is needed and what the
+    scanner host is set to, and a reader who guesses wrong does not find out
+    until the device list comes back empty.
+
+    The target's existence is read off the filesystem rather than hard-coded,
+    so renaming the page in a later phase surfaces here instead of becoming a
+    404 on the busiest page in the documentation.
+    """
+    name = QUICK_START.relative_to(REPO_ROOT)
+    section = _section_lines(QUICK_START, PREREQUISITES_HEADING)
+    assert section, f"{name} has no `{PREREQUISITES_HEADING}` section"
+    targets = [
+        (target, resolved)
+        for target, resolved in _resolved_link_targets(QUICK_START, section)
+        if SETUP_CHOOSER_LINK_TARGET in target
+    ]
+    assert targets, (
+        f"{name}'s prerequisites do not link to `{SETUP_CHOOSER_LINK_TARGET}`. "
+        "The reader decides which deployment shape they are in before they "
+        "install, or they debug the wrong one"
+    )
+    dangling = [target for target, resolved in targets if not resolved.is_file()]
+    assert not dangling, (
+        f"{name} links to a setup chooser that does not exist: {dangling}"
+    )
+
+
+def test_the_no_auth_note_appears_on_both_entry_surfaces() -> None:
+    """
+    Both entry surfaces say there is no login, and link to the proxy option.
+
+    The web UI has no authentication and binds every interface. Whether that is
+    acceptable is the operator's call, and they can only make it if they are
+    told -- so it is said on the two pages someone deploys from, the quick
+    start and the Docker reference, rather than only on the API reference that
+    a reader following either of them never opens.
+
+    D-50 rejected a page of its own for this. The assertion is therefore that
+    each surface carries the sentence and a link that resolves to one of the
+    two places the posture is already written out in full, not that it repeats
+    the posture a third time.
+    """
+    for page in TRUST_NOTE_SURFACES:
+        text, name = _read(page)
+        lowered = text.lower()
+        assert any(phrase in lowered for phrase in NO_AUTH_PHRASES), (
+            f"{name} does not say the web UI has no login. An operator who is "
+            f"never told cannot decide whether that is safe on their network"
+        )
+        assert any(phrase in lowered for phrase in ALL_INTERFACES_PHRASES), (
+            f"{name} does not say the server binds every network interface"
+        )
+        linked = [
+            (target, resolved)
+            for target, resolved in _resolved_link_targets(page, text.splitlines())
+            if resolved in TRUST_LINK_TARGETS
+        ]
+        assert linked, (
+            f"{name} states the posture but links to neither of the two pages "
+            "that explain what to do about it, so the sentence is a dead end"
+        )
+        dangling = [target for target, resolved in linked if not resolved.is_file()]
+        assert not dangling, (
+            f"{name} links to trust-model material that does not exist: {dangling}"
+        )
