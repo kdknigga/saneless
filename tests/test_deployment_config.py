@@ -54,7 +54,12 @@ import re
 import subprocess
 from pathlib import Path
 
-from saneless.config import ProfileConfig, WebConfig, is_placeholder_token
+from saneless.config import (
+    OutputConfig,
+    ProfileConfig,
+    WebConfig,
+    is_placeholder_token,
+)
 from saneless.vocabulary import (
     ExitCode,
     RequestRejection,
@@ -1697,3 +1702,235 @@ def test_dockerfile_sets_a_workdir_in_the_runtime_stage() -> None:
         f"runtime stage begins at line {max(froms)}, so the runtime stage "
         "still starts in /"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: one port everywhere, and the non-1000 operator (D-26, D-31, D-32)
+# ---------------------------------------------------------------------------
+
+# A `-p` publish flag, with or without a bind address in front of it, and a
+# quoted compose `ports:` entry. Both are matched narrowly rather than by a
+# bare `\d+:\d+`, which would also read the minutes out of a log timestamp.
+PUBLISH_FLAG = re.compile(
+    r"-p\s+(?:\d+\.\d+\.\d+\.\d+:)?(?P<host>\d{2,5}):(?P<container>\d{2,5})"
+)
+QUOTED_MAPPING = re.compile(r'"(?P<host>\d{2,5}):(?P<container>\d{2,5})"')
+EXPOSE_PORT = re.compile(r"\bEXPOSE\s+(?P<port>\d+)")
+HEALTH_URL_PORT = re.compile(r"localhost:(?P<port>\d+)/health")
+
+# A `web_port` assignment that is live rather than commented out.
+LIVE_WEB_PORT = re.compile(r"^\s*web_port\s*=")
+
+UID_CHOWN_COMMAND = "chown -R 1000:1000 ./config"
+
+
+# The service key that opens a block in a compose file, at the one indent
+# level compose and every fenced example in the docs use for it.
+COMPOSE_SERVICE_KEY = re.compile(r"^  (?P<name>[A-Za-z0-9_.-]+):\s*$")
+IMAGE_KEY = re.compile(r"^\s*image:\s*(?P<reference>\S+)")
+
+# Substring identifying this project's own image. `paperless-ngx` does not
+# contain it, which is the distinction that matters in the side-by-side
+# compose example.
+OWN_IMAGE_MARKER = "saneless"
+
+
+def _port_bearing_files() -> list[Path]:
+    """Return every file that could name a container-side port."""
+    return [DOCKERFILE, COMPOSE, README, *_doc_pages()]
+
+
+def _shell_command_at(lines: list[str], index: int) -> str:
+    """
+    Return the whole shell command beginning at ``index``, continuations joined.
+
+    A ``docker run`` in the documentation is usually wrapped over several
+    lines with trailing backslashes, and the image it runs is on the last one.
+    Reading only the line that carries the ``-p`` flag would leave the command
+    unattributable.
+
+    Args:
+        lines: Every line of the file, in order.
+        index: 0-based index of the line carrying the flag.
+
+    Returns:
+        The command text, continuation lines appended.
+
+    """
+    parts = [lines[index]]
+    cursor = index
+    while lines[cursor].rstrip().endswith("\\") and cursor + 1 < len(lines):
+        cursor += 1
+        parts.append(lines[cursor])
+    return " ".join(parts)
+
+
+def _compose_service_image(lines: list[str], index: int) -> str:
+    """
+    Return the image of the compose service whose block contains ``index``.
+
+    The docs put saneless and paperless-ngx side by side in one compose
+    example, so a ports entry says nothing on its own about which service it
+    belongs to.
+
+    Args:
+        lines: Every line of the file, in order.
+        index: 0-based index of the line inside the service block.
+
+    Returns:
+        The image reference, or the empty string when there is no enclosing
+        service block or it declares no image.
+
+    """
+    start = None
+    for cursor in range(index, -1, -1):
+        if COMPOSE_SERVICE_KEY.match(lines[cursor]):
+            start = cursor
+            break
+    if start is None:
+        return ""
+    for line in lines[start:]:
+        if COMPOSE_SERVICE_KEY.match(line) and line is not lines[start]:
+            break
+        match = IMAGE_KEY.match(line)
+        if match is not None:
+            return match.group("reference")
+    return ""
+
+
+def test_the_example_config_does_not_ship_a_live_web_port() -> None:
+    """
+    ``saneless.toml.example`` does not set ``web_port`` live (D-32).
+
+    The example shipped ``web_port = 8081``, which is wrong for every Docker
+    reader: the image's ``EXPOSE`` and healthcheck are both 8080, so copying
+    the example into a mounted ``config.toml`` moved the server off the port
+    the healthcheck probes and the container went unhealthy with nothing on
+    screen to say why. The line joins the commented pair below it instead, so
+    it still documents the key without configuring anything.
+    """
+    name = TOML_EXAMPLE.relative_to(REPO_ROOT)
+    offenders = [
+        f"{name}:{number}: {line.strip()}"
+        for number, line in _numbered(TOML_EXAMPLE)
+        if LIVE_WEB_PORT.match(line)
+    ]
+    assert not offenders, (
+        "the example config sets web_port live. In Docker the container port "
+        "is fixed and you remap on the host, so a live value here can only "
+        "move the server away from the port the image's healthcheck "
+        "probes:\n" + "\n".join(offenders)
+    )
+
+
+def test_every_documented_container_port_matches_the_model_default() -> None:
+    """
+    Image, compose file and every doc page agree on one container port (D-31).
+
+    The expectation is read off ``OutputConfig`` rather than written out here,
+    so changing the default cannot leave the image and the documentation
+    disagreeing without something going red. Only the *container* side of a
+    ``-p`` mapping is checked: remapping on the host is exactly what operators
+    are told to do when 8080 is taken.
+
+    A mapping counts only when the image it belongs to is this project's. The
+    compose how-to stands saneless next to paperless-ngx, whose own
+    ``"8000:8000"`` is correct and none of this contract's business, so each
+    mapping is attributed first -- to the enclosing compose service's image,
+    or to the shell command the flag appears in, continuations included.
+    """
+    expected = str(OutputConfig.model_fields["web_port"].default)
+    text, dockerfile_name = _read(DOCKERFILE)
+    assert f"EXPOSE {expected}" in text, (
+        f"{dockerfile_name} does not EXPOSE {expected}, the port "
+        "OutputConfig.web_port defaults to"
+    )
+    assert f"localhost:{expected}/health" in text, (
+        f"{dockerfile_name}'s healthcheck does not probe port {expected}"
+    )
+    offenders = []
+    for path in _port_bearing_files():
+        name = path.relative_to(REPO_ROOT)
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for index, line in enumerate(lines):
+            found = [
+                match.group("container")
+                for match in PUBLISH_FLAG.finditer(line)
+                if OWN_IMAGE_MARKER in _shell_command_at(lines, index)
+            ]
+            found.extend(
+                match.group("container")
+                for match in QUOTED_MAPPING.finditer(line)
+                if OWN_IMAGE_MARKER in _compose_service_image(lines, index)
+            )
+            found.extend(
+                match.group("port")
+                for pattern in (EXPOSE_PORT, HEALTH_URL_PORT)
+                for match in pattern.finditer(line)
+            )
+            offenders.extend(
+                f"{name}:{index + 1}: {port} in {line.strip()}"
+                for port in found
+                if port != expected
+            )
+    assert not offenders, (
+        f"a container-side port other than {expected} is documented. The "
+        "container's port is fixed; web_port is a bare-metal setting and the "
+        "host side of the mapping is the half operators change:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_compose_carries_a_commented_user_override() -> None:
+    """
+    The compose example ships the UID override commented out (D-26).
+
+    The image already runs as 1000:1000, which is what the operator's own
+    ``./config`` directory is on a single-user Linux host, so the override is
+    for the minority case and must not be live. It is a literal rather than
+    ``user: "${UID}:${GID}"`` on purpose: compose does not populate ``UID``
+    unless the shell exports it, so that form silently falls back to an empty
+    string and the service fails to start for a reason that looks like
+    nothing.
+    """
+    name = COMPOSE.relative_to(REPO_ROOT)
+    lines = _numbered(COMPOSE)
+    live = [
+        f"{name}:{number}: {line.strip()}"
+        for number, line in lines
+        if line.strip().startswith("user:")
+    ]
+    assert not live, (
+        "docker-compose.yml sets `user:` live. The image already runs as "
+        "1000:1000; a live override here is one more thing to get wrong on "
+        "the happy path:\n" + "\n".join(live)
+    )
+    commented = [
+        number
+        for number, line in lines
+        if _is_comment(line) and "user:" in line and "1000" in line
+    ]
+    assert commented, (
+        f"{name} has no commented `user:` line naming 1000. An operator whose "
+        "own UID is not 1000 needs the override where they are already "
+        "reading, not only in the documentation"
+    )
+
+
+def test_the_uid_is_documented_where_operators_will_look() -> None:
+    """
+    Both Docker pages state the UID and give the ``chown`` command (D-26).
+
+    A bind mount does not inherit the image directory's ownership the way a
+    named volume does -- that was measured -- so an operator whose UID is not
+    1000 has to fix the host directory themselves. This is handled with
+    documentation rather than a runtime fix-up because any fix-up would have
+    to start as root, which is the thing running as UID 1000 exists to stop.
+    """
+    for page in (DOCKER_REFERENCE, DEPLOY_HOWTO):
+        text, name = _read(page)
+        assert "1000" in text, f"{name} does not state the UID the image runs as"
+        assert UID_CHOWN_COMMAND in text, (
+            f"{name} does not give the `{UID_CHOWN_COMMAND}` command for an "
+            "operator whose own UID is not 1000"
+        )
