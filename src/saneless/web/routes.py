@@ -1518,8 +1518,9 @@ def refresh_checks(request: Request) -> Response:
     """
     state = request.app.state
     state.refresher.note_watcher()
-    if state.checks.claim_manual_refresh() and not state.refresher.probe_now():
-        state.checks.release_manual_claim()
+    claim = state.checks.claim_manual_refresh()
+    if claim and not state.refresher.probe_now():
+        state.checks.release_manual_claim(claim)
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",
