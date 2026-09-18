@@ -348,6 +348,77 @@ this phase's own.
 
 ---
 
+### Amendments after research (2026-09-18)
+
+Research (`31-RESEARCH.md`) executed rather than read — it ran zizmor, built the wheel,
+measured volume ownership, and read Dependabot's parser source. Five decisions above are
+amended as a result. **These amendments are locked; treat them exactly as the D-numbered
+decisions they modify.**
+
+- **D-13 AMENDED (user decision):** `docs.yml` moves to the **Pages-artifact flow** —
+  `mkdocs build --strict` → `actions/upload-pages-artifact` → `actions/deploy-pages`.
+  `mkdocs gh-deploy` **cannot** satisfy D-15: it pushes using the checkout's persisted
+  credentials, so zizmor raises `artipacked`; `persist-credentials: false` breaks the
+  deploy, omitting it is a finding, and suppression is forbidden. The artifact flow was
+  measured at zero findings, exit 0. Two consequences:
+  - **Blocker 5 changes** to *Settings → Pages → Source: **GitHub Actions*** (not "serve
+    the `gh-pages` branch").
+  - GitHub auto-creates a **third** environment, `github-pages`, alongside D-18's
+    `testpypi` and `pypi`. D-18's "two environments" refers to the publish environments
+    only and is otherwise unchanged.
+  - The docs job needs **no `libsane-dev`**:
+    `uv sync --locked --only-group dev --no-install-project` installs mkdocs-material
+    without building `python-sane`.
+
+- **D-27 AMENDED:** Dependabot's Docker parser matches **`FROM` lines only** — it
+  explicitly skips `COPY --from=` (verified in `dependabot-core`'s
+  `docker/lib/dependabot/docker/file_parser.rb`). A digest pin written directly on the
+  `COPY --from=ghcr.io/astral-sh/uv:…` line would never be updated. Restructure to
+  `FROM ghcr.io/astral-sh/uv:<ver>@sha256:… AS uv` followed by
+  `COPY --from=uv /uv /usr/local/bin/uv`, so Dependabot sees it. Also: adding a second
+  `updates:` entry creates a `dependabot-cooldown` zizmor finding unless **both** entries
+  carry a `cooldown:` block.
+
+- **D-36/D-38 AMENDED (user decision):** in **serve** mode the stream renders
+  **tracebacks**, with or without `-v`. Phase 28 D-06's traceback-free rule was justified
+  by "stderr is the user's terminal now" — that is false for a service, where the stream
+  *is* the log and `docker logs`/journald is nobody's terminal, and where no file exists
+  to carry the traceback instead. **CLI mode is unchanged**: traceback-free unless `-v`,
+  exactly as Phase 28 wrote it. D-38's "`-v` is unchanged in serve" still holds for what
+  `-v` *means* (saneless loggers at DEBUG; uvicorn and httpx never raised).
+
+- **D-08 CORRECTED:** the claim of "three enforcement points" was wrong.
+  `.pre-commit-config.yaml` has **no pytest hook** — its push stage runs ty, pyrefly,
+  ruff check and ruff format only. The guard therefore has **two** enforcement points
+  (CI, and a local `uv run pytest`) unless the plan also adds a pytest push hook. CI-02
+  is satisfied by CI alone, so this is not blocking; the plan may add the hook or not,
+  but it must not restate the false claim.
+
+- **D-05 RATIONALE CORRECTED:** neither `uv_build` 0.10.3 nor `twine check` errors when
+  the legacy license classifier is left alongside `license-expression`. The migration is
+  still correct and PEP 639 support is **verified working** (a real build produced
+  `saneless-0.2.0.dist-info/licenses/LICENSE` and `License-Expression: MIT`), but nothing
+  in the toolchain will catch a regression — so the classifier's **absence needs a static
+  assertion** in the test harness, like every other claim in this phase.
+
+**Verify-at-implementation (not settled):** research reports that zizmor 1.30.1 raises
+`self-repository` against `uses: ./.github/workflows/ci.yml` and demands
+`uses: $/.github/workflows/ci.yml`, citing a GitHub changelog of 2026-07-30 and runner
+≥ 2.336.0. GitHub's own reusable-workflows documentation still shows only the `./` form.
+The zizmor rule's existence is corroboration, and the release rehearsal would surface a
+break immediately — but the plan must **confirm the syntax against GitHub's current docs
+before writing it**, and fall back to `./` if the `$` form does not resolve.
+
+**Also carried from research:** `FLY002` rewrites `"-".join(("kris", "knigga"))` back
+into the literal string, which would defeat D-11. Research linted three clean
+alternatives; an f-string over named constants is its recommendation. And `S603` applies
+to shelling out to `git ls-files` — the fix is a literal argv with the path passed via
+`cwd=`, the shape `tests/test_scanner.py` and `tests/test_atomic_write.py` already use.
+
+**Standing project rule, restated for the planner:** Claude never runs `git tag`. Every
+tag in this phase is pushed by the user (D-20). No plan task may create a tag.
+
+
 ### Claude's Discretion
 
 - **RC tag shape and `latest` gating (D-23)** — pick the pre-release tag pattern and the
