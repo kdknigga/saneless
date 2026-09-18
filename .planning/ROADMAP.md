@@ -685,7 +685,19 @@ Plans:
   4. All actions are SHA-pinned with Dependabot, every job has a `permissions:` block, a zizmor audit runs in CI, the wheel carries the LICENSE via PEP 639, and `saneless --version` prints the installed version
   5. A reader following README and the docs site hits no false claim: every row of review section 8 is either corrected or the behaviour now matches, `saneless scan` examples run as written, and the new "Which setup do I have?" and trust-model pages resolve from the quick-start prerequisites
 
-**Plans**: TBD
+**Plans**: 10 plans in 8 waves
+
+Plans:
+- [ ] 31-01-PLAN.md — Packaging identity: version 0.2.0, PEP 639 license, `--version`, zizmor dev dependency
+- [ ] 31-02-PLAN.md — The rename and its guard in one commit, plus the README example and deep-link pins
+- [ ] 31-03-PLAN.md — The `serve` logging mode split: streams to stderr, writes no file
+- [ ] 31-04-PLAN.md — Workflow supply-chain hardening: SHA pins, permissions, zizmor, reusable CI gate, routed OIDC publish, Pages-artifact docs
+- [ ] 31-05-PLAN.md — Container hardening: non-root, digest pins, `WORKDIR`, `.dockerignore` allow-list, one port, no `*.png` glob
+- [ ] 31-06-PLAN.md — USB reconciliation, the "Which setup do I have?" page, and the no-auth sentences
+- [ ] 31-07-PLAN.md — Remaining doc-row corrections (30, 31, 32) and the `docs/PRD.md` move
+- [ ] 31-08-PLAN.md — The D-42 audit artifact: 34-row dispositions plus the D-44 re-check
+- [ ] 31-09-PLAN.md — Release prerequisites and the RC tag (blocked on user blockers 1-3, 5, 6)
+- [ ] 31-10-PLAN.md — Clean-machine verification of the published artefacts; restore 0.2.0 (blocked on user blocker 4)
 
 ### Phase 32: Suite Hygiene and Minor Sweep
 
