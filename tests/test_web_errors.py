@@ -343,6 +343,106 @@ def test_no_history_loader_without_refresh_history(client: TestClient) -> None:
     assert "/api/jobs/history" not in response.text
 
 
+# --- R3-CR-02: the status strip's swap target is exempt from the retarget ----
+
+# What htmx puts in the ``HX-Target`` request header: the target element's id
+# with no leading ``#``.  The strip's polling body carries ``hx-target="this"``
+# on ``<div id="checks-body">``, so its poll requests arrive with this value.
+_CHECKS_TARGET_HEADERS = {"HX-Request": "true", "HX-Target": "checks-body"}
+
+# Another element's id, to prove the exemption is one element's and not a
+# change to the application-wide error contract.
+_OTHER_TARGET_HEADERS = {"HX-Request": "true", "HX-Target": "status-area"}
+
+_TARGETED_HEADER_SETS = [_OTHER_TARGET_HEADERS, HTMX_HEADERS]
+_TARGETED_HEADER_IDS = ["other-target", "no-target"]
+
+
+class TestChecksPollTargetIsExemptFromTheRetarget:
+    """
+    A failing checks poll is swapped into the strip, not into the message slot.
+
+    ``render_error`` sets ``HX-Retarget: #status-message`` so an error never
+    lands in the element the request was aimed at (D-02, D-03).  For exactly
+    one element that rule kept a defect alive: htmx 2.0.8 applies
+    ``HX-Retarget`` to the response's target *before* it decides what to swap,
+    so a 4xx from ``GET /api/checks`` was written into ``#status-message`` and
+    ``#checks-body`` was never replaced -- keeping its ``every 2s`` trigger for
+    the life of the tab and overwriting the scan-progress line twice a minute
+    (R3-CR-02).
+
+    The strip is the one element whose error response must land on itself,
+    because it is the one element that polls, and an armed htmx poll ends only
+    when the element leaves the DOM.  These cases pin the exemption to that one
+    id and pin every other target to the unchanged contract.
+    """
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_a_checks_poll_error_is_not_retargeted(
+        self, client: TestClient, rejection: RequestRejection
+    ) -> None:
+        """The strip's own target gets neither retarget header (R3-CR-02)."""
+        status = rejection_status_code(rejection)
+        response = client.get(
+            f"/_test/reject/{rejection.value}", headers=_CHECKS_TARGET_HEADERS
+        )
+        assert response.status_code == status
+        assert "hx-retarget" not in response.headers
+        assert "hx-reswap" not in response.headers
+        assert response.text.strip() == _error_body(rejection, status)
+
+    def test_an_exempt_error_still_carries_retry_after(
+        self, client: TestClient
+    ) -> None:
+        """Dropping the retarget drops nothing else: a 429 keeps Retry-After."""
+        response = client.get(
+            "/_test/reject/QUEUE_FULL", headers=_CHECKS_TARGET_HEADERS
+        )
+        assert response.status_code == 429
+        assert response.headers["Retry-After"] == str(errors.RETRY_AFTER_SECONDS)
+        assert "hx-retarget" not in response.headers
+
+    def test_an_exempt_error_still_carries_the_allow_header(
+        self, client: TestClient
+    ) -> None:
+        """A 405's ``Allow`` survives the exemption (WR-08, RFC 9110 15.5.6)."""
+        response = client.get("/api/scan", headers=_CHECKS_TARGET_HEADERS)
+        assert response.status_code == 405
+        allowed = {method.strip() for method in response.headers["Allow"].split(",")}
+        assert "POST" in allowed
+        assert "hx-retarget" not in response.headers
+        assert "hx-reswap" not in response.headers
+
+    @pytest.mark.parametrize("headers", _TARGETED_HEADER_SETS, ids=_TARGETED_HEADER_IDS)
+    def test_every_other_htmx_error_is_still_retargeted(
+        self, client: TestClient, headers: dict[str, str]
+    ) -> None:
+        """The exemption is an exemption, not a new app-wide contract (D-02)."""
+        rejection = RequestRejection.QUEUE_FULL
+        response = client.get(f"/_test/reject/{rejection.value}", headers=headers)
+        _assert_htmx_error(response, rejection, rejection_status_code(rejection))
+
+    @pytest.mark.parametrize(
+        "target", ["checks-body", "status-area"], ids=["strip", "other"]
+    )
+    def test_a_plain_request_is_json_for_either_target(
+        self, client: TestClient, target: str
+    ) -> None:
+        """Without ``HX-Request`` the target header changes nothing (D-04)."""
+        rejection = RequestRejection.QUEUE_FULL
+        response = client.get(
+            f"/_test/reject/{rejection.value}", headers={"HX-Target": target}
+        )
+        _assert_json_error(response, rejection, rejection_status_code(rejection))
+
+    def test_the_exempt_id_is_the_id_the_strip_template_ships(
+        self, client: TestClient
+    ) -> None:
+        """Renaming one of the two fails here rather than un-fixing the defect."""
+        strip = client.get("/api/checks").text
+        assert f'id="{errors.CHECKS_POLL_TARGET_ID}"' in strip
+
+
 # The disclosure, captured whole. It nests no <details>, so a non-greedy body is
 # exact rather than merely convenient.
 _TECH_DETAILS = re.compile(

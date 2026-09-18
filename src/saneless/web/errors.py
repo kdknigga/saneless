@@ -5,7 +5,9 @@ Route-raised ``HTTPException``s, the router's and ``StaticFiles``' 404 and 405,
 request validation failures and any unhandled exception all end in
 ``render_error`` (D-01).  An htmx request gets the error partial, retargeted
 into the page's ``#status-message`` slot so an error never lands in the element
-the request was aimed at (D-02, D-03); any other request gets
+the request was aimed at (D-02, D-03) -- with one exemption, the polling status
+strip, whose failure has to land on itself to end the poll
+(``CHECKS_POLL_TARGET_ID``, R3-CR-02).  Any other request gets
 ``{"status": "error", "detail": <message>}`` with the same status code, and a
 429 carries ``Retry-After`` on both branches (D-04).
 
@@ -46,6 +48,7 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
 __all__ = [
+    "CHECKS_POLL_TARGET_ID",
     "RETRY_AFTER_SECONDS",
     "RequestRejected",
     "install_error_handlers",
@@ -58,6 +61,24 @@ logger = logging.getLogger(__name__)
 # How long a client is told to wait after a 429.  A scan takes tens of seconds,
 # so a shorter hint would only invite a retry that is rejected again.
 RETRY_AFTER_SECONDS: Final = 30
+
+# The one element whose error response must land on itself.  htmx sends the
+# target element's id in the ``HX-Target`` request header with no leading
+# ``#``, so this is compared against that header verbatim; it is the id
+# ``partials/checks.html`` gives its swap target, and a test asserts the two
+# agree (R3-CR-02).
+#
+# The status strip is the only element in this application that polls, and an
+# armed htmx poll is ended by exactly two things: the element leaving the DOM
+# (``ct()`` re-arms only while ``se(e)``, i.e. while the element is still
+# attached) or an HTTP 286.  Removing an attribute does not end it -- the loop
+# never re-reads ``hx-trigger``.  Retargeting the strip's own failure into
+# ``#status-message`` therefore left ``#checks-body`` on the page with its
+# ``every 2s`` trigger intact, polling for the life of the tab and overwriting
+# the scan-progress line every two seconds.  Exempting this one id is what lets
+# the failure be swapped by the polling element's own ``hx-target="this"
+# hx-swap="outerHTML"``, which detaches it and ends the chain.
+CHECKS_POLL_TARGET_ID: Final = "checks-body"
 
 _TOO_MANY_REQUESTS = 429
 _NOT_FOUND = 404
@@ -156,6 +177,18 @@ def render_error(
     the partial keeps no rule of its own: it reloads exactly when a row was
     written, which is exactly when there is an id to name (D-05).
 
+    One target is exempt from the retarget: a request whose ``HX-Target`` is
+    ``CHECKS_POLL_TARGET_ID`` gets its error body with no ``HX-Retarget`` and
+    no ``HX-Reswap``, so the status strip's own failure replaces the status
+    strip (R3-CR-02).  Two facts make that the fix.  htmx 2.0.8 applies
+    ``HX-Retarget`` to the response's target *before* it decides what to swap,
+    so the header did not merely redirect the error -- it also spared
+    ``#checks-body``, which kept its ``every 2s`` trigger and kept polling,
+    overwriting the scan-progress line in ``#status-message`` twice a minute.
+    And ``base.html``'s ``{"code":"[45]..","swap":true,"error":true}`` rule is
+    what makes an error body swap at all, so it is load-bearing here: without
+    it the exempt response would be discarded and the poll would survive.
+
     Args:
         request: The request being answered.
         rejection: The vocabulary member whose message is shown.
@@ -165,8 +198,10 @@ def render_error(
             keep, such as a 405's ``Allow`` (WR-08, RFC 9110 section 15.5.6).
 
     Returns:
-        The error partial retargeted to ``#status-message`` for an htmx
-        request, otherwise the JSON error shape.
+        The error partial for an htmx request, retargeted to
+        ``#status-message`` unless the request targeted
+        ``CHECKS_POLL_TARGET_ID``, in which case it is left to be swapped by
+        the target's own rule; otherwise the JSON error shape.
 
     """
     headers: dict[str, str] = dict(extra_headers or {})
@@ -174,8 +209,9 @@ def render_error(
         headers["Retry-After"] = str(RETRY_AFTER_SECONDS)
     message = rejection_message(rejection)
     if request.headers.get("HX-Request") == "true":
-        headers["HX-Retarget"] = "#status-message"
-        headers["HX-Reswap"] = "innerHTML"
+        if request.headers.get("HX-Target") != CHECKS_POLL_TARGET_ID:
+            headers["HX-Retarget"] = "#status-message"
+            headers["HX-Reswap"] = "innerHTML"
         return request.app.state.templates.TemplateResponse(
             request,
             "partials/error.html",
