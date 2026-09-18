@@ -341,6 +341,39 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     }
 
 
+def _checks_fallback_context() -> dict[str, object]:
+    """
+    Build the strip the route falls back to when its own render raises.
+
+    Every value here is a developer-authored constant, and that is the whole
+    point: this body is rendered on a page the whole LAN can read, so no part
+    of the exception that produced it may reach the context (ASVS V7, Phase 26
+    D-10, T-30-32-03).  The exception goes to ``logger.exception`` instead.
+
+    ``checks`` is ``None`` and ``checking_rows`` is the cold-start five, so the
+    strip shows five *named* rows rather than an empty list that would read as
+    "nothing to report".  ``freshness_line`` is ``POLL_GAVE_UP_LINE``, which is
+    true here for the same reason it is true at the cap -- nothing has been
+    checked -- and it names the ``Check again`` button that is still on the
+    page, which is the one way forward left.  ``scan_active`` is ``False``
+    because the render that would have read the worker is the one that failed.
+    ``poll_attempt`` is ``None``, and that is what ends the chain: the template
+    emits its request attributes only when it is set, so the body this context
+    renders carries no trigger and the browser stops asking.
+
+    Returns:
+        The same five keys ``_checks_context`` returns.
+
+    """
+    return {
+        "checks": None,
+        "checking_rows": _CHECKING_ROWS,
+        "freshness_line": POLL_GAVE_UP_LINE,
+        "scan_active": False,
+        "poll_attempt": None,
+    }
+
+
 def _get_cached_or_fetch(
     cache: MetadataCache,
     paperless: PaperlessClient,
@@ -1267,7 +1300,7 @@ def followed_job_status(request: Request, job_id: str) -> Response:
 @router.get("/api/checks")
 def get_checks(
     request: Request,
-    attempt: Annotated[int, Query(ge=0, le=POLL_ATTEMPT_CAP)] = 0,
+    attempt: Annotated[int, Query()] = 0,
 ) -> Response:
     """
     Render the status strip from the cache.
@@ -1282,15 +1315,31 @@ def get_checks(
     body names the number the next request should carry, so the count lives in
     the URL rather than on the server: the strip is one shared cache read and
     there is nothing per-tab to keep, and a browser that goes away takes its
-    count with it.  It is bounded at the route by ``Query``, the same idiom the
-    tag filter's ``max_length`` uses, so a crafted value is a 422 and never
-    reaches the context.  The value is never rendered into the visible body --
-    only into the next request's URL.
+    count with it.
+
+    This route no longer hands its own ordinary failures to ``render_error``
+    (R3-CR-02).  An error response is the one thing the polling element cannot
+    usefully receive, so both of the failures this handler can see end as a
+    trigger-free strip at 200 instead.  An out-of-range counter is clamped
+    rather than refused: the ``Query`` bound that used to make it a 422 is
+    gone, and the clamp into ``0..POLL_ATTEMPT_CAP`` runs before anything
+    else reads the value.  The property that bound was defending is unchanged
+    -- a crafted number still never reaches ``_checks_context`` and is still
+    never rendered into the visible body, because only the clamped number is
+    used and only the clamped number goes into the next request's URL.  What
+    changed is the failure mode: past the cap the clamp lands on the cap, which
+    is the give-up body, so an out-of-range counter ends the chain quietly,
+    which is what the strip wanted all along.  A failure inside the watcher
+    stamp or the context build is caught and rendered as
+    ``_checks_fallback_context``.  The ``TemplateResponse`` call stays outside
+    the guard, so there is exactly one render path and one status code.
 
     Args:
         request: The incoming request.
         attempt: Which attempt this is, counted from the zero a page render
-            starts at.  At ``POLL_ATTEMPT_CAP`` the response carries no request
+            starts at.  Clamped into ``0..POLL_ATTEMPT_CAP`` here, so a value
+            below zero is read as the start of a fresh chain and a value above
+            the cap is read as the cap, where the response carries no request
             attribute at all and the strip stops asking.
 
     Returns:
@@ -1298,11 +1347,17 @@ def get_checks(
 
     """
     state = request.app.state
-    state.refresher.note_watcher()
+    counted = min(max(attempt, 0), POLL_ATTEMPT_CAP)
+    try:
+        state.refresher.note_watcher()
+        context = _checks_context(state, attempt=counted)
+    except Exception:
+        logger.exception("Failed to render the status strip")
+        context = _checks_fallback_context()
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",
-        _checks_context(state, attempt=attempt),
+        context,
     )
 
 
