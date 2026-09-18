@@ -7,7 +7,11 @@ request validation failures and any unhandled exception all end in
 into the page's ``#status-message`` slot so an error never lands in the element
 the request was aimed at (D-02, D-03) -- with one exemption, the polling status
 strip, whose failure has to land on itself to end the poll
-(``CHECKS_POLL_TARGET_ID``, R3-CR-02).  Any other request gets
+(``CHECKS_POLL_TARGET_ID``, R3-CR-02).  That exemption is for the strip
+fetching itself, so it is keyed on the method as well as the target: a GET
+aimed at the strip is its poll or its terminal-state reload, while a POST aimed
+at it is the ``Check again`` button, whose failure goes to the slot like any
+other click's (R4-WR-01).  Any other request gets
 ``{"status": "error", "detail": <message>}`` with the same status code, and a
 429 carries ``Retry-After`` on both branches (D-04).
 
@@ -78,6 +82,16 @@ RETRY_AFTER_SECONDS: Final = 30
 # the scan-progress line every two seconds.  Exempting this one id is what lets
 # the failure be swapped by the polling element's own ``hx-target="this"
 # hx-swap="outerHTML"``, which detaches it and ends the chain.
+#
+# The id alone does not identify the poll.  ``Check again`` in the same partial
+# is ``hx-post="/api/checks/refresh" hx-target="#checks-body"``, so its click
+# arrives carrying the same header, and exempting it too meant a failing click
+# wrote the error body over the strip -- five rows and the only button that
+# could bring them back, gone for the life of the tab (R4-WR-01).  So the
+# exemption also requires a GET (``_is_the_strip_fetching_itself``): the
+# strip's poll and its terminal-state reload are both ``GET /api/checks``, the
+# strip asking for its own body, and the one POST aimed at the strip is the
+# button, an action whose failure belongs in the slot with every other click's.
 CHECKS_POLL_TARGET_ID: Final = "checks-body"
 
 _TOO_MANY_REQUESTS = 429
@@ -155,6 +169,32 @@ def rejection_for_status(status_code: int) -> RequestRejection:
     return rejection
 
 
+def _is_the_strip_fetching_itself(request: Request) -> bool:
+    """
+    Say whether this request is the status strip asking for its own body.
+
+    That is the one request whose error must be swapped over the element it
+    was aimed at rather than retargeted, because it is the one element that
+    polls (see ``CHECKS_POLL_TARGET_ID``).  Two things identify it and both are
+    needed.  The target header names the strip, and the method is GET: the
+    strip's poll and its terminal-state reload both fetch ``/api/checks``,
+    while the only other request aimed at the strip is the ``Check again``
+    button's POST, which is an action and not a fetch, and whose failure is
+    reported the way every other click's is (R4-WR-01).
+
+    Args:
+        request: The request being answered.
+
+    Returns:
+        True for a GET whose ``HX-Target`` is ``CHECKS_POLL_TARGET_ID``.
+
+    """
+    return (
+        request.method == "GET"
+        and request.headers.get("HX-Target") == CHECKS_POLL_TARGET_ID
+    )
+
+
 def render_error(
     request: Request,
     rejection: RequestRejection,
@@ -177,10 +217,13 @@ def render_error(
     the partial keeps no rule of its own: it reloads exactly when a row was
     written, which is exactly when there is an id to name (D-05).
 
-    One target is exempt from the retarget: a request whose ``HX-Target`` is
-    ``CHECKS_POLL_TARGET_ID`` gets its error body with no ``HX-Retarget`` and
-    no ``HX-Reswap``, so the status strip's own failure replaces the status
-    strip (R3-CR-02).  Two facts make that the fix.  htmx 2.0.8 applies
+    One request is exempt from the retarget: a GET whose ``HX-Target`` is
+    ``CHECKS_POLL_TARGET_ID`` -- the strip fetching itself -- gets its error
+    body with no ``HX-Retarget`` and no ``HX-Reswap``, so the status strip's
+    own failure replaces the status strip (R3-CR-02).  The method is part of
+    the key because the ``Check again`` button targets the same id, and a
+    click's failure must not take the strip with it (R4-WR-01).  Two facts
+    make the exemption the fix.  htmx 2.0.8 applies
     ``HX-Retarget`` to the response's target *before* it decides what to swap,
     so the header did not merely redirect the error -- it also spared
     ``#checks-body``, which kept its ``every 2s`` trigger and kept polling,
@@ -199,9 +242,9 @@ def render_error(
 
     Returns:
         The error partial for an htmx request, retargeted to
-        ``#status-message`` unless the request targeted
-        ``CHECKS_POLL_TARGET_ID``, in which case it is left to be swapped by
-        the target's own rule; otherwise the JSON error shape.
+        ``#status-message`` unless the request is the strip fetching itself
+        (a GET targeting ``CHECKS_POLL_TARGET_ID``), in which case it is left
+        to be swapped by the target's own rule; otherwise the JSON error shape.
 
     """
     headers: dict[str, str] = dict(extra_headers or {})
@@ -209,7 +252,7 @@ def render_error(
         headers["Retry-After"] = str(RETRY_AFTER_SECONDS)
     message = rejection_message(rejection)
     if request.headers.get("HX-Request") == "true":
-        if request.headers.get("HX-Target") != CHECKS_POLL_TARGET_ID:
+        if not _is_the_strip_fetching_itself(request):
             headers["HX-Retarget"] = "#status-message"
             headers["HX-Reswap"] = "innerHTML"
         return request.app.state.templates.TemplateResponse(
