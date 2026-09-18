@@ -884,7 +884,7 @@ wheels = [
 
 [[package]]
 name = "saneless"
-version = "0.2.0"
+version = "0.2.0rc1"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
