@@ -11,7 +11,7 @@ Every requirement below resolves one or more findings from `.planning/reviews/20
 ### CI Gate
 
 - [x] **CI-01**: Every push and pull request runs ruff check, ruff format --check, ty, pyrefly, and the non-browser pytest suite in GitHub Actions, and a red run blocks merge [M-25]
-- [ ] **CI-02**: CI fails if any shipped file references `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, or `ghcr.io/kris-knigga/saneless` (grep guard, excluding `.planning/` and `site/`) [M-27]
+- [x] **CI-02**: CI fails if any shipped file references `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, or `ghcr.io/kris-knigga/saneless` (grep guard, excluding `.planning/` and `site/`) [M-27]
 
 ### Contracts and Vocabulary
 
@@ -141,10 +141,10 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 ### Delivery and Identity
 
-- [ ] **DLVR-01**: Every reference to `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, and `ghcr.io/kris-knigga/saneless` in shipped files (24 lines in nine files) is updated to the `kdknigga/saneless` forms; the PyPI distribution name stays `saneless` [M-27, doc row 19]
+- [x] **DLVR-01**: Every reference to `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, and `ghcr.io/kris-knigga/saneless` in shipped files (24 lines in nine files) is updated to the `kdknigga/saneless` forms; the PyPI distribution name stays `saneless` [M-27, doc row 19]
 - [ ] **DLVR-02**: The release workflow succeeds end to end: PyPI trusted publisher and GHCR package configured for `kdknigga/saneless`, the unresolvable `pypa/gh-action-pypi-publish@v1.12` ref fixed, and a pre-release tag rehearsed against TestPyPI verified by a `pip install` and `docker pull` from a clean machine [M-26]
 - [x] **DLVR-03**: All GitHub Actions are pinned to commit SHAs with a Dependabot config, every job has a `permissions:` block, and a workflow audit (zizmor) runs in CI [N-31]
-- [ ] **DLVR-04**: Container logs appear in `docker logs` (stderr handler enabled in the container command) [M-28]
+- [x] **DLVR-04**: Container logs appear in `docker logs` (stderr handler enabled in the container command) [M-28]
 - [ ] **DLVR-05**: The example config, `EXPOSE`, and `HEALTHCHECK` agree on one port [M-29, doc row 21]
 - [ ] **DLVR-06**: A `.dockerignore` allow-list keeps config files, secrets, `.planning/`, and tests out of the build context [M-31]
 - [ ] **DLVR-07**: The container runs as a non-root user, base images are pinned by digest, and a `WORKDIR` is set so relative writes do not land in `/` [N-26]
@@ -155,7 +155,7 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 ### Documentation Accuracy
 
 - [ ] **DOCS-01**: Every false claim in review section 8 (rows 1 through 34) is corrected or the behaviour is implemented, and each behaviour change in this milestone updates the sentence that described the old behaviour in the same phase [section 8]
-- [ ] **DOCS-02**: README examples run as written: `saneless scan` shows the required `--title`, `source` values match real SANE spelling, and the tutorial link resolves [N-42, doc row 16, 17, 18]
+- [x] **DOCS-02**: README examples run as written: `saneless scan` shows the required `--title`, `source` values match real SANE spelling, and the tutorial link resolves [N-42, doc row 16, 17, 18]
 - [ ] **DOCS-03**: The internal `docs/PRD.md` is removed from the published site (or updated to match the shipped code), and the README's tutorial link points at the getting-started page [N-29, doc row 34]
 - [ ] **DOCS-04**: A "Which setup do I have?" page gives the exact compose lines for USB-on-host, network scanner, and `saned` elsewhere, linked from the quick-start prerequisites; the contradictory USB statements are reconciled [U-10, doc row 29]
 - [ ] **DOCS-05**: The getting-started and Docker pages state in one sentence that the UI has no login and binds all interfaces by default, and point at the reverse-proxy option [U-09]
@@ -238,7 +238,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | CI-01 | Phase 20 — CI Gate | Complete |
-| CI-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| CI-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | CTR-01 | Phase 21 — Vocabulary and Contracts | Complete |
 | CTR-02 | Phase 21 — Vocabulary and Contracts | Partial — typed `ScanResult` shipped; `ScanOutcome.FAILED` deferred to Phase 23 with the code path that produces it (D-07) |
 | CTR-03 | Phase 21 — Vocabulary and Contracts | Complete |
@@ -325,10 +325,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | APPL-10 | Phase 30 — Appliance Layer | Complete |
 | APPL-11 | Phase 30 — Appliance Layer | Complete |
 | APPL-12 | Phase 30 — Appliance Layer | Complete |
-| DLVR-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DLVR-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
-| DLVR-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DLVR-06 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DLVR-07 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
@@ -336,7 +336,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DLVR-09 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DLVR-10 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
-| DOCS-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DOCS-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DOCS-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
