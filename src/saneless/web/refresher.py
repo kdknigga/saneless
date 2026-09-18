@@ -50,9 +50,11 @@ class CheckRefresher:
     D-07 names -- a daemon thread built in ``__init__`` and started separately,
     a ``_stopping`` :class:`threading.Event` set once by :meth:`stop`, an
     ``Event.wait`` idle sleep rather than a blocking one so stopping wakes it
-    at once, and a join bounded by the same ``STOP_JOIN_SECONDS`` imported from
-    that module rather than redefined -- or, when the lifespan brings both
-    threads down against one deadline, by whatever is left of it (WR-07).
+    at once, a per-tick ``try``/``except Exception`` so nothing but stopping
+    ends the loop (ROBU-01), and a join bounded by the same
+    ``STOP_JOIN_SECONDS`` imported from that module rather than redefined --
+    or, when the lifespan brings both threads down against one deadline, by
+    whatever is left of it (WR-07).
 
     Every dependency is injected, and the context arrives from a factory rather
     than from ``app.state``, so the policy can be exercised by calling
@@ -206,7 +208,7 @@ class CheckRefresher:
 
     def _run(self) -> None:
         """
-        Tick until stopped.
+        Tick until stopped, and let nothing but stopping end the loop.
 
         ``Event.wait`` is the idle sleep here, and a blocking sleep is never
         used: setting the event returns from the wait immediately, so
@@ -215,7 +217,19 @@ class CheckRefresher:
         worker's blocked ``get()``.
         """
         while not self._stopping.wait(TICK_SECONDS):
-            self._tick()
+            try:
+                self._tick()
+            except Exception:
+                # The backstop ``ScanWorker._run`` puts round each job, for
+                # the rule it names there: nothing ends the loop but stopping
+                # (ROBU-01).  Without it one raise anywhere in a tick ends
+                # this thread for the life of the process, and a dead
+                # refresher is a strip that never updates again and says
+                # nothing about it -- the operator sees a last-checked time
+                # that simply stops moving (R3-WR-02).  The ``wait`` above
+                # stays outside the guard, so stopping is still the one thing
+                # that ends the loop.
+                logger.exception("Check refresher tick failed; continuing")
 
     @property
     def probe_in_flight(self) -> bool:
