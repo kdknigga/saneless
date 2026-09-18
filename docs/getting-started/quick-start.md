@@ -8,6 +8,10 @@ Get from zero to your first scanned document in paperless-ngx in under five minu
 - A **running paperless-ngx instance** with an API token (generate one under Settings > API Tokens)
 - **Docker** (recommended) or **Python 3.14**
 
+Not sure which deployment shape you are in? Read [Which setup do I have?](which-setup.md) first -- it takes a minute and decides everything below.
+
+The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyone who can reach the port can scan; put it [behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy) if that is not what you want.
+
 ## Install
 
 === "Docker"
