@@ -30,6 +30,7 @@ from __future__ import annotations
 import inspect
 import logging
 import re
+from contextlib import contextmanager
 from html import unescape
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -558,10 +559,35 @@ def _raise_inside_the_checks_route(
         monkeypatch.setattr(_app(client).state.refresher, target, boom)
 
 
+@contextmanager
+def _a_probe_in_flight(client: TestClient) -> Iterator[None]:
+    """
+    Hold the refresher's single-flight lock for the body of the ``with``.
+
+    This is how a test makes ``probe_in_flight`` true without running a probe:
+    the route reads ``Lock.locked()`` and never acquires, so a lock this thread
+    holds is indistinguishable, to the render, from one a checker holds.
+
+    Args:
+        client: The client whose application owns the lock.
+
+    Yields:
+        Nothing; the lock is held for the duration of the block.
+
+    """
+    lock = _refresher(client).probe_lock
+    assert lock.acquire(blocking=False) is True
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 # How far a poll chain is followed before it is called unbounded.  Comfortably
-# past any cap the strip could sanely carry, so a chain that reaches this many
-# links has not been capped, it has been left running.
-_POLL_CHAIN_LIMIT = 60
+# past any cap the strip could sanely carry -- including
+# ``POLL_PROBE_ATTEMPT_CAP``, the larger of the two -- so a chain that reaches
+# this many links has not been capped, it has been left running.
+_POLL_CHAIN_LIMIT = 200
 
 
 def _poll_target(markup: str) -> str | None:
@@ -946,7 +972,7 @@ class TestBoundedPoll:
         is unchanged: what changed is the status code an out-of-range value
         earns, never whether the value itself is trusted.
         """
-        cap = checks_module.POLL_ATTEMPT_CAP
+        cap = checks_module.POLL_PROBE_ATTEMPT_CAP
         seen: list[int] = []
         real = routes_module._checks_context
 
@@ -956,7 +982,7 @@ class TestBoundedPoll:
             return real(state, attempt=attempt)
 
         monkeypatch.setattr(routes_module, "_checks_context", recording)
-        for crafted in ("99", "-5", str(cap + 1)):
+        for crafted in ("999999", "-5", str(cap + 1)):
             body = client.get(f"/api/checks?attempt={crafted}").text
             assert crafted not in unescape(_body_attrs(body)), (crafted, body)
         assert seen == [cap, 0, cap]
@@ -1434,25 +1460,23 @@ class TestCollapsedRefreshStillDelivers:
             lock.release()
         assert "/api/checks?attempt=4" in attrs
 
-    def test_the_settling_poll_stops_at_the_same_cap_the_cold_start_uses(
+    def test_the_settling_poll_stops_at_the_cap_that_applies_to_a_live_probe(
         self, client: TestClient
     ) -> None:
         """
         T-30-29-02: a probe wedged in a getaddrinfo cannot make a tab ask forever.
 
-        The settling poll rides the same ``attempt`` parameter, already bounded
-        at the route by ``Query(le=POLL_ATTEMPT_CAP)``, so it ends where the
-        cold start's does.
+        The settling poll rides the same ``attempt`` parameter, and while a
+        probe demonstrably holds the single-flight lock the bound that applies
+        to it is ``POLL_PROBE_ATTEMPT_CAP`` rather than ``POLL_ATTEMPT_CAP``
+        (R3-WR-04).  It is still a bound: ``Lock.locked()`` stays true forever
+        if the holder dies, so the larger window is a cap and not an exemption.
         """
         _warm_the_cache(client)
-        lock = _refresher(client).probe_lock
-        assert lock.acquire(blocking=False) is True
-        try:
+        with _a_probe_in_flight(client):
             markup = client.get(
-                f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+                f"/api/checks?attempt={checks_module.POLL_PROBE_ATTEMPT_CAP}"
             ).text
-        finally:
-            lock.release()
         assert "hx-" not in _body_attrs(markup)
 
     def test_a_settling_poll_that_runs_out_keeps_its_last_checked_line(
@@ -1466,14 +1490,10 @@ class TestCollapsedRefreshStillDelivers:
         itself, so ``gave_up`` still requires an empty cache.
         """
         _warm_the_cache(client)
-        lock = _refresher(client).probe_lock
-        assert lock.acquire(blocking=False) is True
-        try:
+        with _a_probe_in_flight(client):
             markup = client.get(
-                f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+                f"/api/checks?attempt={checks_module.POLL_PROBE_ATTEMPT_CAP}"
             ).text
-        finally:
-            lock.release()
         match = _CHECK_META.search(markup)
         assert match is not None, markup
         meta = match.group("text").strip()
@@ -1488,16 +1508,14 @@ class TestCollapsedRefreshStillDelivers:
 
         One longer than the cap, for the same reason the cold chain is: its
         first link is the bare route, the body a page render already carries.
+        The cap it ends at is ``POLL_PROBE_ATTEMPT_CAP``, because the lock is
+        held for the whole walk (R3-WR-04).
         """
         _warm_the_cache(client)
-        lock = _refresher(client).probe_lock
-        assert lock.acquire(blocking=False) is True
-        try:
+        with _a_probe_in_flight(client):
             followed = _follow_the_poll(client, _POLL_CHAIN_LIMIT)
-        finally:
-            lock.release()
         record_property("settling_poll_chain_length", len(followed))
-        assert len(followed) == checks_module.POLL_ATTEMPT_CAP + 1, followed
+        assert len(followed) == checks_module.POLL_PROBE_ATTEMPT_CAP + 1, followed
 
     def test_results_and_an_idle_probe_still_carry_no_trigger(
         self, client: TestClient
@@ -1507,6 +1525,189 @@ class TestCollapsedRefreshStillDelivers:
         assert _refresher(client).probe_in_flight is False
         assert "hx-" not in _body_attrs(client.get("/api/checks").text)
         assert "hx-" not in _body_attrs(client.get("/").text)
+
+
+class TestTheWindowFollowsTheProbe:
+    """
+    R3-WR-04: the strip stops asking, but never while the first check is running.
+
+    ``POLL_ATTEMPT_CAP`` is ten attempts at two seconds -- about twenty seconds
+    -- and its comment justified that as "about two and a half times the worst
+    probe budget a cold start can cost".  Three things ``checks.py`` documents
+    elsewhere make that understate the worst case by more than an order of
+    magnitude: ``getaddrinfo`` sits outside every budget in the module, the
+    pre-probe pays it once per configured host up to ``_MAX_PROBE_HOSTS``, and
+    the ordinary local-USB deployment has no parseable host at all, skips the
+    pre-probe entirely and enters ``get_devices()``, which the same file costs
+    at roughly 127 s for a silently unreachable host.
+
+    So a cold start on a wedged scanner reached the cap with an empty cache and
+    printed "The checks have not run yet.  Press Check again to try now." while
+    the first probe was still legitimately in flight.  That is advice that
+    cannot help: the button starts the thing that is already running, the click
+    collapses into it, and the fresh chain gives up again twenty seconds later.
+
+    The window now follows the probe.  While a checker demonstrably holds the
+    single-flight lock the chain runs to ``POLL_PROBE_ATTEMPT_CAP`` instead and
+    the give-up line is withheld.  It is still a cap, and deliberately so:
+    ``Lock.locked()`` stays true forever if the holder dies, so a refresher
+    that died *inside* the lock must still make the asking stop.
+    """
+
+    def test_the_second_cap_bounds_the_worst_case_this_module_documents(self) -> None:
+        """
+        The larger cap is larger, and large enough for the 127 s enumeration.
+
+        Asserted against the figure ``checks.py`` states for a silently
+        unreachable ``get_devices()`` rather than against a number written
+        here, so a cap trimmed back below the probe it exists to outlast fails
+        instead of quietly reintroducing R3-WR-04.
+        """
+        assert checks_module.POLL_PROBE_ATTEMPT_CAP > checks_module.POLL_ATTEMPT_CAP, (
+            "the probe window must be the larger of the two"
+        )
+        assert checks_module.POLL_PROBE_ATTEMPT_CAP * 2 > 127
+
+    def test_the_still_checking_line_names_nothing_a_lan_reader_may_not_see(
+        self,
+    ) -> None:
+        """
+        The new sentence is held to ``POLL_GAVE_UP_LINE``'s rule (ASVS V7).
+
+        It renders on a page the whole LAN can read, so it names no host, port,
+        path, URL or exception text -- only what is happening and roughly how
+        long it can take.
+        """
+        line = checks_module.POLL_STILL_CHECKING_LINE
+        for forbidden in ("http", "://", "/", "\\", ":", "Error", "Traceback"):
+            assert forbidden not in line, (forbidden, line)
+
+    def test_a_cold_chain_with_nothing_in_flight_still_gives_up_at_the_first_cap(
+        self, client: TestClient
+    ) -> None:
+        """
+        The ending IN-07 needed is unchanged, and it is the contrast case.
+
+        Ten attempts is still the bound for a chain with nothing in flight --
+        an appliance whose refresher thread has died, and a tab left open in
+        front of it -- which is the case the cap was always sized for.
+        """
+        markup = client.get(
+            f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+        ).text
+        assert "hx-" not in _body_attrs(markup)
+        meta = _CHECK_META.search(markup)
+        assert meta is not None, markup
+        assert meta.group("text").strip() == checks_module.POLL_GAVE_UP_LINE
+
+    def test_a_cold_chain_waiting_on_a_probe_keeps_asking_past_the_first_cap(
+        self, client: TestClient
+    ) -> None:
+        """A chain that is waiting on a live probe is not out of attempts."""
+        cap = checks_module.POLL_ATTEMPT_CAP
+        with _a_probe_in_flight(client):
+            attrs = unescape(_body_attrs(client.get(f"/api/checks?attempt={cap}").text))
+        assert f"/api/checks?attempt={cap + 1}" in attrs, attrs
+
+    def test_a_cold_chain_waiting_on_a_probe_says_the_first_check_is_still_running(
+        self, client: TestClient
+    ) -> None:
+        """
+        The give-up line is withheld while the thing the button starts is running.
+
+        This is the sentence R3-WR-04 is about.  "Press Check again to try now"
+        beside a probe that is demonstrably in flight tells a household member
+        to do the one thing that cannot help.
+        """
+        with _a_probe_in_flight(client):
+            markup = client.get(
+                f"/api/checks?attempt={checks_module.POLL_ATTEMPT_CAP}"
+            ).text
+        meta = _CHECK_META.search(markup)
+        assert meta is not None, markup
+        line = meta.group("text").strip()
+        assert line == checks_module.POLL_STILL_CHECKING_LINE
+        assert line != checks_module.POLL_GAVE_UP_LINE
+
+    def test_a_probe_that_never_ends_still_stops_the_asking(
+        self, client: TestClient
+    ) -> None:
+        """
+        The second window is a cap, not an exemption (T-30-35-01).
+
+        A thread that died holding the single-flight lock leaves ``locked()``
+        true forever, and that is precisely the failure mode this area keeps
+        hitting, so the larger window has to end on its own too.
+        """
+        with _a_probe_in_flight(client):
+            markup = client.get(
+                f"/api/checks?attempt={checks_module.POLL_PROBE_ATTEMPT_CAP}"
+            ).text
+        assert "hx-" not in _body_attrs(markup)
+        meta = _CHECK_META.search(markup)
+        assert meta is not None, markup
+        assert meta.group("text").strip() == checks_module.POLL_GAVE_UP_LINE
+
+    def test_the_cold_chain_under_a_stuck_probe_is_bounded_by_the_second_cap(
+        self, client: TestClient, record_property: Callable[[str, object], None]
+    ) -> None:
+        """
+        Followed link by link with the lock never released, the chain still ends.
+
+        One longer than the cap, for the same reason every chain in this file
+        is: its first link is the bare route, the body a page render already
+        carries.
+        """
+        with _a_probe_in_flight(client):
+            followed = _follow_the_poll(client, _POLL_CHAIN_LIMIT)
+        record_property("cold_probe_chain_length", len(followed))
+        assert len(followed) == checks_module.POLL_PROBE_ATTEMPT_CAP + 1, len(followed)
+
+    def test_a_settling_chain_past_the_first_cap_keeps_its_last_checked_line(
+        self, client: TestClient
+    ) -> None:
+        """
+        Rows that did run keep their own sentence, whichever cap is in force.
+
+        Neither the give-up line nor the still-checking line belongs beside
+        five results: one says nothing has been checked and the other says the
+        *first* check is running, and both would be false here.
+        """
+        cap = checks_module.POLL_ATTEMPT_CAP
+        _warm_the_cache(client)
+        with _a_probe_in_flight(client):
+            markup = client.get(f"/api/checks?attempt={cap + 5}").text
+        attrs = unescape(_body_attrs(markup))
+        assert f"/api/checks?attempt={cap + 6}" in attrs, attrs
+        meta = _CHECK_META.search(markup)
+        assert meta is not None, markup
+        assert meta.group("text").strip().startswith("Last checked ")
+
+    def test_the_route_accepts_the_second_cap_and_clamps_anything_larger(
+        self, client: TestClient
+    ) -> None:
+        """
+        The clamp's upper bound is the larger cap, so a real attempt survives it.
+
+        Clamping a legitimate settling attempt down to ten would end the chain
+        early by arithmetic the browser never asked for, which is the bug the
+        larger window exists to remove.  Past the larger cap the clamp lands on
+        it, which is the ending, so an out-of-range counter is still a
+        trigger-free 200 and never a status code.
+        """
+        probe_cap = checks_module.POLL_PROBE_ATTEMPT_CAP
+        at_the_cap = client.get(f"/api/checks?attempt={probe_cap}")
+        assert at_the_cap.status_code == 200
+        assert "hx-" not in _body_attrs(at_the_cap.text)
+
+        with _a_probe_in_flight(client):
+            beyond = client.get(f"/api/checks?attempt={probe_cap + 1}")
+            legitimate = client.get(f"/api/checks?attempt={probe_cap - 1}")
+        assert beyond.status_code == 200
+        assert "hx-" not in _body_attrs(beyond.text)
+        assert f"/api/checks?attempt={probe_cap}" in unescape(
+            _body_attrs(legitimate.text)
+        )
 
 
 class TestFreshnessLine:
