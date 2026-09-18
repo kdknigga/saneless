@@ -69,7 +69,7 @@ from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web import routes as routes_module
 from saneless.web.app import create_app
-from saneless.web.checks_cache import CheckCache
+from saneless.web.checks_cache import MIN_MANUAL_REFRESH_SECONDS, CheckCache
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
@@ -557,6 +557,83 @@ def _raise_inside_the_checks_route(
         monkeypatch.setattr(routes_module, "_checks_context", boom)
     else:
         monkeypatch.setattr(_app(client).state.refresher, target, boom)
+
+
+class _RecordingCache(CheckCache):
+    """
+    The real cache, recording what a request was granted and what it gave back.
+
+    A subclass rather than a delegating stand-in, because the refresher and
+    the routes share the one cache instance and every other method -- the
+    store the probe makes, the read the render does -- has to be the real one
+    for the handler under test to behave as it does in production.  Only the
+    two claim methods are observed, and both still do their real work.
+    """
+
+    def __init__(self, clock: Callable[[], float]) -> None:
+        """Wrap a real cache on the given clock, with nothing recorded yet."""
+        super().__init__(clock=clock)
+        self.granted: list[float | None] = []
+        self.released: list[float] = []
+
+    def claim_manual_refresh(
+        self, min_interval: float = MIN_MANUAL_REFRESH_SECONDS
+    ) -> float | None:
+        """
+        Claim as the real cache does, recording what this call was told.
+
+        Args:
+            min_interval: The shortest gap between two grants, in seconds.
+
+        Returns:
+            The stamp this grant recorded, or None when it was too soon.
+
+        """
+        stamp = super().claim_manual_refresh(min_interval)
+        self.granted.append(stamp)
+        return stamp
+
+    def release_manual_claim(self, stamp: float) -> bool:
+        """
+        Release as the real cache does, recording the stamp handed in.
+
+        Args:
+            stamp: The value the handler carried from its grant.
+
+        Returns:
+            Whether the claim was cleared.
+
+        """
+        self.released.append(stamp)
+        return super().release_manual_claim(stamp)
+
+
+@contextmanager
+def _a_recording_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, start: float = 100.0
+) -> Iterator[tuple[TestClient, _RecordingCache]]:
+    """
+    Build a client whose check cache records the handler's claims and releases.
+
+    Substituted where the app builds its cache, for the reason the ``clocked``
+    fixture is: replacing ``app.state.checks`` afterwards would leave the
+    refresher holding the original and the two would no longer be one cache.
+
+    Args:
+        tmp_path: The directory the data and temp folders live in.
+        monkeypatch: The patcher the substitution is installed with.
+        start: The reading the cache's clock begins at.  0.0 is the reading a
+            freshly booted appliance really has, because ``time.monotonic()``
+            counts from boot on Linux.
+
+    Yields:
+        The client and the cache it and its refresher share.
+
+    """
+    cache = _RecordingCache(_FakeClock(start=start))
+    monkeypatch.setattr(app_module, "CheckCache", lambda: cache)
+    with TestClient(_make_app(tmp_path)) as tc:
+        yield tc, cache
 
 
 @contextmanager
@@ -1337,6 +1414,28 @@ class TestRefreshMinimumInterval:
         client.post("/api/checks/refresh")
         assert _refresher(client).watch_count == before + 2
 
+    def test_the_first_click_after_a_boot_is_a_grant_and_not_a_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        R3-IN-03: the handler reads the grant as ``is not None``, not as truthy.
+
+        ``time.monotonic()`` counts from boot on Linux, so the stamp a claim
+        records on a freshly booted appliance really can be 0.0 -- and 0.0 is
+        falsey.  A handler branching on the truth of the returned stamp would
+        read that grant as a refusal and never probe, which is the one click
+        that most deserves one: the floor is a rate limit, and the first
+        request after a boot has nothing to be limited against.
+
+        The cache records the grant, so this asserts against the value the
+        handler was really given rather than against one the test computed.
+        """
+        with _a_recording_cache(tmp_path, monkeypatch, start=0.0) as (client, cache):
+            spy = _spy(monkeypatch)
+            assert client.post("/api/checks/refresh").status_code == 200
+            assert cache.granted == [0.0]
+            assert spy.calls == 1
+
     def test_the_read_only_route_neither_claims_nor_probes(
         self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1410,6 +1509,28 @@ class TestCollapsedRefreshStillDelivers:
         assert spy.calls == 0
         assert client.post("/api/checks/refresh").status_code == 200
         assert spy.calls == 1
+
+    def test_a_collapsed_click_gives_back_the_stamp_it_was_granted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        R3-IN-03: the handler carries its own grant from the claim to the release.
+
+        The release is a compare-and-clear, so what it is handed decides
+        whether anything is given back at all.  The two values compared here
+        are both the cache's own records -- what it granted this request and
+        what it was asked to release -- so a handler that released a stamp it
+        computed for itself, from a fresh clock reading or from anywhere else,
+        fails this even when the two happen to be numerically close.
+        """
+        with _a_recording_cache(tmp_path, monkeypatch) as (client, cache):
+            _spy(monkeypatch)
+            _warm_the_cache(client)
+            with _a_probe_in_flight(client):
+                assert client.post("/api/checks/refresh").status_code == 200
+            assert len(cache.granted) == 1
+            assert cache.granted[0] is not None
+            assert cache.released == cache.granted
 
     def test_both_collapsed_refreshes_ask_for_the_result(
         self, clocked: _Clocked, monkeypatch: pytest.MonkeyPatch
