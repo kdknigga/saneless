@@ -61,10 +61,17 @@ from PIL import Image
 from playwright.sync_api import expect
 
 from saneless.checks import (
+    CHECKING_GLYPH,
     CHECKING_MESSAGE,
+    CHECKING_STATE_CLASS,
     POLL_ATTEMPT_CAP,
     POLL_GAVE_UP_LINE,
+    SKIPPED_STATE_LABEL,
     CheckKey,
+    CheckState,
+    check_state_class,
+    check_state_glyph,
+    check_state_label,
 )
 from saneless.config import (
     OutputConfig,
@@ -2864,7 +2871,7 @@ class TestStatusStripInChromium:
         self, page: Page, cold_strip_server: _BrowserServer
     ) -> None:
         """
-        The Scanner row is skipped and the freshness line says why (P4, D-08).
+        The Scanner row is skipped, marked neutral, and says why (P4, D-08).
 
         The two inputs are set to exactly what a live scan produces -- a current
         job on the worker, and the scanner gate held -- rather than by running
@@ -2872,6 +2879,12 @@ class TestStatusStripInChromium:
         subject and the skip decision is ``tests/test_refresher.py``'s; what is
         only provable here is that the pair of them renders as a paused strip
         rather than a stale or a blank one, which is the whole of D-08.
+
+        The marker assertions are R3-WR-03's, and this is the one place they
+        can be made against a skipped row the application really produced: the
+        row's state is ``CheckState.OK``, so before ``check_row_glyph`` existed
+        Chromium drew a green tick here, in front of a sentence saying nothing
+        had been checked, and announced it as "OK: Scanner".
         """
         server = cold_strip_server
         job_store: JobStore = server.app.state.job_store
@@ -2888,6 +2901,17 @@ class TestStatusStripInChromium:
                 expect(scanner_row).to_contain_text(
                     _SCANNER_PAUSED_MESSAGE, timeout=10_000
                 )
+
+                glyph = scanner_row.locator(".check-glyph")
+                classes = glyph.get_attribute("class") or ""
+                assert CHECKING_STATE_CLASS in classes.split(), classes
+                assert check_state_class(CheckState.OK) not in classes.split(), classes
+                assert glyph.inner_text() == CHECKING_GLYPH
+                assert check_state_glyph(CheckState.OK) not in scanner_row.inner_html()
+                spoken = scanner_row.locator(".sr-only").inner_text()
+                assert spoken == f"{SKIPPED_STATE_LABEL}:", spoken
+                assert spoken != f"{check_state_label(CheckState.OK)}:"
+
                 meta = page.locator(".check-meta")
                 expect(meta).to_contain_text(_PAUSED_PREFIX)
                 assert meta.inner_text().startswith(_PAUSED_PREFIX), meta.inner_text()

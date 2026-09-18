@@ -44,7 +44,12 @@ from saneless.checks import (
     CheckState,
     _saned_hosts,
     _saned_reachable,
+    _scanner_busy,
+    _scanner_skipped,
     check_name,
+    check_row_class,
+    check_row_glyph,
+    check_row_label,
     check_state_class,
     check_state_glyph,
     check_state_label,
@@ -265,6 +270,101 @@ class TestCheckVocabulary:
         """A value that is not a CheckState has no glyph."""
         with pytest.raises(AssertionError):
             check_state_glyph(cast("CheckState", "MAYBE"))
+
+
+class TestRowMarkersReadTheSkippedFlag:
+    """
+    R3-WR-03: the marker a row renders comes from the whole result, not the state.
+
+    ``CheckResult.skipped`` is D-08's "we did not look".  The state beside it is
+    ``OK`` on purpose -- the row still needs a colour and a scripted health gate
+    must not go red for a probe nobody took (D-01) -- which means a marker
+    derived from the state alone shows a green tick in front of a sentence
+    saying nothing was checked.  These three functions are what stops that, so
+    they are pinned over *every* state rather than over the one the skipped
+    rows happen to carry today.
+    """
+
+    @pytest.mark.parametrize("state", list(CheckState))
+    def test_a_probed_row_delegates_to_its_state(self, state: CheckState) -> None:
+        """
+        With the flag clear, each row marker is exactly its state marker.
+
+        Args:
+            state: The state under test.
+
+        """
+        result = CheckResult(key=CheckKey.SCANNER, state=state, message="Probed.")
+        assert check_row_class(result) == check_state_class(state)
+        assert check_row_glyph(result) == check_state_glyph(state)
+        assert check_row_label(result) == check_state_label(state)
+
+    @pytest.mark.parametrize("state", list(CheckState))
+    def test_a_skipped_row_is_neutral_whatever_its_state(
+        self, state: CheckState
+    ) -> None:
+        """
+        With the flag set, the state is not what the row renders.
+
+        An OK, a WARN and a FAIL row all render the neutral cold-start trio when
+        nothing was probed, because the state is only there to give the row a
+        colour to draw and is not a verdict anybody took.
+
+        Args:
+            state: The state under test.
+
+        """
+        result = CheckResult(
+            key=CheckKey.SCANNER, state=state, message="Not looked at.", skipped=True
+        )
+        assert check_row_class(result) == checks.CHECKING_STATE_CLASS
+        assert check_row_glyph(result) == checks.CHECKING_GLYPH
+        assert check_row_label(result) == checks.SKIPPED_STATE_LABEL
+
+    @pytest.mark.parametrize("state", list(CheckState))
+    def test_a_skipped_row_never_renders_the_ok_marker(self, state: CheckState) -> None:
+        """
+        The green tick and the word "OK" are exactly what must not appear.
+
+        Args:
+            state: The state under test.
+
+        """
+        result = CheckResult(
+            key=CheckKey.SCANNER, state=state, message="Not looked at.", skipped=True
+        )
+        assert check_row_class(result) != check_state_class(CheckState.OK)
+        assert check_row_glyph(result) != check_state_glyph(CheckState.OK)
+        assert check_row_label(result) != check_state_label(CheckState.OK)
+
+    def test_the_skipped_word_is_not_the_cold_start_word(self) -> None:
+        """
+        A skipped row borrows the glyph and the colour, but not the word.
+
+        "Checking" spoken over a row that was deliberately not probed tells a
+        listener a probe is running when none is -- a smaller version of the
+        same lie the green tick tells.
+        """
+        assert checks.SKIPPED_STATE_LABEL == "Not checked"
+        assert checks.SKIPPED_STATE_LABEL != checks.CHECKING_STATE_LABEL
+
+    @pytest.mark.parametrize("builder", [_scanner_skipped, _scanner_busy])
+    def test_the_two_skipped_rows_render_neutral(
+        self, builder: Callable[[], CheckResult]
+    ) -> None:
+        """
+        Both rows the registry can actually produce are neutral on both surfaces.
+
+        Args:
+            builder: The row factory under test.
+
+        """
+        result = builder()
+        assert result.skipped is True
+        assert result.state is CheckState.OK
+        assert check_row_class(result) == checks.CHECKING_STATE_CLASS
+        assert check_row_glyph(result) == checks.CHECKING_GLYPH
+        assert check_row_label(result) == checks.SKIPPED_STATE_LABEL
 
 
 class TestCheckResult:
