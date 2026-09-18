@@ -321,3 +321,138 @@ class TestConfigureLogging:
         config = OutputConfig()
         assert ".local/state/saneless" in config.log_file
         assert "/var/log" not in config.log_file
+
+
+def _stderr_stream_handlers() -> list[logging.Handler]:
+    """
+    Return the root logger's handlers that write to the real ``sys.stderr``.
+
+    pytest's own capture handlers are ``StreamHandler`` subclasses over a
+    ``StringIO``, so filtering on the stream identity counts only the handlers
+    ``configure_logging`` attached.
+
+    Returns:
+        The matching handlers, in root-logger order.
+
+    """
+    root = logging.getLogger()
+    return [
+        h
+        for h in root.handlers
+        if isinstance(h, logging.StreamHandler)
+        and not isinstance(h, logging.FileHandler)
+        and h.stream is sys.stderr
+    ]
+
+
+class TestConfigureLoggingStreamMode:
+    """No log file: the 12-factor service shape ``serve`` uses (D-35, DLVR-04)."""
+
+    def _cleanup_handlers(self) -> None:
+        """
+        Remove all handlers from root logger to prevent leaks.
+
+        The ``saneless`` logger is reset too: a verbose call sets it to DEBUG,
+        and that must not leak into whichever test runs next.
+        """
+        root = logging.getLogger()
+        for handler in root.handlers[:]:
+            handler.close()
+            root.removeHandler(handler)
+        root.setLevel(logging.WARNING)
+        logging.getLogger("saneless").setLevel(logging.NOTSET)
+
+    def test_stream_mode_attaches_no_file_handler(self) -> None:
+        """
+        With no log file nothing on the root logger writes to disk (D-40).
+
+        That the configured ``log_file`` path is left untouched -- no file, no
+        parent directory -- is pinned end to end at the CLI seam, by
+        ``tests/test_cli.py::TestServeLogging``.
+        """
+        try:
+            configure_logging(None)
+            root = logging.getLogger()
+            assert not [h for h in root.handlers if isinstance(h, logging.FileHandler)]
+        finally:
+            self._cleanup_handlers()
+
+    def test_stream_mode_attaches_one_stderr_handler_at_the_configured_level(
+        self,
+    ) -> None:
+        """Exactly one stderr handler, root at the configured level (D-36)."""
+        try:
+            configure_logging(None, "DEBUG")
+            assert len(_stderr_stream_handlers()) == 1
+            assert logging.getLogger().level == logging.DEBUG
+        finally:
+            self._cleanup_handlers()
+
+    def test_stream_mode_returns_false(self) -> None:
+        """
+        Stream mode returns False, so the caller records no ``log_file``.
+
+        ``ctx.obj["log_file"] = settings.output.log_file if attached else None``
+        needs no edit: nothing can print "Full details in <log_file>" for a
+        service that writes no file.
+        """
+        try:
+            assert configure_logging(None) is False
+        finally:
+            self._cleanup_handlers()
+
+    def test_stream_mode_renders_the_traceback_without_verbose(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        The serve stream renders a traceback without ``-v`` (D-36 amended).
+
+        The inverse of ``test_stderr_fallback_renders_no_traceback``, and
+        deliberately so: the stream *is* the log here, and no file carries the
+        traceback instead.
+        """
+        try:
+            configure_logging(None)
+            try:
+                _raise_runtime_error("kaboom-71bd")
+            except RuntimeError:
+                logging.getLogger("saneless.test").exception("it failed")
+            err = capsys.readouterr().err
+            assert "it failed" in err
+            assert "Traceback" in err
+            assert "kaboom-71bd" in err
+        finally:
+            self._cleanup_handlers()
+
+    def test_stream_mode_renders_the_traceback_with_verbose(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With ``-v`` the serve stream renders the traceback exactly once."""
+        try:
+            configure_logging(None, verbose=True)
+            try:
+                _raise_runtime_error("kaboom-3f0e")
+            except RuntimeError:
+                logging.getLogger("saneless.test").exception("it failed")
+            err = capsys.readouterr().err
+            assert err.count("Traceback") == 1
+            assert "kaboom-3f0e" in err
+        finally:
+            self._cleanup_handlers()
+
+    def test_stream_mode_leaves_non_saneless_loggers_at_the_configured_level(
+        self,
+    ) -> None:
+        """
+        ``-v`` in stream mode raises only saneless's own loggers (D-38, T-27-23).
+
+        httpx at DEBUG prints the Paperless ``Authorization`` header, so the
+        root logger must keep the configured level in this mode too.
+        """
+        try:
+            configure_logging(None, "INFO", verbose=True)
+            assert logging.getLogger("saneless").level == logging.DEBUG
+            assert logging.getLogger().level == logging.INFO
+            assert len(_stderr_stream_handlers()) == 1
+        finally:
+            self._cleanup_handlers()

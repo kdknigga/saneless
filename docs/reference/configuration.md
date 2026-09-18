@@ -58,10 +58,10 @@ In the path settings (`tmp_dir`, `data_dir`, `log_file`, and `consume_dir` under
 |-------|------|---------|-------------|
 | `tmp_dir` | string | `"/tmp/saneless"` | Scratch space for the scan in progress; its contents are deleted as each scan finishes and nothing durable is kept here. A leading `~` is expanded |
 | `data_dir` | string | `$XDG_STATE_HOME/saneless` (`~/.local/state/saneless` when `XDG_STATE_HOME` is unset) | Durable state: the job database (`saneless.db`) and `failed/`, where scans that could not be delivered to paperless-ngx are preserved. Must survive restarts. The container image sets this to `/var/lib/saneless`. A leading `~` is expanded |
-| `log_file` | string | `$XDG_STATE_HOME/saneless/saneless.log` (`~/.local/state/saneless/saneless.log` when `XDG_STATE_HOME` is unset) | Log file path. A leading `~` is expanded |
-| `log_level` | string | `"INFO"` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, case-insensitive (`warn` means `WARNING`); any other value is rejected when the config loads. `saneless -v` shows saneless's own debug detail without changing this setting |
-| `log_max_bytes` | int | `10485760` | Max log file size before rotation (10 MB) |
-| `log_backup_count` | int | `5` | Number of rotated log files to keep |
+| `log_file` | string | `$XDG_STATE_HOME/saneless/saneless.log` (`~/.local/state/saneless/saneless.log` when `XDG_STATE_HOME` is unset) | Log file path, **for one-shot CLI commands only**. `saneless serve` streams its records to stderr and writes no file at all, so under Docker or systemd the platform (`docker logs`, journald) holds them and owns retention. A leading `~` is expanded |
+| `log_level` | string | `"INFO"` | Log level: `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, case-insensitive (`warn` means `WARNING`); any other value is rejected when the config loads. Applies in **both** modes, unlike the three keys around it. `saneless -v` shows saneless's own debug detail without changing this setting |
+| `log_max_bytes` | int | `10485760` | Max log file size before rotation (10 MB). **One-shot CLI commands only**, like `log_file`: `saneless serve` writes no file, so there is nothing to rotate |
+| `log_backup_count` | int | `5` | Number of rotated log files to keep. **One-shot CLI commands only**, like `log_file`: `saneless serve` writes no file, so there is nothing to keep |
 | `history_retention_days` | int | `7` | Days to keep job history, by creation time and regardless of whether the job finished |
 | `history_max_rows` | int | `500` | Maximum job history entries retained in SQLite; the newest are kept |
 | `paperless_task_timeout` | int | `300` | Seconds to wait for paperless-ngx task completion |

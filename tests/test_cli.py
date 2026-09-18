@@ -7,6 +7,7 @@ import errno
 import importlib.metadata
 import json
 import logging
+import logging.handlers
 import os
 import re
 import sqlite3
@@ -4145,3 +4146,241 @@ class TestJobsJsonContract:
         result = runner.invoke(cli, ["jobs", "--json"])
 
         assert local_time(recorded.created_at) not in result.output
+
+
+def _raise_runtime_error(message: str) -> None:
+    """
+    Raise a RuntimeError carrying ``message``, so a test can log a real traceback.
+
+    Args:
+        message: The exception's message.
+
+    Raises:
+        RuntimeError: Always.
+
+    """
+    raise RuntimeError(message)
+
+
+class TestServeLogging:
+    """
+    ``serve`` streams to stderr and writes no log file (D-34..D-40, DLVR-04).
+
+    Every test here patches in the **real** ``configure_logging``: a stub that
+    attaches nothing can neither prove a handler was attached nor prove one
+    was not.
+    """
+
+    @staticmethod
+    def _serve_settings(tmp_path: Path) -> Settings:
+        """
+        Build settings whose ``log_file`` parent directory does not exist yet.
+
+        A file handler would have to create ``logs/`` to attach, so the
+        directory's absence afterwards is proof that none did.
+
+        Args:
+            tmp_path: The test's temporary directory.
+
+        Returns:
+            Settings serving on 127.0.0.1 with a tmp_path-rooted log file.
+
+        """
+        return _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "logs" / "saneless.log"),
+                web_host="127.0.0.1",
+            ),
+        )
+
+    @staticmethod
+    def _real_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Undo ``_patch_cli``'s stub, so the real configure_logging runs."""
+        monkeypatch.setattr("saneless.cli.configure_logging", configure_logging)
+
+    def test_serve_attaches_no_file_handler_and_creates_no_log_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A service writes no file: the platform owns retention (D-35, D-40)."""
+        settings = self._serve_settings(tmp_path)
+        TestServeCommand._mock_socket(monkeypatch)
+        TestServeCommand._stub_create_app(monkeypatch)
+        TestServeCommand._capture_uvicorn(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["serve"])
+            root_handlers = logging.getLogger().handlers[:]
+
+        assert result.exit_code == 0, result.output
+        # pytest keeps its own /dev/null FileHandler on the root logger, so the
+        # assertion names the handler configure_logging would have attached.
+        assert not [
+            h
+            for h in root_handlers
+            if isinstance(h, logging.handlers.RotatingFileHandler)
+        ]
+        assert not (tmp_path / "logs").exists()
+
+    def test_serve_attaches_one_stderr_stream_handler(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Exactly one stream handler carries the service's records (D-36).
+
+        The handlers are counted by difference against a snapshot, because
+        pytest keeps capture handlers of its own on the root logger. That the
+        one handler writes to stderr rather than stdout is pinned by
+        ``test_serve_stream_renders_a_traceback``.
+        """
+        settings = self._serve_settings(tmp_path)
+        TestServeCommand._mock_socket(monkeypatch)
+        TestServeCommand._stub_create_app(monkeypatch)
+        TestServeCommand._capture_uvicorn(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+        before = {id(h) for h in logging.getLogger().handlers}
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["serve"])
+            added = [h for h in logging.getLogger().handlers if id(h) not in before]
+
+        assert result.exit_code == 0, result.output
+        assert len(added) == 1
+        assert isinstance(added[0], logging.StreamHandler)
+        assert not isinstance(added[0], logging.FileHandler)
+
+    def test_serve_sets_log_file_to_none_in_the_context(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Nothing can print "Full details in <log_file>" for a service.
+
+        ``configure_logging`` reports that no file handler attached, so the
+        context records no log file and the guard's hint stays silent.
+        """
+        settings = self._serve_settings(tmp_path)
+        TestServeCommand._mock_socket(monkeypatch)
+        TestServeCommand._stub_create_app(monkeypatch)
+        TestServeCommand._capture_uvicorn(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+        obj: dict[str, object] = {}
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["serve"], obj=obj)
+
+        assert result.exit_code == 0, result.output
+        assert obj["logging_configured"] is True
+        assert obj["log_file"] is None
+
+    @staticmethod
+    def _uvicorn_logs_a_traceback(monkeypatch: pytest.MonkeyPatch, marker: str) -> None:
+        """Patch uvicorn.run to log an exception through saneless's own logger."""
+
+        def logging_run(_app: object, **_kwargs: object) -> None:
+            try:
+                _raise_runtime_error(marker)
+            except RuntimeError:
+                logging.getLogger("saneless.test").exception("the worker died")
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", logging_run)
+
+    @pytest.mark.parametrize("args", [["serve"], ["-v", "serve"]])
+    def test_serve_stream_renders_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args: list[str]
+    ) -> None:
+        """
+        The serve stream renders tracebacks with and without ``-v`` (D-36 amended).
+
+        D-06's traceback-free rule was justified by "stderr is the user's
+        terminal now". For a service the stream *is* the log, journald is
+        nobody's terminal, and no file carries the traceback instead, so a
+        traceback-free stream would discard every one of them.
+        """
+        marker = "kaboom-serve-8a3c"
+        settings = self._serve_settings(tmp_path)
+        TestServeCommand._mock_socket(monkeypatch)
+        TestServeCommand._stub_create_app(monkeypatch)
+        self._uvicorn_logs_a_traceback(monkeypatch, marker)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, args)
+
+        assert result.exit_code == 0, result.output
+        assert "the worker died" in result.stderr
+        assert result.stderr.count("Traceback") == 1
+        assert marker in result.stderr
+        # D-36: stdout stays the clean channel carrying only "Serving on ...".
+        assert marker not in result.stdout
+
+    def test_serve_never_offers_the_verbose_hint_on_an_unexpected_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An exit-5 line under ``serve`` does not tell the operator to restart.
+
+        The stream already rendered the traceback (D-36 amended), so "Run
+        again with -v to see the traceback" would send someone to restart a
+        running service to see what is printed directly above the line.
+        """
+        settings = self._serve_settings(tmp_path)
+        TestServeCommand._mock_socket(monkeypatch)
+        TestServeCommand._stub_create_app(monkeypatch)
+
+        def exploding_run(_app: object, **_kwargs: object) -> None:
+            _raise_runtime_error("kaboom-serve-exit5")
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", exploding_run)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 5, result.output
+        assert "Unexpected error (RuntimeError): kaboom-serve-exit5" in result.stderr
+        assert cli_module._VERBOSE_HINT not in result.stderr
+        assert "Full details in" not in result.stderr
+        assert "Traceback" in result.stderr
+
+    def test_one_shot_command_still_attaches_the_file_handler(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A one-shot command's logging is untouched by the mode split (D-34).
+
+        The regression guard: ``jobs`` still gets the rotating file handler and
+        still records ``log_file``, so "Full details in <log_file>" keeps
+        working. If this fails, the service mode leaked into CLI mode.
+        """
+        log_file = tmp_path / "logs" / "saneless.log"
+        settings = _make_settings(
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(log_file),
+            ),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+        obj: dict[str, object] = {}
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["jobs"], obj=obj)
+            rotating = [
+                h
+                for h in logging.getLogger().handlers
+                if isinstance(h, logging.handlers.RotatingFileHandler)
+            ]
+            attached_to = [h.baseFilename for h in rotating]
+
+        assert result.exit_code == 0, result.output
+        assert attached_to == [str(log_file)]
+        assert obj["log_file"] == str(log_file)
+        assert log_file.parent.is_dir()

@@ -111,7 +111,8 @@ Other causes of exit 2, each on one line:
 - **`serve` cannot start.** The port is already in use, SANE could not be initialised, or the web
   server failed to start. Stop whatever holds the port or pass `--port`; when SANE failed, the line
   gives its reason (see [Scanner Host Discovery](scanner-host-discovery.md)); when the web server
-  itself failed, the cause is in the log file.
+  itself failed, the cause is in the preceding log lines: `serve` streams its log to stderr
+  rather than writing a file.
 - **The working directory cannot be prepared.** The line names `tmp_dir` (in
   [`[output]`](../reference/configuration.md#output)) and the reason: the directory was removed or
   cannot be created, or the disk is full. Check that it exists, that saneless can write to it, and
@@ -213,6 +214,10 @@ The line starts with `Unexpected error` and names the exception type. The full t
 the log file, which the line names. If the line names no log file (the error happened before
 logging started, or the log file could not be opened), it ends with a hint instead: run the
 command again with `-v` to see the traceback on stderr.
+
+`saneless serve` is the exception: it writes no log file, so the traceback is already on its
+stream, printed directly above the line, and no hint is offered. Collect it from `docker logs`
+or `journalctl` instead of restarting the service.
 
 Please report it as a bug and attach the log file. Attach the log only, never your config file,
 which holds your Paperless API token. If the log was recorded with `log_level = "DEBUG"`, search it
