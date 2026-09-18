@@ -85,6 +85,11 @@ TOML_EXAMPLE = REPO_ROOT / "saneless.toml.example"
 CLI_REFERENCE = DOCS_DIR / "reference" / "cli-commands.md"
 CLI_SCRIPTING = DOCS_DIR / "how-to" / "cli-scripting.md"
 
+# Where `saneless auto-profiles` writes inside the image when no config
+# file was loaded. The CLI writes `./saneless.toml`, and the runtime
+# stage's WORKDIR is what decides where that resolves to.
+AUTO_PROFILES_CONTAINER_PATH = "`/var/lib/saneless/saneless.toml`"
+
 
 def _doc_pages() -> list[Path]:
     """Return every Markdown page under ``docs/``, asserting there is at least one."""
@@ -164,18 +169,20 @@ def test_deploy_doc_explains_missing_config_and_migration() -> None:
 
 def test_deploy_doc_says_where_auto_profiles_writes_without_config_toml() -> None:
     """
-    With no ``config.toml``, the doc says the write lands at ``/saneless.toml`` (WR-06).
+    With no ``config.toml``, the doc names the real write path (WR-06).
 
-    The CLI writes ``./saneless.toml`` when no config file was loaded, which in
-    the image is ``/saneless.toml`` (its runtime stage sets no WORKDIR, so the
-    working directory is ``/``): in the container layer, and first in
-    the search order. The how-to used to imply the write lands in ``./config``.
+    The CLI writes ``./saneless.toml`` when no config file was loaded. The
+    image's runtime stage sets ``WORKDIR /var/lib/saneless``, so that resolves
+    to ``/var/lib/saneless/saneless.toml`` -- inside the declared data volume,
+    where it outlives the container, and still ahead of ``/etc/saneless`` in
+    the config search order. The how-to used to imply the write lands in
+    ``./config``, and before the WORKDIR existed it landed at ``/`` instead.
     """
     text = DEPLOY_HOWTO.read_text(encoding="utf-8")
     name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
-    assert "`/saneless.toml`" in text, (
-        f"{name} does not say auto-profiles writes /saneless.toml "
-        "when config.toml is missing"
+    assert AUTO_PROFILES_CONTAINER_PATH in text, (
+        f"{name} does not say auto-profiles writes "
+        f"{AUTO_PROFILES_CONTAINER_PATH} when config.toml is missing"
     )
     assert "touch config/config.toml" in text, (
         f"{name} does not tell container users to create config/config.toml first"
@@ -183,10 +190,10 @@ def test_deploy_doc_says_where_auto_profiles_writes_without_config_toml() -> Non
 
 
 def test_cli_reference_says_where_auto_profiles_writes_in_the_image() -> None:
-    """The CLI reference names ``/saneless.toml`` for the image (WR-06)."""
+    """The CLI reference names the image's real write path (WR-06)."""
     text = CLI_REFERENCE.read_text(encoding="utf-8")
     name = CLI_REFERENCE.relative_to(REPO_ROOT)
-    assert "`/saneless.toml`" in text, (
+    assert AUTO_PROFILES_CONTAINER_PATH in text, (
         f"{name} does not say where the image writes with no config file loaded"
     )
 
@@ -1639,16 +1646,20 @@ def test_dockerfile_chowns_the_data_dir_before_declaring_the_volume() -> None:
     """
     The data directory is created and chowned **before** ``VOLUME`` (D-28).
 
-    Docker discards build steps that change data within a declared volume path
-    *after* the ``VOLUME`` instruction. Get the order wrong and a fresh named
-    volume comes up owned by root, the non-root process cannot write the job
-    database, and preserved scans have nowhere to go.
+    Whether a build step that changes data inside a declared volume path
+    *after* the ``VOLUME`` instruction survives depends on **which builder
+    ran**: Docker's own reference says the legacy builder discards those
+    changes and BuildKit keeps them. Ordering the ``mkdir`` and ``chown``
+    before ``VOLUME`` is the one arrangement that is correct under both. Get
+    it wrong and, on the builder that discards, a fresh named volume comes up
+    owned by root, the non-root process cannot write the job database, and
+    preserved scans have nowhere to go.
 
-    Ordering by construction rather than by testing is deliberate. buildah --
-    which is what ``docker`` is on the maintainer's host -- was measured
-    *tolerating* the wrong order, so a green local build would say nothing
-    about the real image, which CI builds with BuildKit. This test is the
-    check that does not depend on which builder ran.
+    Asserting the order statically rather than test-driving it is deliberate,
+    for the same reason: buildah -- which is what ``docker`` is on the
+    maintainer's host -- was measured keeping the change even with the wrong
+    order, so a green local build is no evidence at all. This test does not
+    depend on which builder ran.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
     lines = _significant_lines(DOCKERFILE)
