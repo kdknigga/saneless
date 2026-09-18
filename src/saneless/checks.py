@@ -64,11 +64,15 @@ __all__ = [
     "PROBE_CONNECT_SECONDS",
     "PROBE_READ_SECONDS",
     "SANED_PORT",
+    "SKIPPED_STATE_LABEL",
     "CheckContext",
     "CheckKey",
     "CheckResult",
     "CheckState",
     "check_name",
+    "check_row_class",
+    "check_row_glyph",
+    "check_row_label",
     "check_state_class",
     "check_state_glyph",
     "check_state_label",
@@ -149,6 +153,18 @@ CHECKING_MESSAGE: Final = "Checking…"
 # rather than the ellipsis for the same reason ``check_state_label`` says
 # "Failed" instead of "FAIL": the glyph's meaning has to survive as speech.
 CHECKING_STATE_LABEL: Final = "Checking"
+
+# The word a screen reader hears in front of a row nothing looked at (D-08,
+# R3-WR-03).  A skipped row borrows the cold-start glyph and the cold-start
+# colour -- U+00B7 says "not yet", not "bad", and no new colour token is needed
+# -- but it deliberately does not borrow the cold-start *word*.
+# ``CHECKING_STATE_LABEL`` is "Checking", and a listener hearing "Checking:
+# Scanner. Not checked while a scan is running." is told a probe is running
+# when none is: a smaller version of the same lie the green tick told before
+# this constant existed.  It is a word rather than the glyph for the reason
+# ``CHECKING_STATE_LABEL`` is one -- the glyph is ``aria-hidden``, so the
+# marker's meaning only survives as speech if something spells it out.
+SKIPPED_STATE_LABEL: Final = "Not checked"
 
 # How many times the cold-start strip may ask for results before it stops
 # asking (IN-07).  The poll's only other terminating condition is results
@@ -455,6 +471,84 @@ def check_state_glyph(state: CheckState) -> str:
         case _:
             assert_never(state)
     return glyph
+
+
+# The three lookups above answer "what does this *state* look like".  The three
+# below answer "what does this *row* look like", which is not the same question
+# whenever ``skipped`` is set, and it is the second question both surfaces
+# actually ask.  ``check_state_*`` stays exactly as it is: it is still the
+# state's own vocabulary, it is what these three delegate to, and
+# ``saneless doctor``'s ``_state_marker`` is its CLI counterpart.
+
+
+def check_row_class(result: CheckResult) -> str:
+    """
+    Return the CSS class that colours one rendered row's glyph.
+
+    A skipped row is drawn in the neutral cold-start colour rather than in its
+    state's, because the state on a skipped row is not a verdict anybody
+    reached: it is ``CheckState.OK`` so that the row has *some* colour to draw
+    and so that a scripted health gate does not go red for a probe that was
+    deliberately not taken (D-01).  Colouring by it would paint an unprobed row
+    green, which is the divergence R3-WR-03 found.
+
+    Args:
+        result: The finished row about to be rendered.
+
+    Returns:
+        ``CHECKING_STATE_CLASS`` when the probe was skipped, otherwise
+        ``check_state_class(result.state)``.
+
+    """
+    if result.skipped:
+        return CHECKING_STATE_CLASS
+    return check_state_class(result.state)
+
+
+def check_row_glyph(result: CheckResult) -> str:
+    """
+    Return the glyph one rendered row is marked with.
+
+    The skipped glyph is the cold-start one, U+00B7, and for the same reason it
+    is the cold-start one: it says "not yet", not "bad".  "We did not look" is
+    a fact about the probe, not a verdict about the appliance, and the green
+    tick is the one mark that must never stand in front of a sentence saying
+    nothing was checked.
+
+    Args:
+        result: The finished row about to be rendered.
+
+    Returns:
+        ``CHECKING_GLYPH`` when the probe was skipped, otherwise
+        ``check_state_glyph(result.state)``.
+
+    """
+    if result.skipped:
+        return CHECKING_GLYPH
+    return check_state_glyph(result.state)
+
+
+def check_row_label(result: CheckResult) -> str:
+    """
+    Return the word a screen reader announces before one rendered row.
+
+    The glyph and the colour are borrowed from the cold-start trio; the word is
+    not.  ``CHECKING_STATE_LABEL`` would tell a listener a probe is running
+    when the whole point of the flag is that none was, so a skipped row gets
+    ``SKIPPED_STATE_LABEL`` instead -- the only way the neutral glyph's meaning
+    survives for somebody who cannot see it.
+
+    Args:
+        result: The finished row about to be rendered.
+
+    Returns:
+        ``SKIPPED_STATE_LABEL`` when the probe was skipped, otherwise
+        ``check_state_label(result.state)``.
+
+    """
+    if result.skipped:
+        return SKIPPED_STATE_LABEL
+    return check_state_label(result.state)
 
 
 def worst_state(results: Iterable[CheckResult]) -> CheckState:
@@ -1083,8 +1177,15 @@ def _scanner_skipped() -> CheckResult:
     The state is ``OK`` rather than ``WARN`` or ``FAIL``.  "We did not look" is
     a fact about the probe, not a verdict about the appliance, and a scan in
     flight is direct evidence the scanner was working moments ago; a scripted
-    health gate must not go red for the duration of every scan.  The
-    ``skipped`` flag, not the state, is what the two surfaces render.
+    health gate must not go red for the duration of every scan.  The state
+    stays ``OK`` precisely so that gate keeps passing -- ``worst_state`` and
+    ``saneless doctor``'s exit rule read it and nothing else (D-01).
+
+    The ``skipped`` flag, not the state, is what the two surfaces *render*, and
+    the functions that read it are named rather than implied so the claim is
+    checkable by grep: ``check_row_class``, ``check_row_glyph`` and
+    ``check_row_label`` in this module draw the web row, and ``_row_marker`` in
+    ``saneless.cli`` draws the ``doctor`` one.
 
     Returns:
         The UI-SPEC S1 skipped row.
@@ -1120,7 +1221,12 @@ def _scanner_busy() -> CheckResult:
     because it is easy to read as a bug: "we did not look" is a fact about the
     probe, not a verdict about the appliance, and a scripted health gate keyed
     on red (D-01) must not fail because two threads wanted the scanner in the
-    same instant.  The ``skipped`` flag discloses that nothing was checked.
+    same instant.  Keeping the state at ``OK`` is what holds that gate open.
+
+    The ``skipped`` flag is what discloses that nothing was checked, through
+    the same four functions ``_scanner_skipped``'s docstring names:
+    ``check_row_class``, ``check_row_glyph`` and ``check_row_label`` here, and
+    ``_row_marker`` in ``saneless.cli``.
 
     There is deliberately **no** next step.  ``_scanner_skipped`` carries none
     either, and for the same reason: the next probe fixes this by itself,
