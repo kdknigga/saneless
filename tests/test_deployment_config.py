@@ -2324,3 +2324,36 @@ def test_the_deploy_guide_does_not_ship_a_partial_paperless_stack() -> None:
         f"{name} removed the half-a-service but tells the reader nowhere to "
         "get a working one. Link to the official compose documentation"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: nothing from the planning tree is published (row 34, DOCS-03)
+# ---------------------------------------------------------------------------
+
+# Names that belong to the planning tree rather than to a reader.
+PLANNING_ARTIFACT_NAMES = ("PRD.md", "ROADMAP.md", "REQUIREMENTS.md", "STATE.md")
+
+
+def test_no_planning_artifact_is_published_under_docs() -> None:
+    """
+    No planning artifact sits under ``docs/``, whatever the nav says.
+
+    MkDocs builds and publishes every Markdown file under ``docs/`` whether or
+    not the nav lists it, so a page absent from the nav is still served and
+    still search-indexed -- it is only unreachable by clicking. That gap is how
+    a v1.0 planning document, whose claims stopped matching the code releases
+    ago, ended up on the public site with nobody aware it was there (row 34).
+
+    The document itself was not wrong to exist; it is a record of what v1.0
+    intended. It was in the wrong tree, and it now lives beside the other
+    planning artifacts.
+    """
+    offenders = [
+        str(page.relative_to(REPO_ROOT))
+        for page in _doc_pages()
+        if page.name in PLANNING_ARTIFACT_NAMES
+    ]
+    assert not offenders, (
+        "a planning artifact is published as part of the documentation "
+        "site:\n" + "\n".join(offenders)
+    )
