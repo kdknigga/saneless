@@ -512,7 +512,7 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
     ctx.obj["verbose"] = verbose
 
 
-def _load_cli_settings(ctx: click.Context) -> Settings:
+def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Settings:
     """
     Load and validate settings and configure logging, once per process.
 
@@ -529,11 +529,19 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
 
     Once logging is configured, ``ctx.obj`` records it (``logging_configured``)
     and records ``log_file`` only if the file handler really attached, so the
-    guard logs failures and names the log file truthfully.
+    guard logs failures and names the log file truthfully. In the streaming
+    mode ``serve`` asks for, no file handler is attached at all, so
+    ``ctx.obj["log_file"]`` is always None there and nothing ever offers
+    "Full details in <log_file>" for a service that writes none (D-35, D-40).
 
     Args:
         ctx: The command's context; its ``obj`` carries ``config_path`` and
             ``verbose`` from the group, and caches the loaded settings.
+        stream_logs: If True, configure the 12-factor service shape -- records
+            stream to stderr and no log file is written, so ``docker logs`` or
+            journald sees them and owns retention (DLVR-04). Only ``serve``
+            passes it; every one-shot command keeps Phase 28's rotating file
+            handler unchanged (D-34).
 
     Returns:
         The loaded settings, the same object on every call.
@@ -545,8 +553,13 @@ def _load_cli_settings(ctx: click.Context) -> Settings:
 
     settings = load_settings(ctx.obj.get("config_path"))
     validate_settings_dirs(settings)
+    # A service is handed no log file at all: configure_logging then attaches
+    # one stderr handler and returns False, so the line below records no
+    # log_file with no special case of its own. The rotation settings still go
+    # along and are simply unused -- they govern one-shot mode, which is what
+    # the configuration reference says and why no warning fires here (D-39).
     attached = configure_logging(
-        settings.output.log_file,
+        None if stream_logs else settings.output.log_file,
         settings.output.log_level,
         settings.output.log_max_bytes,
         settings.output.log_backup_count,
@@ -863,7 +876,10 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # config or touching the device, exit 2 through the guard (D-05). --help
     # never reaches this body, so it needs no python-sane (CFG-10).
     require_sane()
-    settings = _load_cli_settings(ctx)
+    # The one command that streams its logs: a service writes no file, so its
+    # records reach `docker logs` and journald instead (D-35, DLVR-04). Every
+    # other command keeps the rotating file handler (D-34).
+    settings = _load_cli_settings(ctx, stream_logs=True)
     actual_host = host or settings.output.web_host
     actual_port = port or settings.output.web_port
 
@@ -908,6 +924,13 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # KeyboardInterrupt and returns (measured), so a normal stop exits 0 (D-03).
     # A Ctrl-C before this point -- while settings load or the app is built --
     # is not uvicorn's to handle; it reaches the group guard, exit 130.
+    #
+    # This call needs no change for the streaming mode, and adding one would
+    # break it: a None log config means uvicorn runs no dictConfig and attaches
+    # no handlers of its own, so uvicorn.error, uvicorn.access and uvicorn.asgi
+    # propagate to saneless's root handlers. Leaving the access log on
+    # therefore puts per-request lines, and uvicorn's own startup lines, on the
+    # same stream for free -- which is exactly what DLVR-04 wants (D-37).
     try:
         uvicorn.run(
             app,
@@ -922,7 +945,8 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
             raise
         msg = (
             f"The web server could not start on {actual_host}:{actual_port} "
-            f"(uvicorn exit status {exc.code}); the cause is in the log"
+            f"(uvicorn exit status {exc.code}); the cause is in the preceding "
+            "log lines"
         )
         raise ConfigError(msg) from exc
 

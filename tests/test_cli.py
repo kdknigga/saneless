@@ -4228,26 +4228,30 @@ class TestServeLogging:
     def test_serve_attaches_one_stderr_stream_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Exactly one stderr handler carries the service's records (D-36)."""
+        """
+        Exactly one stream handler carries the service's records (D-36).
+
+        The handlers are counted by difference against a snapshot, because
+        pytest keeps capture handlers of its own on the root logger. That the
+        one handler writes to stderr rather than stdout is pinned by
+        ``test_serve_stream_renders_a_traceback``.
+        """
         settings = self._serve_settings(tmp_path)
         TestServeCommand._mock_socket(monkeypatch)
         TestServeCommand._stub_create_app(monkeypatch)
         TestServeCommand._capture_uvicorn(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         self._real_logging(monkeypatch)
+        before = {id(h) for h in logging.getLogger().handlers}
 
         with _restored_root_logging():
             result = runner.invoke(cli, ["serve"])
-            streams = [
-                h
-                for h in logging.getLogger().handlers
-                if isinstance(h, logging.StreamHandler)
-                and not isinstance(h, logging.FileHandler)
-                and h.stream is sys.stderr
-            ]
+            added = [h for h in logging.getLogger().handlers if id(h) not in before]
 
         assert result.exit_code == 0, result.output
-        assert len(streams) == 1
+        assert len(added) == 1
+        assert isinstance(added[0], logging.StreamHandler)
+        assert not isinstance(added[0], logging.FileHandler)
 
     def test_serve_sets_log_file_to_none_in_the_context(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4312,6 +4316,8 @@ class TestServeLogging:
         assert "the worker died" in result.stderr
         assert result.stderr.count("Traceback") == 1
         assert marker in result.stderr
+        # D-36: stdout stays the clean channel carrying only "Serving on ...".
+        assert marker not in result.stdout
 
     def test_one_shot_command_still_attaches_the_file_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
