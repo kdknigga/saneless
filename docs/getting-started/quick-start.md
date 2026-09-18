@@ -20,7 +20,7 @@ The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyo
 
     ```bash
     docker run -p 8080:8080 \
-      -v ./config:/etc/saneless \
+      -v "$(pwd)/config:/etc/saneless" \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
       ghcr.io/kdknigga/saneless:latest
     ```

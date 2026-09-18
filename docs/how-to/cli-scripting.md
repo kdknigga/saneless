@@ -44,7 +44,7 @@ saneless jobs --json --limit 5
 ```json
 [
   {
-    "id": "a1b2c3d4",
+    "id": "8eae6099-6b24-4b69-a339-8daa8e6c9a5c",
     "profile": "default",
     "title": "Invoice March 2026",
     "state": "DONE",

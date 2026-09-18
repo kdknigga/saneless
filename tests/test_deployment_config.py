@@ -74,6 +74,10 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 DOCS_DIR = REPO_ROOT / "docs"
 
 DIRECTORY_MOUNT = "./config:/etc/saneless"
+# The same directory at the same container path, spelled for a bind-mount flag,
+# where the host side has to be absolute and quoted (row 31).
+ABSOLUTE_DIRECTORY_MOUNT = '"$(pwd)/config:/etc/saneless"'
+DIRECTORY_MOUNT_FORMS = (DIRECTORY_MOUNT, ABSOLUTE_DIRECTORY_MOUNT)
 SINGLE_FILE_MOUNT = "config.toml:/etc/saneless/config.toml"
 
 DEPLOY_HOWTO = DOCS_DIR / "how-to" / "deploy-docker-compose.md"
@@ -147,11 +151,20 @@ def test_no_fail_to_start_claim() -> None:
 
 
 def test_deploy_docs_use_the_directory_mount() -> None:
-    """Each Docker deployment page shows the directory mount."""
+    """
+    Each Docker deployment page mounts the configuration *directory*.
+
+    Two spellings satisfy this, and which one is correct depends on the syntax:
+    a compose ``volumes:`` entry names the directory relative to the compose
+    file, while a bind-mount flag needs the absolute form (row 31). Both name
+    the same directory at the same container path, which is the thing Phase 27
+    D-09 requires; the single-file mount is banned separately.
+    """
     for page in (DEPLOY_HOWTO, DOCKER_REFERENCE, QUICK_START):
         text = page.read_text(encoding="utf-8")
-        assert DIRECTORY_MOUNT in text, (
-            f"{page.relative_to(REPO_ROOT)} does not show '{DIRECTORY_MOUNT}'"
+        assert any(form in text for form in DIRECTORY_MOUNT_FORMS), (
+            f"{page.relative_to(REPO_ROOT)} shows the configuration directory "
+            f"mounted in neither of these forms: {list(DIRECTORY_MOUNT_FORMS)}"
         )
 
 
