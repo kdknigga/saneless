@@ -38,6 +38,7 @@ markdown_extensions:
 nav:
   - Home: index.md
   - Getting Started:
+    - Which setup do I have?: getting-started/which-setup.md
     - Quick Start: getting-started/quick-start.md
     - First CLI Scan: getting-started/first-cli-scan.md
     - First Web UI Scan: getting-started/first-web-ui-scan.md
