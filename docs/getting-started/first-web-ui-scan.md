@@ -72,7 +72,7 @@ The job history table at the bottom of the page lists recent scan jobs with four
 - **Time** -- When the scan was started, in the server's local timezone with the zone named. In a container that means setting `TZ`; without it the times read as UTC
 - **Profile** -- Which scan profile was used
 - **Title** -- The document title, with the page counts on a second line beneath it for jobs that recorded them
-- **Status** -- Current state of the job (Done, Failed, Saved to folder, Scanning, and so on)
+- **Status** -- Current state of the job (Complete, Failed, Cancelled, Saved to folder, Scanning, and so on). The table says **Complete** where the status area above it says **Done**; they are the same state
 
 The history table updates automatically when a job finishes.
 
