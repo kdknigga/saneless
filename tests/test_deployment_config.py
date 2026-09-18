@@ -31,6 +31,12 @@ documentation's expectations from the source: the route decorators, the
 ``WebConfig`` fields and the ``RequestRejection`` members, so a future addition
 cannot ship undocumented (APPL-05, APPL-07, APPL-10, APPL-11, APPL-12).
 
+The Phase 31 tests pin the packaging identity ``pyproject.toml`` publishes:
+the 0.2.0 series, the PEP 639 license keys, the Alpha maturity classifier, the
+absence of the deprecated ``License ::`` classifier -- which nothing in the
+build or publish toolchain rejects, so this is the only thing that does -- and
+the unchanged ``saneless`` distribution name (D-01, D-02, D-05, DLVR-08).
+
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
 """
@@ -50,6 +56,7 @@ from saneless.vocabulary import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
+PYPROJECT = REPO_ROOT / "pyproject.toml"
 DOCS_DIR = REPO_ROOT / "docs"
 
 DIRECTORY_MOUNT = "./config:/etc/saneless"
@@ -1082,4 +1089,94 @@ def test_first_web_ui_scan_walks_the_current_form() -> None:
     assert "multi-select" not in text.lower(), (
         f"{name} still calls the tag picker a multi-select dropdown; it is a "
         "checkbox list (D-30, D-31)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: packaging identity (D-01, D-02, D-05, DLVR-08)
+# ---------------------------------------------------------------------------
+
+# The top-level ``version = "..."`` assignment. Anchored at the start of a line
+# so ``target-version = "py314"`` under [tool.ruff] cannot match it.
+VERSION_LINE = re.compile(r'^version = "([^"]*)"$', re.MULTILINE)
+
+# The 0.2.0 series: the release version itself, or one of its release
+# candidates.
+ZERO_TWO_SERIES = re.compile(r"^0\.2\.0(-rc\.\d+)?$")
+
+LEGACY_LICENSE_CLASSIFIER = "License :: OSI Approved :: MIT License"
+
+
+def test_pyproject_declares_the_0_2_0_series() -> None:
+    """
+    The declared package version is the 0.2.0 series (D-01).
+
+    The pattern admits ``0.2.0-rc.1`` deliberately. The TestPyPI release
+    rehearsal sets exactly that string for the duration of the upload and
+    restores ``0.2.0`` afterwards; a bare equality assertion would go red for
+    the length of the rehearsal, and the pressure then would be to weaken it.
+    Admitting the RC suffix up front is the narrower accommodation.
+    """
+    text, name = _read(PYPROJECT)
+    match = VERSION_LINE.search(text)
+    assert match is not None, f"{name} has no top-level version assignment"
+    declared = match.group(1)
+    assert ZERO_TWO_SERIES.match(declared), (
+        f"{name} declares version {declared!r}; this phase ships the 0.2.0 "
+        "series (0.2.0, or 0.2.0-rc.N during the release rehearsal)"
+    )
+
+
+def test_pyproject_uses_the_pep_639_license_keys() -> None:
+    """The license is the PEP 639 SPDX string plus ``license-files`` (D-05)."""
+    text, name = _read(PYPROJECT)
+    assert 'license = "MIT"' in text, (
+        f'{name} does not declare the PEP 639 SPDX expression license = "MIT"'
+    )
+    assert 'license-files = ["LICENSE"]' in text, (
+        f'{name} does not declare license-files = ["LICENSE"], so the built '
+        "wheel carries no dist-info/licenses/LICENSE (DLVR-08)"
+    )
+    assert "license = {text =" not in text, (
+        f"{name} still uses the deprecated license table form, which PEP 639 "
+        "replaced with the SPDX expression"
+    )
+
+
+def test_pyproject_has_no_legacy_license_classifier() -> None:
+    """
+    The deprecated ``License ::`` classifier is gone (D-05).
+
+    This needs its own assertion because nothing else catches it. Neither
+    ``uv_build`` 0.10.3 nor ``twine check`` errors when the classifier ships
+    beside a PEP 639 ``License-Expression`` -- both were measured doing exactly
+    that -- so no build or publish step would fail if it came back.
+    """
+    text, name = _read(PYPROJECT)
+    assert LEGACY_LICENSE_CLASSIFIER not in text, (
+        f"{name} still carries the {LEGACY_LICENSE_CLASSIFIER!r} classifier, "
+        "which PEP 639 deprecates in favour of the license expression. No "
+        "build step rejects it, so this test is the only thing that does"
+    )
+
+
+def test_pyproject_declares_alpha_maturity() -> None:
+    """The maturity classifier is ``3 - Alpha``, not ``4 - Beta`` (D-02)."""
+    text, name = _read(PYPROJECT)
+    assert "Development Status :: 3 - Alpha" in text, (
+        f"{name} does not classify saneless as Development Status :: 3 - Alpha"
+    )
+    assert "Development Status :: 4 - Beta" not in text, (
+        f"{name} still claims Development Status :: 4 - Beta; the first "
+        "published release is Alpha"
+    )
+
+
+def test_pyproject_distribution_name_is_saneless() -> None:
+    """The PyPI distribution name stays ``saneless`` (DLVR-01)."""
+    text, name = _read(PYPROJECT)
+    assert 'name = "saneless"' in text, (
+        f'{name} no longer declares name = "saneless". The owner rename '
+        "changes the GitHub URLs only; the distribution name is published and "
+        "must not drift to a squattable variant"
     )
