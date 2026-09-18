@@ -34,6 +34,9 @@ from fastapi.testclient import TestClient
 
 from saneless.checks import (
     check_name,
+    check_row_class,
+    check_row_glyph,
+    check_row_label,
     check_state_class,
     check_state_glyph,
     check_state_label,
@@ -921,10 +924,13 @@ class TestAppComposition:
             built.state.paperless.close()
             built.state.job_store.close()
 
-    def test_registers_the_eight_new_filters(self, unstarted_app: FastAPI) -> None:
+    def test_registers_the_eleven_new_filters(self, unstarted_app: FastAPI) -> None:
         """Every name this phase's templates reach for is registered (APPL-03)."""
         filters = unstarted_app.state.templates.env.filters
         expected = {
+            "check_row_class",
+            "check_row_glyph",
+            "check_row_label",
             "check_state_class",
             "check_state_glyph",
             "check_state_label",
@@ -947,6 +953,9 @@ class TestAppComposition:
         edited.  ``is`` is what makes APPL-12's "one shared place" checkable.
         """
         filters = unstarted_app.state.templates.env.filters
+        assert filters["check_row_class"] is check_row_class
+        assert filters["check_row_glyph"] is check_row_glyph
+        assert filters["check_row_label"] is check_row_label
         assert filters["check_state_class"] is check_state_class
         assert filters["check_state_glyph"] is check_state_glyph
         assert filters["check_state_label"] is check_state_label
