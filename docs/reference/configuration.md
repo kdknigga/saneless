@@ -35,7 +35,7 @@ Scanner connection settings.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `host` | string | `""` | SANE net host IP/hostname. Empty = local USB. Colon-separated for multiple hosts (e.g., `192.168.1.50:192.168.1.51`). |
+| `host` | string | `""` | SANE net host IP/hostname. Empty = local USB, on a bare-metal install only -- in a container, leave this set, because the container reaches every scanner through `saned` over the network. Colon-separated for multiple hosts (e.g., `192.168.1.50:192.168.1.51`). |
 | `device` | string | `""` | Pin a specific SANE device name. Empty = auto-detect first available. |
 
 ## `[paperless]`
