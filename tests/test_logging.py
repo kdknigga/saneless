@@ -346,7 +346,7 @@ def _stderr_stream_handlers() -> list[logging.Handler]:
 
 
 class TestConfigureLoggingStreamMode:
-    """``stream=True``: the 12-factor service shape ``serve`` uses (D-35, DLVR-04)."""
+    """No log file: the 12-factor service shape ``serve`` uses (D-35, DLVR-04)."""
 
     def _cleanup_handlers(self) -> None:
         """
@@ -362,34 +362,33 @@ class TestConfigureLoggingStreamMode:
         root.setLevel(logging.WARNING)
         logging.getLogger("saneless").setLevel(logging.NOTSET)
 
-    def test_stream_mode_attaches_no_file_handler(self, tmp_path: Path) -> None:
-        """Stream mode writes no file and creates no directory for one (D-40)."""
-        log_file = tmp_path / "logs" / "test.log"
+    def test_stream_mode_attaches_no_file_handler(self) -> None:
+        """
+        With no log file nothing on the root logger writes to disk (D-40).
+
+        That the configured ``log_file`` path is left untouched -- no file, no
+        parent directory -- is pinned end to end at the CLI seam, by
+        ``tests/test_cli.py::TestServeLogging``.
+        """
         try:
-            configure_logging(str(log_file), stream=True)
+            configure_logging(None)
             root = logging.getLogger()
-            assert not [
-                h
-                for h in root.handlers
-                if isinstance(h, logging.handlers.RotatingFileHandler)
-            ]
-            assert not (tmp_path / "logs").exists()
+            assert not [h for h in root.handlers if isinstance(h, logging.FileHandler)]
         finally:
             self._cleanup_handlers()
 
     def test_stream_mode_attaches_one_stderr_handler_at_the_configured_level(
-        self, tmp_path: Path
+        self,
     ) -> None:
         """Exactly one stderr handler, root at the configured level (D-36)."""
-        log_file = tmp_path / "logs" / "test.log"
         try:
-            configure_logging(str(log_file), "DEBUG", stream=True)
+            configure_logging(None, "DEBUG")
             assert len(_stderr_stream_handlers()) == 1
             assert logging.getLogger().level == logging.DEBUG
         finally:
             self._cleanup_handlers()
 
-    def test_stream_mode_returns_false(self, tmp_path: Path) -> None:
+    def test_stream_mode_returns_false(self) -> None:
         """
         Stream mode returns False, so the caller records no ``log_file``.
 
@@ -397,14 +396,13 @@ class TestConfigureLoggingStreamMode:
         needs no edit: nothing can print "Full details in <log_file>" for a
         service that writes no file.
         """
-        log_file = tmp_path / "logs" / "test.log"
         try:
-            assert configure_logging(str(log_file), stream=True) is False
+            assert configure_logging(None) is False
         finally:
             self._cleanup_handlers()
 
     def test_stream_mode_renders_the_traceback_without_verbose(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """
         The serve stream renders a traceback without ``-v`` (D-36 amended).
@@ -413,9 +411,8 @@ class TestConfigureLoggingStreamMode:
         deliberately so: the stream *is* the log here, and no file carries the
         traceback instead.
         """
-        log_file = tmp_path / "logs" / "test.log"
         try:
-            configure_logging(str(log_file), stream=True)
+            configure_logging(None)
             try:
                 _raise_runtime_error("kaboom-71bd")
             except RuntimeError:
@@ -428,12 +425,11 @@ class TestConfigureLoggingStreamMode:
             self._cleanup_handlers()
 
     def test_stream_mode_renders_the_traceback_with_verbose(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """With ``-v`` the serve stream renders the traceback exactly once."""
-        log_file = tmp_path / "logs" / "test.log"
         try:
-            configure_logging(str(log_file), stream=True, verbose=True)
+            configure_logging(None, verbose=True)
             try:
                 _raise_runtime_error("kaboom-3f0e")
             except RuntimeError:
@@ -445,7 +441,7 @@ class TestConfigureLoggingStreamMode:
             self._cleanup_handlers()
 
     def test_stream_mode_leaves_non_saneless_loggers_at_the_configured_level(
-        self, tmp_path: Path
+        self,
     ) -> None:
         """
         ``-v`` in stream mode raises only saneless's own loggers (D-38, T-27-23).
@@ -453,9 +449,8 @@ class TestConfigureLoggingStreamMode:
         httpx at DEBUG prints the Paperless ``Authorization`` header, so the
         root logger must keep the configured level in this mode too.
         """
-        log_file = tmp_path / "logs" / "test.log"
         try:
-            configure_logging(str(log_file), "INFO", stream=True, verbose=True)
+            configure_logging(None, "INFO", verbose=True)
             assert logging.getLogger("saneless").level == logging.DEBUG
             assert logging.getLogger().level == logging.INFO
             assert len(_stderr_stream_handlers()) == 1
