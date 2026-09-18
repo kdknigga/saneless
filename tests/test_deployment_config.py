@@ -38,7 +38,11 @@ the unchanged ``saneless`` distribution name (D-01, D-02, D-05, DLVR-08).
 
 The Phase 31 identity guard then holds every tracked file outside
 ``.planning/`` to the current GitHub owner, so a stale project URL cannot
-reach a reader or a registry (CI-02, DLVR-01, D-08..D-12).
+reach a reader or a registry (CI-02, DLVR-01, D-08..D-12). Its README tests
+hold the front page's own examples to the source and to the filesystem: the
+scan example shows ``--title``, every ``source`` value is the spelling the
+profile model defaults to, and every documentation deep link names a page
+that exists (DOCS-02, D-45).
 
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
@@ -50,7 +54,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from saneless.config import WebConfig, is_placeholder_token
+from saneless.config import ProfileConfig, WebConfig, is_placeholder_token
 from saneless.vocabulary import (
     ExitCode,
     RequestRejection,
@@ -60,6 +64,7 @@ from saneless.vocabulary import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
+README = REPO_ROOT / "README.md"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 DOCS_DIR = REPO_ROOT / "docs"
 
@@ -1249,4 +1254,70 @@ def test_no_shipped_file_references_the_old_owner() -> None:
         "renames. Every project URL must use the kdknigga forms -- "
         "github.com/kdknigga/saneless, kdknigga.github.io/saneless and "
         "ghcr.io/kdknigga/saneless:\n" + "\n".join(offenders)
+    )
+
+
+# Only the documentation deep links: the site root has no path after
+# ``saneless/`` and is not a page. The trailing ``/`` is greedy so a nested
+# path such as ``reference/cli-commands`` is captured whole.
+README_DOCS_LINK = re.compile(r"kdknigga\.github\.io/saneless/(?P<path>[^)\s]+)/")
+
+SCAN_EXAMPLE = "saneless scan"
+README_SOURCE_ASSIGNMENT = re.compile(r'source = "(?P<value>[^"]*)"')
+
+
+def test_readme_scan_example_carries_a_title() -> None:
+    """Every ``saneless scan`` line in the README shows ``--title`` (DOCS-02)."""
+    offenders = [
+        f"{number}: {line.strip()}"
+        for number, line in _numbered(README)
+        if SCAN_EXAMPLE in line and "--title" not in line
+    ]
+    assert not offenders, (
+        "a README scan example omits --title. The flag is optional at runtime "
+        "-- saneless resolves a default -- but DOCS-02 asks the front-page "
+        "example to show the reader how a document gets its name:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_readme_source_values_are_real_sane_spellings() -> None:
+    """
+    Every README ``source`` value is the spelling the profile model ships.
+
+    saneless compares the configured source against the names the backend
+    reports, and that comparison is case-sensitive: ``"flatbed"`` does not
+    match the ``"Flatbed"`` every SANE backend returns, which is exactly why
+    the lowercase spelling in the README was a real bug and not a typo. The
+    expectation is read off ``ProfileConfig`` rather than written out here, so
+    changing the default cannot leave the front page quietly wrong.
+    """
+    expected = ProfileConfig.model_fields["source"].default
+    offenders = [
+        f"{number}: {line.strip()}"
+        for number, line in _numbered(README)
+        for match in README_SOURCE_ASSIGNMENT.finditer(line)
+        if match.group("value") != expected
+    ]
+    assert not offenders, (
+        f"a README profile example sets source to something other than "
+        f"{expected!r}, the spelling ProfileConfig defaults to and SANE "
+        "reports. The comparison is case-sensitive, so a near-miss selects no "
+        "source at all:\n" + "\n".join(offenders)
+    )
+
+
+def test_every_readme_docs_link_resolves_to_a_page() -> None:
+    """Every README documentation deep link names a page that exists (DOCS-02)."""
+    offenders = [
+        f"{number}: {match.group(0)}"
+        for number, line in _numbered(README)
+        for match in README_DOCS_LINK.finditer(line)
+        if not (DOCS_DIR / f"{match.group('path')}.md").is_file()
+    ]
+    assert not offenders, (
+        "a README documentation link points at a path with no page behind it, "
+        "so the reader lands on a 404. The expectation is the docs/ tree "
+        "itself rather than a hard-coded list, so a page renamed in a later "
+        "phase cannot leave a dead link on the front page:\n" + "\n".join(offenders)
     )
