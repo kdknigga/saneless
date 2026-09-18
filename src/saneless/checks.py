@@ -723,12 +723,19 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     in the string settles it.
 
     The reading taken here is the narrow one: a trailing segment is a port only
-    when the setting has exactly two segments and that segment is all digits
-    within 1..65535.  Anything else is a list of host names, minus any segment
-    that could not be a name.  It is narrow on purpose -- misreading a host as
-    a port would probe the wrong address entirely, and misreading a port as a
-    host dials whatever glibc makes of the number, which is why neither
-    reading is applied to a segment that is all digits.
+    when the setting has exactly two segments and that segment is ASCII decimal
+    digits within 1..65535.  Anything else is a list of host names, minus any
+    segment that could not be a name.  It is narrow on purpose -- misreading a
+    host as a port would probe the wrong address entirely, and misreading a
+    port as a host dials whatever glibc makes of the number, which is why
+    neither reading is applied to a segment glibc would read as a number
+    (``_segment_is_a_numeric_address_shorthand``).
+
+    A leading zero in the port is read as decimal, not octal: ``host:065``
+    yields port 65.  This module does not claim libsane reads it the same way,
+    and it is not in a position to: the range test and the ASCII-decimal test
+    are the whole of what is guaranteed here, and a spelling whose two ends
+    might disagree is one an operator is better off not using.
 
     The range check is not cosmetic, and it is not a tidiness rule either.  A
     port outside 0..65535 does not fail loudly on the way to a socket: passed
@@ -762,8 +769,19 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     half catches ``[fe80::1]:6566`` if it ever reaches here, and the
     host-name half catches ``[2001:db8:0:0:0:0:0:1]:6566``, which has no blank
     segment at all and whose bracket-stripped form is nine groups the stdlib
-    rejects.  The stray colon at either edge stays tolerated, because
-    ``: host-a :`` has only ever meant one host.
+    rejects.  A stray colon at either edge is tolerated only when no port is
+    present: ``: host-a :`` is one host, but adding a port takes the setting
+    past two segments and the refusal above takes the whole thing --
+    ``localhost:6566:`` and ``:localhost:6566`` each yield ``()``.  That is the
+    safe direction rather than a gap: the refusal costs the pre-probe's latency
+    saving and never produces a wrong verdict.
+
+    A fully-qualified name written with its root dot yields ``()`` as well:
+    ``scanner.local.`` is legal DNS, and ``_looks_like_a_host_name``'s
+    trailing-dot rule rejects it.  This is accepted rather than fixed, because
+    widening the accept surface for a spelling that appears nowhere in this
+    project's config examples buys nothing, while the cost of leaving it is
+    only that one latency saving -- the trade the whole module is built on.
 
     **The cap.**  At most ``_MAX_PROBE_HOSTS`` -- four -- entries are returned,
     taken from the front of the configured order.  ``_scanner_preflight`` walks
