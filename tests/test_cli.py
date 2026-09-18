@@ -4319,6 +4319,36 @@ class TestServeLogging:
         # D-36: stdout stays the clean channel carrying only "Serving on ...".
         assert marker not in result.stdout
 
+    def test_serve_never_offers_the_verbose_hint_on_an_unexpected_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An exit-5 line under ``serve`` does not tell the operator to restart.
+
+        The stream already rendered the traceback (D-36 amended), so "Run
+        again with -v to see the traceback" would send someone to restart a
+        running service to see what is printed directly above the line.
+        """
+        settings = self._serve_settings(tmp_path)
+        TestServeCommand._mock_socket(monkeypatch)
+        TestServeCommand._stub_create_app(monkeypatch)
+
+        def exploding_run(_app: object, **_kwargs: object) -> None:
+            _raise_runtime_error("kaboom-serve-exit5")
+
+        monkeypatch.setattr("saneless.cli.uvicorn.run", exploding_run)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 5, result.output
+        assert "Unexpected error (RuntimeError): kaboom-serve-exit5" in result.stderr
+        assert cli_module._VERBOSE_HINT not in result.stderr
+        assert "Full details in" not in result.stderr
+        assert "Traceback" in result.stderr
+
     def test_one_shot_command_still_attaches_the_file_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
