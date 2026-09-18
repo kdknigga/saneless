@@ -431,11 +431,16 @@ def _checks_fallback_context() -> dict[str, object]:
 
     ``checks`` is ``None`` and ``checking_rows`` is the cold-start five, so the
     strip shows five *named* rows rather than an empty list that would read as
-    "nothing to report".  ``freshness_line`` is ``POLL_GAVE_UP_LINE``, which is
-    true here for the same reason it is true at the cap -- nothing has been
-    checked -- and it names the ``Check again`` button that is still on the
-    page, which is the one way forward left.  ``scan_active`` is ``False``
-    because the render that would have read the worker is the one that failed.
+    "nothing to report".  ``freshness_line`` is ``POLL_GAVE_UP_LINE``, and not
+    because nothing has been checked: the guard around this body covers the
+    whole render, so a raise from the worker's job lookup, the refresher's
+    lock or the clock produces it on an appliance whose cache may well hold
+    five true rows.  It is chosen because the render that would have read the
+    cache is the one that failed, so this body asserts nothing about the cache
+    beyond the fact that it could not be shown -- and the line names the
+    ``Check again`` button that is still on the page, which is the one way
+    forward left (R4-IN-02).  ``scan_active`` is ``False`` for the same
+    reason: the render that would have read the worker is the one that failed.
     ``poll_attempt`` is ``None``, and that is what ends the chain: the template
     emits its request attributes only when it is set, so the body this context
     renders carries no trigger and the browser stops asking.
