@@ -27,6 +27,7 @@ import re
 import socket
 import threading
 from dataclasses import FrozenInstanceError
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -898,10 +899,59 @@ class TestSanedReachable:
         assert SANED_PORT == 6566
 
 
+class _SpendingClock:
+    """
+    A monotonic clock that only moves when a dial spends the budget it was given.
+
+    A real clock is useless for measuring a *shared* deadline in this file,
+    because nothing here waits: three refused connects land in the same
+    microsecond, every one of them is handed very nearly the whole budget, and
+    a per-socket implementation is indistinguishable from a deadline.  So the
+    clock is driven by the thing that would really consume the time -- the dial
+    -- and ``spend`` says what fraction of its allowance each dial burns
+    through.  One means a socket that sat there until its timeout expired.
+    """
+
+    def __init__(self, *, spend: float) -> None:
+        """
+        Start at zero, burning ``spend`` of every granted timeout per dial.
+
+        Args:
+            spend: The fraction of each granted timeout a dial consumes.
+
+        """
+        self.now = 0.0
+        self.spend = spend
+
+    def __call__(self) -> float:
+        """
+        Read the clock, the way ``checks.monotonic`` is read.
+
+        Returns:
+            The current reading, in seconds.
+
+        """
+        return self.now
+
+    def spend_on_a_dial(self, granted: float) -> None:
+        """
+        Move the clock forward by what this dial cost.
+
+        Args:
+            granted: The timeout the probe handed the socket it just dialled.
+
+        """
+        self.now += granted * self.spend
+
+
 class _ProbeRecorder:
     """Records what the saned probe did, in place of doing any of it."""
 
-    def __init__(self, connectable: Iterable[object] = ()) -> None:
+    def __init__(
+        self,
+        connectable: Iterable[object] = (),
+        clock: _SpendingClock | None = None,
+    ) -> None:
         """
         Start with nothing recorded.
 
@@ -910,6 +960,9 @@ class _ProbeRecorder:
                 succeed.  Empty by default, so every address refuses unless a
                 case says otherwise and the cases that measure the budget are
                 untouched by the option existing.
+            clock: The scripted clock each dial moves forward, or ``None`` to
+                leave time alone, which is what every case but the shared-budget
+                one wants.
 
         """
         self.constructions: list[tuple[int, int, int]] = []
@@ -917,6 +970,12 @@ class _ProbeRecorder:
         self.timeouts: list[float] = []
         self.addresses: list[object] = []
         self.connectable = frozenset(connectable)
+        self.clock = clock
+
+    def note_a_dial(self) -> None:
+        """Charge the scripted clock, if there is one, for the dial just made."""
+        if self.clock is not None and self.timeouts:
+            self.clock.spend_on_a_dial(self.timeouts[-1])
 
     def socket(self, family: int, socktype: int, proto: int) -> _RecordingSocket:
         """
@@ -999,6 +1058,7 @@ class _RecordingSocket:
         """
         self.recorder.events.append("connect")
         self.recorder.addresses.append(address)
+        self.recorder.note_a_dial()
         if address in self.recorder.connectable:
             return
         msg = "Connection refused"
@@ -1015,7 +1075,10 @@ _THREE_ADDRESSES = [
 
 
 def _install_probe_recorder(
-    monkeypatch: pytest.MonkeyPatch, *, connectable: Iterable[object] = ()
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    connectable: Iterable[object] = (),
+    clock: _SpendingClock | None = None,
 ) -> _ProbeRecorder:
     """
     Replace resolution and socket construction with recording doubles.
@@ -1028,16 +1091,21 @@ def _install_probe_recorder(
     Args:
         monkeypatch: pytest's attribute patcher.
         connectable: The sockaddrs whose ``connect`` succeeds.
+        clock: A scripted clock each dial moves forward, substituted for
+            ``checks.monotonic``.  Omitted, the real clock is left in place and
+            no dial costs anything.
 
     Returns:
         The recorder the probe's calls land in.
 
     """
-    recorder = _ProbeRecorder(connectable)
+    recorder = _ProbeRecorder(connectable, clock)
     monkeypatch.setattr(
         socket, "getaddrinfo", lambda *_args, **_kwargs: _THREE_ADDRESSES
     )
     monkeypatch.setattr(socket, "socket", recorder.socket)
+    if clock is not None:
+        monkeypatch.setattr(checks, "monotonic", clock)
     return recorder
 
 
@@ -1082,20 +1150,49 @@ class TestSanedProbeBound:
         deadline taken once before the walk rather than a per-socket timeout,
         so three addresses cost at most what one address used to.
 
-        The first timeout is asserted as a bound rather than an equality: it
-        is computed from a real clock read and so lands a hair under the
-        budget.
+        **The forbidden implementation, named.**  A ``probe.settimeout(
+        PROBE_CONNECT_SECONDS)`` on each socket, with no deadline over the
+        walk, hands out three *equal* budgets and lets one configured host cost
+        three.  Until R3-IN-02 this test could not tell that apart from the one
+        it is named after: its three assertions were ``timeouts[0] <= budget``,
+        ``all(t > 0)`` and ``timeouts == sorted(timeouts, reverse=True)``, and
+        ``[2.0, 2.0, 2.0]`` satisfies every one of them -- the last because a
+        reverse sort of equal values is the same list.
+
+        It could not tell them apart for a reason worth keeping in mind here:
+        nothing in this file waits, so under a real clock three refused
+        connects land in the same microsecond and each one is handed very
+        nearly the whole budget whichever implementation is underneath.  So the
+        clock is scripted and driven by the dial itself, the way
+        ``test_the_deadline_stops_the_walk``'s is, and the property is measured
+        twice.
+
+        With a dial that spends its whole allowance, the granted timeouts must
+        **sum** to no more than one budget: the first attempt takes all of it
+        and the deadline leaves nothing for the second.  A per-socket
+        implementation sums to three budgets.  No tolerance is needed because
+        the scripted clock's arithmetic is exact.
+
+        With a dial that spends a quarter of its allowance, all three addresses
+        are reached and each one must be granted **strictly** less than the one
+        before.  A per-socket implementation grants three equal budgets, which
+        is not a strictly decreasing sequence.
 
         Args:
             monkeypatch: pytest's patcher.
 
         """
-        recorder = _install_probe_recorder(monkeypatch)
+        spent = _install_probe_recorder(monkeypatch, clock=_SpendingClock(spend=1.0))
         assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
-        assert len(recorder.constructions) == 3
-        assert recorder.timeouts[0] <= _PROBE_BUDGET
-        assert all(timeout > 0 for timeout in recorder.timeouts)
-        assert recorder.timeouts == sorted(recorder.timeouts, reverse=True)
+        assert sum(spent.timeouts) <= _PROBE_BUDGET, spent.timeouts
+
+        partial = _install_probe_recorder(monkeypatch, clock=_SpendingClock(spend=0.25))
+        assert _saned_reachable("scanbox.lan", SANED_PORT, _PROBE_BUDGET) is False
+        assert len(partial.constructions) == 3
+        assert all(timeout > 0 for timeout in partial.timeouts), partial.timeouts
+        assert all(earlier > later for earlier, later in pairwise(partial.timeouts)), (
+            partial.timeouts
+        )
 
     def test_the_addresses_dialled_are_the_ones_the_resolver_returned(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2740,6 +2837,71 @@ def _gate_sampling_context(
     return context, client, backend
 
 
+# The four scanner contexts whose rows differ, which is what makes them the
+# four a gated-equals-ungated claim has to cover (R3-IN-01).  Each produces a
+# different branch of the scanner check: the no-python-sane row decided before
+# anything is touched, the pre-probe row decided before the gate is reached,
+# the enumeration that answers, and the enumeration that raises and is rendered
+# by ``run_checks``' own handler -- which on the gated path also has to release
+# the gate on its way out.
+_GATED_CONTEXTS = (
+    "no-python-sane",
+    "host-unanswered",
+    "one-device",
+    "enumeration-raises",
+)
+
+
+def _gated_context_builder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner_context: str
+) -> Callable[[], CheckContext]:
+    """
+    Return a factory for one of the four scanner contexts whose rows differ.
+
+    A factory rather than a context, because the comparison runs the checks
+    twice and the backends count their calls: handing the same object to both
+    runs would compare a first enumeration against a second.
+
+    The dialler is stubbed for every variant, including the two that never
+    reach it, so no case in this parametrisation can resolve a name or open a
+    socket by accident.
+
+    Args:
+        tmp_path: The test's own directory.
+        monkeypatch: Used to stub the probe seam.
+        scanner_context: One of ``_GATED_CONTEXTS``.
+
+    Returns:
+        A callable building a fresh context for that scenario.
+
+    Raises:
+        ValueError: If ``scanner_context`` is not one of ``_GATED_CONTEXTS``.
+
+    """
+    if scanner_context == "no-python-sane":
+        _recording_dialler(monkeypatch, reachable=False)
+        return lambda: _context(_settings(tmp_path), scanner=None)
+    if scanner_context == "host-unanswered":
+        _recording_dialler(monkeypatch, reachable=False)
+        return lambda: _context(
+            _settings(tmp_path, host="scanbox.lan"),
+            scanner=_CountingBackend([_device()]),
+        )
+    if scanner_context == "one-device":
+        _recording_dialler(monkeypatch, reachable=True)
+        return lambda: _context(
+            _settings(tmp_path, host="scanbox.lan"),
+            scanner=_CountingBackend([_device()]),
+        )
+    if scanner_context == "enumeration-raises":
+        _recording_dialler(monkeypatch, reachable=True)
+        return lambda: _context(
+            _settings(tmp_path, host="scanbox.lan"), scanner=_RaisingBackend()
+        )
+    msg = f"unknown scanner context: {scanner_context}"
+    raise ValueError(msg)
+
+
 # Matches a row that talks about a *scan*, and deliberately not one that talks
 # about the *scanner*: "scanner" is the row's own name and every scanner
 # message is entitled to say it.  Word boundaries are what make the difference,
@@ -2766,22 +2928,37 @@ class TestRunChecksUnderTheScannerGate:
         assert [result.key for result in results] == list(CheckKey)
         assert _row(results, CheckKey.SCANNER).skipped is False
 
+    @pytest.mark.parametrize("scanner_context", list(_GATED_CONTEXTS))
     def test_a_gated_run_returns_what_an_ungated_run_returns(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scanner_context: str
     ) -> None:
         """
-        Handing in a free gate changes the rows not at all.
+        Handing in a free gate changes the rows not at all, in any context.
+
+        ``_scanner_result``'s docstring names this test as the replacement for
+        the uniform-dispatch seam the gate split removed: the gated path no
+        longer routes through ``_dispatch``, so nothing mechanical keeps it and
+        ``saneless doctor``'s ungated ``_check_scanner`` in step -- this does.
+
+        Until R3-IN-02 it ran exactly one scenario, and it was the scenario
+        where the gate is irrelevant (R3-IN-01): a free gate, a backend that
+        answers, and no configured host.  Every context whose *row* differs was
+        untested, so a gated path that diverged on the no-python-sane row, on a
+        host that refuses the pre-probe, or on an enumeration that raises would
+        have passed.  All four run here, and all four are reached without
+        resolving a name or opening a socket -- the dialler is stubbed in every
+        variant, including the two that never reach it.
 
         Args:
             tmp_path: The test's own directory.
+            monkeypatch: Used to stub the probe seam.
+            scanner_context: Which of the four scanner contexts to run.
 
         """
-        ungated = run_checks(
-            _context(_settings(tmp_path), scanner=_CountingBackend([_device()]))
-        )
+        build = _gated_context_builder(tmp_path, monkeypatch, scanner_context)
+        ungated = run_checks(build())
         gated = run_checks(
-            _context(_settings(tmp_path), scanner=_CountingBackend([_device()])),
-            scanner_gate=cast("threading.Lock", _RecordingLock()),
+            build(), scanner_gate=cast("threading.Lock", _RecordingLock())
         )
         assert [result.key for result in gated] == list(CheckKey)
         assert gated == ungated
