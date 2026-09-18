@@ -62,9 +62,11 @@ from saneless.config import (
 )
 from saneless.vocabulary import (
     ExitCode,
+    JobState,
     RequestRejection,
     rejection_message,
     rejection_status_code,
+    state_label,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -2356,4 +2358,111 @@ def test_no_planning_artifact_is_published_under_docs() -> None:
     assert not offenders, (
         "a planning artifact is published as part of the documentation "
         "site:\n" + "\n".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: what the final audit itself found (rows 4 and 10, DOCS-01)
+# ---------------------------------------------------------------------------
+
+# The heading whose body carries the threshold-tuning advice and its example.
+PROFILE_TUNING_HEADING = "## Empty page detection tuning"
+
+# An ``empty_page_*_threshold`` assignment inside a TOML example.
+EMPTY_PAGE_THRESHOLD = re.compile(
+    r"^empty_page_(?P<key>mean|stddev)_threshold = (?P<value>[0-9.]+)$",
+    re.MULTILINE,
+)
+
+# The phrasings that get the dual-threshold rule backwards. ``is_empty_page``
+# is ``mean > mean_threshold and stddev < stddev_threshold``, so lowering the
+# mean threshold admits MORE pages to the blank set, never fewer.
+INVERTED_TUNING_PHRASES = (
+    "lower the thresholds to detect",
+    "lower the thresholds to keep",
+)
+
+# The bullet that lists the words the history table's Status column shows.
+HISTORY_STATUS_WORDS = re.compile(r"Current state of the job \((?P<words>[^)]*)\)")
+
+# The trailing hedge in that bullet, which is prose rather than a label.
+HISTORY_STATUS_HEDGE = "and so on"
+
+
+def test_profile_howto_tuning_advice_matches_the_empty_page_rule() -> None:
+    """
+    The how-to's threshold example moves each threshold the way that keeps pages.
+
+    ``pages.is_empty_page`` is ``mean > mean_threshold and stddev <
+    stddev_threshold``.  Keeping a faint page therefore means **raising** the
+    mean threshold and **lowering** the stddev threshold; lowering the mean
+    threshold does the opposite of what the page promises, and the review
+    caught that inversion as row 10.  The numbers are checked against
+    ``ProfileConfig``'s own defaults, so a default change cannot leave a stale
+    literal here passing.
+    """
+    text, name = _read(PROFILE_HOWTO)
+    body = _section(text, PROFILE_TUNING_HEADING, name)
+    lowered = body.lower()
+    for phrase in INVERTED_TUNING_PHRASES:
+        assert phrase not in lowered, (
+            f"{name}'s tuning advice says {phrase!r}. Lowering the mean "
+            "threshold makes MORE pages count as empty, so this tells the "
+            "reader to do the opposite of what the sentence promises (row 10)"
+        )
+    assert "raise the mean threshold" in lowered, (
+        f"{name} does not tell the reader to raise the mean threshold to keep "
+        "faint pages, which is the direction is_empty_page actually rewards"
+    )
+
+    defaults = ProfileConfig(source="Flatbed")
+    found = {
+        match.group("key"): float(match.group("value"))
+        for match in EMPTY_PAGE_THRESHOLD.finditer(body)
+    }
+    assert set(found) == {"mean", "stddev"}, (
+        f"{name}'s tuning section no longer sets both thresholds in its "
+        f"example; found {sorted(found)}"
+    )
+    assert found["mean"] > defaults.empty_page_mean_threshold, (
+        f"{name}'s example sets empty_page_mean_threshold to {found['mean']}, "
+        f"at or below the default {defaults.empty_page_mean_threshold}. That "
+        "discards more pages, not fewer"
+    )
+    assert found["stddev"] < defaults.empty_page_stddev_threshold, (
+        f"{name}'s example sets empty_page_stddev_threshold to "
+        f"{found['stddev']}, at or above the default "
+        f"{defaults.empty_page_stddev_threshold}. That discards more pages, "
+        "not fewer"
+    )
+
+
+def test_first_web_ui_scan_names_real_history_labels() -> None:
+    """
+    Every word the walkthrough gives for the history Status column is a real label.
+
+    The history table renders ``state_label(job.state)``; the status area above
+    it spells the same terminal state differently -- ``DONE`` is "Complete" in
+    the table and "Done" in the status line.  Naming the status area's word in
+    the description of the table sends a reader looking for a string the table
+    never renders.  Derived from ``JobState`` so a relabelling cannot leave
+    this passing (row 4).
+    """
+    text, name = _read(FIRST_WEB_UI_SCAN)
+    match = HISTORY_STATUS_WORDS.search(text)
+    assert match is not None, (
+        f"{name} no longer describes what the history table's Status column "
+        "shows, so nothing pins its wording to the labels the table renders"
+    )
+    listed = [
+        stripped
+        for word in match.group("words").split(",")
+        if (stripped := word.strip()) and stripped != HISTORY_STATUS_HEDGE
+    ]
+    assert listed, f"{name} lists no example status words at all"
+    real = {state_label(state) for state in JobState}
+    unreal = [word for word in listed if word not in real]
+    assert not unreal, (
+        f"{name} says the history table shows {unreal}, but state_label never "
+        f"returns those. The labels it can return are {sorted(real)}"
     )
