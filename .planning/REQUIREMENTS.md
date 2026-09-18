@@ -126,18 +126,18 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 ### Appliance Layer
 
-- [ ] **APPL-01**: `saneless doctor` runs a shared check list (scanner reachable and named, Paperless URL reachable and token accepted, profiles configured, consume-dir fallback configured, data dir writable) and exits non-zero on any failing check [U-03]
-- [ ] **APPL-02**: The index page shows a status strip with the same checks, refreshed on load and by a button, cached with a TTL, and skipped while a scan is active so it never probes the busy scanner [U-03]
-- [ ] **APPL-03**: The status area and history table show pages scanned, pages removed as blank, and pages uploaded for every terminal job; manual duplex shows front and back counts during pass B [U-02]
-- [ ] **APPL-04**: Every user-facing error shows a plain-language message with a suggested next step derived from `ErrorCategory`, with the raw technical detail inside a collapsed "Technical details" disclosure [U-05]
-- [ ] **APPL-05**: Profiles have `label` and `description` fields; auto-generation fills them ("Feeder, single-sided", "Glass (flatbed)"), the dropdown shows labels with descriptions as help text, and feeder profiles sort first on sheet-fed scanners [U-04]
-- [ ] **APPL-06**: When the config location is read-only, generated profiles are kept in memory and the status strip says so instead of failing silently [U-04, M-30]
-- [ ] **APPL-07**: A placeholder or empty Paperless token is detected at startup, shown red on the status strip, and refuses scans (the server still starts so the operator can see why); the compose template has one place for the secret with the environment block commented out [U-01]
-- [ ] **APPL-08**: A queued job shows "Waiting for '<title>' to finish (N ahead of you)" using `list_pending()` position [U-06]
-- [ ] **APPL-09**: The flip prompt with its Continue and Abort buttons is rendered only for the browser that submitted the job (owner token in an HttpOnly, SameSite=Lax cookie set at submit); other viewers see "Waiting for the stack to be flipped"; Abort asks for confirmation [U-06]
-- [ ] **APPL-10**: Each form control has one line of help text in plain words ("Who sent this document? Optional."), tags use a checkbox list that works with a thumb, and the operator can hide Tags and Correspondent for a simpler form [U-07]
-- [ ] **APPL-11**: The recommended compose example includes the consume-directory mount with a two-line explanation, and the status strip reports "Fallback: not configured; scans cannot be kept if Paperless is down" when it is absent [U-08]
-- [ ] **APPL-12**: All user-facing timestamps in the web UI and CLI display in the server's local timezone with the zone named [M-23]
+- [x] **APPL-01**: `saneless doctor` runs a shared check list (scanner reachable and named, Paperless URL reachable and token accepted, profiles configured, consume-dir fallback configured, data dir writable) and exits non-zero on any failing check [U-03]
+- [x] **APPL-02**: The index page shows a status strip with the same checks, refreshed on load and by a button, cached with a TTL, and skipped while a scan is active so it never probes the busy scanner [U-03]
+- [x] **APPL-03**: The status area and history table show pages scanned, pages removed as blank, and pages uploaded for every terminal job; manual duplex shows front and back counts during pass B [U-02]
+- [x] **APPL-04**: Every user-facing error shows a plain-language message with a suggested next step derived from `ErrorCategory`, with the raw technical detail inside a collapsed "Technical details" disclosure [U-05]
+- [x] **APPL-05**: Profiles have `label` and `description` fields; auto-generation fills them ("Feeder, single-sided", "Glass (flatbed)"), the dropdown shows labels with descriptions as help text, and feeder profiles sort first on sheet-fed scanners [U-04]
+- [x] **APPL-06**: When the config location is read-only, generated profiles are kept in memory and the status strip says so instead of failing silently [U-04, M-30]
+- [x] **APPL-07**: A placeholder or empty Paperless token is detected at startup, shown red on the status strip, and refuses scans (the server still starts so the operator can see why); the compose template has one place for the secret with the environment block commented out [U-01]
+- [x] **APPL-08**: A queued job shows "Waiting for '<title>' to finish (N ahead of you)" using `list_pending()` position [U-06]
+- [x] **APPL-09**: The flip prompt with its Continue and Abort buttons is rendered only for the browser that submitted the job (owner token in an HttpOnly, SameSite=Lax cookie set at submit); other viewers see "Waiting for the stack to be flipped"; Abort asks for confirmation [U-06]
+- [x] **APPL-10**: Each form control has one line of help text in plain words ("Who sent this document? Optional."), tags use a checkbox list that works with a thumb, and the operator can hide Tags and Correspondent for a simpler form [U-07]
+- [x] **APPL-11**: The recommended compose example includes the consume-directory mount with a two-line explanation, and the status strip reports "Fallback: not configured; scans cannot be kept if Paperless is down" when it is absent [U-08]
+- [x] **APPL-12**: All user-facing timestamps in the web UI and CLI display in the server's local timezone with the zone named [M-23]
 
 ### Delivery and Identity
 
@@ -313,18 +313,18 @@ Which phases cover which requirements. Updated during roadmap creation.
 | HARD-03 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
 | HARD-04 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
 | HARD-05 | Phase 29 — Geometry, Memory, and Timeouts | Pending |
-| APPL-01 | Phase 30 — Appliance Layer | Pending |
-| APPL-02 | Phase 30 — Appliance Layer | Pending |
-| APPL-03 | Phase 30 — Appliance Layer | Pending |
-| APPL-04 | Phase 30 — Appliance Layer | Pending |
-| APPL-05 | Phase 30 — Appliance Layer | Pending |
-| APPL-06 | Phase 30 — Appliance Layer | Pending |
-| APPL-07 | Phase 30 — Appliance Layer | Pending |
-| APPL-08 | Phase 30 — Appliance Layer | Pending |
-| APPL-09 | Phase 30 — Appliance Layer | Pending |
-| APPL-10 | Phase 30 — Appliance Layer | Pending |
-| APPL-11 | Phase 30 — Appliance Layer | Pending |
-| APPL-12 | Phase 30 — Appliance Layer | Pending |
+| APPL-01 | Phase 30 — Appliance Layer | Complete |
+| APPL-02 | Phase 30 — Appliance Layer | Complete |
+| APPL-03 | Phase 30 — Appliance Layer | Complete |
+| APPL-04 | Phase 30 — Appliance Layer | Complete |
+| APPL-05 | Phase 30 — Appliance Layer | Complete |
+| APPL-06 | Phase 30 — Appliance Layer | Complete |
+| APPL-07 | Phase 30 — Appliance Layer | Complete |
+| APPL-08 | Phase 30 — Appliance Layer | Complete |
+| APPL-09 | Phase 30 — Appliance Layer | Complete |
+| APPL-10 | Phase 30 — Appliance Layer | Complete |
+| APPL-11 | Phase 30 — Appliance Layer | Complete |
+| APPL-12 | Phase 30 — Appliance Layer | Complete |
 | DLVR-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DLVR-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DLVR-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |

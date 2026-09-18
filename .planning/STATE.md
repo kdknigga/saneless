@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: executing
-stopped_at: Phase 30 UI-SPEC approved
-last_updated: "2026-09-18T01:19:36.251Z"
+status: ready_to_plan
+stopped_at: Phase 30 complete (36/36) — ready to discuss Phase 33
+last_updated: 2026-09-18T03:46:48.932Z
 last_activity: 2026-09-18 -- Phase 30 execution started
 progress:
   total_phases: 15
   completed_phases: 11
   total_plans: 140
-  completed_plans: 134
+  completed_plans: 140
   percent: 73
 ---
 
@@ -21,23 +21,23 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 30 — appliance-layer
+**Current focus:** Phase 33 — disable the openapi schema and docs endpoints
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 30 (appliance-layer) — EXECUTING
-Plan: 1 of 36
-Status: Executing Phase 30
+Phase: 33
+Plan: Not started
+Status: Ready to plan
 Progress: [████████░░] 83%
 Next: Phase 25 (Manual Duplex) — not started, no phase directory yet
-Last activity: 2026-09-18 -- Phase 30 execution started
+Last activity: 2026-09-18
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 68
+- Total plans completed: 104
 - Average duration: 5min
 - Total execution time: 0.27 hours
 
@@ -52,6 +52,7 @@ Last activity: 2026-09-18 -- Phase 30 execution started
 | 26 | 19 | - | - |
 | 27 | 8 | - | - |
 | 28 | 14 | - | - |
+| 30 | 36 | - | - |
 
 **Recent Trend:**
 
