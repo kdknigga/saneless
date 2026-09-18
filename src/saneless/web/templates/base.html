@@ -1,12 +1,21 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="auto">
+<html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    {# htmx drops 4xx/5xx bodies by default; this makes it swap them, so a
+       rejected request shows its message. htmx 2.0.8 merges meta config
+       shallowly, so all three entries are restated: a meta holding only the
+       [45].. entry would replace the array and stop every 2xx swap. #}
+    <meta name="htmx-config"
+          content='{"responseHandling":[{"code":"204","swap":false},{"code":"[23]..","swap":true},{"code":"[45]..","swap":true,"error":true}]}'>
     <title>saneless</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <link rel="stylesheet" href="/static/vendor/pico-2.1.1.min.css"
+          integrity="sha384-L1dWfspMTHU/ApYnFiMz2QID/PlP1xCW9visvBdbEkOLkSSWsP6ZJWhPw6apiXxU">
     <link rel="stylesheet" href="/static/app.css">
-    <script src="https://cdn.jsdelivr.net/npm/htmx.org@2.0.8/dist/htmx.min.js"></script>
+    <script src="/static/vendor/htmx-2.0.8.min.js"
+            integrity="sha384-/TgkGk7p307TH7EXJDuUlgG3Ce1UVolAOFopFekQkkXihi5u/6OCvVKyz1W+idaz"></script>
 </head>
 <body>
     <header class="container">
@@ -15,6 +24,5 @@
     <main class="container">
         {% block content %}{% endblock %}
     </main>
-    <script src="/static/app.js"></script>
 </body>
 </html>

@@ -1,30 +1,77 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
+# Git shims installed by `prek install`; worktrees share them via core.hooksPath.
+default_install_hook_types: [pre-commit, pre-merge-commit, pre-push]
+# The vendored htmx and Pico files under static/vendor/ are pinned by SHA-384
+# `integrity` attributes in base.html, so their bytes must stay exactly as the npm
+# registry shipped them. The byte-rewriting hooks below (end-of-file-fixer,
+# mixed-line-ending, trailing-whitespace) would append a newline or rewrite line
+# endings, the hash would stop matching, and browsers would refuse to load the
+# assets. No hook sees the directory; tests/test_vendor_assets.py is the backstop.
+exclude: ^src/saneless/web/static/vendor/
+# Hooks with no `stages:` of their own run at commit time only, never at merge or
+# push, where a file-modifying hook would abort the operation.
+#
+# It does NOT override a hook whose own manifest declares `stages:` -- a
+# manifest-declared value wins over default_stages. pre-commit-hooks v6.0.0 declares
+# [pre-commit, pre-push, manual] on check-added-large-files,
+# check-executables-have-shebangs, end-of-file-fixer and trailing-whitespace, so each
+# of those carries an explicit `stages: [pre-commit]` below to pin it back. The same
+# manifest declares it on check-shebang-scripts-are-executable and destroyed-symlinks,
+# which this config does not use yet. Read the upstream manifest before adding a hook:
+# if it declares `stages:`, the pin here is what keeps it off merge and push.
+default_stages: [pre-commit]
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: check-added-large-files
-      - id: check-ast
+        stages: [pre-commit]
       - id: check-executables-have-shebangs
+        stages: [pre-commit]
+      # Read-only checks: they report and never rewrite, so nothing here can
+      # abort a merge or a push by modifying a file. They run at all three
+      # stages deliberately -- check-merge-conflict is worth most at
+      # pre-merge-commit, the stage named after the operation it guards, and
+      # detect-private-key and detect-aws-credentials at pre-push, the last
+      # point before content leaves the machine.
+      - id: check-ast
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-json
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-merge-conflict
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-symlinks
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-toml
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-vcs-permalinks
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-xml
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: check-yaml
         args: ["--allow-multiple-documents"]
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: debug-statements
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: detect-aws-credentials
+        stages: [pre-commit, pre-merge-commit, pre-push]
       - id: detect-private-key
+        stages: [pre-commit, pre-merge-commit, pre-push]
+      # File-modifying hooks from here down: commit stage only.
       - id: end-of-file-fixer
+        stages: [pre-commit]
       - id: fix-byte-order-marker
       - id: mixed-line-ending
         args: ["--fix=lf"]
       - id: pretty-format-json
-      - id: sort-simple-yaml
+      # No sort-simple-yaml: upstream declares `files: '^$'`, a pattern that
+      # matches nothing, so the hook can only ever run against a `files:` this
+      # config supplies itself. There is no YAML here whose keys we want sorted
+      # -- ordering is meaningful in this file and in the workflows -- so it is
+      # absent rather than configured.
       - id: trailing-whitespace
+        stages: [pre-commit]
 
   - repo: https://gitlab.com/bmares/check-json5
     rev: v1.0.1
@@ -45,18 +92,94 @@ repos:
 
   - repo: local
     hooks:
+      # Commit time checks src/ only, so a TDD RED commit (a test naming a symbol
+      # that does not exist yet) can land. tests/ is checked in full when the
+      # branch is merged with --no-ff or pushed, by the two "(full)" hooks below.
+      #
+      # No `types:` on any hook in this section, deliberately. Each one pairs
+      # `always_run: true` with `pass_filenames: false`, so it runs whatever
+      # changed and is handed no filenames -- a `types:` filter would have
+      # nothing to act on, and would only suggest a scoping that is not there.
+      # The paths these checkers cover are the ones written into `entry`.
       - id: ty-checker
-        name: ty type checker
-        entry: uv run ty check
+        name: ty type checker (src)
+        entry: uv run ty check src
         language: system
-        types: [python]
         pass_filenames: false
         always_run: true
 
+      # Paths are explicit rather than relying on `project-includes`: pyrefly's
+      # `use-ignore-files` is on by default and is only bypassed when files are
+      # named on the command line.  Without them, a checkout inside a gitignored
+      # directory (a `.claude/worktrees/` git worktree) has every source file
+      # filtered out and the hook fails with "No Python files matched".
       - id: pyrefly-checker
-        name: pyrefly type checker
-        entry: uv run pyrefly check
+        name: pyrefly type checker (src)
+        entry: uv run pyrefly check src
         language: system
-        types: [python]
         pass_filenames: false
         always_run: true
+
+      # The workflow audit, at commit stage with the other cheap checks: it
+      # reads five files, finishes in well under a second, and never rewrites
+      # anything, so it cannot abort an operation by modifying the tree. Any
+      # finding exits non-zero, which is the whole contract -- findings get
+      # fixed, not silenced with an inline audit-ignore comment.
+      - id: zizmor
+        name: zizmor (workflow audit)
+        entry: uv run zizmor .
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: ty-checker-full
+        name: ty type checker (full)
+        entry: uv run ty check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      - id: pyrefly-checker-full
+        name: pyrefly type checker (full)
+        entry: uv run pyrefly check src tests
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      # Lint and format are checked, not applied, at merge and push. The
+      # ruff-pre-commit hooks above rewrite files, so they cannot run at either
+      # stage -- which left the two cheapest checks in the gate deferred to a CI
+      # round trip while the two slowest (the type checkers) ran locally.
+      # `--no-fix` and `--check` report instead of rewriting, so they can.
+      - id: ruff-check-full
+        name: ruff (no fix)
+        entry: uv run ruff check --no-fix .
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      - id: ruff-format-check
+        name: ruff format --check
+        entry: uv run ruff format --check .
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      # The doc-truth harness -- the naming guard and the deployment claims it
+      # asserts -- gets its own gate here, at merge and push. Until this hook
+      # existed there was no pytest hook anywhere in this file, so the guard's
+      # only enforcement points were CI and whatever a developer chose to run
+      # locally; this adds the third. Scoped to the one file the guard lives in
+      # rather than the whole suite: about two seconds instead of twenty-seven,
+      # and the rest of the suite is already CI's job.
+      - id: doc-truth-guard
+        name: doc-truth harness (naming guard, deployment claims)
+        entry: uv run pytest tests/test_deployment_config.py -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]

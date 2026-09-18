@@ -1,0 +1,28 @@
+{# The ONLY copy of the Scan button markup (ROBU-04, C-10).  index.html includes
+   it inline; partials/status_response.html includes it with oob = true so every
+   status response re-renders it from server state.  Keep type="submit"
+   id="scan-btn" as the first two attributes, in that order: the _SCAN_BUTTON
+   regex in tests/test_web_state_rendering.py depends on it.  Never include this
+   inside partials/status.html -- the page includes that partial too, so the
+   page would carry a duplicate id="scan-btn".
+
+   The blocked flag below is the second, independent source of disabled
+   (UI-SPEC S8): a paperless-ngx token nobody set means an upload is impossible
+   before any paper moves, so the button says no.  It lives HERE for the
+   same C-10 reason the partial itself exists -- on htmx 2.0.8 an inherited
+   hx-disabled-elt strips disabled from a server-disabled button the moment a
+   child request finishes (fixed only in 2.0.9, and htmx 4 is out of scope), so
+   this button is re-rendered from server state on every status response.  If
+   the blocked state were expressed anywhere else, the first tag or
+   profile-description request to complete would re-enable it.
+
+   The flag adds a disabled source and nothing more: the label and aria-busy
+   still come from the job, exactly as Phase 26's table says, and the label
+   stays Scan when there is no job.  The reason line lives in index.html,
+   because a disabled button is not focusable and cannot be reliably hovered,
+   so the explanation has to be visible text rather than a tooltip. #}
+<button type="submit" id="scan-btn"{% if oob %} hx-swap-oob="true"{% endif %}
+        {% if scan_blocked %}aria-describedby="scan-blocked-reason"{% endif %}
+        {% if scan_blocked or (job and job.is_active) %}disabled{% endif %}{% if job and job.is_active and job.is_busy %} aria-busy="true"{% endif %}>
+    {% if job and job.state == JobState.AWAITING_FLIP %}Waiting for flip&#8230;{% elif job and job.is_busy %}Scanning&#8230;{% else %}Scan{% endif %}
+</button>

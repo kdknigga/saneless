@@ -51,7 +51,7 @@ empty_page_stddev_threshold = 8.0
 **To be more conservative** (keep more pages): raise the mean threshold or lower the stddev threshold.
 
 !!! tip
-    If you are unsure whether detection is working correctly, run saneless with `--log-level DEBUG`. The log will show the exact mean and stddev values for each page along with the keep/discard decision.
+    If you are unsure whether detection is working correctly, run the scan with `saneless -v scan ...` (or set `log_level = "DEBUG"` under `[output]`). The log will show the exact mean and stddev values for each page along with the keep/discard decision.
 
 ## Disabling Empty Page Detection
 
@@ -66,3 +66,11 @@ enable_empty_page_detection = false
 ```
 
 This is useful when scanning documents where blank pages are intentional (such as forms with designated blank backs).
+
+## When Every Page Is Blank
+
+If detection removes every page of a scan, the scan fails with "All pages were blank" and nothing is uploaded. If the document really is blank, or its pages are faint enough to look blank, make detection more conservative as described under [Tuning the Thresholds](#tuning-the-thresholds) or disable it for that profile.
+
+A scanner that returns no pages at all is reported separately, as "No pages were scanned", and an empty feeder still reports that no paper was detected. The all-blank failure therefore always means the scanner did return pages and detection judged all of them empty, so the two situations are never confused.
+
+Empty page detection is the only place saneless judges what is on a page. The scanner backend never discards a page for its content: with detection disabled, a page that is uniformly white or uniformly black is kept and assembled like any other. The only pages the backend skips are the ones it could not read at all -- an image with zero width or height, or a buffer far too small to be a real page -- and each of those is logged individually with its page number. Those are integrity checks rather than blank-page detection: they ask whether the scanner returned a decodable image, never whether the page was worth keeping.

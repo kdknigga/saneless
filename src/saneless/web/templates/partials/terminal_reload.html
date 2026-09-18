@@ -1,0 +1,15 @@
+{# What a terminal job state has to reload, in one place.
+
+   This factors out the four IDENTICAL hidden history loaders that stood on the
+   DONE, FALLBACK, CANCELLED and ERROR branches of partials/status.html (lines
+   20, 26, 30 and 33 before this phase).  Four copies of one attribute list is
+   four chances for a target or a swap to drift.
+
+   The strip loader is new and it is here for D-08: every terminal branch means
+   the scan has ended and the scanner is free again, so the strip un-pauses at
+   once instead of showing "Paused during scan" until the 30 s TTL runs out.
+   It is a load trigger and nothing else -- no interval -- so it adds no poll.
+
+   Both reuse .htmx-hidden (app.css); this partial adds no class of its own. #}
+<div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+<div hx-get="/api/checks" hx-target="#checks-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
