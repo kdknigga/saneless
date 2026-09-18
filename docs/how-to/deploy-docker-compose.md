@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
 
   saneless:
-    image: ghcr.io/kris-knigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:latest
     ports:
       - "8080:8080"
     volumes:
@@ -85,7 +85,7 @@ volumes:
 
 Key details:
 
-- **Image:** `ghcr.io/kris-knigga/saneless:latest` includes `libsane` and handles `python-sane` compilation automatically
+- **Image:** `ghcr.io/kdknigga/saneless:latest` includes `libsane` and handles `python-sane` compilation automatically
 - **Port 8080:** The saneless web UI
 - **One place for the token:** the paperless-ngx URL and token live in `config/config.toml`, and this compose file deliberately sets neither. **An environment variable overrides the config file**, silently: set `SANELESS_PAPERLESS__TOKEN` here and saneless uses that value and ignores the one in `config.toml`. If it is a placeholder, or empty, saneless shows the status strip red and refuses to scan, and the token you carefully put in `config.toml` has nothing to do with it. Leave the block commented and edit the file
 - **`TZ`:** a container's clock reports UTC. Without `TZ`, every timestamp saneless displays -- the job history, `saneless jobs`, and the fallback title it gives a document in paperless-ngx -- is UTC rather than your local time. It is a standard container variable, not a saneless setting

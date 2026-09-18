@@ -12,7 +12,7 @@
 
 services:
   saneless:
-    image: ghcr.io/kris-knigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:latest
     ports:
       - "8080:8080"
     volumes:
@@ -22,7 +22,7 @@ services:
       # mount makes that rename fail with EBUSY.
       # If config.toml is missing, saneless starts with defaults plus
       # environment variables and does not create the file.
-      # See: https://github.com/kris-knigga/saneless#configuration
+      # See: https://github.com/kdknigga/saneless#configuration
       - ./config:/etc/saneless
       # Durable state: job database and preserved scans. /tmp/saneless is
       # deliberately NOT mounted -- it is disposable scratch space.

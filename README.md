@@ -34,7 +34,7 @@ pip install saneless
 The Docker image includes `libsane` and handles `python-sane` compilation automatically:
 
 ```bash
-docker run -p 8080:8080 ghcr.io/kris-knigga/saneless
+docker run -p 8080:8080 ghcr.io/kdknigga/saneless
 ```
 
 ## Usage
@@ -69,9 +69,9 @@ Or use environment variables: `SANELESS_SCANNER__HOST`, `SANELESS_PAPERLESS__URL
 
 ## Documentation
 
-Full documentation is available at **[saneless.github.io](https://kris-knigga.github.io/saneless/)**.
+Full documentation is available at **[saneless.github.io](https://kdknigga.github.io/saneless/)**.
 
-- [Scan Your First Document](https://kris-knigga.github.io/saneless/tutorials/scan-your-first-document/) -- step-by-step tutorial
-- [How-To Guides](https://kris-knigga.github.io/saneless/how-to/install-bare-metal/) -- installation, Docker, profiles, duplex, CLI
-- [Configuration Reference](https://kris-knigga.github.io/saneless/reference/configuration/) -- all TOML options and defaults
-- [CLI Reference](https://kris-knigga.github.io/saneless/reference/cli-commands/) -- commands, flags, exit codes
+- [Scan Your First Document](https://kdknigga.github.io/saneless/tutorials/scan-your-first-document/) -- step-by-step tutorial
+- [How-To Guides](https://kdknigga.github.io/saneless/how-to/install-bare-metal/) -- installation, Docker, profiles, duplex, CLI
+- [Configuration Reference](https://kdknigga.github.io/saneless/reference/configuration/) -- all TOML options and defaults
+- [CLI Reference](https://kdknigga.github.io/saneless/reference/cli-commands/) -- commands, flags, exit codes
