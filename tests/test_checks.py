@@ -704,6 +704,52 @@ class TestProbeHostCap:
         assert _saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
 
 
+class TestTheParserDocstringIsTrue:
+    """R3-IN-04: one test per sentence of ``_saned_hosts``' contract."""
+
+    def test_a_stray_colon_after_a_port_refuses_the_setting(self) -> None:
+        """
+        ``localhost:6566:`` yields ``()``, not one host on a port.
+
+        The docstring claimed a stray colon at either edge "stays tolerated,
+        because ``: host-a :`` has only ever meant one host".  That is true of
+        a bare name and false in combination with a port: the trailing colon
+        takes the setting to three segments, so the more-than-two-segment
+        refusal fires on ``6566`` not being a plausible host name and the whole
+        setting is refused.  Refusal is the safe direction -- it costs the
+        pre-probe's latency saving and never produces a wrong verdict -- but it
+        is not what the sentence said.
+        """
+        assert _saned_hosts("localhost:6566:") == ()
+
+    def test_a_stray_colon_before_a_port_refuses_the_setting(self) -> None:
+        """``:localhost:6566`` is refused for the same reason as its mirror."""
+        assert _saned_hosts(":localhost:6566") == ()
+
+    def test_a_leading_zero_port_is_read_as_decimal(self) -> None:
+        """
+        ``host:065`` is port 65, and the docstring now says so.
+
+        Nothing here claims libsane reads ``065`` the same way.  The range test
+        and the ASCII-decimal test are the whole of what this module
+        guarantees about a port segment, and this case pins the reading rather
+        than the agreement.
+        """
+        assert _saned_hosts("host:065") == (("host", 65),)
+
+    def test_a_root_dot_fully_qualified_name_yields_no_entries(self) -> None:
+        """
+        ``scanner.local.`` is legal DNS and is still refused.
+
+        ``_looks_like_a_host_name``'s trailing-dot rule rejects it, so the name
+        loses its pre-probe.  The behaviour is documented and pinned rather
+        than fixed: widening the accept surface for a spelling that appears
+        nowhere in this project's config examples buys nothing, and the cost of
+        leaving it is one latency saving.
+        """
+        assert _saned_hosts("scanner.local.") == ()
+
+
 class TestSanedReachable:
     """The only bounded reachability probe in the tree."""
 
