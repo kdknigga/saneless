@@ -208,3 +208,10 @@ None. No placeholder value, empty collection or "coming soon" string was introdu
 ## Threat Flags
 
 None. No new network endpoint, auth path, file access pattern or schema change at a trust boundary; the change is strictly a narrowing of what the existing pre-probe will dial.
+
+## Self-Check: PASSED
+
+- Files claimed modified exist on disk: `src/saneless/checks.py`, `tests/test_checks.py`, `.planning/phases/30-appliance-layer/30-31-SUMMARY.md` — all present.
+- Commits claimed exist in `git log`: `e0d08ed`, `9b5d1c0`, `e7b6780`, `be8c494`, `6aa7562` — all present on `worktree-agent-aa86d14ed0ecb8425`, rooted at the orchestrator's base `2b3cced`.
+- `git diff --diff-filter=D 2b3cced HEAD` — no file deleted by any commit in this plan.
+- Working tree clean after the summary commit; `STATE.md` and `ROADMAP.md` untouched (orchestrator-owned).
