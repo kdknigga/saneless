@@ -1,6 +1,6 @@
 [project]
 name = "saneless"
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 description = "SANE scanner to paperless-ngx bridge"
 readme = "README.md"
 license = "MIT"
