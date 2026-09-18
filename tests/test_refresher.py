@@ -18,6 +18,7 @@ Covers requirements: APPL-02.
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 import threading
 from typing import TYPE_CHECKING
@@ -161,6 +162,35 @@ class _StoreCounter:
         CheckCache.store(self.cache, results)
 
 
+class _RaisingStore:
+    """A cache write that fails, the way a broken clock or a bad entry would."""
+
+    def __init__(self, error: Exception) -> None:
+        """
+        Raise ``error`` on every write, and count the attempts.
+
+        Args:
+            error: What every write raises.
+
+        """
+        self.calls = 0
+        self._error = error
+
+    def __call__(self, results: tuple[CheckResult, ...]) -> None:
+        """
+        Record the attempted write and raise instead of making it.
+
+        Args:
+            results: What the probe produced and could not store.
+
+        Raises:
+            Exception: Always, the error this was built with.
+
+        """
+        self.calls += 1
+        raise self._error
+
+
 class _ScanState:
     """The worker's job-in-flight fact, as the refresher reads it."""
 
@@ -264,6 +294,31 @@ def _spy(
     spy = _RunChecksSpy(error=error)
     monkeypatch.setattr("saneless.web.refresher.run_checks", spy)
     return spy
+
+
+def _refresher_records(
+    caplog: pytest.LogCaptureFixture, text: str
+) -> list[logging.LogRecord]:
+    """
+    Return the refresher's own ERROR records whose message contains ``text``.
+
+    Args:
+        caplog: The capture fixture the test was handed.
+        text: The substring the wanted records carry.
+
+    Returns:
+        Every matching record, so a test can pin "logged once" rather than
+        "logged at all" -- a swallowed failure that is logged twice, or not at
+        all, is a differently-broken appliance.
+
+    """
+    return [
+        record
+        for record in caplog.records
+        if record.name == "saneless.web.refresher"
+        and record.levelno == logging.ERROR
+        and text in record.getMessage()
+    ]
 
 
 def test_tick_without_a_watcher_does_nothing(
@@ -601,6 +656,66 @@ def test_a_failing_run_leaves_the_previous_entry_in_place(
 
     assert cache.current().results == previous
     assert previous == good.results
+
+
+def test_a_raising_store_does_not_escape_the_probe(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    R3-WR-02: a store that raises must not travel up and end the refresher.
+
+    The store used to sit in the ``else`` arm of the probe's ``try``, and an
+    exception raised in an ``else`` arm is not routed to that ``try``'s
+    handlers.  So this raise propagated out of ``_probe_and_store``, out of
+    ``_tick`` and out of ``_run``: an appliance whose strip never updated
+    again, silently, for the life of the process.
+    """
+    _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    store = _RaisingStore(RuntimeError("store exploded"))
+    monkeypatch.setattr(cache, "store", store)
+
+    assert refresher._probe_and_store() is True
+
+    assert store.calls == 1
+    assert refresher.probe_in_flight is False
+    assert len(_refresher_records(caplog, "Check refresh failed")) == 1
+
+
+def test_a_raising_store_leaves_the_previous_entry_in_place(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Last-known-good covers a failed *write* too, not only a failed probe."""
+    good = _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.probe_now()
+    previous = cache.current().results
+    monkeypatch.setattr(cache, "store", _RaisingStore(RuntimeError("store exploded")))
+
+    assert refresher.probe_now() is True
+
+    assert cache.current().results == previous
+    assert previous == good.results
+
+
+def test_probe_now_with_a_raising_store_reports_that_it_probed(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The button's path must render, not 500 with the manual claim spent.
+
+    ``POST /api/checks/refresh`` calls this from a request thread, so a raise
+    here is a raise in a request thread: the clicker gets an error page and
+    their one claim is gone, for a probe that actually ran.
+    """
+    _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    monkeypatch.setattr(cache, "store", _RaisingStore(RuntimeError("store exploded")))
+
+    assert refresher.probe_now() is True
+    assert refresher.probe_in_flight is False
 
 
 def test_start_then_stop_reports_a_stopped_daemon_thread(
