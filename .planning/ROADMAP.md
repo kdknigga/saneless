@@ -664,7 +664,7 @@ Plans:
 
 **Gap wave 9** *(blocked on gap wave 8)*
 
-- [ ] 30-35-PLAN.md — R3-WR-04/R3-IN-01/R3-IN-02/R3-IN-06: the poll window follows the probe's real worst case; two decorative tests become load-bearing
+- [x] 30-35-PLAN.md — R3-WR-04/R3-IN-01/R3-IN-02/R3-IN-06: the poll window follows the probe's real worst case; two decorative tests become load-bearing
 
 **Gap wave 10** *(blocked on gap wave 9)*
 
@@ -731,7 +731,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 34/36 | In Progress|  |
+| 30. Appliance Layer | 35/36 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
