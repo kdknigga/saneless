@@ -43,7 +43,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [x] **Phase 28: Exception Translation** - No third-party exception type escapes a module boundary; the CLI prints one line, not a traceback (completed 2026-09-15)
 - [x] **Phase 29: Geometry, Memory, and Timeouts** - Pages spooled to disk in explicit order, safe cancel, shared flatbed/ADF timeout, guarded `sane.init()` (completed 2026-09-16)
 - [x] **Phase 30: Appliance Layer** - Status strip and `saneless doctor` from one check list, page counts, plain-language errors, human profile labels, queue position, owner-only flip prompt (completed 2026-09-16)
-- [ ] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/saneless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected
+- [x] **Phase 31: Delivery, Identity, and Documentation Accuracy** - `kdknigga/saneless` everywhere with a CI grep guard, a release workflow proven end to end, container fixes, and every false doc claim corrected (completed 2026-09-18)
 - [ ] **Phase 32: Suite Hygiene and Minor Sweep** - Hermetic tests, no `time.sleep`, no low-value tests, and the remaining N-01..N-45 sweep
 - [ ] **Phase 33: Disable the OpenAPI Schema and Docs Endpoints** - `/openapi.json`, `/docs` and `/redoc` are gone rather than broken; nothing claims saneless serves an API schema
 
@@ -696,8 +696,8 @@ Plans:
 - [x] 31-06-PLAN.md — USB reconciliation, the "Which setup do I have?" page, and the no-auth sentences
 - [x] 31-07-PLAN.md — Remaining doc-row corrections (30, 31, 32) and the `docs/PRD.md` move
 - [x] 31-08-PLAN.md — The D-42 audit artifact: 34-row dispositions plus the D-44 re-check
-- [ ] 31-09-PLAN.md — Release prerequisites and the RC tag (blocked on user blockers 1-3, 5, 6)
-- [ ] 31-10-PLAN.md — Clean-machine verification of the published artefacts; restore 0.2.0 (blocked on user blocker 4)
+- [x] 31-09-PLAN.md — Release prerequisites and the RC tag (blocked on user blockers 1-3, 5, 6)
+- [x] 31-10-PLAN.md — Clean-machine verification of the published artefacts; restore 0.2.0 (blocked on user blocker 4)
 
 ### Phase 32: Suite Hygiene and Minor Sweep
 
@@ -744,7 +744,7 @@ Plans:
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
 | 30. Appliance Layer | 36/36 | Complete    | 2026-09-18 |
-| 31. Delivery, Identity, and Documentation Accuracy | 8/10 | In Progress|  |
+| 31. Delivery, Identity, and Documentation Accuracy | 10/10 | Complete   | 2026-09-18 |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
 

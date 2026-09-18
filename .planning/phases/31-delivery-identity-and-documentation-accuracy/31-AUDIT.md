@@ -190,16 +190,75 @@ anchor added to `configure-scan-profiles.md` was confirmed against
 
 ## Release rehearsal evidence
 
-*Placeholder -- Plan 31-10 fills this section in.* It should record the RC tag, the release
-workflow run URL, and the `pip install` and `docker pull` output that D-21 and D-22 require
-before the milestone can be called delivered.
+Recorded 2026-09-18 by plan 31-10. Criterion 2's standard is the user's own: *"verified by an
+actual `pip install` and `docker pull` from a clean machine — not by reading the workflow file."*
+Every row below is command output, not inference.
+
+**Two tags were needed.** `v0.2.0-rc.1` failed at `publish-docker` — `provenance: true` (D-19)
+emits a SLSA attestation, which is a BuildKit feature requiring the docker-container driver, and
+plan 31-04 had added the flag but not `docker/setup-buildx-action`. The build ran on the default
+docker driver and buildx refused: `ERROR: failed to build: Attestation is not supported for the
+docker driver.` Fixed in `f2adf5b`. Because `publish-pypi` had *already succeeded* on that run,
+`0.2.0rc1` is permanently claimed on TestPyPI and the retry had to be `0.2.0-rc.2` — the precise
+hazard 31-09's threat model recorded as T-31-35.
 
 | Item | Value |
 |---|---|
-| RC tag | *pending 31-10* |
-| Release workflow run | *pending 31-10* |
-| `pip install` from the published artifact | *pending 31-10* |
-| `docker pull` of the published image | *pending 31-10* |
+| RC tag (failed) | `v0.2.0-rc.1` → `ef57a0be2372bdc8eb59e499ad4126101a678a39` |
+| RC tag (green) | `v0.2.0-rc.2` → `0002cfc19f2e51ba655e493b891ab48a12b0456e` |
+| Release workflow run | https://github.com/kdknigga/saneless/actions/runs/35403846735 — **all 5 jobs green** (`ci / lint`, `ci / test`, `ci / browser`, `publish-pypi`, `publish-docker`) |
+| PR carrying the CI gate | https://github.com/kdknigga/saneless/pull/9 (open, never merged) |
+| Published to | https://test.pypi.org/project/saneless/ — `0.2.0rc1`, `0.2.0rc2` |
+| Real PyPI | `GET https://pypi.org/pypi/saneless/json` → **404**. The pre-release routing kept the RC off it |
+| Published image | `ghcr.io/kdknigga/saneless:0.2.0-rc.2` |
+| GHCR `latest` tag | **not created** — D-23 deleted the unconditional `type=raw,value=latest`, so `metadata-action`'s `latest=auto` skipped the pre-release. Anonymous tag list: `{"name":"kdknigga/saneless","tags":["0.2.0-rc.2"]}` |
+| GHCR visibility | public — verified by a credential-free `ghcr.io/token` request, no login |
+
+### `pip install` from a clean machine (D-21)
+
+`docker run --rm python:3.14-slim`, `libsane-dev` + toolchain installed, then the **published**
+wheel from TestPyPI:
+
+```
+saneless, version 0.2.0rc2
+/usr/local/bin/saneless
+Requires-Dist count: 12
+License-Expression: MIT
+['saneless-0.2.0rc2.dist-info/licenses/LICENSE', ...]
+```
+
+That last line is **DLVR-08 proven in the published artifact**, not in a local build.
+
+**Deliberate deviation in method, and why.** The first two attempts resolved dependencies across
+both indexes and failed with `Failed to build 'fastapi'`. Cause: TestPyPI hosts a squatted
+`fastapi 1.0` which outranks real PyPI's `0.141.1`, and `--extra-index-url` takes the highest
+version across indexes. That is a TestPyPI hazard, not a defect in this package, and it cannot
+occur at the real release where every dependency resolves from one index. So the check was
+decomposed: dependencies installed from real PyPI (as a real release would), then the published
+wheel installed `--no-deps` from TestPyPI. What was genuinely uncertain — does the published
+wheel install, expose its entry point, and carry correct metadata — is what got tested.
+
+### `docker pull` from a clean machine (D-21)
+
+Anonymous pull of `ghcr.io/kdknigga/saneless:0.2.0-rc.2`:
+
+```
+saneless, version 0.2.0rc2
+uid=1000(saneless) gid=1000(saneless) groups=1000(saneless)
+/var/lib/saneless
+```
+
+Confirms DLVR-07's non-root user and D-28's `WORKDIR` **in the published image**, not in the
+Dockerfile text. Verification host runs podman; `HEALTHCHECK` is not exercisable there (OCI
+format ignores it) and remains statically asserted only.
+
+### What the rehearsal did not prove
+
+The final `v0.2.0` publish to real PyPI is deliberately out of phase scope — criterion 2 asks
+for a pre-release proven end to end, and D-22 keeps the RC as that evidence. The `pypi`
+environment's required-reviewer gate has therefore never fired in anger; it is configured and
+was observed *not* to gate the hyphenated tags, which is the half that mattered here.
+
 
 ## A note on the rename, so nobody goes looking for migration work
 

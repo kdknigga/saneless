@@ -142,7 +142,7 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 ### Delivery and Identity
 
 - [x] **DLVR-01**: Every reference to `kris-knigga/saneless`, `kris-knigga.github.io/saneless`, and `ghcr.io/kris-knigga/saneless` in shipped files (24 lines in nine files) is updated to the `kdknigga/saneless` forms; the PyPI distribution name stays `saneless` [M-27, doc row 19]
-- [ ] **DLVR-02**: The release workflow succeeds end to end: PyPI trusted publisher and GHCR package configured for `kdknigga/saneless`, the unresolvable `pypa/gh-action-pypi-publish@v1.12` ref fixed, and a pre-release tag rehearsed against TestPyPI verified by a `pip install` and `docker pull` from a clean machine [M-26]
+- [x] **DLVR-02**: The release workflow succeeds end to end: PyPI trusted publisher and GHCR package configured for `kdknigga/saneless`, the unresolvable `pypa/gh-action-pypi-publish@v1.12` ref fixed, and a pre-release tag rehearsed against TestPyPI verified by a `pip install` and `docker pull` from a clean machine [M-26]
 - [x] **DLVR-03**: All GitHub Actions are pinned to commit SHAs with a Dependabot config, every job has a `permissions:` block, and a workflow audit (zizmor) runs in CI [N-31]
 - [x] **DLVR-04**: Container logs appear in `docker logs` (stderr handler enabled in the container command) [M-28]
 - [x] **DLVR-05**: The example config, `EXPOSE`, and `HEALTHCHECK` agree on one port [M-29, doc row 21]
@@ -154,7 +154,7 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 ### Documentation Accuracy
 
-- [ ] **DOCS-01**: Every false claim in review section 8 (rows 1 through 34) is corrected or the behaviour is implemented, and each behaviour change in this milestone updates the sentence that described the old behaviour in the same phase [section 8]
+- [x] **DOCS-01**: Every false claim in review section 8 (rows 1 through 34) is corrected or the behaviour is implemented, and each behaviour change in this milestone updates the sentence that described the old behaviour in the same phase [section 8]
 - [x] **DOCS-02**: README examples run as written: `saneless scan` shows the required `--title`, `source` values match real SANE spelling, and the tutorial link resolves [N-42, doc row 16, 17, 18]
 - [x] **DOCS-03**: The internal `docs/PRD.md` is removed from the published site (or updated to match the shipped code), and the README's tutorial link points at the getting-started page [N-29, doc row 34]
 - [x] **DOCS-04**: A "Which setup do I have?" page gives the exact compose lines for USB-on-host, network scanner, and `saned` elsewhere, linked from the quick-start prerequisites; the contradictory USB statements are reconciled [U-10, doc row 29]
@@ -326,7 +326,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | APPL-11 | Phase 30 — Appliance Layer | Complete |
 | APPL-12 | Phase 30 — Appliance Layer | Complete |
 | DLVR-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
-| DLVR-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
@@ -335,7 +335,7 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DLVR-08 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-09 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-10 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
-| DOCS-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
