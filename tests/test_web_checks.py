@@ -428,6 +428,18 @@ def clocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Clocke
 def counting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Counting]:
     """Build a client whose Paperless client answers from a counting transport."""
     counter = _PaperlessRequestCounter()
+    # The refresh minimum interval is measured against CheckCache's clock, so this
+    # fixture substitutes it exactly as ``clocked`` does. Without the injection the
+    # cache runs on the wall clock and "twenty refreshes inside the window" becomes
+    # an assumption about how fast the runner is: true on a laptop (0.37 s for the
+    # whole class), false on a loaded GitHub runner, where all twenty fell outside
+    # the window and probed -- `assert (20 - 0) == 1`, run 35377527532, 2026-09-18.
+    # _FakeClock's own docstring says why the parameter exists: a suite waiting on
+    # the wall clock to watch an interval elapse is slow and flaky (TEST-01).
+    # The clock is never advanced here; this fixture's one test wants the window
+    # held open, and a frozen clock is the only way to say that without timing luck.
+    clock = _FakeClock()
+    monkeypatch.setattr(app_module, "CheckCache", lambda: CheckCache(clock=clock))
 
     def build_client(*, url: str, token: str, consume_dir: str = "") -> PaperlessClient:
         """
