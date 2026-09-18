@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: planning
+status: executing
 stopped_at: Phase 31 planned (10 plans, 8 waves, plan-check 0 blockers)
-last_updated: "2026-09-18T09:26:57.798Z"
+last_updated: "2026-09-18T19:05:30.272Z"
 last_activity: 2026-09-18
 progress:
   total_phases: 15
   completed_phases: 12
   total_plans: 150
-  completed_plans: 140
+  completed_plans: 141
   percent: 80
 ---
 
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-21)
 
 **Core value:** A user can walk up to the web UI, click Scan, and have a correctly assembled PDF land in paperless-ngx with metadata -- without touching any other tool.
-**Current focus:** Phase 33 — disable the openapi schema and docs endpoints
+**Current focus:** Phase 31 — delivery-identity-and-documentation-accuracy
 **Roadmap:** .planning/ROADMAP.md (13 phases, Phase 20 through Phase 32)
 
 ## Current Position
 
-Phase: 33
-Plan: Not started
-Status: Ready to plan
+Phase: 31 (delivery-identity-and-documentation-accuracy) — EXECUTING
+Plan: 2 of 10
+Status: Ready to execute
 Progress: [████████░░] 83%
 Next: Phase 25 (Manual Duplex) — not started, no phase directory yet
 Last activity: 2026-09-18

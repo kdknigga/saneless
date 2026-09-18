@@ -688,7 +688,7 @@ Plans:
 **Plans**: 10 plans in 8 waves
 
 Plans:
-- [ ] 31-01-PLAN.md — Packaging identity: version 0.2.0, PEP 639 license, `--version`, zizmor dev dependency
+- [x] 31-01-PLAN.md — Packaging identity: version 0.2.0, PEP 639 license, `--version`, zizmor dev dependency
 - [ ] 31-02-PLAN.md — The rename and its guard in one commit, plus the README example and deep-link pins
 - [ ] 31-03-PLAN.md — The `serve` logging mode split: streams to stderr, writes no file
 - [ ] 31-04-PLAN.md — Workflow supply-chain hardening: SHA pins, permissions, zizmor, reusable CI gate, routed OIDC publish, Pages-artifact docs
@@ -744,7 +744,7 @@ Plans:
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
 | 30. Appliance Layer | 36/36 | Complete    | 2026-09-18 |
-| 31. Delivery, Identity, and Documentation Accuracy | 0/10 | Planned    |  |
+| 31. Delivery, Identity, and Documentation Accuracy | 1/10 | In Progress|  |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
 
