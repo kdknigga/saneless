@@ -654,9 +654,9 @@ Plans:
 
 **Gap wave 7**
 
-- [ ] 30-31-PLAN.md — R3-CR-01/R3-WR-01/R3-IN-04/R3-IN-05: the host parser stops raising on a Unicode-digit port, stops dialling glibc's numeric shorthands, and bounds its dial list
-- [ ] 30-32-PLAN.md — R3-CR-02: a failing checks poll ends the poll instead of overwriting the scan-status slot every 2 s, measured against the response the app really sends
-- [ ] 30-33-PLAN.md — R3-WR-02: one raise no longer kills the background refresh thread for the life of the process
+- [x] 30-31-PLAN.md — R3-CR-01/R3-WR-01/R3-IN-04/R3-IN-05: the host parser stops raising on a Unicode-digit port, stops dialling glibc's numeric shorthands, and bounds its dial list
+- [x] 30-32-PLAN.md — R3-CR-02: a failing checks poll ends the poll instead of overwriting the scan-status slot every 2 s, measured against the response the app really sends
+- [x] 30-33-PLAN.md — R3-WR-02: one raise no longer kills the background refresh thread for the life of the process
 
 **Gap wave 8** *(blocked on gap wave 7)*
 
@@ -731,7 +731,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 30/30 | In Review  |  |
+| 30. Appliance Layer | 33/36 | In Progress|  |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
