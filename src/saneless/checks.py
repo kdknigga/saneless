@@ -1755,7 +1755,13 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     agree.  A test guarantees it instead --
     ``test_a_gated_run_returns_what_an_ungated_run_returns`` in
     ``tests/test_checks.py`` -- and that is where anyone changing either half
-    should look.
+    should look.  It is parametrised over the four contexts whose rows differ
+    (R3-IN-01): no python-sane, a configured host that refuses the pre-probe,
+    a host that answers and enumerates one device, and an enumeration that
+    raises.  The first two are decided before the gate is reached and the last
+    one leaves through ``run_checks``' handler with the gate released in a
+    ``finally``, so all four halves of this function are compared against
+    ``_check_scanner``.
 
     Args:
         context: The injected dependencies and configuration.
