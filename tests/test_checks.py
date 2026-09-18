@@ -662,6 +662,48 @@ class TestNumericAddressShorthand:
         assert _saned_hosts("box-x1.lan") == (("box-x1.lan", SANED_PORT),)
 
 
+class TestProbeHostCap:
+    """R3-IN-05: the walk over the entries runs inside a request thread."""
+
+    def test_a_long_host_list_is_capped(self) -> None:
+        """
+        Forty configured segments yield ``_MAX_PROBE_HOSTS`` entries.
+
+        ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
+        unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` for each, and
+        that walk runs inside the ``POST /api/checks/refresh`` request thread.
+        The manual-refresh floor bounds the *rate* of those requests, not the
+        duration of one, so without a cap a forty-host setting is a request
+        that can take minutes.
+        """
+        entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
+        assert len(entries) == checks._MAX_PROBE_HOSTS
+
+    def test_the_capped_list_keeps_the_first_entries_in_configured_order(self) -> None:
+        """
+        The tail is what is dropped, so the first-named host is still probed.
+
+        Losing the tail is this module's standard safe direction: no entry
+        means no probe for that host, and the scanner check falls through to
+        ``get_devices()`` exactly as it did before the probe existed.
+        """
+        entries = _saned_hosts(":".join(f"h{index}" for index in range(1, 41)))
+        assert entries[0] == ("h1", SANED_PORT)
+        assert all(host != "h40" for host, _port in entries)
+
+    def test_a_short_host_list_is_unchanged_entry_for_entry(self) -> None:
+        """A setting under the cap is not touched by it."""
+        assert _saned_hosts("a:b:c") == (
+            ("a", SANED_PORT),
+            ("b", SANED_PORT),
+            ("c", SANED_PORT),
+        )
+
+    def test_the_host_port_reading_is_unaffected_by_the_cap(self) -> None:
+        """``host:port`` returns a single entry, so no cap can bite it."""
+        assert _saned_hosts("scanner.local:6566") == (("scanner.local", 6566),)
+
+
 class TestSanedReachable:
     """The only bounded reachability probe in the tree."""
 
