@@ -6,7 +6,7 @@ This tutorial walks you through scanning your first document using the saneless 
 
 Before you begin, make sure you have:
 
-- **A SANE-compatible scanner** connected via USB or network, with `saned` running on the machine that has the scanner attached. saneless talks to scanners through the SANE network protocol.
+- **A SANE-compatible scanner**, reached one of two ways. On a bare-metal install, saneless can use a scanner attached to this machine directly. In a container, and for any scanner on another machine, saneless reaches it over the SANE network protocol, which needs `saned` running on the machine the scanner is attached to. If you are not sure which of those you have, start with [Which setup do I have?](which-setup.md).
 - **A running paperless-ngx instance** with an API token. You can generate a token in the paperless-ngx admin panel under **Settings > API Tokens**.
 - **Python 3.14 or later** (for bare-metal install) or **Docker** (for container install).
 
@@ -62,9 +62,9 @@ net:192.168.1.100:fujitsu:fi-7160    Fujitsu             fi-7160              sc
 
     If no scanners appear:
 
-    - **Check that `saned` is running** on the machine with the scanner attached.
+    - **Check that `saned` is running** on the machine with the scanner attached. A bare-metal install with the scanner on this machine does not need `saned` at all.
     - **Verify network connectivity** -- can you reach the scanner host from the machine running saneless?
-    - **USB scanners** must be connected to the machine running `saned`, not the machine running saneless.
+    - **In a container**, a locally attached scanner is never visible directly: the container reaches every scanner over the SANE network protocol, so even a scanner plugged into the container's own host needs `saned` on that host and `SANELESS_SCANNER__HOST` pointing at it.
     - **Container users**: if saneless runs in Docker, you need to tell it where to find scanners. See [Scanner Host Discovery (Containers)](../how-to/scanner-host-discovery.md).
 
 ## Step 3: Create a configuration file

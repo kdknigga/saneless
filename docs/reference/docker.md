@@ -176,27 +176,13 @@ The data volume is part of the minimum. Without it the job database and any
 preserved scans live inside the container's writable layer and are lost the
 next time the container is recreated.
 
-## USB Scanner Access
+## Scanner Access
 
-For USB-connected scanners managed by a local `saned`, pass the USB bus:
-
-```yaml
-services:
-  saneless:
-    image: ghcr.io/kdknigga/saneless:latest
-    devices:
-      - /dev/bus/usb:/dev/bus/usb
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./config:/etc/saneless
-```
-
-This is **not** required for network scanners. Use `SANELESS_SCANNER__HOST` instead.
-
-## Network Scanner Access
-
-For scanners exposed via `saned` on a remote host, set the scanner host:
+The container never reaches a scanner directly, not even one plugged into its own
+host. It reaches every scanner over the SANE network protocol, which is why no
+device mapping and no `--privileged` flag appear anywhere on this page: `saned`
+owns the scanner, and saneless talks to `saned`. Set the scanner host to the
+machine `saned` runs on -- the container's own host, or another one:
 
 ```yaml
 services:
