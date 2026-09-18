@@ -13,8 +13,21 @@
 services:
   saneless:
     image: ghcr.io/kdknigga/saneless:latest
+    # The container port is fixed at 8080. output.web_port is a bare-metal
+    # setting and does not move it; if 8080 is taken on the host, change the
+    # LEFT half here -- "8888:8080" -- and leave the right half alone.
     ports:
       - "8080:8080"
+    # The image already runs as UID/GID 1000, so on a single-user Linux host --
+    # where ./config is 1000:1000 because you created it -- this needs no
+    # action and stays commented. Uncomment and edit it only if your own UID
+    # differs, or instead run `chown -R 1000:1000 ./config` once. Either way
+    # the ./config mount below has to stay writable: saneless rewrites profiles
+    # by renaming a temp file over config.toml, and it cannot do that in a
+    # directory it cannot write. A literal, not "${UID}:${GID}" -- compose does
+    # not populate UID unless your shell exports it, and the silent fallback is
+    # a container that fails to start for no visible reason.
+    # user: "1000:1000"
     volumes:
       # ./config holds config.toml. Mount the directory, not the file, and keep
       # it writable: saneless rewrites profiles by writing a temp file beside

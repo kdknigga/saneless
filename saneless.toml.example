@@ -8,7 +8,7 @@ token = "your-api-token-here"
 consume_dir = "/path/to/paperless/consume"
 
 [output]
-web_port = 8081          # change if 8080 is taken
+# web_port = 8080       # bare metal only; in Docker remap with -p
 # tmp_dir = "/tmp/saneless"
 # log_level = "INFO"     # DEBUG, INFO, WARNING, ERROR or CRITICAL
 

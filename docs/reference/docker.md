@@ -10,6 +10,29 @@ saneless publishes an OCI container image for deployment alongside paperless-ngx
 | Base | `python:3.14-slim` |
 | Entrypoint | `saneless serve` |
 | Port | `8080` |
+| User | `1000:1000` (non-root) |
+| Working directory | `/var/lib/saneless` |
+
+## User and file ownership
+
+The container runs as UID/GID **1000**, not root, and everything it writes on a
+mounted host directory is owned by 1000. On a single-user Linux host your own
+account is 1000, so the `./config` directory you created is already correct and
+nothing further is needed.
+
+If `id -u` reports something else, hand the config directory over once:
+
+```bash
+chown -R 1000:1000 ./config
+```
+
+This applies to bind mounts only. A named or anonymous volume -- what
+`/var/lib/saneless` gets -- inherits `1000:1000` from the image the first time
+it is used, so durable state needs no fix-up. A bind mount keeps whatever
+ownership the host directory already has, and without write access there
+saneless cannot rewrite `config.toml` when it saves a generated profile. The
+shipped `docker-compose.yml` also carries a commented `user:` line for running
+the container as your own UID instead.
 
 ## Healthcheck
 
@@ -108,7 +131,7 @@ All `SANELESS_*` environment variables are supported inside the container. Commo
 | `SANELESS_SCANNER__HOST` | `192.168.1.50` | Network scanner IP address |
 | `SANELESS_PAPERLESS__URL` | `http://paperless:8000` | Paperless-ngx URL (Docker network) |
 | `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token. Prefer `config.toml` -- see below |
-| `SANELESS_OUTPUT__WEB_PORT` | `8080` | Override web server port |
+| `SANELESS_OUTPUT__WEB_PORT` | `8080` | **The container's port is fixed at 8080.** `web_port` is a bare-metal setting: setting it here moves the server off the port the image exposes and the healthcheck probes, so the container reports unhealthy while the UI is in fact running somewhere else. Remap on the host instead -- `-p 8888:8080` |
 | `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. **Already set by the image** -- override it only if you mount the volume somewhere else |
 | `TZ` | `America/Chicago` | Standard container variable, **not** a saneless setting. A container's clock reports UTC without it, and saneless renders every timestamp in the server's local zone, so `TZ` is what makes the job history, `saneless jobs` and the fallback document title show your local time |
 
