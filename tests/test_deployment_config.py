@@ -2188,3 +2188,72 @@ def test_the_no_auth_note_appears_on_both_entry_surfaces() -> None:
         assert not dangling, (
             f"{name} links to trust-model material that does not exist: {dangling}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: the corrected examples (rows 30, 31) -- DOCS-01
+# ---------------------------------------------------------------------------
+
+# The flag form of a bind mount, with the host side captured. The host side
+# runs up to the first colon, which is where the container path begins.
+VOLUME_FLAG_HOST = re.compile(r"(?:^|\s)(?:-v|--volume)[= ]\s*\"?(?P<host>[^\"\s:]+):")
+
+RELATIVE_PREFIXES = ("./", "../")
+
+# The ``id`` field of a JSON object, with its value captured.
+JSON_ID_FIELD = re.compile(r'"id":\s*"(?P<value>[^"]*)"')
+
+# What ``str(uuid.uuid4())`` produces: 8-4-4-4-12 lowercase hex, with the
+# version nibble and the variant nibble both pinned, so a hand-typed string of
+# the right length but the wrong shape does not pass for one.
+UUID4_SHAPE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
+
+
+def test_no_docker_run_example_uses_a_relative_host_path() -> None:
+    """
+    No ``-v``/``--volume`` flag in any example names a relative host path.
+
+    Docker Engine has historically rejected a host side that is not an absolute
+    path, so a block copied off one of these pages fails outright on a real
+    host rather than doing something subtly different (row 31). ``"$(pwd)/..."``
+    is the form that works, quoted so a directory whose name contains a space
+    is not re-split into two arguments.
+
+    Compose ``volumes:`` entries are a different syntax under different rules --
+    a path beginning with a dot is correct there, and is the mount Phase 27 D-09
+    requires -- so this looks only at the flag form and leaves YAML list items
+    alone.
+    """
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
+        for path in _deployment_files()
+        for number, line in _numbered(path)
+        for match in VOLUME_FLAG_HOST.finditer(line)
+        if match.group("host").startswith(RELATIVE_PREFIXES)
+    ]
+    assert not offenders, (
+        "a bind-mount flag names a host path relative to wherever the reader "
+        "happens to be standing:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_job_json_example_shows_a_real_id_shape() -> None:
+    """
+    The scripting guide's job JSON shows an id in the shape ids really have.
+
+    ``saneless jobs --json`` echoes ``j.id`` straight out of the row, and a job
+    id is ``str(uuid.uuid4())`` -- see ``job.py``. The example used to show a
+    truncated eight-character string, so anything written against it (a script
+    that slices an id, a column sized to fit one, a fixture built to look like
+    one) was written against a shape the program never emits (row 30).
+    """
+    text, name = _read(CLI_SCRIPTING)
+    values = [match.group("value") for match in JSON_ID_FIELD.finditer(text)]
+    assert values, f"{name} no longer shows a job id in its JSON example"
+    wrong = [value for value in values if not UUID4_SHAPE.fullmatch(value)]
+    assert not wrong, (
+        f"{name} shows a job id that no saneless release can produce: {wrong}. "
+        "Job ids are UUID4 strings"
+    )
