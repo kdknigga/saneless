@@ -61,7 +61,7 @@ created: 2026-09-16
 | `✓` | U+2713 | check `OK` | already in use for `Done` |
 | `!` | U+0021 | check `WARN` | every Unicode warning symbol (U+26A0, U+2757) has emoji presentation on at least one shipping platform; the master spec already records U+26A0 as rejected for that reason. `!` has text presentation everywhere and needs no variation selector |
 | `✗` | U+2717 | check `FAIL` | already in use for `Error` |
-| `·` | U+00B7 | cold-start `Checking…` marker, and the separator in `Front: 12 pages · …` | text presentation, neutral |
+| `·` | U+00B7 | cold-start `Checking…` marker, the **skipped-row marker** (D-08, see the five-row table), and the separator in `Front: 12 pages · …` | text presentation, neutral — it says "not yet", not "bad", which is the whole reason a row nobody probed borrows it instead of `✓` |
 | `…` | U+2026 (`&#8230;`) | the strip's `Checking…` copy | matches D-06's spelling and the Scan button's `Scanning…` |
 
 ### New project classes (exhaustive — 14 rows, 17 distinct selectors, no `!important`, no colour literal)
@@ -152,7 +152,7 @@ Rules:
 - **Never a steady-state poll.** Once results land the strip is refetched only by (a) `Check again`, (b) the terminal-state reload below, (c) a page load. A permanent poll would keep D-05's lazy refresher awake for every abandoned browser tab, which is exactly what D-05 forbids.
 - **Paused → un-paused promptly (D-08).** `POST /api/scan` success carries an out-of-band `#checks-body` (flag `refresh_checks`, set only by `start_scan`, exactly parallel to Phase 26's `clear_message`), so the paused note appears at once. Every terminal branch of `status.html` includes `partials/terminal_reload.html`, which holds the existing hidden history loader **plus** a hidden `hx-get="/api/checks" hx-target="#checks-body" hx-swap="outerHTML" hx-trigger="load"` loader, so the strip un-pauses the moment the scan ends instead of waiting out the TTL.
 - The strip carries **no `role="alert"`**. `aria-live="polite"` only: a health list must never interrupt, and Phase 26 requires exactly one assertive region on the page.
-- Templates own no vocabulary: `check_state_class`, `check_state_glyph`, `check_state_label`, `check_name` are Jinja filters registered beside `state_label` in `web/app.py`, implemented in `vocabulary.py`.
+- Templates own no vocabulary: `check_row_class`, `check_row_glyph`, `check_row_label`, `check_name` are the Jinja filters the rows are drawn with, registered beside `state_label` in `web/app.py` and implemented in `checks.py`. The three `check_state_*` lookups stay registered and are what the row filters delegate to, but the template reaches for none of them directly — a row's marker is chosen from the whole `CheckResult`, `skipped` flag included (R3-WR-03).
 
 ### The five rows
 
@@ -164,6 +164,7 @@ Name column is a separate element, so the existing `connection_status_message` s
 | Scanner | FAIL | `Not reachable.` | `Check the scanner is switched on and connected, then press Check again.` |
 | Scanner | FAIL | `Scanner support is not installed on this machine.` (A-1) | `Install saneless with scanner support, then restart it.` |
 | Scanner | skipped (D-08) | `Not checked while a scan is running.` | — |
+| Scanner | skipped (R2-WR-02) | `The scanner was busy, so it was not checked this time.` | — |
 | Paperless | OK | `Connected to paperless-ngx.` | — |
 | Paperless | FAIL | `The paperless-ngx API token has not been set.` (placeholder, D-14/D-15) | `Put a real API token in the saneless config file, then restart saneless.` |
 | Paperless | FAIL | `Paperless-ngx rejected the API token.` | `Check the API token in the saneless config file, then restart saneless.` |
@@ -181,6 +182,8 @@ Name column is a separate element, so the existing `connection_status_message` s
 | Data folder | OK | `The data folder is writable.` | — |
 | Data folder | FAIL | `The data folder cannot be written to.` | `Check the folder exists and saneless can write to it, then restart saneless.` |
 | *(any)* | cold start | `Checking&#8230;` | — |
+
+**The two `skipped` rows render the neutral marker, not the state's (D-08, R3-WR-03).** A skipped row carries `CheckState.OK` so that `saneless doctor` keeps exiting 0 for a probe that was deliberately not taken (D-01) — the state is there to give the row a colour, not to report a verdict. It is therefore drawn with the cold-start glyph `·` and the cold-start class `check-checking`, and announced to a screen reader as **`Not checked:`** (`SKIPPED_STATE_LABEL`), *not* as `OK:` and not as `Checking:` — a listener told "Checking" over a row nobody probed is told a probe is running when none is. The choice is made in Python, by `check_row_class` / `check_row_glyph` / `check_row_label`, which take the whole `CheckResult`; the template reaches for those three and for none of the `check_state_*` filters. `saneless doctor` reads the same flag through `_row_marker` and prints `[SKIP]` (see § CLI parity).
 
 Precedence inside the Profiles check, when more than one condition holds: `FAIL (none configured)` → `WARN (unwritable)` → `WARN (no config file)` → `WARN (no names)` → `OK`. A check returns exactly one `CheckResult`.
 
