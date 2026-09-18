@@ -1478,6 +1478,15 @@ def refresh_checks(request: Request) -> Response:
     exists to bound; and ``_checks_context`` sees the same lock still held and
     emits a trigger, so the page collects the answer on its own.
 
+    The grant given back is identified rather than assumed.  The claim reports
+    the stamp it wrote, this handler holds that stamp for the length of the
+    request, and ``release_manual_claim`` compares before it clears -- so a
+    release can only ever undo this request's own grant and never one a later
+    caller made (R3-IN-03).  The grant is tested with ``is not None`` and not
+    for truth: the stamp is a ``time.monotonic()`` reading, which counts from
+    boot, so the first click on a freshly booted appliance can hold a perfectly
+    valid grant of 0.0.
+
     There is one render path and it is the last statement.  The context decides
     the trigger from ``probe_in_flight``, which is still ``True`` on the
     collapse branch -- the other checker has not released yet -- so the one
@@ -1518,8 +1527,9 @@ def refresh_checks(request: Request) -> Response:
     """
     state = request.app.state
     state.refresher.note_watcher()
-    if state.checks.claim_manual_refresh() and not state.refresher.probe_now():
-        state.checks.release_manual_claim()
+    claim = state.checks.claim_manual_refresh()
+    if claim is not None and not state.refresher.probe_now():
+        state.checks.release_manual_claim(claim)
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",
