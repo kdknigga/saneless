@@ -5,7 +5,7 @@ Run saneless alongside paperless-ngx using Docker Compose -- the most common hom
 ## What you'll need
 
 - Docker and Docker Compose installed on your host
-- A running paperless-ngx instance (or you will set one up in this guide)
+- A running paperless-ngx instance, reachable from this host. This guide covers the saneless side only; stand paperless-ngx up from [its own compose files](https://docs.paperless-ngx.com/setup/) first
 - A paperless-ngx API token (generate one in paperless-ngx under Settings > API Tokens)
 - For network scanners: the scanner's IP address
 
@@ -44,28 +44,24 @@ mode = "Color"
 
 ## Step 2: Create the Docker Compose file
 
-Create a `docker-compose.yml` with both saneless and paperless-ngx on the same Docker network so that `http://paperless:8000` resolves between containers:
+This file defines saneless and nothing else. paperless-ngx is stood up from its own compose file:
+
+!!! note "Where paperless-ngx comes from"
+    paperless-ngx needs more than one container -- a database and a Redis-compatible message broker alongside the web service -- and it publishes [compose files](https://github.com/paperless-ngx/paperless-ngx/tree/main/docker/compose) that wire all of it together. Download the one for your database from [the paperless-ngx setup guide](https://docs.paperless-ngx.com/setup/) and run it in its own directory. This guide does not reproduce it: a copy here would go stale the first time their requirements changed, and a partial copy produces a stack that never finishes starting.
 
 ```yaml
 services:
-  paperless:
-    image: ghcr.io/paperless-ngx/paperless-ngx:latest
-    ports:
-      - "8000:8000"
-    volumes:
-      - paperless-data:/usr/src/paperless/data
-      - paperless-media:/usr/src/paperless/media
-      # Uncomment with the saneless side below to enable the fallback:
-      # - paperless-consume:/usr/src/paperless/consume
-    environment:
-      - PAPERLESS_SECRET_KEY=change-me-to-a-long-random-string
-      # - PAPERLESS_CONSUMPTION_DIR=/usr/src/paperless/consume
-    restart: unless-stopped
-
   saneless:
     image: ghcr.io/kdknigga/saneless:latest
     ports:
       - "8080:8080"
+    # The image already runs as UID/GID 1000, so on a single-user Linux host --
+    # where ./config is 1000:1000 because you created it -- this needs no
+    # action and stays commented. Uncomment and edit it only if your own UID
+    # differs, or run `chown -R 1000:1000 ./config` once instead. A literal,
+    # not "${UID}:${GID}": compose does not populate UID unless your shell
+    # exports it, and the silent fallback is a container that will not start.
+    # user: "1000:1000"
     volumes:
       - ./config:/etc/saneless
       - saneless-data:/var/lib/saneless
@@ -75,6 +71,10 @@ services:
       # back. Set paperless.consume_dir in config.toml to /consume as well --
       # the mount on its own does nothing.
       # - paperless-consume:/consume
+    # Uncomment to put saneless on the network the paperless-ngx stack
+    # created, so that its service name resolves from here. See below.
+    # networks:
+    #   - paperless
     environment:
       # Without this the container reports UTC, so every timestamp saneless
       # shows is UTC. Set your own zone.
@@ -86,10 +86,21 @@ services:
     restart: unless-stopped
 
 volumes:
-  paperless-data:
-  paperless-media:
   saneless-data:
+  # The consume directory is shared with the paperless-ngx stack, which is a
+  # separate compose project. Create the volume once, outside both, with
+  # `docker volume create paperless-consume`, then declare it external here
+  # and mount it on the paperless-ngx side too.
   # paperless-consume:
+  #   external: true
+
+# Uncomment together with the networks: block on the service above. Find the
+# real name with `docker network ls` -- compose names it after the directory
+# the paperless-ngx compose file runs in, usually <directory>_default.
+# networks:
+#   paperless:
+#     external: true
+#     name: paperless-ngx_default
 ```
 
 Key details:
@@ -98,13 +109,13 @@ Key details:
 - **Port 8080:** The saneless web UI
 - **One place for the token:** the paperless-ngx URL and token live in `config/config.toml`, and this compose file deliberately sets neither. **An environment variable overrides the config file**, silently: set `SANELESS_PAPERLESS__TOKEN` here and saneless uses that value and ignores the one in `config.toml`. If it is a placeholder, or empty, saneless shows the status strip red and refuses to scan, and the token you carefully put in `config.toml` has nothing to do with it. Leave the block commented and edit the file
 - **`TZ`:** a container's clock reports UTC. Without `TZ`, every timestamp saneless displays -- the job history, `saneless jobs`, and the fallback title it gives a document in paperless-ngx -- is UTC rather than your local time. It is a standard container variable, not a saneless setting
-- **Consume mount (optional):** `paperless-consume:/consume` shared with paperless-ngx is the [consume-directory fallback](../explanation/consume-directory-fallback.md). Uncomment the volume on both services, the `PAPERLESS_CONSUMPTION_DIR` line, and the entry under `volumes:`, then set `consume_dir = "/consume"` under `[paperless]` in `config.toml`. Mounting without setting `consume_dir` does nothing
+- **Consume mount (optional):** a directory both stacks can see is the [consume-directory fallback](../explanation/consume-directory-fallback.md). Create the shared volume with `docker volume create paperless-consume`, uncomment the mount and the external `volumes:` entry here, mount the same volume at paperless-ngx's consumption directory on its side, and set `consume_dir = "/consume"` under `[paperless]` in `config.toml`. Mounting without setting `consume_dir` does nothing
 - **Config mount:** `./config:/etc/saneless` -- a read-write directory mount. saneless replaces `config.toml` atomically (it writes a temp file in the same directory, then renames it over the original). A single-file bind mount makes that rename fail with EBUSY, and saneless reports "Mount its directory instead"
 - **Data volume:** `saneless-data:/var/lib/saneless` is required, not optional. It holds the job database and the `failed/` directory, where saneless preserves any scan it could not deliver to paperless-ngx. The image already sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless`, so mounting the volume there is all that is needed. See [Docker volumes](../reference/docker.md#volumes) for what accumulates in `failed/` and how to drain it
-- **Shared network:** Both services are on the default Docker Compose network, so `http://paperless:8000` resolves automatically
+- **Reaching paperless-ngx:** the two stacks are separate compose projects, so each gets its own network and the name `paperless` does not resolve from here on its own. Either join the paperless-ngx network -- uncomment both `networks:` blocks above, after checking the real name with `docker network ls` -- and keep `url = "http://paperless:8000"`, or leave the networks alone and point `url` at the host the paperless-ngx stack publishes on, such as `http://192.168.1.10:8000`. Whichever you pick, the URL has to resolve from *inside* the saneless container: `localhost` there is the container itself, not your host
 - **Network scanners:** Set `SANELESS_SCANNER__HOST=192.168.1.50` to discover scanners on a remote host. See [Scanner Host Discovery](scanner-host-discovery.md) for details
 
-## Step 3: Start the services
+## Step 3: Start saneless
 
 ```bash
 docker compose up -d
