@@ -46,7 +46,20 @@
    route already put on the row -- the give-up line included, which arrives as
    `freshness_line` -- and the only conditions here are "are there results yet"
    and "did the server ask for another attempt", never a comparison against a
-   CheckState value. #}
+   CheckState value.
+
+   The filters the results branch reaches for take the WHOLE result rather than
+   its state, because the state is not on its own enough to draw the row: a
+   result the registry skipped carries CheckState.OK so that `saneless doctor`
+   keeps exiting 0 for a probe nobody took (D-01), and drawing from that state
+   put a green tick in front of "Not checked while a scan is running."
+   (R3-WR-03).  Choosing the marker from the result, `skipped` flag included,
+   is a Python decision in check_row_class / check_row_glyph / check_row_label
+   -- which is what keeps the rule out of here and keeps `doctor` reading the
+   same flag through cli._row_marker. #}
+{# `state_class`, `glyph` and `state_label` are what THIS ROW renders, not what
+   its state renders.  The names are unchanged because the macro's job is
+   unchanged: it draws the three markers it is handed and decides nothing. #}
 {%- macro check_row(name, state_class, glyph, state_label, message, next_step) -%}
     <li class="check-row">
       <span class="check-glyph {{ state_class }}" aria-hidden="true">{{ glyph }}</span>
@@ -73,9 +86,9 @@
     {% else %}
       {% for c in checks %}
       {{ check_row(c.key | check_name,
-                   c.state | check_state_class,
-                   c.state | check_state_glyph,
-                   c.state | check_state_label,
+                   c | check_row_class,
+                   c | check_row_glyph,
+                   c | check_row_label,
                    c.message,
                    c.next_step) }}
       {% endfor %}

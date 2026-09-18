@@ -1903,11 +1903,17 @@ class TestASkippedRowIsNotAPassingRow:
         Pattern C applied to the case that broke it: the template gained no
         ``{% if c.skipped %}`` and never reads the attribute at all, so the
         substitution is a Python decision the CLI reads too.
+
+        The spoken word is counted inside its own span rather than anywhere in
+        the row, because UI-SPEC S1's sentence for this row happens to begin
+        with the same two words ("Not checked while a scan is running.") and a
+        bare count would be satisfied by the message alone.
         """
         _app(client).state.checks.store(_results_with_a_skipped_scanner())
         row = _row_named(client.get("/").text, "Scanner")
+        spoken = f'<span class="sr-only">{SKIPPED_STATE_LABEL}:</span>'
         assert row.count(CHECKING_STATE_CLASS) == 1
-        assert row.count(SKIPPED_STATE_LABEL) == 1
+        assert row.count(spoken) == 1
         assert "c.skipped" not in _template()
 
 
