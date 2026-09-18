@@ -1964,3 +1964,77 @@ def test_the_uid_is_documented_where_operators_will_look() -> None:
             f"{name} does not give the `{UID_CHOWN_COMMAND}` command for an "
             "operator whose own UID is not 1000"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: the deployment shapes and the one USB rule (D-47, D-48, DOCS-04)
+# ---------------------------------------------------------------------------
+
+# The host device tree a container would have to be handed in order to reach a
+# scanner over the USB bus itself.
+USB_BUS_PATH = "/dev/bus/usb"
+
+SCANNER_HOST_ROW_MARKER = "| `host` |"
+CONTAINER_CAVEAT_WORDS = ("container", "saned")
+
+
+def test_no_doc_page_documents_usb_passthrough_into_a_container() -> None:
+    """
+    No page or deployment file hands the host USB bus to a container (D-48).
+
+    PROJECT.md constrains this project to need no ``--privileged`` flag,
+    because USB device access is handled by the ``saned`` server rather than by
+    the saneless container. A container reaches a scanner over the SANE network
+    protocol, always -- including a ``saned`` running on its own host.
+
+    Documenting a device mapping as an "advanced" option would add a fourth
+    deployment shape that contradicts that constraint, has never been tested
+    here, and hands the container raw device access it has no use for. It was
+    written once and deleted; this test is what stops it coming back.
+    """
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
+        for path in _deployment_files()
+        for number, line in _numbered(path)
+        if USB_BUS_PATH in line
+    ]
+    assert not offenders, (
+        "a page or deployment file maps the host USB bus into the container. "
+        "Only a bare-metal install enumerates a locally attached scanner; a "
+        "container reaches one through `saned` over the network:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_scanner_host_documentation_carries_the_container_caveat() -> None:
+    """
+    The ``scanner.host`` row states what an empty value means in a container.
+
+    "Empty = local USB" is true, and only for a bare-metal install. Read inside
+    a container it is the opposite of true: leaving the setting empty there
+    gives the backend nothing to probe, and the operator gets an empty device
+    list with nothing on screen to say why. The row therefore has to carry the
+    container caveat next to the default, not three pages away.
+
+    The assertion is on the presence of the caveat words rather than on a whole
+    sentence, so a later rewording of the row cannot fail this for a reason
+    that has nothing to do with the contract.
+    """
+    name = CONFIG_REFERENCE.relative_to(REPO_ROOT)
+    rows = [
+        line
+        for _, line in _numbered(CONFIG_REFERENCE)
+        if SCANNER_HOST_ROW_MARKER in line
+    ]
+    assert rows, f"{name} has no `{SCANNER_HOST_ROW_MARKER}` table row at all"
+    row = " ".join(rows).lower()
+    assert "empty" in row, (
+        f"{name}'s scanner host row no longer says what an empty value means"
+    )
+    missing = [word for word in CONTAINER_CAVEAT_WORDS if word not in row]
+    assert not missing, (
+        f"{name}'s scanner host row does not mention {missing}. An operator "
+        "reading the default inside a container needs to be told there that "
+        "the container cannot see a local scanner and reaches one through "
+        f"`saned`:\n{' '.join(rows).strip()}"
+    )
