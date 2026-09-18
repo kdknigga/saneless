@@ -377,6 +377,12 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
     configured nothing is logged (Pitfall 3); ``-v`` prints the traceback to
     stderr instead, and without it the line says how to get one.
 
+    ``serve`` has neither a log file nor a traceback-free sink: its stream
+    renders the traceback the ``logger.error`` above just emitted, with or
+    without ``-v`` (D-36 amended). The hint is suppressed there rather than
+    telling an operator to restart a running service to see something already
+    printed directly above the line.
+
     Args:
         ctx: The group's context.
         exc: The exception to report.
@@ -392,7 +398,7 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
         log_file = obj.get("log_file")
         if log_file:
             line = f"{line}. Full details in {log_file}"
-        elif not verbose:
+        elif not verbose and not obj.get("log_stream"):
             line = f"{line}. {_VERBOSE_HINT}"
     elif verbose:
         click.echo("".join(traceback.format_exception(exc)), err=True, nl=False)
@@ -498,7 +504,7 @@ class _GuardedGroup(click.Group):
     "-v",
     "--verbose",
     is_flag=True,
-    help="Log saneless's own debug detail to the log file and stderr.",
+    help="Log saneless's own debug detail: stderr, and the log file outside serve.",
 )
 @click.pass_context
 def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
@@ -567,6 +573,9 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
     )
     ctx.obj["logging_configured"] = True
     ctx.obj["log_file"] = settings.output.log_file if attached else None
+    # Read by _report_unexpected: a stream that already renders tracebacks
+    # must not end an exit-5 line with "run again with -v".
+    ctx.obj["log_stream"] = stream_logs
 
     # WR-05: emitted only now, once the log file handler exists to receive it.
     warn_on_legacy_duplex_sources(settings)

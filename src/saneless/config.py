@@ -455,6 +455,13 @@ class OutputConfig(BaseModel):
     # $XDG_STATE_HOME (CFG-03), computed per instance rather than at import.
     # The Dockerfile's SANELESS_OUTPUT__DATA_DIR still overrides data_dir.
     data_dir: str = Field(default_factory=_default_data_dir)
+    # These three describe a rotating file, so they apply to one-shot CLI
+    # commands only: `saneless serve` is a service, streams its records to
+    # stderr and writes no file at all, which is what puts them in `docker
+    # logs` and journald (D-35, D-40, DLVR-04). Setting log_file and running
+    # serve is not an error and raises no warning -- the configuration
+    # reference states the mode scope instead (D-39). log_level below is the
+    # one log key that applies in both modes.
     log_file: str = Field(default_factory=_default_log_file)
     log_level: LogLevel = "INFO"
     log_max_bytes: int = 10_485_760

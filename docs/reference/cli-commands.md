@@ -9,7 +9,7 @@ These options apply to all commands and must appear **before** the subcommand na
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--config PATH` | string | *(search path)* | Path to TOML config file (overrides search path). A path that does not exist or is not a regular file is an error (exit code 2) |
-| `-v, --verbose` | flag | off | Log saneless's own debug detail (DEBUG) to the log file and mirror it to stderr; other libraries and the web server keep the configured `log_level` |
+| `-v, --verbose` | flag | off | Raise saneless's own loggers to DEBUG. In a one-shot command the detail goes to the log file and is mirrored to stderr; in `saneless serve` it goes to the stream, which is stderr and the only sink there is. Other libraries and the web server keep the configured `log_level` |
 
 `--help` on any command works without a valid config file; settings are loaded only when a command runs. Every command exits with code 2 when the configuration cannot be loaded, and prints a header naming the file then one line per problem; a TOML syntax error names its line and column (see [Validation](configuration.md#validation)). On start, saneless logs at INFO which config file it loaded and which setting names came from environment variables.
 
@@ -24,7 +24,7 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, or a job database saneless cannot use (unreadable, or an unsupported schema) |
 | 3 | Paperless-ngx error: unreachable after retries, upload rejected, or a malformed Paperless URL |
 | 4 | PDF assembly error: the scanned pages could not be written as a PDF |
-| 5 | Unexpected error only: a saneless bug. The line names the exception type and the traceback is in the log file |
+| 5 | Unexpected error only: a saneless bug. The line names the exception type and the traceback is in the log file -- or, under `saneless serve`, in the stream, because a service writes no file |
 | 130 | Cancelled by the operator |
 
 Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
@@ -209,7 +209,7 @@ saneless [--config PATH] [-v] serve [--host ADDR] [--port N]
 | 0 | Clean shutdown, including Ctrl-C once the web server is running |
 | 2 | Cannot start (port already in use, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
 | 3 | Malformed Paperless URL |
-| 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 5 | Unexpected error (a saneless bug; the traceback is in the stream, not a file -- `serve` writes none) |
 | 130 | Cancelled (Ctrl-C before the web server has started) |
 
 ---
