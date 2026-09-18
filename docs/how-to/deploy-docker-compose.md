@@ -33,6 +33,15 @@ mode = "Color"
 !!! note
     The container reads `/etc/saneless/config.toml` from the mounted `./config` directory. If `config.toml` is missing, saneless uses its defaults plus environment variables and the container still starts; it does not create the file for you. The directory must be writable, because `saneless auto-profiles` and the profile generation at startup rewrite `config.toml` there once it exists. Neither one creates it. Without `config.toml`, the server keeps the profiles it generates in memory only, and `docker compose exec saneless saneless auto-profiles` writes `/var/lib/saneless/saneless.toml` (the image's working directory is the durable data directory, so `./saneless.toml` resolves there) instead of anything in `./config`. That file sits in the data volume, so it survives container recreation -- and saneless loads it ahead of any `config.toml` you add later, which means it goes on shadowing your real config until you delete it. So before you run `auto-profiles` in the container, create the file with `touch config/config.toml` (an empty file is a valid config). Keep only `config.toml` in the directory, and do not let untrusted users write to it.
 
+!!! note "If your user ID is not 1000"
+    The container runs as UID/GID **1000**, not root, so it writes to `./config` as 1000 no matter who owns the directory on the host. On a single-user Linux machine your own account is already 1000 and the directory you just created belongs to it, so there is nothing to do. If `id -u` reports anything else, hand the directory over once:
+
+    ```bash
+    chown -R 1000:1000 ./config
+    ```
+
+    A bind mount keeps the host's ownership -- unlike the named data volume, which inherits 1000 from the image -- so without this the container cannot rewrite `config.toml`, and saving a generated profile fails. The alternative is the commented `user:` line in the compose file below, which runs the container as your UID instead.
+
 ## Step 2: Create the Docker Compose file
 
 Create a `docker-compose.yml` with both saneless and paperless-ngx on the same Docker network so that `http://paperless:8000` resolves between containers:

@@ -1715,6 +1715,12 @@ PUBLISH_FLAG = re.compile(
     r"-p\s+(?:\d+\.\d+\.\d+\.\d+:)?(?P<host>\d{2,5}):(?P<container>\d{2,5})"
 )
 QUOTED_MAPPING = re.compile(r'"(?P<host>\d{2,5}):(?P<container>\d{2,5})"')
+# A `ports:` key and a YAML sequence item, each also matching the commented
+# form. A quoted `number:number` only counts as a port mapping when it is an
+# entry under `ports:` -- `user: "1000:1000"` has the same shape and is a
+# UID and GID.
+PORTS_KEY = re.compile(r"^\s*#?\s*ports:\s*$")
+SEQUENCE_ITEM = re.compile(r"^\s*#?\s*-\s")
 EXPOSE_PORT = re.compile(r"\bEXPOSE\s+(?P<port>\d+)")
 HEALTH_URL_PORT = re.compile(r"localhost:(?P<port>\d+)/health")
 
@@ -1763,6 +1769,29 @@ def _shell_command_at(lines: list[str], index: int) -> str:
         cursor += 1
         parts.append(lines[cursor])
     return " ".join(parts)
+
+
+def _is_ports_entry(lines: list[str], index: int) -> bool:
+    """
+    Say whether the line at ``index`` is an entry under a compose ``ports:`` key.
+
+    Args:
+        lines: Every line of the file, in order.
+        index: 0-based index of the candidate line.
+
+    Returns:
+        True when the line is a sequence item whose nearest enclosing key is
+        ``ports:``.
+
+    """
+    if not SEQUENCE_ITEM.match(lines[index]):
+        return False
+    for cursor in range(index - 1, -1, -1):
+        line = lines[cursor]
+        if not line.strip() or SEQUENCE_ITEM.match(line):
+            continue
+        return PORTS_KEY.match(line) is not None
+    return False
 
 
 def _compose_service_image(lines: list[str], index: int) -> str:
@@ -1861,7 +1890,8 @@ def test_every_documented_container_port_matches_the_model_default() -> None:
             found.extend(
                 match.group("container")
                 for match in QUOTED_MAPPING.finditer(line)
-                if OWN_IMAGE_MARKER in _compose_service_image(lines, index)
+                if _is_ports_entry(lines, index)
+                and OWN_IMAGE_MARKER in _compose_service_image(lines, index)
             )
             found.extend(
                 match.group("port")
