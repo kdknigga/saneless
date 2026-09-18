@@ -3171,12 +3171,6 @@ class TestColdStartPollIsBounded:
 # it and been caught.
 _ERROR_POLL_WINDOW_MS = 9000
 
-# The body a forced failure answers with. It carries a different id on purpose:
-# the swap that ends the poll is an outerHTML swap of #checks-body, so "the
-# error body is on the page and #checks-body is not" is the mechanism itself,
-# observed rather than inferred from a request count.
-_CHECKS_ERROR_BODY = '<div id="checks-error">The checks could not be loaded.</div>'
-
 # base.html's htmx-config, captured whole. Single-quoted in the template
 # because its value is JSON, so the group ends at the next apostrophe.
 _HTMX_CONFIG_META = re.compile(
@@ -3186,14 +3180,44 @@ _HTMX_CONFIG_META = re.compile(
 BASE_HTML = TEMPLATE_DIR / "base.html"
 """The layout whose htmx-config decides what an error response does to the strip."""
 
+# The ``attempt`` the tampered poll carries. It is not an integer, so FastAPI's
+# own request validation refuses it before the handler runs and the application
+# builds the 422 through ``render_error`` -- which is the whole point: the
+# browser has to receive the response this application really sends, headers
+# included, not one written here.
+_TAMPERED_ATTEMPT = "notanumber"
 
-def _fail_the_checks_poll(page: Page, status: int) -> None:
+_ATTEMPT_PARAM = re.compile(r"attempt=[^&]*")
+
+
+def _tampered_url(url: str) -> str:
     """
-    Answer every ``GET /api/checks`` with ``status``, and nothing else.
+    Return ``url`` with its ``attempt`` value replaced by a non-integer.
 
-    Forced from the browser side rather than by adding a failing route to the
-    application, because the application has to stay exactly as it ships for
-    this measurement to mean anything.
+    Args:
+        url: The poll URL the page asked for.
+
+    Returns:
+        The same URL with an ``attempt`` the server must refuse.
+
+    """
+    if "attempt=" in url:
+        return _ATTEMPT_PARAM.sub(f"attempt={_TAMPERED_ATTEMPT}", url)
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}attempt={_TAMPERED_ATTEMPT}"
+
+
+def _tamper_the_checks_poll(page: Page) -> None:
+    """
+    Make every ``GET /api/checks`` reach the server with an attempt it refuses.
+
+    The request is tampered with and passed on, never answered here. A handler
+    that fulfilled the request itself would be measuring a response this
+    application never sends: the previous version of this class did exactly
+    that, with a hand-written body carrying no headers at all, which is why it
+    could not fail for the property it is named after. ``route.continue_`` puts
+    the application back in the loop, so the browser receives the real 422 that
+    ``render_error`` builds, with the real headers on it.
 
     A page-level handler takes priority over the module's context-level egress
     gate for the URLs it matches, which ``_record_checks_requests`` explains is
@@ -3205,8 +3229,7 @@ def _fail_the_checks_poll(page: Page, status: int) -> None:
     with ``route.fallback()`` and still meets the gate.
 
     Args:
-        page: The page whose poll is to fail.
-        status: The HTTP status every poll request is answered with.
+        page: The page whose poll is to be tampered with.
 
     """
 
@@ -3215,43 +3238,75 @@ def _fail_the_checks_poll(page: Page, status: int) -> None:
         if request.method != "GET" or "/api/checks/refresh" in request.url:
             route.fallback()
             return
-        route.fulfill(status=status, content_type="text/html", body=_CHECKS_ERROR_BODY)
+        route.continue_(url=_tampered_url(request.url))
 
     page.route("**/api/checks*", _handler)
+
+
+def _record_checks_responses(page: Page) -> list[tuple[int, dict[str, str]]]:
+    """
+    Start recording the status and headers of every poll response.
+
+    The headers are the fact the fix turns on, so they are read off the wire
+    rather than inferred from what the page ended up looking like.
+
+    Args:
+        page: The page to watch. Call this before navigating.
+
+    Returns:
+        The list each ``(status, headers)`` pair is appended to, in order.
+        Header names are lower-cased by Playwright.
+
+    """
+    seen: list[tuple[int, dict[str, str]]] = []
+
+    def _record(response: Response) -> None:
+        url = response.url
+        if "/api/checks" in url and "/refresh" not in url:
+            seen.append((response.status, dict(response.headers)))
+
+    page.on("response", _record)
+    return seen
 
 
 @pytest.mark.browser
 class TestPollEndsOnAnErrorResponse:
     """
-    R2-IN-04, measured: a poll whose endpoint fails ends, and this is why.
+    R3-CR-02, measured: the strip's own failure is what ends the strip's poll.
 
-    The review reasoned that ``POLL_ATTEMPT_CAP`` cannot bound the poll when
-    ``/api/checks`` answers a non-2xx, because "htmx does not swap on an error
-    response" and the old body therefore keeps its ``every 2s`` for as long as
-    the tab stays open. That is true of htmx's *default* ``responseHandling``
-    and false here. ``base.html`` ships a customised ``htmx-config`` meta whose
-    third rule is ``{"code":"[45]..","swap":true,"error":true}``, so this
-    application swaps 4xx and 5xx: the error response replaces the polling body
-    and takes the trigger with it. The same rule covers the 422 the review
-    posits for a hand-crafted ``attempt``.
+    There was a defect here, and the previous version of this class concluded
+    there was not. ``render_error`` set ``HX-Retarget: #status-message`` on
+    every htmx error response, and htmx 2.0.8 applies ``HX-Retarget`` to the
+    response's target *before* it decides what to swap. So a 4xx from
+    ``GET /api/checks`` was written into ``#status-message``: ``#checks-body``
+    was never replaced, kept its ``every 2s`` trigger, and went on polling and
+    failing for as long as the tab stayed open -- overwriting the scan-progress
+    line twice a minute while it did.
 
-    Nothing in the source changes for this finding, and nothing should: there is
-    no defect. These tests measure the property against the application exactly
-    as it ships and leave a guard on the mechanism -- the meta rule below --
-    so the next review round has a number and a named dependency to read rather
-    than an argument to re-run.
+    The old measurement could not see that, because it fulfilled the poll from
+    inside the browser with a hand-written body that carried no response
+    headers at all. With no ``HX-Retarget`` on it, the fabricated failure
+    swapped exactly as this class wanted; the application's own failure did
+    not. Every case here now drives the failure through the server.
+
+    The fix is one condition in ``errors.py``: a request whose ``HX-Target`` is
+    the strip's swap target gets no ``HX-Retarget`` and no ``HX-Reswap``, so
+    the response is swapped by the polling element's own ``hx-target="this"
+    hx-swap="outerHTML"``, ``#checks-body`` leaves the DOM, and htmx's ``ct()``
+    loop stops re-arming because ``se(e)`` -- "is this element still attached"
+    -- is false on the next tick. ``base.html``'s ``{"code":"[45]..",
+    "swap":true,"error":true}`` rule is what makes an error body swap at all,
+    so it is load-bearing for the fix and is still pinned below.
     """
 
-    @pytest.mark.parametrize("status", [500, 422])
     def test_a_failed_poll_request_replaces_the_strip_and_stops(
         self,
         page: Page,
         cold_strip_server: _BrowserServer,
         record_property: Callable[[str, object], None],
-        status: int,
     ) -> None:
         """
-        One request, then the error body, then stillness for nine seconds.
+        One request, then the application's own error body, then stillness.
 
         ``cold_strip_server`` is the appliance whose cache never fills, so the
         poll's own terminating conditions cannot fire inside the window and the
@@ -3262,30 +3317,86 @@ class TestPollEndsOnAnErrorResponse:
         would have fired four more times inside ``_ERROR_POLL_WINDOW_MS``.
         """
         polled = _record_checks_requests(page)
-        _fail_the_checks_poll(page, status)
+        answered = _record_checks_responses(page)
+        _tamper_the_checks_poll(page)
         page.goto(cold_strip_server.url)
 
-        expect(page.locator("#checks-error")).to_have_count(1, timeout=_POLL_SETTLE_MS)
+        expect(page.locator("#checks-strip .status-error")).to_have_count(
+            1, timeout=_POLL_SETTLE_MS
+        )
         expect(page.locator("#checks-body")).to_have_count(0)
         at_swap = len(polled)
 
         page.wait_for_timeout(_ERROR_POLL_WINDOW_MS)
-        record_property(f"error_poll_requests_{status}", len(polled))
+        record_property("error_poll_requests", len(polled))
         record_property("error_poll_window_ms", _ERROR_POLL_WINDOW_MS)
         assert len(polled) == at_swap, polled[at_swap:]
         assert len(polled) < POLL_ATTEMPT_CAP, polled
+        assert answered, "the poll response was never observed"
+        assert answered[0][0] == 422, answered
+
+    def test_the_failing_poll_response_carries_no_retarget(
+        self,
+        page: Page,
+        cold_strip_server: _BrowserServer,
+        record_property: Callable[[str, object], None],
+    ) -> None:
+        """
+        The header the fix turns on, read off the wire (R3-CR-02).
+
+        Asserted on its own because the swap above is downstream of it: if
+        ``HX-Retarget`` came back, the error would land in ``#status-message``
+        and the strip would still be polling, and a reader would have to infer
+        the header from the symptom.
+        """
+        answered = _record_checks_responses(page)
+        _tamper_the_checks_poll(page)
+        page.goto(cold_strip_server.url)
+
+        expect(page.locator("#checks-strip .status-error")).to_have_count(
+            1, timeout=_POLL_SETTLE_MS
+        )
+        assert answered, "the poll response was never observed"
+        status, headers = answered[0]
+        record_property("error_poll_status", status)
+        assert status == 422, answered
+        assert "hx-retarget" not in headers, headers
+        assert "hx-reswap" not in headers, headers
+
+    def test_the_failing_poll_never_writes_the_status_message_slot(
+        self,
+        page: Page,
+        cold_strip_server: _BrowserServer,
+    ) -> None:
+        """
+        D-03's slot is left alone, which is the other half of the defect.
+
+        A scan's progress line lives here. While the retarget applied, a poll
+        that failed every two seconds replaced that line with a generic error
+        sentence twice a minute -- so "the error landed somewhere else" is not
+        a detail of the fix, it is the user-visible half of it.
+        """
+        _tamper_the_checks_poll(page)
+        page.goto(cold_strip_server.url)
+
+        expect(page.locator("#checks-strip .status-error")).to_have_count(
+            1, timeout=_POLL_SETTLE_MS
+        )
+        before = page.locator("#status-message").inner_text()
+        page.wait_for_timeout(_ERROR_POLL_WINDOW_MS)
+        assert page.locator("#status-message").inner_text() == before
+        expect(page.locator("#status-message .status-error")).to_have_count(0)
 
     def test_the_htmx_config_meta_swaps_error_responses(self) -> None:
         """
-        The rule the two measurements above depend on, asserted on its own.
+        The rule the measurements above depend on, asserted on its own.
 
-        The strip's poll has a dependency on a meta tag two files away, and
-        this is the assertion that says so out loud. Flipping this rule back to
-        htmx's default -- ``swap`` false for ``[45]..`` -- would restore
-        exactly the unbounded error-path poll R2-IN-04 described: the polling
-        body would survive its own failed request and keep re-firing its
-        ``every 2s`` for as long as the tab stayed open, with no swap to end
-        the chain and no attempt count able to reach the server.
+        It is load-bearing *for the fix*, not evidence that there was never a
+        defect. Dropping ``HX-Retarget`` only ends the poll because an error
+        body is swapped at all, and that is this meta's doing: flipped back to
+        htmx's default -- ``swap`` false for ``[45]..`` -- the exempt response
+        would be discarded, the polling body would survive its own failed
+        request, and the chain would run for as long as the tab stayed open.
         """
         match = _HTMX_CONFIG_META.search(BASE_HTML.read_text(encoding="utf-8"))
         assert match is not None
