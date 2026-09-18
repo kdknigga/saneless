@@ -145,11 +145,11 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 - [ ] **DLVR-02**: The release workflow succeeds end to end: PyPI trusted publisher and GHCR package configured for `kdknigga/saneless`, the unresolvable `pypa/gh-action-pypi-publish@v1.12` ref fixed, and a pre-release tag rehearsed against TestPyPI verified by a `pip install` and `docker pull` from a clean machine [M-26]
 - [x] **DLVR-03**: All GitHub Actions are pinned to commit SHAs with a Dependabot config, every job has a `permissions:` block, and a workflow audit (zizmor) runs in CI [N-31]
 - [x] **DLVR-04**: Container logs appear in `docker logs` (stderr handler enabled in the container command) [M-28]
-- [ ] **DLVR-05**: The example config, `EXPOSE`, and `HEALTHCHECK` agree on one port [M-29, doc row 21]
-- [ ] **DLVR-06**: A `.dockerignore` allow-list keeps config files, secrets, `.planning/`, and tests out of the build context [M-31]
-- [ ] **DLVR-07**: The container runs as a non-root user, base images are pinned by digest, and a `WORKDIR` is set so relative writes do not land in `/` [N-26]
+- [x] **DLVR-05**: The example config, `EXPOSE`, and `HEALTHCHECK` agree on one port [M-29, doc row 21]
+- [x] **DLVR-06**: A `.dockerignore` allow-list keeps config files, secrets, `.planning/`, and tests out of the build context [M-31]
+- [x] **DLVR-07**: The container runs as a non-root user, base images are pinned by digest, and a `WORKDIR` is set so relative writes do not land in `/` [N-26]
 - [x] **DLVR-08**: The built wheel contains the LICENSE file via PEP 639 `license` / `license-files` keys, with the legacy license classifier removed in the same change [N-30]
-- [ ] **DLVR-09**: `.gitignore` no longer blanket-ignores `*.png`; only specific screenshot directories are excluded [N-32]
+- [x] **DLVR-09**: `.gitignore` no longer blanket-ignores `*.png`; only specific screenshot directories are excluded [N-32]
 - [x] **DLVR-10**: `saneless --version` prints the installed version [doc row 15]
 
 ### Documentation Accuracy
@@ -329,11 +329,11 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DLVR-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DLVR-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
-| DLVR-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
-| DLVR-06 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
-| DLVR-07 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
+| DLVR-06 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
+| DLVR-07 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-08 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
-| DLVR-09 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DLVR-09 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DLVR-10 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DOCS-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
