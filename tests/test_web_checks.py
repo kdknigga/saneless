@@ -41,11 +41,18 @@ from fastapi.testclient import TestClient
 
 from saneless import checks as checks_module
 from saneless.checks import (
+    CHECKING_GLYPH,
     CHECKING_MESSAGE,
+    CHECKING_STATE_CLASS,
     CHECKING_STATE_LABEL,
+    SKIPPED_STATE_LABEL,
     CheckKey,
     CheckResult,
     CheckState,
+    check_name,
+    check_state_class,
+    check_state_glyph,
+    check_state_label,
 )
 from saneless.config import (
     OutputConfig,
@@ -237,6 +244,57 @@ def _synthetic_results() -> tuple[CheckResult, ...]:
         )
         for key in CheckKey
     )
+
+
+def _results_with_a_skipped_scanner() -> tuple[CheckResult, ...]:
+    """
+    Build the five rows a refresh during a scan produces.
+
+    The Scanner row carries UI-SPEC S1's paused sentence and the ``skipped``
+    flag; its state is ``OK`` for the reason ``_scanner_skipped``'s is, which is
+    exactly why a marker derived from the state alone would render it green.
+
+    Returns:
+        One result per ``CheckKey`` member, the first of them skipped.
+
+    """
+    return tuple(
+        CheckResult(
+            key=key,
+            state=CheckState.OK,
+            message=(
+                PAUSED_SCANNER_MESSAGE
+                if key is CheckKey.SCANNER
+                else f"{key.value} row."
+            ),
+            skipped=key is CheckKey.SCANNER,
+        )
+        for key in CheckKey
+    )
+
+
+def _row_named(markup: str, name: str) -> str:
+    """
+    Return the one rendered row whose name column is ``name``.
+
+    Row-level assertions are made against this rather than against the whole
+    page, so "the page contains a tick somewhere" can never pass for "the
+    Scanner row is green".
+
+    Args:
+        markup: The rendered page or partial.
+        name: The check name column to find.
+
+    Returns:
+        The inner markup of that row.
+
+    """
+    wanted = f'<span class="check-name">{name}</span>'
+    for row in _CHECK_ROW.findall(markup):
+        if wanted in row:
+            return row
+    msg = f"no {name} row in the rendered strip"
+    raise AssertionError(msg)
 
 
 def _make_app(
@@ -1712,11 +1770,30 @@ class TestStripVocabulary:
 
     @pytest.mark.parametrize(
         "filter_name",
-        ["check_name", "check_state_class", "check_state_glyph", "check_state_label"],
+        ["check_name", "check_row_class", "check_row_glyph", "check_row_label"],
     )
     def test_the_template_reaches_for_each_filter(self, filter_name: str) -> None:
         """All four registered filters are the ones the rows are drawn with."""
         assert filter_name in _template()
+
+    @pytest.mark.parametrize(
+        "filter_name",
+        ["check_state_class", "check_state_glyph", "check_state_label"],
+    )
+    def test_the_template_draws_no_row_from_a_state_alone(
+        self, filter_name: str
+    ) -> None:
+        """
+        R3-WR-03: the marker is chosen from the whole result, flag included.
+
+        A state filter at the call site is what rendered a skipped row as a
+        green tick, so the template reaches for none of the three.
+
+        Args:
+            filter_name: The state filter that must not appear.
+
+        """
+        assert filter_name not in _template()
 
     def test_a_warn_row_renders_its_next_step(self, client: TestClient) -> None:
         """
@@ -1742,6 +1819,96 @@ class TestStripVocabulary:
         """An ``OK`` row has nothing to act on, so it shows no second line."""
         _warm_the_cache(client)
         assert "check-next" not in client.get("/").text
+
+
+class TestASkippedRowIsNotAPassingRow:
+    """
+    R3-WR-03: the strip may not tick a row it never looked at.
+
+    ``_scanner_skipped`` and ``_scanner_busy`` both return ``CheckState.OK``
+    with ``skipped`` set -- the state is there so the row has a colour and so a
+    scripted health gate stays green for a probe nobody took (D-01).  Until the
+    call site read the flag, that made a paused Scanner row render as
+    "✓ Scanner  Not checked while a scan is running.", announced to a screen
+    reader as "OK: Scanner".  These tests are what stops that coming back.
+    """
+
+    def test_a_skipped_row_renders_the_neutral_marker(self, client: TestClient) -> None:
+        """The glyph, the colour and the spoken word all say nothing was checked."""
+        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        row = _row_named(client.get("/").text, "Scanner")
+        assert f'<span class="check-glyph {CHECKING_STATE_CLASS}"' in row
+        assert CHECKING_GLYPH in row
+        assert f'<span class="sr-only">{SKIPPED_STATE_LABEL}:</span>' in row
+
+    def test_a_skipped_row_carries_no_ok_marker(self, client: TestClient) -> None:
+        """
+        The absence is the point, and it is asserted inside the row.
+
+        A page-wide ``"✓" not in markup`` would be satisfied by the four green
+        rows beside this one, so every assertion here is scoped to the Scanner
+        row's own markup.
+        """
+        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        row = _row_named(client.get("/").text, "Scanner")
+        ok_word = f'<span class="sr-only">{check_state_label(CheckState.OK)}:</span>'
+        assert check_state_class(CheckState.OK) not in row
+        assert check_state_glyph(CheckState.OK) not in row
+        assert ok_word not in row
+
+    def test_the_skipped_row_still_says_what_was_not_checked(
+        self, client: TestClient
+    ) -> None:
+        """The neutral marker replaces the tick, not the registry's sentence."""
+        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        row = _row_named(client.get("/").text, "Scanner")
+        assert PAUSED_SCANNER_MESSAGE in row
+        assert "check-next" not in row
+
+    def test_the_other_four_rows_are_unaffected(self, client: TestClient) -> None:
+        """One skipped row does not neutralise the rows that were probed."""
+        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        markup = client.get("/").text
+        ok_class = check_state_class(CheckState.OK)
+        ok_word = f'<span class="sr-only">{check_state_label(CheckState.OK)}:</span>'
+        for key in CheckKey:
+            if key is CheckKey.SCANNER:
+                continue
+            row = _row_named(markup, check_name(key))
+            assert f'<span class="check-glyph {ok_class}"' in row
+            assert check_state_glyph(CheckState.OK) in row
+            assert ok_word in row
+
+    def test_the_cold_branch_still_says_checking(self, client: TestClient) -> None:
+        """
+        D-06's five cold rows are untouched.
+
+        ``_CheckingRow`` is not a ``CheckResult`` and still hands its own trio
+        to the macro, so the cold word stays "Checking" and does not become
+        "Not checked": on a cold start a probe really is coming.
+        """
+        rows = _CHECK_ROW.findall(client.get("/api/checks").text)
+        assert len(rows) == len(CheckKey)
+        for row in rows:
+            assert f'<span class="check-glyph {CHECKING_STATE_CLASS}"' in row
+            assert f'<span class="sr-only">{CHECKING_STATE_LABEL}:</span>' in row
+            assert SKIPPED_STATE_LABEL not in row
+
+    def test_the_skipped_row_authors_no_vocabulary_of_its_own(
+        self, client: TestClient
+    ) -> None:
+        """
+        Every class, glyph and word in the row comes from ``saneless.checks``.
+
+        Pattern C applied to the case that broke it: the template gained no
+        ``{% if c.skipped %}`` and never reads the attribute at all, so the
+        substitution is a Python decision the CLI reads too.
+        """
+        _app(client).state.checks.store(_results_with_a_skipped_scanner())
+        row = _row_named(client.get("/").text, "Scanner")
+        assert row.count(CHECKING_STATE_CLASS) == 1
+        assert row.count(SKIPPED_STATE_LABEL) == 1
+        assert "c.skipped" not in _template()
 
 
 class TestCheckAgainButton:
