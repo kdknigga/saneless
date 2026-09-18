@@ -197,7 +197,7 @@ class CheckCache:
 
     def claim_manual_refresh(
         self, min_interval: float = MIN_MANUAL_REFRESH_SECONDS
-    ) -> bool:
+    ) -> float | None:
         """
         Say whether a manual refresh may probe right now, and record that it did.
 
@@ -231,18 +231,28 @@ class CheckCache:
             min_interval: The shortest gap between two grants, in seconds.
 
         Returns:
-            True when the caller may probe, and False when it is too soon.
+            The stamp this grant recorded, which the caller may hand to
+            :meth:`release_manual_claim` to give the grant back, or ``None``
+            when it is too soon to probe.
+
+            The truthiness of that value is not the contract: callers test
+            against ``None``.  A stamp is a ``time.monotonic()`` reading, and
+            on Linux that counts from boot, so 0.0 is a reading a grant can
+            really record and it is falsey.  A caller branching on truthiness
+            would read the first click after a boot as a refusal -- the one
+            click that certainly deserves a probe, for the same reason
+            ``_last_manual_claim`` starts at ``None`` rather than at 0.0.
 
         """
         now = self._clock()
         with self._lock:
             last = self._last_manual_claim
             if last is not None and now - last < min_interval:
-                return False
+                return None
             self._last_manual_claim = now
-            return True
+            return now
 
-    def release_manual_claim(self) -> None:
+    def release_manual_claim(self, stamp: float) -> bool:
         """
         Give a granted claim back, because the probe it bought never happened.
 
@@ -255,13 +265,18 @@ class CheckCache:
         button appearing to do nothing, twice in a row.  This hands the claim
         back on exactly that branch.
 
-        The clear is unconditional, which is not obviously safe, so here is
-        the argument.  Only a caller that was *granted* a claim calls this, it
-        calls it microseconds later on the same thread, and any competing
-        claimer arriving inside that window is refused by the interval --
-        and :meth:`claim_manual_refresh` states that a refusal changes no
-        state.  No other thread can therefore have overwritten the stamp this
-        caller wrote, so clearing it clears only its own grant.
+        The clear is a compare-and-clear, so a caller can only ever give back
+        its own grant.  The stamp handed in is the one
+        :meth:`claim_manual_refresh` returned; the claim is cleared when that
+        is still the recorded one and left alone when it is not, so a release
+        arriving *after* somebody else's grant is a no-op rather than a hole
+        in the floor (R3-IN-03).  This used to be an argument instead of a
+        check -- the one caller releases microseconds after its grant on the
+        same thread, and a competing claimer inside that window is refused
+        without writing -- and the argument was true of that call site and of
+        nothing else.  A retry, a second caller, or a handler that grew a
+        second release would each have lowered a floor whose whole job is to
+        bound what an unauthenticated LAN endpoint can make the appliance do.
 
         It cannot be abused to defeat the floor (WR-05, T-30-29-01).  The
         release happens only where ``probe_now`` returned False, and that
@@ -270,6 +285,18 @@ class CheckCache:
         its claim back and still generates zero probe traffic.  The moment a
         probe is actually granted, the stamp stands and the next call inside
         the interval is refused like any other.
+
+        Args:
+            stamp: The value :meth:`claim_manual_refresh` returned for the
+                grant being given back.
+
+        Returns:
+            Whether this call cleared the claim, which is False when the stamp
+            is not the recorded one and when no claim is recorded at all.
+
         """
         with self._lock:
+            if self._last_manual_claim != stamp:
+                return False
             self._last_manual_claim = None
+            return True
