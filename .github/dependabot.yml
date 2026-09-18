@@ -1,7 +1,36 @@
-# Set update schedule for GitHub Actions
+# Update schedule for the two ecosystems whose pins are written by hand in this
+# repository: the SHA-pinned actions in .github/workflows/, and the digest-pinned
+# base images in the Dockerfile. Pinning to an immutable SHA or digest is what
+# makes a supply-chain audit pass, and it is also what stops those pins moving on
+# their own -- so something has to move them deliberately, and this is it.
+#
+# Both entries below carry the seven-day settling period. It is not decoration:
+# an `updates:` entry that omits it is a workflow-audit finding, and the audit
+# runs as a blocking CI step -- so any third entry added here needs its own
+# copy of that block or the build fails.
+#
+# Watch item for the docker entry: the ecosystem also parses `image:` keys out
+# of YAML manifests, so it may open pull requests against docker-compose.yml's
+# reference to this project's own published image. If that happens, the fix is
+# an `ignore:` entry for that one dependency -- not dropping the ecosystem,
+# which is here for the base-image digests.
+#
+# Also note: the docker file parser matches `FROM` lines only and explicitly
+# skips `COPY --from=`, so a digest written directly on a `COPY --from=` line
+# would never be updated. Tool images have to enter via a named `FROM ... AS`
+# stage to be seen.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
