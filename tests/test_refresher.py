@@ -34,7 +34,7 @@ from saneless.worker import STOP_JOIN_SECONDS
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from saneless.config import Settings
     from saneless.scanner.base import ScannerBackend
@@ -213,6 +213,42 @@ class _ScanState:
 
         """
         return self.active
+
+
+class _RaisingTick:
+    """A ``_tick`` stand-in that raises once and then defers to the real one."""
+
+    def __init__(self, inner: Callable[[], None], error: Exception) -> None:
+        """
+        Raise ``error`` on the first call and tick for real on every later one.
+
+        Args:
+            inner: The refresher's own ``_tick``, so the recovery tick is the
+                real policy rather than a stand-in for it -- the point is that
+                the cache refills itself, not merely that a call happened.
+            error: What the first tick raises.
+
+        """
+        self.calls = 0
+        self.recovered = threading.Event()
+        self._inner = inner
+        self._error = error
+
+    def __call__(self) -> None:
+        """
+        Raise once, then run the real tick and announce that it ran.
+
+        Raises:
+            Exception: On the first call only, the error this was built with.
+
+        """
+        self.calls += 1
+        if self.calls == 1:
+            raise self._error
+        try:
+            self._inner()
+        finally:
+            self.recovered.set()
 
 
 def _results(message: str = "All good.") -> tuple[CheckResult, ...]:
@@ -739,6 +775,46 @@ def test_start_then_stop_reports_a_stopped_daemon_thread(
     assert refresher._thread.is_alive() is True
     assert refresher.stop() is True
     assert refresher._thread.is_alive() is False
+
+
+def test_a_raising_tick_does_not_end_the_refresher(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    started_refreshers: list[CheckRefresher],
+) -> None:
+    """
+    R3-WR-02: nothing ends the loop but stopping, which is ROBU-01's rule.
+
+    ``ScanWorker._run`` guards each iteration for exactly this reason, and
+    this loop had no ``try`` at all.  A refresher thread that dies is the case
+    ``POLL_ATTEMPT_CAP``'s own comment names: a strip that never updates
+    again, silently, for the life of the process, with the ``Check again``
+    button as its only remaining source of results.
+
+    The recovery is observed rather than assumed -- the second tick is the
+    real ``_tick``, and the assertion is that the cache it fills has results
+    in it.  The tick is shortened to hundredths of a second so nothing here
+    waits on the wall clock, and every wait is bounded so a wedged thread
+    fails this test instead of hanging the suite.
+    """
+    spy = _spy(monkeypatch)
+    monkeypatch.setattr(refresher_module, "TICK_SECONDS", 0.01)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    tick = _RaisingTick(refresher._tick, RuntimeError("tick exploded"))
+    monkeypatch.setattr(refresher, "_tick", tick)
+    refresher.note_watcher()
+    started_refreshers.append(refresher)
+
+    refresher.start()
+
+    assert tick.recovered.wait(_JOIN_TIMEOUT_SECONDS) is True
+    assert refresher._thread.is_alive() is True
+    assert tick.calls >= 2
+    assert refresher.stop() is True
+    assert refresher._thread.is_alive() is False
+    assert cache.current().results == spy.results
+    assert len(_refresher_records(caplog, "Check refresher tick failed")) == 1
 
 
 def test_stop_on_a_refresher_that_never_started_returns_true(
