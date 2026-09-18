@@ -18,6 +18,7 @@ Covers requirements: APPL-02.
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 import threading
 from typing import TYPE_CHECKING
@@ -33,7 +34,7 @@ from saneless.worker import STOP_JOIN_SECONDS
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from saneless.config import Settings
     from saneless.scanner.base import ScannerBackend
@@ -161,6 +162,35 @@ class _StoreCounter:
         CheckCache.store(self.cache, results)
 
 
+class _RaisingStore:
+    """A cache write that fails, the way a broken clock or a bad entry would."""
+
+    def __init__(self, error: Exception) -> None:
+        """
+        Raise ``error`` on every write, and count the attempts.
+
+        Args:
+            error: What every write raises.
+
+        """
+        self.calls = 0
+        self._error = error
+
+    def __call__(self, results: tuple[CheckResult, ...]) -> None:
+        """
+        Record the attempted write and raise instead of making it.
+
+        Args:
+            results: What the probe produced and could not store.
+
+        Raises:
+            Exception: Always, the error this was built with.
+
+        """
+        self.calls += 1
+        raise self._error
+
+
 class _ScanState:
     """The worker's job-in-flight fact, as the refresher reads it."""
 
@@ -183,6 +213,42 @@ class _ScanState:
 
         """
         return self.active
+
+
+class _RaisingTick:
+    """A ``_tick`` stand-in that raises once and then defers to the real one."""
+
+    def __init__(self, inner: Callable[[], None], error: Exception) -> None:
+        """
+        Raise ``error`` on the first call and tick for real on every later one.
+
+        Args:
+            inner: The refresher's own ``_tick``, so the recovery tick is the
+                real policy rather than a stand-in for it -- the point is that
+                the cache refills itself, not merely that a call happened.
+            error: What the first tick raises.
+
+        """
+        self.calls = 0
+        self.recovered = threading.Event()
+        self._inner = inner
+        self._error = error
+
+    def __call__(self) -> None:
+        """
+        Raise once, then run the real tick and announce that it ran.
+
+        Raises:
+            Exception: On the first call only, the error this was built with.
+
+        """
+        self.calls += 1
+        if self.calls == 1:
+            raise self._error
+        try:
+            self._inner()
+        finally:
+            self.recovered.set()
 
 
 def _results(message: str = "All good.") -> tuple[CheckResult, ...]:
@@ -264,6 +330,31 @@ def _spy(
     spy = _RunChecksSpy(error=error)
     monkeypatch.setattr("saneless.web.refresher.run_checks", spy)
     return spy
+
+
+def _refresher_records(
+    caplog: pytest.LogCaptureFixture, text: str
+) -> list[logging.LogRecord]:
+    """
+    Return the refresher's own ERROR records whose message contains ``text``.
+
+    Args:
+        caplog: The capture fixture the test was handed.
+        text: The substring the wanted records carry.
+
+    Returns:
+        Every matching record, so a test can pin "logged once" rather than
+        "logged at all" -- a swallowed failure that is logged twice, or not at
+        all, is a differently-broken appliance.
+
+    """
+    return [
+        record
+        for record in caplog.records
+        if record.name == "saneless.web.refresher"
+        and record.levelno == logging.ERROR
+        and text in record.getMessage()
+    ]
 
 
 def test_tick_without_a_watcher_does_nothing(
@@ -603,6 +694,66 @@ def test_a_failing_run_leaves_the_previous_entry_in_place(
     assert previous == good.results
 
 
+def test_a_raising_store_does_not_escape_the_probe(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    R3-WR-02: a store that raises must not travel up and end the refresher.
+
+    The store used to sit in the ``else`` arm of the probe's ``try``, and an
+    exception raised in an ``else`` arm is not routed to that ``try``'s
+    handlers.  So this raise propagated out of ``_probe_and_store``, out of
+    ``_tick`` and out of ``_run``: an appliance whose strip never updated
+    again, silently, for the life of the process.
+    """
+    _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    store = _RaisingStore(RuntimeError("store exploded"))
+    monkeypatch.setattr(cache, "store", store)
+
+    assert refresher._probe_and_store() is True
+
+    assert store.calls == 1
+    assert refresher.probe_in_flight is False
+    assert len(_refresher_records(caplog, "Check refresh failed")) == 1
+
+
+def test_a_raising_store_leaves_the_previous_entry_in_place(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Last-known-good covers a failed *write* too, not only a failed probe."""
+    good = _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    refresher.probe_now()
+    previous = cache.current().results
+    monkeypatch.setattr(cache, "store", _RaisingStore(RuntimeError("store exploded")))
+
+    assert refresher.probe_now() is True
+
+    assert cache.current().results == previous
+    assert previous == good.results
+
+
+def test_probe_now_with_a_raising_store_reports_that_it_probed(
+    default_settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The button's path must render, not 500 with the manual claim spent.
+
+    ``POST /api/checks/refresh`` calls this from a request thread, so a raise
+    here is a raise in a request thread: the clicker gets an error page and
+    their one claim is gone, for a probe that actually ran.
+    """
+    _spy(monkeypatch)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    monkeypatch.setattr(cache, "store", _RaisingStore(RuntimeError("store exploded")))
+
+    assert refresher.probe_now() is True
+    assert refresher.probe_in_flight is False
+
+
 def test_start_then_stop_reports_a_stopped_daemon_thread(
     default_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -624,6 +775,46 @@ def test_start_then_stop_reports_a_stopped_daemon_thread(
     assert refresher._thread.is_alive() is True
     assert refresher.stop() is True
     assert refresher._thread.is_alive() is False
+
+
+def test_a_raising_tick_does_not_end_the_refresher(
+    default_settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    started_refreshers: list[CheckRefresher],
+) -> None:
+    """
+    R3-WR-02: nothing ends the loop but stopping, which is ROBU-01's rule.
+
+    ``ScanWorker._run`` guards each iteration for exactly this reason, and
+    this loop had no ``try`` at all.  A refresher thread that dies is the case
+    ``POLL_ATTEMPT_CAP``'s own comment names: a strip that never updates
+    again, silently, for the life of the process, with the ``Check again``
+    button as its only remaining source of results.
+
+    The recovery is observed rather than assumed -- the second tick is the
+    real ``_tick``, and the assertion is that the cache it fills has results
+    in it.  The tick is shortened to hundredths of a second so nothing here
+    waits on the wall clock, and every wait is bounded so a wedged thread
+    fails this test instead of hanging the suite.
+    """
+    spy = _spy(monkeypatch)
+    monkeypatch.setattr(refresher_module, "TICK_SECONDS", 0.01)
+    refresher, cache = _build(default_settings, _FakeClock(), threading.Lock())
+    tick = _RaisingTick(refresher._tick, RuntimeError("tick exploded"))
+    monkeypatch.setattr(refresher, "_tick", tick)
+    refresher.note_watcher()
+    started_refreshers.append(refresher)
+
+    refresher.start()
+
+    assert tick.recovered.wait(_JOIN_TIMEOUT_SECONDS) is True
+    assert refresher._thread.is_alive() is True
+    assert tick.calls >= 2
+    assert refresher.stop() is True
+    assert refresher._thread.is_alive() is False
+    assert cache.current().results == spy.results
+    assert len(_refresher_records(caplog, "Check refresher tick failed")) == 1
 
 
 def test_stop_on_a_refresher_that_never_started_returns_true(
