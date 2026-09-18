@@ -553,6 +553,7 @@ class TestReleaseManualClaim:
 
         assert stamps == [100.0]
         assert releases == [True, False]
+        assert second is not None
         assert second == clock.now
         assert cache.claim_manual_refresh() is None
         assert cache.release_manual_claim(second) is True
