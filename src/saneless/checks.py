@@ -740,23 +740,35 @@ def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
     ``0x0.0``, ``6566.0``, ``01.02.03.04``, ``0xdeadbeef``) is numeric in some
     form nobody typed as an address, and the answer is True.
 
+    One legal literal is refused all the same.  ``0.0.0.0`` parses as a dotted
+    quad, so the rule above accepted it -- and it is the very address the
+    hazard paragraph names, since a ``connect()`` to the unspecified address
+    is the loopback dial the shorthands were refused for.  No scanner is ever
+    at the unspecified address, so refusing it by name costs nothing and
+    closes the one dotted quad the rule left open (R4-WR-03).
+
     Args:
         segment: One stripped segment of the ``scanner.host`` setting.
 
     Returns:
-        True when glibc would read the segment as a number and it is not a
-        legal dotted-quad IPv4 literal.
+        True when glibc would read the segment as a number and it is either
+        not a legal dotted-quad IPv4 literal or the unspecified address
+        ``0.0.0.0``.
 
     """
     if not all(_part_is_a_number_to_glibc(part) for part in segment.split(".")):
         return False
     try:
-        ipaddress.IPv4Address(segment)
+        address = ipaddress.IPv4Address(segment)
     except ValueError:
         # Numeric, but not a legal literal: one of the shorthands glibc
         # invents an address from.
         return True
-    return False
+    # The one legal literal that is still the hazard this function documents:
+    # on Linux a connect() to the unspecified address reaches loopback, so it
+    # would report the configured host reachable off any local listener.  It
+    # names no scanner, so nothing is lost by refusing it (R4-WR-03).
+    return address.is_unspecified
 
 
 def _looks_like_a_host_name(segment: str) -> bool:
@@ -797,15 +809,20 @@ def _looks_like_a_host_name(segment: str) -> bool:
     ``192.0.2.10`` is not a number glibc invented an address from -- it is the
     address the operator configured -- and dialling it is precisely the
     pre-probe's job on a static-IP scanner, worth about 127 s of
-    uninterruptible ``get_devices()`` when the appliance is off.
+    uninterruptible ``get_devices()`` when the appliance is off.  The one
+    exception is ``0.0.0.0`` itself: a legal literal, but the very address the
+    paragraph above names as the worst case, and one no scanner is ever at, so
+    ``_segment_is_a_numeric_address_shorthand`` refuses it by name
+    (R4-WR-03).
 
     Args:
         segment: One stripped segment of the ``scanner.host`` setting.
 
     Returns:
         True when the segment is non-empty, is not a number glibc would
-        resolve as an address, is made only of ASCII letters, digits, hyphens
-        and dots, and neither starts nor ends with a hyphen or a dot.
+        resolve as an address, is not the unspecified address, is made only of
+        ASCII letters, digits, hyphens and dots, and neither starts nor ends
+        with a hyphen or a dot.
 
     """
     if not segment:
