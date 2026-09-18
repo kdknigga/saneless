@@ -16,7 +16,7 @@ import threading
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, assert_never
+from typing import TYPE_CHECKING, Final, assert_never
 from uuid import uuid4
 
 import click
@@ -29,6 +29,7 @@ from .auto_profiles import (
 from .checks import (
     CheckContext,
     CheckKey,
+    CheckResult,
     CheckState,
     check_name,
     run_checks,
@@ -1037,13 +1038,65 @@ def _state_marker(state: CheckState) -> str:
     return marker
 
 
+# The token a row nobody probed prints instead of `[ OK ]` (D-08, R3-WR-03).
+#
+# No `doctor` invocation produces this marker today: the command builds its
+# CheckContext with `skip_scanner` at its default and passes no scanner gate,
+# so neither `_scanner_skipped` nor `_scanner_busy` is reachable from the CLI.
+# It exists anyway, and deliberately. D-02's whole claim is that one registry
+# feeds both surfaces, so a surface that would mis-render a row the registry
+# can build is a divergence already present and merely unreached -- and leaving
+# `CheckResult.skipped` half-wired, rendered by neither surface while two
+# docstrings said it was rendered by both, is precisely what R3-WR-03 found.
+# The first caller that passes `skip_scanner=True` should get a correct table,
+# not a bug report.
+#
+# Six characters, like the three state tokens, so `_MARKER_WIDTH` below does
+# not silently widen the name column for one row.
+_SKIPPED_MARKER: Final = "[SKIP]"
+
+
+def _row_marker(result: CheckResult) -> str:
+    """
+    Return the token ``doctor`` prints in front of one finished row.
+
+    ``_state_marker`` answers "what does this state look like"; this answers
+    "what does this row look like", and the two differ whenever ``skipped`` is
+    set.  The flag is a fact about the probe and the state is a verdict about
+    the appliance: a skipped row carries ``CheckState.OK`` so that a scripted
+    health gate does not go red for a probe that was deliberately not taken
+    (D-01), which means marking it from the state alone prints the one token a
+    reader scans for as "fine" in front of a sentence saying nothing was
+    checked.  ``checks.check_row_class`` and its two siblings make the same
+    substitution for the web strip, from the same flag.
+
+    Args:
+        result: The finished row about to be printed.
+
+    Returns:
+        ``_SKIPPED_MARKER`` when the probe was skipped, otherwise
+        ``_state_marker(result.state)``.
+
+    """
+    if result.skipped:
+        return _SKIPPED_MARKER
+    return _state_marker(result.state)
+
+
 # The three column widths `saneless doctor` renders with, all derived rather
 # than written down, exactly as _STATUS_COL_WIDTH is and for the same reason: a
 # sixth CheckKey with a longer name, or a fourth CheckState with a wider token,
 # must not be able to overflow an 80-column terminal without anyone noticing.
 # The indent puts a next step underneath the message it belongs to, so a row
 # and its remedy read as one item rather than two.
-_MARKER_WIDTH = max(len(_state_marker(state)) for state in CheckState)
+#
+# The marker width counts `_SKIPPED_MARKER` alongside the state tokens rather
+# than relying on the four strings happening to be the same length, so the
+# derivation stays correct if any one of them is ever respelled.
+_MARKER_WIDTH = max(
+    len(marker)
+    for marker in (*(_state_marker(state) for state in CheckState), _SKIPPED_MARKER)
+)
 _NAME_COL_WIDTH = max(len(check_name(key)) for key in CheckKey)
 _NEXT_STEP_INDENT = " " * (_MARKER_WIDTH + 1 + _NAME_COL_WIDTH + 1)
 
@@ -1160,7 +1213,7 @@ def doctor(ctx: click.Context) -> None:
 
     for result in results:
         click.echo(
-            f"{_state_marker(result.state):<{_MARKER_WIDTH}} "
+            f"{_row_marker(result):<{_MARKER_WIDTH}} "
             f"{check_name(result.key):<{_NAME_COL_WIDTH}} {result.message}"
         )
         if result.next_step:
