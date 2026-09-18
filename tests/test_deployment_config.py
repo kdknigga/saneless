@@ -1479,3 +1479,210 @@ def test_gitignore_ignores_the_playwright_artifact_directory() -> None:
         "archives untracked-but-visible in every `git status` after a failed "
         "browser test"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: the container image itself (D-25, D-27, D-28, D-29, DLVR-07)
+# ---------------------------------------------------------------------------
+
+DOCKERFILE = REPO_ROOT / "Dockerfile"
+
+DATA_DIR = "/var/lib/saneless"
+
+# The reference on a ``FROM`` line: everything up to the first whitespace.
+FROM_LINE = re.compile(r"^FROM\s+(?P<ref>\S+)", re.IGNORECASE)
+FROM_STAGE = re.compile(r"^FROM\s+(?P<ref>\S+)\s+AS\s+(?P<stage>\S+)", re.IGNORECASE)
+USER_LINE = re.compile(r"^USER\s+(?P<user>\S+)", re.IGNORECASE)
+DIGEST_SUFFIX = re.compile(r"@sha256:[0-9a-f]{64}$")
+
+UV_IMAGE = "ghcr.io/astral-sh/uv"
+
+# Spellings of the superuser a ``USER`` instruction can carry.
+ROOT_USERS = frozenset({"root", "0", "0:0", "root:root"})
+
+WHEEL_BUILD_INPUTS = ("pyproject.toml", "uv.lock", "README.md", "LICENSE")
+
+
+def test_dockerfile_pins_every_base_image_by_digest() -> None:
+    """
+    Every ``FROM`` reference carries both a tag and a ``sha256`` digest (D-27).
+
+    The digest is what makes the build reproducible: a tag can be repointed at
+    new content between two builds of the same source. The **tag** has to stay
+    in the reference alongside it, not move into the trailing comment, because
+    that is how Dependabot knows which stream the pin belongs to and what to
+    bump it to. A bare digest is immutable and unmaintained -- it just rots.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    references = [
+        (number, line, match.group("ref"))
+        for number, line in _significant_lines(DOCKERFILE)
+        for match in [FROM_LINE.match(line)]
+        if match is not None
+    ]
+    assert references, f"{name} has no FROM instructions at all"
+    offenders = [
+        f"{name}:{number}: {line}"
+        for number, line, reference in references
+        if not DIGEST_SUFFIX.search(reference)
+        or ":" not in reference.split("@")[0].rsplit("/", 1)[-1]
+    ]
+    assert not offenders, (
+        "a FROM reference is not pinned as 'image:tag@sha256:<64 hex>'. Both "
+        "halves are load-bearing: the digest pins the content, the tag tells "
+        "Dependabot what stream to bump:\n" + "\n".join(offenders)
+    )
+
+
+def test_dockerfile_gets_uv_from_a_named_from_stage() -> None:
+    """
+    The uv tool image arrives through a named ``FROM`` stage, not a copy-from.
+
+    Dependabot's Docker file parser iterates the file matching ``FROM``
+    directives **only**, and deliberately excludes builder-stage references
+    written as a ``COPY`` with a ``--from`` pointing at a registry image. A
+    digest written straight onto such a line is invisible to it and would
+    never be updated -- the pin would look maintained and quietly rot.
+    Promoting uv to ``FROM ... AS uv`` costs one line and makes the third
+    digest pin real.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    lines = _significant_lines(DOCKERFILE)
+    uv_stages = [
+        number
+        for number, line in lines
+        for match in [FROM_STAGE.match(line)]
+        if match is not None and match.group("ref").startswith(UV_IMAGE)
+    ]
+    assert uv_stages, (
+        f"{name} has no `FROM {UV_IMAGE}:<version>@sha256:... AS uv` stage, so "
+        "the uv digest pin is one Dependabot cannot see or maintain"
+    )
+    offenders = [
+        f"{name}:{number}: {line}"
+        for number, line in lines
+        if line.upper().startswith("COPY") and "--from=ghcr.io/" in line
+    ]
+    assert not offenders, (
+        "a COPY names a registry image in its --from. Dependabot skips those "
+        "lines, so a digest written there never gets bumped:\n" + "\n".join(offenders)
+    )
+
+
+def test_dockerfile_copies_only_the_wheel_build_inputs() -> None:
+    """
+    The builder stage copies named paths, never the whole working tree (D-29).
+
+    This is the second of the two independent build-context gates, the first
+    being the ``.dockerignore`` allow-list. Copying the entire context sweeps
+    whatever the daemon was sent into a layer -- which, before this phase,
+    included a real ``config.toml`` holding a live paperless-ngx token. Naming
+    the inputs means a mistake in the allow-list alone cannot leak anything.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    lines = _significant_lines(DOCKERFILE)
+    offenders = [
+        f"{name}:{number}: {line}"
+        for number, line in lines
+        if line.upper().startswith("COPY") and line.split()[1:] == [".", "."]
+    ]
+    assert not offenders, (
+        "the builder stage still copies the entire build context:\n"
+        + "\n".join(offenders)
+    )
+    copied = " ".join(line for _, line in lines if line.upper().startswith("COPY"))
+    missing = [entry for entry in WHEEL_BUILD_INPUTS if entry not in copied]
+    assert not missing, f"{name} has no COPY line naming {missing}"
+    assert "src" in copied.split(), (
+        f"{name} has no COPY line naming the `src` package directory"
+    )
+
+
+def test_dockerfile_runs_as_a_non_root_user() -> None:
+    """
+    The image ends on a ``USER`` that is not root (D-25, DLVR-07).
+
+    A root process in the container reaches much further into a bind-mounted
+    host directory, and into the kernel, than UID 1000 does. The account is
+    created at a **fixed** 1000 on purpose: on the single-user Linux host this
+    appliance targets, the operator's own ``./config`` directory is already
+    ``1000:1000``, so the read-write config mount works with no ``chown`` at
+    all. A high UID such as 10001 can never match, which would put a fix-up on
+    every deployment's happy path.
+
+    This test reads the file. That the built image actually starts as UID 1000
+    is proven separately, by running it.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    users = [
+        (number, match.group("user"))
+        for number, line in _significant_lines(DOCKERFILE)
+        for match in [USER_LINE.match(line)]
+        if match is not None
+    ]
+    assert users, f"{name} has no USER instruction, so the image runs as root"
+    offenders = [
+        f"{name}:{number}: USER {user}" for number, user in users if user in ROOT_USERS
+    ]
+    assert not offenders, "a USER instruction names the superuser:\n" + "\n".join(
+        offenders
+    )
+    text, _ = _read(DOCKERFILE)
+    for needle in ("groupadd", "useradd", "1000"):
+        assert needle in text, (
+            f"{name} does not create the account with {needle!r}; the USER "
+            "instruction names an account that has to exist in the image"
+        )
+
+
+def test_dockerfile_chowns_the_data_dir_before_declaring_the_volume() -> None:
+    """
+    The data directory is created and chowned **before** ``VOLUME`` (D-28).
+
+    Docker discards build steps that change data within a declared volume path
+    *after* the ``VOLUME`` instruction. Get the order wrong and a fresh named
+    volume comes up owned by root, the non-root process cannot write the job
+    database, and preserved scans have nowhere to go.
+
+    Ordering by construction rather than by testing is deliberate. buildah --
+    which is what ``docker`` is on the maintainer's host -- was measured
+    *tolerating* the wrong order, so a green local build would say nothing
+    about the real image, which CI builds with BuildKit. This test is the
+    check that does not depend on which builder ran.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    lines = _significant_lines(DOCKERFILE)
+    chowns = [number for number, line in lines if "chown" in line and DATA_DIR in line]
+    volumes = [number for number, line in lines if line.upper().startswith("VOLUME")]
+    assert chowns, f"{name} never chowns {DATA_DIR}"
+    assert volumes, f"{name} has no VOLUME instruction"
+    assert max(chowns) < min(volumes), (
+        f"{name} chowns {DATA_DIR} at line {max(chowns)}, after the VOLUME "
+        f"instruction at line {min(volumes)}. Docker discards that change, so "
+        "a fresh volume would come up owned by root and the non-root process "
+        "could not write to it"
+    )
+
+
+def test_dockerfile_sets_a_workdir_in_the_runtime_stage() -> None:
+    """
+    The runtime stage anchors relative writes inside the durable volume (D-28).
+
+    With no ``WORKDIR`` the working directory is ``/``, so a relative write --
+    ``saneless auto-profiles`` with no config file loaded writes
+    ``./saneless.toml`` -- lands in the container's own writable layer, first
+    in the config search order and destroyed on the next recreation. Pointing
+    ``WORKDIR`` at the declared volume puts it somewhere durable and owned by
+    the app user instead.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    lines = _significant_lines(DOCKERFILE)
+    froms = [number for number, line in lines if FROM_LINE.match(line) is not None]
+    workdirs = [number for number, line in lines if line == f"WORKDIR {DATA_DIR}"]
+    assert froms, f"{name} has no FROM instructions at all"
+    assert workdirs, f"{name} does not set `WORKDIR {DATA_DIR}`"
+    assert max(workdirs) > max(froms), (
+        f"{name} sets `WORKDIR {DATA_DIR}` at line {max(workdirs)}, before the "
+        f"runtime stage begins at line {max(froms)}, so the runtime stage "
+        "still starts in /"
+    )
