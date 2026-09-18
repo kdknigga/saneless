@@ -419,6 +419,38 @@ to shelling out to `git ls-files` — the fix is a literal argv with the path pa
 tag in this phase is pushed by the user (D-20). No plan task may create a tag.
 
 
+### Branch and CI strategy (user decision, 2026-09-18)
+
+Added after a premature RC tag push exposed the gap. **This is locked.**
+
+- **D-54:** Phase 31 work happens on **`autodev`**. The `autodev-filtered-2` branch and its PR #8
+  were deleted; the `v0.2.0-rc.1` tag that pointed at Phase 30 commit `82d2556` was deleted from
+  both the remote and the local repo. Clean slate: zero tags, zero filtered branches, zero open PRs.
+- **D-55:** **Filter + PR before wave 7.** `ci.yml` triggers on `push: branches: [master]` and
+  `pull_request:` only — so a push to `autodev` with no open PR produces **no CI run at all**.
+  Waves 1-6 therefore run on local gates (`uv run pytest`, `uv run prek run --all-files`,
+  `uv run zizmor .`, the four quality gates). Before wave 7, a `.planning`-stripped branch is built
+  from `autodev` (`/gsd-pr-branch`), pushed, and a PR opened against `master` — that PR is what
+  makes CI run. Claude may push the branch and open the PR; **Claude never merges it.**
+- **D-56:** **The release tag points at the filtered branch head, not at an `autodev` commit.**
+  Filtering rewrites history, so the version-bump commit has a different SHA on the filtered branch.
+  Releasing from the filtered tree is also the more correct artifact: it carries no `.planning/`.
+- **D-57:** The two rejected alternatives, recorded so they are not re-proposed: a throwaway
+  unfiltered `autodev` → `master` PR purely to carry CI during waves 1-6 (rejected — noisy, ships
+  `.planning/` into a PR), and adding `autodev` to `ci.yml`'s push trigger (rejected — bakes a
+  temporary branch name into a permanent workflow).
+
+**Known flake blocking the wave-7 CI gate (Phase 32 debt, diagnosed 2026-09-18):**
+`tests/test_web_checks.py::TestRefreshMinimumInterval::test_twenty_refreshes_issue_one_paperless_request`
+is wall-clock dependent. Its `counting` fixture (`tests/test_web_checks.py:428`) substitutes the
+Paperless transport but **not** the clock, unlike the sibling `clocked` fixture
+(`tests/test_web_checks.py:412`) which injects `_FakeClock`. It passes locally (10 tests, 0.37s) and
+failed on a loaded GitHub runner with `assert (20 - 0) == 1` — every refresh fell outside the
+throttle window. The throttle is correct; the test's timing assumption is not. This is squarely
+TEST-01..TEST-06 (Phase 32, hermetic tests). The fix is to give `counting` the same `_FakeClock`
+injection `clocked` already has. **Do not weaken the assertion.**
+
+
 ### Claude's Discretion
 
 - **RC tag shape and `latest` gating (D-23)** — pick the pre-release tag pattern and the
