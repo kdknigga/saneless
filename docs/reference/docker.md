@@ -13,6 +13,11 @@ saneless publishes an OCI container image for deployment alongside paperless-ngx
 | User | `1000:1000` (non-root) |
 | Working directory | `/var/lib/saneless` |
 
+The published port serves a UI with **no login**, bound to `0.0.0.0` -- all network
+interfaces -- so every host that can reach it can start a scan; see
+[Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy)
+and the [Web API](web-api.md) notes on the trust model.
+
 ## User and file ownership
 
 The container runs as UID/GID **1000**, not root, and everything it writes on a
