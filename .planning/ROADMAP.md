@@ -744,7 +744,7 @@ Plans:
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
 | 30. Appliance Layer | 36/36 | Complete    | 2026-09-18 |
-| 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
+| 31. Delivery, Identity, and Documentation Accuracy | 0/10 | Planned    |  |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
 
