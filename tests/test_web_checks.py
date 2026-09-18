@@ -28,6 +28,7 @@ be satisfied by markup somewhere else on the page.
 from __future__ import annotations
 
 import inspect
+import logging
 import re
 from html import unescape
 from pathlib import Path
@@ -66,6 +67,8 @@ from tests.conftest import StubScannerBackend
 if TYPE_CHECKING:
     import threading
     from collections.abc import Callable, Iterator
+
+    from starlette.datastructures import State
 
     from saneless.checks import CheckContext
     from saneless.web.refresher import CheckRefresher
@@ -467,6 +470,36 @@ def _body_attrs(markup: str) -> str:
     return match.group("attrs")
 
 
+# The text an injected failure carries.  Deliberately unlike anything the strip
+# can render, so "absent from the body" means the guard held rather than that
+# the marker happened not to collide with the markup.
+_CHECKS_BOOM_MARKER = "zz-checks-boom"
+
+
+def _raise_inside_the_checks_route(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """
+    Make one half of the checks route's guarded region raise.
+
+    Args:
+        client: The client whose application is patched.
+        monkeypatch: The patcher, so the injected failure is undone after.
+        target: ``_checks_context`` for the context build, ``note_watcher``
+            for the watcher stamp that precedes it inside the same guard.
+
+    """
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        """Fail the way an unexpected bug in this route would."""
+        raise RuntimeError(_CHECKS_BOOM_MARKER)
+
+    if target == "_checks_context":
+        monkeypatch.setattr(routes_module, "_checks_context", boom)
+    else:
+        monkeypatch.setattr(_app(client).state.refresher, target, boom)
+
+
 # How far a poll chain is followed before it is called unbounded.  Comfortably
 # past any cap the strip could sanely carry, so a chain that reaches this many
 # links has not been capped, it has been left running.
@@ -808,21 +841,81 @@ class TestBoundedPoll:
             assert meta is not None
             assert meta.group("text").strip() != checks_module.POLL_GAVE_UP_LINE
 
-    def test_an_attempt_outside_the_bound_is_rejected_before_the_context(
+    def test_an_attempt_outside_the_bound_ends_the_chain_instead_of_erroring(
         self, client: TestClient
     ) -> None:
         """
-        A crafted ``attempt`` is a 422 at the route boundary (T-30-27-02).
+        An out-of-range ``attempt`` is a trigger-free 200, not a 422 (R3-CR-02).
 
-        The same ``Query`` bound the tag filter's ``max_length`` uses, for the
-        same reason: request input that reaches a render is input that has to
-        be trusted, and this one never does.
+        The bound used to be a ``Query`` constraint, so a number past the cap
+        was rejected during request validation and came back through
+        ``render_error``.  That was the wrong failure mode for the one element
+        on the page that polls: an error response is the thing the strip cannot
+        usefully receive, and the ordinary way past the cap is exactly the
+        ending the strip wanted anyway.  Above the cap the clamp lands on the
+        cap, which is the give-up body; the chain stops there.
         """
         cap = checks_module.POLL_ATTEMPT_CAP
-        assert client.get(f"/api/checks?attempt={cap + 1}").status_code == 422
-        assert client.get("/api/checks?attempt=-1").status_code == 422
-        assert client.get("/api/checks?attempt=nine").status_code == 422
-        assert client.get("/api/checks?attempt=1e9").status_code == 422
+        response = client.get(f"/api/checks?attempt={cap + 1}")
+        assert response.status_code == 200
+        assert "hx-trigger" not in _body_attrs(response.text)
+
+        far_past = client.get("/api/checks?attempt=999999")
+        assert far_past.status_code == 200
+        assert "hx-trigger" not in _body_attrs(far_past.text)
+
+    def test_a_negative_attempt_is_the_start_of_a_chain(
+        self, client: TestClient
+    ) -> None:
+        """
+        Below zero clamps to zero: a fresh chain, not a status code.
+
+        A negative counter says nothing the server needs to act on -- there is
+        no state behind it -- so the honest reading is "this browser has not
+        asked yet", which is what attempt zero means everywhere else.
+        """
+        response = client.get("/api/checks?attempt=-5")
+        assert response.status_code == 200
+        assert "/api/checks?attempt=1" in unescape(_body_attrs(response.text))
+
+    def test_a_crafted_attempt_never_reaches_the_context_or_the_body(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The clamp runs first, so only clamped numbers travel (T-30-32-02).
+
+        This is the property the removed ``Query`` bound was defending, and it
+        is unchanged: what changed is the status code an out-of-range value
+        earns, never whether the value itself is trusted.
+        """
+        cap = checks_module.POLL_ATTEMPT_CAP
+        seen: list[int] = []
+        real = routes_module._checks_context
+
+        def recording(state: State, *, attempt: int = 0) -> dict[str, object]:
+            """Record the attempt the handler passed on, then build normally."""
+            seen.append(attempt)
+            return real(state, attempt=attempt)
+
+        monkeypatch.setattr(routes_module, "_checks_context", recording)
+        for crafted in ("99", "-5", str(cap + 1)):
+            body = client.get(f"/api/checks?attempt={crafted}").text
+            assert crafted not in unescape(_body_attrs(body)), (crafted, body)
+        assert seen == [cap, 0, cap]
+
+    @pytest.mark.parametrize("crafted", ["abc", "nine", "1e9", ""])
+    def test_an_attempt_that_is_not_an_integer_is_still_a_422(
+        self, client: TestClient, crafted: str
+    ) -> None:
+        """
+        The clamp replaces a range bound, never the type (T-30-32-02).
+
+        A value that is not a number at all is still refused by request
+        validation, and with the strip's retarget exemption in place that 422
+        replaces the strip and ends the poll rather than being redirected into
+        the message slot.
+        """
+        assert client.get(f"/api/checks?attempt={crafted}").status_code == 422
 
     def test_the_full_page_starts_the_poll_at_its_first_attempt(
         self, client: TestClient
@@ -872,6 +965,70 @@ class TestBoundedPoll:
         assert len(_CHECK_ROW.findall(response.text)) == len(CheckKey)
         # Results landed, so the strip is settled rather than polling again.
         assert "hx-trigger" not in _body_attrs(response.text)
+
+
+class TestTheStripSurvivesItsOwnFailure:
+    """
+    An internal failure in the strip's render is a cold strip, not an error.
+
+    The strip is the one element that polls, so an error response to it is the
+    one response it cannot usefully receive: before R3-CR-02 an exception in
+    ``_checks_context`` became a 500 that was retargeted into the message slot,
+    leaving ``#checks-body`` on the page still polling, still failing, still
+    overwriting the scan-progress line every two seconds.
+
+    So this route catches its own failures and renders the cold-start body
+    instead: five named rows, the give-up line naming the button that is still
+    on the page, and no trigger.  The exception goes to the log and nowhere
+    else -- this body is rendered on a page the whole LAN can read (ASVS V7,
+    Phase 26 D-10, T-30-32-03).
+    """
+
+    @pytest.mark.parametrize("target", ["_checks_context", "note_watcher"])
+    def test_a_failure_inside_the_render_is_a_cold_strip_at_200(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, target: str
+    ) -> None:
+        """Both halves of the guarded region fall back to the same body."""
+        _raise_inside_the_checks_route(client, monkeypatch, target)
+
+        response = client.get("/api/checks")
+        assert response.status_code == 200
+        rows = _CHECK_ROW.findall(response.text)
+        assert len(rows) == len(CheckKey)
+        assert all(CHECKING_MESSAGE in row for row in rows)
+        meta = _CHECK_META.search(response.text)
+        assert meta is not None, response.text
+        assert meta.group("text").strip() == checks_module.POLL_GAVE_UP_LINE
+        assert 'hx-post="/api/checks/refresh"' in response.text
+        assert "Check again" in response.text
+        assert "hx-trigger" not in _body_attrs(response.text)
+
+    @pytest.mark.parametrize("target", ["_checks_context", "note_watcher"])
+    def test_no_part_of_the_exception_reaches_the_page(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, target: str
+    ) -> None:
+        """The failed render says nothing about why (ASVS V7, T-30-32-03)."""
+        _raise_inside_the_checks_route(client, monkeypatch, target)
+
+        body = client.get("/api/checks").text
+        for forbidden in (_CHECKS_BOOM_MARKER, "Traceback", "RuntimeError", ".py"):
+            assert forbidden not in body, (forbidden, body)
+
+    def test_the_failure_is_logged_with_its_traceback(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Nothing is swallowed: the page loses the detail, the log keeps it."""
+        _raise_inside_the_checks_route(client, monkeypatch, "_checks_context")
+
+        with caplog.at_level(logging.ERROR, logger=routes_module.__name__):
+            assert client.get("/api/checks").status_code == 200
+        assert any(
+            record.exc_info is not None and _CHECKS_BOOM_MARKER in str(record.exc_info)
+            for record in caplog.records
+        )
 
 
 class TestRefreshButton:
