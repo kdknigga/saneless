@@ -1,8 +1,8 @@
 site_name: saneless
 site_description: SANE scanner to paperless-ngx bridge
-site_url: https://kris-knigga.github.io/saneless/
-repo_url: https://github.com/kris-knigga/saneless
-repo_name: kris-knigga/saneless
+site_url: https://kdknigga.github.io/saneless/
+repo_url: https://github.com/kdknigga/saneless
+repo_name: kdknigga/saneless
 
 theme:
   name: material

@@ -18,7 +18,7 @@ Get from zero to your first scanned document in paperless-ngx in under five minu
     docker run -p 8080:8080 \
       -v ./config:/etc/saneless \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
-      ghcr.io/kris-knigga/saneless:latest
+      ghcr.io/kdknigga/saneless:latest
     ```
 
     Replace `192.168.1.50` with the IP address of the machine running `saned`.

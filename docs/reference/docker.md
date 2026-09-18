@@ -6,7 +6,7 @@ saneless publishes an OCI container image for deployment alongside paperless-ngx
 
 | Property | Value |
 |----------|-------|
-| Image | `ghcr.io/kris-knigga/saneless:latest` |
+| Image | `ghcr.io/kdknigga/saneless:latest` |
 | Base | `python:3.14-slim` |
 | Entrypoint | `saneless serve` |
 | Port | `8080` |
@@ -138,7 +138,7 @@ shipped template now does.
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kris-knigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:latest
     ports:
       - "8080:8080"
     volumes:
@@ -160,7 +160,7 @@ For USB-connected scanners managed by a local `saned`, pass the USB bus:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kris-knigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:latest
     devices:
       - /dev/bus/usb:/dev/bus/usb
     ports:
@@ -178,7 +178,7 @@ For scanners exposed via `saned` on a remote host, set the scanner host:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kris-knigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:latest
     ports:
       - "8080:8080"
     volumes:
@@ -196,7 +196,7 @@ For detailed setup instructions, see [Scanner Host Discovery](../how-to/scanner-
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kris-knigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:latest
     ports:
       - "8080:8080"
     volumes:

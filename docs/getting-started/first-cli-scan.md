@@ -35,7 +35,7 @@ Before you begin, make sure you have:
     For a quick test, run saneless directly:
 
     ```bash
-    docker run -p 8080:8080 ghcr.io/kris-knigga/saneless
+    docker run -p 8080:8080 ghcr.io/kdknigga/saneless
     ```
 
     For a permanent setup alongside paperless-ngx, see the

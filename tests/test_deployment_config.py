@@ -25,17 +25,20 @@ subsection, and the absence of the two claims that phase falsified (D-20).
 The Phase 30 tests hold the shipped compose template to D-17 -- the paperless
 connection is commented out, because a live line there silently overrides
 ``./config/config.toml`` -- and to APPL-11's consume-directory mount and
-APPL-12's ``TZ``. They also pin the ``kris-knigga`` occurrence count, so this
-phase provably does not perform Phase 31's DLVR-01 rename, and derive the
-documentation's expectations from the source: the route decorators, the
-``WebConfig`` fields and the ``RequestRejection`` members, so a future addition
-cannot ship undocumented (APPL-05, APPL-07, APPL-10, APPL-11, APPL-12).
+APPL-12's ``TZ``. They derive the documentation's expectations from the
+source: the route decorators, the ``WebConfig`` fields and the
+``RequestRejection`` members, so a future addition cannot ship undocumented
+(APPL-05, APPL-07, APPL-10, APPL-11, APPL-12).
 
 The Phase 31 tests pin the packaging identity ``pyproject.toml`` publishes:
 the 0.2.0 series, the PEP 639 license keys, the Alpha maturity classifier, the
 absence of the deprecated ``License ::`` classifier -- which nothing in the
 build or publish toolchain rejects, so this is the only thing that does -- and
 the unchanged ``saneless`` distribution name (D-01, D-02, D-05, DLVR-08).
+
+The Phase 31 identity guard then holds every tracked file outside
+``.planning/`` to the current GitHub owner, so a stale project URL cannot
+reach a reader or a registry (CI-02, DLVR-01, D-08..D-12).
 
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
@@ -44,6 +47,7 @@ YAML parser makes of it.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 from saneless.config import WebConfig, is_placeholder_token
@@ -785,14 +789,6 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
 # Phase 30: the shipped deployment template (D-17, APPL-07, APPL-11, APPL-12)
 # ---------------------------------------------------------------------------
 
-# The number of ``kris-knigga`` strings in ``docker-compose.yml`` before this
-# phase: the image reference and the ``#configuration`` anchor link. Renaming
-# them is DLVR-01 in Phase 31, deliberately NOT this phase's work. Pinning the
-# count proves Phase 30 left those lines alone -- if this fires because the
-# rename really happened, the fix is to update this constant in that phase, not
-# to weaken the assertion (T-30-88).
-COMPOSE_KRIS_KNIGGA_COUNT = 2
-
 # Every environment variable that carries the paperless-ngx connection. A live
 # line here silently overrides ``./config/config.toml`` -- the U-01 finding.
 OVERRIDING_ENV_KEYS = ("SANELESS_PAPERLESS__URL", "SANELESS_PAPERLESS__TOKEN")
@@ -921,16 +917,6 @@ def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
     assert not offenders, (
         "a shipped example sets the paperless token to a value this release "
         "detects as a placeholder and refuses scans for:\n" + "\n".join(offenders)
-    )
-
-
-def test_phase_30_does_not_perform_the_dlvr_01_rename() -> None:
-    """``kris-knigga`` appears in the compose template exactly as often as before."""
-    count = COMPOSE.read_text(encoding="utf-8").count("kris-knigga")
-    assert count == COMPOSE_KRIS_KNIGGA_COUNT, (
-        f"{COMPOSE.name} has {count} 'kris-knigga' strings, expected "
-        f"{COMPOSE_KRIS_KNIGGA_COUNT}. Renaming them is DLVR-01 in Phase 31; "
-        "Phase 30 must leave the image reference and its link alone (T-30-88)"
     )
 
 
@@ -1179,4 +1165,88 @@ def test_pyproject_distribution_name_is_saneless() -> None:
         f'{name} no longer declares name = "saneless". The owner rename '
         "changes the GitHub URLs only; the distribution name is published and "
         "must not drift to a squattable variant"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: the identity guard (CI-02, DLVR-01, D-08..D-12)
+# ---------------------------------------------------------------------------
+
+# The forbidden owner slug is assembled at runtime from these two halves. The
+# obvious spelling is a single literal, but the guard below scans *every*
+# tracked file outside ``.planning/`` -- including this one -- so a literal here
+# would make the guard report itself and go red with no real regression behind
+# it. No file is exempt, which is exactly the point: there is nowhere a genuine
+# stale reference could hide (D-11). The other obvious spelling, a ``"-".join``
+# over an inline literal sequence, is no good either: ruff's FLY002 rewrites it
+# straight back into the literal string, and suppressing the rule is forbidden.
+# An f-string over named constants is the form FLY002 leaves alone. Fold this
+# back into one string and the suite goes red on this very file.
+_OWNER_GIVEN = "kris"
+_OWNER_FAMILY = "knigga"
+FORBIDDEN_OWNER_SLUG = f"{_OWNER_GIVEN}-{_OWNER_FAMILY}"
+
+_EXCLUDED_PREFIX = ".planning/"
+
+
+def _shipped_files() -> list[str]:
+    """
+    Return every tracked path outside ``.planning/`` (DLVR-01, D-10).
+
+    "Shipped" is defined as ``git ls-files`` rather than a hand-maintained
+    list, so a file added in a later phase is covered without anyone
+    remembering to extend anything. ``site/`` is ignored by version control and
+    therefore never reaches ``git ls-files``, so the built documentation site
+    is excluded for free.
+
+    Returns:
+        Repo-relative path names, NUL-separated by the child process and split
+        here.
+
+    """
+    # Every argv element is a literal and the repository path travels in the
+    # ``cwd`` keyword -- the shape test_scanner.py and test_atomic_write.py
+    # established for the other child-process tests in this suite. Passing
+    # ``str(REPO_ROOT)`` as a ``-C`` argument instead trips ruff S603, and
+    # suppression is forbidden.
+    result = subprocess.run(
+        ["/usr/bin/git", "ls-files", "-z"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return [
+        name
+        for name in result.stdout.split("\0")
+        if name and not name.startswith(_EXCLUDED_PREFIX)
+    ]
+
+
+def test_no_shipped_file_references_the_old_owner() -> None:
+    """No tracked file outside ``.planning/`` names the old GitHub owner."""
+    offenders: list[str] = []
+    for name in _shipped_files():
+        # Two clauses rather than one tuple: at this project's ruff
+        # target-version, ruff format rewrites a parenthesised tuple into
+        # PEP 758's bracketless form, which the pre-commit
+        # debug-statements hook -- running on its own older interpreter --
+        # cannot parse. Separate clauses read identically to both.
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if FORBIDDEN_OWNER_SLUG in line
+        )
+    assert not offenders, (
+        "a shipped file still references the old GitHub owner, which DLVR-01 "
+        "renames. Every project URL must use the kdknigga forms -- "
+        "github.com/kdknigga/saneless, kdknigga.github.io/saneless and "
+        "ghcr.io/kdknigga/saneless:\n" + "\n".join(offenders)
     )
