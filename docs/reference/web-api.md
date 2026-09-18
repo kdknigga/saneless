@@ -134,7 +134,7 @@ Renders the system status strip -- the Scanner, Paperless, Profiles, Fallback an
 
 Before any results exist the response is five `Checking...` rows carrying a self-poll; once results exist the body it returns carries no poll trigger, so the polling stops on its own. While a scan is running the scanner check is skipped and the strip says so rather than probing a device that is in use.
 
-A poll whose request fails ends too, and there are two ways it does. An attempt counter the server cannot read as an in-range number, and any failure inside the strip's own rendering, come back as the strip itself with no poll attached: the five rows and the `Check again` button are still on the page, and nothing asks again. A genuine error response to this one request -- a counter that is not a number at all, or a method the route does not serve -- is deliberately not retargeted into the status area the way every other htmx error in this application is, so it replaces the strip, and the poll ends with it.
+A poll whose request fails ends too, and there are two ways it does. An attempt counter the server cannot read as an in-range number, and any failure inside the strip's own rendering, come back as the strip itself with no poll attached: the five rows and the `Check again` button are still on the page, and nothing asks again. A genuine error response to the poll's own request -- a counter that is not a number at all -- is deliberately not retargeted into the status area the way every other htmx error in this application is, so it replaces the strip, and the poll ends with it. That exemption is for the strip fetching itself and for nothing else: the `Check again` button aims at the same element, but it is a POST, and an error answering it goes to the status area like every other click's, leaving the strip and the button on the page.
 
 One case is left, and it is stated here rather than left to be rediscovered: a request that gets no response at all -- the appliance switched off mid-poll, the connection reset -- produces nothing to replace the strip with, so that tab goes on asking every couple of seconds until it is closed. It is asking an origin that is not answering, so there is nothing on the page for it to overwrite and no scanner or paperless-ngx traffic behind it.
 
@@ -153,6 +153,8 @@ The longer window is still a window. After about three minutes the strip stops a
 Re-runs every check immediately, ignoring the cache, and returns the refreshed strip. This is the `Check again` button: an operator who has just plugged the scanner back in should not have to wait out a TTL.
 
 **Response:** HTML partial (the strip body, for `outerHTML` swap).
+
+A failure inside the strip's own rendering comes back the way it does from [`GET /api/checks`](#get-apichecks): as the cold-start body at `200`, five named rows and the `Check again` button, with no poll attached. A failure in the re-run itself is an ordinary error response, shown in the status area, and the strip is left as it was.
 
 During a scan, the checks that would touch the scanner are skipped -- an explicit click does not get to interrupt a scan in progress -- and the Scanner row keeps its "not checked while a scan is running" message. That decision is taken from the job the scan worker reports it is running, and not from whether some other health check happened to be busy at the same moment: when another check is holding the scanner briefly -- the capability read saneless does at start-up, for instance -- the row says the scanner was busy and names no scan at all.
 
