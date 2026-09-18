@@ -668,7 +668,7 @@ Plans:
 
 **Gap wave 10** *(blocked on gap wave 9)*
 
-- [ ] 30-36-PLAN.md — R3-IN-03: the manual-refresh claim is released by compare-and-clear, not by an argument
+- [x] 30-36-PLAN.md — R3-IN-03: the manual-refresh claim is released by compare-and-clear, not by an argument
 
 **UI hint**: yes
 
@@ -731,7 +731,7 @@ Plans:
 | 27. Configuration Strictness | 8/8 | Complete    | 2026-09-15 |
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
-| 30. Appliance Layer | 35/36 | In Progress|  |
+| 30. Appliance Layer | 36/36 | Complete   | 2026-09-18 |
 | 31. Delivery, Identity, and Documentation Accuracy | 0/? | Not started | - |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
