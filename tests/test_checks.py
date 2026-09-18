@@ -748,6 +748,30 @@ class TestNumericAddressShorthand:
         """A static-IP scanner keeps its pre-probe and its ~127 s saving."""
         assert _saned_hosts("192.0.2.10") == (("192.0.2.10", SANED_PORT),)
 
+    @pytest.mark.parametrize("setting", ["0.0.0.0", "0.0.0.0:6566"])
+    def test_the_unspecified_address_is_never_dialled(self, setting: str) -> None:
+        """
+        R4-WR-03: the one legal dotted quad that is still the hazard.
+
+        ``0.0.0.0`` parses as a legal literal, so the shorthand refusal let it
+        through -- and the guard's own docstring names it as the worst case:
+        on Linux a ``connect()`` to it reaches loopback, so it makes
+        ``any(...)`` true off any unrelated local listener on 6566 and lets a
+        dead scanner host fall through to the ~127 s ``get_devices()``.  No
+        scanner is at the unspecified address, so refusing it costs nothing.
+
+        Args:
+            setting: The unspecified address, bare and with an explicit port.
+
+        """
+        assert _saned_hosts(setting) == ()
+
+    def test_a_stray_character_in_a_port_does_not_add_a_loopback_dial(
+        self,
+    ) -> None:
+        """``scanbox:0.0.0.0`` is one host, not a host and the unspecified address."""
+        assert _saned_hosts("scanbox:0.0.0.0") == (("scanbox", SANED_PORT),)
+
     def test_a_legal_dotted_quad_with_a_port_is_still_dialled(self) -> None:
         """The wider refusal does not touch the ``host:port`` reading either."""
         assert _saned_hosts("192.0.2.10:6566") == (("192.0.2.10", 6566),)
