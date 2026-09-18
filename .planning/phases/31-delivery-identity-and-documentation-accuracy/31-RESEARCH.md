@@ -1665,32 +1665,53 @@ structurally.
 
 ---
 
-## Open Questions
+## Open Questions (ALL RESOLVED)
 
-1. **Does the serve stream carry tracebacks without `-v`?**
+> Resolved 2026-09-18, after this research was written. Every question below was closed by a
+> user decision recorded in `31-CONTEXT.md` or by a task in the committed plan set (`0f4ad70`).
+> Nothing here is still open; the recommendations are kept for the reasoning, not as pending advice.
+
+
+1. **Does the serve stream carry tracebacks without `-v`?** — **RESOLVED: yes.**
+   Closed by `31-CONTEXT.md` § Amendments, *D-36/D-38 AMENDED* (user decision): in serve mode the
+   stream renders tracebacks with or without `-v`, because D-06's "stderr is the user's terminal"
+   rationale is false for a service and no file exists to carry the traceback instead. CLI mode is
+   unchanged. Implemented by 31-03 Tasks 1-2.
    - What we know: the discretion note says `_TracebackFreeFormatter`'s rule must hold on the
      stream; D-35/D-40 say there is no file.
    - What's unclear: whether the user intends tracebacks from a running service to be
      unrecoverable without a restart.
    - Recommendation: ask before the plan locks it; default to the literal reading (§11.4).
 
-2. **`gh-deploy` or the Pages-artifact flow?**
+2. **`gh-deploy` or the Pages-artifact flow?** — **RESOLVED: the Pages-artifact flow.**
+   Closed by `31-CONTEXT.md` § Amendments, *D-13 AMENDED* (user decision). Blocker 5 changed to
+   *Settings → Pages → Source: GitHub Actions*, and a third (`github-pages`) environment is
+   auto-created. Implemented by 31-04 Task 3.
    - What we know: `gh-deploy` cannot pass zizmor at the default persona; the Pages flow can,
      and is verified zero-finding.
    - What's unclear: whether the user is willing to change the Pages source setting.
    - Recommendation: the Pages flow; it also removes `contents: write` (§11.1).
 
-3. **Does D-08's third enforcement point get built?**
+3. **Does D-08's third enforcement point get built?** — **RESOLVED: yes, scoped.**
+   `31-CONTEXT.md` § Amendments, *D-08 CORRECTED* records that the third point did not exist. The
+   planner added a `stages: [pre-merge-commit, pre-push]` hook running
+   `uv run pytest tests/test_deployment_config.py -q` (~2 s) rather than the full suite.
+   Implemented by 31-04 Task 1.
    - Recommendation: add `uv run pytest -m "not browser and not sane_hardware"` at
      `stages: [pre-merge-commit, pre-push]`, or restate D-08 as two points (§8).
 
-4. **What version does `pyproject.toml` carry during the rehearsal?**
+4. **What version does `pyproject.toml` carry during the rehearsal?** — **RESOLVED: `0.2.0-rc.1`.**
+   31-01 sets `0.2.0`; 31-09 Task 2 bumps to `0.2.0-rc.1` for the rehearsal; 31-10 Task 3 restores
+   `0.2.0`. The static assertion is `^0\.2\.0(-rc\.\d+)?$` — judged by `gsd-plan-checker` as a
+   narrowly-scoped accommodation, not a weakened assertion. The final `v0.2.0` release is
+   deliberately **not** a phase task: criterion 2 asks only for a pre-release proven end to end.
    - `0.2.0-rc.1` normalises to `0.2.0rc1`, which is correct for TestPyPI but means the final
      release is a second version bump commit. The alternative (tag the RC against a
      `0.2.0` pyproject) would publish `0.2.0` to TestPyPI and burn the number there.
    - Recommendation: bump to `0.2.0-rc.1`, rehearse, then bump to `0.2.0` for the real tag.
 
-5. **Is `mkdocs build --strict` added to the docs job?**
+5. **Is `mkdocs build --strict` added to the docs job?** — **RESOLVED: yes.**
+   It is the build step of the Pages-artifact flow. Implemented by 31-04 Task 3.
    - It passes today [VERIFIED], and it would catch a broken nav or link. Recommendation: yes.
 
 ---
