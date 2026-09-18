@@ -480,6 +480,14 @@ class _GuardedGroup(click.Group):
 
 
 @click.group(cls=_GuardedGroup)
+# package_name makes click read the version from importlib.metadata, so
+# pyproject.toml stays its single source (D-03). No custom message is passed:
+# the default "%(prog)s, version %(version)s" is the whole contract, because
+# `saneless doctor` already reports the Python and platform detail a longer
+# block would duplicate (D-04). No short flag either -- `-v` below is already
+# --verbose on this group, and click would bind it to whichever option
+# declared it last, silently.
+@click.version_option(package_name="saneless")
 @click.option(
     "--config",
     "config_path",
