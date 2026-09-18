@@ -304,10 +304,9 @@ $RECYCLE.BIN/
 
 # End of https://www.toptal.com/developers/gitignore/api/linux,windows,python,visualstudiocode,vim,emacs
 
-*.png
-
 .serena/
 .playwright-mcp/
+/test-results/
 
 saneless.toml
 
