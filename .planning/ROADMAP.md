@@ -695,7 +695,7 @@ Plans:
 - [x] 31-05-PLAN.md — Container hardening: non-root, digest pins, `WORKDIR`, `.dockerignore` allow-list, one port, no `*.png` glob
 - [x] 31-06-PLAN.md — USB reconciliation, the "Which setup do I have?" page, and the no-auth sentences
 - [x] 31-07-PLAN.md — Remaining doc-row corrections (30, 31, 32) and the `docs/PRD.md` move
-- [ ] 31-08-PLAN.md — The D-42 audit artifact: 34-row dispositions plus the D-44 re-check
+- [x] 31-08-PLAN.md — The D-42 audit artifact: 34-row dispositions plus the D-44 re-check
 - [ ] 31-09-PLAN.md — Release prerequisites and the RC tag (blocked on user blockers 1-3, 5, 6)
 - [ ] 31-10-PLAN.md — Clean-machine verification of the published artefacts; restore 0.2.0 (blocked on user blocker 4)
 
@@ -744,7 +744,7 @@ Plans:
 | 28. Exception Translation | 14/14 | Complete    | 2026-09-15 |
 | 29. Geometry, Memory, and Timeouts | 11/11 | Complete   | 2026-09-16 |
 | 30. Appliance Layer | 36/36 | Complete    | 2026-09-18 |
-| 31. Delivery, Identity, and Documentation Accuracy | 7/10 | In Progress|  |
+| 31. Delivery, Identity, and Documentation Accuracy | 8/10 | In Progress|  |
 | 32. Suite Hygiene and Minor Sweep | 0/? | Not started | - |
 | 33. Disable the OpenAPI Schema and Docs Endpoints | 0/? | Not started | - |
 
