@@ -156,10 +156,10 @@ Both defects below were discovered *during* Phase 23 execution, not by the 2026-
 
 - [ ] **DOCS-01**: Every false claim in review section 8 (rows 1 through 34) is corrected or the behaviour is implemented, and each behaviour change in this milestone updates the sentence that described the old behaviour in the same phase [section 8]
 - [x] **DOCS-02**: README examples run as written: `saneless scan` shows the required `--title`, `source` values match real SANE spelling, and the tutorial link resolves [N-42, doc row 16, 17, 18]
-- [ ] **DOCS-03**: The internal `docs/PRD.md` is removed from the published site (or updated to match the shipped code), and the README's tutorial link points at the getting-started page [N-29, doc row 34]
+- [x] **DOCS-03**: The internal `docs/PRD.md` is removed from the published site (or updated to match the shipped code), and the README's tutorial link points at the getting-started page [N-29, doc row 34]
 - [x] **DOCS-04**: A "Which setup do I have?" page gives the exact compose lines for USB-on-host, network scanner, and `saned` elsewhere, linked from the quick-start prerequisites; the contradictory USB statements are reconciled [U-10, doc row 29]
 - [x] **DOCS-05**: The getting-started and Docker pages state in one sentence that the UI has no login and binds all interfaces by default, and point at the reverse-proxy option [U-09]
-- [ ] **DOCS-06**: The compose example's Paperless service is either complete (Redis broker included) or replaced by a pointer to the official Paperless compose file, and `docker run` examples use `$(pwd)` [doc row 31, 32]
+- [x] **DOCS-06**: The compose example's Paperless service is either complete (Redis broker included) or replaced by a pointer to the official Paperless compose file, and `docker run` examples use `$(pwd)` [doc row 31, 32]
 
 ### Test Suite Hygiene
 
@@ -337,10 +337,10 @@ Which phases cover which requirements. Updated during roadmap creation.
 | DLVR-10 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-01 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
 | DOCS-02 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
-| DOCS-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-03 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-04 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | DOCS-05 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
-| DOCS-06 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Pending |
+| DOCS-06 | Phase 31 — Delivery, Identity, and Documentation Accuracy | Complete |
 | TEST-01 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | TEST-02 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
 | TEST-03 | Phase 32 — Suite Hygiene and Minor Sweep | Pending |
