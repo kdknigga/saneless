@@ -1321,3 +1321,161 @@ def test_every_readme_docs_link_resolves_to_a_page() -> None:
         "itself rather than a hard-coded list, so a page renamed in a later "
         "phase cannot leave a dead link on the front page:\n" + "\n".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 31: the container build context (D-29, D-30, D-33, DLVR-06, DLVR-09)
+# ---------------------------------------------------------------------------
+
+DOCKERIGNORE = REPO_ROOT / ".dockerignore"
+GITIGNORE = REPO_ROOT / ".gitignore"
+
+# Path fragments that must never appear on a ``!`` re-include line. ``config``
+# and ``saneless.toml`` are where a live paperless-ngx token lives; ``tests``
+# and ``.planning`` are bulk the image has no use for, and ``.planning`` in
+# particular carries the phase audit artifacts.
+FORBIDDEN_CONTEXT_PATHS = (
+    ".env",
+    ".git",
+    ".planning",
+    "config",
+    "config.toml",
+    "saneless.toml",
+    "tests",
+)
+
+# Every entry the wheel build reads. ``uv.lock`` is deliberately absent: the
+# build succeeds without it, so requiring it here would assert a convenience
+# rather than a contract.
+REQUIRED_CONTEXT_PATHS = ("!src/", "!pyproject.toml", "!README.md", "!LICENSE")
+
+
+def _significant_lines(path: Path) -> list[tuple[int, str]]:
+    """
+    Return ``(line number, stripped line)`` for non-blank, non-comment lines.
+
+    Filtering comments out rather than matching raw text is what stops these
+    tests self-invalidating: a comment that quotes ``*.png`` to explain why the
+    glob was removed would otherwise read as the glob itself.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        One pair per meaningful line, 1-based, in file order.
+
+    """
+    return [
+        (number, line.strip())
+        for number, line in _numbered(path)
+        if line.strip() and not _is_comment(line)
+    ]
+
+
+def test_dockerignore_starts_with_a_deny_everything_line() -> None:
+    """
+    ``.dockerignore``'s first meaningful line is exactly ``*`` (D-29, D-30).
+
+    The file is an allow-list: ``*`` excludes the whole working tree and each
+    ``!`` line below re-includes one path the wheel build needs. That only
+    holds while ``*`` comes first. Move it down, or drop it, and every ``!``
+    line below it becomes decoration while the working tree -- including a real
+    ``config.toml`` with a live paperless-ngx token -- rides into a build layer
+    that is recoverable from the image.
+    """
+    lines = _significant_lines(DOCKERIGNORE)
+    name = DOCKERIGNORE.relative_to(REPO_ROOT)
+    assert lines, f"{name} has no meaningful lines at all"
+    number, first = lines[0]
+    assert first == "*", (
+        f"{name}:{number} is {first!r}, not '*'. The allow-list's first "
+        "meaningful line must exclude everything, or nothing below it is "
+        "re-including anything -- the whole working tree reaches the daemon"
+    )
+
+
+def test_dockerignore_never_reincludes_a_secret_or_test_path() -> None:
+    """
+    No ``!`` line re-includes a config, a secret, ``.planning/`` or tests (D-30).
+
+    Nothing else in CI would notice the allow-list being weakened: there is no
+    docker-build-and-inspect step, and a leak is only visible by unpacking a
+    layer. This test is the guard.
+    """
+    name = DOCKERIGNORE.relative_to(REPO_ROOT)
+    offenders = [
+        f"{name}:{number}: {line}"
+        for number, line in _significant_lines(DOCKERIGNORE)
+        if line.startswith("!")
+        and any(needle in line for needle in FORBIDDEN_CONTEXT_PATHS)
+    ]
+    assert not offenders, (
+        "a .dockerignore re-include line names a path the build context must "
+        "never carry. The image needs the package sources and the two files "
+        "the wheel metadata reads -- nothing else:\n" + "\n".join(offenders)
+    )
+
+
+def test_dockerignore_reincludes_everything_the_wheel_build_needs() -> None:
+    """
+    The allow-list re-includes every input ``uv build --wheel`` actually reads.
+
+    Two of these are live traps rather than conveniences. ``pyproject.toml``
+    declares ``readme = "README.md"`` and the PEP 639
+    ``license-files = ["LICENSE"]``; excluding either file makes the wheel
+    build **fail**, not merely produce a thinner wheel. An over-tightened
+    allow-list therefore breaks the image build rather than degrading it
+    quietly, which is the better failure -- but only if it is caught here
+    first.
+    """
+    lines = {line for _, line in _significant_lines(DOCKERIGNORE)}
+    name = DOCKERIGNORE.relative_to(REPO_ROOT)
+    missing = [entry for entry in REQUIRED_CONTEXT_PATHS if entry not in lines]
+    assert not missing, (
+        f"{name} does not re-include {missing}. README.md and LICENSE are not "
+        "optional: pyproject.toml's readme and license-files keys each make "
+        "`uv build --wheel` fail when the named file is absent from the "
+        "context"
+    )
+
+
+def test_gitignore_has_no_blanket_png_glob() -> None:
+    """
+    ``.gitignore`` no longer blanket-ignores every PNG in the tree (DLVR-09).
+
+    A repository-wide ``*.png`` silently swallows an asset someone means to
+    commit -- a documentation screenshot, a favicon -- and gives no signal at
+    all when it does. Paths are ignored by path here instead.
+    """
+    name = GITIGNORE.relative_to(REPO_ROOT)
+    offenders = [
+        f"{name}:{number}: {line}"
+        for number, line in _significant_lines(GITIGNORE)
+        if line == "*.png"
+    ]
+    assert not offenders, (
+        "the blanket PNG glob is back in .gitignore. Ignore the directory that "
+        "produces the files instead, so committing an intentional image does "
+        "not silently do nothing:\n" + "\n".join(offenders)
+    )
+
+
+def test_gitignore_ignores_the_playwright_artifact_directory() -> None:
+    """
+    ``/test-results/`` is ignored -- the one path the blanket glob covered.
+
+    ``git check-ignore -v`` was run against every candidate PNG path in the
+    repository. ``site/``, ``.planning/ui-reviews/`` and ``.playwright-mcp/``
+    each have their own entry and survive the glob's removal; pytest-playwright's
+    default artifact directory had nothing but ``*.png`` behind it. It holds
+    failure videos and trace archives as well as screenshots, so the directory
+    is the correct replacement rather than a narrower glob.
+    """
+    lines = {line for _, line in _significant_lines(GITIGNORE)}
+    name = GITIGNORE.relative_to(REPO_ROOT)
+    assert "/test-results/" in lines, (
+        f"{name} does not ignore /test-results/. Removing the blanket *.png "
+        "glob leaves pytest-playwright's failure screenshots, videos and trace "
+        "archives untracked-but-visible in every `git status` after a failed "
+        "browser test"
+    )
