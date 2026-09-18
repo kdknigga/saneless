@@ -49,7 +49,13 @@ from saneless.checks import (
     check_name,
     run_checks,
 )
-from saneless.cli import cli
+from saneless.cli import (
+    _MARKER_WIDTH,
+    _SKIPPED_MARKER,
+    _row_marker,
+    _state_marker,
+    cli,
+)
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -243,6 +249,32 @@ def _all_ok() -> tuple[CheckResult, ...]:
 
     """
     return tuple(_row(key, CheckState.OK) for key in CheckKey)
+
+
+def _one_skipped_scanner() -> tuple[CheckResult, ...]:
+    """
+    Build five rows of which the Scanner one was never probed.
+
+    ``run_checks`` really can produce this -- ``_scanner_skipped`` and
+    ``_scanner_busy`` both do -- but no ``doctor`` invocation reaches it today,
+    because the command builds its context with ``skip_scanner`` defaulted and
+    passes no scanner gate.  The stub is therefore how this row gets in front
+    of the printer at all, which is exactly the half-wiring R3-WR-03 found:
+    until something rendered it, nothing noticed it rendered wrong.
+
+    Returns:
+        Five rows in ``CheckKey`` order, the Scanner one skipped.
+
+    """
+    return tuple(
+        CheckResult(
+            key=key,
+            state=CheckState.OK,
+            message=f"{check_name(key)} message.",
+            skipped=key is CheckKey.SCANNER,
+        )
+        for key in CheckKey
+    )
 
 
 def _stub_registry(
@@ -468,6 +500,103 @@ class TestDoctorOutput:
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
         assert all(line.startswith("[") for line in _lines(result.output))
+
+
+class TestASkippedRowIsNotAPassingRow:
+    """
+    R3-WR-03, the CLI half: ``[ OK ]`` is the token a reader scans for as "fine".
+
+    ``_scanner_skipped`` and ``_scanner_busy`` return ``CheckState.OK`` with
+    ``skipped`` set, so a marker derived from the state alone prints
+    ``[ OK ] Scanner  Not checked while a scan is running.`` -- a captured
+    transcript that says a probe passed when none was taken.  The marker is
+    wired even though no current ``doctor`` invocation can produce the row,
+    because D-02's claim is that one registry feeds both surfaces and a surface
+    that would mis-render a row the registry can build is a latent divergence.
+    """
+
+    @pytest.mark.parametrize("state", list(CheckState))
+    def test_a_probed_row_still_gets_its_state_marker(self, state: CheckState) -> None:
+        """
+        With the flag clear, ``_row_marker`` is exactly ``_state_marker``.
+
+        Args:
+            state: The state under test.
+
+        """
+        result = CheckResult(key=CheckKey.SCANNER, state=state, message="Probed.")
+        assert _row_marker(result) == _state_marker(state)
+
+    @pytest.mark.parametrize("state", list(CheckState))
+    def test_a_skipped_row_gets_the_skipped_marker(self, state: CheckState) -> None:
+        """
+        With the flag set, the state is not what the row prints.
+
+        Args:
+            state: The state under test.
+
+        """
+        result = CheckResult(
+            key=CheckKey.SCANNER, state=state, message="Not looked at.", skipped=True
+        )
+        assert _row_marker(result) == _SKIPPED_MARKER
+        assert _row_marker(result) != _state_marker(CheckState.OK)
+
+    def test_the_skipped_marker_is_as_wide_as_the_state_markers(self) -> None:
+        """
+        A wider token would push one row's name column out of line.
+
+        ``_MARKER_WIDTH`` is what ``_NEXT_STEP_INDENT`` is derived from, so this
+        is the assertion that keeps the derivation honest rather than trusting
+        two string literals to stay the same length by coincidence.
+        """
+        assert len(_SKIPPED_MARKER) <= _MARKER_WIDTH
+        assert {len(_state_marker(state)) for state in CheckState} == {
+            len(_SKIPPED_MARKER)
+        }
+
+    def test_the_printed_table_marks_the_skipped_row(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The row the registry skipped prints as skipped, and the rest do not."""
+        runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
+        _stub_registry(monkeypatch, _one_skipped_scanner())
+        result = runner.invoke(cli, ["doctor"])
+        lines = _lines(result.output)
+        assert len(lines) == len(CheckKey)
+        assert lines[0].startswith(f"{_SKIPPED_MARKER} ")
+        assert not lines[0].startswith(_state_marker(CheckState.OK))
+        assert all(
+            line.startswith(f"{_state_marker(CheckState.OK)} ") for line in lines[1:]
+        )
+
+    def test_a_skipped_row_does_not_fail_the_gate(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        D-01: a probe nobody took is not a red appliance.
+
+        The state stays ``OK`` for exactly this reason, so wiring the marker
+        must not have moved the exit-code rule -- a scripted health gate that
+        went red for the duration of every scan is what the flag exists to
+        avoid.
+        """
+        runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
+        _stub_registry(monkeypatch, _one_skipped_scanner())
+        assert runner.invoke(cli, ["doctor"]).exit_code == 0
+
+    def test_the_name_column_still_lines_up(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Every message starts at the same column, skipped row included."""
+        runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
+        _stub_registry(monkeypatch, _one_skipped_scanner())
+        result = runner.invoke(cli, ["doctor"])
+        starts = {
+            line.index(f"{check_name(key)} message.")
+            for key, line in zip(CheckKey, _lines(result.output), strict=True)
+        }
+        assert len(starts) == 1
 
 
 class TestDoctorUsesTheRealRegistry:
