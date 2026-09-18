@@ -157,7 +157,12 @@ def web_scanner() -> StubScannerBackend:
 def app(test_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
     """Create the FastAPI app with the test-only error routes added."""
     application = create_app(test_settings, web_scanner)
-    application.add_api_route("/_test/reject/{name}", _raise_rejection)
+    # Served on POST as well as GET so the retarget exemption, which is keyed
+    # on the method, can be pinned for every rejection in both directions
+    # (R4-WR-01).
+    application.add_api_route(
+        "/_test/reject/{name}", _raise_rejection, methods=["GET", "POST"]
+    )
     application.add_api_route(
         "/_test/reject-history/{name}", _raise_rejection_with_history
     )
@@ -375,6 +380,15 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
     because it is the one element that polls, and an armed htmx poll ends only
     when the element leaves the DOM.  These cases pin the exemption to that one
     id and pin every other target to the unchanged contract.
+
+    The id is not the whole key.  ``Check again`` in the same partial is
+    ``hx-post="/api/checks/refresh" hx-target="#checks-body"``, so its click
+    carries the very same header, and an exemption keyed on the header alone
+    let a failing click write the error body over the strip -- five rows and
+    the only button that could bring them back, gone for the life of the tab
+    (R4-WR-01).  The exemption therefore also requires a GET, which is what
+    the strip's poll and its terminal-state reload send and the button does
+    not, and the cases below pin the POST side as firmly as the GET side.
     """
 
     @pytest.mark.parametrize("rejection", list(RequestRejection))
@@ -441,6 +455,56 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
         """Renaming one of the two fails here rather than un-fixing the defect."""
         strip = client.get("/api/checks").text
         assert f'id="{errors.CHECKS_POLL_TARGET_ID}"' in strip
+
+    @pytest.mark.parametrize("rejection", list(RequestRejection))
+    def test_a_post_aimed_at_the_strip_is_still_retargeted(
+        self, client: TestClient, rejection: RequestRejection
+    ) -> None:
+        """
+        The same target header on a POST gets the ordinary contract (R4-WR-01).
+
+        The strip's poll is a GET.  A POST carrying the strip's ``HX-Target``
+        is the ``Check again`` button, and its failure belongs in the message
+        slot: retargeted there, the strip and the button are left on the page.
+        """
+        response = client.post(
+            f"/_test/reject/{rejection.value}", headers=_CHECKS_TARGET_HEADERS
+        )
+        _assert_htmx_error(response, rejection, rejection_status_code(rejection))
+
+    def test_a_refused_check_again_click_lands_in_the_slot(
+        self, client: TestClient
+    ) -> None:
+        """
+        The real button route, refused by real middleware, is retargeted.
+
+        ``CrossOriginGuard`` answers a cross-site POST before the route runs,
+        which makes it the one failure of ``POST /api/checks/refresh`` that
+        needs no patching to reach ``render_error``.  Before R4-WR-01 this
+        response carried no retarget and the button's own ``hx-swap=outerHTML``
+        wrote it over the strip.
+        """
+        rejection = RequestRejection.CROSS_SITE
+        response = client.post(
+            "/api/checks/refresh",
+            headers={**_CHECKS_TARGET_HEADERS, "Sec-Fetch-Site": "cross-site"},
+        )
+        _assert_htmx_error(response, rejection, rejection_status_code(rejection))
+
+    def test_a_get_aimed_at_the_strip_is_the_only_exempt_shape(
+        self, client: TestClient
+    ) -> None:
+        """Both halves of the key are needed: same rejection, four requests."""
+        rejection = RequestRejection.QUEUE_FULL
+        path = f"/_test/reject/{rejection.value}"
+        exempt = client.get(path, headers=_CHECKS_TARGET_HEADERS)
+        assert "hx-retarget" not in exempt.headers
+        for response in (
+            client.post(path, headers=_CHECKS_TARGET_HEADERS),
+            client.get(path, headers=_OTHER_TARGET_HEADERS),
+            client.post(path, headers=_OTHER_TARGET_HEADERS),
+        ):
+            assert response.headers["HX-Retarget"] == "#status-message"
 
 
 # The disclosure, captured whole. It nests no <details>, so a non-greedy body is

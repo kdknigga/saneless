@@ -1143,7 +1143,71 @@ class TestTheStripSurvivesItsOwnFailure:
     on the page, and no trigger.  The exception goes to the log and nowhere
     else -- this body is rendered on a page the whole LAN can read (ASVS V7,
     Phase 26 D-10, T-30-32-03).
+
+    ``POST /api/checks/refresh`` renders the same strip through the same
+    ``_checks_context`` and had no guard at all (R4-WR-01), so a raise there
+    was a 500 aimed at ``#checks-body`` -- and with the retarget exemption
+    keyed on that target alone, the button's own ``hx-swap="outerHTML"`` wrote
+    the error over the strip.  The refresh route now guards its render the
+    same way, and only its render: the probe is the click's action, and an
+    action that fails is reported as a failure rather than hidden behind a
+    body that says nothing has been checked.
     """
+
+    def test_a_failure_inside_the_refresh_render_is_a_cold_strip_at_200(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The button's render falls back to the body its sibling does (R4-WR-01)."""
+        _raise_inside_the_checks_route(client, monkeypatch, "_checks_context")
+
+        response = client.post("/api/checks/refresh")
+        assert response.status_code == 200
+        rows = _CHECK_ROW.findall(response.text)
+        assert len(rows) == len(CheckKey)
+        assert all(CHECKING_MESSAGE in row for row in rows)
+        meta = _CHECK_META.search(response.text)
+        assert meta is not None, response.text
+        assert meta.group("text").strip() == checks_module.POLL_GAVE_UP_LINE
+        assert 'hx-post="/api/checks/refresh"' in response.text
+        assert "Check again" in response.text
+        assert "hx-trigger" not in _body_attrs(response.text)
+        for forbidden in (_CHECKS_BOOM_MARKER, "Traceback", "RuntimeError", ".py"):
+            assert forbidden not in response.text, (forbidden, response.text)
+
+    def test_the_refresh_failure_is_logged_with_its_traceback(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The refresh guard swallows nothing either: the log keeps the detail."""
+        _raise_inside_the_checks_route(client, monkeypatch, "_checks_context")
+
+        with caplog.at_level(logging.ERROR, logger=routes_module.__name__):
+            assert client.post("/api/checks/refresh").status_code == 200
+        assert any(
+            record.exc_info is not None and _CHECKS_BOOM_MARKER in str(record.exc_info)
+            for record in caplog.records
+        )
+
+    def test_a_probe_that_raises_is_a_failed_click_not_a_cold_strip(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The guard covers the render and nothing before it.
+
+        A cold strip says the checks have not run; a probe that blew up is not
+        that, it is a click that failed, and ``render_error`` reports it in the
+        message slot with the strip left as it was.  The test client re-raises
+        what the catch-all handler saw, which is the assertion here.
+        """
+
+        def boom(*_args: object, **_kwargs: object) -> bool:
+            raise RuntimeError(_CHECKS_BOOM_MARKER)
+
+        monkeypatch.setattr(_app(client).state.refresher, "probe_now", boom)
+        with pytest.raises(RuntimeError, match=_CHECKS_BOOM_MARKER):
+            client.post("/api/checks/refresh")
 
     @pytest.mark.parametrize("target", ["_checks_context", "note_watcher"])
     def test_a_failure_inside_the_render_is_a_cold_strip_at_200(

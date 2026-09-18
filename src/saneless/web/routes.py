@@ -1493,6 +1493,20 @@ def refresh_checks(request: Request) -> Response:
     render covers both outcomes, and there is no second response and no
     "poll once" flag for a later reader to keep in step with the template.
 
+    That render is guarded the way ``get_checks``'s is, and only the render.
+    ``_checks_context`` raising here used to be a 500, and because the button
+    aims at ``#checks-body`` that 500 arrived carrying the strip's own
+    ``HX-Target`` -- which, until R4-WR-01 narrowed the exemption to a GET,
+    meant the error body was written over the strip, taking the five rows and
+    the only button that could bring them back.  Now a failure inside the
+    strip's rendering ends as ``_checks_fallback_context`` at 200 on this route
+    too, so the strip and the button stay on the page.  Everything before the
+    render -- the watcher stamp, the claim, the probe -- is the click's action
+    rather than the strip's drawing, and stays outside the guard on purpose: a
+    probe that raises is a failed click, and a failed click is reported like
+    every other one, as an error in the message slot with the strip left as it
+    was.
+
     During a scan it re-runs only the checks that do not touch the scanner, and
     that decision comes from the worker's own record of a job in flight rather
     than from a failed attempt on a lock.  An explicit click does not get to
@@ -1530,10 +1544,15 @@ def refresh_checks(request: Request) -> Response:
     claim = state.checks.claim_manual_refresh()
     if claim is not None and not state.refresher.probe_now():
         state.checks.release_manual_claim(claim)
+    try:
+        context = _checks_context(state)
+    except Exception:
+        logger.exception("Failed to render the status strip")
+        context = _checks_fallback_context()
     return state.templates.TemplateResponse(
         request,
         "partials/checks.html",
-        _checks_context(state),
+        context,
     )
 
 
