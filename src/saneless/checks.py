@@ -33,7 +33,7 @@ import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from string import ascii_letters, digits
+from string import ascii_letters, digits, hexdigits
 from time import monotonic
 from typing import TYPE_CHECKING, Final, assert_never
 
@@ -108,6 +108,18 @@ SANED_PORT: Final = 6566
 # validator, it is the smallest set that tells a name apart from the halves an
 # IPv6 literal falls into when it is split on ``:``.
 _HOST_NAME_CHARACTERS: Final = frozenset(ascii_letters + digits + "-.")
+
+# The only digits this module will read as a number.  ``str.isdigit()`` is not
+# that set: it is True for Unicode category ``No`` characters ``int()`` refuses
+# outright (U+00B2 SUPERSCRIPT TWO, U+2460 CIRCLED DIGIT ONE) and True for
+# non-ASCII decimals ``int()`` accepts but libsane's C-side parsing would read
+# as a name (U+0661.. Arabic-Indic).  ASCII decimal is the only reading both
+# ends agree on (R3-CR-01).
+_ASCII_DIGITS: Final = frozenset(digits)
+
+# The digits an ASCII ``0x``/``0X`` literal may be made of.  glibc reads such a
+# segment as a number, so a name may not look like one (R3-WR-01).
+_ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 
 # The cold-start row, before any check has run (D-06).  It lives here rather
 # than in the template for the same reason the state glyphs do: templates own
@@ -500,6 +512,91 @@ def _saned_host_setting(settings: Settings) -> str:
     return os.environ.get("SANE_NET_HOSTS") or settings.scanner.host
 
 
+def _part_is_a_number_to_glibc(part: str) -> bool:
+    """
+    Say whether one dot-separated part of a segment is a number to glibc.
+
+    glibc's ``inet_aton``-style parsing reads each dot-separated part in its
+    own base: a plain run of decimal digits, an ASCII ``0x``/``0X`` hex
+    literal, or -- because a leading zero means octal -- ``01`` and ``0755``,
+    which are decimal runs as far as *this* function is concerned and are
+    caught by the caller's dotted-quad test instead.  Anything holding a
+    character outside those forms is a name, because no numeric reading of it
+    exists.
+
+    Args:
+        part: One dot-separated part of a colon-separated segment.
+
+    Returns:
+        True when the part is empty of anything but a number glibc could
+        read; False when it is empty, non-ASCII, or holds a letter outside a
+        leading hex prefix.
+
+    """
+    if not part:
+        return False
+    # Stated once, for both arms below: a non-ASCII digit is never a number
+    # here.  Both character sets happen to be ASCII-only already, so this is
+    # belt and braces -- but the rule is the point of the function, and a rule
+    # that holds only because of how a constant was spelled is one edit from
+    # not holding.
+    if not part.isascii():
+        return False
+    if set(part) <= _ASCII_DIGITS:
+        return True
+    if part[:2] not in {"0x", "0X"}:
+        return False
+    after_prefix = part[2:]
+    return bool(after_prefix) and set(after_prefix) <= _ASCII_HEX_DIGITS
+
+
+def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
+    """
+    Say whether glibc would resolve this segment as an address nobody typed.
+
+    ``_looks_like_a_host_name`` used to reject a segment only when
+    ``segment.isdigit()``, and the hazard it was written for is glibc's
+    non-dotted-quad numeric parsing, which accepts far more than all-digit
+    strings.  Measured by round 3 on this machine: ``0.0`` and ``0x0.0``
+    resolve to ``0.0.0.0``, ``0x7f.1`` and ``127.1`` resolve to ``127.0.0.1``,
+    and ``6566.0`` costs one unbounded lookup before NXDOMAIN.  All of them
+    passed the old guard because they contain a ``.`` (R3-WR-01).
+
+    On Linux a ``connect()`` to ``0.0.0.0`` reaches loopback, so one of those
+    in the dial list lets any unrelated local process listening on 6566 make
+    ``any(...)`` true, suppress ``_scanner_host_unanswered`` and let the check
+    fall through to ``get_devices()`` -- reinstating the ~127 s uninterruptible
+    hang the pre-probe exists to avoid, on an appliance whose configured host
+    is in fact dead.
+
+    The rule is in two steps.  If any dot-separated part is not a number glibc
+    could read, the segment holds a letter outside a hex prefix and is a name,
+    so the answer is False -- which is what keeps ``box-x1.lan`` dialable.
+    Otherwise every part is a number, and the stdlib decides: a segment that
+    parses as a legal dotted quad is the address the operator configured and
+    the answer is False, while one that does not (``0.0``, ``127.1``,
+    ``0x0.0``, ``6566.0``, ``01.02.03.04``, ``0xdeadbeef``) is numeric in some
+    form nobody typed as an address, and the answer is True.
+
+    Args:
+        segment: One stripped segment of the ``scanner.host`` setting.
+
+    Returns:
+        True when glibc would read the segment as a number and it is not a
+        legal dotted-quad IPv4 literal.
+
+    """
+    if not all(_part_is_a_number_to_glibc(part) for part in segment.split(".")):
+        return False
+    try:
+        ipaddress.IPv4Address(segment)
+    except ValueError:
+        # Numeric, but not a legal literal: one of the shorthands glibc
+        # invents an address from.
+        return True
+    return False
+
+
 def _looks_like_a_host_name(segment: str) -> bool:
     """
     Say whether one colon-separated segment could be a host name at all.
@@ -517,30 +614,43 @@ def _looks_like_a_host_name(segment: str) -> bool:
     "yes" is what WR-01 was: three junk dials and, through the pre-probe's
     short circuit, a wrong verdict.
 
-    An all-digit segment is rejected for that reason and not for tidiness.  No
-    legal host name is entirely digits, and every all-digit segment arriving
-    here is either a mis-parsed port or half an IPv6 literal -- but glibc
-    *accepts* such strings, reading them as the single-integer IPv4 form.
-    Measured on this machine, ``getaddrinfo('2001', 6566)`` answers
-    ``0.0.7.209``, ``getaddrinfo('99999', 6566)`` answers ``0.1.134.159`` and
-    ``getaddrinfo('0', 6566)`` answers ``0.0.0.0``.  The last one is the worst
-    of the three: on Linux a ``connect()`` to ``0.0.0.0`` reaches loopback, so
-    a ``0`` in the dial list lets the probe report the configured scanner host
-    "reachable" off any unrelated local process listening on 6566 (R2-WR-01,
-    T-30-28-01).
+    A segment glibc would read as a number is rejected for that reason and not
+    for tidiness, and the rule is wider than "all digits" because glibc's
+    parsing is.  Measured on this machine, ``getaddrinfo('2001', 6566)``
+    answers ``0.0.7.209``, ``getaddrinfo('99999', 6566)`` answers
+    ``0.1.134.159``, ``getaddrinfo('0', 6566)`` answers ``0.0.0.0``, and --
+    the five forms an all-digit test misses because they carry a ``.`` --
+    ``0.0`` and ``0x0.0`` answer ``0.0.0.0``, ``0x7f.1`` and ``127.1`` answer
+    ``127.0.0.1``, and ``6566.0`` spends one unbounded lookup before NXDOMAIN
+    (R3-WR-01).  ``0.0.0.0`` is the worst of them: on Linux a ``connect()`` to
+    it reaches loopback, so such a segment in the dial list lets the probe
+    report the configured scanner host "reachable" off any unrelated local
+    process listening on 6566 (R2-WR-01, T-30-28-01, T-30-31-02).
+    ``_segment_is_a_numeric_address_shorthand`` is what answers the wide
+    question; the ``isdigit()`` line below is kept because it only ever
+    rejects and is cheaper, and the wider rule subsumes rather than replaces
+    it.
+
+    A legal dotted-quad IPv4 literal is accepted, deliberately and by name.
+    ``192.0.2.10`` is not a number glibc invented an address from -- it is the
+    address the operator configured -- and dialling it is precisely the
+    pre-probe's job on a static-IP scanner, worth about 127 s of
+    uninterruptible ``get_devices()`` when the appliance is off.
 
     Args:
         segment: One stripped segment of the ``scanner.host`` setting.
 
     Returns:
-        True when the segment is non-empty, is not entirely digits, is made
-        only of ASCII letters, digits, hyphens and dots, and neither starts
-        nor ends with a hyphen or a dot.
+        True when the segment is non-empty, is not a number glibc would
+        resolve as an address, is made only of ASCII letters, digits, hyphens
+        and dots, and neither starts nor ends with a hyphen or a dot.
 
     """
     if not segment:
         return False
     if segment.isdigit():
+        return False
+    if _segment_is_a_numeric_address_shorthand(segment):
         return False
     if segment[0] in "-." or segment[-1] in "-.":
         return False
@@ -672,9 +782,22 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
         host, maybe_port = present
         # The host half is checked too, so ``0:6566`` cannot slip an all-digit
         # host through the one branch that does not reach the filter below.
+        #
+        # The port half is tested against ASCII decimal rather than with
+        # ``str.isdigit()``, which is True for Unicode category ``No``
+        # characters ``int()`` refuses -- U+00B2 SUPERSCRIPT TWO, U+2460
+        # CIRCLED DIGIT ONE -- and True for non-ASCII decimals ``int()``
+        # accepts but libsane's C-side parsing would read as a name.  The
+        # first class raised a ``ValueError`` out of this function and turned
+        # the Scanner row into ``run_checks``' generic failure row; the second
+        # derived a port number from a string libsane never would (R3-CR-01).
+        # ASCII decimal is the only reading both ends agree on.  The emptiness
+        # test is not redundant: ``set("") <= _ASCII_DIGITS`` is True where
+        # ``"".isdigit()`` was False, and ``int("")`` raises.
         if (
             _looks_like_a_host_name(host)
-            and maybe_port.isdigit()
+            and maybe_port
+            and set(maybe_port) <= _ASCII_DIGITS
             and 0 < int(maybe_port) <= 65535
         ):
             return ((host, int(maybe_port)),)
