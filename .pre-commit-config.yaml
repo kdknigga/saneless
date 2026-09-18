@@ -120,6 +120,18 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # The workflow audit, at commit stage with the other cheap checks: it
+      # reads five files, finishes in well under a second, and never rewrites
+      # anything, so it cannot abort an operation by modifying the tree. Any
+      # finding exits non-zero, which is the whole contract -- findings get
+      # fixed, not silenced with an inline audit-ignore comment.
+      - id: zizmor
+        name: zizmor (workflow audit)
+        entry: uv run zizmor .
+        language: system
+        pass_filenames: false
+        always_run: true
+
       - id: ty-checker-full
         name: ty type checker (full)
         entry: uv run ty check
@@ -152,6 +164,21 @@ repos:
       - id: ruff-format-check
         name: ruff format --check
         entry: uv run ruff format --check .
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-merge-commit, pre-push]
+
+      # The doc-truth harness -- the naming guard and the deployment claims it
+      # asserts -- gets its own gate here, at merge and push. Until this hook
+      # existed there was no pytest hook anywhere in this file, so the guard's
+      # only enforcement points were CI and whatever a developer chose to run
+      # locally; this adds the third. Scoped to the one file the guard lives in
+      # rather than the whole suite: about two seconds instead of twenty-seven,
+      # and the rest of the suite is already CI's job.
+      - id: doc-truth-guard
+        name: doc-truth harness (naming guard, deployment claims)
+        entry: uv run pytest tests/test_deployment_config.py -q
         language: system
         pass_filenames: false
         always_run: true
