@@ -455,7 +455,7 @@ def counting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Count
             url=url,
             token=token,
             consume_dir=consume_dir,
-            _transport=httpx.MockTransport(counter),
+            transport=httpx.MockTransport(counter),
         )
 
     monkeypatch.setattr(app_module, "PaperlessClient", build_client)

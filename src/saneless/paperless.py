@@ -444,7 +444,10 @@ class PaperlessClient:
         consume_dir: Optional fallback directory for PDF upload failures;
             None disables the fallback copy.
         max_retries: Maximum number of upload attempts, including the first.
-        _transport: Optional httpx transport for testing.
+        transport: The httpx transport requests go through, handed straight
+            to ``httpx.Client(transport=...)``. None uses httpx's default
+            network transport. This is the injection seam for tests (an
+            ``httpx.MockTransport``) and for custom transports.
 
     Raises:
         PaperlessError: If ``url`` is not a valid URL (``httpx.InvalidURL``).
@@ -457,7 +460,8 @@ class PaperlessClient:
         token: str,
         consume_dir: Path | None = None,
         max_retries: int = 3,
-        _transport: httpx.BaseTransport | None = None,
+        *,
+        transport: httpx.BaseTransport | None = None,
     ) -> None:
         """Initialize the paperless-ngx API client."""
         base_url = url.rstrip("/")
@@ -466,15 +470,7 @@ class PaperlessClient:
         # proxy) must not put that password in job.error, on the terminal or
         # in the log (WR-08, D-08).
         self._display_url = _without_userinfo(base_url)
-        client_kwargs: dict = {
-            "headers": {
-                "Authorization": f"Token {token}",
-                "Accept": _API_VERSION_ACCEPT,
-            },
-            "timeout": 30.0,
-        }
-        if _transport is not None:
-            client_kwargs["transport"] = _transport
+        auth: httpx.BasicAuth | None = None
         try:
             parsed = httpx.URL(base_url)
             if parsed.userinfo:
@@ -482,12 +478,18 @@ class PaperlessClient:
                 # from the URL anyway, so the request is unchanged, while the
                 # base URL itself -- which httpx names in its own request log
                 # line and exception text -- no longer carries them.
-                client_kwargs["auth"] = httpx.BasicAuth(
-                    parsed.username, parsed.password
-                )
+                auth = httpx.BasicAuth(parsed.username, parsed.password)
                 base_url = str(parsed.copy_with(userinfo=b"")).rstrip("/")
-            client_kwargs["base_url"] = base_url
-            self._client = httpx.Client(**client_kwargs)
+            self._client = httpx.Client(
+                base_url=base_url,
+                auth=auth,
+                headers={
+                    "Authorization": f"Token {token}",
+                    "Accept": _API_VERSION_ACCEPT,
+                },
+                timeout=30.0,
+                transport=transport,
+            )
         except httpx.InvalidURL as exc:
             msg = f"Paperless URL {self._display_url} is not valid: {describe(exc)}"
             raise PaperlessError(msg) from exc
@@ -795,7 +797,7 @@ class PaperlessClient:
             staged.unlink(missing_ok=True)
             raise
 
-    def poll_task(self, task_id: str, timeout: int | float = 300) -> dict[str, object]:
+    def poll_task(self, task_id: str, *, timeout: float) -> dict[str, object]:
         """
         Poll the task endpoint with exponential backoff until the task succeeds.
 
@@ -826,7 +828,9 @@ class PaperlessClient:
         Args:
             task_id: Task UUID returned from upload.
             timeout: Maximum seconds to wait, measured on a monotonic clock
-                that includes request time as well as sleep time.
+                that includes request time as well as sleep time. There is
+                no default: callers pass ``output.paperless_task_timeout``,
+                so the configured value is the only source.
 
         Returns:
             The task dict, only when the task reached SUCCESS.

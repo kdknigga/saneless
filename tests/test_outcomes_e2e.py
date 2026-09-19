@@ -17,8 +17,8 @@ Exactly two things are stubbed, and nothing else:
   the real ``SpooledPageSink`` that writes them and the real records that come
   back, so the pages this module's PDFs embed are real files;
 * **the HTTP layer** -- an ``httpx.MockTransport`` passed through
-  ``PaperlessClient(..., _transport=...)``, the seam ``tests/test_paperless.py``
-  already uses 24 times.  It sits *below* ``httpx.Client``, so the real
+  ``PaperlessClient(..., transport=...)``, the seam ``tests/test_paperless.py``
+  uses throughout.  It sits *below* ``httpx.Client``, so the real
   ``upload_document`` and ``poll_task`` bodies execute, retries and all.
 
 Everything else is production code: real PDF assembly, real empty-page
@@ -607,7 +607,7 @@ def _build_settings(tmp_path: Path, case: _Case) -> Settings:
         paperless=PaperlessConfig(
             url="http://paperless.invalid:8000",
             token="e2e-token",
-            consume_dir=str(tmp_path / "consume") if case.with_consume_dir else "",
+            consume_dir=tmp_path / "consume" if case.with_consume_dir else None,
         ),
         output=OutputConfig(
             tmp_dir=str(tmp_path / "scratch"),
@@ -728,7 +728,7 @@ class TestFiveOutcomesEndToEnd:
             # is identical at any retry count -- exhausting them is what
             # triggers it.
             max_retries=1,
-            _transport=httpx.MockTransport(case.handler_factory()),
+            transport=httpx.MockTransport(case.handler_factory()),
         )
         worker = ScanWorker(
             _build_scanner(case.scan_passes),
@@ -791,7 +791,7 @@ class TestAPartialScanSurvivesTheWorker:
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
             max_retries=1,
-            _transport=httpx.MockTransport(_accepting_handler()),
+            transport=httpx.MockTransport(_accepting_handler()),
         )
         worker = ScanWorker(
             _jamming_scanner(3, _SCANNER_FAILURE), paperless, settings, store
@@ -857,7 +857,7 @@ class TestFlipTimeoutReleasesTheWorker:
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
             max_retries=1,
-            _transport=httpx.MockTransport(_accepting_handler()),
+            transport=httpx.MockTransport(_accepting_handler()),
         )
         # Pass A of the timed-out job, then the single pass of the simplex job
         # that follows it.  No third batch: the timed-out job must never reach

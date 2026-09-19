@@ -1496,7 +1496,7 @@ def _paperless(
 
     """
     return PaperlessClient(
-        url=url, token=_REAL_TOKEN, _transport=httpx.MockTransport(counter)
+        url=url, token=_REAL_TOKEN, transport=httpx.MockTransport(counter)
     )
 
 

@@ -2044,7 +2044,7 @@ def _count_upstream(app: FastAPI) -> _RecordingTransport:
     app.state.paperless = PaperlessClient(
         url="http://paperless.invalid:8000",
         token="a-real-looking-token",
-        _transport=httpx.MockTransport(handler),
+        transport=httpx.MockTransport(handler),
     )
     return handler
 
@@ -2699,7 +2699,7 @@ def _counted_app(
     app.state.paperless = PaperlessClient(
         url="http://localhost:8000",
         token=credential,
-        _transport=httpx.MockTransport(counter),
+        transport=httpx.MockTransport(counter),
     )
     return app, counter
 

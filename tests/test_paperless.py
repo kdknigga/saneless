@@ -100,7 +100,7 @@ def _poll_client(
     return PaperlessClient(
         url="http://paperless:8000",
         token=_MOCK_AUTH,
-        _transport=_make_transport(handler),
+        transport=_make_transport(handler),
     )
 
 
@@ -215,7 +215,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         result = client.upload_document(sample_pdf, title="Test Doc")
         assert result.delivered_to_api is True
@@ -236,7 +236,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         client.upload_document(sample_pdf, title="Test", tags=[1, 2, 3])
         # Tags should appear as repeated form fields
@@ -257,7 +257,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         client.upload_document(sample_pdf, title="Test", correspondent=5)
         assert "correspondent" in captured_data["content"]
@@ -277,7 +277,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         client.upload_document(sample_pdf, title="Test", created="2026-03-20")
         content = captured_data["content"]
@@ -299,7 +299,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         client.upload_document(sample_pdf, title="Test Doc", created="2026-03-22")
         body = captured_data["body"].decode("utf-8", errors="replace")
@@ -328,7 +328,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Retry Test")
@@ -349,7 +349,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         with pytest.raises(PaperlessError, match="rejected"):
             client.upload_document(sample_pdf, title="Bad")
@@ -367,7 +367,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
             max_retries=3,
         )
         with pytest.raises(PaperlessError, match="attempts"):
@@ -390,7 +390,7 @@ class TestUploadDocument:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            _transport=transport,
+            transport=transport,
             max_retries=3,
         )
         result = client.upload_document(sample_pdf, title="Fallback")
@@ -467,7 +467,7 @@ def _upload_client(
         url="http://paperless:8000",
         token=_MOCK_AUTH,
         consume_dir=consume_dir,
-        _transport=_make_transport(handler),
+        transport=_make_transport(handler),
         max_retries=3,
     )
 
@@ -520,7 +520,7 @@ class TestUrlCredentialsNeverShown:
         client = PaperlessClient(
             url=f"https://scanner:{_URL_SECRET}@paperless.example",
             token=_MOCK_AUTH,
-            _transport=_make_transport(handler),
+            transport=_make_transport(handler),
             max_retries=3,
         )
         try:
@@ -545,7 +545,7 @@ class TestUrlCredentialsNeverShown:
         client = PaperlessClient(
             url=f"https://scanner:{_URL_SECRET}@paperless.example/sub/",
             token=_MOCK_AUTH,
-            _transport=_make_transport(handler),
+            transport=_make_transport(handler),
         )
         try:
             client.get_tags()
@@ -571,7 +571,7 @@ class TestUrlCredentialsNeverShown:
         client = PaperlessClient(
             url=f"https://scanner:{_URL_SECRET}@paperless.example",
             token=_MOCK_AUTH,
-            _transport=_make_transport(_CountingHandler(respond)),
+            transport=_make_transport(_CountingHandler(respond)),
         )
         try:
             client.upload_document(sample_pdf, title="Logged")
@@ -1707,7 +1707,7 @@ def _metadata_client(handler: _CountingHandler) -> PaperlessClient:
     return PaperlessClient(
         url="http://paperless.test:8000",
         token=_MOCK_AUTH,
-        _transport=_make_transport(handler),
+        transport=_make_transport(handler),
     )
 
 
@@ -1845,7 +1845,7 @@ class TestConnectionTest:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         assert client.test_connection() is ConnectionStatus.CONNECTED
         client.close()
@@ -1902,7 +1902,7 @@ class TestConnectionTimeout:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=_make_transport(handler),
+            transport=_make_transport(handler),
         )
         try:
             if timeout is None:
@@ -1986,7 +1986,7 @@ class TestConsumeDir:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            _transport=transport,
+            transport=transport,
             max_retries=1,
         )
         result = client.upload_document(sample_pdf, title="Auto-create test")
@@ -2014,7 +2014,7 @@ class TestConsumeDir:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            _transport=transport,
+            transport=transport,
             max_retries=1,
         )
         result = client.upload_document(sample_pdf, title="Existing dir test")
@@ -2041,7 +2041,7 @@ class TestConsumeDir:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            _transport=_make_transport(_always_refused),
+            transport=_make_transport(_always_refused),
             max_retries=1,
         )
         result = client.upload_document(sample_pdf, title="Atomic test")
@@ -2077,7 +2077,7 @@ class TestConsumeDir:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            _transport=_make_transport(_always_refused),
+            transport=_make_transport(_always_refused),
             max_retries=1,
         )
         try:
@@ -2113,7 +2113,7 @@ class TestConsumeDir:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            _transport=_make_transport(_always_refused),
+            transport=_make_transport(_always_refused),
             max_retries=1,
         )
         try:
@@ -2143,7 +2143,7 @@ class TestConsumeDir:
             url="http://paperless:8000",
             token=_MOCK_AUTH,
             consume_dir=consume_dir,
-            _transport=transport,
+            transport=transport,
             max_retries=1,
         )
         with caplog.at_level(logging.WARNING, logger="saneless.paperless"):
@@ -2168,7 +2168,7 @@ class TestAuthHeader:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=auth,
-            _transport=transport,
+            transport=transport,
         )
         client.test_connection()
         assert captured_headers["auth"] == "Token my-secret-token"
@@ -2191,7 +2191,7 @@ class TestAuthHeader:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            _transport=transport,
+            transport=transport,
         )
         client.test_connection()
         assert captured_headers["accept"] == "application/json; version=9"
@@ -2266,7 +2266,7 @@ class TestUploadResultContract:
         client = PaperlessClient(
             "http://localhost:8000",
             "token",
-            _transport=transport,
+            transport=transport,
         )
         try:
             with pytest.raises(PaperlessError, match="no task ID"):
