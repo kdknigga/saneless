@@ -1205,9 +1205,12 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
 
     """
     urls = [_socket_url(sock) for sock in sockets]
+    # Printed, not logged: serve's log stream is stderr as well, so doing both
+    # put the same line there twice, and a log record alone would disappear
+    # at log_level WARNING. uvicorn announces no address of its own when it is
+    # handed sockets, so this is the only place the address is shown.
     for url in urls:
         click.echo(f"Serving on {url}", err=True)
-        logger.info("Serving on %s", url)
 
     # uvicorn follows the configured log_level, not -v: -v is saneless's own
     # detail and must not turn on uvicorn's or httpx's debug output. The

@@ -237,7 +237,7 @@ saneless [--config PATH] [-v] serve [--host ADDR] [--port N]
 | `--host` | TEXT | `0.0.0.0` (from config) | Bind address or hostname. The default `0.0.0.0` listens on all network interfaces. IPv6 addresses such as `::1` or `::` work too |
 | `--port` | int | `8080` (from config) | Bind port, 0 to 65535. `--port 0` lets the OS choose a free port. A value outside that range is a usage error, exit 2 |
 
-Once the addresses are bound, `serve` prints one `Serving on http://<address>:<port>` line per bound address to stderr and logs the same line. The port on that line is the one actually bound, so with `--port 0` it names the port the OS chose. An IPv6 address is shown in brackets, for example `Serving on http://[::1]:43127`.
+Once the addresses are bound, `serve` prints one `Serving on http://<address>:<port>` line per bound address to stderr. It is printed rather than logged, so it appears once whatever `log_level` is set to, and it is not written in the log format. The port on that line is the one actually bound, so with `--port 0` it names the port the OS chose. An IPv6 address is shown in brackets, for example `Serving on http://[::1]:43127`.
 
 `--host` takes an address or a hostname. A hostname is resolved and every address it resolves to is bound, all on the same port, so `--host localhost` listens on both `::1` and `127.0.0.1` where the machine has both. If any one of those addresses cannot be bound, `serve` binds none of them and exits 2. Binding `::` listens on IPv6 only, not on IPv4 as well; the default `0.0.0.0` listens on IPv4.
 

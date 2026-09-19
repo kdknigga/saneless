@@ -75,6 +75,7 @@ if TYPE_CHECKING:
 
     from click.testing import Result
 
+    from saneless.config import LogLevel
     from saneless.scanner.base import PageSink, ScanSettings
 
 
@@ -2531,16 +2532,15 @@ class TestServeCommand:
         assert run.config.access_log is True
 
     def test_serve_port_0_binds_an_os_chosen_port_and_reports_it(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
         ``--port 0`` binds a real port, and the line on stderr names that port.
 
-        The address goes to stderr and the log, so stdout stays clean.
+        The address goes to stderr, so stdout stays clean.
         """
         runs = _fake_server_run(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)
-        caplog.set_level(logging.INFO, logger="saneless.cli")
 
         result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
 
@@ -2548,10 +2548,8 @@ class TestServeCommand:
         [run] = runs
         assert run.family == socket.AF_INET
         assert run.port
-        line = f"Serving on http://127.0.0.1:{run.port}"
-        assert result.stderr.splitlines() == [line]
+        assert result.stderr.splitlines() == [f"Serving on http://127.0.0.1:{run.port}"]
         assert "Serving on" not in result.stdout
-        assert line in [r.getMessage() for r in caplog.records]
 
     def test_serve_explicit_port_0_is_not_replaced_by_config(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4879,6 +4877,32 @@ class TestServeLogging:
             if isinstance(h, logging.handlers.RotatingFileHandler)
         ]
         assert not (tmp_path / "logs").exists()
+
+    @pytest.mark.parametrize("level", ["DEBUG", "INFO", "WARNING", "ERROR"])
+    def test_serve_announces_its_address_once_at_any_log_level(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, level: LogLevel
+    ) -> None:
+        """
+        The Serving on line reaches stderr exactly once, whatever the level.
+
+        A service's log stream is stderr too, so printing the line and also
+        logging it put the same fact on the same stream twice; a log record
+        alone would vanish at ``log_level = "WARNING"``.
+        """
+        settings = self._serve_settings(tmp_path)
+        settings.output.log_level = level
+        TestServeCommand._stub_create_app(monkeypatch)
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        self._real_logging(monkeypatch)
+
+        with _restored_root_logging():
+            result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        assert result.stderr.count("Serving on") == 1
+        assert f"Serving on http://127.0.0.1:{run.port}\n" in result.stderr
 
     def test_serve_attaches_one_stderr_stream_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
