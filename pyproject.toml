@@ -101,13 +101,33 @@ dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
 [tool.ruff.lint.flake8-type-checking]
 # FastAPI evaluates a route's annotations at runtime, when the decorator runs,
-# so ruff must not move the names they use under TYPE_CHECKING.
+# so ruff must not move the names they use under TYPE_CHECKING.  Every route
+# decorator on both APIRouter and FastAPI is listed, so a route added through
+# any of them is covered.  Ruff resolves the receiver (`router`, `app`) only
+# through an assignment in the same module, so the APIRouter or FastAPI must be
+# constructed in the module that decorates with it; one imported from another
+# module is not recognised, and the exemption silently stops applying.
 runtime-evaluated-decorators = [
     "fastapi.APIRouter.get",
     "fastapi.APIRouter.post",
     "fastapi.APIRouter.put",
     "fastapi.APIRouter.patch",
     "fastapi.APIRouter.delete",
+    "fastapi.APIRouter.head",
+    "fastapi.APIRouter.options",
+    "fastapi.APIRouter.trace",
+    "fastapi.APIRouter.api_route",
+    "fastapi.APIRouter.websocket",
+    "fastapi.FastAPI.get",
+    "fastapi.FastAPI.post",
+    "fastapi.FastAPI.put",
+    "fastapi.FastAPI.patch",
+    "fastapi.FastAPI.delete",
+    "fastapi.FastAPI.head",
+    "fastapi.FastAPI.options",
+    "fastapi.FastAPI.trace",
+    "fastapi.FastAPI.api_route",
+    "fastapi.FastAPI.websocket",
 ]
 
 [tool.ruff.format]
