@@ -68,7 +68,7 @@ class SpooledPageSink(PageSink):
 
     The constructor takes four arguments beside ``self``, which is ruff's
     ``PLR0913`` ceiling.  Any further knob has to be a method, not a fifth
-    parameter -- the rule ``FakeSaneDev.set_page_delay`` already follows.
+    parameter.
     """
 
     def __init__(

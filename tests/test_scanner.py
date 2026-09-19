@@ -350,8 +350,9 @@ def fake_sane_module(monkeypatch: pytest.MonkeyPatch) -> FakeSaneModule:
     """
     Patch the one shared fake into sane_backend's module-level ``sane`` name.
 
-    ``_ensure_sane()`` leaves that name None until first use, which is the seam
-    that makes the whole approach work; it is kept exactly as it was.
+    ``_ensure_sane()`` returns whatever is patched into that name before it
+    would import python-sane, which is the seam that makes the whole approach
+    work.
 
     The device is asked to report ``"ADF"`` alongside the long feeder name so
     the tests below can exercise both spellings. Both are real -- plenty of

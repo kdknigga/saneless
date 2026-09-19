@@ -264,7 +264,7 @@ class TestRealSaneCancelSequence:
         """
         backend = SaneBackend()
         assert backend is not None  # the constructor is what ran sane.init()
-        device = sane_backend_mod.sane.open("test:0")
+        device = sane_backend_mod._ensure_sane().open("test:0")
         try:
             try:
                 device.source = "Automatic Document Feeder"

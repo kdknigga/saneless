@@ -55,7 +55,6 @@ purpose rather than discovered there.
 from __future__ import annotations
 
 import threading
-import time
 import weakref
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, assert_never
@@ -694,7 +693,6 @@ class FakeSaneDev:
     _page_index: int
     _page_size: tuple[int, int]
     _page_images: list[Image.Image]
-    _page_delay: float
     _source_resolution_ranges: dict[str, tuple[float, float, float]]
     _call_errors: dict[str, BaseException]
     _assignment_errors: dict[str, BaseException]
@@ -741,7 +739,6 @@ class FakeSaneDev:
         state["_page_index"] = 0
         state["_page_size"] = _DEFAULT_PAGE_SIZE
         state["_page_images"] = []
-        state["_page_delay"] = 0.0
         state["_source_resolution_ranges"] = {}
         state["_call_errors"] = {}
         state["_assignment_errors"] = {}
@@ -841,40 +838,20 @@ class FakeSaneDev:
         self.__dict__["_pages"] = len(pages)
         self.__dict__["_page_index"] = 0
 
-    def set_page_delay(self, seconds: float) -> None:
-        """
-        Make each page take time to arrive, so a timeout can be exercised.
-
-        A scan that is merely slow is a real condition, and the backend's
-        per-page timeout exists precisely for it, so the delay belongs in the
-        device rather than in a bespoke blocking iterator written per test.  A
-        hand-rolled blocking double is what this replaces, and it modelled a
-        device handle -- exactly what D-17 leaves only one of.
-
-        A method rather than a constructor keyword for the usual reason:
-        ``__init__`` already carries ruff's maximum of five arguments.
-
-        Args:
-            seconds: How long each ``start()`` blocks before its page.
-
-        """
-        self.__dict__["_page_delay"] = seconds
-
     def block_read(self, mode: ReadBlockMode) -> None:
         """
         Arm the Event-gated blocking read, so a cancel can be exercised.
 
         A read that has started and has not come back is a real condition --
-        it is the whole of HARD-03 -- so it belongs in the one shared device
-        rather than in a bespoke blocking iterator written per test, for the
-        same reason ``set_page_delay`` gives: a hand-rolled blocking double is
-        a device handle of its own, and this module exists so there is exactly
-        one of those.
+        a slow page and a scanner that stopped answering both look like this
+        to the backend -- so it belongs in the one shared device rather than
+        in a bespoke blocking iterator written per test: a hand-rolled blocking
+        double is a device handle of its own, and this module exists so there
+        is exactly one of those.
 
-        Unlike ``set_page_delay`` this costs no wall-clock time at all.  The
-        blocked ``snap()`` waits on ``read_gate``, so a test observes the block
-        and ends it by setting an ``Event`` rather than by outwaiting a sleep,
-        which is what TEST-02 requires.
+        It costs no wall-clock time at all.  The blocked ``snap()`` waits on
+        ``read_gate``, so a test observes the block and ends it by setting an
+        ``Event`` rather than by outwaiting a sleep; the suite has no sleeps.
 
         A method rather than a constructor keyword for the usual reason:
         ``__init__`` already carries ruff's maximum of five arguments.
@@ -1242,12 +1219,7 @@ class FakeSaneDev:
         if self._start_error is not None and self._page_index == self._start_error_page:
             raise self._start_error
         if self._page_index >= self._pages:
-            # No delay on this path: the end-of-feed probe is not a page being
-            # scanned.  Charging it one made the wall-clock arithmetic in the
-            # per-page timeout tests wrong by a whole delay.
             raise FakeSaneError(_FEEDER_EMPTY_MESSAGE)
-        if self._page_delay:
-            time.sleep(self._page_delay)
 
     def snap(self, *, no_cancel: bool = False) -> Image.Image:
         """

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import importlib
 import logging
 import os
 import threading
@@ -43,23 +44,33 @@ from saneless.scanner.base import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterator
+    from types import ModuleType
 
     from saneless.scanner.base import PageRecord, PageSink
 
-# python-sane is imported as a module-level name so that tests can
-# monkeypatch ``sane_backend.sane`` without the real C extension
-# being installed.  The actual import is deferred to avoid a hard
-# dependency at collection time.
+# Tests patch a fake python-sane module into this name, so the backend can be
+# driven without the real C extension.  Production leaves it None and every SANE
+# call goes through _ensure_sane(), which keeps python-sane out of import time.
 sane: Any = None
 
 
-def _ensure_sane() -> None:
-    """Import the real sane module on first use."""
-    global sane  # noqa: PLW0603
-    if sane is None:
-        import sane as _sane  # noqa: PLC0415
+def _ensure_sane() -> ModuleType:
+    """
+    Return the python-sane module every SANE call goes through.
 
-        sane = _sane
+    A module patched into ``sane`` wins; otherwise python-sane is imported.
+    The import is repeated on each call rather than remembered, which costs a
+    ``sys.modules`` lookup and keeps ``sys.modules`` the only record: a caller
+    that evicts or blocks the module there sees that on the very next call.
+
+    Returns:
+        The patched module, or the imported python-sane.
+
+    Raises:
+        ImportError: If python-sane or its shared library cannot be loaded.
+
+    """
+    return sane if sane is not None else importlib.import_module("sane")
 
 
 def require_sane() -> None:
@@ -740,19 +751,17 @@ class _Slot:
 @dataclass
 class _Wedge:
     """
-    What the module remembers about a reader thread still inside SANE (D-13).
+    What the module remembers about a reader thread still inside SANE.
 
     Module-level and **mutated, never rebound**.  Rebinding would need a
-    ``global`` statement, which the ``PL`` rules in ruff's ``select`` reject;
-    the one existing rebinding in this file carries a ``# noqa`` for exactly
-    that, and CLAUDE.md forbids adding another, so this state lives in a
+    ``global`` statement, which the ``PL`` rules in ruff's ``select`` reject
+    and which this project does not suppress, so this state lives in a
     container instead of in a name.
 
     ``device`` and ``iterator`` are **strong** references, deliberately.
     ``SaneDev_dealloc`` calls ``sane_close()`` and ``_SaneIterator.__del__``
     calls ``device.cancel()``, so letting a wedged handle be garbage-collected
-    would reintroduce exactly the close-while-reading this module now avoids
-    (29-RESEARCH.md Pitfall 3).
+    would reintroduce exactly the close-while-reading this module now avoids.
 
     ``done`` identifies *which* acquisition is wedged.  A reader that wakes up
     long afterwards compares against it, so a late wake-up belonging to an
@@ -882,7 +891,7 @@ def _ensure_initialised(host: str) -> object:
                 os.environ["SANE_NET_HOSTS"],
             )
         try:
-            version = sane.init()
+            version = _ensure_sane().init()
         except Exception as exc:
             # python-sane raises _sane.error, RuntimeError or AttributeError,
             # with no shared base, so the boundary catches Exception (D-08).
@@ -899,8 +908,8 @@ def _read_outstanding() -> bool:
     """
     Report whether any reader thread is still inside a SANE read.
 
-    ``_wedged_by`` answers the same question about one handle; the shutdown
-    path has no handle to ask about and needs the process-wide answer.
+    The shutdown path has no handle to ask about, so it needs this
+    process-wide answer rather than one about a single device.
 
     Returns:
         True if a read recorded in the wedge has not come back.
@@ -951,7 +960,7 @@ def shutdown() -> None:
             )
             return
         try:
-            sane.exit()
+            _ensure_sane().exit()
         except Exception:
             logger.warning("Could not shut SANE down", exc_info=True)
         _INIT.done = False
@@ -1084,21 +1093,6 @@ def _release_wedge(dev: SaneDevice, done: threading.Event) -> None:
         _WEDGE.iterator = None
         _WEDGE.device_id = ""
         _WEDGE.page_label = ""
-
-
-def _wedged_by(dev: SaneDevice) -> bool:
-    """
-    Report whether this handle is the one a reader is still inside.
-
-    Args:
-        dev: The handle to test.
-
-    Returns:
-        True if a reader never returned from a read on this device.
-
-    """
-    with _WEDGE_LOCK:
-        return _WEDGE.stuck and _WEDGE.device is dev
 
 
 def _retain_iterator(dev: SaneDevice, iterator: object) -> bool:
@@ -1328,7 +1322,6 @@ def _acquire_with_timeout(
         return _as_image(slot.value)
 
     returned = _settle_or_wedge(dev, done, grace, page_label)
-    logger.error("%s timed out after %.0fs", page_label, timeout)
     timeout_msg = f"{page_label} timed out after {timeout:.0f}s"
     if not returned:
         timeout_msg += (
@@ -1959,7 +1952,7 @@ class SaneBackend(ScannerBackend):
 
         """
         require_sane()
-        self._sane_version = _ensure_initialised(host)
+        _ensure_initialised(host)
 
     def close(self) -> None:
         """
@@ -2007,7 +2000,7 @@ class SaneBackend(ScannerBackend):
 
         """
         try:
-            dev: SaneDevice = sane.open(device_id)
+            dev: SaneDevice = _ensure_sane().open(device_id)
         except Exception as exc:
             open_msg = f"Could not open scanner {device_id}: {describe(exc)}"
             raise ScanError(open_msg) from exc
@@ -2063,7 +2056,7 @@ class SaneBackend(ScannerBackend):
         # scanner is holding things up.
         _refuse_if_wedged("the scanners", "list")
         try:
-            raw_devices = sane.get_devices()
+            raw_devices = _ensure_sane().get_devices()
         except Exception as exc:
             list_msg = f"Could not list scanners: {describe(exc)}"
             raise ScanError(list_msg) from exc
