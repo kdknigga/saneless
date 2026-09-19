@@ -1982,6 +1982,160 @@ class TestMetadataPagination:
         )
 
 
+class _EndlessHandler:
+    """
+    A mock server that always names a next page, whatever page is asked for.
+
+    ``page_for`` builds the body for the page number requested.  The handler
+    refuses to answer more than ``limit`` requests, so a client that never
+    stops fails the test with an AssertionError instead of hanging it.
+    """
+
+    def __init__(self, page_for: Callable[[int], object], limit: int = 50) -> None:
+        """Build a handler that answers page N with ``page_for(N)``."""
+        self.requests: list[httpx.Request] = []
+        self._page_for = page_for
+        self._limit = limit
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Record the request and answer it, refusing to go on forever."""
+        self.requests.append(request)
+        assert len(self.requests) <= self._limit, "the client never stopped"
+        page = int(request.url.params.get("page", "1"))
+        return httpx.Response(200, json=self._page_for(page))
+
+
+def _fetch_endless(handler: _EndlessHandler, method: str) -> list[dict[str, object]]:
+    """Run one metadata fetch against an endless ``handler``."""
+    client = PaperlessClient(
+        url=f"http://{_CONFIGURED_HOST}:8000",
+        token=_MOCK_AUTH,
+        transport=_make_transport(handler),
+    )
+    try:
+        return getattr(client, method)()
+    finally:
+        client.close()
+
+
+class TestMetadataPaginationTerminates:
+    """A server that never stops naming a next page cannot keep the client busy."""
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    @pytest.mark.parametrize("count", [None, 50, "many"])
+    def test_a_server_ignoring_page_fails_on_the_second_request(
+        self, method: str, noun: str, count: object
+    ) -> None:
+        """
+        The same non-final page twice in a row is a PaperlessError.
+
+        A proxy that drops the query string, or a server that ignores
+        ``page``, answers page 1 to every request.  The second, identical
+        answer shows the client is making no progress, so it stops loudly
+        instead of asking forever while the metadata cache lock is held.
+        """
+        items = _items(noun, 1, 2)
+        handler = _EndlessHandler(
+            lambda _page: {
+                "count": count,
+                "next": _next_link(noun, 2),
+                "previous": None,
+                "results": items,
+            }
+        )
+        with pytest.raises(PaperlessError) as exc_info:
+            _fetch_endless(handler, method)
+        message = str(exc_info.value)
+        assert message.startswith(
+            f"Could not fetch {noun} from Paperless at http://{_CONFIGURED_HOST}:8000: "
+        )
+        assert "page 2 repeated page 1" in message
+        assert "\n" not in message
+        assert len(handler.requests) == 2
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_reaching_the_servers_count_ends_the_fetch(
+        self, method: str, noun: str
+    ) -> None:
+        """Once the collected items reach ``count``, a non-null ``next`` is ignored."""
+        items = _items(noun, 1, 3)
+        handler = _EndlessHandler(
+            lambda page: {
+                "count": 3,
+                "next": _next_link(noun, page + 1),
+                "previous": None,
+                "results": items if page == 1 else _items(noun, 100 + page, 1),
+            }
+        )
+        assert _fetch_endless(handler, method) == items
+        assert len(handler.requests) == 1
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_count_across_several_pages_ends_the_fetch(
+        self, method: str, noun: str
+    ) -> None:
+        """Pages are joined until their total reaches ``count``, then no more."""
+        handler = _EndlessHandler(
+            lambda page: {
+                "count": 5,
+                "next": _next_link(noun, page + 1),
+                "previous": None,
+                "results": _items(noun, 2 * page - 1, 2),
+            }
+        )
+        assert _fetch_endless(handler, method) == _items(noun, 1, 6)
+        assert len(handler.requests) == 3
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_pages_that_never_reach_count_stop_at_a_cap(
+        self, method: str, noun: str
+    ) -> None:
+        """
+        New pages that never add up to ``count`` stop one page past the need.
+
+        Page 1 holds 2 of a count of 10, so 5 pages should be enough; the
+        client allows one more, then reports the server rather than asking
+        on.
+        """
+        handler = _EndlessHandler(
+            lambda page: {
+                "count": 10,
+                "next": _next_link(noun, page + 1),
+                "previous": None,
+                "results": _items(noun, 10 * page, 2 if page == 1 else 1),
+            }
+        )
+        with pytest.raises(PaperlessError) as exc_info:
+            _fetch_endless(handler, method)
+        assert "after 6 pages" in str(exc_info.value)
+        assert len(handler.requests) == 6
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    @pytest.mark.parametrize("count", [None, -1, True, "10"])
+    def test_without_a_usable_count_a_fixed_cap_applies(
+        self, monkeypatch: pytest.MonkeyPatch, method: str, noun: str, count: object
+    ) -> None:
+        """
+        With no usable ``count``, distinct endless pages stop at a fixed cap.
+
+        The cap is lowered here so the test makes a handful of requests
+        rather than a thousand.
+        """
+        monkeypatch.setattr("saneless.paperless._METADATA_MAX_PAGES", 4)
+        handler = _EndlessHandler(
+            lambda page: {
+                "count": count,
+                "next": _next_link(noun, page + 1),
+                "previous": None,
+                "results": _items(noun, page, 1),
+            }
+        )
+        with pytest.raises(PaperlessError) as exc_info:
+            _fetch_endless(handler, method)
+        assert "after 4 pages" in str(exc_info.value)
+        assert len(handler.requests) == 4
+
+
 # ---------------------------------------------------------------------------
 # Connection test
 # ---------------------------------------------------------------------------

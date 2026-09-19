@@ -10,6 +10,7 @@ reporting one of the five ConnectionStatus outcomes.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import shutil
@@ -59,6 +60,12 @@ _NO_FAILURE_MESSAGE = "Paperless reported a failure but supplied no message"
 # 100000, so larger collections take a few requests rather than being cut off.
 _METADATA_PAGE_SIZE: Final = 1000
 
+# The most pages one metadata fetch asks for when the server gives no usable
+# ``count`` to bound it: a million items at the page size above.  A server or
+# proxy that ignores ``?page=`` but varies its answer would otherwise keep the
+# fetch, and the metadata cache lock it runs under, busy forever.
+_METADATA_MAX_PAGES: Final = 1000
+
 _DUPLICATE_HINT = (
     "the document may already be in Paperless; check before scanning again"
 )
@@ -90,6 +97,28 @@ def _extract_task(payload: object) -> dict[str, object] | None:
         if isinstance(first, dict):
             return {str(key): value for key, value in first.items()}
     return None
+
+
+def _usable_count(page: dict[object, object]) -> int | None:
+    """
+    Return a paginated page's ``count``, or None when it cannot bound a fetch.
+
+    Only a non-negative integer is a count.  A missing or null value, a
+    string, a negative number and a bool (which Python treats as an int)
+    are all ignored.
+
+    Args:
+        page: The decoded body of one paginated metadata page.
+
+    Returns:
+        The total number of items the server says the collection holds, or
+        None.
+
+    """
+    count = page.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
 
 
 def _task_status(task: dict[str, object]) -> str:
@@ -1066,12 +1095,21 @@ class PaperlessClient:
         Fetch every page of one metadata collection.
 
         Pages are requested by number, ``?page=N``, on the configured base
-        URL until a page's ``next`` is null or a page comes back empty.  The
-        ``next`` link itself is only read as "there is another page" and is
-        never requested: a server behind a misconfigured reverse proxy builds
-        it from the wrong host or scheme, and following it would send the
-        API token there.  A redirect is not followed either; it fails the
-        fetch.  A bare-list response is the whole collection.
+        URL until a page's ``next`` is null, a page comes back empty, or the
+        items collected reach the server's own ``count``.  The ``next`` link
+        itself is only read as "there is another page" and is never
+        requested: a server behind a misconfigured reverse proxy builds it
+        from the wrong host or scheme, and following it would send the API
+        token there.  A redirect is not followed either; it fails the fetch.
+        A bare-list response is the whole collection.
+
+        The client does not take the server's word alone that it is making
+        progress.  A proxy that drops the query string, or a server that
+        ignores ``page``, answers page 1 to every request with a non-null
+        ``next``; a page identical to the one before it therefore fails the
+        fetch.  So does asking for more pages than ``count`` can need (one
+        more than ``count`` over the size of the first page), or, with no
+        usable ``count``, more than ``_METADATA_MAX_PAGES``.
 
         This is a module boundary: no httpx type and no raw ValueError leaves
         it.  A status error is rendered by ``_one_line_reason`` as status,
@@ -1086,33 +1124,81 @@ class PaperlessClient:
 
         Raises:
             PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
-                <reason>``, chained to the httpx error or the ValueError.
+                <reason>``, chained to the httpx error or the ValueError, or
+                unchained when the body is neither a list nor an object, the
+                server repeats a page, or it needs more pages than its
+                ``count`` allows.
 
         """
         prefix = f"Could not fetch {noun} from Paperless at {self._display_url}"
         results: list[dict[str, object]] = []
+        previous: object = None
+        page_limit = _METADATA_MAX_PAGES
         page = 1
         while True:
-            try:
-                response = self._client.get(
-                    path, params={"page": page, "page_size": _METADATA_PAGE_SIZE}
-                )
-                response.raise_for_status()
-            except httpx.HTTPError as exc:
-                msg = f"{prefix}: {_one_line_reason(exc)}"
-                raise PaperlessError(msg) from exc
-            try:
-                data = response.json()
-            except ValueError as exc:
-                msg = f"{prefix}: {_one_line_reason(exc)}"
-                raise PaperlessError(msg) from exc
-            if not isinstance(data, dict):
+            data = self._fetch_page(path, page, prefix)
+            if isinstance(data, list):
                 return data
+            if not isinstance(data, dict):
+                msg = f"{prefix}: the response was neither a list nor an object"
+                raise PaperlessError(msg)
             batch = data.get("results", [])
-            results.extend(batch)
-            if not data.get("next") or not batch:
+            if not batch:
                 return results
+            if batch == previous:
+                msg = (
+                    f"{prefix}: page {page} repeated page {page - 1}; the server "
+                    "or a proxy in front of it may be ignoring the page parameter"
+                )
+                raise PaperlessError(msg)
+            results.extend(batch)
+            if not data.get("next"):
+                return results
+            count = _usable_count(data)
+            if count is not None:
+                if len(results) >= count:
+                    return results
+                if page == 1:
+                    page_limit = min(page_limit, math.ceil(count / len(batch)) + 1)
+            if page >= page_limit:
+                msg = (
+                    f"{prefix}: the server still named a next page after "
+                    f"{page} pages; it may be ignoring the page parameter"
+                )
+                raise PaperlessError(msg)
+            previous = batch
             page += 1
+
+    def _fetch_page(self, path: str, page: int, prefix: str) -> object:
+        """
+        Request one metadata page and return its decoded JSON body.
+
+        Args:
+            path: The collection endpoint, e.g. ``/api/tags/``.
+            page: The page number to ask for.
+            prefix: The message prefix naming the collection and base URL.
+
+        Returns:
+            The decoded body, whatever its shape.
+
+        Raises:
+            PaperlessError: ``<prefix>: <reason>``, chained to the httpx error
+                or the ValueError.
+
+        """
+        try:
+            response = self._client.get(
+                path, params={"page": page, "page_size": _METADATA_PAGE_SIZE}
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            msg = f"{prefix}: {_one_line_reason(exc)}"
+            raise PaperlessError(msg) from exc
+        try:
+            return response.json()
+        except ValueError as exc:
+            msg = f"{prefix}: {_one_line_reason(exc)}"
+            raise PaperlessError(msg) from exc
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
