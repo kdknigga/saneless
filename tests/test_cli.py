@@ -1505,6 +1505,47 @@ class TestDevicesCommand:
         assert "Discovering scanners..." in result.stderr
         assert "Discovering scanners..." not in result.stdout
 
+    @pytest.mark.parametrize(
+        ("args", "stdout", "stderr"),
+        [
+            (["devices"], "", ["Discovering scanners...", "No scanners found."]),
+            (["devices", "--json"], "[]\n", []),
+        ],
+        ids=["table", "json"],
+    )
+    def test_devices_with_no_scanners_keeps_stdout_for_data(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        args: list[str],
+        stdout: str,
+        stderr: list[str],
+    ) -> None:
+        """
+        "No scanners found." is a status line, so it goes to stderr.
+
+        An empty table is no data at all, so ``saneless devices | grep`` sees
+        nothing; the JSON form still prints its empty array on stdout, because
+        that is the data.
+        """
+
+        class _NoScanners(StubScannerBackend):
+            """A backend that finds no devices."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept the host the CLI passes."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """Report no devices."""
+                return []
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_NoScanners)
+
+        result = runner.invoke(cli, args)
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == stdout
+        assert result.stderr.splitlines() == stderr
+
     def test_devices_capabilities(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Devices --capabilities -> raw option names shown."""
         runner, _ = _patch_cli(monkeypatch)

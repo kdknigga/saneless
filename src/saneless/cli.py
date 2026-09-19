@@ -932,7 +932,13 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     device_list = scanner.get_devices()
 
     if not device_list:
-        click.echo("No scanners found." if not as_json else "[]")
+        # The empty JSON array is data, so it goes to stdout; the table mode's
+        # sentence is a status line like "Discovering scanners...", so it goes
+        # to stderr and an empty table leaves stdout empty.
+        if as_json:
+            click.echo("[]")
+        else:
+            click.echo("No scanners found.", err=True)
         return
 
     render = _devices_as_json if as_json else _devices_as_text

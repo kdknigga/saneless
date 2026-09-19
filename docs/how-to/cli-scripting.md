@@ -40,7 +40,7 @@ These four keys, in this order, are the whole object unless you add `--capabilit
 With `--capabilities`, each device also carries a `capabilities` object:
 
 ```bash
-saneless devices --json --capabilities | jq '.[] | {name, sources: .capabilities.sources}'
+saneless devices --json --capabilities
 ```
 
 ```json
@@ -58,6 +58,16 @@ saneless devices --json --capabilities | jq '.[] | {name, sources: .capabilities
     }
   }
 ]
+```
+
+To pick out one field per device, filter it with `jq`:
+
+```bash
+saneless devices --json --capabilities | jq -c '.[] | {name, sources: .capabilities.sources}'
+```
+
+```json
+{"name":"net:192.168.1.50:pixma:MF740C","sources":["Flatbed","ADF Simplex","ADF Duplex"]}
 ```
 
 A key appears only when the device reported something for it. A device that gives its resolution as a range has `"resolution_range": {"min": ..., "max": ..., "step": ...}` instead of `resolutions`.

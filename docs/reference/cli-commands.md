@@ -87,7 +87,7 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 130 | Cancelled (Ctrl-C) |
 
-Only data goes to stdout. The `Discovering scanners...` status line, which the table mode prints, and any per-device capability error go to stderr, so `saneless devices | grep` and `saneless devices --json | jq` see the device list and nothing else.
+Only data goes to stdout. The `Discovering scanners...` and `No scanners found.` status lines, which the table mode prints, and any per-device capability error go to stderr, so `saneless devices | grep` and `saneless devices --json | jq` see the device list and nothing else. With no scanners, the table mode writes nothing to stdout and `--json` writes `[]`; both exit 0.
 
 **Example output (table):**
 
