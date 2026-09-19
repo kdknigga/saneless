@@ -2266,7 +2266,7 @@ class TestWorkerGuard:
         caplog: pytest.LogCaptureFixture,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """ROBU-01, D-13: a raising prune is logged, and jobs around it finish."""
+        """ROBU-01, D-13: a raising prune is a WARNING with its traceback; jobs finish."""
         caplog.set_level(logging.INFO, logger="saneless.worker")
         monkeypatch.setattr("saneless.worker._IDLE_TICK_SECONDS", _FAST_TICK)
         monkeypatch.setattr("saneless.worker._PRUNE_INTERVAL_SECONDS", 0.05)
@@ -2296,9 +2296,10 @@ class TestWorkerGuard:
         assert pruned
         assert [job.state for job in finished] == [JobState.DONE, JobState.DONE]
         assert alive
-        records = _worker_records(caplog, logging.ERROR, "Idle history prune failed")
-        assert records
+        records = _worker_records(caplog, logging.WARNING, "Idle history prune failed")
+        assert len(records) == 1
         assert records[0].exc_info is not None
+        assert not _worker_records(caplog, logging.ERROR, "Idle history prune failed")
 
     def test_pipeline_failures_are_job_failures_not_loop_failures(
         self,
