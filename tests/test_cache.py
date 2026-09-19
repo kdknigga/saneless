@@ -314,6 +314,10 @@ def test_failed_refresh_re_arms_the_entry_for_one_more_ttl(
 
     for record in _warnings(caplog):
         assert "Token" not in record.getMessage()
+        assert record.getMessage().startswith(
+            "Refreshing tags from paperless-ngx failed; "
+            "serving the last good copy for another 60s: "
+        )
 
 
 def test_recovered_refresh_replaces_the_last_good_value() -> None:
@@ -366,12 +370,15 @@ def test_failure_without_a_last_good_value_propagates_and_stores_nothing(
     assert _warnings(caplog) == []
 
 
-def test_invalidate_racing_a_failed_refresh_is_not_overwritten() -> None:
+def test_invalidate_racing_a_failed_refresh_is_not_overwritten(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """
     An invalidate during a failing fetch is not undone by the re-arm.
 
     The in-flight caller still gets the previous value, but the entry is not
-    re-armed, so the next caller fetches; its result is stored normally.
+    re-armed, so the next caller fetches; its result is stored normally.  The
+    warning says so, rather than promising the copy for another TTL.
     """
     clock = _FakeClock()
     cache = MetadataCache(ttl=60, clock=clock)
@@ -392,16 +399,22 @@ def test_invalidate_racing_a_failed_refresh_is_not_overwritten() -> None:
         results["in_flight"] = cache.get_or_fetch("tags", slow_failing_fetch)
 
     thread = threading.Thread(target=in_flight)
-    thread.start()
-    try:
-        assert entered.wait(_WAIT_SECONDS)
-        cache.invalidate("tags")
-    finally:
-        release.set()
-        thread.join(_WAIT_SECONDS)
+    with caplog.at_level(logging.WARNING, logger=_CACHE_LOGGER):
+        thread.start()
+        try:
+            assert entered.wait(_WAIT_SECONDS)
+            cache.invalidate("tags")
+        finally:
+            release.set()
+            thread.join(_WAIT_SECONDS)
 
     assert results["in_flight"] is good
     assert cache.get("tags") is None
+    [record] = _warnings(caplog)
+    assert record.getMessage() == (
+        "Refreshing tags from paperless-ngx failed; serving the last good copy, "
+        "and the next request fetches again: paperless unreachable"
+    )
 
     fresh: _Rows = [{"id": 2, "name": "invoice"}]
     assert cache.get_or_fetch("tags", lambda: fresh) is fresh

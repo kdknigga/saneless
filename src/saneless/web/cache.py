@@ -16,9 +16,16 @@ __all__ = ["MetadataCache"]
 
 logger = logging.getLogger(__name__)
 
-_STALE_MESSAGE: Final = (
+_STALE_RE_ARMED: Final = (
     "Refreshing %s from paperless-ngx failed; "
     "serving the last good copy for another %ss: %s"
+)
+
+# The same failure when an invalidate ran during the fetch: the last good copy
+# is still served, but it was not re-armed, so the next request fetches again.
+_STALE_NOT_RE_ARMED: Final = (
+    "Refreshing %s from paperless-ngx failed; "
+    "serving the last good copy, and the next request fetches again: %s"
 )
 
 
@@ -110,9 +117,11 @@ class MetadataCache:
         else with one.  The threads queued behind the failed fetch find the
         re-armed entry, so an outage costs one failed fetch and one log line
         per TTL rather than one per page load.  The re-arm obeys the same
-        invalidate check as a successful fetch.  When there is no last good
-        copy, the exception propagates, nothing is cached, and the next call
-        fetches again.
+        invalidate check as a successful fetch; when an invalidate stops it,
+        the copy is still returned but the warning says the next request
+        fetches again rather than promising another TTL.  When there is no
+        last good copy, the exception propagates, nothing is cached, and the
+        next call fetches again.
 
         Known limitation: while Paperless is unreachable and there is no last
         good copy, the waiting threads retry the fetch one after another, each
@@ -140,26 +149,34 @@ class MetadataCache:
                 generation = self._generations.get(key, 0)
             try:
                 data = fetch()
-            except PaperlessError as exc:
-                stale = self._re_arm(key, generation)
-                if stale is None:
-                    raise
-                logger.warning(_STALE_MESSAGE, key, self._ttl, describe(exc))
-                return stale
             except Exception as exc:
-                stale = self._re_arm(key, generation)
+                stale, re_armed = self._re_arm(key, generation)
                 if stale is None:
                     raise
-                logger.warning(
-                    _STALE_MESSAGE, key, self._ttl, describe(exc), exc_info=True
-                )
+                # An expected Paperless error is described by its message
+                # alone; anything else is a surprise and keeps its traceback.
+                traceback = None if isinstance(exc, PaperlessError) else exc
+                if re_armed:
+                    logger.warning(
+                        _STALE_RE_ARMED,
+                        key,
+                        self._ttl,
+                        describe(exc),
+                        exc_info=traceback,
+                    )
+                else:
+                    logger.warning(
+                        _STALE_NOT_RE_ARMED, key, describe(exc), exc_info=traceback
+                    )
                 return stale
             with self._locks_guard:
                 if self._generations.get(key, 0) == generation:
                     self.set(key, data)
             return data
 
-    def _re_arm(self, key: str, generation: int) -> list[dict[str, object]] | None:
+    def _re_arm(
+        self, key: str, generation: int
+    ) -> tuple[list[dict[str, object]] | None, bool]:
         """
         Keep the key's last good copy for one more TTL after a failed fetch.
 
@@ -171,14 +188,16 @@ class MetadataCache:
             generation: The key's generation when the fetch started.
 
         Returns:
-            The last good copy, or None when the key has never had one.
+            The last good copy, or None when the key has never had one, and
+            whether it was stored for another TTL.
 
         """
         with self._locks_guard:
             stale = self._last_good.get(key)
-            if stale is not None and self._generations.get(key, 0) == generation:
+            re_armed = stale is not None and self._generations.get(key, 0) == generation
+            if stale is not None and re_armed:
                 self._store[key] = (self._clock(), stale)
-        return stale
+        return stale, re_armed
 
     def invalidate(self, key: str) -> None:
         """

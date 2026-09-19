@@ -1674,6 +1674,12 @@ def invalidate_cache(
     partial for the specified resource.  Any other resource name is a 422
     before the cache is touched.
 
+    Invalidating means "fetch again", not "forget": when the refetch fails,
+    the partial is rendered from the last list fetched successfully (empty
+    if there has never been one) and the failure is logged.  The response
+    itself does not say the list is stale; the checks strip is what reports
+    Paperless unreachable.
+
     The tag refresh renders the same partial the filter does, from the same
     context, so a refresh mid-filter comes back filtered and still ticked.  The
     two extra values arrive in the body rather than the query string only

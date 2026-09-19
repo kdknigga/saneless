@@ -215,6 +215,8 @@ Returns the one-sentence description of a scan profile, for the help line beneat
 
 Invalidates a specific cache entry and returns fresh data from paperless-ngx.
 
+If paperless-ngx cannot be reached, the response is built from the last list that was fetched successfully, or is empty if there has never been one, and the failure is logged as a warning. The response does not mark the list as stale; the checks strip at the top of the page is what shows paperless-ngx as unreachable.
+
 **Query parameter:**
 
 | Parameter | Type | Description |
