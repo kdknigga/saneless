@@ -192,7 +192,14 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
 def test_metadata_fetch_failure_falls_back_to_an_empty_list(
     client: TestClient, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A Paperless failure still renders empty options and logs a WARNING (ROBU-05)."""
+    """
+    A failure with no list fetched before renders empty options and logs why.
+
+    Nothing has fetched the tags in this app yet, so there is no previous list
+    to fall back on (``tests/test_metadata_fallback.py`` covers the case where
+    there is).  The failure here is not a Paperless error, so the warning
+    carries the traceback as well as the cause.
+    """
     app = _app(client)
 
     def failing_get_tags() -> list[dict[str, object]]:
@@ -200,17 +207,20 @@ def test_metadata_fetch_failure_falls_back_to_an_empty_list(
         raise ConnectionError(msg)
 
     app.state.paperless.get_tags = failing_get_tags
-    app.state.cache.invalidate("tags")
     with caplog.at_level(logging.WARNING, logger="saneless.web.routes"):
         response = client.get("/api/tags")
 
     assert response.status_code == 200
     assert "receipt" not in response.text
     assert app.state.cache.get("tags") is None
-    assert any(
-        r.levelno == logging.WARNING and "using empty list" in r.getMessage()
+    records = [
+        r
         for r in caplog.records
-    )
+        if r.levelno == logging.WARNING and "using empty list" in r.getMessage()
+    ]
+    assert len(records) == 1
+    assert "paperless unreachable" in records[0].getMessage()
+    assert records[0].exc_info is not None
 
 
 def test_health_reports_degraded_worker(

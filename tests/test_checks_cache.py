@@ -1,12 +1,9 @@
 """
 CheckCache unit tests.
 
-This file deliberately inverts the approach ``tests/test_cache.py`` is forced
-into.  That file has to sleep for 1.1 real seconds (``test_cache.py:28``) to
-watch a TTL expire, because ``MetadataCache`` calls ``time.monotonic()``
-inline at ``cache.py:54`` and ``cache.py:66`` and a test has no way to move it.
-``CheckCache`` takes its clock as a constructor parameter instead, so every
-assertion about the TTL here advances a float.
+``CheckCache`` takes its clock as a constructor parameter, as
+``MetadataCache`` does, so every assertion about the TTL here advances a float
+instead of waiting for real seconds to pass.
 
 Nothing in this file sleeps, and nothing in it ever may: a suite that waits on
 the wall clock to observe a timeout is both slow and flaky, and making that
