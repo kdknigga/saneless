@@ -46,7 +46,7 @@ Paperless-ngx API connection settings.
 |-------|------|---------|-------------|
 | `url` | string | `""` | Paperless-ngx base URL (e.g., `http://paperless:8000`) |
 | `token` | string | `""` | API authentication token. Never written to logs or error messages. |
-| `consume_dir` | string | `""` | Fallback directory for PDF deposit when API is unavailable. A leading `~` is expanded. |
+| `consume_dir` | string | unset (empty or omitted means disabled) | Fallback directory for PDF deposit when API is unavailable. An empty or whitespace-only value disables the fallback rather than naming the working directory. A leading `~` is expanded. |
 
 ## `[output]`
 

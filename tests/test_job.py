@@ -774,7 +774,7 @@ class TestMigrationLadder:
         db_file.write_bytes(b"this is not a database\n" * 64)
 
         with pytest.raises(StorageError) as exc_info:
-            JobStore(db_path=str(db_file))
+            JobStore(db_path=db_file)
 
         message = str(exc_info.value)
         assert message.startswith("Could not open the job database at ")
@@ -855,6 +855,26 @@ class TestMigrationLadder:
             fetched = reopened.get_job(job_id)
             assert fetched is not None
             assert fetched.title == "Persistent Doc"
+        finally:
+            reopened.close()
+
+    def test_a_path_and_its_string_open_the_same_database(self, tmp_path: Path) -> None:
+        """
+        ``db_path`` takes a Path, which is what ``settings.output.db_path`` is.
+
+        A job written through a store opened on the Path is read back through
+        one opened on the equivalent string, so both name the same file.
+        """
+        db_file = tmp_path / "typed.db"
+        store = JobStore(db_path=db_file)
+        job_id = store.create_job("default", "Typed Doc").id
+        store.close()
+
+        reopened = JobStore(db_path=str(db_file))
+        try:
+            fetched = reopened.get_job(job_id)
+            assert fetched is not None
+            assert fetched.title == "Typed Doc"
         finally:
             reopened.close()
 

@@ -1927,7 +1927,7 @@ class TestJobsCommand:
             ),
         )
 
-    def _populate_store(self, db_path: str, count: int = 2) -> None:
+    def _populate_store(self, db_path: Path, count: int = 2) -> None:
         """Populate a JobStore at db_path with test jobs."""
         store = JobStore(db_path=db_path)
         for i in range(count):
@@ -1937,7 +1937,7 @@ class TestJobsCommand:
             )
         store.close()
 
-    def _populate_one(self, db_path: str, state: JobState, title: str) -> None:
+    def _populate_one(self, db_path: Path, state: JobState, title: str) -> None:
         """Populate a JobStore at db_path with a single job in `state`."""
         store = JobStore(db_path=db_path)
         job = store.create_job(profile="default", title=title)
@@ -1949,7 +1949,7 @@ class TestJobsCommand:
         settings = self._settings_for(tmp_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         # Create empty DB
-        store = JobStore(db_path=str(settings.output.db_path))
+        store = JobStore(db_path=settings.output.db_path)
         store.close()
 
         result = runner.invoke(cli, ["jobs"])
@@ -1960,7 +1960,7 @@ class TestJobsCommand:
     ) -> None:
         """Jobs with 2 jobs shows table with Timestamp, Profile, Title, Status columns."""
         settings = self._settings_for(tmp_path)
-        self._populate_store(str(settings.output.db_path), count=2)
+        self._populate_store(settings.output.db_path, count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
@@ -1981,7 +1981,7 @@ class TestJobsCommand:
     ) -> None:
         """Jobs --json with 2 jobs returns valid JSON array."""
         settings = self._settings_for(tmp_path)
-        self._populate_store(str(settings.output.db_path), count=2)
+        self._populate_store(settings.output.db_path, count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs", "--json"])
@@ -2003,9 +2003,7 @@ class TestJobsCommand:
     ) -> None:
         """A FALLBACK job reads "Saved to folder", not Complete and not Failed."""
         settings = self._settings_for(tmp_path)
-        self._populate_one(
-            str(settings.output.db_path), JobState.FALLBACK, "Fallback Doc"
-        )
+        self._populate_one(settings.output.db_path, JobState.FALLBACK, "Fallback Doc")
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
@@ -2028,9 +2026,7 @@ class TestJobsCommand:
         """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
-        self._populate_one(
-            str(settings.output.db_path), JobState.FALLBACK, "Fallback Doc"
-        )
+        self._populate_one(settings.output.db_path, JobState.FALLBACK, "Fallback Doc")
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
@@ -2054,9 +2050,7 @@ class TestJobsCommand:
         `"DONE"` or `"FALLBACK"`.
         """
         settings = self._settings_for(tmp_path)
-        self._populate_one(
-            str(settings.output.db_path), JobState.FALLBACK, "Fallback Doc"
-        )
+        self._populate_one(settings.output.db_path, JobState.FALLBACK, "Fallback Doc")
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs", "--json"])
@@ -2071,7 +2065,7 @@ class TestJobsCommand:
     def test_jobs_limit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --limit 1 with 2 jobs in DB shows only 1 job."""
         settings = self._settings_for(tmp_path)
-        self._populate_store(str(settings.output.db_path), count=2)
+        self._populate_store(settings.output.db_path, count=2)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs", "--limit", "1"])
@@ -2096,7 +2090,7 @@ class TestJobsCommand:
         """Jobs --json with no jobs outputs empty JSON array."""
         settings = self._settings_for(tmp_path)
         # Create empty DB
-        store = JobStore(db_path=str(settings.output.db_path))
+        store = JobStore(db_path=settings.output.db_path)
         store.close()
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
@@ -2756,7 +2750,7 @@ class TestTruncation:
                 log_file=str(tmp_path / "saneless.log"),
             ),
         )
-        store = JobStore(db_path=str(settings.output.db_path))
+        store = JobStore(db_path=settings.output.db_path)
         store.create_job(profile="default", title=long_title)
         store.close()
 
@@ -4021,7 +4015,7 @@ class TestJobsTableWidth:
             ),
         )
 
-    def _one_job(self, db_path: str) -> Job:
+    def _one_job(self, db_path: Path) -> Job:
         """Create one job and return it as the store recorded it."""
         store = JobStore(db_path=db_path)
         store.create_job(profile="default", title="Invoice")
@@ -4042,7 +4036,7 @@ class TestJobsTableWidth:
         """Each row's timestamp is local_time's output, seconds dropped."""
         cli_local_zone("America/Chicago")
         settings = self._settings_for(tmp_path)
-        job = self._one_job(str(settings.output.db_path))
+        job = self._one_job(settings.output.db_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
@@ -4063,7 +4057,7 @@ class TestJobsTableWidth:
         """Unchanged from before this plan: the zone token fits in the slack."""
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
-        self._one_job(str(settings.output.db_path))
+        self._one_job(settings.output.db_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
@@ -4079,7 +4073,7 @@ class TestJobsTableWidth:
         """40 columns still renders a table rather than raising."""
         monkeypatch.setenv("COLUMNS", "40")
         settings = self._settings_for(tmp_path)
-        self._one_job(str(settings.output.db_path))
+        self._one_job(settings.output.db_path)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
 
         result = runner.invoke(cli, ["jobs"])
@@ -4112,7 +4106,7 @@ class TestJobsJsonContract:
         """The offset is +00:00 even on a server the table renders as CDT."""
         cli_local_zone("America/Chicago")
         settings = self._settings_for(tmp_path)
-        store = JobStore(db_path=str(settings.output.db_path))
+        store = JobStore(db_path=settings.output.db_path)
         store.create_job(profile="default", title="Invoice")
         recorded = store.list_recent(limit=1)[0]
         store.close()
@@ -4134,7 +4128,7 @@ class TestJobsJsonContract:
         """Localising a machine contract would break every script silently."""
         cli_local_zone("America/Chicago")
         settings = self._settings_for(tmp_path)
-        job = JobStore(db_path=str(settings.output.db_path))
+        job = JobStore(db_path=settings.output.db_path)
         job.create_job(profile="default", title="Invoice")
         recorded = job.list_recent(limit=1)[0]
         job.close()

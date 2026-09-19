@@ -717,7 +717,7 @@ class TestFiveOutcomesEndToEnd:
         """Drive one scan end to end and assert the row it left behind."""
         settings = _build_settings(tmp_path, case)
         consume_dir = tmp_path / "consume"
-        store = JobStore(db_path=str(settings.output.db_path))
+        store = JobStore(db_path=settings.output.db_path)
         paperless = PaperlessClient(
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
@@ -785,7 +785,7 @@ class TestAPartialScanSurvivesTheWorker:
         """Three sheets fed, a jam on the fourth, through the real worker."""
         case = next(case for case in _CASES if case.label == "success")
         settings = _build_settings(tmp_path, case)
-        store = JobStore(db_path=str(settings.output.db_path))
+        store = JobStore(db_path=settings.output.db_path)
         paperless = PaperlessClient(
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),
@@ -851,7 +851,7 @@ class TestFlipTimeoutReleasesTheWorker:
         """
         case = next(case for case in _CASES if case.label == "flip-timeout")
         settings = _build_settings(tmp_path, case)
-        store = JobStore(db_path=str(settings.output.db_path))
+        store = JobStore(db_path=settings.output.db_path)
         paperless = PaperlessClient(
             url=settings.paperless.url,
             token=settings.paperless.token.get_secret_value(),

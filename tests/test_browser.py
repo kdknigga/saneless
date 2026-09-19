@@ -3518,7 +3518,7 @@ class TestErrorRenderingInChromium:
             expect(details).to_contain_text(f"Job: {job.id}")
 
             source = page.content()
-            log_file = server.app.state.settings.output.log_file
+            log_file = str(server.app.state.settings.output.log_file)
             assert log_file not in source, log_file
             # Not just this deployment's path: any filename that looks like a
             # log would be a host filesystem detail on a page the whole LAN can

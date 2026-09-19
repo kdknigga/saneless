@@ -101,7 +101,7 @@ def _seed_crashed_store(settings: Settings) -> _Seeded:
     One finished job and three in-flight ones.  The SCANNING row is created
     last, so it is the newest row and the one the status area falls back to.
     """
-    store = JobStore(db_path=str(settings.output.db_path))
+    store = JobStore(db_path=settings.output.db_path)
     try:
         done = store.create_job("default", "finished before the crash")
         store.finish_job(done.id, JobState.DONE)
