@@ -88,6 +88,10 @@ __all__ = ["ClickFlipCoordinator", "_truncate", "cli"]
 
 logger = logging.getLogger(__name__)
 
+# How many not-yet-accepted connections the web server's socket queues. This
+# is the backlog uvicorn itself listens with.
+_LISTEN_BACKLOG: Final = 2048
+
 # Width of the Status column in `saneless jobs`, derived rather than written
 # down: the humanised labels are longer than the raw enum values they replaced,
 # and a ninth JobState member must not be able to overflow an 80-column
@@ -1005,9 +1009,64 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
         store.close()
 
 
+def _bind_listening_socket(host: str, port: int) -> socket.socket:
+    """
+    Bind and listen on the address ``serve`` was given, before uvicorn starts.
+
+    The socket is bound here rather than by uvicorn so that the port saneless
+    reports is the port it holds: with port 0 the OS chooses one, and there is
+    no gap between checking a port and binding it for another process to take
+    it in. The address family comes from resolving the host, so an IPv6
+    address binds IPv6. Only the first address a name resolves to is bound,
+    so ``--host`` is meant to take an address.
+
+    The options match what uvicorn's own bind set. SO_REUSEADDR lets a
+    restart bind a port whose last connections are still closing. On IPv6,
+    IPV6_V6ONLY keeps ``::`` from also listening on IPv4 behind the
+    operator's back. Port sharing is never switched on, because it would let
+    a second process listen on the same port. ``listen()`` is called before
+    the socket is handed over, so a connection made while the app starts up
+    waits in the queue instead of being refused.
+
+    Args:
+        host: The address to bind.
+        port: The port to bind; 0 asks the OS for a free one.
+
+    Returns:
+        The bound, listening socket.
+
+    Raises:
+        ConfigError: The host did not resolve or the address could not be
+            bound. That is a setup problem, so it exits 2 like any other
+            failure to start.
+
+    """
+    try:
+        family, socktype, proto, _, sockaddr = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )[0]
+        sock = socket.socket(family, socktype, proto)
+    except OSError as exc:
+        msg = f"Cannot bind to {host}:{port}: {describe(exc)}"
+        raise ConfigError(msg) from exc
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind(sockaddr)
+        sock.listen(_LISTEN_BACKLOG)
+    except OSError as exc:
+        sock.close()
+        msg = f"Cannot bind to {host}:{port}: {describe(exc)}"
+        raise ConfigError(msg) from exc
+    return sock
+
+
 @cli.command()
 @click.option("--host", default=None, help="Bind address.")
-@click.option("--port", default=None, type=int, help="Bind port.")
+@click.option(
+    "--port", default=None, type=int, help="Bind port; 0 lets the OS choose one."
+)
 @click.pass_context
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Start the web server."""
@@ -1020,7 +1079,9 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # other command keeps the rotating file handler (D-34).
     settings = _load_cli_settings(ctx, stream_logs=True)
     actual_host = host or settings.output.web_host
-    actual_port = port or settings.output.web_port
+    # An explicit 0 is a request for an OS-chosen port, not a missing value,
+    # so only an absent flag falls back to the configured port.
+    actual_port = port if port is not None else settings.output.web_port
 
     # serve scans nothing itself, so SANE failing to initialise is a failure
     # to start -- "can't start, fix your setup", exit 2 like a port that cannot
@@ -1036,58 +1097,51 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # no thread can still be inside SANE (D-18).
     app = create_app(settings, scanner)
 
-    # Check port availability before starting to give a clear error. A port
-    # that cannot be bound is a setup problem -- "can't start, fix your
-    # setup" -- so it is a ConfigError, one line and exit 2 through the guard
-    # (D-07 amendment), not exit 1, which means a scan error.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        sock.bind((actual_host, actual_port))
-    except OSError as e:
-        msg = f"Cannot bind to {actual_host}:{actual_port}: {describe(e)}"
-        raise ConfigError(msg) from e
-    finally:
-        sock.close()
-
-    click.echo(f"Serving on http://{actual_host}:{actual_port}")
+    sock = _bind_listening_socket(actual_host, actual_port)
+    bound_port = sock.getsockname()[1]
+    # An IPv6 address is bracketed so the URL can be pasted into a browser.
+    shown_host = f"[{actual_host}]" if ":" in actual_host else actual_host
+    click.echo(f"Serving on http://{shown_host}:{bound_port}", err=True)
+    logger.info("Serving on http://%s:%d", shown_host, bound_port)
 
     # uvicorn follows the configured log_level, not -v: -v is saneless's own
-    # detail and must not turn on uvicorn's or httpx's debug output
-    # (orchestrator resolution 5). The validated LogLevel Literal lower-cases
-    # to a name uvicorn accepts.
+    # detail and must not turn on uvicorn's or httpx's debug output. The
+    # validated log level lower-cases to a name uvicorn accepts.
     #
-    # uvicorn exits 3 on a startup failure, which would read as "Paperless
-    # error" in saneless's table; every command shares one table, so a failure
-    # status becomes a ConfigError, exit 2 (D-07 amendment). A clean SystemExit
-    # passes through unchanged. Ctrl-C needs no handling: uvicorn.run swallows
-    # KeyboardInterrupt and returns (measured), so a normal stop exits 0 (D-03).
-    # A Ctrl-C before this point -- while settings load or the app is built --
-    # is not uvicorn's to handle; it reaches the group guard, exit 130.
-    #
-    # This call needs no change for the streaming mode, and adding one would
-    # break it: a None log config means uvicorn runs no dictConfig and attaches
-    # no handlers of its own, so uvicorn.error, uvicorn.access and uvicorn.asgi
-    # propagate to saneless's root handlers. Leaving the access log on
-    # therefore puts per-request lines, and uvicorn's own startup lines, on the
-    # same stream for free -- which is exactly what DLVR-04 wants (D-37).
-    try:
-        uvicorn.run(
+    # The config needs nothing extra for the streaming mode, and adding
+    # anything would break it: a None log config means uvicorn applies no
+    # dictConfig and attaches no handlers of its own, so uvicorn.error,
+    # uvicorn.access and uvicorn.asgi propagate to saneless's root handlers.
+    # Leaving the access log on therefore puts per-request lines, and
+    # uvicorn's own startup lines, on the same stream for free.
+    server = uvicorn.Server(
+        uvicorn.Config(
             app,
-            host=actual_host,
-            port=actual_port,
             log_config=None,
             log_level=settings.output.log_level.lower(),
             access_log=True,
         )
-    except SystemExit as exc:
-        if exc.code is None or exc.code == 0:
-            raise
+    )
+    # On Ctrl-C uvicorn shuts down gracefully and then re-raises the signal it
+    # caught, which arrives here as KeyboardInterrupt. A running server being
+    # stopped is a normal stop, exit 0, so it is swallowed here; a Ctrl-C
+    # before this point -- while settings load or the app is built -- is not
+    # uvicorn's to handle and reaches the group guard, exit 130.
+    try:
+        server.run(sockets=[sock])
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
+    # Server.run returns quietly when start-up fails, such as the app's
+    # lifespan raising; uvicorn has already logged why. Every command shares
+    # one exit table, so that is a failure to start: one line, exit 2.
+    if not server.started:
         msg = (
-            f"The web server could not start on {actual_host}:{actual_port} "
-            f"(uvicorn exit status {exc.code}); the cause is in the preceding "
-            "log lines"
+            f"The web server could not start on http://{shown_host}:{bound_port}; "
+            "the cause is in the preceding log lines"
         )
-        raise ConfigError(msg) from exc
+        raise ConfigError(msg)
 
 
 def _echo_write_result(

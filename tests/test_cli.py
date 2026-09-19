@@ -2685,10 +2685,11 @@ class TestServeCommand:
 
         assert result.exit_code == 2, result.output
         [run] = runs
-        lines = _failure_lines(result)
-        assert lines == [
+        # The address was bound, and announced, before uvicorn tried to start.
+        assert _failure_lines(result) == [
+            f"Serving on http://127.0.0.1:{run.port}",
             f"The web server could not start on http://127.0.0.1:{run.port}; "
-            "the cause is in the preceding log lines"
+            "the cause is in the preceding log lines",
         ]
         assert "Traceback" not in result.output
 
@@ -4735,9 +4736,7 @@ class TestServeLogging:
         settings = self._serve_settings(tmp_path)
         TestServeCommand._stub_create_app(monkeypatch)
 
-        def exploding_run(
-            _self: uvicorn.Server, _sockets: list[socket.socket] | None = None
-        ) -> None:
+        def exploding_run(_self: uvicorn.Server, **_kwargs: object) -> None:
             _raise_runtime_error("kaboom-serve-exit5")
 
         monkeypatch.setattr(uvicorn.Server, "run", exploding_run)
