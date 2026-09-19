@@ -4,9 +4,9 @@ The one health-check registry, and the words both surfaces use to show it.
 This is not a leaf module -- it needs ``Settings``, a scanner backend and a
 Paperless client to answer anything -- but it has a leaf's import rule all the
 same, and the rule is the point of the module.  ``saneless doctor`` and the web
-status strip are required to report the *same* checks in the *same* words
-(D-02), so this module must import **nothing from ``saneless.web`` and nothing
-from ``saneless.cli``**.  If it imported either, it would belong to that
+status strip are required to report the *same* checks in the *same* words, so
+this module must import **nothing from ``saneless.web`` and nothing from
+``saneless.cli``**.  If it imported either, it would belong to that
 surface, and the other one would end up building a web application to print a
 terminal table or importing Click to render a page.
 
@@ -19,8 +19,8 @@ reports all five rows.
 ASVS V7 applies to every string this module can render.  No message and no next
 step carries a filesystem path, a URL, a token value or exception text.  The
 Paperless URL may hold ``user:pass@`` (``paperless.py:461``) and the fallback
-folder is a host path on a LAN-visible page, so both are deliberately omitted
-for the same reason D-13 omits the log path.
+folder is a host path on a LAN-visible page, so both are deliberately omitted,
+exactly as the log file's path is.
 """
 
 from __future__ import annotations
@@ -105,8 +105,7 @@ PROBE_CONNECT_SECONDS: Final = 2.0
 PROBE_READ_SECONDS: Final = 5.0
 
 # saned's registered port.  IANA names 6566 ``sane-port``, and this machine's
-# ``/etc/services`` agrees, which settles RESEARCH assumption A1.  Read at call
-# time.
+# ``/etc/services`` agrees.  Read at call time.
 SANED_PORT: Final = 6566
 
 # Every character a segment of ``scanner.host`` may contain and still be read
@@ -120,14 +119,14 @@ _HOST_NAME_CHARACTERS: Final = frozenset(ascii_letters + digits + "-.")
 # outright (U+00B2 SUPERSCRIPT TWO, U+2460 CIRCLED DIGIT ONE) and True for
 # non-ASCII decimals ``int()`` accepts but libsane's C-side parsing would read
 # as a name (U+0661.. Arabic-Indic).  ASCII decimal is the only reading both
-# ends agree on (R3-CR-01).
+# ends agree on.
 _ASCII_DIGITS: Final = frozenset(digits)
 
 # The digits an ASCII ``0x``/``0X`` literal may be made of.  glibc reads such a
-# segment as a number, so a name may not look like one (R3-WR-01).
+# segment as a number, so a name may not look like one.
 _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 
-# How many hosts one setting may put in front of the pre-probe (R3-IN-05).
+# How many hosts one setting may put in front of the pre-probe.
 # ``_scanner_preflight`` walks the entries with ``any(...)``, paying an
 # unbounded ``getaddrinfo`` plus ``PROBE_CONNECT_SECONDS`` for each, and that
 # walk runs inside the ``POST /api/checks/refresh`` request thread.  The
@@ -142,7 +141,7 @@ _ASCII_HEX_DIGITS: Final = frozenset(hexdigits)
 # host onwards loses the pre-probe, not the check.
 _MAX_PROBE_HOSTS: Final = 4
 
-# The cold-start row, before any check has run (D-06).  It lives here rather
+# The cold-start row, before any check has run.  It lives here rather
 # than in the template for the same reason the state glyphs do: templates own
 # no vocabulary.  U+00B7 is neutral -- it says "not yet", not "bad" -- and
 # U+2026 matches the spelling of the Scan button's "Scanning...".
@@ -156,8 +155,8 @@ CHECKING_MESSAGE: Final = "Checking…"
 # "Failed" instead of "FAIL": the glyph's meaning has to survive as speech.
 CHECKING_STATE_LABEL: Final = "Checking"
 
-# The word a screen reader hears in front of a row nothing looked at (D-08,
-# R3-WR-03).  A skipped row borrows the cold-start glyph and the cold-start
+# The word a screen reader hears in front of a row nothing looked at.  A
+# skipped row borrows the cold-start glyph and the cold-start
 # colour -- U+00B7 says "not yet", not "bad", and no new colour token is needed
 # -- but it deliberately does not borrow the cold-start *word*.
 # ``CHECKING_STATE_LABEL`` is "Checking", and a listener hearing "Checking:
@@ -169,7 +168,7 @@ CHECKING_STATE_LABEL: Final = "Checking"
 SKIPPED_STATE_LABEL: Final = "Not checked"
 
 # How many times the cold-start strip may ask for results before it stops
-# asking (IN-07).  The poll's only other terminating condition is results
+# asking.  The poll's only other terminating condition is results
 # landing in the cache, so an appliance whose refresher thread has died -- or
 # one where the watch window and scanner-gate contention keep every tick from
 # storing -- leaves every open tab asking indefinitely, and this is a machine
@@ -189,7 +188,7 @@ SKIPPED_STATE_LABEL: Final = "Not checked"
 # That is *not* sized against the worst probe a cold start can cost, and the
 # arithmetic that once claimed it was -- two and a half times
 # ``PROBE_CONNECT_SECONDS`` plus ``PROBE_READ_SECONDS``, so about 7 s -- is
-# disproved by three things this same module documents (R3-WR-04).
+# disproved by three things this same module documents.
 # ``getaddrinfo`` is outside every budget here: ``PROBE_CONNECT_SECONDS`` says
 # at length that an unreachable resolver costs whatever ``resolv.conf`` says,
 # and nothing bounds it.  The saned pre-probe pays that once per configured
@@ -209,8 +208,8 @@ SKIPPED_STATE_LABEL: Final = "Not checked"
 POLL_ATTEMPT_CAP: Final = 10
 
 # How many times a strip may ask while a probe is demonstrably in flight --
-# that is, while some checker holds the refresher's single-flight lock
-# (R3-WR-04).  Ninety attempts at the real two-second interval is about 180 s,
+# that is, while some checker holds the refresher's single-flight lock.
+# Ninety attempts at the real two-second interval is about 180 s,
 # which exceeds the ~127 s worst-case ``get_devices()`` this file documents
 # plus both probe budgets (``PROBE_CONNECT_SECONDS`` for saned and
 # ``PROBE_READ_SECONDS`` for Paperless) with room left over for the pre-probe's
@@ -221,9 +220,10 @@ POLL_ATTEMPT_CAP: Final = 10
 # It is a second cap and not an exemption, and that is deliberate.
 # ``Lock.locked()`` stays true forever if the holder dies, and a thread that
 # died inside the lock is precisely the failure mode this area keeps hitting,
-# so an unbounded "keep asking while the lock is held" would reintroduce
-# IN-07's unbounded poll through a narrower door.  A refresher that died
-# holding the lock therefore still makes the asking stop; it just takes about
+# so an unbounded "keep asking while the lock is held" would reintroduce the
+# endless poll ``POLL_ATTEMPT_CAP`` exists to stop, through a narrower door.  A
+# refresher that died holding the lock therefore still makes the asking stop;
+# it just takes about
 # three minutes instead of twenty seconds.  That cost lands only on the tab
 # that was already waiting on a probe, never on the healthy-idle case.
 POLL_PROBE_ATTEMPT_CAP: Final = 90
@@ -238,7 +238,7 @@ POLL_PROBE_ATTEMPT_CAP: Final = 90
 POLL_GAVE_UP_LINE: Final = "The checks have not run yet. Press Check again to try now."
 
 # What the strip says instead, while it is still asking because a probe is
-# demonstrably in flight (R3-WR-04).  ``POLL_GAVE_UP_LINE`` points at the
+# demonstrably in flight.  ``POLL_GAVE_UP_LINE`` points at the
 # ``Check again`` button, and beside a running probe that is advice that cannot
 # help: the click collapses into the probe already running.  So this sentence
 # says what is true -- the first check has not finished -- and sets an
@@ -254,7 +254,7 @@ POLL_STILL_CHECKING_LINE: Final = (
 
 # How much of a device's own description a row will print.  Nothing else bounds
 # what a scanner can call itself, and the row is rendered into HTML next to
-# four others whose width is fixed (ROBU-08).
+# four others whose width is fixed.
 _DEVICE_LABEL_MAX_LENGTH: Final = 60
 
 # The row a check that raised is rendered as.  Developer constants, because the
@@ -266,7 +266,7 @@ _CHECK_FAILED_NEXT_STEP: Final = "Restart saneless, then press Check again."
 
 class CheckState(StrEnum):
     """
-    How one health check came out: three states, and only three (D-01).
+    How one health check came out: three states, and only three.
 
     ``OK`` is nothing to do.  ``WARN`` is a true statement about a deployment
     that still works -- no fallback folder, profiles that live only in memory
@@ -290,7 +290,7 @@ class CheckState(StrEnum):
 
 class CheckKey(StrEnum):
     """
-    The five checks, and the contract that both surfaces show all five (D-02).
+    The five checks, and the contract that both surfaces show all five.
 
     This enum *is* the "neither surface may define a check the other does not
     have" rule.  ``run_checks`` iterates it and returns one result per member,
@@ -326,11 +326,10 @@ class CheckResult:
     it on the way to a page or a terminal.
 
     ``next_step`` is empty for every ``OK`` row and non-empty for every
-    ``WARN`` and ``FAIL`` row.  That is the whole of APPL-04's shape here: a
-    red row that does not say what to do about it is a red row a household
-    member can only escalate.
+    ``WARN`` and ``FAIL`` row, because a red row that does not say what to do
+    about it is a red row a household member can only escalate.
 
-    ``skipped`` is D-08's "not checked while a scan is running".  It is a
+    ``skipped`` is the "not checked while a scan is running" row.  It is a
     separate flag rather than a fourth state because the row still has to carry
     *some* state for its glyph, and "we did not look" is a fact about the
     probe, not a verdict about the appliance.
@@ -358,15 +357,15 @@ class CheckContext:
     Everything the five checks need, handed in rather than reached for.
 
     Every dependency is injected because the two surfaces build them
-    differently, and neither may be the one this module knows about (D-02).
+    differently, and neither may be the one this module knows about.
     The web app has a worker, a long-lived Paperless client and a scanner
     backend it opened at startup; ``saneless doctor`` has none of those and
     builds what it needs for one command.
 
     ``scanner=None`` is how "python-sane is not installed on this machine" is
     represented.  That is what lets ``doctor`` report all five rows on such a
-    machine instead of refusing at ``require_sane()`` and reporting none
-    (Amendment A-1) -- the thing an operator most needs a diagnostic for is the
+    machine instead of refusing at ``require_sane()`` and reporting none --
+    the thing an operator most needs a diagnostic for is the
     machine where the diagnostic would otherwise not run.
 
     ``paperless=None`` means no usable client could be built at all, which
@@ -376,7 +375,7 @@ class CheckContext:
     generated profiles, not something re-derived here.  ``doctor`` derives its
     own from whether a config file was loaded.  It has to be a record rather
     than a fresh probe, because the two in-memory cases are indistinguishable
-    afterwards and the read-only one is the only one worth acting on (D-22).
+    afterwards and the read-only one is the only one worth acting on.
 
     Attributes:
         settings: The loaded configuration.
@@ -384,7 +383,7 @@ class CheckContext:
         paperless: The Paperless client, or None when none could be built.
         profile_storage: What the profile write actually did.
         skip_scanner: True while a scan is running, which pauses the scanner
-            check without touching the backend (D-08).
+            check without touching the backend.
 
     """
 
@@ -402,7 +401,7 @@ def check_name(key: CheckKey) -> str:
     The name is a separate element from the message in both surfaces, which is
     what lets ``connection_status_message``'s existing sentences drop into the
     Paperless row verbatim with no string surgery and no capitalisation
-    collision (UI-SPEC S1).
+    collision.
 
     Args:
         key: The check to name.
@@ -466,8 +465,8 @@ def check_state_class(state: CheckState) -> str:
 
     Templates own no vocabulary, so the mapping from a state to a class lives
     here and never as a ``{% if state == 'FAIL' %}`` in a template.  Each class
-    is an alias over an existing colour token; this phase introduces no new
-    colour value.
+    is an alias over an existing colour token; none introduces a new colour
+    value.
 
     Args:
         state: The state to classify.
@@ -542,8 +541,8 @@ def check_row_class(result: CheckResult) -> str:
     state's, because the state on a skipped row is not a verdict anybody
     reached: it is ``CheckState.OK`` so that the row has *some* colour to draw
     and so that a scripted health gate does not go red for a probe that was
-    deliberately not taken (D-01).  Colouring by it would paint an unprobed row
-    green, which is the divergence R3-WR-03 found.
+    deliberately not taken.  Colouring by it would paint an unprobed row
+    green, telling the reader that a probe passed when none ever ran.
 
     Args:
         result: The finished row about to be rendered.
@@ -719,10 +718,10 @@ def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
     ``_looks_like_a_host_name`` used to reject a segment only when
     ``segment.isdigit()``, and the hazard it was written for is glibc's
     non-dotted-quad numeric parsing, which accepts far more than all-digit
-    strings.  Measured by round 3 on this machine: ``0.0`` and ``0x0.0``
+    strings.  Measured on this machine: ``0.0`` and ``0x0.0``
     resolve to ``0.0.0.0``, ``0x7f.1`` and ``127.1`` resolve to ``127.0.0.1``,
     and ``6566.0`` costs one unbounded lookup before NXDOMAIN.  All of them
-    passed the old guard because they contain a ``.`` (R3-WR-01).
+    passed the old guard because they contain a ``.``.
 
     On Linux a ``connect()`` to ``0.0.0.0`` reaches loopback, so one of those
     in the dial list lets any unrelated local process listening on 6566 make
@@ -745,7 +744,7 @@ def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
     hazard paragraph names, since a ``connect()`` to the unspecified address
     is the loopback dial the shorthands were refused for.  No scanner is ever
     at the unspecified address, so refusing it by name costs nothing and
-    closes the one dotted quad the rule left open (R4-WR-03).
+    closes the one dotted quad the rule left open.
 
     Args:
         segment: One stripped segment of the ``scanner.host`` setting.
@@ -767,7 +766,7 @@ def _segment_is_a_numeric_address_shorthand(segment: str) -> bool:
     # The one legal literal that is still the hazard this function documents:
     # on Linux a connect() to the unspecified address reaches loopback, so it
     # would report the configured host reachable off any local listener.  It
-    # names no scanner, so nothing is lost by refusing it (R4-WR-03).
+    # names no scanner, so nothing is lost by refusing it.
     return address.is_unspecified
 
 
@@ -785,7 +784,7 @@ def _looks_like_a_host_name(segment: str) -> bool:
     Being narrow is the safe direction.  A false "no" costs the pre-probe's
     latency saving and nothing else, because ``_saned_hosts`` then returns no
     entries and the scanner check falls through to ``get_devices()``.  A false
-    "yes" is what WR-01 was: three junk dials and, through the pre-probe's
+    "yes" costs three junk dials and, through the pre-probe's
     short circuit, a wrong verdict.
 
     A segment glibc would read as a number is rejected for that reason and not
@@ -795,11 +794,11 @@ def _looks_like_a_host_name(segment: str) -> bool:
     ``0.1.134.159``, ``getaddrinfo('0', 6566)`` answers ``0.0.0.0``, and --
     the five forms an all-digit test misses because they carry a ``.`` --
     ``0.0`` and ``0x0.0`` answer ``0.0.0.0``, ``0x7f.1`` and ``127.1`` answer
-    ``127.0.0.1``, and ``6566.0`` spends one unbounded lookup before NXDOMAIN
-    (R3-WR-01).  ``0.0.0.0`` is the worst of them: on Linux a ``connect()`` to
+    ``127.0.0.1``, and ``6566.0`` spends one unbounded lookup before
+    NXDOMAIN.  ``0.0.0.0`` is the worst of them: on Linux a ``connect()`` to
     it reaches loopback, so such a segment in the dial list lets the probe
     report the configured scanner host "reachable" off any unrelated local
-    process listening on 6566 (R2-WR-01, T-30-28-01, T-30-31-02).
+    process listening on 6566.
     ``_segment_is_a_numeric_address_shorthand`` is what answers the wide
     question; the ``isdigit()`` line below is kept because it only ever
     rejects and is cheaper, and the wider rule subsumes rather than replaces
@@ -812,8 +811,7 @@ def _looks_like_a_host_name(segment: str) -> bool:
     uninterruptible ``get_devices()`` when the appliance is off.  The one
     exception is ``0.0.0.0`` itself: a legal literal, but the very address the
     paragraph above names as the worst case, and one no scanner is ever at, so
-    ``_segment_is_a_numeric_address_shorthand`` refuses it by name
-    (R4-WR-03).
+    ``_segment_is_a_numeric_address_shorthand`` refuses it by name.
 
     Args:
         segment: One stripped segment of the ``scanner.host`` setting.
@@ -908,8 +906,8 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     truncated modulo 65536 instead, which means ``host:99999`` would quietly
     dial port 34463 -- a real probe of an address nobody configured.
 
-    Reading such a segment as a host name does *not* avoid that, which is what
-    R2-WR-01 established and what this docstring used to claim.  Measured on
+    Reading such a segment as a host name does *not* avoid that, whatever this
+    docstring once claimed.  Measured on
     this machine, ``getaddrinfo('99999', 6566)`` answers ``0.1.134.159``:
     glibc's single-integer IPv4 form means the junk dial happens anyway, at a
     different address nobody configured.  The segment is therefore *dropped* --
@@ -923,8 +921,7 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     address, there are no entries and no probe
     (``_looks_like_an_ipv6_literal``).  That covers the compressed spelling and
     the expanded one alike, which the segment rules alone did not -- before it,
-    ``2001:db8:0:0:0:0:0:1`` produced eight entries, five of them ``0``
-    (R2-WR-01).
+    ``2001:db8:0:0:0:0:0:1`` produced eight entries, five of them ``0``.
 
     The segment rules stay on top of it, because the stdlib will not parse
     every spelling an operator can type.  With more than one colon present the
@@ -953,7 +950,7 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
     ``PROBE_CONNECT_SECONDS`` for each, inside the ``POST /api/checks/refresh``
     request thread; the manual-refresh floor bounds how often that request may
     be made and not how long one of them takes, so the length of this tuple is
-    the only place the duration can be bounded (R3-IN-05).  A longer setting
+    the only place the duration can be bounded.  A longer setting
     loses the pre-probe for its tail rather than losing the bound, which is the
     module's standard safe direction: no entry means no probe for that host,
     and the scanner check falls through to ``get_devices()`` exactly as it did
@@ -999,7 +996,7 @@ def _saned_hosts(host_setting: str) -> tuple[tuple[str, int], ...]:
         # accepts but libsane's C-side parsing would read as a name.  The
         # first class raised a ``ValueError`` out of this function and turned
         # the Scanner row into ``run_checks``' generic failure row; the second
-        # derived a port number from a string libsane never would (R3-CR-01).
+        # derived a port number from a string libsane never would.
         # ASCII decimal is the only reading both ends agree on.  The emptiness
         # test is not redundant: ``set("") <= _ASCII_DIGITS`` is True where
         # ``"".isdigit()`` was False, and ``int("")`` raises.
@@ -1039,10 +1036,10 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
     resolver order, and all of them together.  The budget is a *deadline*,
     read once before the walk rather than handed to each socket, so every
     attempt gets only what the attempts before it left over and a host with
-    three addresses costs no more than a host with one.  That is the property
-    WR-02 asked for, and it is kept.
+    three addresses costs no more than a host with one.  That property is
+    wanted, and it is kept.
 
-    What WR-02's fix did instead was dial only the resolver's first answer,
+    An earlier version got it by dialling only the resolver's first answer,
     and that was a strict regression, for a reason that lives in the resolver
     rather than in the handshake.  ``getaddrinfo`` is called with no
     ``AI_ADDRCONFIG``, so glibc returns AAAA records even on a host with no
@@ -1053,12 +1050,12 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
     it has" -- was true of the case that does not matter and false of the one
     that does: a host that is *on*, answering over one family and not the
     other, was reported dead, permanently, on an appliance that scans
-    perfectly well (R2-CR-01).
+    perfectly well.
 
     Resolution itself is outside the budget and is left that way deliberately.
     ``getaddrinfo`` takes no timeout, so bounding it means running it on a
     thread and abandoning the thread when the deadline passes.  That is the
-    same trade plan 30-21's decision record refuses for the enumeration: a
+    same trade the scanner check refuses for the enumeration: a
     thread parked in a C call that nothing can interrupt is worse than a slow
     answer, because it is still in there after the caller has moved on.  An
     unreachable resolver therefore costs whatever ``resolv.conf`` says, and
@@ -1070,7 +1067,7 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
     its own: the walk holds no subscript, so nothing to dial is a loop body
     that never runs.  Subscripting the resolver's first answer raised
     ``IndexError`` there, which is not an ``OSError`` and so escaped into
-    ``run_checks``' generic red row (R2-IN-01).  It is
+    ``run_checks``' generic red row.  It is
     the *caller* that decides what a ``False`` means, and the caller never
     turns "the probe could not be run at all" into a bad row: when
     ``_saned_hosts`` yields no entries to dial, no probe happens and the
@@ -1078,7 +1075,7 @@ def _saned_reachable(host: str, port: int, timeout: float) -> bool:
     behaviour that existed before this module.  A probe that actually ran and
     was refused on every configured entry produces ``WARN``, not ``FAIL`` --
     it establishes that the configured host did not answer, which is not the
-    same claim as "there is no scanner" (CR-02, ``_scanner_host_unanswered``)
+    same claim as "there is no scanner" (see ``_scanner_host_unanswered``)
     -- and in that state ``get_devices()`` would spend two minutes reaching a
     less useful version of the same observation.
 
@@ -1126,7 +1123,7 @@ def _directory_accepts_a_write(path: Path) -> bool:
 
     This writes and removes a temporary file rather than asking
     ``os.access``.  ``os.access`` answers a question about the directory's mode
-    bits, and the failure Phase 27 D-09 was written for is not a mode bit: a
+    bits, and the failure that matters here is not a mode bit: a
     single-file bind mount where the directory is writable, ``os.access`` says
     yes, and only the operation itself fails with EBUSY.  A check that asks a
     different question to the one the appliance will ask at scan time is a
@@ -1179,7 +1176,7 @@ def _scanner_unreachable() -> CheckResult:
     Build the "the scanner is not answering" row.
 
     Returns:
-        The UI-SPEC S1 not-reachable row.
+        The red not-reachable Scanner row.
 
     """
     return CheckResult(
@@ -1194,7 +1191,7 @@ def _scanner_unreachable() -> CheckResult:
 
 def _scanner_host_unanswered() -> CheckResult:
     """
-    Build the "the configured scanner host did not answer" row (CR-02).
+    Build the "the configured scanner host did not answer" row.
 
     Amber, not red, and the distinction is the whole point.  What the
     pre-probe observed is a fact about the *configured host*, not about the
@@ -1203,20 +1200,24 @@ def _scanner_host_unanswered() -> CheckResult:
     (``sane_backend.py:876`` only sets the variable), so "every configured
     sane-net host refused TCP" never implied "there is no scanner".  A machine
     with a working USB scanner and a switched-off network one scans perfectly,
-    and D-01 calls a true statement about a deployment that still works amber
-    -- the same shape as D-22's read-only-configuration row.  Reporting it red
+    and a true statement about a deployment that still works is amber -- the
+    same shape as the read-only-configuration Profiles row.  Reporting it red
     would break the rule ``CheckState``'s own docstring states outright: a
     healthy appliance must never go red.
 
     The cost is recorded rather than hidden.  An appliance whose *only*
     scanner is an unreachable network host now reports amber, so ``saneless
-    doctor`` exits 0 for it.  That is accepted: D-01 already keys a scripted
-    gate on red alone, the row is still visible, it still names the scanner
+    doctor`` exits 0 for it.  That is accepted: a scripted gate is keyed on
+    red alone by design, the row is still visible, it still names the scanner
     host as the thing that did not answer, and it still carries the same next
     step, so a human loses nothing.  Getting the red back means bounding
     ``get_devices()`` on a second thread, which cannot be done safely while
-    ``sane_get_devices`` is uninterruptible -- the reasoning is in plan
-    30-21's decision record and should be read before anyone tries.
+    ``sane_get_devices`` is uninterruptible.  A thread past its deadline is
+    still inside libsane after the caller has returned and released the gate,
+    which breaks the gate's one-caller-inside-libsane rule, and
+    ``scanner.close()`` would then run ``sane_exit()`` with a SANE call still
+    outstanding -- a segfault risk.  Making it safe needs a helper thread that
+    owns the gate itself and that the refresher's shutdown can see.
 
     Neither string names the host, its address or its port.  A LAN address on
     a LAN-visible page is the same class of disclosure as the SANE device id
@@ -1242,14 +1243,14 @@ def _scanner_host_unanswered() -> CheckResult:
 
 def _scanner_skipped() -> CheckResult:
     """
-    Build the row shown while a scan is running (D-08).
+    Build the row shown while a scan is running.
 
     The state is ``OK`` rather than ``WARN`` or ``FAIL``.  "We did not look" is
     a fact about the probe, not a verdict about the appliance, and a scan in
     flight is direct evidence the scanner was working moments ago; a scripted
     health gate must not go red for the duration of every scan.  The state
     stays ``OK`` precisely so that gate keeps passing -- ``worst_state`` and
-    ``saneless doctor``'s exit rule read it and nothing else (D-01).
+    ``saneless doctor``'s exit rule read it and nothing else.
 
     The ``skipped`` flag, not the state, is what the two surfaces *render*, and
     the functions that read it are named rather than implied so the claim is
@@ -1258,7 +1259,7 @@ def _scanner_skipped() -> CheckResult:
     ``saneless.cli`` draws the ``doctor`` one.
 
     Returns:
-        The UI-SPEC S1 skipped row.
+        The neutral skipped Scanner row.
 
     """
     return CheckResult(
@@ -1271,7 +1272,7 @@ def _scanner_skipped() -> CheckResult:
 
 def _scanner_busy() -> CheckResult:
     """
-    Build the row shown when something else held the scanner gate (R2-WR-02).
+    Build the row shown when something else held the scanner gate.
 
     This exists separately from ``_scanner_skipped`` because the distinction is
     the whole of the fix.  ``run_checks`` honours ``context.skip_scanner``
@@ -1290,7 +1291,7 @@ def _scanner_busy() -> CheckResult:
     The state is ``OK`` for the same reason ``_scanner_skipped``'s is, restated
     because it is easy to read as a bug: "we did not look" is a fact about the
     probe, not a verdict about the appliance, and a scripted health gate keyed
-    on red (D-01) must not fail because two threads wanted the scanner in the
+    on red must not fail because two threads wanted the scanner in the
     same instant.  Keeping the state at ``OK`` is what holds that gate open.
 
     The ``skipped`` flag is what discloses that nothing was checked, through
@@ -1321,13 +1322,13 @@ def _scanner_busy() -> CheckResult:
 
 def _scanner_support_missing() -> CheckResult:
     """
-    Build the "there is no python-sane on this machine" row (Amendment A-1).
+    Build the "there is no python-sane on this machine" row.
 
     Its own constructor because two callers need the same row and a row
     written twice is a row that can drift.
 
     Returns:
-        The UI-SPEC S1 no-scanner-support row.
+        The red no-scanner-support row.
 
     """
     return CheckResult(
@@ -1344,7 +1345,7 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | None:
 
     This is everything the scanner check can settle before libsane is touched,
     and it is a separate function so it can run with the worker's scanner gate
-    **free** (R2-IN-03).  Nothing here is SANE work: it is a settings read, a
+    **free**.  Nothing here is SANE work: it is a settings read, a
     name resolution and a TCP handshake.  That matters because resolution is
     outside every budget this module states -- ``getaddrinfo`` takes no
     timeout, as ``PROBE_CONNECT_SECONDS`` says at length -- so a check holding
@@ -1354,16 +1355,16 @@ def _scanner_preflight(context: CheckContext) -> CheckResult | None:
     seconds.
 
     The order inside it is the order ``_check_scanner`` always had.  A machine
-    with no python-sane is its own row (Amendment A-1) and is decided without
+    with no python-sane is its own row and is decided without
     touching anything.  The host SANE will actually dial is then pre-probed,
     and every configured entry refusing a TCP connection ends the check right
     there, with the amber ``_scanner_host_unanswered`` row: ``get_devices()``
     would spend about two minutes reaching a conclusion inside a C call
-    nothing can interrupt (T-30-22), and the conclusion it would reach is not
+    nothing can interrupt, and the conclusion it would reach is not
     the one the probe is entitled to report.  A refused dial says the
     configured host did not answer; it does not say there is no scanner,
     because ``SANE_NET_HOSTS`` adds net devices rather than replacing local
-    enumeration (CR-02).
+    enumeration.
 
     Args:
         context: The injected dependencies and configuration.
@@ -1414,9 +1415,9 @@ def _scanner_enumeration(context: CheckContext) -> CheckResult:
         devices = scanner.get_devices()
     except Exception as exc:
         # The backend raises ScanError, but python-sane underneath it raises
-        # _sane.error, RuntimeError or AttributeError with no shared base
-        # (sane_backend.py D-08), so the boundary catches Exception.  The type
-        # name is logged; nothing from the exception reaches the row.
+        # _sane.error, RuntimeError or AttributeError with no shared base, so
+        # the boundary catches Exception.  The type name is logged; nothing
+        # from the exception reaches the row.
         logger.warning("Scanner enumeration failed: %s", type(exc).__name__)
         return _scanner_unreachable()
     if not devices:
@@ -1460,7 +1461,7 @@ def _paperless_next_step(status: ConnectionStatus) -> str:
     """
     Return what to do about one connection outcome.
 
-    The sentences are UI-SPEC S1's, and they pair with the messages
+    The sentences are fixed user copy, and they pair with the messages
     ``connection_status_message`` already owns -- this module authors the
     remedy, never the diagnosis, so the two surfaces cannot disagree about
     what happened even if they disagreed about what to do.
@@ -1502,10 +1503,10 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     Report whether scans can be filed, without spending thirty seconds on it.
 
     The token is examined first and the probe is skipped entirely when it is a
-    placeholder (D-14): an unset token cannot succeed, so a request would only
+    placeholder: an unset token cannot succeed, so a request would only
     tell paperless-ngx about it.  ``is_placeholder_token`` is the one predicate
     ``doctor``, this check, the scan route and ``saneless scan`` share, so all
-    four agree on whether the appliance can upload (APPL-07).
+    four agree on whether the appliance can upload.
 
     A ``None`` client means one could not be constructed, and the only way
     ``PaperlessClient.__init__`` refuses is a URL httpx will not parse -- which
@@ -1553,13 +1554,12 @@ def _check_profiles(context: CheckContext) -> CheckResult:
     all (amber) beats a generated profile with no name (amber) beats the count.
     The two amber rows are deliberately different sentences, because "saneless
     has no file to save to" and "saneless has one and cannot write it" are
-    different facts and only the second is worth investigating (D-22,
-    Amendment A-2).
+    different facts and only the second is worth investigating.
 
     The storage outcome is recorded by the worker rather than recomputed here.
-    A fresh ``os.access`` probe cannot substitute for it: Phase 27 D-09's
-    motivating failure is a bind mount where the directory is writable and only
-    the rename fails.
+    A fresh ``os.access`` probe cannot substitute for it: the failure that
+    matters is a single-file bind mount, where the directory is writable and
+    only the rename fails.
 
     Args:
         context: The injected dependencies and configuration.
@@ -1585,8 +1585,8 @@ def _check_profiles(context: CheckContext) -> CheckResult:
                 key=CheckKey.PROFILES,
                 state=CheckState.WARN,
                 # One literal, deliberately over the 88-column guide (E501 is
-                # off in this project): D-22 pins this sentence verbatim, and a
-                # grep for it has to find it on one line.
+                # off in this project): the sentence is pinned word for word,
+                # and a grep for it has to find it on one line.
                 message="Generated in memory — the config location is read-only, so they are lost on restart.",
                 next_step=(
                     "Make the saneless config directory writable, "
@@ -1629,14 +1629,14 @@ def _check_fallback(context: CheckContext) -> CheckResult:
     """
     Report whether a scan has somewhere to go when paperless-ngx is down.
 
-    An unset fallback folder is amber and never red (APPL-11, D-22).  The
+    An unset fallback folder is amber and never red.  The
     appliance scans and files perfectly without one; what it cannot do is
     survive paperless-ngx being down, and a red row for a deployment that works
     is a row people learn to ignore.
 
     The configured path is not in either sentence.  It is a host filesystem
-    path on a LAN-visible page, omitted for the same reason D-13 omits the log
-    path (T-30-21).
+    path on a LAN-visible page, omitted for the same reason the log file's
+    path is.
 
     Args:
         context: The injected dependencies and configuration.
@@ -1741,8 +1741,8 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     Run the scanner check, holding the worker's gate for the part that needs it.
 
     This is the only place in the registry that takes the gate, because the
-    enumeration is the only thing any check does inside libsane.  What changed
-    with R2-IN-03 is the size of the gated region: the pre-probe runs *first*,
+    enumeration is the only thing any check does inside libsane.  What matters
+    is the size of the gated region: the pre-probe runs *first*,
     with the gate free, and only ``_scanner_enumeration`` is held.  The
     pre-probe is a name resolution and a TCP handshake, and resolution is
     outside every budget this module states, so holding the gate across it
@@ -1759,7 +1759,7 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     latter names a running scan, and ``run_checks`` has already dealt with that
     case before this function is reached, so the only thing a lost gate
     establishes is that somebody else is in SANE -- today, the worker's startup
-    capability read, which runs before any job exists (R2-WR-02).
+    capability read, which runs before any job exists.
 
     The release is in a ``finally``, so a check that raises still hands the
     scanner back before the exception reaches ``run_checks``' per-check
@@ -1772,8 +1772,8 @@ def _scanner_result(context: CheckContext, scanner_gate: threading.Lock) -> Chec
     agree.  A test guarantees it instead --
     ``test_a_gated_run_returns_what_an_ungated_run_returns`` in
     ``tests/test_checks.py`` -- and that is where anyone changing either half
-    should look.  It is parametrised over the four contexts whose rows differ
-    (R3-IN-01): no python-sane, a configured host that refuses the pre-probe,
+    should look.  It is parametrised over the four contexts whose rows differ:
+    no python-sane, a configured host that refuses the pre-probe,
     a host that answers and enumerates one device, and an enumeration that
     raises.  The first two are decided before the gate is reached and the last
     one leaves through ``run_checks``' handler with the gate released in a
@@ -1806,7 +1806,7 @@ def run_checks(
     Run every check once, in member order, and never raise.
 
     This is the function both surfaces call, and the tuple it returns is the
-    whole of what either of them may show (D-02).  It iterates ``CheckKey``, so
+    whole of what either of them may show.  It iterates ``CheckKey``, so
     a check that exists for ``saneless doctor`` and not for the status strip is
     not something either surface is able to express.
 
@@ -1814,12 +1814,13 @@ def run_checks(
     it returns the paused row without entering the backend at all.  That is
     correctness, not politeness: nothing in ``sane_backend.py`` mutually
     excludes two SANE calls, so a status probe landing on the device mid-scan
-    is a second caller into the same C library (Pitfall 2).  It is honoured
+    is a second caller into the same C library while a read is outstanding,
+    which SANE does not allow.  It is honoured
     *first*, before the gate is looked at: a caller that already knows a scan
     is running has no reason to touch the gate at all.
 
     The gate is a parameter rather than something the caller holds around this
-    call, and that is the whole of WR-03's fix.  Only ``_check_scanner`` enters
+    call, and that is deliberate.  Only ``_check_scanner`` enters
     libsane.  ``_check_paperless`` carries a multi-second HTTP budget, and
     ``_check_fallback`` and ``_check_data_dir`` each create and delete a real
     file.  A caller that wrapped all five made the lock that exists to keep two
