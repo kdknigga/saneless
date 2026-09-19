@@ -81,11 +81,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
-      - run: uv run pytest -m "not browser and not sane_hardware"
+      # pytest runs with HOME at a fresh empty directory, so a test that reads
+      # or writes the real home fails here instead of passing on whatever the
+      # runner happens to hold -- the suite must never touch a real ~/.config
+      # or ~/.local/state. Only pytest sees the empty HOME: uv resolves its
+      # cache and managed Python before `env` runs, under the real one.
+      - name: Test with an empty HOME
+        run: uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"
       # Drives the real SANE `test` backend. It ships with the SANE runtime
       # pulled in transitively by the headers installed above, so this step
-      # needs no extra apt package.
-      - run: uv run pytest -m sane_hardware
+      # needs no extra apt package. Empty HOME for the same reason as above.
+      - name: SANE test backend with an empty HOME
+        run: uv run env HOME="$(mktemp -d)" pytest -m sane_hardware
 
   # The browser tests run offline behind an in-test egress gate (every page is
   # routed, and any request not addressed to the local test server fails the
@@ -107,5 +114,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - run: uv sync --locked
+      # Installed under the real HOME, into ~/.cache/ms-playwright.
       - run: uv run playwright install --with-deps chromium
-      - run: uv run pytest -m browser
+      # Empty HOME for the same reason as the test job. Playwright looks for
+      # its browsers under HOME, so the step names the real registry
+      # explicitly: the shell expands `$HOME` before `env` replaces it, so
+      # the path is the one the install step above wrote Chromium to.
+      - name: Browser tests with an empty HOME
+        run: uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser

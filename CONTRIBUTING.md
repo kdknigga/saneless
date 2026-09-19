@@ -64,9 +64,9 @@ three parallel jobs in `.github/workflows/ci.yml`:
 | `lint` | `uv run ruff format --check .` |
 | `lint` | `uv run ty check` |
 | `lint` | `uv run pyrefly check src tests` |
-| `test` | `uv run pytest -m "not browser and not sane_hardware"` |
-| `test` | `uv run pytest -m sane_hardware` |
-| `browser` | `uv run pytest -m browser` |
+| `test` | `uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"` |
+| `test` | `uv run env HOME="$(mktemp -d)" pytest -m sane_hardware` |
+| `browser` | `uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser` |
 
 You can reproduce the gate exactly, in the same order, with:
 
@@ -75,11 +75,22 @@ uv run ruff check .
 uv run ruff format --check .
 uv run ty check
 uv run pyrefly check src tests
-uv run pytest -m "not browser and not sane_hardware"
-uv run pytest -m sane_hardware
+uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"
+uv run env HOME="$(mktemp -d)" pytest -m sane_hardware
 uv run playwright install chromium   # once, to fetch the browser
-uv run pytest -m browser
+uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser
 ```
+
+The test commands point `HOME` at a fresh empty directory, which proves on every run
+that the suite never reads or writes your real home: no `~/.config/saneless` config
+(with its live Paperless URL and token), no `~/.local/state`. The suite also isolates
+itself -- every test gets a fake `HOME` and XDG tree and runs in its own working
+directory -- so a plain `uv run pytest` is safe too; the empty `HOME` is what checks
+that isolation holds. The browser line names Playwright's browser directory because
+Playwright looks for Chromium under `HOME`, and `$HOME` there is expanded by your
+shell, before `env` changes it, so it is your real home, where `playwright install`
+put Chromium. If you set `PLAYWRIGHT_BROWSERS_PATH` or `XDG_CACHE_HOME` for the
+install, use that directory instead.
 
 All seven must exit 0. Fix what they report -- do not silence them. `# noqa`,
 `# type: ignore` and rule-disabling are not accepted, and both type checkers must be
