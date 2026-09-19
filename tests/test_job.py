@@ -11,7 +11,6 @@ import ast
 import inspect
 import sqlite3
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -564,17 +563,11 @@ def test_list_recent() -> None:
     """List recent jobs returns entries in reverse chronological order (UI-05)."""
     store = JobStore()
     try:
-        titles = [f"Job {i}" for i in range(5)]
-        for title in titles:
-            store.create_job(profile="default", title=title)
-            time.sleep(0.01)  # Ensure distinct timestamps
+        ids = _create_in_order(store, 5)
 
         jobs = store.list_recent(limit=3)
-        assert len(jobs) == 3
         # Most recent first
-        assert jobs[0].title == "Job 4"
-        assert jobs[1].title == "Job 3"
-        assert jobs[2].title == "Job 2"
+        assert [job.id for job in jobs] == [ids[4], ids[3], ids[2]]
     finally:
         store.close()
 
@@ -617,13 +610,11 @@ def test_prune_by_count() -> None:
     """Prune keeps only the N most recent jobs (UI-06)."""
     store = JobStore()
     try:
-        for i in range(5):
-            store.create_job(profile="default", title=f"Job {i}")
-            time.sleep(0.01)
+        ids = _create_in_order(store, 5)
 
         store.prune(max_age_days=365, max_rows=3)
         remaining = store.list_recent()
-        assert len(remaining) == 3
+        assert [job.id for job in remaining] == [ids[4], ids[3], ids[2]]
     finally:
         store.close()
 
