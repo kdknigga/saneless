@@ -472,12 +472,14 @@ class TestScanCommand:
         assert "Done: Test" in result.output
 
     def test_scan_status_output(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Scan shows progress messages during pipeline execution."""
+        """Scan shows its progress messages in pipeline order."""
         runner, _ = _patch_cli(monkeypatch)
         result = runner.invoke(cli, ["scan", "--title", "Test"])
-        assert "Scanning..." in result.output
-        assert "Assembling PDF..." in result.output
-        assert "Uploading to paperless-ngx..." in result.output
+        assert result.exit_code == 0, result.output
+        scanning = result.output.index("Scanning...")
+        assembling = result.output.index("Assembling PDF...")
+        uploading = result.output.index("Uploading to paperless-ngx...")
+        assert scanning < assembling < uploading
 
     def test_scan_config_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Config loading raises ConfigError -> exit code 2, message as rendered."""
@@ -1390,35 +1392,40 @@ class TestDevicesCommand:
 class TestCliFlags:
     """CLI flag tests."""
 
-    def test_verbose_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The -v flag calls configure_logging with verbose=True."""
-        captured: dict[str, object] = {}
-
-        def capture_logging(*_args: object, **kwargs: object) -> None:
-            """Record whether verbose was passed."""
-            captured["verbose"] = kwargs.get("verbose", False)
-
-        runner = CliRunner()
+    def test_verbose_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """-v puts saneless at DEBUG and mirrors its DEBUG records to stderr."""
         monkeypatch.setattr(
-            "saneless.cli.load_settings", lambda *_a, **_kw: _make_settings()
+            "saneless.cli.load_settings", lambda *_a, **_kw: _tmp_settings(tmp_path)
         )
-        monkeypatch.setattr("saneless.cli.configure_logging", capture_logging)
 
         class MockSaneBackend(StubScannerBackend):
-            """Mock scanner that returns no devices."""
+            """Mock scanner that logs one DEBUG record and returns no devices."""
 
             def __init__(self, host: str = "") -> None:
                 """Accept host parameter for API compatibility."""
 
             def get_devices(self) -> list[DeviceInfo]:
-                """Return empty device list."""
+                """
+                Log a saneless DEBUG record, then report no devices.
+
+                Returns:
+                    An empty list.
+
+                """
+                logging.getLogger("saneless.scanner").debug("verbose-probe-5c1d")
                 return []
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
 
-        result = runner.invoke(cli, ["-v", "devices"])
-        assert result.exit_code == 0
-        assert captured.get("verbose") is True
+        with _restored_logging():
+            result = CliRunner().invoke(cli, ["-v", "devices"])
+            saneless_level = logging.getLogger("saneless").getEffectiveLevel()
+
+        assert result.exit_code == 0, result.output
+        assert saneless_level == logging.DEBUG
+        assert "verbose-probe-5c1d" in result.stderr
 
     def test_config_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """--config /path/to/config -> load_settings called with that path."""

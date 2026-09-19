@@ -747,13 +747,11 @@ class TestFlipPromptUI:
     ) -> None:
         """Flip prompt is not visible when no job is in AWAITING_FLIP state."""
         page.goto(browser_server_url)
-        # On idle, the flip prompt area should not show Continue/Cancel
+        # On idle there is no flip prompt at all, so no Continue control either.
         flip_continue = page.locator(
             "button:has-text('Continue'), [hx-post*='flip/continue']"
         )
-        # Either not present or not visible
-        if flip_continue.count() > 0:
-            assert not flip_continue.first.is_visible()
+        expect(flip_continue).to_have_count(0)
 
     def test_scan_button_present(self, page: Page, browser_server_url: str) -> None:
         """Scan button exists and is visible in idle state."""

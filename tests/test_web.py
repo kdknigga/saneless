@@ -148,7 +148,7 @@ def test_page_loads(client: TestClient) -> None:
 
 
 def test_health_endpoint_ok(client: TestClient) -> None:
-    """GET /health returns 200 with status ok, and needs no authentication (HLTH-01)."""
+    """GET /health returns 200 with status ok, and needs no authentication."""
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -413,9 +413,24 @@ def test_error_display(client: TestClient) -> None:
 
 
 def test_cache_invalidate(client: TestClient) -> None:
-    """POST /api/cache/invalidate refreshes resource (UI-08)."""
+    """POST /api/cache/invalidate refetches the resource and renders it."""
+    app = _app(client)
+    app.state.cache.set("tags", [{"id": 1, "name": "receipt"}])
+    fetches: list[int] = []
+
+    def fresh_tags() -> list[dict[str, object]]:
+        fetches.append(1)
+        return [{"id": 7, "name": "tax-return"}]
+
+    app.state.paperless.get_tags = fresh_tags
+
     response = client.post("/api/cache/invalidate?resource=tags")
+
     assert response.status_code == 200
+    assert fetches == [1]
+    assert "tax-return" in response.text
+    assert "receipt" not in response.text
+    assert app.state.cache.get("tags") == [{"id": 7, "name": "tax-return"}]
 
 
 def test_cache_invalidate_rejects_an_unknown_resource(client: TestClient) -> None:

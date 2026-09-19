@@ -848,7 +848,7 @@ class TestWorkerIntermediateStates:
         monkeypatch: pytest.MonkeyPatch,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """Worker sets ASSEMBLING when pipeline emits 'Assembling PDF...'."""
+        """Worker sets ASSEMBLING when the pipeline emits PipelineEvent.ASSEMBLING."""
         states_seen: list[str] = []
         store = JobStore()
         try:
@@ -896,7 +896,7 @@ class TestWorkerIntermediateStates:
         monkeypatch: pytest.MonkeyPatch,
         wait_for_state: Callable[..., Job],
     ) -> None:
-        """Worker sets UPLOADING when pipeline emits 'Uploading to paperless-ngx...'."""
+        """Worker sets UPLOADING when the pipeline emits PipelineEvent.UPLOADING."""
         states_seen: list[str] = []
         store = JobStore()
         try:

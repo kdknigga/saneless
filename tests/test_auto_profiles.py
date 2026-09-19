@@ -202,9 +202,10 @@ class TestPickClosestResolution:
         )
 
     def test_nearest_when_no_exact(self) -> None:
-        """Returns nearest resolution when DEFAULT_RESOLUTION is not available."""
+        """Returns the resolution nearest DEFAULT_RESOLUTION when it is absent."""
+        # 150 is 150 away from 300 and 600 is 300 away, so 150 is the answer.
         result = pick_closest_resolution([150, 600], target=DEFAULT_RESOLUTION)
-        assert result in (150, 600)
+        assert result == 150
 
     def test_empty_returns_target(self) -> None:
         """Returns target when no resolutions available."""
@@ -288,7 +289,8 @@ class TestPickClosestResolutionHonoursARange:
             resolution_range=(1.0, 1200.0, 1.0),
         )
 
-        assert result in (150, 600)
+        # The range alone would have offered 300 exactly; the list's nearest is 150.
+        assert result == 150
 
     def test_a_device_constraining_nothing_still_leaves_the_target_alone(self) -> None:
         """Neither shape reported means there is nothing to honour."""

@@ -19,7 +19,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.paperless import UploadResult
+from saneless.paperless import PaperlessClient, UploadResult
 from saneless.pipeline import FlipCoordinator
 from saneless.scanner import sane_backend as sane_backend_mod
 from saneless.scanner.base import DeviceCapabilities, ScanBatch, ScannerBackend
@@ -596,7 +596,7 @@ def content_page_image() -> Image.Image:
 @pytest.fixture
 def mock_paperless() -> MagicMock:
     """Return a mock PaperlessClient that succeeds."""
-    paperless = MagicMock()
+    paperless = MagicMock(spec=PaperlessClient)
     paperless.upload_document.return_value = UploadResult(
         delivered_to_api=True, task_uuid="mock-task-uuid"
     )

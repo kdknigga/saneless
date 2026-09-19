@@ -447,7 +447,7 @@ class TestSaneBackendInit:
     def test_sane_backend_init_calls_sane_init(
         self, fake_sane_module: FakeSaneModule
     ) -> None:
-        """SaneBackend constructor calls sane.init() exactly once."""
+        """SaneBackend constructor calls sane.init()."""
         assert fake_sane_module.init_call_count == 0
         SaneBackend()
         assert fake_sane_module.init_call_count == 1
