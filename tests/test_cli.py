@@ -2643,6 +2643,25 @@ class TestServeCommand:
         ]
         assert runs == []
 
+    @pytest.mark.parametrize("port", ["-1", "65536", "70000"])
+    def test_serve_out_of_range_port_is_a_usage_error(
+        self, monkeypatch: pytest.MonkeyPatch, port: str
+    ) -> None:
+        """
+        ``--port`` outside 0-65535 is refused before anything is bound.
+
+        The resolver would otherwise wrap it into a different real port.
+        """
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", port])
+
+        assert result.exit_code == 2, result.output
+        assert "--port" in result.stderr
+        assert "0<=x<=65535" in result.stderr
+        assert runs == []
+
     def test_serve_unresolvable_host_exits_2_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

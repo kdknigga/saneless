@@ -1577,6 +1577,34 @@ flip_timeout_seconds = 90
         assert settings.output.flip_timeout_seconds == 90
 
 
+class TestWebPort:
+    """
+    OutputConfig web_port is a real TCP port number.
+
+    The resolver truncates a service number to 16 bits, so an out-of-range
+    value would otherwise bind a different port without any error: 70000
+    became 4464 and 65536 became an OS-chosen port.
+    """
+
+    @pytest.mark.parametrize("value", [-1, 65_536, 70_000])
+    def test_web_port_out_of_range_rejected(self, value: int) -> None:
+        """A negative port and anything above 65535 fail validation."""
+        with pytest.raises(ValidationError, match="web_port"):
+            OutputConfig(web_port=value)
+
+    @pytest.mark.parametrize("value", [0, 65_535])
+    def test_web_port_bounds_accepted(self, value: int) -> None:
+        """0 (an OS-chosen port) and 65535 are the inclusive bounds."""
+        assert OutputConfig(web_port=value).web_port == value
+
+    def test_web_port_out_of_range_in_toml_rejected(self, tmp_config_dir: Path) -> None:
+        """A TOML ``web_port = 80800`` fails at load instead of binding 15264."""
+        config_file = tmp_config_dir / "web_port_typo.toml"
+        config_file.write_text("[output]\nweb_port = 80800\n\n[profiles.default]\n")
+        with pytest.raises(ConfigError, match="web_port"):
+            load_settings(config_path=str(config_file))
+
+
 class TestDuplexField:
     """ProfileConfig duplex field validation (DPLX-01)."""
 

@@ -235,7 +235,7 @@ saneless [--config PATH] [-v] serve [--host ADDR] [--port N]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--host` | TEXT | `0.0.0.0` (from config) | Bind address. The default `0.0.0.0` listens on all network interfaces. IPv6 addresses such as `::1` or `::` work too |
-| `--port` | int | `8080` (from config) | Bind port. `--port 0` lets the OS choose a free port |
+| `--port` | int | `8080` (from config) | Bind port, 0 to 65535. `--port 0` lets the OS choose a free port. A value outside that range is a usage error, exit 2 |
 
 Once the address is bound, `serve` prints `Serving on http://<host>:<port>` to stderr and logs the same line. The port on that line is the one actually bound, so with `--port 0` it names the port the OS chose. An IPv6 address is shown in brackets, for example `Serving on http://[::1]:43127`.
 

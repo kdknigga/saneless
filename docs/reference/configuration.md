@@ -69,7 +69,7 @@ In the path settings (`tmp_dir`, `data_dir`, `log_file`, and `consume_dir` under
 | `flip_timeout_seconds` | int | `600` | Seconds a manual duplex scan waits for the operator to flip the stack between passes, in the web UI and the CLI. If nobody confirms in time, the job fails and nothing is uploaded. Must be a whole number of seconds from 1 to 86400 (one day); 0 and negative values are rejected when the config is loaded, so there is no "wait forever" setting |
 | `min_free_space_mb` | int | `500` | Free disk space (MB) saneless keeps in reserve for assembling the PDF. It is checked twice: once before a scan starts, and again before each page is written to disk, against that page's size *plus* this reserve. A scan that runs out of room fails naming the page number and the path, and the pages already scanned are preserved |
 | `web_host` | string | `"0.0.0.0"` | Web server bind address. The default `0.0.0.0` listens on all network interfaces |
-| `web_port` | int | `8080` | Web server port |
+| `web_port` | int | `8080` | Web server port, 0 to 65535. `0` lets the OS choose a free port; a value outside the range is rejected when the config is loaded |
 
 ## `[web]`
 

@@ -503,7 +503,10 @@ class OutputConfig(BaseModel):
     flip_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
-    web_port: int = 8080
+    # A TCP port number. Bounded at load because the resolver truncates a
+    # service number to 16 bits, so 70000 would quietly bind port 4464 and
+    # 65536 an OS-chosen one. 0 stays valid: it asks the OS for a free port.
+    web_port: int = Field(default=8080, ge=0, le=65_535)
 
     @field_validator("tmp_dir", "data_dir", "log_file", mode="after")
     @classmethod

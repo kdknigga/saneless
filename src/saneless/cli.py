@@ -1065,7 +1065,10 @@ def _bind_listening_socket(host: str, port: int) -> socket.socket:
 @cli.command()
 @click.option("--host", default=None, help="Bind address.")
 @click.option(
-    "--port", default=None, type=int, help="Bind port; 0 lets the OS choose one."
+    "--port",
+    default=None,
+    type=click.IntRange(0, 65_535),
+    help="Bind port; 0 lets the OS choose one.",
 )
 @click.pass_context
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
