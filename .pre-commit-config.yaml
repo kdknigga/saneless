@@ -214,7 +214,9 @@ repos:
   # only ever reads Python, templates, CSS and JavaScript under src/. The
   # top-level exclude keeps the vendored assets out. Read-only, so it runs at
   # all three stages. tests/test_deployment_config.py holds the same pattern,
-  # asserts the two stay identical, and runs the same check in CI.
+  # asserts the two stay identical, and runs it over src/ in CI. The test picks
+  # files by suffix where this hook picks them by type, so a Python script with
+  # no .py suffix would be checked here and not there.
   - repo: local
     hooks:
       - id: no-planning-citations

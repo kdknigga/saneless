@@ -1332,6 +1332,43 @@ def _shipped_source_files() -> list[str]:
     ]
 
 
+def _citation_offenders(names: list[str], root: Path) -> list[str]:
+    """
+    Return every cited planning artefact, and every file that could not be read.
+
+    A file the guard cannot read is an offender too, not a pass: a source
+    file that is not UTF-8, or that vanished between listing and reading,
+    has not been checked, so it must not count as clean.
+
+    Args:
+        names: Repo-relative file names to check.
+        root: The directory the names are relative to.
+
+    Returns:
+        One ``name:line: text`` entry per citation, and one ``name: reason``
+        entry per file that could not be read.
+
+    """
+    offenders: list[str] = []
+    for name in names:
+        # Two clauses rather than one tuple, for the reason given in the
+        # owner guard above.
+        try:
+            text = (root / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            offenders.append(f"{name}: not UTF-8, so it was not checked: {exc}")
+            continue
+        except OSError as exc:
+            offenders.append(f"{name}: unreadable, so it was not checked: {exc}")
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if PLANNING_CITATION.search(line)
+        )
+    return offenders
+
+
 def test_no_src_file_cites_a_planning_artefact() -> None:
     """
     No shipped source file points at the planning records for its reasons.
@@ -1339,27 +1376,36 @@ def test_no_src_file_cites_a_planning_artefact() -> None:
     A comment that says only "see decision so-and-so" tells a reader of the
     product nothing, because the planning directory does not ship with it.
     Each comment in src/ has to carry its own reason in plain words.
+
+    This test and the no-planning-citations hook share one pattern, but not
+    quite one file set: the test picks files by suffix (``.py``, ``.html``,
+    ``.css``, ``.js``), while the hook picks them by the type ``identify``
+    detects, which also takes in, for example, an extensionless script with
+    a Python shebang or a ``.mjs`` file. src/ holds neither today, so the two
+    check the same files; the drift is accepted rather than making the test
+    depend on ``identify``.
     """
-    offenders: list[str] = []
-    for name in _shipped_source_files():
-        # Two clauses rather than one tuple, for the reason given in the
-        # owner guard above.
-        try:
-            text = (REPO_ROOT / name).read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        except OSError:
-            continue
-        offenders.extend(
-            f"{name}:{number}: {line.strip()}"
-            for number, line in enumerate(text.splitlines(), start=1)
-            if PLANNING_CITATION.search(line)
-        )
+    offenders = _citation_offenders(_shipped_source_files(), REPO_ROOT)
     assert not offenders, (
-        "a file under src/ cites a planning artefact. Replace the reference "
-        "with the reason it stood for, in words, or delete it where the "
-        "sentence is complete without it:\n" + "\n".join(offenders)
+        "a file under src/ cites a planning artefact or could not be read. "
+        "Replace a reference with the reason it stood for, in words, or "
+        "delete it where the sentence is complete without it:\n" + "\n".join(offenders)
     )
+
+
+def test_the_citation_guard_reports_a_file_it_cannot_read(tmp_path: Path) -> None:
+    """A non-UTF-8 or missing file is reported, never skipped as clean."""
+    (tmp_path / "latin1.py").write_bytes(b"# caf\xe9\n")
+    (tmp_path / "clean.py").write_text("# nothing to see\n", encoding="utf-8")
+
+    offenders = _citation_offenders(["latin1.py", "clean.py", "gone.py"], tmp_path)
+
+    assert [entry.split(":", 1)[0] for entry in offenders] == [
+        "latin1.py",
+        "gone.py",
+    ]
+    assert "not UTF-8" in offenders[0]
+    assert "unreadable" in offenders[1]
 
 
 def test_the_citation_hook_uses_the_guard_pattern() -> None:
