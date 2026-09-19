@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 # Every handler below is a plain ``def`` on purpose.  Each one calls blocking
 # code -- sync httpx to Paperless, sqlite through the job store, the worker --
 # and FastAPI runs ``def`` handlers on its threadpool, so a slow Paperless call
-# cannot stall ``/health`` or the status poll (ROBU-05, M-01).  The shared state
+# cannot stall ``/health`` or the status poll.  The shared state
 # they touch is locked: the JobStore's RLock, the worker's profile lock and the
 # metadata cache's per-key locks.
 router = APIRouter()
@@ -77,7 +77,7 @@ _TAGS_QUERY_DEFAULT = Query(default=[])
 
 TAG_FILTER_MAX_LENGTH: Final = 100
 """
-The cap on the tag filter, applied at the boundary before any work (T-30-76).
+The cap on the tag filter, applied at the boundary before any work.
 
 A hundred characters is far more than a tag name and far less than a payload:
 the value is a substring test against names the operator chose, so anything
@@ -89,10 +89,10 @@ shape ``MetadataResource`` uses for ``resource``.
 
 # The only metadata resources the cache holds.  A runtime alias, not a
 # TYPE_CHECKING import, because FastAPI reads it to validate the ``resource``
-# query parameter: anything else is a 422 instead of reaching the cache (N-20).
+# query parameter: anything else is a 422 instead of reaching the cache.
 MetadataResource = Literal["tags", "correspondents"]
 
-# The cookie naming the browser that started a scan (D-23).  Every attribute it
+# The cookie naming the browser that started a scan.  Every attribute it
 # is set with is deliberate: ``HttpOnly`` so no script can read it -- there is
 # no script file in this application at all; ``SameSite=Lax`` so the browser
 # withholds it on any cross-site POST; no lifetime attribute, so it is a
@@ -100,14 +100,14 @@ MetadataResource = Literal["tags", "correspondents"]
 # ``Secure``, because the appliance is served over plain HTTP on a LAN and that
 # flag would silently stop the cookie being sent rather than harden it.
 #
-# REQUIREMENTS' position, recorded here so a later reader does not mistake this
+# The token's position, recorded here so a later reader does not mistake this
 # for something it is not: the token is a footgun guard for the flip prompt,
 # not an authentication mechanism.  ``CrossOriginGuard`` allows a POST that
 # carries neither ``Sec-Fetch-Site`` nor ``Origin``, so a scripted client that
 # sends a guessed cookie of its own can answer a flip.  That is accepted on a
 # trusted LAN, not overlooked.  What the token stops is the household member
 # standing at the same appliance pressing Continue on a stack they did not
-# load, which is the failure this phase exists to close.
+# load, which is the failure the token exists to close.
 OWNER_COOKIE: Final = "saneless_owner"
 
 
@@ -134,15 +134,15 @@ def _is_owner(presented: str | None, recorded: str | None) -> bool:
     """
     Report whether a presented token speaks for the job that recorded one.
 
-    A NULL recorded token means the job is unowned and everyone may answer it
-    (UI-SPEC S5).  Every row written before this phase has one, including a
+    A NULL recorded token means the job is unowned and everyone may answer it.
+    Every row written before owner tokens existed has one, including a
     manual-duplex job that was in flight across an upgrade, and a strict rule
-    would leave such a job un-continuable until the Phase 25 flip timeout fired
-    it away.  Nothing can create a NULL-token job after this phase, so the
-    exception has a closed lifetime.
+    would leave such a job un-continuable until the manual-duplex flip timeout
+    fired it away.  Nothing creates a NULL-token job any more, so the exception
+    has a closed lifetime.
 
     The comparison goes through ``secrets.compare_digest`` so no timing
-    difference can be read off it (T-30-57).  Both sides are encoded first:
+    difference can be read off it.  Both sides are encoded first:
     the presented value arrives as text out of a header and ``compare_digest``
     refuses a non-ASCII ``str``, while it compares bytes of any two lengths
     safely.
@@ -164,12 +164,12 @@ def _is_owner(presented: str | None, recorded: str | None) -> bool:
 
 def _owner_answers(presented: str | None, job: Job | None) -> bool:
     """
-    Report whether this request may answer the named job's flip prompt (D-24).
+    Report whether this request may answer the named job's flip prompt.
 
     An unknown job id answers False: there is nothing to own, and the worker
     would have dropped the answer anyway.  The outcome is logged as a match or
     a mismatch and never as a value -- the token is not allowed into a log
-    line any more than into the markup (T-30-59).
+    line any more than into the markup.
 
     Args:
         presented: The token this request carries, or None.
@@ -190,11 +190,10 @@ def _owner_answers(presented: str | None, job: Job | None) -> bool:
     return matched
 
 
-# The freshness line's four UI-SPEC variants, composed here rather than in the
+# The freshness line's four variants, composed here rather than in the
 # template: the strip's templates own no vocabulary, and a page that assembled
-# its own prose would be a second place for the copy to drift from D-08's
-# specimen.  The dash is U+2014 with spaces on both sides, as that specimen
-# writes it.
+# its own prose would be a second place for the copy to drift.  The dash is
+# U+2014 with spaces on both sides.
 _PAUSED_PREFIX: Final = "Paused during scan — "
 _COLD_PAUSED_LINE: Final = f"{_PAUSED_PREFIX}not checked yet."
 
@@ -202,7 +201,7 @@ _COLD_PAUSED_LINE: Final = f"{_PAUSED_PREFIX}not checked yet."
 @dataclass(frozen=True, slots=True)
 class _CheckingRow:
     """
-    One cold-start placeholder row, before any probe has happened (D-06).
+    One cold-start placeholder row, before any probe has happened.
 
     It is not a :class:`~saneless.checks.CheckResult` because "we have not
     looked yet" is not one of the three ``CheckState`` members, and inventing a
@@ -239,15 +238,15 @@ def _freshness_line(cached: CachedChecks, *, scan_active: bool) -> str:
     """
     Compose the one sentence under the rows, for the four situations.
 
-    The four variants are UI-SPEC S1's, verbatim.  Two axes produce them:
-    whether any results exist yet, and whether a scan is holding the scanner.
-    The paused wording is D-08's whole point -- a strip that silently showed a
+    Two axes produce the four variants: whether any results exist yet, and
+    whether a scan is holding the scanner.  The paused wording is why the
+    checks can be skipped during a scan at all -- a strip that silently showed a
     half-hour-old Scanner row during a scan would be lying by omission, and one
     that blanked would throw away the four rows that are still true.
 
     The timestamp goes through the shared ``local_time`` filter, which is the
     same object ``saneless doctor``'s table uses, so the two surfaces cannot
-    disagree about the zone or the format (APPL-12, D-35).
+    disagree about the zone or the format.
 
     Args:
         cached: The cache snapshot this render is showing.
@@ -284,7 +283,7 @@ def _poll_line(
     that is still asking because a probe demonstrably holds the single-flight
     lock says the first check is still running instead: the button that
     ``POLL_GAVE_UP_LINE`` names starts the very probe that is already running,
-    so naming it there would be advice that cannot help (R3-WR-04).  Once the
+    so naming it there would be advice that cannot help.  Once the
     larger cap is reached the give-up line comes back even over a probe that is
     still held, because the chain has stopped: the button is again the only
     thing that can put an answer on the page, and a lock a dead thread holds
@@ -315,12 +314,12 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     """
     Build the context ``partials/checks.html`` renders from, without probing.
 
-    D-04: this reads the cache and never probes.  Probing inside
-    a request handler is what an unplugged scanner host would make hang -- a
-    sane-net connect that Linux retries six times costs roughly two minutes
-    inside a blocking C call, and a page that waited for it would be a page
-    that never arrives.  The background refresher is what fills the cache; this
-    only reads what is already there.
+    This reads the cache and never probes.  Probing inside a request handler is
+    what an unplugged scanner host would make hang -- a sane-net connect that
+    Linux retries six times costs roughly two minutes inside a blocking C call,
+    and a page that waited for it would be a page that never arrives.  The
+    background refresher is what fills the cache; this only reads what is
+    already there.
 
     ``checks`` is ``None`` on a cold cache, and that is the primary fact the
     template branches on: no results means the placeholder rows are drawn,
@@ -328,14 +327,14 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
 
     ``poll_attempt`` is the second.  It is the number the *next* request should
     carry, or ``None`` when there is to be no next request -- either because
-    there is nothing left to wait for, which is D-06's ending and still the one
-    that matters, or because the applicable cap has been reached, which is the
-    ending IN-07 needed.  The template emits its request attributes only when
-    this is set, so "should the browser ask again" is decided here and never in
-    the markup.
+    there is nothing left to wait for, which is the cold-start ending and still
+    the one that matters, or because the applicable cap has been reached, which
+    is how a chain ends when results never arrive.  The template emits its
+    request attributes only when this is set, so "should the browser ask
+    again" is decided here and never in the markup.
 
     There are two caps, and which one applies is decided by the same
-    ``probe_in_flight`` read the disjunct below uses (R3-WR-04).  With nothing
+    ``probe_in_flight`` read the disjunct below uses.  With nothing
     in flight the bound is ``POLL_ATTEMPT_CAP`` -- ten attempts, about twenty
     seconds -- which is the case that cap was sized for: a refresher thread
     that has died and a tab left open in front of it.  While a checker
@@ -347,7 +346,7 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     The larger window is still a cap: ``Lock.locked()`` stays true forever if
     the holder dies.
 
-    "Nothing left to wait for" is two facts, not one, and the second is WR-03's.
+    "Nothing left to wait for" is two facts, not one.
     An empty cache is the cold start.  A probe in flight is the case where
     results *do* exist but the answer on the page is about to be superseded: the
     probe has not stored yet, so this render is of the pre-probe entry, and with
@@ -357,7 +356,7 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     visibly do nothing.  What the disjunct costs: a render landing during a
     background probe issues a small, capped number of extra cache reads before
     it settles.  Each is a cache read and never a probe, and the count is
-    bounded by ``POLL_PROBE_ATTEMPT_CAP`` (T-30-29-02, T-30-35-01).
+    bounded by ``POLL_PROBE_ATTEMPT_CAP``.
     ``probe_in_flight`` is a ``locked()`` read and never an acquire, so no
     request thread can be parked behind the probe it is asking about.
 
@@ -369,7 +368,7 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     alone.  What changed is that a cold chain at ``POLL_ATTEMPT_CAP`` with a
     probe in flight has *not* stopped: it keeps asking up to
     ``POLL_PROBE_ATTEMPT_CAP`` and shows ``POLL_STILL_CHECKING_LINE`` in place
-    of the cold-start ``Checking…`` line (R3-WR-04).  The give-up line is
+    of the cold-start ``Checking…`` line.  The give-up line is
     withheld there because it points at the ``Check again`` button, and a click
     on that button while a probe holds the lock collapses into the probe
     already running -- advice that cannot help.  At the larger cap it comes
@@ -395,7 +394,7 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     # for the lock a live scan holds.
     scan_active = state.worker.current_job_id is not None
     # Read once, so the two decisions below cannot disagree about it.  This is
-    # `Lock.locked()`: an observation, never an acquire (T-30-29-03).
+    # `Lock.locked()`: an observation, never an acquire.
     probe_in_flight = state.refresher.probe_in_flight
     # Which cap applies is the probe's decision, and it is taken once from the
     # one read above so the line and the trigger cannot disagree about it.
@@ -428,8 +427,8 @@ def _checks_fallback_context() -> dict[str, object]:
 
     Every value here is a developer-authored constant, and that is the whole
     point: this body is rendered on a page the whole LAN can read, so no part
-    of the exception that produced it may reach the context (ASVS V7, Phase 26
-    D-10, T-30-32-03).  The exception goes to ``logger.exception`` instead.
+    of the exception that produced it may reach the context (ASVS V7).  The
+    exception goes to ``logger.exception`` instead.
 
     ``checks`` is ``None`` and ``checking_rows`` is the cold-start five, so the
     strip shows five *named* rows rather than an empty list that would read as
@@ -441,7 +440,7 @@ def _checks_fallback_context() -> dict[str, object]:
     cache is the one that failed, so this body asserts nothing about the cache
     beyond the fact that it could not be shown -- and the line names the
     ``Check again`` button that is still on the page, which is the one way
-    forward left (R4-IN-02).  ``scan_active`` is ``False`` for the same
+    forward left.  ``scan_active`` is ``False`` for the same
     reason: the render that would have read the worker is the one that failed.
     ``poll_attempt`` is ``None``, and that is what ends the chain: the template
     emits its request attributes only when it is set, so the body this context
@@ -511,7 +510,7 @@ def _tag_list_context(
     """
     Build the tag checkbox list's context: the filtered list and pinned ticks.
 
-    Two lists, not one, and that is the whole of Amendment A-5.  The filter
+    Two lists, not one, and that is the whole design.  The filter
     request carries the currently ticked ids with it -- ``hx-include`` over a
     checkbox list gathers only the boxes that are checked -- so this function
     can re-render every one of them ticked, and pin the ones the filter
@@ -523,10 +522,10 @@ def _tag_list_context(
     ``q`` is a Python-side substring test over the already-cached list and
     nothing else (ASVS V5).  It is never interpolated into a paperless-ngx
     query URL -- the cache holds the whole list, so there is nothing to ask
-    upstream and the filter costs no request at all (T-30-75) -- and it is
+    upstream and the filter costs no request at all -- and it is
     deliberately absent from the context this returns, so it cannot be echoed
-    back into the page (T-30-74).  Its length is already bounded by the
-    route's ``max_length`` before this runs (T-30-76).
+    back into the page.  Its length is already bounded by the route's
+    ``max_length`` before this runs.
 
     Args:
         state: Application state, for the metadata cache and Paperless client.
@@ -538,7 +537,7 @@ def _tag_list_context(
         filtered list, the ticked ids, and whether any tag exists at all.
 
     """
-    # IN-01.  With ``[web] show_tags`` off the tag markup is never emitted, so
+    # With ``[web] show_tags`` off the tag markup is never emitted, so
     # a fetch here buys nothing and costs a paperless-ngx round trip on every
     # cold-cache page load -- and the flag that would hide the list is the same
     # flag that decides whether the data can ever be seen.  The guard sits in
@@ -588,19 +587,19 @@ def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | Non
     request landing as a job ends -- a flip Continue or Abort in particular --
     finds no current job.  Falling back to the most recent job makes that
     request report the job that just ended instead of the idle "Ready to scan."
-    copy, which would claim nothing happened (M-02).  Every route that renders
-    the status area uses this one lookup, so none of them can drift (D-17).
+    copy, which would claim nothing happened.  Every route that renders the
+    status area uses this one lookup, so none of them can drift.
 
-    The fallback skips rows rejected at submit (D-06).  A refused submit --
+    The fallback skips rows rejected at submit.  A refused submit --
     queue full, worker down or degraded -- writes a REJECTED row that is newer
     than the job running at the time, yet it never ran, so it cannot be "the
     job that just ended".  ``JobStore.latest_run_job`` leaves those rows out;
-    D-17's contract is otherwise unchanged, and history still lists them.
+    the lookup's contract is otherwise unchanged, and history still lists them.
 
     The fallback also skips a refused submit whose REJECTED write the request
-    could not make and owed to the worker (WR-01).  Until the worker writes it,
+    could not make and owed to the worker.  Until the worker writes it,
     that row is PENDING with no marker and would render as "Starting scan..."
-    with the Scan button disabled, for a scan that never ran (IN-08).  The
+    with the Scan button disabled, for a scan that never ran.  The
     accepted residual window is a poll landing during the request's own write
     attempt, between ``create_job`` and that write or the ``owe_rejection``
     call after it failed.
@@ -632,14 +631,14 @@ def _busy_line(worker: ScanWorker, job_store: JobStore, job: Job | None) -> str 
 
     Three situations, in the precedence ``busy_line`` itself documents.  A
     PENDING job while the worker runs a *different* one is waiting in the
-    queue, and is told what it is waiting for and how many jobs are ahead
-    (APPL-08).  The job the worker is actually running, on its second
+    queue, and is told what it is waiting for and how many jobs are ahead.
+    The job the worker is actually running, on its second
     manual-duplex pass, leads with the pages counted on the first.  Everything
     else is the plain progress prose, unchanged.
 
     The zero case reads as being next in line; a count of none ahead is never
     spelled out as a number, because it is technically true and reads like a
-    bug (UI-SPEC S5).  That rule lives in ``vocabulary.busy_line``, so this
+    bug.  That rule lives in ``vocabulary.busy_line``, so this
     function passes the count through and does not restate it.
 
     Args:
@@ -669,9 +668,9 @@ class _StatusFacts:
     """
     The per-request facts a status render needs beyond the worker and store.
 
-    Bundled rather than passed one by one because ``_status_context`` had
-    reached ``PLR0913``'s five-parameter ceiling and this plan adds a sixth
-    fact.  A suppression is forbidden (CLAUDE.md), and ``create_job`` already
+    Bundled rather than passed one by one because passing them separately
+    would take ``_status_context`` past ``PLR0913``'s five-parameter ceiling.
+    A suppression is forbidden (CLAUDE.md), and ``create_job`` already
     had to take the same route, so the frozen dataclass is the established
     answer here.
 
@@ -698,8 +697,8 @@ def _status_facts(
 
     ``owner_token`` and ``scan_blocked`` are both derived here rather than at
     each call site, so a new status-rendering route cannot silently lose the
-    owner's flip prompt (D-24) or hand back an enabled Scan button on a
-    blocked appliance (D-15).  Only the two facts a route genuinely knows
+    owner's flip prompt or hand back an enabled Scan button on a blocked
+    appliance.  Only the two facts a route genuinely knows
     about itself -- the answer it just claimed, and the job the browser is
     following -- are passed in.
 
@@ -707,11 +706,11 @@ def _status_facts(
     process start, so it cannot change while the process runs: there is no live
     flip to orchestrate and ``POST /api/checks/refresh`` deliberately carries
     neither the button nor the reason line, because re-running the checks
-    cannot change a verdict that was never read from them (UI-SPEC S8).
+    cannot change a verdict that was never read from them.
 
     This unwraps the configured token, and the value goes to the predicate and
     nowhere else: it is never logged, rendered or echoed, and the flag that
-    reaches the template is a bool (ASVS V7, CFG-05).
+    reaches the template is a bool (ASVS V7).
 
     Args:
         request: The incoming request, for its cookies and the app's settings.
@@ -739,27 +738,27 @@ def _status_context(
     """
     Build the context ``partials/status.html`` renders from.
 
-    The job comes from ``_current_or_recent_job`` (D-17), and the store's
-    recorded state still selects the branch the partial renders, so D-16's
-    objection to a route asserting state the store has not recorded does not
-    apply.  What this adds is ``flip_answer``: for a job the store still reads
-    as ``AWAITING_FLIP``, whether its flip wait has already been answered, and
-    with what.  That is a fact the worker genuinely holds, and it lets the
-    partial acknowledge the answer instead of re-rendering the Continue and
-    Abort buttons as though the click did nothing (CR-01).
+    The job comes from ``_current_or_recent_job``, and the store's recorded
+    state still selects the branch the partial renders, so no route asserts a
+    state the store has not recorded.  What this adds is ``flip_answer``: for a
+    job the store still reads as ``AWAITING_FLIP``, whether its flip wait has
+    already been answered, and with what.  That is a fact the worker genuinely
+    holds, and it lets the partial acknowledge the answer instead of
+    re-rendering the Continue and Abort buttons as though the click did
+    nothing.
 
     ``claimed`` exists because the worker may already have cleared its flip
     coordinator by the time the route reads it: a route that just claimed an
     answer is authoritative for its own job.  It is used only when it names
     the job being rendered, so a posted foreign job id cannot acknowledge a
-    job nobody answered (T-25-49).
+    job nobody answered.
 
     ``followed_job_id`` is the second such extra fact: the job this browser
     submitted, baked into its poll URL by ``start_scan``.  It is used only to
     select which job is rendered, and when it names no existing row the
     function falls back to ``_current_or_recent_job``, so a browser whose job
-    has been pruned degrades to today's behaviour instead of meeting a 404
-    (D-25).  The context key echoes back only an id that was actually found,
+    has been pruned degrades to today's behaviour instead of meeting a 404.
+    The context key echoes back only an id that was actually found,
     which is what keeps that fallback rendering byte-identical to the one
     ``GET /api/jobs/current/status`` produces.
 
@@ -777,18 +776,18 @@ def _status_context(
     ``is_owner`` is decided here, once, rather than at each call site, for the
     same reason ``refresh_checks`` is: a route added later must not be able to
     acquire or lose the gate by forgetting about it.  The partial reads the
-    flag and never the token, so the value itself has no path into the markup
-    (T-30-59).
+    flag and never the token, so the value itself has no path into the
+    markup.
 
     ``scan_blocked`` rides along for the same reason again, and it is why every
     out-of-band ``#scan-btn`` -- the scan submit's own response, both status
     polls and both flip answers -- carries the blocked state: they all render
     ``partials/scan_button.html`` from this one context, so no status response
-    can hand back an enabled button on an appliance that cannot upload
-    (UI-SPEC S8, C-10).  On a blocked appliance ``POST /api/scan`` is refused
-    before it reaches its success branch, so that one is unreachable today; it
-    is included anyway, because the property being defended is that the flag
-    lives in one partial fed from one builder, not that each caller remembered.
+    can hand back an enabled button on an appliance that cannot upload.  On a
+    blocked appliance ``POST /api/scan`` is refused before it reaches its
+    success branch, so that one is unreachable today; it is included anyway,
+    because the property being defended is that the flag lives in one partial
+    fed from one builder, not that each caller remembered.
 
     Returns:
         The job, its flip answer, the followed job's id, the one busy line,
@@ -841,14 +840,14 @@ class _ProfileOption:
 
 def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
     """
-    Build the ordered option list the Profile select renders (APPL-05, D-21).
+    Build the ordered option list the Profile select renders.
 
-    D-21 asks for feeder profiles first on a sheet-fed device, and this is
+    Feeder profiles come first on a sheet-fed device, and this is
     where ``has_flatbed`` is read: sheet-fed means the device reports no
     flatbed source, and at render time the server's evidence for that is the
     generated profile set, which mirrors the device's sources.  So the answer
-    is derived from the profiles already in hand -- no new device probe, no new
-    config key, which is exactly what the decision asks for.
+    is derived from the profiles already in hand -- no new device probe and no
+    new config key.
 
     The classification comes from ``classify_source`` and from nowhere else:
     its docstring states it is the only source-classification rule in the
@@ -880,8 +879,8 @@ def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
             (
                 _ProfileOption(
                     name=name,
-                    # Amendment A-3.  A deployed config whose profiles predate
-                    # this phase carries an empty human name: startup
+                    # A deployed config whose profiles predate the ``label``
+                    # key carries an empty human name: startup
                     # generation only runs on a bare default config, so it is
                     # skipped there, and a blank option is worse than a raw
                     # profile name.  ``saneless auto-profiles --force`` is what
@@ -906,11 +905,11 @@ def index(request: Request) -> Response:
     Render the main page with scan form, status, and job history.
 
     Populates profile selector from the worker's profile set (read under its
-    profile lock, D-19), fetches tags and correspondents from cache or
+    profile lock), fetches tags and correspondents from cache or
     paperless-ngx, and loads recent job history from the database.
     """
     state = request.app.state
-    # D-05: the refresher only probes while a page says someone is looking, so
+    # The refresher only probes while a page says someone is looking, so
     # every route that renders the strip has to stamp this.  Without it the
     # lazy thread returns at its first guard for ever and the strip never
     # leaves its cold-start rows.
@@ -920,7 +919,7 @@ def index(request: Request) -> Response:
     # context the filter route builds, so it goes through the same function
     # rather than a second shape the two could drift apart on.
     tag_list = _tag_list_context(state, q="", selected=[])
-    # The correspondent half of the same saving (IN-01).  ``show_correspondent``
+    # The correspondent half of the same saving.  ``show_correspondent``
     # off means the select is left out of the markup, so this fetch would be a
     # second cold-cache round trip for a list nobody can be shown.  The key
     # stays in the context either way: the template reaches for it inside its
@@ -945,7 +944,7 @@ def index(request: Request) -> Response:
             # it.  A browser selects the first option when none is marked, so
             # naming the first one here is the only way the highlighted option
             # and the description beneath it cannot disagree on first paint --
-            # and after the D-21 regrouping the first option is no longer
+            # and after the feeder-first regrouping the first option is no longer
             # necessarily the first profile in the config file.
             "selected": profiles[0].name if profiles else "",
             "selected_description": profiles[0].description if profiles else "",
@@ -954,19 +953,19 @@ def index(request: Request) -> Response:
             **status,
             **_checks_context(state),
             "jobs": jobs,
-            # The title input's maxlength; templates own no vocabulary (ROBU-08).
+            # The title input's maxlength; templates own no vocabulary.
             "title_max_length": TITLE_MAX_LENGTH,
             # The reason line's copy, which only the full page renders: it is
             # never an out-of-band swap target, so no status response needs it
-            # and it never has to exist as an empty placeholder (UI-SPEC S8).
+            # and it never has to exist as an empty placeholder.
             # The template reads the string and decides nothing; the flag that
             # says whether to render it comes from the status context.
             "scan_blocked_reason": SCAN_BLOCKED_REASON,
-            # Which optional controls this appliance's form carries (D-28).  A
+            # Which optional controls this appliance's form carries.  A
             # configured key and not a per-browser toggle: one appliance, one
             # form shape, and the template renders the controls or leaves them
             # out of the markup entirely rather than hiding them with CSS.
-            # Turning one off changes the form and never the scan (D-29) --
+            # Turning one off changes the form and never the scan --
             # ``start_scan`` falls back to the profile's defaults for exactly
             # the control that is no longer on the page.
             "show_tags": state.settings.web.show_tags,
@@ -982,9 +981,9 @@ def health(request: Request) -> dict[str, str] | JSONResponse:
 
     Returns 200 with ``{"status": "ok"}`` when the worker is healthy.
     Otherwise 503, whose detail distinguishes a failing job store ("job store
-    failing") from a dead worker thread ("worker thread is down") (D-10).
+    failing") from a dead worker thread ("worker thread is down").
     Docker's HEALTHCHECK marks the container unhealthy on a 503 but does not
-    restart it (documented in 26-14).
+    restart it, as ``docs/reference/docker.md`` explains.
     """
     worker_health = request.app.state.worker.health
     if worker_health is WorkerHealth.HEALTHY:
@@ -1010,7 +1009,7 @@ def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
         # The class name and not the exception: a configured paperless.url may
         # carry ``user:pass@`` and httpx puts the URL it could not reach in the
         # exception's string form, which is why every handler in this module
-        # names the class instead (ASVS V7, IN-02).
+        # names the class instead (ASVS V7).
         logger.warning("Paperless connection test failed: %s", type(exc).__name__)
         return JSONResponse(
             status_code=502,
@@ -1039,7 +1038,7 @@ def _unhealthy_rejection(
 
     Returns:
         ``None`` when the worker is healthy, otherwise the rejection to raise
-        and the job-row error text that records it (D-05, D-11).
+        and the job-row error text that records it.
 
     """
     match worker_health:
@@ -1060,15 +1059,15 @@ def _record_refused_submit(
     """
     Record a submit refused before any job row existed, in one statement.
 
-    D-05 departs from C-09's "create the row only after enqueue" because the
-    user wants the refused attempt visible in history.  The row is written
+    This departs from the older rule of creating a row only after enqueue,
+    because a refused attempt should be visible in history.  The row is written
     already ``ERROR`` with ``ErrorCategory.REJECTED``, the marker that keeps it
-    out of the status area (D-06).
+    out of the status area.
 
     ``create_rejected_job`` is a single ``INSERT``.  Create-then-finish would be
     two transactions, and a failure between them would leave a PENDING row with
-    no marker that nothing ever reconciles, disabling the Scan button for good
-    (WR-01).  With one statement a failure leaves no row at all.
+    no marker that nothing ever reconciles, disabling the Scan button for good.
+    With one statement a failure leaves no row at all.
 
     Args:
         job_store: The job store to write to.
@@ -1101,17 +1100,16 @@ def _reject_created_job(
     worker: ScanWorker, job_store: JobStore, job_id: str, *, error: str
 ) -> str | None:
     """
-    Mark a job row the worker then refused as a REJECTED error (D-05, D-06).
+    Mark a job row the worker then refused as a REJECTED error.
 
     The row had to exist before ``put_nowait``, or the worker could dequeue an
-    id with no row (D-05), so this refusal is recorded by finishing that row.
-    The ``ErrorCategory.REJECTED`` marker is what keeps it out of the status
-    area (D-06).
+    id with no row, so this refusal is recorded by finishing that row.  The
+    ``ErrorCategory.REJECTED`` marker is what keeps it out of the status area.
 
     The row already exists, so a failed write cannot simply be dropped: the
     row would stay PENDING with no marker, disabling the Scan button until a
     restart.  It is owed to the worker instead, which records it on its next
-    idle tick (WR-01).
+    idle tick.
 
     Args:
         worker: The worker a failed write is owed to.
@@ -1157,25 +1155,25 @@ def start_scan(
 
     Input is validated before any job row exists: a title over
     ``TITLE_MAX_LENGTH`` or a profile that is not configured (checked under
-    the worker's profile lock) is a 422 and writes nothing (ROBU-08, D-19).
+    the worker's profile lock) is a 422 and writes nothing.
 
     A valid submit creates the job row and offers it to the worker, returning
     the status partial once the job is queued.  That response re-renders the
-    Scan button out-of-band from server state (ROBU-04) and clears the
+    Scan button out-of-band from server state and clears the
     ``#status-message`` slot out-of-band, so an error left there by an earlier
-    rejected submit disappears (D-03).  A refused submit records a
+    rejected submit disappears.  A refused submit records a
     REJECTED error row and raises: 429 with ``Retry-After`` when the queue is
-    full, 503 when the worker is down or degraded (ROBU-02, D-05, D-11), and
+    full, 503 when the worker is down or degraded, and
     503 with its own message when the paperless-ngx API token is a placeholder
     nobody replaced, which is the one failure certain to waste paper because
-    the pages would be scanned and then have nowhere to go (APPL-07, D-15).
+    the pages would be scanned and then have nowhere to go.
     The rendered error reloads Job History only when that row was written.
 
     Args:
         request: The incoming HTTP request.
         profile: Scan profile name.
         title: Document title; when blank, the profile's title, else
-            'Scan <time>' (D-16).
+            'Scan <time>'.
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
 
@@ -1190,13 +1188,13 @@ def start_scan(
     if found is None:
         raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
     title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
-    # D-29, as WR-06 corrected it.  Hiding a control changes the form, never
-    # the scan: with ``[web] show_tags`` or ``show_correspondent`` off, the
-    # submit carries nothing for that field and the profile's own default is
-    # what applies, exactly as a blank title already falls back to the
-    # profile's title on the line above.  An operator who turns a control off
-    # gets the profile's answer rather than none at all, and the CLI, which has
-    # always applied these defaults, stops being the odd one out.
+    # Hiding a control changes the form, never the scan: with
+    # ``[web] show_tags`` or ``show_correspondent`` off, the submit carries
+    # nothing for that field and the profile's own default is what applies, exactly as a
+    # blank title already falls back to the profile's title on the line above.
+    # An operator who turns a control off gets the profile's answer rather than
+    # none at all, and the CLI, which has always applied these defaults, stops
+    # being the odd one out.
     #
     # The gate is the config key and never the submitted value, because the
     # submitted value cannot carry the distinction this needs: an empty tag
@@ -1204,7 +1202,7 @@ def start_scan(
     # control was never rendered or was rendered and the user cleared it.  Only
     # the setting that decided which page was served knows which happened.
     # Reading the value instead took away an ability the appliance had -- the
-    # web path applied no profile defaults at all before this phase, so
+    # web path once applied no profile defaults at all, so
     # ``tags or found.default_tags`` silently re-tagged a submit from somebody
     # who had deliberately unticked every box.  With the control on the page
     # the submit is now the whole answer, cleared list included; with it off
@@ -1218,13 +1216,13 @@ def start_scan(
         profile=profile, title=title, tags=tags, correspondent=correspondent
     )
 
-    # D-15: the route guard is the enforcement and the disabled Scan button is
+    # The route guard is the enforcement and the disabled Scan button is
     # only a courtesy, so this refusal holds for curl, for a script, and for a
     # browser whose ``disabled`` attribute was removed in devtools.  It is
     # unconditional -- a configured consume directory does not buy an exception
     # -- and it sits ahead of ``create_job`` so a scan that could never upload
     # leaves exactly one row: the REJECTED one, which Job History shows so the
-    # attempt is visible rather than silently swallowed (Phase 26 D-05).
+    # attempt is visible rather than silently swallowed.
     # The degraded-worker rejection is deliberately not reused here, and this
     # comment names it in prose rather than as the symbol so a grep for that
     # member still counts only the places that raise it: "the scan service was
@@ -1238,7 +1236,7 @@ def start_scan(
     # after the PaperlessClient build in ``web/app.py`` and the Paperless check
     # in ``checks.py``.  The value goes to the predicate and nowhere else: it is
     # never logged, rendered, echoed or put in the job row, whose text names the
-    # problem and the file to edit and never the secret (ASVS V7, CFG-05).
+    # problem and the file to edit and never the secret (ASVS V7).
     if is_placeholder_token(state.settings.paperless.token.get_secret_value()):
         written = _record_refused_submit(
             state.job_store, form, error=TOKEN_UNSET_JOB_ERROR
@@ -1251,7 +1249,7 @@ def start_scan(
         written = _record_refused_submit(state.job_store, form, error=error)
         raise RequestRejected(rejection, job_id=written)
 
-    # D-23's mint rule: a token is minted on the first submit from a browser
+    # The mint rule: a token is minted on the first submit from a browser
     # and reused for every later job from it, so two tabs on one device do not
     # disown each other.  It is recorded on the row either way; only a mint
     # reaches the response as a cookie.
@@ -1269,9 +1267,9 @@ def start_scan(
     match result:
         case SubmitResult.ACCEPTED:
             # A job created by this request cannot have a flip answer yet.
-            # Only a successful scan clears the status-message slot (D-03), and
-            # only a successful scan carries the strip out-of-band: the scanner
-            # has just become busy, so D-08's paused note is due now rather than
+            # Only a successful scan clears the status-message slot, and only a
+            # successful scan carries the strip out-of-band: the scanner has
+            # just become busy, so the strip's paused note is due now rather than
             # at the end of the cache's TTL.  The strip's own context rides
             # along because the partial is rendered inside this response.
             response = state.templates.TemplateResponse(
@@ -1280,7 +1278,7 @@ def start_scan(
                 {
                     # The created job is the followed job, so the poll URL this
                     # browser is handed names it and the status area keeps
-                    # reporting the scan this person started (D-25).
+                    # reporting the scan this person started.
                     **_status_context(
                         state.worker,
                         state.job_store,
@@ -1330,11 +1328,11 @@ def current_job_status(request: Request) -> Response:
 
     Returns the status partial template for HTMX polling swap.  While an
     answered job is still recorded ``AWAITING_FLIP``, the partial shows the
-    acknowledgment rather than the flip buttons (CR-01).
+    acknowledgment rather than the flip buttons.
 
-    The response re-renders the Scan button out-of-band from server state
-    (ROBU-04).  It never clears ``#status-message``: a poll carrying that clear
-    would erase a rejection shown mid-scan within a second (D-03).
+    The response re-renders the Scan button out-of-band from server state.
+    It never clears ``#status-message``: a poll carrying that clear would erase
+    a rejection shown mid-scan within a second.
     """
     state = request.app.state
     return state.templates.TemplateResponse(
@@ -1350,7 +1348,7 @@ def current_job_status(request: Request) -> Response:
 @router.get("/api/jobs/{job_id}/status")
 def followed_job_status(request: Request, job_id: str) -> Response:
     """
-    Poll the status of the job this browser submitted (D-25).
+    Poll the status of the job this browser submitted.
 
     Declared after ``/api/jobs/current/status`` so that literal path keeps
     winning: a browser that submitted nothing still gets today's route and
@@ -1358,13 +1356,13 @@ def followed_job_status(request: Request, job_id: str) -> Response:
 
     The path parameter is an opaque store lookup key and nothing else.  It
     never builds a filesystem path, a URL or a template name, so there is no
-    traversal surface to guard (T-30-61), and an id naming no row is a
+    traversal surface to guard, and an id naming no row is a
     fallback rather than a 404 by design: a browser whose job has been pruned
     degrades to the inferred rendering, and a 404 would additionally confirm to
     a caller which ids exist.
 
     Everything else matches ``current_job_status``: the Scan button rides along
-    out-of-band (ROBU-04) and ``#status-message`` is left alone (D-03).
+    out-of-band and ``#status-message`` is left alone.
 
     Args:
         request: The incoming HTTP request.
@@ -1399,18 +1397,18 @@ def get_checks(
 
     This is the target of the cold-start poll, and it is a cache read: it never
     probes, so no number of open browser tabs can raise the probe rate above
-    the cache's TTL (D-04, T-30-26).  The poll ends itself -- the body this
+    the cache's TTL.  The poll ends itself -- the body this
     returns once results exist carries no ``hx-trigger``, so the swap that
     installs it is the last one.
 
-    ``attempt`` is how the poll ends when results never arrive (IN-07).  Each
+    ``attempt`` is how the poll ends when results never arrive.  Each
     body names the number the next request should carry, so the count lives in
     the URL rather than on the server: the strip is one shared cache read and
     there is nothing per-tab to keep, and a browser that goes away takes its
     count with it.
 
-    This route no longer hands its own ordinary failures to ``render_error``
-    (R3-CR-02).  An error response is the one thing the polling element cannot
+    This route no longer hands its own ordinary failures to ``render_error``.
+    An error response is the one thing the polling element cannot
     usefully receive, so both of the failures this handler can see end as a
     trigger-free strip at 200 instead.  An out-of-range counter is clamped
     rather than refused: the ``Query`` bound that used to make it a 422 is
@@ -1433,7 +1431,7 @@ def get_checks(
             value below zero is read as the start of a fresh chain and a value
             above the larger cap is read as that cap, where the response
             carries no request attribute at all and the strip stops asking.
-            The bound is the *larger* of the two caps on purpose (R3-WR-04):
+            The bound is the *larger* of the two caps on purpose:
             clamping at ``POLL_ATTEMPT_CAP`` would cut a legitimate chain that
             is waiting on a live probe down to an ending it never reached.
 
@@ -1459,7 +1457,7 @@ def get_checks(
 @router.post("/api/checks/refresh")
 def refresh_checks(request: Request) -> Response:
     """
-    Re-probe every check now, bypassing the TTL, and render the result (D-09).
+    Re-probe every check now, bypassing the TTL, and render the result.
 
     This is the one handler in this module allowed to probe, and the bypass is
     the whole point of the button.  Routing the click through the refresher's
@@ -1477,7 +1475,7 @@ def refresh_checks(request: Request) -> Response:
     would cost a Paperless request and two filesystem writes to produce it
     twice.
 
-    The collapse used to cost the clicker three things, and WR-03 named each.
+    The collapse used to cost the clicker three things.
     The strip rendered was the cache *as it stood* -- the pre-probe entry,
     because the in-flight probe had not stored yet.  Because results already
     existed the body carried no trigger, so nothing on the page was ever going
@@ -1495,7 +1493,7 @@ def refresh_checks(request: Request) -> Response:
     the stamp it wrote, this handler holds that stamp for the length of the
     request, and ``release_manual_claim`` compares before it clears -- so a
     release can only ever undo this request's own grant and never one a later
-    caller made (R3-IN-03).  The grant is tested with ``is not None`` and not
+    caller made.  The grant is tested with ``is not None`` and not
     for truth: the stamp is a ``time.monotonic()`` reading, which counts from
     boot, so the first click on a freshly booted appliance can hold a perfectly
     valid grant of 0.0.
@@ -1509,7 +1507,7 @@ def refresh_checks(request: Request) -> Response:
     That render is guarded the way ``get_checks``'s is, and only the render.
     ``_checks_context`` raising here used to be a 500, and because the button
     aims at ``#checks-body`` that 500 arrived carrying the strip's own
-    ``HX-Target`` -- which, until R4-WR-01 narrowed the exemption to a GET,
+    ``HX-Target`` -- which, until the exemption was narrowed to a GET,
     meant the error body was written over the strip, taking the five rows and
     the only button that could bring them back.  Now a failure inside the
     strip's rendering ends as ``_checks_fallback_context`` at 200 on this route
@@ -1527,12 +1525,12 @@ def refresh_checks(request: Request) -> Response:
     mutually excludes two callers and a status probe landing mid-scan is a
     second caller into the same C library.  Deriving it from the job state is
     also what stops two checkers contending from being rendered to a household
-    member as a running scan (WR-04).
+    member as a running scan.
 
     ``CrossOriginGuard`` is app-wide middleware on every non-safe method
     (``web/app.py``), so this POST inherits the cross-site check and must
     **not** add a per-route dependency: a dependency is something a route added
-    later can forget, and the middleware is not (T-30-46, D-23).
+    later can forget, and the middleware is not.
 
     A registry that raised is logged by the probe and stores nothing, leaving
     the previous entry in place -- and a strip that blanked would be worse than
@@ -1547,7 +1545,7 @@ def refresh_checks(request: Request) -> Response:
     *concurrent* callers, and a serial loop is not concurrent.  The cost is
     not only traffic; ``ScanWorker._scan_job`` blocks on a scanner gate that is
     not a fair lock, so an unbounded loop can park a submitted job whose row
-    already reads ``SCANNING`` (WR-05).  A too-soon click re-renders the
+    already reads ``SCANNING``.  A too-soon click re-renders the
     current strip instead of erroring, because the click is not wrong, only
     early: there is nothing to tell the person at the appliance, and the
     response is the same partial from the same cache read either way.
@@ -1638,7 +1636,7 @@ def get_profile_description(request: Request, profile: str) -> Response:
     URL or a template name.  It is validated against the known profile set
     before any work, by one locked lookup that both checks the name and yields
     the profile, leaving no check-then-read gap -- the same shape ``start_scan``
-    uses.  An unknown name is a 422 (T-30-69).
+    uses.  An unknown name is a 422.
 
     Args:
         request: The incoming HTTP request.
@@ -1674,7 +1672,7 @@ def invalidate_cache(
 
     After clearing the cached entry, fetches and returns the updated
     partial for the specified resource.  Any other resource name is a 422
-    before the cache is touched (N-20).
+    before the cache is touched.
 
     The tag refresh renders the same partial the filter does, from the same
     context, so a refresh mid-filter comes back filtered and still ticked.  The
@@ -1731,26 +1729,26 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
     Answer the named job's flip prompt with Continue, starting its pass B.
 
-    The posted ``job_id`` scopes the answer (CR-01).  A Continue for any other
+    The posted ``job_id`` scopes the answer.  A Continue for any other
     job, one sent before that job reached the flip prompt, or one arriving
     after the prompt was already answered is dropped -- and the route still
-    returns the current status rather than an error (D-16).  Nothing is
+    returns the current status rather than an error.  Nothing is
     waited for: the route renders whatever the store has recorded and the
     one-second poll picks up pass B from there.
 
     While the store still reads ``AWAITING_FLIP`` for an answered job, the
     partial acknowledges the answer in place of the Continue and Abort
     buttons, so a claimed or repeated click never re-renders a prompt that
-    looks unanswered (CR-01).
+    looks unanswered.
 
     A Continue from a browser that does not hold the job's owner token is
-    dropped in exactly the same way, and for the same reason (D-24): the
+    dropped in exactly the same way, and for the same reason: the
     household member who did not load the paper must not be able to start
     pass B, and must not be shown a failure for trying either.  A job whose
     ``owner_token`` is NULL is unowned and anyone may answer it.
 
     The response re-renders the Scan button out-of-band from server state
-    (ROBU-04) and leaves ``#status-message`` alone (D-03).
+    and leaves ``#status-message`` alone.
     """
     state = request.app.state
     presented = _presented_owner(request)
@@ -1779,22 +1777,22 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
     Answer the named job's flip prompt with Abort, failing it before pass B.
 
-    The posted ``job_id`` scopes the answer (CR-01): a double-clicked Abort
+    The posted ``job_id`` scopes the answer: a double-clicked Abort
     cannot land on the next queued job.  An Abort for any other job, one sent
     before that job reached the flip prompt, or one arriving after Continue
-    already answered is dropped rather than reported as an error (D-16): the
+    already answered is dropped rather than reported as an error: the
     route returns the current status either way.
 
     While the store still reads ``AWAITING_FLIP`` for an answered job, the
     partial shows "Aborting scan..." (or the answer that won) in place of the
-    buttons, so the response never invites a second click (CR-01).
+    buttons, so the response never invites a second click.
 
     An Abort from a browser that does not hold the job's owner token is
-    dropped the same way (D-24): someone else's scan is not theirs to stop.
+    dropped the same way: someone else's scan is not theirs to stop.
     A job whose ``owner_token`` is NULL is unowned and anyone may answer it.
 
     The response re-renders the Scan button out-of-band from server state
-    (ROBU-04) and leaves ``#status-message`` alone (D-03).
+    and leaves ``#status-message`` alone.
     """
     state = request.app.state
     presented = _presented_owner(request)
