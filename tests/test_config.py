@@ -203,8 +203,11 @@ class TestLoadedConfigPath:
         settings = load_settings()
         assert settings.config_path == Path("saneless.toml")
 
-    def test_home_search_path_is_recorded(self, empty_cwd_and_home: Path) -> None:
+    def test_home_search_path_is_recorded(
+        self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A config found under the redirected HOME is recorded (D-16)."""
+        monkeypatch.delenv("XDG_CONFIG_HOME")
         home_config = empty_cwd_and_home / "home" / ".config" / "saneless"
         home_config.mkdir(parents=True)
         (home_config / "config.toml").write_text("[profiles.default]\n")
@@ -239,6 +242,7 @@ class TestLoadedConfigPath:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A HOME change after import is honoured by the search list (D-16)."""
+        monkeypatch.delenv("XDG_CONFIG_HOME")
         monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
         expected = tmp_path / "elsewhere" / ".config" / "saneless" / "config.toml"
         assert config_mod.config_search_paths()[1] == expected
@@ -290,12 +294,15 @@ class TestXdgBaseDirectories:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> Path:
         """
-        Run in an empty CWD with HOME redirected into tmp_path.
+        Run in an empty CWD with HOME redirected and both XDG variables unset.
 
-        ``clean_env`` has already removed any ambient XDG variables.
+        The suite's autouse ``hermetic_env`` points every XDG variable into a
+        fake home; these tests are about what happens without them.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        monkeypatch.delenv("XDG_CONFIG_HOME")
+        monkeypatch.delenv("XDG_STATE_HOME")
         return tmp_path
 
     @pytest.mark.parametrize("base", _XDG_BASES)
@@ -382,11 +389,6 @@ class TestXdgBaseDirectories:
         output = Settings().output
         assert output.data_dir == state
         assert output.log_file == state / "saneless.log"
-
-    def test_xdg_variables_are_removed_before_each_test(self) -> None:
-        """``clean_env`` keeps developer and CI XDG variables out of the suite."""
-        assert "XDG_CONFIG_HOME" not in os.environ
-        assert "XDG_STATE_HOME" not in os.environ
 
 
 class TestInvalidToml:
@@ -2076,10 +2078,10 @@ class TestDataDir:
         assert data_dir.parts[-3:] == (".local", "state", "saneless")
 
     def test_data_dir_default_is_not_the_temp_dir(self) -> None:
-        """The default data_dir is not tmp_dir and is not under the temp root."""
+        """The default data_dir is the XDG state directory, not tmp_dir."""
         config = OutputConfig()
+        assert config.data_dir == Path(os.environ["XDG_STATE_HOME"]) / "saneless"
         assert config.data_dir != config.tmp_dir
-        assert not config.data_dir.is_relative_to(tempfile.gettempdir())
 
     def test_db_path_is_saneless_db_under_data_dir(self) -> None:
         """db_path is <data_dir>/saneless.db as a Path."""

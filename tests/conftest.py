@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,13 +32,22 @@ if TYPE_CHECKING:
     from saneless.scanner.base import DeviceInfo, PageRecord, PageSink, ScanSettings
     from saneless.vocabulary import JobState
 
-_TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
-# Keeps the suite out of the developer's real ~/.local/state/saneless, which is
-# where data_dir would otherwise resolve once a test builds a JobStore.
-_TEST_DATA = str(Path(tempfile.gettempdir()) / "saneless-test" / "data")
-_TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
-
 _POLL_INTERVAL = 0.02
+
+# Where Playwright keeps its browsers, resolved once from the real environment
+# when this module is imported -- before any test redirects HOME. The browser
+# driver starts inside a test, where HOME and XDG_CACHE_HOME already point at an
+# empty fake home, and it would look for Chromium there.
+_BROWSERS = os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or str(
+    Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ms-playwright"
+)
+
+_XDG_BASES = (
+    ("XDG_CONFIG_HOME", (".config",)),
+    ("XDG_STATE_HOME", (".local", "state")),
+    ("XDG_DATA_HOME", (".local", "share")),
+    ("XDG_CACHE_HOME", (".cache",)),
+)
 
 
 @pytest.fixture
@@ -129,57 +138,6 @@ def _suite_leaves_cwd_config_alone() -> Iterator[None]:
         pytest.fail(f"the test suite created or modified {path}")
 
 
-def _failed_dir_entries() -> set[str]:
-    """
-    List whatever is sitting in the suite's shared preservation directory.
-
-    Returns:
-        The entry names, or an empty set when the directory does not exist.
-
-    """
-    failed = Path(_TEST_DATA) / "failed"
-    if not failed.is_dir():
-        return set()
-    return {entry.name for entry in failed.iterdir()}
-
-
-@pytest.fixture(autouse=True, scope="session")
-def _suite_leaves_the_shared_failed_dir_alone() -> Iterator[None]:
-    """
-    Fail the run if a test preserved a scan into the shared ``failed/`` (WR-07).
-
-    ``default_settings`` points ``data_dir`` at a process-wide
-    ``/tmp/saneless-test``, and nothing removes what lands there -- so a test
-    that triggers preservation without repointing ``data_dir`` writes a real
-    PDF, or a whole page directory, on every run, for ever.
-
-    That is not only untidy. ``_warn_if_failed_dir_growing`` starts emitting
-    its WARNING once twenty artefacts have accumulated, and it emits it inside
-    whichever unrelated test happened to trigger the next preservation --
-    several of which assert on captured log records. A leak here is therefore a
-    flake that appears weeks after the test that caused it, on a machine that
-    has run the suite often enough, and nowhere near the code to blame.
-
-    ``tests/test_pipeline.py::_isolate_dirs`` is the pattern a preserving test
-    wants: point ``tmp_dir`` and ``data_dir`` at separate subtrees of
-    ``tmp_path``.
-
-    Yields:
-        Nothing; the check runs after the last test.
-
-    """
-    before = _failed_dir_entries()
-    yield
-    leaked = sorted(_failed_dir_entries() - before)
-    if leaked:
-        pytest.fail(
-            f"the test suite preserved {len(leaked)} artefact(s) into the shared "
-            f"{Path(_TEST_DATA) / 'failed'}: {', '.join(leaked)}. Point the "
-            f"test's output.tmp_dir and output.data_dir at tmp_path, the way "
-            f"tests/test_pipeline.py::_isolate_dirs does."
-        )
-
-
 def reset_sane_process_state() -> None:
     """
     Return SANE to "never initialised, not wedged" for the next test.
@@ -253,24 +211,56 @@ def sane_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture(autouse=True)
-def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def hermetic_env(
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """
-    Remove all SANELESS_* env vars and the XDG base variables before each test.
+    Run every test in a fake home and its own working directory.
 
-    ``XDG_CONFIG_HOME`` and ``XDG_STATE_HOME`` decide config discovery and the
-    state defaults (CFG-03); a developer's or CI runner's values would otherwise
-    defeat every test that redirects HOME.
+    Without this a test reaches the developer's real files: ``Path.home()``
+    and the XDG variables decide config discovery and the state defaults, so a
+    ``Settings()`` would read ``~/.config/saneless/config.toml`` -- live URL and
+    token included -- and a ``JobStore`` would write under ``~/.local/state``.
+    The working directory matters the same way, because ``./saneless.toml`` is
+    the first config search path and a developer's checkout usually has one.
+
+    HOME and the XDG variables are set, not ``Path.home()`` patched, so
+    ``os.path.expanduser``, every library and any subprocess see the fake home
+    too. The fake home comes from ``tmp_path_factory`` rather than from inside
+    ``tmp_path``, because some tests assert exactly what ``tmp_path`` holds.
+
+    A test about the unset-XDG fallback deletes the variable itself.
+
+    Args:
+        tmp_path: The test's own directory, which becomes the working directory.
+        tmp_path_factory: Source of a fresh fake home directory.
+        monkeypatch: Undoes every change after the test.
+
     """
     for key in list(os.environ):
         if key.startswith("SANELESS_"):
             monkeypatch.delenv(key, raising=False)
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    for variable, parts in _XDG_BASES:
+        monkeypatch.setenv(variable, str(home.joinpath(*parts)))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", _BROWSERS)
+    monkeypatch.chdir(tmp_path)
 
 
 @pytest.fixture
-def default_settings() -> Settings:
-    """Return a Settings instance with test-safe defaults."""
+def default_settings(tmp_path: Path) -> Settings:
+    """
+    Return a Settings instance with test-safe defaults.
+
+    Scratch space and durable state sit on separate subtrees of ``tmp_path``,
+    as they do in a real deployment. Temp-cleanup assertions walk ``tmp_dir``
+    demanding that nothing survives a run, and ``failed/`` under ``data_dir`` is
+    meant to survive, so the two must not share a root.
+    """
     auth = "test-token"
     return Settings(
         scanner=ScannerConfig(device="test:device:001"),
@@ -279,9 +269,9 @@ def default_settings() -> Settings:
             token=auth,
         ),
         output=OutputConfig(
-            tmp_dir=_TEST_TMP,
-            data_dir=_TEST_DATA,
-            log_file=_TEST_LOG,
+            tmp_dir=tmp_path / "tmp",
+            data_dir=tmp_path / "data",
+            log_file=tmp_path / "data" / "saneless.log",
         ),
         profiles={"default": ProfileConfig()},
     )
@@ -642,6 +632,7 @@ def wait_for_state(
     wanted = state if isinstance(state, frozenset) else frozenset([state])
     observed = "<no such job>"
     found: Job | None = None
+    tick = threading.Event()  # never set: each wait() is a bounded pause
     for _ in range(max(1, int(timeout / _POLL_INTERVAL))):
         job = store.get_job(job_id)
         if job is not None:
@@ -649,7 +640,7 @@ def wait_for_state(
             if job.state in wanted:
                 found = job
                 break
-        time.sleep(_POLL_INTERVAL)
+        tick.wait(_POLL_INTERVAL)
     else:
         names = ", ".join(sorted(s.value for s in wanted))
         msg = (
@@ -676,3 +667,48 @@ def _wait_for_state_fixture() -> Callable[..., Job]:
 
     """
     return wait_for_state
+
+
+def poll_until(
+    predicate: Callable[[], bool], budget: float, interval: float = _POLL_INTERVAL
+) -> bool:
+    """
+    Poll ``predicate`` until it holds or ``budget`` seconds pass.
+
+    The pause between polls is a wait on an Event nobody sets: bounded by
+    ``interval``, and not a sleep of the whole thread. The predicate is checked once more
+    after the deadline, so a condition that became true during the last pause
+    is still seen.
+
+    Args:
+        predicate: The condition to wait for; called repeatedly, so it must be
+            cheap and free of side effects.
+        budget: Seconds to keep polling.
+        interval: Seconds between polls.
+
+    Returns:
+        Whether the predicate held before the budget ran out.
+
+    """
+    deadline = time.monotonic() + budget
+    tick = threading.Event()  # never set: each wait() is a bounded pause
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        tick.wait(interval)
+    return predicate()
+
+
+@pytest.fixture(name="poll_until")
+def _poll_until_fixture() -> Callable[..., bool]:
+    """
+    Hand the poll_until helper to a test module.
+
+    A fixture for the same reason as ``wait_for_state``: test modules cannot
+    import from conftest by name under pytest 9's importlib mode.
+
+    Returns:
+        The poll_until function itself, uncalled.
+
+    """
+    return poll_until
