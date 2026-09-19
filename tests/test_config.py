@@ -369,10 +369,10 @@ class TestXdgBaseDirectories:
         state = empty_cwd_and_home / "state"
         monkeypatch.setenv("XDG_STATE_HOME", str(state))
         settings = Settings()
-        assert settings.output.data_dir == str(state / "saneless")
-        assert settings.output.log_file == str(state / "saneless" / "saneless.log")
-        assert OutputConfig().data_dir == str(state / "saneless")
-        assert OutputConfig().log_file == str(state / "saneless" / "saneless.log")
+        assert settings.output.data_dir == state / "saneless"
+        assert settings.output.log_file == state / "saneless" / "saneless.log"
+        assert OutputConfig().data_dir == state / "saneless"
+        assert OutputConfig().log_file == state / "saneless" / "saneless.log"
 
     def test_xdg_unset_home_change_after_import_moves_state_defaults(
         self, empty_cwd_and_home: Path
@@ -380,8 +380,8 @@ class TestXdgBaseDirectories:
         """With XDG unset, both state defaults follow a HOME changed after import."""
         state = empty_cwd_and_home / "home" / ".local" / "state" / "saneless"
         output = Settings().output
-        assert output.data_dir == str(state)
-        assert output.log_file == str(state / "saneless.log")
+        assert output.data_dir == state
+        assert output.log_file == state / "saneless.log"
 
     def test_xdg_variables_are_removed_before_each_test(self) -> None:
         """``clean_env`` keeps developer and CI XDG variables out of the suite."""
@@ -509,7 +509,7 @@ class TestSettingsDefaults:
         settings = load_settings()
         assert settings.scanner.host == ""
         assert settings.paperless.url == ""
-        assert settings.output.tmp_dir.endswith("saneless")
+        assert settings.output.tmp_dir == Path(tempfile.gettempdir()) / "saneless"
         assert settings.output.log_level == "INFO"
 
 
@@ -1913,7 +1913,7 @@ class TestPathExpansion:
     ``~/scans`` in a config file used to be taken literally, creating a
     directory named ``~`` in the working directory. By decision (Claude's
     Discretion), only ``~`` is expanded: ``$VAR`` stays literal (T-27-26), and
-    an empty ``consume_dir`` stays empty because empty means disabled.
+    an empty ``consume_dir`` is None because empty means disabled.
     """
 
     @pytest.fixture
@@ -1935,21 +1935,21 @@ class TestPathExpansion:
         output = OutputConfig(
             tmp_dir="~/t", data_dir="~/d", log_file="~/l/saneless.log"
         )
-        assert output.tmp_dir == str(home / "t")
-        assert output.data_dir == str(home / "d")
-        assert output.log_file == str(home / "l" / "saneless.log")
+        assert output.tmp_dir == home / "t"
+        assert output.data_dir == home / "d"
+        assert output.log_file == home / "l" / "saneless.log"
 
     def test_expanduser_consume_dir(self, home: Path) -> None:
         """``consume_dir`` expands ``~`` under HOME."""
         paperless = PaperlessConfig(consume_dir="~/consume")
-        assert paperless.consume_dir == str(home / "consume")
+        assert paperless.consume_dir == home / "consume"
 
     def test_expanduser_from_toml(self, home: Path, tmp_path: Path) -> None:
         """A ``~`` path read from a TOML file is expanded."""
         config_file = tmp_path / "x.toml"
         config_file.write_text('[output]\ndata_dir = "~/state"\n\n[profiles.default]\n')
         settings = load_settings(str(config_file))
-        assert settings.output.data_dir == str(home / "state")
+        assert settings.output.data_dir == home / "state"
 
     def test_expanduser_from_environment(
         self, home: Path, monkeypatch: pytest.MonkeyPatch
@@ -1957,17 +1957,17 @@ class TestPathExpansion:
         """A ``~`` path from a SANELESS_* variable is expanded."""
         monkeypatch.setenv("SANELESS_OUTPUT__LOG_FILE", "~/x.log")
         settings = load_settings()
-        assert settings.output.log_file == str(home / "x.log")
+        assert settings.output.log_file == home / "x.log"
 
     @pytest.mark.usefixtures("home")
-    def test_expanduser_leaves_empty_consume_dir_empty(self) -> None:
-        """An empty ``consume_dir`` means disabled and is not expanded."""
-        assert PaperlessConfig(consume_dir="").consume_dir == ""
+    def test_expanduser_leaves_empty_consume_dir_disabled(self) -> None:
+        """An empty ``consume_dir`` means disabled: None, not ``Path(".")``."""
+        assert PaperlessConfig(consume_dir="").consume_dir is None
 
     @pytest.mark.usefixtures("home")
     def test_expanduser_does_not_expand_variables(self) -> None:
         """``$HOME`` in a path setting is kept literally (T-27-26)."""
-        assert OutputConfig(data_dir="$HOME/x").data_dir == "$HOME/x"
+        assert OutputConfig(data_dir="$HOME/x").data_dir == Path("$HOME/x")
 
     @pytest.mark.usefixtures("home")
     def test_unknown_user_in_a_toml_path_is_a_config_error(
@@ -2010,20 +2010,76 @@ class TestPathExpansion:
         assert "'~'" in message
 
 
+class TestPathTypedSettings:
+    """
+    The path settings are ``Path`` values on the model, not strings.
+
+    ``consume_dir`` is the one optional path: empty or omitted means the
+    fallback copy is disabled, so it loads as None. Pydantic would otherwise
+    turn ``""`` into ``Path(".")`` and the fallback would write PDFs into the
+    working directory.
+    """
+
+    def test_output_path_defaults_are_paths(self) -> None:
+        """``tmp_dir``, ``data_dir`` and ``log_file`` default to Path values."""
+        output = OutputConfig()
+        assert output.tmp_dir == Path(tempfile.gettempdir()) / "saneless"
+        assert isinstance(output.data_dir, Path)
+        assert output.log_file == output.data_dir / "saneless.log"
+
+    def test_output_paths_given_as_strings_become_paths(self, tmp_path: Path) -> None:
+        """A string from a config file or constructor is stored as a Path."""
+        output = OutputConfig(
+            tmp_dir=str(tmp_path / "t"),
+            data_dir=str(tmp_path / "d"),
+            log_file=str(tmp_path / "l.log"),
+        )
+        assert output.tmp_dir == tmp_path / "t"
+        assert output.data_dir == tmp_path / "d"
+        assert output.log_file == tmp_path / "l.log"
+
+    def test_consume_dir_defaults_to_disabled(self) -> None:
+        """An omitted ``consume_dir`` is None."""
+        assert PaperlessConfig().consume_dir is None
+
+    def test_whitespace_only_consume_dir_is_disabled(self) -> None:
+        """A whitespace-only ``consume_dir`` is None, never ``Path("  ")``."""
+        assert PaperlessConfig(consume_dir="   ").consume_dir is None
+
+    def test_a_configured_consume_dir_is_a_path(self, tmp_path: Path) -> None:
+        """A non-empty ``consume_dir`` string is stored as a Path."""
+        target = tmp_path / "consume"
+        assert PaperlessConfig(consume_dir=str(target)).consume_dir == target
+
+    def test_empty_consume_dir_from_environment_is_disabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_PAPERLESS__CONSUME_DIR=""`` loads as None."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("SANELESS_PAPERLESS__CONSUME_DIR", "")
+        assert load_settings().paperless.consume_dir is None
+
+    def test_empty_consume_dir_from_toml_is_disabled(self, tmp_path: Path) -> None:
+        """A TOML ``consume_dir = ""`` loads as None."""
+        config_file = tmp_path / "x.toml"
+        config_file.write_text('[paperless]\nconsume_dir = ""\n\n[profiles.default]\n')
+        assert load_settings(str(config_file)).paperless.consume_dir is None
+
+
 class TestDataDir:
     """OutputConfig.data_dir and its computed db_path / failed_dir properties."""
 
     def test_data_dir_default_is_under_local_state(self) -> None:
-        """The default data_dir is a str ending in .local/state/saneless."""
+        """The default data_dir is a Path ending in .local/state/saneless."""
         data_dir = OutputConfig().data_dir
-        assert isinstance(data_dir, str)
-        assert data_dir.endswith(".local/state/saneless")
+        assert isinstance(data_dir, Path)
+        assert data_dir.parts[-3:] == (".local", "state", "saneless")
 
     def test_data_dir_default_is_not_the_temp_dir(self) -> None:
         """The default data_dir is not tmp_dir and is not under the temp root."""
         config = OutputConfig()
         assert config.data_dir != config.tmp_dir
-        assert not config.data_dir.startswith(tempfile.gettempdir())
+        assert not config.data_dir.is_relative_to(tempfile.gettempdir())
 
     def test_db_path_is_saneless_db_under_data_dir(self) -> None:
         """db_path is <data_dir>/saneless.db as a Path."""
@@ -2061,7 +2117,7 @@ class TestDataDir:
         override = tmp_path / "custom-state"
         monkeypatch.setenv("SANELESS_OUTPUT__DATA_DIR", str(override))
         settings = load_settings()
-        assert settings.output.data_dir == str(override)
+        assert settings.output.data_dir == override
         assert settings.output.db_path == override / "saneless.db"
 
 
