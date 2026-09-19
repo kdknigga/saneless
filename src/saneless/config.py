@@ -81,15 +81,15 @@ DEFAULT_RESOLUTION = 300
 """Default scan resolution in DPI.
 
 300 DPI is the minimum recommended by Tesseract OCR and the industry
-standard for professional document scanning. See Phase 11 research.
+standard for professional document scanning.
 """
 
-# The bounds on the two generated profile text fields (D-18, APPL-05). Named
-# constants rather than inline integers, the way TITLE_MAX_LENGTH is, so the
-# schema, the generator and the tests read the same number. A label is an
-# option's text and a description is one short sentence beneath it; both are
-# rendered into HTML, so they are bounded for the same reason default_title is
-# (T-30-06, T-30-08, ROBU-08).
+# The bounds on the two generated profile text fields. Named constants rather
+# than inline integers, the way TITLE_MAX_LENGTH is, so the schema, the
+# generator and the tests read the same number. A label is an option's text and
+# a description is one short sentence beneath it; both are rendered into HTML,
+# so they are bounded for the same reason default_title is: nothing else bounds
+# what a config file can put on the page.
 PROFILE_LABEL_MAX_LENGTH: Final = 64
 """The longest ``profiles.<name>.label`` a config may carry."""
 
@@ -97,7 +97,7 @@ PROFILE_DESCRIPTION_MAX_LENGTH: Final = 200
 """The longest ``profiles.<name>.description`` a config may carry."""
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-"""The logging level names ``output.log_level`` accepts (CFG-04, M-21).
+"""The logging level names ``output.log_level`` accepts.
 
 Each is a key of ``logging.getLevelNamesMapping()`` and, lower-cased, a valid
 uvicorn ``log_level``.
@@ -106,11 +106,11 @@ uvicorn ``log_level``.
 
 def _xdg_base(variable: str, *fallback: str) -> Path:
     """
-    Resolve an XDG base directory from the environment at call time (CFG-03).
+    Resolve an XDG base directory from the environment at call time.
 
     Per the XDG Base Directory Specification, an unset or empty variable means
     the ``$HOME``-relative default, and a relative value is invalid and ignored
-    -- otherwise discovery would depend on the working directory (T-27-25).
+    -- otherwise discovery would depend on the working directory.
 
     Args:
         variable: The environment variable, e.g. ``XDG_CONFIG_HOME``.
@@ -129,7 +129,7 @@ def _xdg_base(variable: str, *fallback: str) -> Path:
 
 def xdg_config_home() -> Path:
     """
-    Return the XDG config home, ``$XDG_CONFIG_HOME`` or ``~/.config`` (CFG-03).
+    Return the XDG config home, ``$XDG_CONFIG_HOME`` or ``~/.config``.
 
     Read at call time, not import, so a later HOME or XDG change is honoured.
     An empty or relative ``$XDG_CONFIG_HOME`` is ignored, per the basedir spec.
@@ -143,7 +143,7 @@ def xdg_config_home() -> Path:
 
 def xdg_state_home() -> Path:
     """
-    Return the XDG state home, ``$XDG_STATE_HOME`` or ``~/.local/state`` (CFG-03).
+    Return the XDG state home, ``$XDG_STATE_HOME`` or ``~/.local/state``.
 
     Read at call time, not import, so a later HOME or XDG change is honoured.
     An empty or relative ``$XDG_STATE_HOME`` is ignored, per the basedir spec.
@@ -207,7 +207,7 @@ def _expand_user(value: Path) -> Path:
 
 def _is_legacy_manual_duplex_source(source: str) -> bool:
     """
-    Recognise the deprecated ``source = "Manual Duplex"`` config form (DPLX-02).
+    Recognise the deprecated ``source = "Manual Duplex"`` config form.
 
     This exists ONLY to detect a legacy profile at config load so it can be
     translated to ``duplex = "manual"``, and so ``warn_on_legacy_duplex_sources``
@@ -229,7 +229,7 @@ def _is_legacy_manual_duplex_source(source: str) -> bool:
 class ScannerConfig(BaseModel):
     """Scanner connection settings."""
 
-    # An unknown key is an error, not silently dropped (CFG-01, M-18).
+    # An unknown key is an error, not silently dropped.
     model_config = ConfigDict(extra="forbid")
 
     host: str = ""
@@ -237,7 +237,7 @@ class ScannerConfig(BaseModel):
 
 
 # Every token value the project has ever shipped as a stand-in, plus the
-# obvious hand-written ones.  Compared exactly, never as substrings (D-14).
+# obvious hand-written ones.  Compared exactly, never as substrings.
 PLACEHOLDER_TOKENS: Final[frozenset[str]] = frozenset(
     {
         # Kept for the upgrade path, not because this tree ships it: an
@@ -266,7 +266,7 @@ PLACEHOLDER_TOKENS: Final[frozenset[str]] = frozenset(
         "todo",
     }
 )
-"""The literal token values that mean "nobody has configured this" (APPL-07)."""
+"""The literal token values that mean "nobody has configured this"."""
 
 
 def is_placeholder_token(value: str) -> bool:
@@ -275,11 +275,11 @@ def is_placeholder_token(value: str) -> bool:
 
     This is the one predicate ``doctor``, the web status strip, the scan route
     and ``saneless scan`` share, so all four agree on whether the appliance can
-    upload (APPL-07). A value counts as a placeholder when it is empty or
+    upload. A value counts as a placeholder when it is empty or
     whitespace-only, or when stripping and lower-casing it lands on a member of
     ``PLACEHOLDER_TOKENS``.
 
-    D-14: the set is a small fixed literal set, deliberately **not** a shape
+    The set is a small fixed literal set, deliberately **not** a shape
     heuristic (no length, entropy or character-class test). Refusing a
     legitimate token from a future paperless-ngx version is worse than missing
     an exotic placeholder, so membership is exact and never a substring match:
@@ -287,7 +287,7 @@ def is_placeholder_token(value: str) -> bool:
 
     ASVS V7: this function neither logs nor returns the value it is given -- it
     returns only a ``bool``. It takes an already-unwrapped ``str``, so it adds
-    no secret-unwrapping call site to this module (CFG-05, N-15), and
+    no secret-unwrapping call site to this module, and
     callers must not log or render the value either.
 
     Args:
@@ -304,12 +304,11 @@ def is_placeholder_token(value: str) -> bool:
 class PaperlessConfig(BaseModel):
     """Paperless-ngx API connection settings."""
 
-    # A mistyped ``tokne`` used to leave the token unset without a word
-    # (CFG-01, M-18).
+    # A mistyped ``tokne`` used to leave the token unset without a word.
     model_config = ConfigDict(extra="forbid")
 
     url: str = ""
-    # Masked in repr, tracebacks and model_dump (CFG-05, N-15). Unwrapped with
+    # Masked in repr, tracebacks and model_dump. Unwrapped with
     # get_secret_value only where PaperlessClient is built: cli.py scan and
     # web/app.py create_app.
     token: SecretStr = SecretStr("")
@@ -358,30 +357,28 @@ class PaperlessConfig(BaseModel):
 class ProfileConfig(BaseModel):
     """Scan profile configuration."""
 
-    # extra="forbid" (CFG-01) is safe alongside the legacy-duplex
+    # extra="forbid" is safe alongside the legacy-duplex
     # before-validator: it only ever adds ``duplex``, which is a real field.
     # populate_by_name keeps both ``title`` and ``default_title`` accepted.
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    # The profile's human name and the sentence beneath it in the dropdown
-    # (APPL-05, UI-SPEC S4). Declared first so a human opening the file reads
-    # the human name before the machine settings.
+    # The profile's human name and the sentence beneath it in the dropdown.
+    # Declared first so a human opening the file reads the human name before
+    # the machine settings.
     #
-    # D-18: these are persisted, tool-owned keys. They join Phase 27 D-02's
-    # owned key set and behave exactly like ``source`` / ``mode`` /
-    # ``resolution``: ``saneless auto-profiles`` writes them, ``--force``
-    # overwrites them in place, and D-03's "an owned key a fresh generation
-    # does not write is deleted" applies. The operator's escape hatch is the
-    # documented one -- remove ``auto_generated`` to take the profile over.
+    # These are persisted, tool-owned keys. They join the auto-profiles owned
+    # key set and behave exactly like ``source`` / ``mode`` / ``resolution``:
+    # ``saneless auto-profiles`` writes them, ``--force`` overwrites them in
+    # place, and an owned key a fresh generation does not write is deleted.
+    # The operator's escape hatch is the documented one -- remove
+    # ``auto_generated`` to take the profile over.
     #
     # Bounded for the same reason ``default_title`` is: they are rendered into
-    # HTML, and nothing else bounds what a config file can put on the page
-    # (T-30-06, T-30-08, ROBU-08).
+    # HTML, and nothing else bounds what a config file can put on the page.
     #
-    # Defaulting to ``""`` is what keeps a config written before this phase
-    # loading under ``extra="forbid"``; the dropdown renders ``label or name``
-    # (Amendment A-3) so a pre-existing generated profile is never a blank
-    # option.
+    # Defaulting to ``""`` is what keeps a config written before these keys
+    # existed loading under ``extra="forbid"``; the dropdown renders ``label or
+    # name`` so a pre-existing generated profile is never a blank option.
     label: str = Field(default="", max_length=PROFILE_LABEL_MAX_LENGTH)
     description: str = Field(default="", max_length=PROFILE_DESCRIPTION_MAX_LENGTH)
 
@@ -392,18 +389,17 @@ class ProfileConfig(BaseModel):
     # How the profile scans both sides of a sheet. "manual" drives the two-pass
     # flip workflow. Nothing reads "hardware": the device decides duplexing
     # from the source name it is handed, so the value only records operator
-    # intent and makes a profile self-describing. Phase 30's APPL-05 (the
-    # generated label/description) is its eventual reader. It is deliberately
-    # not cross-validated against a FEEDER_DUPLEX source -- profile fields have
+    # intent and makes a profile self-describing. It is deliberately not
+    # cross-validated against a FEEDER_DUPLEX source -- profile fields have
     # never been cross-checked (auto_source_mode is not checked against Auto).
     duplex: Literal["none", "hardware", "manual"] = "none"
     paper_size: PaperSize = "full"
     default_tags: list[int] = []
     default_correspondent: int | None = None
-    # A literal title, not a template: no placeholder vocabulary (D-15). Used
-    # when a scan is submitted with a blank title (resolve_job_title, D-16).
-    # Bounded because the route's Form(max_length=...) only checks the typed
-    # title, so an unbounded profile title would bypass ROBU-08.
+    # A literal title, not a template: no placeholder vocabulary. Used when a
+    # scan is submitted with a blank title (resolve_job_title). Bounded because
+    # the route's Form(max_length=...) only checks the typed title, so an
+    # unbounded profile title would bypass the length limit a typed one gets.
     default_title: str = Field(default="", alias="title", max_length=TITLE_MAX_LENGTH)
     empty_page_mean_threshold: float = 250.0
     empty_page_stddev_threshold: float = 5.0
@@ -440,12 +436,12 @@ def resolve_job_title(
     typed: str | None, profile: ProfileConfig | None, *, now: datetime
 ) -> str:
     """
-    Choose a scan job's title by the one rule every front end shares (D-16).
+    Choose a scan job's title by the one rule every front end shares.
 
     A typed title that is non-blank after stripping wins; otherwise the
     profile's ``title``, when it is non-blank; otherwise ``Scan <time>``. The
     timestamp renders in the server's local zone with the zone named, whatever
-    zone ``now`` carries (APPL-12), through ``local_time`` -- the same shared
+    zone ``now`` carries, through ``local_time`` -- the same shared
     function the web history table and the ``saneless jobs`` table read, so the
     three cannot disagree about what time a scan happened. That string is
     user-facing twice over: it becomes the paperless-ngx document title, and it
@@ -471,23 +467,23 @@ def resolve_job_title(
 class OutputConfig(BaseModel):
     """Output and logging configuration."""
 
-    # An unknown key is an error, not silently dropped (CFG-01, M-18).
+    # An unknown key is an error, not silently dropped.
     model_config = ConfigDict(extra="forbid")
 
     tmp_dir: Path = Path(tempfile.gettempdir()) / "saneless"
     # Durable state: the job database and preserved scans. Deliberately NOT
-    # under tmp_dir, which is disposable scratch space. Phase 23 (D-14) kept
-    # the data_dir and log_file defaults in step; both now follow
-    # $XDG_STATE_HOME (CFG-03), computed per instance rather than at import.
+    # under tmp_dir, which is disposable scratch space. The data_dir and
+    # log_file defaults move together: both follow $XDG_STATE_HOME, computed
+    # per instance rather than at import so a changed HOME is honoured.
     # The Dockerfile's SANELESS_OUTPUT__DATA_DIR still overrides data_dir.
     data_dir: Path = Field(default_factory=_default_data_dir)
     # These three describe a rotating file, so they apply to one-shot CLI
     # commands only: `saneless serve` is a service, streams its records to
     # stderr and writes no file at all, which is what puts them in `docker
-    # logs` and journald (D-35, D-40, DLVR-04). Setting log_file and running
-    # serve is not an error and raises no warning -- the configuration
-    # reference states the mode scope instead (D-39). log_level below is the
-    # one log key that applies in both modes.
+    # logs` and journald. Setting log_file and running serve is not an error
+    # and raises no warning -- the configuration reference states the mode
+    # scope instead. log_level below is the one log key that applies in both
+    # modes.
     log_file: Path = Field(default_factory=_default_log_file)
     log_level: LogLevel = "INFO"
     log_max_bytes: int = 10_485_760
@@ -500,10 +496,10 @@ class OutputConfig(BaseModel):
     # A config key, unlike the scan-side module constants
     # (_DEFAULT_PAGE_TIMEOUT_SECONDS, _MAX_ADF_PAGES): this is the only timeout
     # that waits on a human rather than a machine, and ten minutes is a guess
-    # about someone else's household (D-10). Bounded at load (WR-01): zero or a
-    # negative value would fail every manual-duplex job right after pass A, and
-    # a value above threading.TIMEOUT_MAX makes Event.wait raise OverflowError
-    # at the same point. One day is the ceiling -- far beyond any real flip.
+    # about someone else's household. Bounded at load: zero or a negative value
+    # would fail every manual-duplex job right after pass A, and a value above
+    # threading.TIMEOUT_MAX makes Event.wait raise OverflowError at the same
+    # point. One day is the ceiling -- far beyond any real flip.
     flip_timeout_seconds: int = Field(default=600, ge=1, le=86_400)
     min_free_space_mb: int = 500
     web_host: str = "0.0.0.0"
@@ -532,10 +528,10 @@ class OutputConfig(BaseModel):
     @classmethod
     def _normalise_log_level(cls, value: object) -> object:
         """
-        Normalise a configured level name before the ``Literal`` check (CFG-04).
+        Normalise a configured level name before the ``Literal`` check.
 
         ``getattr(logging, name)`` used to accept any attribute name and crash
-        on an unknown one such as ``TRACE`` long after load (M-21). The name is
+        on an unknown one such as ``TRACE`` long after load. The name is
         trimmed and upper-cased, and ``WARN`` is read as ``WARNING`` because
         ``logging.getLevelNamesMapping()`` itself lists ``WARN``. Anything that
         is not a string is returned unchanged so pydantic rejects it.
@@ -582,19 +578,19 @@ class OutputConfig(BaseModel):
 class WebConfig(BaseModel):
     """Which optional controls the scan form shows."""
 
-    # An unknown key is an error, not silently dropped (CFG-01, M-18). Here it
-    # also means a mistyped key cannot quietly leave a control visible that the
-    # operator meant to hide (T-30-07).
+    # An unknown key is an error, not silently dropped. Here it also means a
+    # mistyped key cannot quietly leave a control visible that the operator
+    # meant to hide.
     model_config = ConfigDict(extra="forbid")
 
-    # D-28 and D-29 together. D-28: this is one appliance with one configured
-    # form shape, not a per-browser toggle -- the household member never sees a
-    # control the owner turned off, and the shape is testable without a
-    # browser. D-29: hiding a control changes the form and never the scan. The
-    # profile's ``default_tags`` and ``default_correspondent`` still apply,
-    # mirroring how a blank title already falls back to the profile title
-    # through ``resolve_job_title``. Both default True so an existing
-    # deployment's form is unchanged by the upgrade.
+    # This is one appliance with one configured form shape, not a per-browser
+    # toggle -- the household member never sees a control the owner turned
+    # off, and the shape is testable without a browser. Hiding a control
+    # changes the form and never the scan. The profile's ``default_tags`` and
+    # ``default_correspondent`` still apply, mirroring how a blank title
+    # already falls back to the profile title through ``resolve_job_title``.
+    # Both default True so an existing deployment's form is unchanged by the
+    # upgrade.
     show_tags: bool = True
     show_correspondent: bool = True
 
@@ -603,8 +599,8 @@ class WebConfig(BaseModel):
 # (config.py's OutputConfig) because moving them would be a breaking config
 # change for every deployment that sets them. So ``[web]`` currently holds only
 # the form-shape keys, and ``[output]`` holds the server's bind address -- an
-# acknowledged incoherence (RESEARCH, the [web] placement question), preferred
-# over breaking a key operators already write.
+# acknowledged incoherence, preferred over breaking a key operators already
+# write.
 
 _ENV_PREFIX: Final = "SANELESS_"
 """The environment variable prefix; the unknown-variable scan uses it too."""
@@ -626,13 +622,14 @@ class Settings(BaseSettings):
         env_prefix=_ENV_PREFIX,
         env_nested_delimiter=_ENV_DELIMITER,
         # pydantic-settings already forbids unknown top-level names; stated
-        # explicitly so it cannot drift from the nested models (CFG-01).
+        # explicitly so it cannot drift from the nested models.
         extra="forbid",
     )
 
     # default_factory, not a plain instance: an ``OutputConfig()`` default is
-    # built once at import and would freeze the HOME/XDG state defaults
-    # (CFG-03, RESEARCH Pitfall 3). scanner and paperless match for consistency.
+    # built once at import and would freeze the HOME/XDG state defaults, so a
+    # HOME changed later would be ignored. scanner and paperless match for
+    # consistency.
     scanner: ScannerConfig = Field(default_factory=ScannerConfig)
     paperless: PaperlessConfig = Field(default_factory=PaperlessConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
@@ -644,7 +641,7 @@ class Settings(BaseSettings):
 
     # A PrivateAttr, not a field: a field would be settable from
     # SANELESS_CONFIG_PATH and from a top-level TOML key, letting either
-    # redirect profile writes (D-16, research Pattern 8).
+    # redirect profile writes.
     _config_path: Path | None = PrivateAttr(default=None)
 
     @property
@@ -710,9 +707,9 @@ def profile_storage_for_loaded(settings: Settings) -> ProfileStorage:
     """
     Say where the profiles live when no write to the config file was attempted.
 
-    This is the one derivation of that fact, and it exists because D-02
-    requires ``saneless doctor`` and the web status strip to report the *same*
-    Profiles row for the same appliance.  CR-01 was this rule written twice
+    This is the one derivation of that fact, and it exists because
+    ``saneless doctor`` and the web status strip must report the *same*
+    Profiles row for the same appliance.  This rule was once written twice
     with only one copy correct: ``doctor`` said ``[ OK ] Profiles`` while the
     strip printed a permanent amber "Generated in memory -- no configuration
     file is in use", for one machine, at the same moment.  Two callers, one
@@ -727,7 +724,7 @@ def profile_storage_for_loaded(settings: Settings) -> ProfileStorage:
     what the *worker* records when its one startup attempt to persist generated
     profiles was refused -- an outcome only an attempted write can produce.  A
     caller that has attempted no write has no such outcome to report and must
-    not invent one by probing: Phase 27 D-09's motivating failure is EBUSY on a
+    not invent one by probing: the failure that matters is EBUSY on a
     single-file bind mount, where the directory is writable, ``os.access`` says
     yes, and only the rename fails, so no probe short of the write itself can
     see it.
@@ -750,17 +747,17 @@ def warn_on_legacy_duplex_sources(settings: Settings) -> None:
     Warn, by profile name, about each profile with a legacy-looking source.
 
     A function the CLI calls right after ``configure_logging``, not a
-    ``Settings`` validator (WR-05): a validator runs inside ``load_settings``,
+    ``Settings`` validator: a validator runs inside ``load_settings``,
     before ``cli()`` has configured logging, so its record went to Python's
     ``lastResort`` handler on stderr and never reached ``log_file`` -- and
     this message is the operator's only migration instruction, since the
-    legacy form is documented nowhere. D-03's split is intact: the translation
-    stays in ``ProfileConfig`` (every construction path), and the naming lives
-    here because a profile cannot name itself. The replacement is stated
-    inline (D-18); no removal is promised.
+    legacy form is documented nowhere. The work is split on purpose: the
+    translation stays in ``ProfileConfig`` (every construction path), and the
+    naming lives here because a profile cannot name itself. The replacement is
+    stated inline; no removal is promised.
 
     A legacy-looking source with an explicit non-manual ``duplex`` is warned
-    about too (IN-04): explicit configuration still wins, so it is not read as
+    about too: explicit configuration still wins, so it is not read as
     manual duplex, but its source goes to the scanner verbatim.
 
     Args:
@@ -798,7 +795,7 @@ def warn_on_legacy_duplex_sources(settings: Settings) -> None:
 # Hand-maintained, and it must stay in step with ``Settings``' own fields: the
 # other readers derive from ``Settings.model_fields``, but ``_render_error``
 # looks the section's model up here, so a section missing from this mapping
-# loads fine and then renders a bare pydantic message instead of the D-11
+# loads fine and then renders a bare pydantic message instead of the
 # "unknown key ...; valid keys: ..." line. TestEverySectionRendersUnknownKeys
 # parametrises over ``Settings``' own sections, so a section added to one and
 # not the other fails at once rather than silently losing its error line.
@@ -808,7 +805,7 @@ _SECTION_MODELS: Final[dict[str, type[BaseModel]]] = {
     "output": OutputConfig,
     "web": WebConfig,
 }
-"""The plain ``Settings`` sections, each a single table of keys (D-11)."""
+"""The plain ``Settings`` sections, each a single table of keys."""
 
 _PROFILE_LABEL: Final = "profiles.<name>"
 """How a key that belongs in some profile table is named in an error."""
@@ -820,7 +817,7 @@ def _escape_name(name: str) -> str:
 
     TOML quoted keys and profile names can hold newlines or terminal escapes;
     ``repr`` escapes them, so an error line cannot forge further stderr or log
-    lines (T-27-11, the ``web/errors.py`` precedent).
+    lines, the same defence ``web/errors.py`` uses.
 
     Args:
         name: A key, section or profile name taken from the configuration.
@@ -834,7 +831,7 @@ def _escape_name(name: str) -> str:
 
 def _valid_keys(model: type[BaseModel]) -> list[str]:
     """
-    List the keys a section accepts, as the operator writes them (D-11).
+    List the keys a section accepts, as the operator writes them.
 
     Args:
         model: The section's model.
@@ -848,7 +845,7 @@ def _valid_keys(model: type[BaseModel]) -> list[str]:
 
 def _match_candidates(model: type[BaseModel]) -> list[str]:
     """
-    List every spelling a section accepts: field names plus aliases (D-11).
+    List every spelling a section accepts: field names plus aliases.
 
     Args:
         model: The section's model.
@@ -863,7 +860,7 @@ def _match_candidates(model: type[BaseModel]) -> list[str]:
 
 def _section_owning(key: str, *, exclude: type[BaseModel] | None) -> str | None:
     """
-    Name the section a misplaced key really belongs in (D-11).
+    Name the section a misplaced key really belongs in.
 
     Args:
         key: The unknown key.
@@ -885,7 +882,7 @@ def _section_owning(key: str, *, exclude: type[BaseModel] | None) -> str | None:
 
 def _format_loc_path(parts: Sequence[str | int]) -> str:
     """
-    Render the key path below a section, e.g. ``default_tags[0]`` (D-10).
+    Render the key path below a section, e.g. ``default_tags[0]``.
 
     Args:
         parts: The ``loc`` elements after the section (and profile name).
@@ -908,7 +905,7 @@ def _describe_unknown_key(
     label: str, key: str, model: type[BaseModel], *, variable: str | None
 ) -> str:
     """
-    Describe an unknown key inside a section or profile table (D-11, D-12).
+    Describe an unknown key inside a section or profile table.
 
     Args:
         label: The section label, e.g. ``paperless`` or ``profiles.default``.
@@ -936,7 +933,7 @@ def _describe_unknown_key(
 
 def _describe_unknown_top_level(name: str) -> str:
     """
-    Describe an unknown top-level name (D-11, M-18).
+    Describe an unknown top-level name.
 
     A miscased section (``[Paperless]``) is suggested as the real section,
     never as ``[profiles.Paperless]``; a key of some section says where it
@@ -970,8 +967,8 @@ def _env_contribution() -> dict[str, object]:
     Return what the SANELESS_* environment contributes to the settings.
 
     This is pydantic-settings' own prefix, delimiter, case-folding and JSON
-    logic, so error attribution (D-12) and the CFG-11 key names cannot drift
-    from what was actually loaded (RESEARCH "Don't Hand-Roll").
+    logic, so error attribution and the environment-supplied key names logged
+    at startup cannot drift from what was actually loaded.
 
     Returns:
         The case-folded nested mapping the environment source produces.
@@ -987,7 +984,7 @@ def _env_variable_for(
     loc: tuple[str | int, ...], env_data: Mapping[str, object]
 ) -> str | None:
     """
-    Name the environment variable an error's value came from, if any (D-12).
+    Name the environment variable an error's value came from, if any.
 
     ``env_data`` is walked by the string elements of ``loc``. Its keys are
     already case-folded by pydantic-settings, so an error in a TOML
@@ -998,9 +995,9 @@ def _env_variable_for(
     ``SANELESS_OUTPUT``. Environment beats file after the sources merge, so a
     value present in ``env_data`` is the one that failed.
 
-    The environment is named only when the failing value is in ``env_data``
-    (WR-04). A key the walk does not find there came from the file, even when
-    a JSON variable such as ``SANELESS_OUTPUT`` supplied other keys of the same
+    The environment is named only when the failing value is in ``env_data``.
+    A key the walk does not find there came from the file, even when a JSON
+    variable such as ``SANELESS_OUTPUT`` supplied other keys of the same
     section, so no prefix fallback is tried. The walk stops without judging at
     a non-string element (a list index) or at a value that is not a mapping
     (the failing value itself). When the value at ``loc`` is a mapping the
@@ -1051,7 +1048,7 @@ def _render_error(
     env_data: Mapping[str, object],
 ) -> str:
     """
-    Render one pydantic error as a ``[section] key`` line (D-10, D-11, D-12).
+    Render one pydantic error as a ``[section] key`` line.
 
     Args:
         loc: The error's location.
@@ -1093,15 +1090,15 @@ def _render_error_lines(
     errors: Sequence[ErrorDetails], env_data: Mapping[str, object]
 ) -> list[str]:
     """
-    Render every validation error as one line, sorted for stable output (D-10).
+    Render every validation error as one line, sorted for stable output.
 
     Only ``loc``, ``type`` and ``msg`` are read. ``input`` and ``ctx`` are
     never touched: for ``tokne = "..."`` the input is the Paperless token, and
-    ``str(ValidationError)`` embeds it (D-14, CFG-05).
+    ``str(ValidationError)`` embeds it.
 
     Args:
         errors: ``ValidationError.errors()``.
-        env_data: The environment's contribution, for attribution (D-12).
+        env_data: The environment's contribution, for attribution.
 
     Returns:
         The error lines, without indentation or header.
@@ -1148,13 +1145,13 @@ def _suggest_env_name(first: str, rest: str) -> str:
 
 def _unknown_env_lines(environ: Mapping[str, str]) -> list[str]:
     """
-    Reject SANELESS_* variables whose first segment names no section (D-13).
+    Reject SANELESS_* variables whose first segment names no section.
 
     pydantic-settings silently ignores them, so ``SANELESS_PAPERLES__TOKEN``
     would leave the token unset without a word, and ``SANELESS_CONFIG_PATH``
     would look as if it did something. This runs in the loader, never in a
     ``Settings`` validator, so direct ``Settings(...)`` construction is
-    unaffected (Pitfall 9, S-10).
+    unaffected.
 
     Args:
         environ: The process environment.
@@ -1202,12 +1199,12 @@ def _build_settings(
     Build Settings, rendering every validation error into one ConfigError.
 
     Each error becomes one line under a header naming the file, or naming
-    defaults and environment when no file was loaded (D-10). Errors whose
-    value came from the environment name the variable (D-12), unknown
-    SANELESS_* variables are added to the same list (D-13), and invalid JSON
-    in a variable becomes a line too (Pitfall 2). A TOML syntax error, a file
-    that is not UTF-8 and a file that cannot be read each become one line
-    under the same header too, chained to their cause (D-12).
+    defaults and environment when no file was loaded. Errors whose value came
+    from the environment name the variable, unknown SANELESS_* variables are
+    added to the same list, and invalid JSON in a variable becomes a line too.
+    A TOML syntax error, a file that is not UTF-8 and a file that cannot be
+    read each become one line under the same header too, chained to their
+    cause.
 
     Args:
         toml_file: The TOML file to load, or None for defaults plus environment.
@@ -1226,7 +1223,7 @@ def _build_settings(
         env_data = _env_contribution()
     except SettingsError as exc:
         # The message names the field and source, never the value; the
-        # exception (and its JSON-decoding cause) is not chained (T-27-13).
+        # exception (and its JSON-decoding cause) is not chained.
         lines.append(f"environment: {_escape_name(str(exc))}")
     else:
         try:
@@ -1238,7 +1235,7 @@ def _build_settings(
             lines.extend(_render_error_lines(exc.errors(), env_data))
         # Only the position and the parser's own words are rendered: the
         # decode errors' ``doc`` and ``object`` hold file content, possibly the
-        # token (T-28-05).
+        # token.
         except tomllib.TOMLDecodeError as exc:
             lines.append(
                 f"line {exc.lineno}, column {exc.colno}: {_escape_name(exc.msg)}"
@@ -1263,9 +1260,9 @@ def _build_settings(
     msg = "\n".join([header, *(f"  {line}" for line in lines)])
     # Raised outside the except block. A ValidationError stays unchained
     # (from None): its str() embeds the inputs -- possibly the token -- and a
-    # traceback prints the chain (Pitfall 1, Phase 27 D-14). A TOMLDecodeError,
-    # UnicodeDecodeError or OSError is chained: none of their str() forms holds
-    # file content, and the cause is what tells a caller which failure it was.
+    # traceback prints the chain. A TOMLDecodeError, UnicodeDecodeError or
+    # OSError is chained: none of their str() forms holds file content, and the
+    # cause is what tells a caller which failure it was.
     if cause is not None:
         raise ConfigError(msg) from cause
     raise ConfigError(msg) from None
@@ -1273,7 +1270,7 @@ def _build_settings(
 
 def _nearest_existing_ancestor(path: Path) -> Path:
     """
-    Find the deepest existing path among ``path`` and its ancestors (M-20).
+    Find the deepest existing path among ``path`` and its ancestors.
 
     Args:
         path: A directory that may not exist yet.
@@ -1291,7 +1288,7 @@ def _nearest_existing_ancestor(path: Path) -> Path:
 
 def _require_writable(label: str, directory: Path) -> None:
     """
-    Raise ConfigError unless ``directory`` could be written or created (M-20).
+    Raise ConfigError unless ``directory`` could be written or created.
 
     A missing directory is judged by its nearest existing ancestor, since that
     is where creating it would fail -- not just by an immediate parent that
@@ -1322,10 +1319,9 @@ def validate_settings_dirs(settings: Settings) -> None:
 
     Validates directory writability at startup so permission errors surface
     immediately rather than mid-scan, or - for data_dir - at the moment a
-    failed scan needs preserving. Per D-13, raises ConfigError (not
-    ValueError) for writability failures. A missing directory is checked
-    against its nearest existing ancestor, so ``<unwritable>/a/b/c`` fails
-    here too (M-20).
+    failed scan needs preserving. Raises ConfigError (not ValueError) for
+    writability failures. A missing directory is checked against its nearest
+    existing ancestor, so ``<unwritable>/a/b/c`` fails here too.
 
     Args:
         settings: Application settings to validate.
@@ -1344,9 +1340,9 @@ def config_search_paths() -> tuple[Path, ...]:
     """
     List the config file locations searched when no explicit path is given.
 
-    The single search list for both loading and the CLI's write target
-    (D-16): ``./saneless.toml``, then ``$XDG_CONFIG_HOME/saneless/config.toml``
-    (``~/.config`` when unset, CFG-03), then ``/etc/saneless/config.toml``. A
+    The single search list for both loading and the CLI's write target:
+    ``./saneless.toml``, then ``$XDG_CONFIG_HOME/saneless/config.toml``
+    (``~/.config`` when unset), then ``/etc/saneless/config.toml``. A
     function rather than a module constant so HOME and ``$XDG_CONFIG_HOME``
     are read when called, not at import.
 
@@ -1378,28 +1374,28 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     Raises:
         ConfigError: If an explicit path is empty, cannot have its ``~``
-            expanded, is missing or is not a regular file (CFG-02), if the
-            file cannot be read, is not UTF-8 or is not valid TOML (D-12,
-            chained to the OSError, UnicodeDecodeError or TOMLDecodeError),
-            or if the configuration fails validation (D-10).
+            expanded, is missing or is not a regular file, if the file
+            cannot be read, is not UTF-8 or is not valid TOML (chained to the
+            OSError, UnicodeDecodeError or TOMLDecodeError), or if the
+            configuration fails validation.
 
     """
     path: Path | None
     if config_path == "":
         # ``--config "$CFG"`` with CFG unset or empty is an explicit path that
         # names nothing, not "no path": discovery here would load, and
-        # auto-profiles would write, whatever file happens to be found (WR-05).
+        # auto-profiles would write, whatever file happens to be found.
         msg = "Config file path is empty (was --config given an unset variable?)"
         raise ConfigError(msg)
     if config_path is not None:
         try:
             explicit = Path(config_path).expanduser()
         except RuntimeError:
-            # ``~nosuchuser/...``, or ``~`` with no home directory (WR-03).
+            # ``~nosuchuser/...``, or ``~`` with no home directory.
             msg = f"Cannot expand '~' in --config path: {config_path}"
             raise ConfigError(msg) from None
         # A directory counts as missing: Docker creates one where a
-        # single-file bind mount's source does not exist (CFG-02, M-19).
+        # single-file bind mount's source does not exist.
         if not explicit.is_file():
             msg = f"Config file not found or not a regular file: {explicit}"
             raise ConfigError(msg)
@@ -1417,7 +1413,7 @@ def _dotted_leaves(node: Mapping[str, object], prefix: str) -> Iterator[str]:
     Yield the dotted names of the leaves of a nested mapping.
 
     A non-empty mapping is descended into; anything else is a leaf. Each
-    segment is escaped, because profile names reach the log (T-27-11).
+    segment is escaped, because profile names reach the log.
 
     Args:
         node: The mapping to flatten.
@@ -1437,7 +1433,7 @@ def _dotted_leaves(node: Mapping[str, object], prefix: str) -> Iterator[str]:
 
 def env_sourced_keys() -> list[str]:
     """
-    List the settings that SANELESS_* environment variables supply (CFG-11).
+    List the settings that SANELESS_* environment variables supply.
 
     Names only, never values: the Paperless token is commonly one of them.
     A JSON-valued section such as ``SANELESS_OUTPUT`` is reported by its
@@ -1452,14 +1448,14 @@ def env_sourced_keys() -> list[str]:
 
 def log_config_sources(settings: Settings) -> None:
     """
-    Log, once at INFO, where the configuration came from (CFG-11, U-01).
+    Log, once at INFO, where the configuration came from.
 
     Names the loaded file, or says that only defaults and environment were
     used, and lists the dotted names of the environment-sourced keys -- an
     operator can then see that a stray variable overrides the file. Values are
     never logged. Like ``warn_on_legacy_duplex_sources``, this is a function
     the CLI calls after ``configure_logging``, not a validator: a record logged
-    during load would never reach ``log_file`` (S-10, WR-05). It runs only
+    during load would never reach ``log_file``. It runs only
     after a successful load, so the environment is known to parse.
 
     Args:

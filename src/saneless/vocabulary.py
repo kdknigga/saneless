@@ -101,15 +101,15 @@ class ErrorCategory(StrEnum):
 
     ``REJECTED`` is not a failure of a scan that ran.  It marks a job row
     written for a submit that was refused -- the queue was full, or the worker
-    was down or degraded -- so the job never ran at all (D-05).
+    was down or degraded -- so the job never ran at all.
     ``JobStore.latest_run_job`` skips it, so the status area never reports a
-    rejection as the job that just ended (D-06), while the history table still
-    lists the row.
+    rejection as the job that just ended, while the history table still lists
+    the row.
 
     ``ASSEMBLY`` means the scanned pages could not be assembled into a PDF --
     img2pdf or Pillow refused the images, or the output directory could not be
     written.  It is its own category so a full disk is never reported as a
-    scanner failure (D-04).
+    scanner failure.
     """
 
     FEEDER = "FEEDER"
@@ -126,11 +126,11 @@ class ErrorAdvice:
     """
     What a reader is told about an error category, and what to do next.
 
-    The two halves travel together because they are always rendered together
-    (APPL-04): a message without a next step leaves the reader stuck, and a
-    next step without a message leaves them guessing what went wrong.  Frozen
-    and slotted so a renderer cannot edit approved copy in place, and so a
-    typo cannot quietly add a third field that nothing renders.
+    The two halves travel together because they are always rendered together:
+    a message without a next step leaves the reader stuck, and a next step
+    without a message leaves them guessing what went wrong.  Frozen and slotted
+    so a renderer cannot edit approved copy in place, and so a typo cannot
+    quietly add a third field that nothing renders.
     """
 
     message: str
@@ -172,15 +172,14 @@ class ProfileStorage(StrEnum):
     recomputed because ``_persist_generated_profiles`` returns ``None`` for two
     genuinely different situations -- no config file was loaded at all, and a
     config file was loaded but could not be written -- and the status strip's
-    Profiles row must tell a household member which one happened (Amendment
-    A-2, D-22).  One is "saneless has no config file to save to"; the other is
-    "saneless has one and cannot write it", and only the second is worth
-    investigating.
+    Profiles row must tell a household member which one happened.  One is
+    "saneless has no config file to save to"; the other is "saneless has one
+    and cannot write it", and only the second is worth investigating.
 
     A fresh ``os.access()`` probe at check time cannot substitute for the
-    record.  Phase 27 D-09's motivating failure is EBUSY on a single-file bind
-    mount, where the directory is writable, ``os.access`` says yes, and only
-    the rename fails.  The check reads what the write actually did.
+    record.  The failure that matters is EBUSY on a single-file bind mount,
+    where the directory is writable, ``os.access`` says yes, and only the
+    rename fails.  The check reads what the write actually did.
 
     ``PERSISTED`` means the profiles are in the config file and will survive a
     restart.  Both ``IN_MEMORY_`` members mean they are in memory for this run
@@ -196,7 +195,7 @@ class ExitCode(IntEnum):
     """
     The process exit codes of the saneless CLI.
 
-    This is the one definition of the CLI exit codes (D-07).  The documentation
+    This is the one definition of the CLI exit codes.  The documentation
     tables that list them are pinned to this enum by a doc-truth test, so the
     two cannot drift apart.  Dispatch onto it is a ``match`` with
     ``assert_never`` in ``exit_code_for``, so a new ``ErrorCategory`` member
@@ -297,7 +296,7 @@ class WorkerHealth(StrEnum):
 
     ``DOWN`` means the worker thread is not alive.  ``DEGRADED`` means the
     thread is alive but has hit N consecutive loop-level failures -- job store
-    writes, pruning -- and no store probe has succeeded since (D-10, D-12).
+    writes, pruning -- and no store probe has succeeded since.
     ``HEALTHY`` is everything else.
     """
 
@@ -308,7 +307,7 @@ class WorkerHealth(StrEnum):
 
 class SubmitResult(StrEnum):
     """
-    What ``ScanWorker.submit`` reports instead of blocking (C-09).
+    What ``ScanWorker.submit`` reports instead of blocking.
 
     ``ACCEPTED`` means the job is queued.  ``QUEUE_FULL`` means the bounded
     queue had no room.  ``DOWN`` covers every state in which the worker cannot
@@ -326,9 +325,9 @@ class SubmitResult(StrEnum):
 # The member value for the unset-token refusal, named rather than written
 # inline, for the same reason ``_REJECTED_WIRE_VALUE`` is: ruff's S105 reads any
 # string literal assigned to a name containing "token" as a hardcoded
-# credential.  The member name is fixed by APPL-07 and every StrEnum in this
-# module has value == name, so the literal gets a name S105 does not flag rather
-# than the convention getting an exception.
+# credential.  The member name is fixed and every StrEnum in this module has
+# value == name, so the literal gets a name S105 does not flag rather than the
+# convention getting an exception.
 _UNSET_REJECTION_VALUE = "TOKEN_UNSET"
 
 
@@ -346,7 +345,7 @@ class RequestRejection(StrEnum):
     QUEUE_FULL = "QUEUE_FULL"
     WORKER_DOWN = "WORKER_DOWN"
     WORKER_DEGRADED = "WORKER_DEGRADED"
-    # Its own member rather than a reuse of WORKER_DEGRADED (D-15).  Degraded
+    # Its own member rather than a reuse of WORKER_DEGRADED.  Degraded
     # says "the scan service was unavailable", which is untrue here: the
     # service is fine and nobody set the paperless-ngx API token.  Sharing the
     # member would send a household member looking for a broken server.
@@ -363,15 +362,13 @@ class RequestRejection(StrEnum):
 
 # The one title length cap.  The ``Form(max_length=...)`` validation on the scan
 # route, the ``maxlength`` attribute on the title input and the TITLE_TOO_LONG
-# message all read this constant, so the three cannot drift apart (ROBU-08,
-# UI-SPEC S5).
+# message all read this constant, so the three cannot drift apart.
 TITLE_MAX_LENGTH: Final = 256
 
 # Job-row error texts.  A submit refused because the queue was full, the
 # worker was down or degraded, or the paperless-ngx API token was never set
-# still writes a job row, so history shows the attempt (D-05); these are that
-# row's ``error``.  Like every other ``job.error`` they carry no trailing
-# period.
+# still writes a job row, so history shows the attempt; these are that row's
+# ``error``.  Like every other ``job.error`` they carry no trailing period.
 QUEUE_FULL_JOB_ERROR: Final = "Not started: the scan queue was full"
 WORKER_DOWN_JOB_ERROR: Final = "Not started: the scan service was not running"
 WORKER_DEGRADED_JOB_ERROR: Final = "Not started: the scan service was unavailable"
@@ -379,18 +376,17 @@ WORKER_DEGRADED_JOB_ERROR: Final = "Not started: the scan service was unavailabl
 # same reason ``_REJECTED_WIRE_VALUE`` is: ruff's S105 reads any string literal
 # assigned to a name containing "token" as a hardcoded credential.  This is
 # job-row copy *about* a token nobody set, not a token, and the exported name
-# is fixed by APPL-07, so the literal gets a name S105 does not flag.
+# is fixed, so the literal gets a name S105 does not flag.
 _UNSET_CREDENTIAL_JOB_ERROR = (
     "Not started: the paperless-ngx API token has not been set"
 )
 TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
 
-# Why the Scan button is greyed out, rendered as a line beneath it (UI-SPEC
-# S8).  It deliberately does not repeat the fix: the status strip's Paperless
-# row, a few centimetres above on the same page, already carries "Put a real
-# API token in the saneless config file, then restart saneless." as its next
-# step.  Three surfaces name the same problem in the same words; only one owns
-# the remedy.
+# Why the Scan button is greyed out, rendered as a line beneath it.  It
+# deliberately does not repeat the fix: the status strip's Paperless row, a few
+# centimetres above on the same page, already carries "Put a real API token in
+# the saneless config file, then restart saneless." as its next step.  Three
+# surfaces name the same problem in the same words; only one owns the remedy.
 #
 # Like every other string here it is a developer constant: it names the problem
 # and nothing else -- never the token value and never the paperless-ngx URL,
@@ -401,13 +397,13 @@ SCAN_BLOCKED_REASON: Final = (
 )
 
 # What startup recovery passes to ``JobStore.fail_active_jobs`` for a job the
-# previous process left in flight (D-13), and what a flip wait aborted by
-# shutdown records.
+# previous process left in flight, and what a flip wait aborted by shutdown
+# records.
 RESTART_REASON: Final = "The server restarted before this scan finished"
 
 # How every user-facing timestamp is spelled, on the web page and in the CLI
-# table alike (D-34, D-35).  ``%Z`` is on the format rather than in a column
-# caption so the zone is named on every line and a copy-pasted timestamp is
+# table alike.  ``%Z`` is on the format rather than in a column caption so
+# the zone is named on every line and a copy-pasted timestamp is
 # self-describing.  One constant, read by the Jinja filter and by ``cli.py``,
 # is what stops the two surfaces from disagreeing.  Seconds are deliberately
 # absent: they buy nothing a reader wants and they cost the CLI table three
@@ -415,7 +411,7 @@ RESTART_REASON: Final = "The server restarted before this scan finished"
 LOCAL_TIME_FORMAT: Final = "%Y-%m-%d %H:%M %Z"
 
 # The separator between the pass-A front count and the progress prose on the
-# manual-duplex busy line (D-33).  U+00B7 MIDDLE DOT with a space either side.
+# manual-duplex busy line.  U+00B7 MIDDLE DOT with a space either side.
 _BUSY_SEPARATOR: Final = "·"
 
 
@@ -513,8 +509,8 @@ def progress_label(state: JobState) -> str:
 
     ``DONE``, ``ERROR``, ``FALLBACK`` and ``CANCELLED`` have no progress prose
     in production: the status partial and the CLI both branch structurally for
-    the four terminal states.  Their arms exist so the lookup is total and a future
-    member cannot be forgotten; they have no production caller in this phase.
+    the four terminal states.  Their arms exist so the lookup is total and a
+    future member cannot be forgotten; they have no production caller.
 
     Args:
         state: The job state to describe.
@@ -562,7 +558,7 @@ def busy_line(
     """
     Return the one line the status area shows while a job is in flight.
 
-    Three branches in strict precedence (D-33, APPL-08):
+    Three branches in strict precedence:
 
     1. The job is queued behind another one, so it is told what it is waiting
        for and how many jobs are ahead.  This wins outright: a job that has not
@@ -572,14 +568,12 @@ def busy_line(
     3. Otherwise the progress prose alone, exactly as before.
 
     ``(0 ahead of you)`` is never produced.  It is technically true and reads
-    like a bug, so the last job in the queue is told it is ``next in line``
-    (D-25).
+    like a bug, so the last job in the queue is told it is ``next in line``.
 
     The trailing phrase in branch 2 is ``progress_label(SCANNING_REVERSE)`` --
     master-pinned copy with its own tests -- and not the history table's
-    ``state_label``, which is a different owner with a different string.  This
-    is a deliberate, recorded deviation from D-33's specimen wording; the
-    count, the separator and the live behaviour are as D-33 specifies.
+    ``state_label``, which is a different owner with a different string.  The
+    choice is deliberate.
 
     ``queue_title`` is the only user data any string here carries.  It is
     returned as plain text, escaped by Jinja's autoescape at render time, and
@@ -617,8 +611,8 @@ def local_time(value: datetime) -> str:
 
     ``astimezone()`` is called with no argument, so the zone is the process's
     own whatever zone the value carries.  That makes ``TZ`` load-bearing: a
-    container reports UTC unless it is set, which satisfies APPL-12 on paper
-    and helps nobody.  No ``zoneinfo`` import and no new config key is
+    container reports UTC unless it is set, which does name a zone and helps
+    nobody.  No ``zoneinfo`` import and no new config key is
     involved -- the operator's ``TZ`` is the single source.
 
     ``%Z`` renders as the empty string when the platform reports no zone
@@ -648,7 +642,7 @@ def page_counts(job: PageCounted) -> str | None:
 
     A NULL count renders nothing at all -- no element, no empty line -- and one
     NULL is enough to suppress the whole sentence, because a sentence naming
-    two of three counts invites the reader to wonder about the third (D-32).
+    two of three counts invites the reader to wonder about the third.
     This is the common path, not an edge: four of the six terminal cases have
     no counts by construction (ERROR, CANCELLED, REJECTED and every row written
     before the columns existed).
@@ -684,7 +678,7 @@ def flip_answer_label(outcome: FlipOutcome) -> str:
     Once a job's flip wait has been answered but the worker has not yet
     persisted the job's next state, the status area shows this sentence in
     place of the flip prompt, so the Continue and Abort buttons do not come
-    back as though the click did nothing (CR-01).  The trailing ellipsis is
+    back as though the click did nothing.  The trailing ellipsis is
     three ASCII periods, matching ``progress_label``.
 
     ``TIMED_OUT`` has an arm for totality: a timed-out job moves to ``ERROR``
@@ -753,10 +747,10 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
     """
     Return what to tell a reader about an error category, and what to do next.
 
-    This is the one ``match`` over ``ErrorCategory`` in this module (D-10,
-    D-11).  ``error_message`` and ``error_next_step`` are one-line accessors
-    over it rather than lookups of their own, so a category can never end up
-    with a message and no next step, or with two lookups that drift apart.
+    This is the one ``match`` over ``ErrorCategory`` in this module.
+    ``error_message`` and ``error_next_step`` are one-line accessors over it
+    rather than lookups of their own, so a category can never end up with a
+    message and no next step, or with two lookups that drift apart.
 
     The wording is surface-neutral.  Both the web page and the CLI render the
     same string, so a next step never says "press Scan" (the CLI has no
@@ -827,7 +821,7 @@ def error_advice(category: ErrorCategory) -> ErrorAdvice:
         case ErrorCategory.REJECTED:
             advice = ErrorAdvice(
                 # Neutral on purpose: REJECTED also covers down and degraded
-                # refusals, where no scan is running to wait for (IN-02).
+                # refusals, where no scan is running to wait for.
                 message=(
                     "This scan was not started. Check that saneless is ready "
                     "to scan, then try again."
@@ -846,10 +840,8 @@ def error_message(category: ErrorCategory) -> str:
     """
     Return the plain-language user message for an error category.
 
-    APPL-04 is the arrival this function's docstring used to promise: the
-    plain-language display is wired, and the message is now half of an
-    ``ErrorAdvice`` rather than a lookup of its own.  The D-10 rule is that
-    there is exactly one ``match`` over ``ErrorCategory`` in this module, in
+    The message is half of an ``ErrorAdvice`` rather than a lookup of its own.
+    There is exactly one ``match`` over ``ErrorCategory`` in this module, in
     ``error_advice``; this accessor reads it so the message and the next step
     cannot drift apart.
 
@@ -871,7 +863,7 @@ def error_next_step(category: ErrorCategory) -> str:
     Return the action a reader should take after an error category.
 
     The companion of ``error_message`` and, like it, a one-line accessor over
-    ``error_advice`` (D-10, D-11).
+    ``error_advice``.
 
     Args:
         category: The error category to advise on.
@@ -1004,7 +996,7 @@ def rejection_message(rejection: RequestRejection) -> str:
     """
     Return the user-facing message for a web-layer rejection.
 
-    This is the approved copy from 26-UI-SPEC S3, and the only place it lives.
+    This is the approved copy, and the only place it lives.
     Every message is a developer-authored constant that ends with a period.
     The TITLE_TOO_LONG message is built from ``TITLE_MAX_LENGTH`` so the number
     it names cannot drift from the cap the form enforces.
@@ -1131,13 +1123,12 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
     * A cancel is not a category.  ``ScanCancelledError`` and
       ``KeyboardInterrupt`` map to ``ExitCode.CANCELLED``.
     * ``StorageError`` classifies as ``UNKNOWN``, but it is a setup problem, so
-      the CLI guard maps it to ``ExitCode.CONFIG`` (exit 2) by type (D-07
-      amendment).  The mapping is by type rather than by making
-      ``classify_error`` return ``CONFIG`` because ``ErrorCategory`` is
-      persisted on job records, and a store that cannot open is not a job's
-      configuration failure.  An ``ErrorCategory.STORAGE`` member was rejected
-      for the same reason: it would be a new persisted value no job could ever
-      carry.
+      the CLI guard maps it to ``ExitCode.CONFIG`` (exit 2) by type.  The
+      mapping is by type rather than by making ``classify_error`` return
+      ``CONFIG`` because ``ErrorCategory`` is persisted on job records, and a
+      store that cannot open is not a job's configuration failure.  An
+      ``ErrorCategory.STORAGE`` member was rejected for the same reason: it
+      would be a new persisted value no job could ever carry.
 
     ``UNKNOWN`` therefore reaches ``UNEXPECTED`` only for exceptions that are
     not saneless types -- and for a bare ``SanelessError``, which is itself a
@@ -1180,7 +1171,7 @@ def classify_error(exc: Exception) -> ErrorCategory:
     and the trailing ``UNKNOWN`` is the correct total fallback.
 
     ``ScanCancelledError`` is deliberately left ``UNKNOWN``: a cancel is not a
-    failure category, and callers test for it before they classify (D-01).
+    failure category, and callers test for it before they classify.
     ``StorageError`` is also ``UNKNOWN``; its exit code is assigned by type, as
     ``exit_code_for`` explains.
 
