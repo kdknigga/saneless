@@ -35,6 +35,41 @@ saneless devices --json
 ]
 ```
 
+These four keys, in this order, are the whole object unless you add `--capabilities`. Only the JSON document is written to stdout; status lines and errors go to stderr, so you can pipe the output straight into `jq`.
+
+With `--capabilities`, each device also carries a `capabilities` object:
+
+```bash
+saneless devices --json --capabilities | jq '.[] | {name, sources: .capabilities.sources}'
+```
+
+```json
+[
+  {
+    "name": "net:192.168.1.50:pixma:MF740C",
+    "vendor": "Canon",
+    "model": "MF740C Series",
+    "type": "multi-function peripheral",
+    "capabilities": {
+      "sources": ["Flatbed", "ADF Simplex", "ADF Duplex"],
+      "resolutions": [150, 300, 600],
+      "modes": ["Color", "Gray", "Lineart"],
+      "raw_options": ["source", "mode", "resolution"]
+    }
+  }
+]
+```
+
+A key appears only when the device reported something for it. A device that gives its resolution as a range has `"resolution_range": {"min": ..., "max": ..., "step": ...}` instead of `resolutions`.
+
+If one device's capabilities cannot be read, that device gets `"capabilities": null` and a one-line `"capabilities_error"` string. The other devices are still reported and stdout is still valid JSON, but the command exits 1, so check the exit code as well as the document:
+
+```bash
+if ! caps=$(saneless devices --json --capabilities); then
+  echo "$caps" | jq -r '.[] | select(.capabilities == null) | "\(.name): \(.capabilities_error)"' >&2
+fi
+```
+
 ### Job history JSON
 
 ```bash

@@ -75,17 +75,19 @@ saneless [--config PATH] [-v] devices [--json] [--capabilities]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--json` | flag | off | Output device list as JSON |
-| `--capabilities` | flag | off | Show each device's sources, modes and resolution support — either a list of values or a minimum/maximum/step range, whichever the device reports — plus its raw SANE option names |
+| `--capabilities` | flag | off | Show each device's sources, modes and resolution support — either a list of values or a minimum/maximum/step range, whichever the device reports — plus its raw SANE option names. With `--json`, each device object gains a `capabilities` object |
 
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success (even if no devices found) |
-| 1 | Scan error (SANE failed while listing devices or reading capabilities) |
+| 1 | Scan error (SANE failed while listing devices, or at least one device's capabilities could not be read; the other devices are still reported) |
 | 2 | Configuration error (invalid config, or python-sane not installed) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 130 | Cancelled (Ctrl-C) |
+
+Only data goes to stdout. The `Discovering scanners...` status line, which the table mode prints, and any per-device capability error go to stderr, so `saneless devices | grep` and `saneless devices --json | jq` see the device list and nothing else.
 
 **Example output (table):**
 
@@ -95,6 +97,8 @@ Name                 Vendor          Model                Type
 ------------------------------------------------------------
 net:192.168.1.50:pi  Canon           MF740C Series        scanner
 ```
+
+The first line is on stderr; the table is on stdout.
 
 **Example output (JSON):**
 
@@ -108,6 +112,37 @@ net:192.168.1.50:pi  Canon           MF740C Series        scanner
   }
 ]
 ```
+
+Without `--capabilities` the JSON has exactly these four keys per device, in this order.
+
+**Example output (`--json --capabilities`):**
+
+```json
+[
+  {
+    "name": "net:192.168.1.50:pixma:MF740C",
+    "vendor": "Canon",
+    "model": "MF740C Series",
+    "type": "scanner",
+    "capabilities": {
+      "sources": ["Flatbed", "ADF Simplex", "ADF Duplex"],
+      "resolutions": [150, 300, 600],
+      "modes": ["Color", "Gray", "Lineart"],
+      "raw_options": ["source", "mode", "resolution"]
+    }
+  },
+  {
+    "name": "test:0",
+    "vendor": "Noname",
+    "model": "frontend-tester",
+    "type": "virtual device",
+    "capabilities": null,
+    "capabilities_error": "Could not open scanner test:0: Device busy"
+  }
+]
+```
+
+The output is one JSON document. A `capabilities` object has a key only for what the device reported. A device that constrains resolution with a range gets `"resolution_range": {"min": 1.0, "max": 1200.0, "step": 1.0}` instead of `resolutions`, and the numbers are the ones the device gave. When a device's capabilities cannot be read, that device gets `"capabilities": null` and a one-line `"capabilities_error"`. Every other device is still reported, the same reason is printed on stderr as `Capabilities for <name>: <reason>`, and the command exits 1 after writing the whole document. The table mode does the same: it prints that stderr line for the failed device, lists the others, and exits 1.
 
 ---
 
@@ -199,15 +234,19 @@ saneless [--config PATH] [-v] serve [--host ADDR] [--port N]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--host` | TEXT | `0.0.0.0` (from config) | Bind address. The default `0.0.0.0` listens on all network interfaces |
-| `--port` | int | `8080` (from config) | Bind port |
+| `--host` | TEXT | `0.0.0.0` (from config) | Bind address. The default `0.0.0.0` listens on all network interfaces. IPv6 addresses such as `::1` or `::` work too |
+| `--port` | int | `8080` (from config) | Bind port. `--port 0` lets the OS choose a free port |
+
+Once the address is bound, `serve` prints `Serving on http://<host>:<port>` to stderr and logs the same line. The port on that line is the one actually bound, so with `--port 0` it names the port the OS chose. An IPv6 address is shown in brackets, for example `Serving on http://[::1]:43127`.
+
+`--host` takes an address. A hostname is resolved and only its first address is bound. Binding `::` listens on IPv6 only, not on IPv4 as well; the default `0.0.0.0` listens on IPv4.
 
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Clean shutdown, including Ctrl-C once the web server is running |
-| 2 | Cannot start (port already in use, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
+| 2 | Cannot start (port already in use, a host that does not resolve or an address that cannot be bound, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
 | 3 | Malformed Paperless URL |
 | 5 | Unexpected error (a saneless bug; the traceback is in the stream, not a file -- `serve` writes none) |
 | 130 | Cancelled (Ctrl-C before the web server has started) |

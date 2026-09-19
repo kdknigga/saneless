@@ -58,6 +58,8 @@ Name                 Vendor          Model                Type
 net:192.168.1.100:fujitsu:fi-7160    Fujitsu             fi-7160              scanner
 ```
 
+`Discovering scanners...` is a status line printed on stderr. Only the table goes to stdout, so piping the command into another tool leaves that line out.
+
 !!! tip "No scanner found?"
 
     If no scanners appear:

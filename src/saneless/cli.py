@@ -1,8 +1,11 @@
 """
-Click CLI group with scan and devices commands.
+The saneless command-line interface: one click group and its six commands.
 
-Provides the main command-line interface for saneless, including
-scanner discovery and the full scan-to-upload pipeline.
+``scan`` runs the scan-to-upload pipeline, ``devices`` lists the scanners
+SANE can see, ``jobs`` prints the job history, ``serve`` starts the web
+server, ``auto-profiles`` writes scan profiles from a scanner's capabilities,
+and ``doctor`` runs the readiness checks. Every command runs inside one guard
+that turns a failure into a single stderr line and a documented exit code.
 """
 
 from __future__ import annotations
@@ -84,7 +87,7 @@ if TYPE_CHECKING:
     from .config import ProfileConfig
     from .scanner.base import DeviceCapabilities, DeviceInfo, ScannerBackend
 
-__all__ = ["ClickFlipCoordinator", "_truncate", "cli"]
+__all__ = ["ClickFlipCoordinator", "cli"]
 
 logger = logging.getLogger(__name__)
 
