@@ -2708,6 +2708,60 @@ class TestServeCommand:
         assert len(made) == 1
         assert made[0].fileno() == -1
 
+    def test_serve_port_conflict_fails_before_sane_is_initialised(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A port that is taken is found before SANE is touched.
+
+        Binding first means a setup mistake costs no SANE start-up, and leaves
+        no initialised backend behind that no lifespan will ever close.
+        """
+        scanner_cls, built = _closing_scanner()
+        runs = _fake_server_run(monkeypatch)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            taken = holder.getsockname()[1]
+            runner, _ = _patch_cli(
+                monkeypatch,
+                settings=self._loopback_settings(tmp_path, port=taken),
+                scanner_cls=scanner_cls,
+            )
+
+            result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        assert built == []
+        assert runs == []
+
+    def test_serve_closes_the_sockets_when_sane_fails_to_initialise(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """SANE failing after the bind still closes the bound socket: exit 2."""
+
+        class FailingSaneBackend:
+            """A backend whose construction fails the way ``sane.init()`` does."""
+
+            def __init__(self, host: str = "") -> None:
+                msg = "Could not initialise SANE: Error during device I/O"
+                raise ScanError(msg)
+
+        made = _record_sockets(monkeypatch)
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=self._loopback_settings(tmp_path),
+            scanner_cls=FailingSaneBackend,
+        )
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        assert runs == []
+        assert len(made) == 1
+        assert made[0].fileno() == -1
+
     def test_serve_hands_over_a_listening_socket_without_reuseport(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

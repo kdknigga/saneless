@@ -1165,24 +1165,26 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # so only an absent flag falls back to the configured port.
     actual_port = port if port is not None else settings.output.web_port
 
-    # serve scans nothing itself, so SANE failing to initialise is a failure
-    # to start -- "can't start, fix your setup", exit 2 like a port that cannot
-    # be bound -- not exit 1, which means a scan failed.
-    try:
-        scanner = SaneBackend(host=settings.scanner.host)
-    except ScanError as exc:
-        msg = f"The web server could not start: {exc}"
-        raise ConfigError(msg) from exc
-    # No close callback here, unlike the three one-shot commands: this backend
-    # outlives the command body.  The app is handed it and the lifespan closes
-    # it once the worker confirms it stopped, which is the only point at which
-    # no thread can still be inside SANE.
-    app = create_app(settings, scanner)
-
+    # The address is bound before SANE is initialised or the app is built, so
+    # a port that is taken fails at once, costing no SANE start-up and leaving
+    # no initialised backend behind that no lifespan would ever close.
     sockets = _bind_listening_sockets(actual_host, actual_port)
     # Every path out of here closes every socket, whatever raises between the
     # bind and the end of Server.run.
     try:
+        # serve scans nothing itself, so SANE failing to initialise is a
+        # failure to start -- "can't start, fix your setup", exit 2 like a
+        # port that cannot be bound -- not exit 1, which means a scan failed.
+        try:
+            scanner = SaneBackend(host=settings.scanner.host)
+        except ScanError as exc:
+            msg = f"The web server could not start: {exc}"
+            raise ConfigError(msg) from exc
+        # No close callback here, unlike the three one-shot commands: this
+        # backend outlives the command body.  The app is handed it and the
+        # lifespan closes it once the worker confirms it stopped, which is the
+        # only point at which no thread can still be inside SANE.
+        app = create_app(settings, scanner)
         _run_server(app, sockets, settings.output.log_level)
     finally:
         for sock in sockets:
