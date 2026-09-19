@@ -16,18 +16,25 @@ are still proven to be the numbers a real page produces.
 from __future__ import annotations
 
 import base64
+import inspect
 import io
+import os
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
 from PIL import Image, ImageDraw
 
+import saneless
+import saneless.cli as cli_module
+import saneless.pages as pages_module
 from saneless.pages import filter_empty_pages, generate_thumbnail, is_empty_page
 from saneless.pipeline import _SPOOL_LABEL_A
 from saneless.spool import SpooledPageSink
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from saneless.scanner.base import PageRecord
@@ -37,6 +44,31 @@ if TYPE_CHECKING:
 # passes anywhere the test suite can run at all, and it is still a real check
 # rather than a disabled one.
 _TEST_RESERVE_MB = 1
+
+# The pixel ceiling the application relaxes Pillow's decompression-bomb check
+# to at start-up: above a 1200 dpi A4 colour page, about 139M pixels.
+_LARGE_SCAN_PIXEL_LIMIT = 200_000_000
+
+# The EXIF orientation tag, set on a source image so a test can tell whether
+# any EXIF survived into what saneless wrote.
+_EXIF_ORIENTATION_TAG = 0x0112
+
+# How long the fresh interpreter that imports the imaging modules may take.
+_CHILD_IMPORT_SECONDS = 30.0
+
+# Run in a fresh interpreter, so no earlier import in the test session can
+# have changed Pillow's limit first.  Prints the limit before and after
+# importing every module that used to change it as a side effect.
+_IMPORT_CHECK = """
+import PIL.Image
+
+before = PIL.Image.MAX_IMAGE_PIXELS
+import saneless.pages
+import saneless.pdf
+import saneless.scanner.sane_backend
+
+print(before, PIL.Image.MAX_IMAGE_PIXELS)
+"""
 
 
 def _spool(directory: Path, pages: Sequence[Image.Image]) -> list[PageRecord]:
@@ -244,6 +276,24 @@ class TestFilterEmptyPages:
 class TestThumbnailGeneration:
     """Tests for generate_thumbnail, which still takes a page image."""
 
+    def test_the_thumbnail_carries_no_exif(self) -> None:
+        """
+        A source page with EXIF still yields a thumbnail JPEG with none.
+
+        Asserted on the decoded JPEG, because that is what a browser shows: an
+        orientation tag surviving into it would rotate the preview.
+        """
+        page = _inked_page()
+        exif = Image.Exif()
+        exif[_EXIF_ORIENTATION_TAG] = 6
+        page.info["exif"] = exif.tobytes()
+
+        raw = base64.b64decode(generate_thumbnail(page))
+
+        with Image.open(io.BytesIO(raw)) as thumb:
+            assert "exif" not in thumb.info
+            assert dict(thumb.getexif()) == {}
+
     def test_returns_nonempty_base64(self) -> None:
         """generate_thumbnail returns a non-empty base64 string."""
         result = generate_thumbnail(_inked_page())
@@ -290,3 +340,74 @@ class TestThumbnailGeneration:
         thumb = Image.open(io.BytesIO(raw))
         assert thumb.width == 200
         assert thumb.height == 300
+
+
+class TestLargeScanPixelLimit:
+    """
+    Pillow's pixel limit is relaxed once, at start-up, and nowhere else.
+
+    A 1200 dpi A4 colour page is about 139M pixels, over Pillow's default of
+    about 89.5M, and img2pdf re-opens every spooled page with ``Image.open``,
+    where the decompression-bomb check applies.  Importing a module must not
+    change a process-wide setting, so the relaxation is one call the entry
+    point makes.
+    """
+
+    def test_allow_large_scans_raises_the_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The call sets the limit a high-dpi page fits under."""
+        monkeypatch.setattr(Image, "MAX_IMAGE_PIXELS", Image.MAX_IMAGE_PIXELS)
+
+        pages_module.allow_large_scans()
+
+        assert Image.MAX_IMAGE_PIXELS == _LARGE_SCAN_PIXEL_LIMIT
+
+    def test_importing_the_imaging_modules_leaves_the_limit_alone(self) -> None:
+        """A fresh interpreter keeps Pillow's default after every import."""
+        result = subprocess.run(
+            ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
+            env={
+                **os.environ,
+                "SANELESS_TEST_PYTHON": sys.executable,
+                "SANELESS_TEST_CODE": _IMPORT_CHECK,
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CHILD_IMPORT_SECONDS,
+        )
+
+        assert result.returncode == 0, result.stderr
+        before, after = result.stdout.split()
+        assert after == before
+        assert int(after) != _LARGE_SCAN_PIXEL_LIMIT
+
+    def test_main_relaxes_the_limit_before_running_the_cli(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The console entry point makes the call, and makes it first."""
+        calls: list[str] = []
+        monkeypatch.setattr(
+            pages_module, "allow_large_scans", lambda: calls.append("allow")
+        )
+        monkeypatch.setattr(cli_module, "cli", lambda: calls.append("cli"))
+
+        saneless.main()
+
+        assert calls == ["allow", "cli"]
+
+
+class TestThresholdsHaveOneSource:
+    """The blank-page thresholds come from the profile, never from a default."""
+
+    @pytest.mark.parametrize("function", [is_empty_page, filter_empty_pages])
+    def test_thresholds_are_required_keywords(
+        self, function: Callable[..., object]
+    ) -> None:
+        """Both thresholds are keyword-only and carry no default of their own."""
+        parameters = inspect.signature(function).parameters
+
+        for name in ("mean_threshold", "stddev_threshold"):
+            assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
+            assert parameters[name].default is inspect.Parameter.empty

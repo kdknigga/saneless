@@ -55,6 +55,10 @@ if TYPE_CHECKING:
 # The backend module's own logger, for the tests that read what it reported.
 _BACKEND_LOGGER = "saneless.scanner.sane_backend"
 
+# The EXIF orientation tag, set on a page so a test can tell whether any EXIF
+# survived into the file the spool wrote.
+_EXIF_ORIENTATION_TAG = 0x0112
+
 # ---------------------------------------------------------------------------
 # Mock helpers
 # ---------------------------------------------------------------------------
@@ -75,6 +79,36 @@ def _make_content_image(
     draw.rectangle([10, 10, width - 10, height - 10], fill="blue")
     draw.ellipse([30, 30, width - 30, height - 30], fill="green")
     return img
+
+
+def _with_orientation_exif(page: Image.Image) -> Image.Image:
+    """
+    Attach a real EXIF block, with an orientation tag, to a page.
+
+    Args:
+        page: The page to tag; it is modified and returned.
+
+    Returns:
+        The same page, carrying ``info["exif"]``.
+
+    """
+    exif = Image.Exif()
+    exif[_EXIF_ORIENTATION_TAG] = 6
+    page.info["exif"] = exif.tobytes()
+    return page
+
+
+def _assert_no_exif_on_disk(record: PageRecord) -> None:
+    """
+    Assert the spooled file behind a record carries no EXIF at all.
+
+    Args:
+        record: The record whose file to open.
+
+    """
+    with Image.open(record.path) as spooled:
+        assert "exif" not in spooled.info
+        assert dict(spooled.getexif()) == {}
 
 
 # D-17 completed: MockSaneDev, MockSaneModule and _FakeSaneDevice used to live
@@ -1358,36 +1392,38 @@ class TestSaneBackendPageValidation:
     def test_exif_stripped(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
-        """EXIF data is gone from the page the ADF path spooled."""
+        """
+        No EXIF reaches the PNG the ADF path spooled.
+
+        Read back off disk, because the spooled PNG *is* what the PDF embeds:
+        an orientation tag in that file is what img2pdf would act on.  The
+        page handed over carries a real orientation tag, so the assertion
+        fails if anything on the way writes EXIF out.
+        """
         mock_dev = fake_sane_module.open(_TEST_DEVICE)
-        img = _make_content_image()
-        # Inject fake EXIF data
-        img.info["exif"] = b"fake-exif-data"
-        mock_dev.load_feeder([img])
+        mock_dev.load_feeder([_with_orientation_exif(_make_content_image())])
 
         backend = SaneBackend()
         settings = ScanSettings(source="ADF", resolution=300, mode="Color")
         batch = backend.scan_pages("test:device:001", settings, page_sink)
+
         assert len(batch.pages) == 1
-        # Read back off disk, because the spooled PNG *is* what the PDF
-        # embeds now: a strip that only cleaned an in-memory copy would leave
-        # the orientation tag in the file img2pdf actually reads.
-        assert "exif" not in images_of(batch)[0].info
+        _assert_no_exif_on_disk(batch.pages[0])
 
     def test_exif_stripped_flatbed(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
     ) -> None:
-        """EXIF data is gone from the page the flatbed path spooled too."""
+        """No EXIF reaches the PNG the flatbed path spooled either."""
         mock_dev = fake_sane_module.open(_TEST_DEVICE)
-        img = Image.new("RGB", (100, 100), "white")
-        img.info["exif"] = b"fake-exif-data"
-        mock_dev.load_feeder([img])
+        page = _with_orientation_exif(Image.new("RGB", (100, 100), "white"))
+        mock_dev.load_feeder([page])
 
         backend = SaneBackend()
         settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
         batch = backend.scan_pages("test:device:001", settings, page_sink)
+
         assert len(batch.pages) == 1
-        assert "exif" not in images_of(batch)[0].info
+        _assert_no_exif_on_disk(batch.pages[0])
 
 
 class TestFlatbedIntegrityChecks:

@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 from pydantic import ValidationError
 
+import saneless.vocabulary as vocabulary_module
 from saneless.config import ProfileConfig
 from saneless.paper_sizes import PAPER_SIZES_MM, PaperSize, crop_to_paper_size
 from saneless.scanner.base import ScanSettings
@@ -20,6 +21,28 @@ class TestPaperSizeLiteral:
         """PaperSize Literal includes full, a3, a4, a5, letter, legal."""
         args = get_args(PaperSize)
         assert set(args) == {"full", "a3", "a4", "a5", "letter", "legal"}
+
+
+class TestPaperSizeHasOneDefinition:
+    """
+    The paper-size names are defined once and the lookup table cannot drift.
+
+    ``PaperSize`` lives in the vocabulary module, and every other module uses
+    that one object.  ``PAPER_SIZES_MM`` has an entry for every name except
+    ``"full"``, which means the whole bed and so has no dimensions.
+    """
+
+    def test_the_table_covers_every_size_but_full(self) -> None:
+        """Every non-full paper size has dimensions, and nothing else does."""
+        assert set(PAPER_SIZES_MM) == set(get_args(vocabulary_module.PaperSize)) - {
+            "full"
+        }
+
+    def test_the_other_modules_use_the_vocabulary_definition(self) -> None:
+        """The paper-size module and the profile field share the one Literal."""
+        assert PaperSize is vocabulary_module.PaperSize
+        field = ProfileConfig.model_fields["paper_size"]
+        assert field.annotation is vocabulary_module.PaperSize
 
 
 class TestPaperSizesMM:
