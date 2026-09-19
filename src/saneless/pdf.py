@@ -3,7 +3,7 @@ PDF assembly via img2pdf, over the pages the spool already wrote.
 
 Each acquired page is on disk as a PNG before assembly starts, written once
 by ``saneless.spool``, and that file is what img2pdf embeds -- losslessly,
-with no second encode (D-03). This module therefore creates no temporary
+with no second encode. This module therefore creates no temporary
 image files and owns no page's lifetime: the spool lives in the job's
 workspace, and assembly only reads from it.
 
@@ -152,13 +152,13 @@ def assemble_pdf(
     and img2pdf embeds those very files. There is no longer a temporary
     directory of re-saved copies here, because that second encode produced a
     PNG that was byte-for-byte pointless -- the spooled one already *is* the
-    PDF's page content (D-03).
+    PDF's page content.
 
     The order of ``records`` is the document order and the only source of it.
     The spool directory is never sorted and never globbed: after a
     manual-duplex interleave the file names do not sort into document order,
     and a file sitting in that directory without a record does not belong in
-    this PDF (D-02).
+    this PDF.
 
     ``filename`` is **required**, with no default. Giving it one -- the single
     hardcoded name this function used to write every PDF to -- would have kept
@@ -211,7 +211,7 @@ def assemble_pdf(
     assigned per acquisition pass, so after a manual-duplex interleave two
     records legitimately share the number 1. Naming by position keeps the merge
     argv unique and in document order by construction, with nothing sorted and
-    nothing globbed (D-02).
+    nothing globbed.
 
     This function is a module boundary that raises only ``PdfError``, and the
     caught type is ``Exception``, **deliberately**. img2pdf raises seven
@@ -224,7 +224,8 @@ def assemble_pdf(
     directory creation, the per-page converts and the merge, nothing else --
     and broad in *type*. pikepdf needed **no new** ``except`` clause for that
     reason: its errors are ordinary ``Exception`` subclasses and this boundary
-    already covered them, so EXC-01 is unaffected.
+    already covered them, so every one of them still leaves this function
+    as a ``PdfError``.
     Nothing is masked: the original is always chained on ``__cause__`` and its
     text kept in the message. ``KeyboardInterrupt`` and ``SystemExit`` derive
     from ``BaseException`` and pass through untouched.
@@ -252,7 +253,7 @@ def assemble_pdf(
     if not records:
         # The pipeline's _require_pages already refuses an empty batch; this
         # keeps img2pdf's "Unable to process empty list" ValueError unreachable
-        # from any caller of this public function (N-06).
+        # from any caller of this public function.
         msg = "Could not assemble a PDF: no pages were given"
         raise PdfError(msg)
 

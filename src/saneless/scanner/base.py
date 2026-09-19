@@ -102,10 +102,10 @@ def classify_source(source: str) -> SourceKind:
         return SourceKind.FEEDER
     if "flatbed" in lower:
         return SourceKind.FLATBED
-    # ANSWERED, not deferred -- Phase 24, D-01. UNKNOWN keeps single-page
-    # routing, so uses_feeder is False.
+    # ANSWERED, not deferred. UNKNOWN keeps single-page routing, so
+    # uses_feeder is False.
     #
-    # C-06's safer default -- "if the device exposes a source option, treat
+    # The proposed "safer" default -- "if the device exposes a source option, treat
     # anything that is not the flatbed entry as multi-page" -- is DECLINED.
     # It is a bet about scanners nobody has seen, and it trades a cheap,
     # visible failure for an expensive one.
@@ -115,8 +115,7 @@ def classify_source(source: str) -> SourceKind:
     # above. That is visible to the operator and is fixed by one entry in a
     # tuple. The opposite failure -- treating a flatbed as a feeder and
     # re-scanning the platen until something stops it -- is the expensive one,
-    # and it is bounded separately by _MAX_ADF_PAGES in sane_backend.py
-    # (plan 24-03).
+    # and it is bounded separately by _MAX_ADF_PAGES in sane_backend.py.
     #
     # This is a settled answer. Do not re-open it as an unmade decision.
     return SourceKind.UNKNOWN
@@ -185,17 +184,18 @@ class ScanSettings:
     mode: str
     auto_source_mode: str = "flatbed"
     # Manual duplex: resolve a document feeder from the device's own source
-    # list instead of validating ``source`` verbatim (D-02). The backend
+    # list instead of validating ``source`` verbatim. The backend
     # prefers ``source`` when the device reports it and it feeds, falls back
     # to the first reported feeder, and refuses when there is none -- it never
-    # substitutes ``Auto``, which is how C-01 took two platen snapshots.
+    # substitutes ``Auto``, which is how manual duplex once took two platen
+    # snapshots and reported success.
     #
     # A plain bool, not a scanner-side DuplexMode enum: inside the scanner
     # that enum's NONE and HARDWARE members would behave identically, one
     # behaviour with two spellings. The bool also keeps ProfileConfig.duplex's
     # Literal as the only spelling of "duplex", with one conversion point in
-    # run_pipeline. Like auto_source_mode it is a plain value, because Phase 21
-    # D-03 forbids this package depending on the job-state enums.
+    # run_pipeline. Like auto_source_mode it is a plain value, because the
+    # scanner package deliberately does not depend on the job-state enums.
     resolve_feeder_source: bool = False
     paper_size: PaperSize = "full"
 
@@ -206,16 +206,16 @@ class ScanBatch:
     The pages one acquisition produced, and what the device actually did.
 
     Three fields, and the per-page structure is now ``pages`` itself: the
-    ordered page records HARD-01 called for are that design, and every
+    ordered page records are that design, and every
     per-page fact -- which file a sheet landed in, what was measured about it,
     where it sat in the pass -- belongs on ``PageRecord`` rather than here.
     What survives at batch level is exactly the two things the device reports
     about the pass as a whole, so this stays the one channel carrying
     ``actual_resolution`` and ``pages_rejected`` alongside the records and
-    there is no second route out of the backend (Phase 24 D-12, amended by
-    D-01). Do not extend this casually: a fact that is per-page belongs on the
-    record. It deliberately carries no geometry either, because D-19 reuses
-    the existing crop fallback rather than reporting the area back out.
+    there is no second route out of the backend. Do not extend this casually:
+    a fact that is per-page belongs on the record. It deliberately carries no
+    geometry either, because a scan area the device clamped falls back to the
+    existing crop rather than being reported back out.
 
     ``frozen=True`` is a departure from the plain ``@dataclass`` used by
     ``DeviceInfo``, ``DeviceCapabilities``, ``ScanSettings`` and
@@ -228,7 +228,7 @@ class ScanBatch:
         pages: The page records the sink produced, in document order. The
             order of this tuple is the document order, and
             ``PageRecord.sequence`` -- not the filesystem, not a glob, not a
-            sort -- is the proof of it (D-02). After a manual-duplex
+            sort -- is the proof of it. After a manual-duplex
             interleave the spooled file names do not sort into document order
             at all, so recovering order from the directory is not a shortcut
             but a bug.
@@ -252,13 +252,13 @@ class ScanBatch:
 @dataclass(frozen=True)
 class PageRecord:
     """
-    One acquired page, after it was written to the spool (HARD-01, D-02).
+    One acquired page, after it was written to the spool.
 
     Facts, never verdicts. Every field here is something that was measured
     while the page was in memory; nothing here is a judgement about what the
     page means. In particular there is deliberately **no** ``is_blank`` field:
-    blank-page policy belongs to the pipeline, under the profile's toggle
-    (Phase 24 D-05), and ``pipeline._drop_empty_pages`` applies the profile's
+    blank-page policy belongs to the pipeline, under the profile's toggle,
+    and ``pipeline._drop_empty_pages`` applies the profile's
     ``empty_page_mean_threshold`` / ``empty_page_stddev_threshold`` to the
     ``mean`` and ``stddev`` stored here. A verdict baked in at acquisition
     would freeze one profile's thresholds into the record and make the toggle
@@ -299,11 +299,11 @@ class PageRecord:
 
 class PageSink(ABC):
     """
-    Where the backend puts each page it acquires (HARD-01, M-08, D-01).
+    Where the backend puts each page it acquires.
 
     The backend acquires one page, crops it if it has to, hands it here, and
     forgets it. It never accumulates a list of images, which is the whole of
-    HARD-01's memory bound: peak memory is a property of who holds a page, not
+    the memory bound: peak memory is a property of who holds a page, not
     of how the pages are produced. The concrete implementation is
     pipeline-owned (``saneless.spool.SpooledPageSink``), because where a page
     lands and what is measured about it are pipeline concerns; this module
@@ -316,9 +316,9 @@ class PageSink(ABC):
     project implements itself (``ScannerBackend``). A page sink is a seam this
     project implements.
 
-    Two alternatives were rejected (D-01):
+    Two alternatives were rejected:
 
-    1. Going back to a generator. Phase 24 moved away from one because a
+    1. Going back to a generator. The backend moved away from one because a
        generator can only hand back images: its return value -- the resolution
        the device settled on and the sheets it rejected -- is discarded by the
        ``list()`` every caller wrapped it in. Streaming pages out is not worth
@@ -336,8 +336,8 @@ class PageSink(ABC):
         The sink owns the page from this call onwards: it decides where the
         page lands, writes it, and measures it. The caller must not retain the
         image afterwards -- a retained reference is exactly the accumulation
-        this seam exists to prevent, and it would put the memory bound back
-        where M-08 measured it.
+        this seam exists to prevent, and it would put peak memory back to
+        growing with the page count.
 
         Args:
             image: The page the device produced, already cropped if the
@@ -389,18 +389,18 @@ class ScannerBackend(ABC):
         measures -- the resolution the device settled on, and the sheets it
         could not read -- had no way out of the backend at all.
 
-        The *input* is a sink for the matching reason (D-01). The backend must
+        The *input* is a sink for the matching reason. The backend must
         never hold more than one decoded page: peak memory is a property of
         who holds a page, not of how the pages are produced, and a backend
-        that accumulated them would put HARD-01's bound back where M-08
-        measured it at 1395 MB for 48 pages. Where a page lands is not the
+        that accumulated them would put peak memory back where it was
+        measured at 1395 MB for 48 pages. Where a page lands is not the
         backend's business either -- the workspace, the ``tmp_dir`` under it
         and the job id in its name are all pipeline facts -- so the caller
         supplies the concrete sink and the backend only fills it.
 
-        Two alternatives were rejected (D-01). Going back to a generator
-        streams pages out but throws away the two measured facts again, which
-        is what Phase 24 moved away from. A bare callback with no declared
+        Two alternatives were rejected. Going back to a generator streams
+        pages out but throws away the two measured facts again, which is why
+        the backend moved away from one. A bare callback with no declared
         contract was rejected because neither type checker could see what it
         promised, so neither a wrong argument nor a wrong return value would
         have been caught anywhere.
@@ -422,7 +422,7 @@ class ScannerBackend(ABC):
 
     def close(self) -> None:
         """
-        Release whatever this backend holds process-wide (D-18, N-04).
+        Release whatever this backend holds process-wide.
 
         Deliberately **not** an ``@abstractmethod``, and the default body does
         nothing but say so. Most backends hold no process-global resource at

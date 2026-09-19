@@ -8,7 +8,7 @@ libraries keep the configured level.
 
 ``saneless serve`` passes no log file at all instead: a service streams to
 stderr and writes nothing to disk, so the platform -- ``docker logs``,
-journald -- owns retention (D-35, DLVR-04).
+journald -- owns retention.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ class _TracebackFreeFormatter(logging.Formatter):
 
     Used for the stderr fallback when the log file cannot be opened and ``-v``
     was not given: stderr is then the user's terminal, and no user sees a
-    traceback without asking for one (EXC-02, D-06, CR-01). The record itself
+    traceback without asking for one. The record itself
     keeps its ``exc_info``, so any other handler still renders it in full.
     """
 
@@ -147,19 +147,19 @@ def configure_logging(
     root_logger = logging.getLogger()
     _remove_own_handlers(root_logger)
     # The level-name mapping rather than an attribute lookup on the module,
-    # which would also "resolve" non-level names such as BASIC_FORMAT (CFG-04).
+    # which would also "resolve" non-level names such as BASIC_FORMAT.
     root_logger.setLevel(logging.getLevelNamesMapping()[log_level.upper()])
 
     if log_file is None:
         # The reader who knows the fallback branch below will expect
         # _TracebackFreeFormatter here too. It is deliberately the plain
-        # formatter instead. D-06's traceback-free rule was justified by
+        # formatter instead. The fallback's traceback-free rule is justified by
         # "stderr is the user's terminal now" -- that is false for a service:
         # the stream *is* the log, and docker logs or journald is nobody's
         # terminal. There is also no file here to carry the traceback instead.
         # Swap in _TracebackFreeFormatter and every unexpected worker exception
         # leaves one message line in `docker logs` and nothing else, recoverable
-        # only by restarting the service with -v (D-36 amended, DLVR-04).
+        # only by restarting the service with -v.
         stream_handler = logging.StreamHandler(sys.stderr)
         stream_handler.set_name("saneless.stream")
         stream_handler.setFormatter(formatter)

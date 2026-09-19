@@ -1,13 +1,13 @@
 """
-Durable, all-or-nothing replacement of a config file (M-10, CFG-08).
+Durable, all-or-nothing replacement of a config file.
 
 ``replace_file_atomically`` is the one primitive saneless uses to rewrite a
 file the operator owns. It writes the new text beside the real file, fsyncs
 it, and renames it into place, so a crash, a full disk, or a killed process
-leaves either the old file or the new one -- never a truncated config
-(D-05). It keeps the original's mode and owner (D-06), follows symlinks to
-the real file (D-07), and reports a single-file bind mount -- which cannot be
-renamed over -- as a ``ConfigError`` naming the fix (D-08).
+leaves either the old file or the new one -- never a truncated config.
+It keeps the original's mode and owner, follows symlinks to the real file,
+and reports a single-file bind mount -- which cannot be renamed over -- as a
+``ConfigError`` naming the fix.
 
 The module knows nothing about TOML: callers produce the text, this module
 only makes the write durable.
@@ -35,7 +35,7 @@ def _fsync_directory(directory: Path) -> None:
     """
     Flush ``directory``'s entry table so a completed rename survives a crash.
 
-    Best effort (Pitfall 7): some FUSE, network, and Docker Desktop shared
+    Best effort: some FUSE, network, and Docker Desktop shared
     folder mounts reject ``fsync`` on a directory descriptor. By the time this
     runs the rename has already happened and the new data is in place, so a
     refusal here must not turn a successful write into a reported failure.
@@ -54,7 +54,7 @@ def _fsync_directory(directory: Path) -> None:
 
 def _single_file_mount_message(target: Path) -> str:
     """
-    Word D-08's refusal for a config mounted as a single file.
+    Word the refusal for a config mounted as a single file.
 
     Args:
         target: The real file that cannot be replaced.
@@ -92,13 +92,14 @@ def _is_read_only_mount(path: Path) -> bool:
 
 def _read_only_mount_error(target: Path) -> ConfigError | None:
     """
-    Explain a read-only mount under an existing config file (WR-01).
+    Explain a read-only mount under an existing config file.
 
     ``os.access`` answers False on a read-only filesystem even for root, so
     without this check a legacy ``:ro`` mount was reported as "Permission
     denied" and the operator went looking at file permissions. The read-only
     flag belongs to a mount, so a read-only file whose directory is writable
-    is itself a mount point: the single-file bind mount D-08 describes.
+    is itself a mount point: a single-file bind mount, which cannot be
+    renamed over either.
 
     Args:
         target: The real, existing file about to be replaced.
@@ -143,17 +144,17 @@ def _refused(exc: OSError) -> bool:
 
 def _copy_owner_and_mode(fd: int, original: os.stat_result) -> None:
     """
-    Give the temp file the original's owner, group and permission bits (D-06).
+    Give the temp file the original's owner, group and permission bits.
 
     A host-owned config must not become root-owned after a container rewrite,
     or the operator needs sudo to edit it. Each change is made only when the
     process is permitted and the filesystem supports it; a refusal is skipped
     silently (with a DEBUG line) so it never fails a write that would
-    otherwise succeed (WR-02). When the owner cannot be set, the group alone
+    otherwise succeed. When the owner cannot be set, the group alone
     is still tried: a service user rewriting a ``root:saneless`` 0664 config
     may keep the group it belongs to. chown comes BEFORE chmod because
-    chown(2) may clear the set-id bits the mode copy would otherwise restore
-    (Pitfall 5).
+    chown(2) may clear the set-id bits the mode copy would otherwise
+    restore.
 
     Args:
         fd: The open temp file.
@@ -191,7 +192,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     Load-bearing details:
 
     * ``path`` is resolved first and the **real** file is replaced, so a
-      dotfiles-style symlink keeps pointing at it (D-07).
+      dotfiles-style symlink keeps pointing at it.
     * The temp file comes from ``tempfile.mkstemp`` in the real file's **own
       directory**: ``rename(2)`` is atomic only within one filesystem, and a
       mounted config directory is a separate one. mkstemp's random name and
@@ -201,16 +202,16 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     * An existing file's owner, group and permission bits are copied onto
       the temp file before any content is written, each when this process is
       permitted to set it and the filesystem supports it, so the rewrite
-      neither changes who can edit the file nor widens who can read it
-      (D-06). A refused change is skipped, never a failed write (WR-02). A
-      new file keeps mkstemp's 0600.
+      neither changes who can edit the file nor widens who can read it. A
+      refused change is skipped, never a failed write. A new file keeps
+      mkstemp's 0600.
     * The temp file is fsynced **before** the rename; renaming unsynced data
       can leave a zero-length file after a crash.
     * A rename refused with EBUSY means the file is a single-file bind mount;
       that is reported as a ``ConfigError`` naming the fix, with no
-      non-atomic fallback (D-08). A read-only mount -- the legacy ``:ro``
+      non-atomic fallback. A read-only mount -- the legacy ``:ro``
       single-file mount, or a read-only directory mount -- is reported the
-      same way before anything is written, rather than as EACCES (WR-01).
+      same way before anything is written, rather than as EACCES.
     * The rename is ``Path.replace``, the atomic, unconditionally
       overwriting ``rename(2)``. The ``os`` module's function of the same
       name is not called directly only because ruff's PTH105 forbids it and
@@ -239,7 +240,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
             is removed.
 
     """
-    # D-07: write through a symlink to the real file. The config path and its
+    # Write through a symlink to the real file. The config path and its
     # directory are operator-controlled, and the plain in-place write this
     # helper replaces followed links too, so following one here is no
     # regression.
@@ -251,7 +252,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
     if original is not None and (mount_error := _read_only_mount_error(target)):
         raise mount_error
     if original is not None and not os.access(target, os.W_OK):
-        # Pitfall 6: rename(2) needs only a writable directory, so without
+        # rename(2) needs only a writable directory, so without
         # this check a chmod 0444 config would be silently replaced. Refusing
         # keeps today's meaning of a read-only file ("cannot be written").
         raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(target))
@@ -272,7 +273,7 @@ def replace_file_atomically(path: Path, text: str) -> Path:
         try:
             tmp.replace(target)
         except OSError as exc:
-            # D-08: the kernel refuses to rename over a bind-mount point, which
+            # The kernel refuses to rename over a bind-mount point, which
             # is what a config mounted as a single file is. There is no
             # non-atomic fallback by decision: it would bring back the
             # truncated-config risk this helper exists to remove.

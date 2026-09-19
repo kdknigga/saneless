@@ -7,7 +7,7 @@ itself, and generates base64-encoded JPEG thumbnails of scanned pages.
 
 Only the thumbnail half still takes an image. The filter half takes records,
 because the measurements it needs were made once already, at spool time, while
-the page was in memory (D-06) -- reading them off the record is what stops the
+the page was in memory -- reading them off the record is what stops the
 same greyscale conversion being paid a second time per page.
 """
 
@@ -150,11 +150,11 @@ def generate_thumbnail(
     Fits the image inside a ``max_edge`` square (preserving aspect
     ratio), then encodes as JPEG and returns the base64 string.
 
-    The full-size duplicate this used to start with is gone, as one of M-08's
-    cheap wins (D-06): it copied a 26 MB page so that a 300 px thumbnail could
-    be made from the copy. Pillow's ``contain`` operation produces the same
-    small result directly, in 29 ms measured, with no full-size intermediate
-    and no mutation of the caller's image.
+    The full-size duplicate this used to start with is gone, because it
+    copied a 26 MB page so that a 300 px thumbnail could be made from the
+    copy. Pillow's ``contain`` operation produces the same small result
+    directly, in 29 ms measured, with no full-size intermediate and no
+    mutation of the caller's image.
 
     Args:
         image: PIL Image of the scanned page.
