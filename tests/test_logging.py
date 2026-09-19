@@ -39,8 +39,8 @@ def _deny_mkdir(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
     """
     Make creating ``directory`` fail with EACCES; every other mkdir still works.
 
-    Injecting the failure rather than chmod-ing a directory keeps the test
-    meaningful as root, whom file modes do not stop.
+    Injecting the failure rather than taking a directory's permissions away
+    keeps the test meaningful as root, whom file modes do not stop.
 
     Args:
         monkeypatch: The test's monkeypatch fixture.

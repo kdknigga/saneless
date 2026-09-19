@@ -567,8 +567,8 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
     attached = configure_logging(
         None if stream_logs else settings.output.log_file,
         settings.output.log_level,
-        settings.output.log_max_bytes,
-        settings.output.log_backup_count,
+        max_bytes=settings.output.log_max_bytes,
+        backup_count=settings.output.log_backup_count,
         verbose=bool(ctx.obj.get("verbose")),
     )
     ctx.obj["logging_configured"] = True
