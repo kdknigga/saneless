@@ -363,7 +363,11 @@ class ScanWorker:
         settings: Settings,
         job_store: JobStore,
     ) -> None:
-        """Initialize the worker with its dependencies and start queue."""
+        """
+        Store the worker's dependencies and create its job queue.
+
+        The worker thread is created here but not started; ``start()`` launches it.
+        """
         self._scanner = scanner
         self._paperless = paperless
         self._settings = settings
@@ -1317,7 +1321,7 @@ class ScanWorker:
                 self._settings.output.history_max_rows,
             )
         except Exception:
-            logger.exception("Idle history prune failed")
+            logger.warning("Idle history prune failed", exc_info=True)
             self._record_loop_failure()
 
     def _flush_unrecorded_failures(self) -> None:
