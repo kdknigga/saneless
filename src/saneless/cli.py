@@ -103,8 +103,8 @@ _STATUS_COL_WIDTH = max(len(state_label(state)) for state in JobState)
 
 # The widest zone token ``%Z`` produces at a realistic offset: five characters,
 # the ``+0545`` shape the tz database falls back to where there is no
-# abbreviation (RESEARCH § 8, assumption A3). The only literal in the width
-# below, and the one this host cannot demonstrate on its own.
+# abbreviation. The only literal in the width below, and the one this host
+# cannot demonstrate on its own.
 _WIDEST_ZONE_TOKEN = len("+0545")
 
 # Width of the Timestamp column in `saneless jobs`, derived from a rendered
@@ -124,16 +124,16 @@ _TIME_COL_WIDTH = max(
 # What the operator is asked between the two manual-duplex passes.  A yes/no
 # question rather than "press Enter" on purpose: click's pause(), the only API that
 # matches "press Enter", is a documented no-op off a terminal and would start
-# pass B on the unflipped stack without a word (C-02).
+# pass B on the unflipped stack without a word.
 _FLIP_PROMPT = (
     "Flip the stack over and load it back into the feeder. Scan the back sides?"
 )
 
-# Why `scan` refuses when nobody configured paperless-ngx (D-16, APPL-07). A
-# developer constant: it names the problem and never the value, the URL or the
-# config path. Lower-cased and without a full stop because it is the tail of
-# Phase 28 D-08's `<what saneless was doing>: <problem>` line, unlike
-# checks.py's sentence for the same fact, which stands alone in a table row.
+# Why `scan` refuses when nobody configured paperless-ngx. A developer
+# constant: it names the problem and never the value, the URL or the config
+# path. Lower-cased and without a full stop because it is the tail of the CLI's
+# `<what saneless was doing>: <problem>` error line, unlike checks.py's
+# sentence for the same fact, which stands alone in a table row.
 #
 # The name carries no password-ish word on purpose: ruff's S105 reads the
 # *name* of the target, not the value, so `_TOKEN_...` here would be flagged as
@@ -153,7 +153,7 @@ def _stdin_is_interactive() -> bool:
 
 class ClickFlipCoordinator(FlipCoordinator):
     """
-    The CLI flip coordinator: a terminal prompt with a bounded wait (D-19).
+    The CLI flip coordinator: a terminal prompt with a bounded wait.
 
     ``click.confirm`` has no timeout of its own, so it runs on a daemon thread
     while the calling thread waits for at most ``timeout`` seconds.  Whichever
@@ -166,13 +166,13 @@ class ClickFlipCoordinator(FlipCoordinator):
     (``click.Abort`` on the prompt thread) and Ctrl-C (``KeyboardInterrupt`` on
     the calling thread, where Python delivers SIGINT).  Those three are an
     operator's abort -- a cancel -- so giving up at the terminal and clicking
-    Abort in the web UI end the job the same way (D-02).  End of input counts
-    as a cancel however it arrives, including a terminal that closes, since
-    ``click.confirm`` reports it as ``click.Abort`` (D-02, D-03).  A prompt
-    that fails with a read error instead -- an I/O error from the terminal,
-    undecodable input -- also answers ``ABORTED`` at once, logged with its
-    traceback (WR-08), but it records the exception as ``abort_cause``: nobody
-    chose to stop, so the scan is reported as failed (exit 1), not cancelled.
+    Abort in the web UI end the job the same way.  End of input counts as a
+    cancel however it arrives, including a terminal that closes, since
+    ``click.confirm`` reports it as ``click.Abort``.  A prompt that fails with a
+    read error instead -- an I/O error from the terminal, undecodable input --
+    also answers ``ABORTED`` at once, logged with its traceback, but it records
+    the exception as ``abort_cause``: nobody chose to stop, so the scan is
+    reported as failed (exit 1), not cancelled.
 
     Accepted cost, deliberate and not a leak: after a timeout the prompt thread
     is abandoned.  It keeps its read on stdin until the process exits, and its
@@ -188,7 +188,7 @@ class ClickFlipCoordinator(FlipCoordinator):
         self._slot = FlipAnswerSlot()
         # Held across a broken prompt's claim and its cause, so the calling
         # thread, woken by that claim, cannot read the cause before it is set
-        # (the WorkerFlipCoordinator.abort_for_shutdown precedent, WR-06).
+        # (as WorkerFlipCoordinator.abort_for_shutdown does).
         self._cause_lock = threading.Lock()
         self._abort_cause: Exception | None = None
 
@@ -240,15 +240,15 @@ class ClickFlipCoordinator(FlipCoordinator):
             self._slot.settle(FlipOutcome.ABORTED)
             return
         except Exception as exc:
-            # WR-08: anything else used to kill this thread silently, leaving
-            # the calling thread waiting out the whole timeout and then
-            # reporting that nobody confirmed the flip, which was false.  The
-            # prompt broke, so the scan stops now: ABORTED rather than a fourth
-            # outcome (D-09), with the exception kept as abort_cause so the
-            # pipeline reports a failure, not a cancel (D-02).  The cause is
-            # set only if this claim won: a Ctrl-C or a timeout that answered
-            # first keeps its own meaning.  Logged before the claim, so the
-            # record exists once the wait wakes.
+            # Anything else used to kill this thread silently, leaving the
+            # calling thread waiting out the whole timeout and then reporting
+            # that nobody confirmed the flip, which was false.  The prompt
+            # broke, so the scan stops now: ABORTED rather than a fourth
+            # outcome, with the exception kept as abort_cause so the pipeline
+            # reports a failure, not a cancel.  The cause is set only if this
+            # claim won: a Ctrl-C or a timeout that answered first keeps its own
+            # meaning.  Logged before the claim, so the record exists once the
+            # wait wakes.
             logger.exception("Flip prompt failed; treating it as an abort")
             with self._cause_lock:
                 claimed = self._slot.offer(FlipOutcome.ABORTED)
@@ -290,7 +290,7 @@ def _logging_ready(ctx: click.Context) -> bool:
 
     Before that, an ERROR record has no handler but ``logging.lastResort``,
     which would print it -- traceback and all -- straight to stderr, so the
-    guard must not log at all (Pitfall 3).
+    guard must not log at all.
 
     Args:
         ctx: The group's context; its ``obj`` is shared with the subcommand's.
@@ -324,7 +324,7 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
     The prefixes are documented (``docs/how-to/set-up-adf-duplex.md`` quotes
     them), so they are kept as they were before the guard existed. A
     configuration error is printed as-is: the loader's renderer already wrote
-    its own ``Configuration error in <file>:`` header (Phase 27 D-10).
+    its own ``Configuration error in <file>:`` header.
 
     Args:
         exc: The failure.
@@ -355,8 +355,8 @@ def _log_failure(ctx: click.Context, exc: Exception) -> None:
     Log a failure with its traceback, but only once logging is configured.
 
     The message names the failure too: when the log fell back to stderr the
-    traceback is not rendered there (CR-01), and the record must still say
-    what went wrong.
+    traceback is not rendered there, and the record must still say what went
+    wrong.
 
     Args:
         ctx: The group's context.
@@ -374,21 +374,21 @@ def _log_failure(ctx: click.Context, exc: Exception) -> None:
 
 def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
     """
-    Report an exception that is not a saneless type as one stderr line (D-06).
+    Report an exception that is not a saneless type as one stderr line.
 
     Once logging is configured the traceback goes to the log, and the line
     points at the log file only when the file handler really attached
-    (``configure_logging``'s return value): a stderr fallback must not be
-    called a log file. That fallback never renders a traceback (CR-01), so
-    without ``-v`` the line then says how to get one. Before logging is
-    configured nothing is logged (Pitfall 3); ``-v`` prints the traceback to
-    stderr instead, and without it the line says how to get one.
+    (``configure_logging``'s return value): a stderr fallback must not be called
+    a log file. That fallback never renders a traceback, so without ``-v`` the
+    line then says how to get one. Before logging is configured nothing is
+    logged; ``-v`` prints the traceback to stderr instead, and without it the
+    line says how to get one.
 
     ``serve`` has neither a log file nor a traceback-free sink: its stream
     renders the traceback the ``logger.error`` above just emitted, with or
-    without ``-v`` (D-36 amended). The hint is suppressed there rather than
-    telling an operator to restart a running service to see something already
-    printed directly above the line.
+    without ``-v``. The hint is suppressed there rather than telling an operator
+    to restart a running service to see something already printed directly above
+    the line.
 
     Args:
         ctx: The group's context.
@@ -416,29 +416,29 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
 
 class _GuardedGroup(click.Group):
     """
-    The CLI group with one last-resort handler around every command (EXC-02).
+    The CLI group with one last-resort handler around every command.
 
-    Every failure a command raises becomes one stderr message and its D-07
-    exit code, and no user ever sees a traceback unless they asked for one
-    with ``-v`` (D-06). The ``except`` clauses are ordered, and the order is
-    the design:
+    Every failure a command raises becomes one stderr message and its
+    ``ExitCode``, and no user ever sees a traceback unless they asked for one
+    with ``-v``. The ``except`` clauses are ordered, and the order is the
+    design:
 
     1. click's ``Exit``, ``Abort`` and ``ClickException`` are re-raised first.
        ``Exit`` and ``Abort`` subclass ``RuntimeError``, so a later
-       ``except Exception`` would turn ``--help`` into exit 5 (Pitfall 2).
+       ``except Exception`` would turn ``--help`` into exit 5.
     2. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
-       failure: one line and exit 130 (D-03, D-01).
+       failure: one line and exit 130.
     3. ``StorageError`` -- a job database saneless cannot use -- is a setup
-       problem and exits 2 (D-07 amendment). It is mapped here by type and
-       sits before the ``SanelessError`` clause because ``ErrorCategory`` is
-       persisted on job records, and ``classify_error`` deliberately keeps
-       ``StorageError`` ``UNKNOWN`` rather than growing a category for it.
-       Its message already names the database path and the reason.
+       problem and exits 2. It is mapped here by type and sits before the
+       ``SanelessError`` clause because ``ErrorCategory`` is persisted on job
+       records, and ``classify_error`` deliberately keeps ``StorageError``
+       ``UNKNOWN`` rather than growing a category for it. Its message already
+       names the database path and the reason.
     4. Any other ``SanelessError`` is classified once, by the same
        ``classify_error`` the web worker uses, so the CLI's exit code and the
        job's category cannot disagree.
     5. Anything else is not a saneless type: ``Unexpected error (<Type>)``,
-       exit 5, the traceback in the log (M-17).
+       exit 5, the traceback in the log.
     """
 
     def invoke(self, ctx: click.Context) -> object:
@@ -475,15 +475,15 @@ class _GuardedGroup(click.Group):
                 _report_unexpected(ctx, exc)
             else:
                 _log_failure(ctx, exc)
-                # D-12: two lines, and the first one is not ours to change.
-                # Line 1 is Phase 28 D-08's locked shape, printed unchanged, so
-                # a script parsing it and the doc-truth message-shape tests that
-                # pin it are both unaffected. Line 2 is the same
-                # error_next_step string the web error page renders -- which is
-                # why the copy is surface-neutral and never says "press Scan" or
-                # "run the command" (D-10, D-11). The UNEXPECTED branch above
-                # gets no advice: its category is a guess about an exception
-                # saneless did not raise.
+                # Two lines, and the first one is not ours to change. Line 1
+                # keeps its documented `<what saneless was doing>: <problem>`
+                # shape, printed unchanged, so a script parsing it and the
+                # doc-truth message-shape tests that pin it are both unaffected.
+                # Line 2 is the same error_next_step string the web error page
+                # renders -- which is why the copy is surface-neutral and never
+                # says "press Scan" or "run the command". The UNEXPECTED branch
+                # above gets no advice: its category is a guess about an
+                # exception saneless did not raise.
                 click.echo(_failure_line(exc, category), err=True)
                 click.echo(f"Try: {error_next_step(category)}", err=True)
             ctx.exit(code)
@@ -494,12 +494,12 @@ class _GuardedGroup(click.Group):
 
 @click.group(cls=_GuardedGroup)
 # package_name makes click read the version from importlib.metadata, so
-# pyproject.toml stays its single source (D-03). No custom message is passed:
-# the default "%(prog)s, version %(version)s" is the whole contract, because
+# pyproject.toml stays its single source. No custom message is passed: the
+# default "%(prog)s, version %(version)s" is the whole contract, because
 # `saneless doctor` already reports the Python and platform detail a longer
-# block would duplicate (D-04). No short flag either -- `-v` below is already
-# --verbose on this group, and click would bind it to whichever option
-# declared it last, silently.
+# block would duplicate. No short flag either -- `-v` below is already --verbose
+# on this group, and click would bind it to whichever option declared it last,
+# silently.
 @click.version_option(package_name="saneless")
 @click.option(
     "--config",
@@ -518,7 +518,7 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
     """Saneless -- SANE scanner to paperless-ngx bridge."""
     # Click runs this callback before a subcommand parses its own --help, and
     # ctx.resilient_parsing is False there, so nothing may be loaded here: a
-    # broken config would otherwise break `saneless serve --help` (CFG-10).
+    # broken config would otherwise break `saneless serve --help`.
     # Each command loads through _load_cli_settings instead.
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
@@ -529,32 +529,30 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
     """
     Load and validate settings and configure logging, once per process.
 
-    Called by every command on first need rather than by the group callback,
-    so ``--help`` never touches the configuration (CFG-10). Nothing is caught
-    here: every failure reaches the group guard. Loading and directory
-    validation raise ``ConfigError`` for every problem with the file --
-    including a TOML syntax error (D-12) -- which the guard prints as rendered
-    and exits 2; anything else is an unexpected error, exit 5 (D-06). An
-    unwritable ``log_file`` is not a failure: ``configure_logging`` warns on
-    stderr, logs there instead, and the command runs. ``load_settings`` and
-    ``configure_logging`` are called by their module-global names, which is
-    where the tests patch them.
+    Called by every command on first need rather than by the group callback, so
+    ``--help`` never touches the configuration. Nothing is caught here: every
+    failure reaches the group guard. Loading and directory validation raise
+    ``ConfigError`` for every problem with the file -- including a TOML syntax
+    error -- which the guard prints as rendered and exits 2; anything else is an
+    unexpected error, exit 5. An unwritable ``log_file`` is not a failure:
+    ``configure_logging`` warns on stderr, logs there instead, and the command
+    runs. ``load_settings`` and ``configure_logging`` are called by their
+    module-global names, which is where the tests patch them.
 
     Once logging is configured, ``ctx.obj`` records it (``logging_configured``)
     and records ``log_file`` only if the file handler really attached, so the
     guard logs failures and names the log file truthfully. In the streaming
     mode ``serve`` asks for, no file handler is attached at all, so
     ``ctx.obj["log_file"]`` is always None there and nothing ever offers
-    "Full details in <log_file>" for a service that writes none (D-35, D-40).
+    "Full details in <log_file>" for a service that writes none.
 
     Args:
         ctx: The command's context; its ``obj`` carries ``config_path`` and
             ``verbose`` from the group, and caches the loaded settings.
         stream_logs: If True, configure the 12-factor service shape -- records
             stream to stderr and no log file is written, so ``docker logs`` or
-            journald sees them and owns retention (DLVR-04). Only ``serve``
-            passes it; every one-shot command keeps Phase 28's rotating file
-            handler unchanged (D-34).
+            journald sees them and owns retention. Only ``serve`` passes it;
+            every one-shot command keeps the rotating file handler unchanged.
 
     Returns:
         The loaded settings, the same object on every call.
@@ -570,7 +568,7 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
     # one stderr handler and returns False, so the line below records no
     # log_file with no special case of its own. The rotation settings still go
     # along and are simply unused -- they govern one-shot mode, which is what
-    # the configuration reference says and why no warning fires here (D-39).
+    # the configuration reference says and why no warning fires here.
     attached = configure_logging(
         None if stream_logs else settings.output.log_file,
         settings.output.log_level,
@@ -584,9 +582,9 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
     # must not end an exit-5 line with "run again with -v".
     ctx.obj["log_stream"] = stream_logs
 
-    # WR-05: emitted only now, once the log file handler exists to receive it.
+    # Emitted only now, once the log file handler exists to receive it.
     warn_on_legacy_duplex_sources(settings)
-    # CFG-11: which file and which environment keys, names only, once.
+    # Which file and which environment keys, names only, once.
     log_config_sources(settings)
 
     ctx.obj["settings"] = settings
@@ -608,8 +606,8 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
 def scan(ctx: click.Context, profile: str, title: str) -> None:
     """Scan a document and upload to paperless-ngx."""
     # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard (D-05). --help
-    # never reaches this body, so it needs no python-sane (CFG-10).
+    # config or touching the device, exit 2 through the guard. --help never
+    # reaches this body, so it needs no python-sane.
     require_sane()
     settings = _load_cli_settings(ctx)
 
@@ -617,12 +615,12 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         click.echo(f"Unknown profile: {profile}", err=True)
         ctx.exit(ExitCode.CONFIG)
 
-    # D-16: the one title rule the web form shares -- typed, else the profile's
+    # The one title rule the web form shares -- typed, else the profile's
     # title, else "Scan <time>"; blank after stripping counts as not typed.
     now = datetime.now(tz=UTC)
     resolved_title = resolve_job_title(title, settings.profiles[profile], now=now)
 
-    # D-16: refused here, before the scanner is opened, because a scan that
+    # Refused here, before the scanner is opened, because a scan that
     # cannot upload is wasted paper. The refusal is unconditional -- a
     # configured paperless.consume_dir fallback does not soften it, or `scan`,
     # `doctor` and the web UI would disagree about whether the appliance can
@@ -632,10 +630,10 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # This is the second place cli.py unwraps the token; the PaperlessClient
     # construction below is the other. The value goes to the predicate and
     # nowhere else -- it is never logged, echoed or interpolated into the
-    # message, which is a developer constant (ASVS V7, T-30-42). The line is
-    # built in Phase 28 D-08's shape because ErrorCategory.CONFIG prints the
-    # exception as-is (_failure_line), so the "what saneless was doing" half
-    # has to be part of the message.
+    # message, which is a developer constant (ASVS V7). The line is built in the
+    # `<what saneless was doing>: <problem>` shape because ErrorCategory.CONFIG
+    # prints the exception as-is (_failure_line), so the "what saneless was
+    # doing" half has to be part of the message.
     if is_placeholder_token(settings.paperless.token.get_secret_value()):
         msg = (
             f"Scanning '{resolved_title}' with profile '{profile}': "
@@ -660,7 +658,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # block: on success, on ctx.exit(), and while an exception propagates --
     # all of them before the guarded group's error handlers choose an exit
     # code. So SANE is already down by the time the error line is printed, and
-    # no early exit path can skip it (D-18).
+    # no early exit path can skip it.
     ctx.call_on_close(scanner.close)
     paperless = PaperlessClient(
         settings.paperless.url,
@@ -680,14 +678,13 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             profile_name=profile,
             title=resolved_title,
             # A uuid4, exactly as the worker supplies for a web job.  Without
-            # one, every CLI run composed {timestamp}-{title-slug}.pdf and rested
-            # on the timestamp alone -- while build_pdf_filename's whole
-            # collision argument is "uniqueness comes from the job id".  That
-            # is not cosmetic: preservation moves onto an explicit destination
+            # one, every CLI run composed {timestamp}-{title-slug}.pdf and
+            # rested on the timestamp alone -- while build_pdf_filename's whole
+            # collision argument is "uniqueness comes from the job id".  That is
+            # not cosmetic: preservation moves onto an explicit destination
             # path, which overwrites silently, so two same-second scans of the
-            # same title would have destroyed one of them in failed/ (WR-09).
-            # This phase multiplied what lands there from one artefact kind to
-            # four and made them reachable from every mid-scan fault.
+            # same title would have destroyed one of them in failed/. Four kinds
+            # of artefact land there, and every mid-scan fault can reach it.
             job_id=str(uuid4()),
             tags=settings.profiles[profile].default_tags or None,
             correspondent=settings.profiles[profile].default_correspondent,
@@ -704,7 +701,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         )
     finally:
         # Failures reach the group guard, which prints one line and exits with
-        # the D-07 code; the client is closed either way.
+        # its ExitCode; the client is closed either way.
         paperless.close()
 
 
@@ -719,7 +716,7 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
 
     Every line is printed only when there is something to put after its label.
     A label followed by nothing is the symptom the operator actually saw on a
-    range-reporting device (N-01): it reads as "this scanner offers none",
+    range-reporting device: it reads as "this scanner offers none",
     when the truth was that saneless had not read what the scanner offered.
 
     Args:
@@ -916,8 +913,8 @@ def _devices_as_text(
 def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     """List available scanning devices."""
     # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard (D-05). --help
-    # never reaches this body, so it needs no python-sane (CFG-10).
+    # config or touching the device, exit 2 through the guard. --help never
+    # reaches this body, so it needs no python-sane.
     require_sane()
     _settings = _load_cli_settings(ctx)
 
@@ -927,7 +924,7 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
         click.echo("Discovering scanners...", err=True)
     scanner = SaneBackend(host=_settings.scanner.host)
     # Registered before the first SANE call, so an enumeration that fails still
-    # leaves the process with SANE shut down (D-18).
+    # leaves the process with SANE shut down.
     ctx.call_on_close(scanner.close)
     device_list = scanner.get_devices()
 
@@ -972,11 +969,11 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                             # is the machine contract and scripts compare
                             # against "DONE" / "FALLBACK".
                             "state": j.state.value,
-                            # UTC ISO-8601, deliberately not localised: this
-                            # is a machine contract documented in
-                            # docs/how-to/cli-scripting.md, and APPL-12 asks
-                            # for local time on *user-facing* surfaces. The
-                            # human table below goes local; this does not.
+                            # UTC ISO-8601, deliberately not localised: this is
+                            # a machine contract documented in
+                            # docs/how-to/cli-scripting.md, and local time is
+                            # for *user-facing* surfaces. The human table below
+                            # goes local; this does not.
                             "created_at": j.created_at.isoformat(),
                             "outcome": j.outcome.value if j.outcome else None,
                             "warning": j.warning,
@@ -1001,8 +998,8 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
             for j in recent:
                 click.echo(
                     # The one shared formatter the web history table reads, so
-                    # the two surfaces cannot drift (D-34, D-35). Seconds are
-                    # gone and the zone is named.
+                    # the two surfaces cannot drift. Seconds are gone and
+                    # the zone is named.
                     f"{local_time(j.created_at):<{ts_w}} "
                     f"{_truncate(j.profile, profile_w):<{profile_w}} "
                     f"{_truncate(j.title, title_w):<{title_w}} "
@@ -1074,12 +1071,12 @@ def _bind_listening_socket(host: str, port: int) -> socket.socket:
 def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     """Start the web server."""
     # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard (D-05). --help
-    # never reaches this body, so it needs no python-sane (CFG-10).
+    # config or touching the device, exit 2 through the guard. --help never
+    # reaches this body, so it needs no python-sane.
     require_sane()
     # The one command that streams its logs: a service writes no file, so its
-    # records reach `docker logs` and journald instead (D-35, DLVR-04). Every
-    # other command keeps the rotating file handler (D-34).
+    # records reach `docker logs` and journald instead. Every other command
+    # keeps the rotating file handler.
     settings = _load_cli_settings(ctx, stream_logs=True)
     actual_host = host or settings.output.web_host
     # An explicit 0 is a request for an OS-chosen port, not a missing value,
@@ -1088,7 +1085,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
 
     # serve scans nothing itself, so SANE failing to initialise is a failure
     # to start -- "can't start, fix your setup", exit 2 like a port that cannot
-    # be bound -- not exit 1, which means a scan failed (D-07 amendment, WR-07).
+    # be bound -- not exit 1, which means a scan failed.
     try:
         scanner = SaneBackend(host=settings.scanner.host)
     except ScanError as exc:
@@ -1097,7 +1094,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # No close callback here, unlike the three one-shot commands: this backend
     # outlives the command body.  The app is handed it and the lifespan closes
     # it once the worker confirms it stopped, which is the only point at which
-    # no thread can still be inside SANE (D-18).
+    # no thread can still be inside SANE.
     app = create_app(settings, scanner)
 
     sock = _bind_listening_socket(actual_host, actual_port)
@@ -1154,7 +1151,7 @@ def _echo_write_result(
     Print what ``auto-profiles`` did to the config file, grouped by action.
 
     The group lines come from ``ProfileWriteResult.groups``, the same
-    vocabulary the worker's startup log uses (D-04). Added and Refreshed
+    vocabulary the worker's startup log uses. Added and Refreshed
     groups are followed by one detail line per profile they wrote.
 
     Args:
@@ -1190,19 +1187,19 @@ def _echo_write_result(
 def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     """Generate scan profiles from scanner capabilities."""
     # python-sane is mandatory: a command that needs it refuses before loading
-    # config or touching the device, exit 2 through the guard (D-05). --help
-    # never reaches this body, so it needs no python-sane (CFG-10).
+    # config or touching the device, exit 2 through the guard. --help never
+    # reaches this body, so it needs no python-sane.
     require_sane()
     settings = _load_cli_settings(ctx)
 
     scanner = SaneBackend(host=settings.scanner.host)
     # This command ends through ctx.exit() as well as by returning and by
-    # raising; a close callback covers all three (D-18).
+    # raising; a close callback covers all three.
     ctx.call_on_close(scanner.close)
     device_list = scanner.get_devices()
     if not device_list:
         # A setup problem, exit 2 through the guard, exactly as `scan` reports
-        # the same finding: D-07 applies it uniformly to every command (WR-06).
+        # the same finding: an exit code means the same thing in every command.
         msg = (
             "No scanner found: auto-detection found no devices. "
             "Check what SANE can see with `saneless devices`"
@@ -1216,10 +1213,9 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
 
     # The file that was loaded (including an explicit --config). With no loaded
     # file the target stays ./saneless.toml, and the output names the resolved
-    # absolute path so the operator sees where it went (orchestrator
-    # resolution 2).
+    # absolute path so the operator sees where it went.
     config_path = settings.config_path or Path("./saneless.toml")
-    # A ConfigError here (D-08: a single-file bind mount, a non-UTF-8 file, or
+    # A ConfigError here (a single-file bind mount, a non-UTF-8 file, or
     # merged text that would not parse) names the file and the fix; the group
     # guard prints it as-is and exits 2, with no traceback.
     try:
@@ -1266,16 +1262,16 @@ def _state_marker(state: CheckState) -> str:
     return marker
 
 
-# The token a row nobody probed prints instead of `[ OK ]` (D-08, R3-WR-03).
+# The token a row nobody probed prints instead of `[ OK ]`.
 #
 # No `doctor` invocation produces this marker today: the command builds its
 # CheckContext with `skip_scanner` at its default and passes no scanner gate,
 # so neither `_scanner_skipped` nor `_scanner_busy` is reachable from the CLI.
-# It exists anyway, and deliberately. D-02's whole claim is that one registry
-# feeds both surfaces, so a surface that would mis-render a row the registry
-# can build is a divergence already present and merely unreached -- and leaving
-# `CheckResult.skipped` half-wired, rendered by neither surface while two
-# docstrings said it was rendered by both, is precisely what R3-WR-03 found.
+# It exists anyway, and deliberately. The point of one check registry is that
+# it feeds both surfaces, so a surface that would mis-render a row the registry
+# can build is a divergence already present and merely unreached -- and
+# `CheckResult.skipped` was once left exactly that way, half-wired, rendered by
+# neither surface while two docstrings said it was rendered by both.
 # The first caller that passes `skip_scanner=True` should get a correct table,
 # not a bug report.
 #
@@ -1292,11 +1288,11 @@ def _row_marker(result: CheckResult) -> str:
     "what does this row look like", and the two differ whenever ``skipped`` is
     set.  The flag is a fact about the probe and the state is a verdict about
     the appliance: a skipped row carries ``CheckState.OK`` so that a scripted
-    health gate does not go red for a probe that was deliberately not taken
-    (D-01), which means marking it from the state alone prints the one token a
-    reader scans for as "fine" in front of a sentence saying nothing was
-    checked.  ``checks.check_row_class`` and its two siblings make the same
-    substitution for the web strip, from the same flag.
+    health gate does not go red for a probe that was deliberately not taken,
+    which means marking it from the state alone prints the one token a reader
+    scans for as "fine" in front of a sentence saying nothing was checked.
+    ``checks.check_row_class`` and its two siblings make the same substitution
+    for the web strip, from the same flag.
 
     Args:
         result: The finished row about to be printed.
@@ -1334,8 +1330,9 @@ def _doctor_scanner(settings: Settings) -> ScannerBackend | None:
     Build a scanner backend for one ``doctor`` run, or report that there is none.
 
     ``None`` is how ``CheckContext`` represents "no scanner support on this
-    machine", and producing it here rather than letting the failure out is the
-    whole of Amendment A-1 on the SANE side.
+    machine", and producing it here rather than letting the failure out is what
+    lets ``doctor`` report a machine without scanner support instead of
+    refusing to run on it.
 
     All three failure shapes collapse to ``None``. ``ImportError`` is the bare
     missing module; ``ConfigError`` is what ``require_sane`` -- which
@@ -1389,27 +1386,27 @@ def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
             settings.paperless.consume_dir,
         )
     except PaperlessError as exc:
-        # The message names the URL, which may carry user:pass@ (WR-08, D-08).
+        # The message names the URL, which may carry user:pass@.
         logger.info("Paperless client unavailable: %s", type(exc).__name__)
         return None
 
 
-# Amendment A-1: this command deliberately does NOT call require_sane(), which
-# is the first statement of `scan` (cli.py:515-519), `devices`, `serve` and
-# `auto-profiles`. Those four cannot do their job without a scanner, so
-# refusing early is honest. `doctor`'s job is to say what is wrong, and a
-# machine with no python-sane is precisely the machine whose owner needs that
-# said: it still has a token, profiles, a fallback folder and a data directory
-# to be told about. The import failure is caught in _doctor_scanner and
-# rendered as one FAIL row among five instead of a refusal to run at all.
+# This command deliberately does NOT call require_sane(), which is the first
+# statement of `scan`, `devices`, `serve` and `auto-profiles`. Those four cannot
+# do their job without a scanner, so refusing early is honest. `doctor`'s job is
+# to say what is wrong, and a machine with no python-sane is precisely the
+# machine whose owner needs that said: it still has a token, profiles, a
+# fallback folder and a data directory to be told about. The import failure is
+# caught in _doctor_scanner and rendered as one FAIL row among five instead of a
+# refusal to run at all.
 #
-# There is no --json, and this is a decision rather than an omission. Research
-# found no consumer anywhere in the docs, the tests, the Dockerfile or the
-# compose file; REQUIREMENTS' Out of Scope table already refuses a container
-# HEALTHCHECK that calls `doctor`, which is the one caller that would have
-# wanted a machine shape. A JSON mode would be a wire contract with no reader,
-# and a wire contract is only free until the first person parses it. The
-# human-readable table plus the exit code is the whole contract.
+# There is no --json, and this is a decision rather than an omission. Nothing in
+# the docs, the tests, the Dockerfile or the compose file would consume it, and
+# a container HEALTHCHECK that calls `doctor` -- the one caller that would have
+# wanted a machine shape -- is deliberately not offered. A JSON mode would be a
+# wire contract with no reader, and a wire contract is only free until the first
+# person parses it. The human-readable table plus the exit code is the whole
+# contract.
 @cli.command()
 @click.pass_context
 def doctor(ctx: click.Context) -> None:
@@ -1418,7 +1415,7 @@ def doctor(ctx: click.Context) -> None:
     scanner = _doctor_scanner(settings)
     if scanner is not None:
         # Registered before the first SANE call, so a check that fails still
-        # leaves the process with SANE shut down (D-18).
+        # leaves the process with SANE shut down.
         ctx.call_on_close(scanner.close)
     paperless = _doctor_paperless(settings)
     try:
@@ -1431,7 +1428,7 @@ def doctor(ctx: click.Context) -> None:
                 # derivation it is entitled to; the function's docstring has
                 # the reasoning, including why it cannot report the third
                 # outcome. The status strip calls the same function, which is
-                # what keeps the two surfaces on one Profiles row (D-02).
+                # what keeps the two surfaces on one Profiles row.
                 profile_storage=profile_storage_for_loaded(settings),
             )
         )
@@ -1447,15 +1444,16 @@ def doctor(ctx: click.Context) -> None:
         if result.next_step:
             click.echo(f"{_NEXT_STEP_INDENT}{result.next_step}")
 
-    # D-01's mapping, and no new ExitCode member to express it. Three reasons,
-    # in order: tests/test_deployment_config.py:393,403 assert the documented
-    # global tables equal every member, so a sixth code is a documentation
-    # change in three files and a revision of Phase 28's D-07 table; 2 already
-    # means "can't start, fix your setup", which is what every red check is
-    # saying; and `doctor` reports a list, so one process has one exit code to
-    # give and splitting a red Paperless row out to 3 would mean choosing which
-    # red row the shell gets to hear about. A WARN is deliberately not a
-    # failure -- an appliance that scans and files is not broken because it
-    # could be tidier, and a gate that goes red for tidiness gets ignored.
+    # Any failing check exits 2, and no new ExitCode member expresses it. Three
+    # reasons, in order: tests/test_deployment_config.py:393,403 assert the
+    # documented global tables equal every member, so a sixth code is a
+    # documentation change in three files and a revision of the exit-code table;
+    # 2 already means "can't start, fix your setup", which is what every red
+    # check is saying; and `doctor` reports a list, so one process has one exit
+    # code to give and splitting a red Paperless row out to 3 would mean
+    # choosing which red row the shell gets to hear about. A WARN is
+    # deliberately not a failure -- an appliance that scans and files is not
+    # broken because it could be tidier, and a gate that goes red for tidiness
+    # gets ignored.
     if worst_state(results) is CheckState.FAIL:
         ctx.exit(ExitCode.CONFIG)

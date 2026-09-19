@@ -68,9 +68,9 @@ def _slugify(source: str) -> str:
     half-normalised string and get a slug that silently breaks the contract.
 
     This is deliberately NOT the PDF filename sanitiser, and the two must not
-    be merged: Phase 23's D-19 separated them because this one passed "/" and
-    ".." straight through. D-15 fixes that character-set weakness here; it does
-    not make this function safe to reuse for filesystem paths.
+    be merged: they were separated because this one passed "/" and ".."
+    straight through. The strict character set fixes that weakness here; it
+    does not make this function safe to reuse for filesystem paths.
 
     Args:
         source: SANE source name, in whatever case the device reported it.
@@ -87,15 +87,15 @@ def source_to_slug(source: str) -> str:
     """
     Convert a SANE source name to a profile slug.
 
-    Every source is named from the device's own wording (D-14). This function
-    used to map each SourceKind onto one of four hard-coded friendly names,
-    which forced a special case for "ADF Back". The reason is worth keeping:
-    "which scan path do I take?" and "what do I name this profile?" are
-    different questions with different equivalence classes. "ADF Front" and "ADF Back" are both feeders
+    Every source is named from the device's own wording. This function used to
+    map each SourceKind onto one of four hard-coded friendly names, which forced
+    a special case for "ADF Back". The reason is worth keeping: "which scan path
+    do I take?" and "what do I name this profile?" are different questions with
+    different equivalence classes. "ADF Front" and "ADF Back" are both feeders
     for routing, so naming them from the kind collapsed two distinct sources
-    onto one profile and silently lost one (the N-09 defect). Naming from the
-    source itself removes the naming question's need for a rule at all, so no
-    source can be named after another source's kind.
+    onto one profile and silently lost one. Naming from the source itself
+    removes the naming question's need for a rule at all, so no source can be
+    named after another source's kind.
 
     Two *different* names can still normalise alike ("ADF-Front" and
     "ADF Front"). That residue is resolved where profiles are assembled, with a
@@ -158,8 +158,8 @@ def pick_closest_resolution(
     wins when present: ``min(..., key=absolute difference)`` is already exactly
     right for it.
 
-    The range branch is what closes N-01. This function used to return the
-    target unchanged whenever the list was empty -- which is precisely what a
+    The range branch is not optional. This function used to return the target
+    unchanged whenever the list was empty -- which is precisely what a
     range-reporting device produces -- so such a device was asked for 300 dpi
     regardless of what it supported, and a device whose ceiling sat below 300
     got a resolution it had never advertised.
@@ -214,7 +214,7 @@ def is_bare_default(settings: Settings) -> bool:
     The whole profile is compared rather than a hand-picked subset, so a field
     added later cannot be silently ignored -- as ``duplex`` was, which let a
     hand-written manual-duplex default be replaced in memory by a generated
-    flatbed profile (WR-04). Pydantic model equality compares field values,
+    flatbed profile. Pydantic model equality compares field values,
     not which fields were set, so a config that spells out default values
     explicitly still counts as bare. ``auto_generated=True`` is covered by the
     same equality, because the bare profile has ``auto_generated=False``.
@@ -241,8 +241,8 @@ def _claim_slug(source: str, claimed: dict[str, str]) -> str:
     source names that normalise to the same slug -- so the assignment needs a
     tie-break. The first source to claim a slug keeps it bare; each later
     collider gains a "-2", "-3", ... suffix. "Last wins" is rejected: it
-    silently drops a source the device reported, which is N-09's actual
-    complaint.
+    silently drops a source the device reported, which is the very loss the
+    tie-break exists to prevent.
 
     The walk follows ``capabilities.sources`` order, so the result is
     deterministic given the device's own stable ordering of its sources.
@@ -312,13 +312,12 @@ def _duplex(source: str) -> Literal["none", "hardware"]:
     manual duplex is not a device source at all, so auto-profiles has no
     evidence for it and those profiles are always written by hand.
 
-    Nothing reads ``"hardware"`` (D-05). It records operator intent and makes a
-    generated profile self-describing. Its readers are ``_profile_label`` and
-    ``_profile_description`` below, which turn a FEEDER_DUPLEX source into the
-    double-sided feeder wording the scan page shows (Phase 30, APPL-05).
-    ``config.py`` states the same fact; it is repeated here
-    because this is where the value is produced, and a reader here will ask
-    what consumes it.
+    Nothing reads ``"hardware"``. It records operator intent and makes a
+    generated profile self-describing. The double-sided feeder wording the scan
+    page shows comes from ``_profile_label`` and ``_profile_description``
+    below, which classify the same source rather than reading this value.
+    ``config.py`` states the same fact; it is repeated here because this is
+    where the value is produced, and a reader here will ask what consumes it.
 
     The value is always passed explicitly, never left to the field default:
     the config loader reads a source name containing both "manual" and
@@ -342,11 +341,11 @@ def _profile_label(source: str) -> str:
     """
     Return the short human name a generated profile carries.
 
-    D-19: the text is derived from what the code already knows -- the
-    ``SourceKind`` the one classification rule reports -- so there is no new
-    probe of the device and no new config key to fill in. The three feeder and
-    glass forms are the ones D-19 names verbatim; ``Auto`` and an unrecognised
-    name get their own so that no profile is ever offered under a blank name.
+    The text is derived from what the code already knows -- the ``SourceKind``
+    the one classification rule reports -- so there is no new probe of the
+    device and no new config key to fill in. The three feeder and glass forms
+    have fixed, agreed wording; ``Auto`` and an unrecognised name get their own
+    so that no profile is ever offered under a blank name.
 
     Every returned string is a developer-authored constant. The SANE source
     name is never interpolated into it, so a vendor-chosen source string
@@ -386,9 +385,9 @@ def _profile_description(source: str) -> str:
     Return the one-sentence explanation a generated profile carries.
 
     The sentence beneath the profile dropdown. Like ``_profile_label`` it is
-    derived under D-19 from the ``SourceKind`` alone: no new probe, no new
-    config key, and the SANE source name is never interpolated into the
-    result, so every string here is a developer-authored constant.
+    derived from the ``SourceKind`` alone: no new probe, no new config key, and
+    the SANE source name is never interpolated into the result, so every string
+    here is a developer-authored constant.
 
     Args:
         source: The SANE source name the profile will carry.
@@ -436,12 +435,11 @@ def generate_profiles(
     first reported source does, which is the only honest candidate available.
 
     Every question this function asks about a source name is answered by
-    ``classify_source`` (D-02, Q9). It previously carried three rules of its
-    own -- an equality test for "auto" and two ``"flatbed" in s.lower()``
-    substring tests -- which disagreed with the classifier at the edges: stray
-    whitespace defeated the equality test, and the substring test called
-    "Flatbed Duplex" a flatbed, making a duplex feeder back the default
-    profile.
+    ``classify_source``. It previously carried three rules of its own -- an
+    equality test for "auto" and two ``"flatbed" in s.lower()`` substring tests
+    -- which disagreed with the classifier at the edges: stray whitespace
+    defeated the equality test, and the substring test called "Flatbed Duplex" a
+    flatbed, making a duplex feeder back the default profile.
 
     Args:
         capabilities: Scanner device capabilities with sources,
@@ -520,7 +518,7 @@ def generate_profiles(
 
 
 # The loader's reading of ``auto_generated``: pydantic's lax ``bool``, the type
-# ``ProfileConfig.auto_generated`` declares (CR-01).
+# ``ProfileConfig.auto_generated`` declares.
 _FLAG: Final = TypeAdapter(bool)
 
 
@@ -537,7 +535,7 @@ def _is_auto_generated(table: object) -> bool:
     (``ProfileConfig.auto_generated``), not Python truthiness: the loader reads
     ``auto_generated = "false"`` (or ``"no"``, ``"off"``, ``"0"``) as False, so
     the writer must call that profile hand-written too, or it would refresh or
-    prune a profile the loader says the operator owns (D-01). A value the
+    prune a profile the loader says the operator owns. A value the
     loader would reject is not the tool's either.
 
     Args:
@@ -570,16 +568,16 @@ _UNPRUNABLE = frozenset({"default"})
 
 
 # The keys a generation writes, and so the keys the tool owns in a profile that
-# carries ``auto_generated = true`` (D-02). ``--force`` overwrites exactly these
-# on the existing table and deletes any of them the fresh generation omits
-# (D-03); every other key -- default_tags, title, thresholds -- is the user's.
-# A hand edit to an owned key is overwritten while the flag is set: to keep it,
-# remove ``auto_generated`` and the profile is never touched again (D-01).
+# carries ``auto_generated = true``. ``--force`` overwrites exactly these on the
+# existing table and deletes any of them the fresh generation omits; every
+# other key -- default_tags, title, thresholds -- is the user's. A hand edit to
+# an owned key is overwritten while the flag is set: to keep it, remove
+# ``auto_generated`` and the profile is never touched again.
 #
 # ``label`` and ``description`` come first because this tuple is the file key
 # order for a newly written table: a human opening the config should read the
 # profile's human name before the SANE source string it was derived from.
-# D-18 makes them ordinary owned keys -- ``--force`` overwrites them exactly as
+# They are ordinary owned keys -- ``--force`` overwrites them exactly as
 # it overwrites ``source``, ``mode`` and ``resolution``, with no special case
 # for free text. They are the first free-text keys the tool owns, so the how-to
 # spells that out in plain words next to the escape hatch.
@@ -595,7 +593,7 @@ _OWNED_KEYS: Final = (
 )
 
 # Why an unflagged same-name profile was left alone, and how to hand it back to
-# the tool (D-01). There is deliberately no flag that overrides this.
+# the tool. There is deliberately no flag that overrides this.
 _NOT_GENERATED_REASON: Final = (
     "not created by auto-profiles (no auto_generated = true); "
     "rename or delete it to regenerate"
@@ -605,7 +603,7 @@ _NOT_GENERATED_REASON: Final = (
 @dataclass(frozen=True, slots=True)
 class ProfileWriteResult:
     """
-    What one ``write_profiles_to_config`` call did, grouped by action (D-04).
+    What one ``write_profiles_to_config`` call did, grouped by action.
 
     The CLI and the worker's startup log both print it through ``describe``,
     so the two front ends share one vocabulary rather than two spellings.
@@ -615,11 +613,10 @@ class ProfileWriteResult:
         added: Generated names the file did not have, now written.
         refreshed: Flagged profiles whose owned keys ``force`` rewrote.
         skipped_not_generated: Same-name profiles without a truthy
-            ``auto_generated``, never touched, under ``force`` too (D-01).
+            ``auto_generated``, never touched, under ``force`` too.
         skipped_existing: Flagged profiles left alone because ``force`` was
             not passed.
-        removed: Flagged profiles the scanner no longer produces, pruned
-            (Phase 24 D-16).
+        removed: Flagged profiles the scanner no longer produces, pruned.
 
     """
 
@@ -689,9 +686,9 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     Build the owned key values a fresh generation writes for ``profile``.
 
     Insertion order is the file's key order for a new table. Only non-default
-    values of ``auto_source_mode`` and ``duplex`` are included (Phase 25 D-06),
-    so a refreshed table reads the way a freshly generated one does.
-    ``label`` and ``description`` are the exception: they are always written.
+    values of ``auto_source_mode`` and ``duplex`` are included, so a refreshed
+    table reads the way a freshly generated one does. ``label`` and
+    ``description`` are the exception: they are always written.
 
     Args:
         profile: A generated profile.
@@ -704,12 +701,12 @@ def _generated_values(profile: ProfileConfig) -> dict[str, str | int | bool]:
     values: dict[str, str | int | bool] = {
         # Deliberately unconditional, unlike auto_source_mode and duplex below,
         # which are written only when they differ from the model default. That
-        # is what makes Phase 27 D-03's rule -- an owned key a fresh generation
-        # does not write is deleted from the table -- unreachable for these
-        # two, so a free-text field a human reads can never be silently pruned
-        # by a refresh. Derived from the source rather than copied from the
-        # model, so a refresh also corrects a profile whose stored text no
-        # longer matches the source it carries.
+        # is what makes the prune rule -- an owned key a fresh generation does
+        # not write is deleted from the table -- unreachable for these two, so a
+        # free-text field a human reads can never be silently pruned by a
+        # refresh. Derived from the source rather than copied from the model, so
+        # a refresh also corrects a profile whose stored text no longer matches
+        # the source it carries.
         "label": _profile_label(profile.source),
         "description": _profile_description(profile.source),
         "source": profile.source,
@@ -748,14 +745,14 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
     Raises:
         ConfigError: The file's bytes are not valid UTF-8, or the text is not
             valid TOML; the latter names the line and column when tomlkit
-            reports one and is chained to tomlkit's error (D-12, M-17, IN-03).
+            reports one and is chained to tomlkit's error.
 
     """
     if not config_path.exists():
         return tomlkit.document(), ""
-    # D-05 / Pitfall 4: bytes decoded as UTF-8 here. Path's text-mode reader
-    # uses the locale encoding and translates CRLF to LF, silently re-encoding
-    # the file and rewriting its line endings on the way back out.
+    # Bytes decoded as UTF-8 here. Path's text-mode reader uses the locale
+    # encoding and translates CRLF to LF, silently re-encoding the file and
+    # rewriting its line endings on the way back out.
     try:
         text = config_path.read_bytes().decode("utf-8")
     except UnicodeDecodeError:
@@ -765,7 +762,7 @@ def _read_config(config_path: Path) -> tuple[TOMLDocument, str]:
         document = tomlkit.parse(text)
     except TOMLKitError as exc:
         # Every tomlkit error, not only ParseError: a table redefined under a
-        # dotted header raises KeyAlreadyPresent, which is not one (IN-03).
+        # dotted header raises KeyAlreadyPresent, which is not one.
         # tomlkit's str() is its message plus, for a ParseError, the position --
         # never document text, so the chain cannot carry the token. The
         # position is rendered once, in saneless's own words, and only when
@@ -820,7 +817,7 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
     Parsing is not enough: tomlkit can emit valid TOML that means something
     else. With top-level dotted keys (``profiles.default.source = ...``) a
     table it adds captures the dotted lines after it, so the file would parse
-    and then fail to load (CR-02). The dumped text is therefore re-parsed and
+    and then fail to load. The dumped text is therefore re-parsed and
     compared with the merged document's data.
 
     Args:
@@ -840,11 +837,11 @@ def _render_checked(config_path: Path, doc: TOMLDocument, original_text: str) ->
     crlf_count = original_text.count("\r\n")
     if crlf_count and crlf_count == original_text.count("\n"):
         # tomlkit keeps the CRLF of the lines it parsed but ends the lines it
-        # adds with a bare LF; normalise those so the file stays CRLF (D-05).
+        # adds with a bare LF; normalise those so the file stays CRLF.
         # Only when EVERY line ending in the original is CRLF: a file that
         # mixes endings, or holds a bare LF inside a multi-line string, is
         # left as tomlkit wrote it, so no LF the user wrote becomes CRLF and
-        # no string value changes (WR-08).
+        # no string value changes.
         new_text = re.sub(r"(?<!\r)\n", "\r\n", new_text)
     try:
         reparsed: object = _comparable(tomllib.loads(new_text))
@@ -904,15 +901,15 @@ def _merge_profile(
         section[name] = table
         return "added"
     if not _is_auto_generated(existing) or not isinstance(existing, MutableMapping):
-        # D-01: not created by the tool (a stray scalar included), so not the
-        # tool's to change. Reported, never overwritten, under force too.
+        # Not created by the tool (a stray scalar included), so not the tool's
+        # to change. Reported, never overwritten, under force too.
         return "skipped_not_generated"
     if not force:
         return "skipped_existing"
-    # D-02: keys are set on the EXISTING table -- never a fresh table assigned
-    # over it, which would drop default_tags, title and the comments. D-03: an
-    # owned key this generation omits is deleted, so a stale
-    # ``duplex = "hardware"`` does not outlive the source that produced it.
+    # Keys are set on the EXISTING table -- never a fresh table assigned over
+    # it, which would drop default_tags, title and the comments. An owned key
+    # this generation omits is deleted, so a stale ``duplex = "hardware"`` does
+    # not outlive the source that produced it.
     owned = cast("MutableMapping[str, object]", existing)
     for key in _OWNED_KEYS:
         if key in values:
@@ -936,11 +933,11 @@ def write_profiles_to_config(
 
     * absent from the file: a new table is added;
     * present without a truthy ``auto_generated``: left byte for byte alone and
-      reported, whether or not ``force`` is passed (D-01);
+      reported, whether or not ``force`` is passed;
     * present and flagged, without ``force``: skipped as already existing;
     * present and flagged, with ``force``: the owned keys (``_OWNED_KEYS``) are
       written onto the existing table and any the generation omits are
-      deleted, so every other key and every comment survives (D-02, D-03).
+      deleted, so every other key and every comment survives.
 
     Auto-generated profiles that the freshly generated set no longer names are
     pruned first, so renaming does not strand the profiles it replaced. The
@@ -958,10 +955,10 @@ def write_profiles_to_config(
         profiles: Dictionary of profile name to ProfileConfig.
         force: If True, refresh the owned keys of flagged profiles.
 
-    The rewrite is durable (CFG-08): the file is read as UTF-8 bytes, CRLF
-    line endings are kept, the new text is re-parsed and must mean exactly
-    the merged document before anything is replaced (CR-02), and
-    ``replace_file_atomically`` swaps it in through any symlink (D-05, D-07).
+    The rewrite is durable: the file is read as UTF-8 bytes, CRLF line endings
+    are kept, the new text is re-parsed and must mean exactly the merged
+    document before anything is replaced, and ``replace_file_atomically`` swaps
+    it in through any symlink.
     A merge that changes nothing does not rewrite the file.
 
     Args:
@@ -1032,7 +1029,7 @@ def write_profiles_to_config(
         new_text = _render_checked(config_path, doc, original_text)
         target = replace_file_atomically(config_path, new_text)
         if target != config_path.absolute():
-            # D-07: the operator edits the link, the write lands on the target;
+            # The operator edits the link, the write lands on the target;
             # naming both explains which file changed.
             logger.info("Wrote profiles to %s (symlink to %s)", config_path, target)
 
