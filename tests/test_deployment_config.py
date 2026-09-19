@@ -2466,3 +2466,58 @@ def test_first_web_ui_scan_names_real_history_labels() -> None:
         f"{name} says the history table shows {unreal}, but state_label never "
         f"returns those. The labels it can return are {sorted(real)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Hook interpreter pin (tooling hygiene, found during the Phase 31 rehearsal)
+# ---------------------------------------------------------------------------
+
+PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
+
+
+def _ruff_target_python() -> str:
+    """
+    Return ruff's ``target-version`` as an interpreter name, e.g. ``python3.14``.
+
+    Derived from ``pyproject.toml`` rather than written down here, because
+    ruff's target is what decides which syntax ``ruff format`` may EMIT, and
+    that is precisely what the hook interpreters have to be able to parse.
+
+    Returns:
+        The ``pythonX.Y`` interpreter name matching ruff's target version.
+
+    """
+    text, _ = _read(PYPROJECT)
+    match = re.search(r'^target-version\s*=\s*"py(\d)(\d+)"', text, re.MULTILINE)
+    assert match, f"{PYPROJECT.name} has no [tool.ruff] target-version"
+    return f"python{match.group(1)}.{match.group(2)}"
+
+
+def test_hook_interpreter_is_pinned_to_the_project_python() -> None:
+    """
+    The prek hooks run on the interpreter ruff targets, not whatever is found.
+
+    ``check-ast`` and ``debug-statements`` parse this project's source with
+    their own interpreter. Unpinned, prek builds each hook environment with
+    whichever Python it happens to locate -- environments at 3.12.4, 3.13.9 and
+    3.14.2 all existed on one machine at once. Anything below ruff's target
+    rejects syntax ruff itself produces: PEP 758's bracketless
+    ``except ValueError, TypeError:`` is a SyntaxError before 3.14, and
+    ``ruff format`` writes exactly that at ``target-version = "py314"``.
+    """
+    text, name = _read(PRE_COMMIT_CONFIG)
+    expected = _ruff_target_python()
+    match = re.search(
+        r"^default_language_version:\s*\n\s+python:\s*(\S+)\s*$",
+        text,
+        re.MULTILINE,
+    )
+    assert match, (
+        f"{name} does not pin default_language_version.python. Without it prek "
+        f"picks any interpreter, and one older than {expected} cannot parse the "
+        f"syntax ruff format emits at this project's target-version"
+    )
+    assert match.group(1) == expected, (
+        f"{name} pins the hook interpreter to {match.group(1)}, but ruff targets "
+        f"{expected}. A hook older than ruff's target rejects syntax ruff writes"
+    )
