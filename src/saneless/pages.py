@@ -18,7 +18,6 @@ import io
 import logging
 from typing import TYPE_CHECKING
 
-import PIL.Image
 from PIL import Image, ImageOps
 from PIL.Image import Resampling
 
@@ -27,19 +26,38 @@ if TYPE_CHECKING:
 
     from saneless.scanner.base import PageRecord
 
-# Allow high-DPI scans (same as sane_backend.py and pdf.py).
-PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
-
-__all__ = ["filter_empty_pages", "generate_thumbnail", "is_empty_page"]
+__all__ = [
+    "allow_large_scans",
+    "filter_empty_pages",
+    "generate_thumbnail",
+    "is_empty_page",
+]
 
 logger = logging.getLogger(__name__)
+
+
+def allow_large_scans() -> None:
+    """
+    Raise Pillow's decompression-bomb limit so high-dpi pages can be opened.
+
+    A 600 dpi A4 colour page is about 34.8M pixels and a 1200 dpi one about
+    139M, over Pillow's default limit of about 89.5M.  Pages arrive from
+    python-sane through ``Image.frombuffer``, which does not check the limit,
+    but img2pdf re-opens every spooled page with ``Image.open``, which does,
+    so without this a high-dpi scan would fail at PDF assembly.
+
+    The limit is process-wide, so it is set here, once, by the entry point
+    at start-up, rather than as a side effect of importing a module.
+    """
+    Image.MAX_IMAGE_PIXELS = 200_000_000
 
 
 def is_empty_page(
     mean: float,
     stddev: float,
-    mean_threshold: float = 250.0,
-    stddev_threshold: float = 5.0,
+    *,
+    mean_threshold: float,
+    stddev_threshold: float,
 ) -> bool:
     """
     Detect whether a scanned page is empty (blank) from its statistics.
@@ -50,7 +68,7 @@ def is_empty_page(
     AND between them and the strictness of both comparisons are exactly as
     they were; only where the two numbers come from has changed.
 
-    The page itself no longer arrives here, and that is D-06. This used to
+    The page itself no longer arrives here. This used to
     convert the image to greyscale and run Pillow's image-statistics helper
     over the result -- measured at 6 ms for the conversion and 3 ms for the
     statistics, plus a
@@ -63,9 +81,9 @@ def is_empty_page(
         mean: Greyscale mean luminance, as measured when the page was spooled.
         stddev: Greyscale standard deviation, measured at the same moment.
         mean_threshold: Pages with mean luminance above this are
-            candidates for empty detection. Default 250.0.
+            candidates for empty detection.  The profile supplies it.
         stddev_threshold: Pages with stddev below this (combined
-            with high mean) are considered empty. Default 5.0.
+            with high mean) are considered empty.  The profile supplies it.
 
     Returns:
         True if the page is considered empty, False otherwise.
@@ -83,8 +101,9 @@ def is_empty_page(
 
 def filter_empty_pages(
     pages: Sequence[PageRecord],
-    mean_threshold: float = 250.0,
-    stddev_threshold: float = 5.0,
+    *,
+    mean_threshold: float,
+    stddev_threshold: float,
 ) -> list[PageRecord]:
     """
     Remove empty pages from a record sequence, by the dual-threshold rule.
@@ -107,7 +126,12 @@ def filter_empty_pages(
     """
     kept: list[PageRecord] = []
     for record in pages:
-        if is_empty_page(record.mean, record.stddev, mean_threshold, stddev_threshold):
+        if is_empty_page(
+            record.mean,
+            record.stddev,
+            mean_threshold=mean_threshold,
+            stddev_threshold=stddev_threshold,
+        ):
             logger.info("Page %d: DISCARD (empty)", record.sequence)
         else:
             logger.info("Page %d: KEEP", record.sequence)
@@ -142,8 +166,6 @@ def generate_thumbnail(
 
     """
     thumb = ImageOps.contain(image, (max_edge, max_edge), Resampling.LANCZOS)
-    # Strip EXIF to avoid img2pdf/viewer orientation issues (Pitfall #5)
-    thumb.info.pop("exif", None)
     buf = io.BytesIO()
     thumb.save(buf, format="JPEG", quality=quality)
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")

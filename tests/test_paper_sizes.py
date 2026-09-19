@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import get_args
+from typing import cast, get_args
 
 import pytest
 from PIL import Image
@@ -85,7 +85,9 @@ class TestCropToPaperSize:
     def test_unknown_size_returns_unchanged(self) -> None:
         """crop_to_paper_size returns image unchanged when paper_size not in PAPER_SIZES_MM."""
         img = Image.new("RGB", (3000, 4000), "red")
-        result = crop_to_paper_size(img, "unknown_size", 300)
+        # Past the type, as an unvalidated caller would: the guard is for them.
+        unknown = cast("PaperSize", "unknown_size")
+        result = crop_to_paper_size(img, unknown, 300)
         assert result is img
 
     def test_a4_at_300dpi_crops_correctly(self) -> None:

@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
+
+from saneless.vocabulary import PaperSize
 
 if TYPE_CHECKING:
     from PIL import Image
 
 __all__ = ["PAPER_SIZES_MM", "PaperSize", "crop_to_paper_size"]
-
-PaperSize = Literal["full", "a3", "a4", "a5", "letter", "legal"]
-"""Valid paper size names for scan area constraint."""
 
 PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
     "a3": (297.0, 420.0),
@@ -27,7 +26,7 @@ PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
 
 def crop_to_paper_size(
     image: Image.Image,
-    paper_size: str,
+    paper_size: PaperSize,
     dpi: int,
 ) -> Image.Image:
     """

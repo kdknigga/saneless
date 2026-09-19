@@ -2163,12 +2163,13 @@ def run_pipeline(
         actual_dpi = batch.actual_resolution
         rejected_warning = _rejected_pages_warning(batch.pages_rejected)
 
-        # There is no per-page EXIF strip here any more, and restoring one
-        # would have nothing to act on (Pitfall #5).  The pages are files the
-        # spool wrote: the backend drops ``info["exif"]`` before handing a page
-        # over, and Pillow's PNG encoder emits an EXIF chunk only for one
-        # passed to it through ``encoderinfo``, which the spool never does.
-        # The thumbnail helper in ``pages`` still strips it for its JPEG.
+        # There is no per-page EXIF strip here, and one would have nothing to
+        # act on.  python-sane builds each page with ``Image.frombuffer``,
+        # which carries no EXIF, and the pages are files the spool wrote:
+        # Pillow writes EXIF into a PNG or a JPEG only when it is passed as
+        # the ``exif`` argument, which neither the spool's PNG save nor the
+        # thumbnail's JPEG save ever does.  An orientation tag that img2pdf
+        # or a browser would act on therefore cannot reach either file.
 
         # Step 2: Filter empty pages (gated on profile toggle, per D-17)
         filtered = _drop_empty_pages(records, profile)

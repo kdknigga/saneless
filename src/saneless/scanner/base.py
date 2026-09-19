@@ -19,6 +19,8 @@ if TYPE_CHECKING:
 
     from PIL import Image
 
+    from saneless.vocabulary import PaperSize
+
 __all__ = [
     "DeviceCapabilities",
     "DeviceInfo",
@@ -195,7 +197,7 @@ class ScanSettings:
     # run_pipeline. Like auto_source_mode it is a plain value, because Phase 21
     # D-03 forbids this package depending on the job-state enums.
     resolve_feeder_source: bool = False
-    paper_size: str = "full"
+    paper_size: PaperSize = "full"
 
 
 @dataclass(frozen=True)

@@ -27,7 +27,6 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Protocol, assert_never
 
-import PIL.Image
 from PIL import Image
 
 from saneless.exceptions import ConfigError, FeederEmptyError, ScanError, describe
@@ -47,6 +46,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from saneless.scanner.base import PageRecord, PageSink
+    from saneless.vocabulary import PaperSize
 
 # Tests patch a fake python-sane module into this name, so the backend can be
 # driven without the real C extension.  Production leaves it None and every SANE
@@ -108,11 +108,6 @@ def require_sane() -> None:
         )
         raise ConfigError(msg) from exc
 
-
-# Allow high-DPI scans without triggering Pillow's decompression bomb check.
-# 600 DPI A4 color = ~34.8M pixels; 1200 DPI = ~139M pixels.
-# Pillow default limit is 89.5M pixels.
-PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
 
 # Per-page timeout: 2x a generous single-page scan estimate (60s at 600 DPI).
 # At 300 DPI typical scan is ~10-15s, so 120s is very conservative.
@@ -574,7 +569,7 @@ def _area_matches(
 
 def _set_geometry(
     dev: SaneDevice,
-    paper_size: str,
+    paper_size: PaperSize,
     raw_options: list[tuple],
     resolution: int,
 ) -> bool:
@@ -651,7 +646,7 @@ def _set_geometry(
 
 def _maybe_crop(
     image: Image.Image,
-    paper_size: str,
+    paper_size: PaperSize,
     resolution: int,
     *,
     geometry_set: bool,
@@ -1460,12 +1455,6 @@ def _acquire_pages(
                 rejected_pages += 1
                 continue
 
-            # Strip EXIF (Pitfall #5: invalid EXIF breaks img2pdf).  Before
-            # the crop rather than after it: Pillow copies ``info`` into the
-            # cropped result, so a strip afterwards would have to be repeated
-            # on whichever object came back.
-            page_image.info.pop("exif", None)
-
             # Cropped here, per page, instead of over a finished list
             # afterwards.  The sink is where this page stops being ours, so
             # everything that has to happen to it happens before the hand-off
@@ -1887,8 +1876,6 @@ def _snap_flatbed(
         )
         raise ScanError(unreadable_msg)
 
-    # Strip EXIF from flatbed scans too, before the crop copies ``info``.
-    image.info.pop("exif", None)
     return sink.add(crop(image))
 
 

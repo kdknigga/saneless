@@ -46,6 +46,7 @@ __all__ = [
     "FlipOutcome",
     "JobState",
     "PageCounted",
+    "PaperSize",
     "ProfileStorage",
     "RequestRejection",
     "ScanOutcome",
@@ -68,6 +69,15 @@ __all__ = [
     "state_label",
     "worker_health_detail",
 ]
+
+
+PaperSize = Literal["full", "a3", "a4", "a5", "letter", "legal"]
+"""
+The paper sizes a profile can constrain a scan to.
+
+``"full"`` means no constraint: the whole bed is scanned.  Every other name has
+its dimensions in ``saneless.paper_sizes.PAPER_SIZES_MM``.
+"""
 
 
 class JobState(StrEnum):

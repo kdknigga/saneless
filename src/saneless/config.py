@@ -36,7 +36,12 @@ from pydantic_settings import (
 from pydantic_settings.exceptions import SettingsError
 
 from saneless.exceptions import ConfigError
-from saneless.vocabulary import TITLE_MAX_LENGTH, ProfileStorage, local_time
+from saneless.vocabulary import (
+    TITLE_MAX_LENGTH,
+    PaperSize,
+    ProfileStorage,
+    local_time,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
@@ -392,7 +397,7 @@ class ProfileConfig(BaseModel):
     # not cross-validated against a FEEDER_DUPLEX source -- profile fields have
     # never been cross-checked (auto_source_mode is not checked against Auto).
     duplex: Literal["none", "hardware", "manual"] = "none"
-    paper_size: Literal["full", "a3", "a4", "a5", "letter", "legal"] = "full"
+    paper_size: PaperSize = "full"
     default_tags: list[int] = []
     default_correspondent: int | None = None
     # A literal title, not a template: no placeholder vocabulary (D-15). Used

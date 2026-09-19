@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING
 
 import img2pdf
 import pikepdf
-import PIL.Image
 
 from saneless.exceptions import PdfError, describe
 
@@ -32,10 +31,6 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from saneless.scanner.base import PageRecord
-
-# Allow high-DPI scans without triggering Pillow's decompression bomb check.
-# 600 DPI A4 color = ~34.8M pixels; 1200 DPI = ~139M pixels.
-PIL.Image.MAX_IMAGE_PIXELS = 200_000_000
 
 # Everything outside the allow-list becomes a separator.  See
 # sanitise_title_for_filename for why this is an allow-list and not a
