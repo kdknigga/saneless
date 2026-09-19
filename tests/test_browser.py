@@ -29,10 +29,9 @@ import json
 import re
 import socket
 import threading
-import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal, NamedTuple
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -280,41 +279,60 @@ def _browser_test_settings(tmp_dir: Path) -> Settings:
 
 
 class _RunningUvicorn(NamedTuple):
-    """A uvicorn server running on a daemon thread, and the port it bound."""
+    """A uvicorn server running on a daemon thread, and the socket it serves."""
 
     server: uvicorn.Server
     thread: threading.Thread
+    sock: socket.socket
     port: int
 
 
 def _start_uvicorn(app: ASGIApp, host: str) -> _RunningUvicorn:
-    """Run ``app`` under uvicorn on a daemon thread, bound to ``host`` on a free port."""
-    # Note: uvicorn.Server.capture_signals already skips signal handling
-    # when running in a non-main thread, so no special config is needed.
-    config = uvicorn.Config(app, host=host, port=0, log_level="warning")
-    server = uvicorn.Server(config)
+    """
+    Run ``app`` under uvicorn on a daemon thread, bound to ``host`` on a free port.
 
-    thread = threading.Thread(target=server.run, daemon=True)
+    The socket is bound and listening before the thread starts, so the port is
+    known at once and a connection made before uvicorn is serving waits in the
+    listen queue instead of being refused.  uvicorn accepts nothing until its
+    lifespan start-up has finished, so one request is enough to know it has:
+    crash recovery, the start-up prune and the worker have all run, and a test
+    that writes to the job store next cannot have its row failed by recovery.
+    That request is answered, not polled for, so nothing here sleeps.
+
+    Raises:
+        RuntimeError: When uvicorn does not answer that first request.
+
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((host, 0))
+    sock.listen()
+    port = sock.getsockname()[1]
+    # uvicorn.Server.capture_signals already skips signal handling when it runs
+    # in a non-main thread, so no special config is needed.
+    server = uvicorn.Server(uvicorn.Config(app, log_level="warning"))
+    thread = threading.Thread(
+        target=server.run, kwargs={"sockets": [sock]}, daemon=True
+    )
     thread.start()
-
-    # Wait for server startup
-    for _ in range(100):
-        if server.started:
-            break
-        time.sleep(0.05)
-    else:
-        msg = "Uvicorn server failed to start"
-        raise RuntimeError(msg)
-
-    # Get actual assigned port
-    port = server.servers[0].sockets[0].getsockname()[1]
-    return _RunningUvicorn(server=server, thread=thread, port=port)
+    running = _RunningUvicorn(server=server, thread=thread, sock=sock, port=port)
+    try:
+        httpx.get(
+            f"http://127.0.0.1:{port}/static/app.css", timeout=10
+        ).raise_for_status()
+    except httpx.HTTPError as exc:
+        _stop_uvicorn(running)
+        msg = f"Uvicorn server failed to start: {exc}"
+        raise RuntimeError(msg) from exc
+    return running
 
 
 def _stop_uvicorn(running: _RunningUvicorn) -> None:
     """Stop a server started by ``_start_uvicorn`` and assert its thread ended."""
     running.server.should_exit = True
     running.thread.join(timeout=5)
+    # uvicorn closes the socket on a normal shutdown, but not when its start-up
+    # failed; closing it again is harmless.
+    running.sock.close()
     # join() reports nothing on timeout. A uvicorn thread that fails to stop
     # leaves a bound port and a live app behind for the rest of the session,
     # so the outcome is asserted rather than discarded.
@@ -806,11 +824,11 @@ class TestFlipPromptUI:
 
 _COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').length"
 
-# Counts the two in-form controls that load themselves on page load. htmx 2.0.8
-# strips hx-disabled-elt's `disabled` inside the request's onload handler, after
-# the swap and before htmx:afterSettle, so once both events have fired the
-# inheritance trap has either sprung or it has not. Registered as an init script
-# so the listener exists before htmx issues the load requests.
+# Counts the swaps of the two in-form controls the refresh buttons re-fetch.
+# htmx 2.0.8 strips hx-disabled-elt's `disabled` inside the request's onload
+# handler, after the swap and before htmx:afterSettle, so once both events have
+# fired the inheritance trap has either sprung or it has not. Registered as an
+# init script so the listener exists before anything on the page can ask.
 #
 # afterSettle, not afterRequest: the tag list is swapped outerHTML, and htmx
 # fires afterRequest on the element it requested *after* that swap has already
@@ -820,15 +838,34 @@ _COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').leng
 # "the trap has had its chance" signal. The correspondent select is swapped
 # innerHTML and settles as itself; the new tag list settles under the same id
 # the old one carried, because the partial renders its own wrapper.
-_RECORD_LOAD_REQUESTS = """
-window.__selectLoadsFinished = 0;
+_RECORD_CONTROL_SWAPS = """
+window.__controlSwapsFinished = 0;
 document.addEventListener("htmx:afterSettle", (event) => {
     const id = event.detail.elt && event.detail.elt.id;
     if (id === "tags-list" || id === "correspondent-select") {
-        window.__selectLoadsFinished += 1;
+        window.__controlSwapsFinished += 1;
     }
 });
 """
+
+
+def _refresh_both_lists(page: Page) -> None:
+    """
+    Click the tags and the correspondents refresh buttons and wait for both swaps.
+
+    Needs ``_RECORD_CONTROL_SWAPS`` installed before the page loaded.
+
+    Args:
+        page: The browser page, already on the scan form.
+
+    """
+    for resource in ("tags", "correspondents"):
+        with page.expect_response(
+            lambda r, name=resource: r.url.endswith(f"resource={name}")
+        ) as refreshed:
+            page.click(f'button[aria-label="Refresh {resource}"]')
+        assert refreshed.value.status == 200, resource
+    page.wait_for_function("window.__controlSwapsFinished >= 2")
 
 
 @pytest.mark.browser
@@ -904,13 +941,14 @@ class TestServerOwnedScanButton:
         wait_for_state: Callable[..., Job],
     ) -> None:
         """
-        A page opened mid-scan keeps Scan disabled after its selects load (B7).
+        A page opened mid-scan keeps Scan disabled after its lists refresh (B7).
 
         The form carries ``hx-disabled-elt="#scan-btn"``. Without
-        ``hx-disinherit`` the tags and correspondents selects inherit it, and on
-        htmx 2.0.8 finishing their load requests strips ``disabled`` from the
-        button the server rendered disabled -- C-10 again, on every page load
-        during a scan (T-26-48).
+        ``hx-disinherit`` the tags and correspondents refresh buttons inherit
+        it, and on htmx 2.0.8 finishing their requests strips ``disabled`` from
+        the button the server rendered disabled -- C-10 again, on every refresh
+        during a scan (T-26-48).  The page itself no longer asks for either list
+        on load, so the two refresh clicks are what exercise the trap.
         """
         server = scan_harness.server
         server.scanner.gate.clear()
@@ -921,20 +959,16 @@ class TestServerOwnedScanButton:
             assert len(created) == 1, created
             wait_for_state(scan_harness.job_store, created[0], JobState.SCANNING)
 
-            page.add_init_script(_RECORD_LOAD_REQUESTS)
-            with (
-                page.expect_response(lambda r: "/api/tags" in r.url),
-                page.expect_response(lambda r: "/api/correspondents" in r.url),
-            ):
-                page.goto(server.url)
-            page.wait_for_function("window.__selectLoadsFinished >= 2")
+            page.add_init_script(_RECORD_CONTROL_SWAPS)
+            page.goto(server.url)
+            _refresh_both_lists(page)
 
             # Read once, without retrying. expect(...).to_be_disabled() polls for
             # up to 5 s, and the status poll re-renders the button disabled
             # every second, so a retrying check waits out the trap and passes
             # with it sprung -- observed with hx-disinherit removed.
             assert page.locator("#scan-btn").is_disabled(), (
-                "a page load during an active scan re-enabled the Scan button"
+                "a list refresh during an active scan re-enabled the Scan button"
             )
         finally:
             server.scanner.gate.set()
@@ -1193,10 +1227,10 @@ class TestContrastHelper:
 
     def test_a_translucent_layer_is_blended_rather_than_ignored(self) -> None:
         """A 3.75%-opacity grey over white reads as near-white, not as the grey."""
-        # This is Pico's striped-row colour. It is unreachable today --
-        # history.html uses role="grid", which Pico 2.1.1 does not stripe -- but
-        # adding class="striped" is a one-attribute change, and reading it as
-        # opaque would report a passing ratio as ~1.1:1.
+        # This is Pico's striped-row colour. It is unreachable today -- the
+        # history table carries no class="striped", so Pico 2.1.1 does not
+        # stripe it -- but adding that class is a one-attribute change, and
+        # reading it as opaque would report a passing ratio as ~1.1:1.
         stripe = "rgba(111, 120, 135, 0.0375)"
         flattened = _flatten([stripe, _PICO_SURFACE["light"]])
         assert _relative_luminance(flattened) > 0.9
@@ -2261,35 +2295,33 @@ class TestBlockedScanButtonInABrowser:
         assert reason_box is not None
         assert reason_box["y"] >= button_box["y"] + button_box["height"]
 
-    def test_the_blocked_button_survives_its_own_page_load_requests(
+    def test_the_blocked_button_survives_the_form_s_own_requests(
         self,
         page: Page,
         blocked_server: _BrowserServer,
         egress_allowlist: list[str],
     ) -> None:
         """
-        The load requests inside the form do not re-enable it (C-10, T-30-66).
+        The requests inside the form do not re-enable it (C-10, T-30-66).
 
         On htmx 2.0.8 an inherited ``hx-disabled-elt`` strips ``disabled`` from
         a server-disabled button the moment a child request finishes. With no
         job active there is no one-second status poll to put it back, so a
         blocked button that lost the attribute here would stay clickable --
-        which is exactly why the flag lives in the one button partial.
+        which is exactly why the flag lives in the one button partial.  The two
+        refresh buttons are the form's own requests now that the page asks for
+        neither list on load.
         """
         egress_allowlist.append(blocked_server.url)
-        page.add_init_script(_RECORD_LOAD_REQUESTS)
-        with (
-            page.expect_response(lambda r: "/api/tags" in r.url),
-            page.expect_response(lambda r: "/api/correspondents" in r.url),
-        ):
-            page.goto(blocked_server.url)
-        page.wait_for_function("window.__selectLoadsFinished >= 2")
+        page.add_init_script(_RECORD_CONTROL_SWAPS)
+        page.goto(blocked_server.url)
+        _refresh_both_lists(page)
 
         # Read once, without retrying: nothing re-renders this button while no
         # job is active, so a retrying check would only hide a sprung trap
         # behind a timeout.
         assert page.locator("#scan-btn").is_disabled(), (
-            "the page's own load requests re-enabled a blocked Scan button"
+            "the form's own refresh requests re-enabled a blocked Scan button"
         )
         assert page.locator(_BLOCKED_REASON_SELECTOR).is_visible()
 
@@ -2476,6 +2508,86 @@ _BROWSER_TAGS: list[dict[str, object]] = [
 ]
 
 
+_PAGE_LOAD_TAGS: list[dict[str, object]] = [
+    {"id": 31, "name": "bank"},
+    {"id": 32, "name": "school"},
+]
+_PAGE_LOAD_CORRESPONDENTS: list[dict[str, object]] = [
+    {"id": 41, "name": "Acme Water"},
+]
+
+
+@pytest.mark.browser
+class TestPageLoadAsksForNoList:
+    """
+    The page renders the tag list and the correspondent options itself.
+
+    Both come from the metadata cache the full page render reads, so a load
+    trigger asking ``/api/tags`` or ``/api/correspondents`` for them again would
+    only repeat the page's own work.  This proves nothing on the page still
+    depends on such a trigger: the lists are there without one, and each
+    refresh button still fetches and swaps.
+    """
+
+    def test_no_list_request_on_load_and_both_refreshes_still_swap(
+        self, page: Page, tmp_path: Path, egress_allowlist: list[str]
+    ) -> None:
+        """
+        Load the page, record every request, then refresh each list.
+
+        The refresh requests are recorded by the same listener, so the empty
+        load-time record is not a listener that heard nothing at all.
+        """
+        tags = list(_PAGE_LOAD_TAGS)
+        correspondents = list(_PAGE_LOAD_CORRESPONDENTS)
+        requested: list[str] = []
+
+        def _record(request: Request) -> None:
+            requested.append(urlsplit(request.url).path)
+
+        with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
+            egress_allowlist.append(server.url)
+            paperless = server.app.state.paperless
+            paperless.get_tags = lambda: list(tags)
+            paperless.get_correspondents = lambda: list(correspondents)
+
+            page.on("request", _record)
+            page.goto(server.url)
+            page.wait_for_load_state("networkidle")
+
+            on_load = [
+                path
+                for path in requested
+                if path in {"/api/tags", "/api/correspondents"}
+            ]
+            assert on_load == [], on_load
+            expect(page.locator("label.tag-option")).to_have_count(len(tags))
+            expect(
+                page.locator('#correspondent-select option[value="41"]')
+            ).to_have_text("Acme Water")
+
+            tags.append({"id": 33, "name": "garden"})
+            correspondents.append({"id": 42, "name": "Globex Power"})
+            with page.expect_response(
+                lambda r: r.url.endswith("resource=tags")
+            ) as tag_refresh:
+                page.click('button[aria-label="Refresh tags"]')
+            assert tag_refresh.value.status == 200
+            expect(page.locator("label.tag-option")).to_have_count(len(tags))
+            expect(page.locator("#tags-list")).to_contain_text("garden")
+
+            with page.expect_response(
+                lambda r: r.url.endswith("resource=correspondents")
+            ) as correspondent_refresh:
+                page.click('button[aria-label="Refresh correspondents"]')
+            assert correspondent_refresh.value.status == 200
+            expect(
+                page.locator('#correspondent-select option[value="42"]')
+            ).to_have_text("Globex Power")
+
+        assert requested.count("/api/cache/invalidate") == 2, requested
+
+
 @pytest.fixture
 def tagged_server(browser_server: _BrowserServer) -> Iterator[_BrowserServer]:
     """
@@ -2511,7 +2623,7 @@ class TestTagFilterInChromium:
 
     def _load_tags(self, page: Page, url: str) -> None:
         """
-        Open the page and wait for the tag list to have loaded itself.
+        Open the page and wait for its server-rendered tag list.
 
         Args:
             page: The browser page.
