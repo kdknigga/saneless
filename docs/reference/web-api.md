@@ -176,7 +176,7 @@ If the check registry itself fails, the previous results stay on the page rather
 
 ### `GET /api/tags`
 
-Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses cached data when available; an error reaching paperless-ngx renders an empty list rather than an error.
+Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses cached data when available. If a refresh cannot reach paperless-ngx, the picker shows the last list fetched successfully, or an empty list if there has never been one, rather than an error; the cause is logged, and while paperless-ngx stays unreachable the refresh is retried, and the cause logged again, once per `paperless_cache_ttl_seconds` (60 by default).
 
 **Query parameters:**
 
@@ -191,7 +191,7 @@ Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses ca
 
 ### `GET /api/correspondents`
 
-Fetches paperless-ngx correspondents for the dropdown selector. Uses cached data when available.
+Fetches paperless-ngx correspondents for the dropdown selector. Uses cached data when available. If a refresh cannot reach paperless-ngx, the dropdown offers the last list fetched successfully, or no correspondents if there has never been one, rather than an error.
 
 **Response:** HTML partial (`<option>` elements for HTMX swap).
 

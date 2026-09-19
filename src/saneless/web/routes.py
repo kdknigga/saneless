@@ -23,6 +23,7 @@ from saneless.checks import (
     CheckKey,
 )
 from saneless.config import is_placeholder_token, resolve_job_title
+from saneless.exceptions import PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
 from saneless.scanner.base import SourceKind, classify_source
 from saneless.vocabulary import (
@@ -468,9 +469,11 @@ def _get_cached_or_fetch(
     Retrieve metadata from cache or fetch from paperless-ngx.
 
     The fetch goes through the cache's single-flight ``get_or_fetch``, so
-    concurrent requests for the same resource make one Paperless call
-    (ROBU-05).  Falls back to an empty list if the paperless API is
-    unreachable, ensuring the UI always loads even when paperless-ngx is down.
+    concurrent requests for the same resource make one Paperless call.  When
+    a refresh fails, the cache serves the last list fetched successfully;
+    only when there has never been one does the error reach this function,
+    which logs its cause and falls back to an empty list, so the UI always
+    loads even when paperless-ngx is down.
 
     Args:
         cache: Metadata cache instance.
@@ -478,16 +481,25 @@ def _get_cached_or_fetch(
         resource: Resource name ('tags' or 'correspondents').
 
     Returns:
-        List of metadata dicts, or empty list on error.
+        List of metadata dicts: fresh, the last good list, or empty.
 
     """
     fetch = paperless.get_tags if resource == "tags" else paperless.get_correspondents
     try:
         data = cache.get_or_fetch(resource, fetch)
-    except Exception:
+    except PaperlessError as exc:
         logger.warning(
-            "Failed to fetch %s from paperless-ngx, using empty list",
+            "Failed to fetch %s from paperless-ngx, using empty list: %s",
             resource,
+            describe(exc),
+        )
+        data = []
+    except Exception as exc:
+        logger.warning(
+            "Failed to fetch %s from paperless-ngx, using empty list: %s",
+            resource,
+            describe(exc),
+            exc_info=True,
         )
         data = []
     return data
@@ -1572,7 +1584,8 @@ def get_tags(
     Render the tag checkbox list, optionally narrowed by a filter.
 
     Uses cached data when available, falling back to a fresh fetch from
-    paperless-ngx; an API error renders the empty list rather than an error.
+    paperless-ngx; an API error renders the last list fetched successfully, or
+    an empty list if there has never been one, rather than an error.
 
     The response is the whole swap target, wrapper included, because the filter
     swaps it ``outerHTML``.  Both parameters arrive from the same
@@ -1601,7 +1614,8 @@ def get_correspondents(request: Request) -> Response:
     Fetch correspondent options for the dropdown selector.
 
     Uses cached data when available, falling back to a fresh fetch
-    from paperless-ngx. Returns empty options on API errors.
+    from paperless-ngx. On an API error it returns the last list fetched
+    successfully, or empty options if there has never been one.
     """
     state = request.app.state
     correspondents = _get_cached_or_fetch(

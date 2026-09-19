@@ -77,23 +77,19 @@ class CheckCache:
     The status strip's cache: one TTL, one entry, and the previous answer kept.
 
     The shape is copied from :class:`~saneless.web.cache.MetadataCache` -- a
-    TTL, a timestamp taken at store time, and one lock with a comment naming
-    exactly what it guards.  It deviates from that class in three deliberate
-    ways:
+    TTL, a timestamp taken at store time, a clock passed to the constructor,
+    and one lock with a comment naming exactly what it guards.  Both caches
+    take the clock as a parameter so their tests advance a float instead of
+    waiting out a TTL, and cost the suite no wall-clock time.  This one
+    deviates from that class in two deliberate ways:
 
-    1. **The clock is a constructor parameter.**  ``MetadataCache`` calls
-       ``time.monotonic()`` inline (``cache.py:54`` and ``cache.py:66``), which
-       is the sole reason ``tests/test_cache.py:28`` has to sleep for 1.1 real
-       seconds to watch a TTL expire.  Injecting the clock lets every test here
-       advance a float instead, so this cache costs the suite no wall-clock
-       time and has no timing flake to inherit.
-    2. **It keeps last-known-good.**  ``MetadataCache.get_or_fetch``
-       (``cache.py:69-116``) re-raises when a fetch fails and caches nothing;
-       ``routes.py:79-86`` is what swallows that and substitutes ``[]``.  D-08
-       needs the opposite: an expired or unrefreshable entry keeps its results
-       and its wall-clock stamp so the strip can say "Paused during scan --
-       last checked 14:02" rather than going blank.
-    3. **It is typed to ``CheckResult``,** not ``list[dict[str, object]]``.
+    1. **Its previous answer is always on show.**  ``MetadataCache`` keeps a
+       last good copy too, but hands it out only after a refresh has failed;
+       otherwise an expired entry is a miss.  Here an expired or unrefreshable
+       entry is returned with its results and its wall-clock stamp, marked
+       stale, so the strip can say "Paused during scan -- last checked 14:02"
+       rather than going blank.
+    2. **It is typed to ``CheckResult``,** not ``list[dict[str, object]]``.
        ``run_checks`` already returns a ``tuple`` of frozen results, so the
        cached value is immutable all the way down and a renderer cannot mutate
        what the next renderer will read.
