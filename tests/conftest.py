@@ -772,10 +772,12 @@ def poll_until(
     """
     Poll ``predicate`` until it holds or ``budget`` seconds pass.
 
-    The pause between polls is a wait on an Event nobody sets: bounded by
-    ``interval``, and not a sleep of the whole thread. The predicate is checked once more
-    after the deadline, so a condition that became true during the last pause
-    is still seen.
+    Between polls the calling thread pauses for ``interval`` on an Event
+    nobody sets: a bounded pause between polls, which the ``time.sleep`` ban
+    does not see, so the budget -- not the pause -- is what keeps it short.
+    A passing test stops polling as soon as the predicate holds. The
+    predicate is checked once more after the deadline, so a condition that
+    became true during the last pause is still seen.
 
     Args:
         predicate: The condition to wait for; called repeatedly, so it must be
@@ -809,3 +811,24 @@ def _poll_until_fixture() -> Callable[..., bool]:
 
     """
     return poll_until
+
+
+def quiet_window(seconds: float) -> None:
+    """
+    Block the calling thread for ``seconds``: the one sanctioned fixed pause.
+
+    Some tests prove that something does *not* happen, and nothing can be
+    polled for an event that never comes, so they give the code a short
+    window to misbehave in and then look. That window is a pause in all but
+    name, and it costs its full length on every passing run, so it goes
+    through this one helper rather than an inline wait: every fixed pause in
+    the suite can then be found by searching for its name, and a prek hook
+    flags an inline ``Event().wait`` written anywhere else. Import it as
+    ``from tests.conftest import quiet_window``.
+
+    Args:
+        seconds: How long to leave the code under test alone. Keep it short.
+
+    """
+    never_set = threading.Event()
+    never_set.wait(seconds)

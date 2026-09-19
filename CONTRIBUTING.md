@@ -96,11 +96,20 @@ All seven must exit 0. Fix what they report -- do not silence them. `# noqa`,
 `# type: ignore` and rule-disabling are not accepted, and both type checkers must be
 clean because they do not always report the same issues for the same code.
 
-Tests never sleep. A test that needs something to happen waits on a
-`threading.Event`, polls with `poll_until` from `tests/conftest.py`, or advances a fake
-clock. `tests/ruff.toml` extends the project's ruff settings with a `time.sleep` ban
-that covers `tests/` only, so `ruff check` fails on a new sleep in a test while
-production code, such as the Paperless upload backoff, may still sleep.
+Tests do not call `time.sleep`. A test that needs something to happen waits on a
+`threading.Event` that the code under test sets, polls with `poll_until` from
+`tests/conftest.py`, or advances a fake clock. `tests/ruff.toml` extends the project's
+ruff settings with a `time.sleep` ban that covers `tests/` only, so `ruff check` fails
+on a new sleep in a test while production code, such as the Paperless upload backoff,
+may still sleep.
+
+The ban covers `time.sleep` and nothing else, so it does not prove that no test pauses.
+`poll_until` and `wait_for_state` pause briefly between polls, on an Event nobody sets,
+until their condition holds or their budget runs out. A test that proves something does
+*not* happen has nothing to poll for, so it may leave the code a short fixed window
+through `quiet_window` in `tests/conftest.py`, which keeps every such pause findable by
+name. The `no-inline-fixed-waits` hook fails on the inline `Event().wait(...)` spelling
+of a pause; a pause written any other way is left to review.
 
 Comments in `src/` state their reasons in words and never cite planning IDs (decision,
 finding or requirement numbers, phase or plan numbers, planning file names), because the

@@ -47,7 +47,7 @@ from saneless.vocabulary import (
     classify_error,
 )
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, poll_until, scan_batch
+from tests.conftest import StubScannerBackend, poll_until, quiet_window, scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -705,8 +705,8 @@ class TestWorkerFlipCoordinator:
     It is also bound to one job and accepts an answer only once armed, which
     the worker does when the job announces ``AWAITING_FLIP`` (CR-01).
 
-    Every wait here is bounded by ``0``: ``threading.Event().wait(0)`` returns
-    in microseconds, so nothing in this class waits on a wall clock.
+    Every wait here is bounded by ``0``: an Event wait with a zero timeout
+    returns in microseconds, so nothing in this class waits on a wall clock.
     """
 
     def test_the_coordinator_is_bound_to_one_job(self) -> None:
@@ -4442,8 +4442,8 @@ class TestStartupProfileGeneration:
             # A fixed window, not a poll: this is a negative observation.  The
             # worker is blocked on ``release``, so nothing should happen; the
             # window only gives a worker that skipped ahead to the queue time to
-            # start the job and be caught.  The Event is never set.
-            threading.Event().wait(0.2)
+            # start the job and be caught.
+            quiet_window(0.2)
             held_state = _get(store, job.id).state
             runs_while_held = len(seen)
             release.set()

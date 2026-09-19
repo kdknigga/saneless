@@ -2550,7 +2550,7 @@ class TestSaneBackendCancelSequence:
 #
 # It blocks in ``os.read`` on a pipe nobody writes to.  That is the honest
 # stand-in for ``sane_read``: a real blocking syscall that releases the GIL,
-# which a ``threading.Event().wait()`` would only pretend to be -- and the
+# which a wait on a ``threading.Event`` would only pretend to be -- and the
 # whole claim under test is about what the interpreter does at exit with a
 # thread parked in exactly such a call.
 #

@@ -224,3 +224,17 @@ repos:
         files: ^src/
         types_or: [python, html, css, javascript]
         stages: [pre-commit, pre-merge-commit, pre-push]
+
+      # tests/ruff.toml bans time.sleep in tests, but a thread can pause just as
+      # well on an Event nobody sets, and the ban cannot see that. A fixed
+      # pause belongs in conftest's quiet_window helper, where it can be found
+      # by name, so the one-line idiom for an inline pause fails here. It is a
+      # net for the common spelling, not a proof: a named Event that is never
+      # set still gets through, and review has to catch it.
+      - id: no-inline-fixed-waits
+        name: no inline fixed pauses in tests
+        language: pygrep
+        entry: 'Event\(\)\.wait\('
+        files: ^tests/
+        types: [python]
+        stages: [pre-commit, pre-merge-commit, pre-push]
