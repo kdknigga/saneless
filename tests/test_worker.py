@@ -3587,24 +3587,6 @@ class TestWorkerProfileLock:
         assert again == ["default", "flatbed"]
         assert list(default_settings.profiles) == ["default", "flatbed"]
 
-    def test_profile_lock_has_profile(
-        self,
-        mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
-    ) -> None:
-        """D-19 / ROBU-08: has_profile answers from the locked profiles."""
-        store = JobStore()
-        try:
-            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
-            known = worker.has_profile("default")
-            unknown = worker.has_profile("nope")
-        finally:
-            store.close()
-
-        assert known is True
-        assert unknown is False
-
     def test_profile_lock_get_profile(
         self,
         mock_scanner: MagicMock,
@@ -3722,7 +3704,7 @@ class TestWorkerProfileLock:
         barrier = threading.Barrier(5)
 
         def reader() -> None:
-            """Read names, look each up, and check membership, many times."""
+            """Read names and look each one up, many times."""
             try:
                 barrier.wait(_STATE_BUDGET)
                 for _ in range(_PROFILE_LOCK_ROUNDS):
@@ -3731,7 +3713,6 @@ class TestWorkerProfileLock:
                         unexpected.append(names)
                     for name in names:
                         worker.get_profile(name)
-                    worker.has_profile("default")
             except Exception as exc:  # recorded and asserted on below
                 errors.append(exc)
 

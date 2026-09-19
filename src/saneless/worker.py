@@ -808,30 +808,14 @@ class ScanWorker:
         with self._profiles_lock:
             return list(self._settings.profiles)
 
-    def has_profile(self, name: str) -> bool:
-        """
-        Report whether a profile is configured, under the profile lock.
-
-        The scan route's unknown-profile check does not use this: it calls
-        :meth:`get_profile`, so one locked lookup both validates the name and
-        yields the profile.
-
-        Args:
-            name: The profile name to look for.
-
-        Returns:
-            Whether ``name`` is a configured profile.
-
-        """
-        with self._profiles_lock:
-            return name in self._settings.profiles
-
     def get_profile(self, name: str) -> ProfileConfig | None:
         """
         Look up a profile under the profile lock.
 
         The worker's own lookup for a job goes through here, sharing the lock
-        with request threads.
+        with request threads.  So does the scan route's unknown-profile check:
+        a ``None`` here is the "no such profile" answer, so one locked lookup
+        both validates the name and yields the profile.
 
         Args:
             name: The profile name to look up.
