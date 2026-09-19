@@ -1,6 +1,6 @@
 # Web API
 
-saneless exposes a web API at the configured host and port (default `0.0.0.0:8080`). The web UI uses these endpoints via HTMX. They can also be called directly for integration.
+saneless exposes a web API at the configured host and port (default `0.0.0.0:8080`). The web UI uses these endpoints via HTMX. They exist for the web UI: most return HTML fragments for HTMX to swap into the page rather than JSON, so their responses change along with the UI. Only `GET /health` and `GET /api/paperless/test` return JSON; see [Notes](#notes).
 
 ## Endpoint Overview
 
@@ -334,3 +334,11 @@ Browsers do not send `Sec-Fetch-Site` to a plain-HTTP address such as `http://<l
 
 - Put saneless behind a reverse proxy that answers only requests for its own hostname, and make saneless itself reachable only by the proxy (for example, set `web_host` to an address only the proxy can reach). A rebinding page's requests carry the hostile hostname in `Host`, so the proxy refuses them. See [Answering only your own hostname](../how-to/deploy-docker-compose.md#answering-only-your-own-hostname).
 - Use a DNS resolver with rebind protection, which refuses to return private addresses for public hostnames. Many home routers offer this, as do dnsmasq (`--stop-dns-rebind`) and Pi-hole.
+
+### No API schema or interactive documentation
+
+**saneless serves no generated API schema and no interactive API documentation.** `GET /openapi.json`, `GET /docs` and `GET /redoc` answer `404` exactly like any unknown path, with the error body described under [Errors](#errors).
+
+This is deliberate. saneless is an appliance on a trusted LAN that serves an HTMX UI, and, as the note above says, its API has no authentication. A published schema would only hand a map of every state-changing endpoint to any host that can reach the port -- or to a DNS-rebinding page, which [Cross-site requests](#cross-site-requests) explains cannot be stopped by the cross-site check alone. The generated schema also never worked: the route handlers' `Response` return annotation was imported for type checking only, so the framework could not resolve it and the schema endpoint answered `500`. That annotation now resolves, but the endpoints stay off. Even generated correctly, the schema would describe the HTML-fragment endpoints as returning JSON, and nothing in the app, its documentation or its tests consumes a schema.
+
+This page -- the endpoint table and the per-endpoint sections above -- is the reference for the API.
