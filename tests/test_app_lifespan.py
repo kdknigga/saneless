@@ -862,7 +862,9 @@ def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
 # rather than being passed over in silence: that is what makes a route added
 # later covered on the day it lands, instead of quietly uncovered.  The reverse
 # holds too: an entry naming a route the app no longer serves fails the test,
-# so a removed route cannot leave a stale entry behind.
+# so a removed route cannot leave a stale entry behind, and a drive the router
+# turns away with a 404 or 405 fails it, so an entry whose method no longer
+# matches its route cannot pass without reaching the handler.
 _ROUTE_CALLS: dict[str, dict[str, Any]] = {
     "/": {"method": "GET"},
     "/health": {"method": "GET"},
@@ -977,6 +979,13 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
             method = kwargs.pop("method")
             response = client.request(method, path, **kwargs)
             assert response.status_code < 500, (path, response.status_code)
+            # A 404 or 405 means routing turned the request away before any
+            # handler ran, so the route was never exercised.  This is what
+            # catches an entry whose method no longer matches its route.
+            assert response.status_code not in {404, 405}, (
+                path,
+                response.status_code,
+            )
             # The claim is per route, not per run: a single count at the end
             # could not say which handler had moved it.
             assert fake.init_call_count == 1, path
