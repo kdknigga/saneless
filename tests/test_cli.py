@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import importlib.metadata
 import json
@@ -10,6 +11,7 @@ import logging
 import logging.handlers
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
@@ -17,13 +19,14 @@ import time
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
+from typing import TYPE_CHECKING, NoReturn
 
 import click
 import pytest
 import tomlkit
+import uvicorn
 from click.testing import CliRunner
+from fastapi import FastAPI
 from PIL import Image, ImageDraw
 
 import saneless.cli as cli_module
@@ -2261,124 +2264,152 @@ class TestJobsCommand:
         assert data == []
 
 
+_UVICORN_LOGGERS = ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")
+
+
+@pytest.fixture
+def uvicorn_loggers_restored() -> Generator[None]:
+    """
+    Put uvicorn's logger levels back after a test that built a real Config.
+
+    ``uvicorn.Config`` sets the level of three uvicorn loggers when it is
+    constructed, and those loggers are process-global.
+    """
+    levels = {name: logging.getLogger(name).level for name in _UVICORN_LOGGERS}
+    yield
+    for name, level in levels.items():
+        logging.getLogger(name).setLevel(level)
+
+
+def _free_loopback_port() -> int:
+    """
+    Return a loopback port that was free a moment ago.
+
+    Returns:
+        An ephemeral port number on 127.0.0.1, released again.
+
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def _ipv6_loopback_available() -> bool:
+    """
+    Report whether this host can bind a socket on ``::1``.
+
+    ``socket.has_ipv6`` only says Python was built with IPv6; a container can
+    still have it switched off, so the test binds an ephemeral port to find out.
+
+    Returns:
+        True when ``::1`` accepts a bind.
+
+    """
+    if not socket.has_ipv6:
+        return False
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+            probe.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+@dataclasses.dataclass
+class _ServerRun:
+    """What ``serve`` handed ``uvicorn.Server.run``, read while it was open."""
+
+    sockets: list[socket.socket] | None
+    config: uvicorn.Config
+    family: int | None = None
+    port: int | None = None
+    v6only: int | None = None
+    reuseaddr: int | None = None
+    reuseport: int | None = None
+    listening: int | None = None
+
+
+def _read_socket(run: _ServerRun, sock: socket.socket) -> None:
+    """
+    Record the facts about the handed-over socket that the tests assert on.
+
+    Args:
+        run: The record to fill in.
+        sock: The first socket ``serve`` passed to ``Server.run``.
+
+    """
+    run.family = sock.family
+    run.port = sock.getsockname()[1]
+    run.reuseaddr = sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR)
+    if hasattr(socket, "SO_REUSEPORT"):
+        run.reuseport = sock.getsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT)
+    if hasattr(socket, "SO_ACCEPTCONN"):
+        run.listening = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+    if sock.family == socket.AF_INET6:
+        run.v6only = sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+
+
+def _fake_server_run(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    started: bool = True,
+    then: BaseException | None = None,
+) -> list[_ServerRun]:
+    """
+    Replace ``uvicorn.Server.run`` with a recorder that serves nothing.
+
+    The recorder reads the socket it was given, closes the app's eagerly
+    opened JobStore so no test leaks one, sets ``started`` the way a real
+    start-up would, and then raises ``then`` if one was given.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        started: What ``server.started`` reads once the fake run returns.
+        then: An exception to raise after recording, such as the
+            KeyboardInterrupt uvicorn re-raises after a graceful stop.
+
+    Returns:
+        The list each call's record is appended to.
+
+    """
+    runs: list[_ServerRun] = []
+
+    def fake_run(
+        self: uvicorn.Server, sockets: list[socket.socket] | None = None
+    ) -> None:
+        run = _ServerRun(sockets=sockets, config=self.config)
+        if sockets:
+            _read_socket(run, sockets[0])
+        runs.append(run)
+        app = self.config.app
+        if isinstance(app, FastAPI):
+            store: object = app.state.job_store
+            if isinstance(store, JobStore):
+                store.close()
+        self.started = started
+        if then is not None:
+            raise then
+
+    monkeypatch.setattr(uvicorn.Server, "run", fake_run)
+    return runs
+
+
+@pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeCommand:
-    """Serve command tests."""
+    """
+    Serve command tests.
+
+    ``serve`` binds its own socket and hands it to uvicorn, so these tests bind
+    for real, but only on the loopback address and an OS-chosen port, and
+    replace ``uvicorn.Server.run`` so nothing is served.
+    """
 
     @staticmethod
-    def _mock_socket(monkeypatch: pytest.MonkeyPatch) -> None:
-        """Bypass the port-availability check in serve()."""
-        mock_sock = MagicMock()
-        monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: mock_sock)
-
-    @staticmethod
-    def _capture_uvicorn(
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> dict[str, object]:
-        """Patch uvicorn.run to capture args and close the app's job_store."""
-        captured: dict[str, object] = {}
-
-        def mock_uvicorn_run(app: object, **kwargs: object) -> None:
-            """Capture uvicorn.run arguments and close the app's job_store."""
-            captured["app"] = app
-            captured.update(kwargs)
-            # Close the eagerly-created JobStore to prevent ResourceWarning
-            from fastapi import FastAPI  # noqa: PLC0415
-
-            if isinstance(app, FastAPI):
-                store: object = app.state.job_store
-                if isinstance(store, JobStore):
-                    store.close()
-
-        monkeypatch.setattr("saneless.cli.uvicorn.run", mock_uvicorn_run)
-        return captured
-
-    def test_serve_calls_uvicorn_defaults(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Serve with no flags calls uvicorn.run with config defaults."""
-        self._mock_socket(monkeypatch)
-        captured = self._capture_uvicorn(monkeypatch)
-        runner, _settings = _patch_cli(monkeypatch)
-
-        result = runner.invoke(cli, ["serve"])
-        assert result.exit_code == 0
-        assert captured["host"] == "0.0.0.0"
-        assert captured["port"] == 8080
-        assert captured["log_config"] is None
-        assert captured["access_log"] is True
-
-    def test_serve_custom_host_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Serve --host/--port overrides config defaults."""
-        self._mock_socket(monkeypatch)
-        captured = self._capture_uvicorn(monkeypatch)
-        runner, _ = _patch_cli(monkeypatch)
-
-        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "9090"])
-        assert result.exit_code == 0
-        assert captured["host"] == "127.0.0.1"
-        assert captured["port"] == 9090
-
-    def test_serve_log_level(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Serve passes log_level from settings to uvicorn."""
-        self._mock_socket(monkeypatch)
-        captured = self._capture_uvicorn(monkeypatch)
-        runner, _ = _patch_cli(monkeypatch)
-
-        result = runner.invoke(cli, ["serve"])
-        assert result.exit_code == 0
-        assert captured["log_level"] == "info"
-
-    def test_serve_log_level_ignores_verbose(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """
-        With ``-v`` uvicorn still gets the configured level, not ``debug``.
-
-        ``-v`` is saneless's own detail; turning uvicorn up with it would drag
-        its and httpx's debug output into the log (orchestrator resolution 5).
-        """
-        self._mock_socket(monkeypatch)
-        captured = self._capture_uvicorn(monkeypatch)
-        runner, _ = _patch_cli(monkeypatch)
-
-        result = runner.invoke(cli, ["-v", "serve"])
-        assert result.exit_code == 0
-        assert captured["log_level"] == "info"
-
-    def test_serve_prints_address(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Serve prints listening address to stdout."""
-        self._mock_socket(monkeypatch)
-        self._capture_uvicorn(monkeypatch)
-        runner, _ = _patch_cli(monkeypatch)
-
-        result = runner.invoke(cli, ["serve"])
-        assert result.exit_code == 0
-        assert "Serving on http://0.0.0.0:8080" in result.output
-
-    def test_serve_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Serve --help shows --host and --port options."""
-        runner, _ = _patch_cli(monkeypatch)
-
-        result = runner.invoke(cli, ["serve", "--help"])
-        assert result.exit_code == 0
-        assert "--host" in result.output
-        assert "--port" in result.output
-
-    def test_serve_receives_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Serve passes a FastAPI app (not None) to uvicorn.run."""
-        self._mock_socket(monkeypatch)
-        captured = self._capture_uvicorn(monkeypatch)
-        runner, _ = _patch_cli(monkeypatch)
-
-        result = runner.invoke(cli, ["serve"])
-        assert result.exit_code == 0
-        assert captured["app"] is not None
-
-    @staticmethod
-    def _loopback_settings(tmp_path: Path) -> Settings:
-        """Build settings that serve on 127.0.0.1, port left at its 8080 default."""
+    def _loopback_settings(tmp_path: Path, port: int = 0) -> Settings:
+        """Build settings that serve on 127.0.0.1 and, by default, port 0."""
         settings = _make_settings(tmp_path)
         settings.output.web_host = "127.0.0.1"
+        settings.output.web_port = port
         return settings
 
     @staticmethod
@@ -2390,119 +2421,320 @@ class TestServeCommand:
 
         monkeypatch.setattr("saneless.cli.create_app", fake_create_app)
 
-    @staticmethod
-    def _uvicorn_exits(monkeypatch: pytest.MonkeyPatch, code: int | None) -> list[str]:
-        """Patch uvicorn.run to raise ``SystemExit(code)``; return its call record."""
-        calls: list[str] = []
+    def test_serve_binds_the_configured_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With no flags, the configured ``0.0.0.0:8080`` is what gets resolved.
 
-        def exiting_run(_app: object, **_kwargs: object) -> None:
-            calls.append("uvicorn.run")
-            raise SystemExit(code)
+        The resolver is wrapped so the real bind lands on an ephemeral loopback
+        port: a unit test must not take 8080 on every interface.
+        """
+        real_getaddrinfo = socket.getaddrinfo
+        asked: list[tuple[str | bytes | None, str | int | None]] = []
 
-        monkeypatch.setattr("saneless.cli.uvicorn.run", exiting_run)
-        return calls
+        def recording_getaddrinfo(
+            host: str | bytes | None, port: str | int | None, **kwargs: int
+        ) -> list:
+            asked.append((host, port))
+            return real_getaddrinfo("127.0.0.1", 0, **kwargs)
+
+        monkeypatch.setattr("saneless.cli.socket.getaddrinfo", recording_getaddrinfo)
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        assert asked == [("0.0.0.0", 8080)]
+        [run] = runs
+        assert run.config.log_config is None
+        assert run.config.access_log is True
+
+    def test_serve_port_0_binds_an_os_chosen_port_and_reports_it(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        ``--port 0`` binds a real port, and the line on stderr names that port.
+
+        The address goes to stderr and the log, so stdout stays clean.
+        """
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+        caplog.set_level(logging.INFO, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        assert run.family == socket.AF_INET
+        assert run.port
+        line = f"Serving on http://127.0.0.1:{run.port}"
+        assert result.stderr.splitlines() == [line]
+        assert "Serving on" not in result.stdout
+        assert line in [r.getMessage() for r in caplog.records]
+
+    def test_serve_explicit_port_0_is_not_replaced_by_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An explicit ``--port 0`` is a request, not a missing value."""
+        free_port = _free_loopback_port()
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(
+            monkeypatch, settings=self._loopback_settings(tmp_path, port=free_port)
+        )
+
+        result = runner.invoke(cli, ["serve", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        assert run.port
+        assert run.port != free_port
+
+    def test_serve_configured_port_is_used_without_a_flag(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With no ``--port``, the configured port is the one bound."""
+        free_port = _free_loopback_port()
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(
+            monkeypatch, settings=self._loopback_settings(tmp_path, port=free_port)
+        )
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 0, result.output
+        assert [run.port for run in runs] == [free_port]
+
+    @pytest.mark.skipif(
+        not _ipv6_loopback_available(), reason="this host cannot bind ::1"
+    )
+    def test_serve_binds_an_ipv6_address_and_brackets_it(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``--host ::1`` binds IPv6, restricted to IPv6, and prints a usable URL.
+
+        IPV6_V6ONLY keeps ``--host ::`` from quietly listening on IPv4 too.
+        """
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "::1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        assert run.family == socket.AF_INET6
+        assert run.v6only == 1
+        assert result.stderr.splitlines() == [f"Serving on http://[::1]:{run.port}"]
+
+    def test_serve_hands_over_a_listening_socket_without_reuseport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The socket is already listening, reuses addresses, and never shares a port.
+
+        Listening before the hand-over means a connection made during start-up
+        queues rather than being refused. SO_REUSEADDR matches what uvicorn's
+        own bind set; SO_REUSEPORT would let a second process listen on the
+        same port, so it is never set.
+        """
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        assert run.sockets is not None
+        assert len(run.sockets) == 1
+        assert run.reuseaddr
+        assert run.reuseport in {None, 0}
+        assert run.listening in {None, 1}
+
+    def test_serve_closes_the_socket_once_the_server_returns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The listening socket does not outlive the command."""
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        assert run.sockets is not None
+        assert run.sockets[0].fileno() == -1
+
+    def test_serve_log_level(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Serve passes log_level from settings to uvicorn."""
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        assert [run.config.log_level for run in runs] == ["info"]
+
+    def test_serve_log_level_ignores_verbose(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With ``-v`` uvicorn still gets the configured level, not ``debug``.
+
+        ``-v`` is saneless's own detail; turning uvicorn up with it would drag
+        its and httpx's debug output into the log.
+        """
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(
+            cli, ["-v", "serve", "--host", "127.0.0.1", "--port", "0"]
+        )
+
+        assert result.exit_code == 0, result.output
+        assert [run.config.log_level for run in runs] == ["info"]
+
+    def test_serve_help(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Serve --help shows --host and --port options."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--help"])
+        assert result.exit_code == 0
+        assert "--host" in result.output
+        assert "--port" in result.output
+
+    def test_serve_receives_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Serve hands uvicorn the FastAPI app it built."""
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        assert isinstance(run.config.app, FastAPI)
 
     def test_serve_bind_failure_exits_2_with_one_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A port that cannot be bound is a setup problem: one line, exit 2.
+        A port that is already taken is a setup problem: one line, exit 2.
 
-        It used to be a ``ClickException``, exit 1, which collided with "scan
-        error" in the shared exit-code table (D-07 amendment).
+        The port is held by a listening socket of the test's own, which no
+        SO_REUSEADDR lets a second socket bind.
         """
-        sock = MagicMock()
-        sock.bind.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
-        monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: sock)
         self._stub_create_app(monkeypatch)
-        runs = self._uvicorn_exits(monkeypatch, 0)
-        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
+        runs = _fake_server_run(monkeypatch)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            taken = holder.getsockname()[1]
+            runner, _ = _patch_cli(
+                monkeypatch, settings=self._loopback_settings(tmp_path, port=taken)
+            )
 
-        result = runner.invoke(cli, ["serve"])
+            result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
         assert _failure_lines(result) == [
-            f"Cannot bind to 127.0.0.1:8080: [Errno {errno.EADDRINUSE}] "
-            "Address already in use"
+            f"Cannot bind to 127.0.0.1:{taken}: [Errno {errno.EADDRINUSE}] "
+            f"{os.strerror(errno.EADDRINUSE)}"
         ]
         assert runs == []
-        sock.close.assert_called_once()
 
-    def test_serve_uvicorn_startup_failure_exits_2_not_3(
+    def test_serve_unresolvable_host_exits_2_with_one_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A host the resolver cannot turn into an address is exit 2, one line."""
+
+        def failing_getaddrinfo(*_args: object, **_kwargs: object) -> NoReturn:
+            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+
+        monkeypatch.setattr("saneless.cli.socket.getaddrinfo", failing_getaddrinfo)
+        self._stub_create_app(monkeypatch)
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(
+            cli, ["serve", "--host", "scanner.invalid", "--port", "0"]
+        )
+
+        assert result.exit_code == 2, result.output
+        assert _failure_lines(result) == [
+            f"Cannot bind to scanner.invalid:0: [Errno {socket.EAI_NONAME}] "
+            "Name or service not known"
+        ]
+        assert "Traceback" not in result.output
+        assert runs == []
+
+    def test_serve_startup_failure_exits_2(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        A uvicorn startup failure (its own exit 3) becomes exit 2 (D-07 amendment).
+        A server that never started is a start-up failure: exit 2, one line.
 
-        Exit 3 is "Paperless error" in saneless's table, so passing uvicorn's
-        status through would send scripts and systemd after the wrong cause.
+        uvicorn records the cause in its own log lines; saneless's exit table
+        has one code for "cannot start", whatever uvicorn's own status was.
         """
-        self._mock_socket(monkeypatch)
         self._stub_create_app(monkeypatch)
-        runs = self._uvicorn_exits(monkeypatch, 3)
+        runs = _fake_server_run(monkeypatch, started=False)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 2, result.output
+        [run] = runs
         lines = _failure_lines(result)
-        assert len(lines) == 1, result.stderr
-        assert "web server could not start" in lines[0]
-        assert "127.0.0.1:8080" in lines[0]
+        assert lines == [
+            f"The web server could not start on http://127.0.0.1:{run.port}; "
+            "the cause is in the preceding log lines"
+        ]
         assert "Traceback" not in result.output
-        assert runs == ["uvicorn.run"]
 
-    @pytest.mark.parametrize("code", [0, None])
-    def test_serve_uvicorn_clean_system_exit_stays_0(
-        self, monkeypatch: pytest.MonkeyPatch, code: int | None, tmp_path: Path
+    def test_serve_normal_stop_exits_0(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A ``SystemExit`` with no failure status from uvicorn still exits 0."""
-        self._mock_socket(monkeypatch)
+        """A server that started and then returned is a clean shutdown, exit 0."""
         self._stub_create_app(monkeypatch)
-        self._uvicorn_exits(monkeypatch, code)
+        runs = _fake_server_run(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 0, result.output
-        assert result.stderr == ""
+        [run] = runs
+        assert result.stderr.splitlines() == [f"Serving on http://127.0.0.1:{run.port}"]
 
-    def test_serve_normal_stop_exits_0_not_cancelled(
+    def test_serve_ctrl_c_once_running_exits_0_not_cancelled(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Ctrl-C on ``serve`` is a normal stop, exit 0, not a cancel (D-03).
+        Ctrl-C on a running ``serve`` is a normal stop, exit 0, not a cancel.
 
-        uvicorn.run catches the KeyboardInterrupt itself and returns, so the
-        stub returning is exactly what a graceful stop looks like to saneless.
+        uvicorn stops gracefully and then re-raises the captured SIGINT, which
+        arrives as the KeyboardInterrupt the fake raises after starting.
         """
-        self._mock_socket(monkeypatch)
         self._stub_create_app(monkeypatch)
-        calls: list[str] = []
-
-        def returning_run(_app: object, **_kwargs: object) -> None:
-            calls.append("uvicorn.run")
-
-        monkeypatch.setattr("saneless.cli.uvicorn.run", returning_run)
+        runs = _fake_server_run(monkeypatch, then=KeyboardInterrupt())
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
         assert result.exit_code == 0, result.output
-        assert calls == ["uvicorn.run"]
+        assert len(runs) == 1
         assert "Cancelled" not in result.output
 
     def test_serve_sane_init_failure_exits_2_not_1(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        SANE failing to initialise stops ``serve`` starting: exit 2, not 1 (WR-07).
+        SANE failing to initialise stops ``serve`` starting: exit 2, not 1.
 
-        ``serve`` scans nothing itself, so its setup failures share the D-07
-        amendment's "can't start, fix your setup" code.
+        ``serve`` scans nothing itself, so its setup failures share the
+        "can't start, fix your setup" code.
         """
-        self._mock_socket(monkeypatch)
-        runs = self._uvicorn_exits(monkeypatch, 0)
+        runs = _fake_server_run(monkeypatch)
 
         class FailingSaneBackend:
             """A backend whose construction fails the way ``sane.init()`` does."""
@@ -2530,12 +2762,11 @@ class TestServeCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
-        Ctrl-C during start-up, before uvicorn owns the signal, is a cancel (D-03).
+        Ctrl-C during start-up, before uvicorn owns the signal, is a cancel.
 
         Only uvicorn's own graceful stop exits 0; the reference documents both.
         """
-        self._mock_socket(monkeypatch)
-        runs = self._uvicorn_exits(monkeypatch, 0)
+        runs = _fake_server_run(monkeypatch)
 
         def interrupted_create_app(*_args: object, **_kwargs: object) -> object:
             raise KeyboardInterrupt
@@ -2553,8 +2784,7 @@ class TestServeCommand:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A Paperless URL the client cannot parse is a Paperless error, exit 3."""
-        self._mock_socket(monkeypatch)
-        runs = self._uvicorn_exits(monkeypatch, 0)
+        runs = _fake_server_run(monkeypatch)
 
         def failing_create_app(*_args: object, **_kwargs: object) -> object:
             msg = "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
@@ -3715,6 +3945,7 @@ class TestEntryPointsCloseTheBackend:
         assert result.exit_code == 2, result.output
         assert [scanner.close_calls for scanner in built] == [1]
 
+    @pytest.mark.usefixtures("uvicorn_loggers_restored")
     def test_serve_leaves_the_backend_for_the_lifespan_to_close(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3727,10 +3958,9 @@ class TestEntryPointsCloseTheBackend:
         scanner_cls, built = _closing_scanner()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=scanner_cls)
         monkeypatch.setattr("saneless.cli.create_app", lambda *_args: object())
-        monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_k: MagicMock())
-        monkeypatch.setattr("saneless.cli.uvicorn.run", lambda *_a, **_k: None)
+        _fake_server_run(monkeypatch)
 
-        result = runner.invoke(cli, ["serve"])
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
 
         assert result.exit_code == 0, result.output
         assert [scanner.close_calls for scanner in built] == [0]
@@ -4330,6 +4560,7 @@ def _raise_runtime_error(message: str) -> None:
     raise RuntimeError(message)
 
 
+@pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeLogging:
     """
     ``serve`` streams to stderr and writes no log file (D-34..D-40, DLVR-04).
@@ -4351,7 +4582,8 @@ class TestServeLogging:
             tmp_path: The test's temporary directory.
 
         Returns:
-            Settings serving on 127.0.0.1 with a tmp_path-rooted log file.
+            Settings serving on 127.0.0.1, on a port the OS chooses, with a
+            tmp_path-rooted log file.
 
         """
         return _make_settings(
@@ -4361,6 +4593,7 @@ class TestServeLogging:
                 data_dir=str(tmp_path),
                 log_file=str(tmp_path / "logs" / "saneless.log"),
                 web_host="127.0.0.1",
+                web_port=0,
             ),
         )
 
@@ -4374,9 +4607,8 @@ class TestServeLogging:
     ) -> None:
         """A service writes no file: the platform owns retention (D-35, D-40)."""
         settings = self._serve_settings(tmp_path)
-        TestServeCommand._mock_socket(monkeypatch)
         TestServeCommand._stub_create_app(monkeypatch)
-        TestServeCommand._capture_uvicorn(monkeypatch)
+        _fake_server_run(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         self._real_logging(monkeypatch)
 
@@ -4406,9 +4638,8 @@ class TestServeLogging:
         ``test_serve_stream_renders_a_traceback``.
         """
         settings = self._serve_settings(tmp_path)
-        TestServeCommand._mock_socket(monkeypatch)
         TestServeCommand._stub_create_app(monkeypatch)
-        TestServeCommand._capture_uvicorn(monkeypatch)
+        _fake_server_run(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         self._real_logging(monkeypatch)
         before = {id(h) for h in logging.getLogger().handlers}
@@ -4432,9 +4663,8 @@ class TestServeLogging:
         context records no log file and the guard's hint stays silent.
         """
         settings = self._serve_settings(tmp_path)
-        TestServeCommand._mock_socket(monkeypatch)
         TestServeCommand._stub_create_app(monkeypatch)
-        TestServeCommand._capture_uvicorn(monkeypatch)
+        _fake_server_run(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         self._real_logging(monkeypatch)
         obj: dict[str, object] = {}
@@ -4448,15 +4678,20 @@ class TestServeLogging:
 
     @staticmethod
     def _uvicorn_logs_a_traceback(monkeypatch: pytest.MonkeyPatch, marker: str) -> None:
-        """Patch uvicorn.run to log an exception through saneless's own logger."""
+        """Patch the server's run to log an exception through saneless's logger."""
 
-        def logging_run(_app: object, **_kwargs: object) -> None:
+        def logging_run(
+            self: uvicorn.Server, sockets: list[socket.socket] | None = None
+        ) -> None:
+            self.started = True
             try:
                 _raise_runtime_error(marker)
             except RuntimeError:
                 logging.getLogger("saneless.test").exception("the worker died")
+            for sock in sockets or []:
+                sock.close()
 
-        monkeypatch.setattr("saneless.cli.uvicorn.run", logging_run)
+        monkeypatch.setattr(uvicorn.Server, "run", logging_run)
 
     @pytest.mark.parametrize("args", [["serve"], ["-v", "serve"]])
     def test_serve_stream_renders_a_traceback(
@@ -4472,7 +4707,6 @@ class TestServeLogging:
         """
         marker = "kaboom-serve-8a3c"
         settings = self._serve_settings(tmp_path)
-        TestServeCommand._mock_socket(monkeypatch)
         TestServeCommand._stub_create_app(monkeypatch)
         self._uvicorn_logs_a_traceback(monkeypatch, marker)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
@@ -4485,8 +4719,8 @@ class TestServeLogging:
         assert "the worker died" in result.stderr
         assert result.stderr.count("Traceback") == 1
         assert marker in result.stderr
-        # D-36: stdout stays the clean channel carrying only "Serving on ...".
-        assert marker not in result.stdout
+        # Everything serve prints, the address line included, is on stderr.
+        assert result.stdout == ""
 
     def test_serve_never_offers_the_verbose_hint_on_an_unexpected_error(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4499,13 +4733,14 @@ class TestServeLogging:
         running service to see what is printed directly above the line.
         """
         settings = self._serve_settings(tmp_path)
-        TestServeCommand._mock_socket(monkeypatch)
         TestServeCommand._stub_create_app(monkeypatch)
 
-        def exploding_run(_app: object, **_kwargs: object) -> None:
+        def exploding_run(
+            _self: uvicorn.Server, _sockets: list[socket.socket] | None = None
+        ) -> None:
             _raise_runtime_error("kaboom-serve-exit5")
 
-        monkeypatch.setattr("saneless.cli.uvicorn.run", exploding_run)
+        monkeypatch.setattr(uvicorn.Server, "run", exploding_run)
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         self._real_logging(monkeypatch)
 
