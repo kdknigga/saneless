@@ -313,7 +313,9 @@ class TestUploadDocument:
         assert 'name="created"; filename=' not in body
         client.close()
 
-    def test_upload_retry_on_network_error(self, sample_pdf: Path) -> None:
+    def test_upload_retry_on_network_error(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
         """Upload retries on ConnectError and eventually succeeds."""
         call_count = {"n": 0}
 
@@ -335,6 +337,7 @@ class TestUploadDocument:
         assert result.delivered_to_api is True
         assert result.task_uuid == "task-id-ok"
         assert call_count["n"] == 3
+        assert sleeps == [1, 2]
         client.close()
 
     def test_upload_no_retry_on_4xx(self, sample_pdf: Path) -> None:
@@ -356,7 +359,9 @@ class TestUploadDocument:
         assert call_count["n"] == 1
         client.close()
 
-    def test_upload_retry_exhausted_no_fallback(self, sample_pdf: Path) -> None:
+    def test_upload_retry_exhausted_no_fallback(
+        self, sample_pdf: Path, sleeps: list[float]
+    ) -> None:
         """Upload raises PaperlessError when retries are exhausted without fallback."""
 
         def handler(_request: httpx.Request) -> httpx.Response:
@@ -372,10 +377,11 @@ class TestUploadDocument:
         )
         with pytest.raises(PaperlessError, match="attempts"):
             client.upload_document(sample_pdf, title="Fail")
+        assert sleeps == [1, 2]
         client.close()
 
     def test_upload_retry_exhausted_with_fallback(
-        self, sample_pdf: Path, tmp_path: Path
+        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
     ) -> None:
         """Upload falls back to consume directory when retries are exhausted."""
         consume_dir = tmp_path / "consume"
@@ -405,6 +411,7 @@ class TestUploadDocument:
         # The result names the exact file the PDF was copied to -- something
         # the old magic-string sentinel could not carry.
         assert result.consume_dir_path == copied[0]
+        assert sleeps == [1, 2]
         client.close()
 
 
@@ -1760,6 +1767,7 @@ class TestMetadataFetchTranslation:
             assert getattr(client, method)() == items
         finally:
             client.close()
+        assert handler.calls == 1
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     def test_metadata_paginated_response_is_unwrapped(
@@ -1774,6 +1782,204 @@ class TestMetadataFetchTranslation:
             assert getattr(client, method)() == items
         finally:
             client.close()
+
+
+_CONFIGURED_HOST = "paperless.test"
+_FOREIGN_HOST = "evil.example"
+
+
+def _page_payload(items: list[dict[str, object]], next_url: str | None) -> object:
+    """Build one paginated metadata page as paperless-ngx serves it."""
+    return {"count": None, "next": next_url, "previous": None, "results": items}
+
+
+def _items(noun: str, first: int, count: int) -> list[dict[str, object]]:
+    """Build ``count`` metadata items with ids from ``first`` upwards."""
+    return [
+        {"id": item_id, "name": f"{noun} {item_id}"}
+        for item_id in range(first, first + count)
+    ]
+
+
+class _PagedHandler:
+    """
+    A mock server that records every request and answers by page number.
+
+    A request without a ``page`` parameter is page 1, as it is for the real
+    server; a page the script does not name is answered 404, the server's
+    "Invalid page".
+    """
+
+    def __init__(self, pages: dict[int, httpx.Response]) -> None:
+        """Build a handler that answers page N with ``pages[N]``."""
+        self.requests: list[httpx.Request] = []
+        self._pages = pages
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Record the request and answer the page it asks for."""
+        self.requests.append(request)
+        page = int(request.url.params.get("page", "1"))
+        response = self._pages.get(page)
+        if response is None:
+            return httpx.Response(404, json={"detail": "Invalid page."})
+        return response
+
+    @property
+    def pages_requested(self) -> list[str | None]:
+        """Return the ``page`` parameter of every request, in order."""
+        return [request.url.params.get("page") for request in self.requests]
+
+
+def _paged_client(handler: _PagedHandler) -> PaperlessClient:
+    """Build a metadata client on the configured test host."""
+    return PaperlessClient(
+        url=f"http://{_CONFIGURED_HOST}:8000",
+        token=_MOCK_AUTH,
+        transport=_make_transport(handler),
+    )
+
+
+def _fetch(handler: _PagedHandler, method: str) -> list[dict[str, object]]:
+    """Run one metadata fetch against ``handler`` and close the client."""
+    client = _paged_client(handler)
+    try:
+        return getattr(client, method)()
+    finally:
+        client.close()
+
+
+def _next_link(noun: str, page: int, host: str = _CONFIGURED_HOST) -> str:
+    """Build the absolute ``next`` link a server would put on a page."""
+    return f"http://{host}:8000/api/{noun}/?page={page}&page_size=1000"
+
+
+class TestMetadataPagination:
+    """Tags and correspondents are fetched page by page on the configured URL."""
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_all_pages_are_concatenated_in_order(self, method: str, noun: str) -> None:
+        """Pages 1, 2 and 3 are fetched until ``next`` is null and joined."""
+        first, second, third = (
+            _items(noun, 1, 3),
+            _items(noun, 4, 3),
+            _items(noun, 7, 1),
+        )
+        handler = _PagedHandler(
+            {
+                1: httpx.Response(200, json=_page_payload(first, _next_link(noun, 2))),
+                2: httpx.Response(200, json=_page_payload(second, _next_link(noun, 3))),
+                3: httpx.Response(200, json=_page_payload(third, None)),
+            }
+        )
+        assert _fetch(handler, method) == first + second + third
+        assert handler.pages_requested == ["1", "2", "3"]
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_a_foreign_next_link_is_never_contacted(
+        self, method: str, noun: str
+    ) -> None:
+        """
+        A ``next`` naming another host is read only as "there is a page 2".
+
+        A server behind a misconfigured proxy builds its ``next`` links from
+        the wrong host or scheme.  The client carries the API token on every
+        request, so every request must go to the configured host and
+        collection path, with page 2 asked for by number.
+        """
+        first, second = _items(noun, 1, 2), _items(noun, 3, 2)
+        foreign_next = f"http://{_FOREIGN_HOST}/api/{noun}/?page=2"
+        handler = _PagedHandler(
+            {
+                1: httpx.Response(200, json=_page_payload(first, foreign_next)),
+                2: httpx.Response(200, json=_page_payload(second, None)),
+            }
+        )
+        assert _fetch(handler, method) == first + second
+        assert {request.url.host for request in handler.requests} == {_CONFIGURED_HOST}
+        assert all(request.url.path == f"/api/{noun}/" for request in handler.requests)
+        assert all(
+            request.headers["Authorization"] == f"Token {_MOCK_AUTH}"
+            for request in handler.requests
+        )
+        assert handler.pages_requested == ["1", "2"]
+        assert not any(
+            _FOREIGN_HOST in str(request.url) for request in handler.requests
+        )
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_a_bare_list_is_returned_after_one_request(
+        self, method: str, noun: str
+    ) -> None:
+        """A bare JSON list is the whole collection: nothing more is asked for."""
+        items = _items(noun, 1, 2)
+        handler = _PagedHandler({1: httpx.Response(200, json=items)})
+        assert _fetch(handler, method) == items
+        assert len(handler.requests) == 1
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_an_empty_page_ends_the_fetch(self, method: str, noun: str) -> None:
+        """
+        An empty page stops the fetch even though its ``next`` is not null.
+
+        Otherwise a server that always names a next page would keep the
+        client asking forever.
+        """
+        first = _items(noun, 1, 2)
+        handler = _PagedHandler(
+            {
+                1: httpx.Response(200, json=_page_payload(first, _next_link(noun, 2))),
+                2: httpx.Response(200, json=_page_payload([], _next_link(noun, 3))),
+                3: httpx.Response(200, json=_page_payload(_items(noun, 9, 1), None)),
+            }
+        )
+        assert _fetch(handler, method) == first
+        assert handler.pages_requested == ["1", "2"]
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_a_redirect_on_a_later_page_is_a_paperless_error(
+        self, method: str, noun: str
+    ) -> None:
+        """A 302 on page 2 is not followed; it fails the whole fetch."""
+        handler = _PagedHandler(
+            {
+                1: httpx.Response(
+                    200, json=_page_payload(_items(noun, 1, 1), _next_link(noun, 2))
+                ),
+                2: httpx.Response(
+                    302,
+                    headers={"Location": f"http://{_FOREIGN_HOST}/api/{noun}/?page=2"},
+                ),
+            }
+        )
+        with pytest.raises(PaperlessError) as exc_info:
+            _fetch(handler, method)
+        assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
+        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+        assert handler.pages_requested == ["1", "2"]
+        assert {request.url.host for request in handler.requests} == {_CONFIGURED_HOST}
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_every_page_asks_for_a_large_page_size(
+        self, method: str, noun: str
+    ) -> None:
+        """
+        Each request names its page and asks for at least 1000 items.
+
+        A typical install then fits in one round trip.
+        """
+        handler = _PagedHandler(
+            {
+                1: httpx.Response(
+                    200, json=_page_payload(_items(noun, 1, 1), _next_link(noun, 2))
+                ),
+                2: httpx.Response(200, json=_page_payload(_items(noun, 2, 1), None)),
+            }
+        )
+        _fetch(handler, method)
+        assert handler.pages_requested == ["1", "2"]
+        assert all(
+            int(request.url.params["page_size"]) >= 1000 for request in handler.requests
+        )
 
 
 # ---------------------------------------------------------------------------
