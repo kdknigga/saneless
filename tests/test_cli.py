@@ -1277,6 +1277,53 @@ class TestManualDuplexPrompt:
         assert len(calls) == 1
 
 
+class _RangeScanner(StubScannerBackend):
+    """A scanner whose device constrains resolution with a range."""
+
+    def __init__(self, host: str = "") -> None:
+        """Accept host parameter for API compatibility."""
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """Return one device, named as the SANE test backend names it."""
+        return [DeviceInfo("test:0", "TestVendor", "TestModel", "scanner")]
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """Report resolution as a range and give no word list at all."""
+        return DeviceCapabilities(
+            sources=["Flatbed", "Automatic Document Feeder"],
+            resolutions=[],
+            modes=["Color", "Gray"],
+            resolution_range=(1.0, 1200.0, 1.0),
+        )
+
+
+_HALF_BROKEN_REASON = "Could not open hp:002: Error during device I/O"
+
+
+class _HalfBrokenScanner(StubScannerBackend):
+    """Two devices, and the second one's capabilities cannot be read."""
+
+    def __init__(self, host: str = "") -> None:
+        """Accept host parameter for API compatibility."""
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """Return a readable device and one whose probe fails."""
+        return [
+            DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner"),
+            DeviceInfo("hp:002", "HP", "Envy 6055", "multi-function peripheral"),
+        ]
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """Answer for the first device and fail the way SANE does for the second."""
+        if device_id == "hp:002":
+            # Whitespace the one-line rendering has to collapse.
+            msg = "Could not open hp:002:\n  Error during device I/O"
+            raise ScanError(msg)
+        return DeviceCapabilities(
+            sources=["Flatbed"], resolutions=[300], modes=["color"]
+        )
+
+
 class TestDevicesCommand:
     """Devices command tests."""
 
@@ -1297,10 +1344,162 @@ class TestDevicesCommand:
 
         result = runner.invoke(cli, ["devices", "--json"])
         assert result.exit_code == 0
-        data = json.loads(result.output)
+        data = json.loads(result.stdout)
         assert isinstance(data, list)
         assert len(data) == 2
         assert data[0]["name"] == "epson:001"
+
+    def test_devices_json_without_capabilities_is_unchanged_byte_for_byte(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Scripts written against the plain device list see exactly what they saw.
+
+        The capabilities key exists only when it was asked for, so the plain
+        document is pinned as a literal: four keys, in this order, indented by
+        two, and nothing on stdout before or after it.
+        """
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["devices", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert result.stdout == (
+            "[\n"
+            "  {\n"
+            '    "name": "epson:001",\n'
+            '    "vendor": "Epson",\n'
+            '    "model": "ET-4850",\n'
+            '    "type": "flatbed scanner"\n'
+            "  },\n"
+            "  {\n"
+            '    "name": "hp:002",\n'
+            '    "vendor": "HP",\n'
+            '    "model": "Envy 6055",\n'
+            '    "type": "multi-function peripheral"\n'
+            "  }\n"
+            "]\n"
+        )
+
+    def test_devices_json_capabilities_is_one_document(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``--json --capabilities`` is a single JSON document a script can parse.
+
+        Each device carries what the text mode prints for it: sources,
+        resolutions, modes and the raw SANE option names.
+        """
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["devices", "--json", "--capabilities"])
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.stdout)
+        assert [d["name"] for d in data] == ["epson:001", "hp:002"]
+        for device in data:
+            assert device["capabilities"] == {
+                "sources": ["Flatbed", "ADF"],
+                "resolutions": [150, 300, 600],
+                "modes": ["color", "gray"],
+                "raw_options": ["source"],
+            }
+            assert "capabilities_error" not in device
+
+    def test_devices_json_capabilities_reports_a_range_as_a_range(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A range-reporting device gets min, max and step, and no invented list."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_RangeScanner)
+
+        result = runner.invoke(cli, ["devices", "--json", "--capabilities"])
+
+        assert result.exit_code == 0, result.output
+        [device] = json.loads(result.stdout)
+        assert device["capabilities"] == {
+            "sources": ["Flatbed", "Automatic Document Feeder"],
+            "resolution_range": {"min": 1.0, "max": 1200.0, "step": 1.0},
+            "modes": ["Color", "Gray"],
+        }
+
+    def test_devices_json_capabilities_reports_a_failed_probe_per_device(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        One device whose capabilities cannot be read does not hide the others.
+
+        That device gets ``null`` and the reason, the rest report in full,
+        stdout is still one parseable document, and the exit code says a scan
+        error happened.
+        """
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HalfBrokenScanner)
+        caplog.set_level(logging.WARNING, logger="saneless.cli")
+
+        result = runner.invoke(cli, ["devices", "--json", "--capabilities"])
+
+        assert result.exit_code == 1, result.output
+        good, bad = json.loads(result.stdout)
+        assert good["capabilities"]["sources"] == ["Flatbed"]
+        assert "capabilities_error" not in good
+        assert bad["capabilities"] is None
+        assert bad["capabilities_error"] == _HALF_BROKEN_REASON
+        assert result.stderr.splitlines() == [
+            f"Capabilities for hp:002: {_HALF_BROKEN_REASON}"
+        ]
+        assert [
+            r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+        ] == [f"Could not read capabilities for hp:002: {_HALF_BROKEN_REASON}"]
+
+    def test_devices_text_capabilities_reports_a_failed_probe_and_lists_the_rest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Text mode behaves the same: one stderr line, the others listed, exit 1."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HalfBrokenScanner)
+
+        result = runner.invoke(cli, ["devices", "--capabilities"])
+
+        assert result.exit_code == 1, result.output
+        assert "Capabilities for epson:001:" in result.stdout
+        assert "  Sources: Flatbed" in result.stdout
+        assert "hp:002" in result.stdout  # still in the table
+        assert "Capabilities for hp:002" not in result.stdout
+        assert result.stderr.splitlines() == [
+            "Discovering scanners...",
+            f"Capabilities for hp:002: {_HALF_BROKEN_REASON}",
+        ]
+
+    def test_devices_capability_probe_bug_still_reaches_the_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a scanner error is reported per device; a saneless bug is exit 5."""
+
+        class _BuggyScanner(_HalfBrokenScanner):
+            """A scanner whose capability read fails with a non-saneless error."""
+
+            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+                """Fail the way a bug would, not the way SANE does."""
+                msg = f"bug reading {device_id}"
+                raise RuntimeError(msg)
+
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_BuggyScanner)
+
+        result = runner.invoke(cli, ["devices", "--json", "--capabilities"])
+
+        assert result.exit_code == 5, result.output
+        assert "Unexpected error (RuntimeError)" in result.stderr
+
+    @pytest.mark.parametrize("args", [["devices"], ["devices", "--capabilities"]])
+    def test_devices_status_line_goes_to_stderr(
+        self, monkeypatch: pytest.MonkeyPatch, args: list[str]
+    ) -> None:
+        """Only data reaches stdout, so ``saneless devices | grep`` stays clean."""
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, args)
+
+        assert result.exit_code == 0, result.output
+        assert "Discovering scanners..." in result.stderr
+        assert "Discovering scanners..." not in result.stdout
 
     def test_devices_capabilities(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Devices --capabilities -> raw option names shown."""
@@ -1334,26 +1533,6 @@ class TestDevicesCommand:
         backend constrains resolution with ``(1.0, 1200.0, 1.0)``, which used to
         arrive as an empty list and print a label with nothing after it.
         """
-
-        class _RangeScanner(StubScannerBackend):
-            """A scanner whose device constrains resolution with a range."""
-
-            def __init__(self, host: str = "") -> None:
-                """Accept host parameter for API compatibility."""
-
-            def get_devices(self) -> list[DeviceInfo]:
-                """Return one device, named as the SANE test backend names it."""
-                return [DeviceInfo("test:0", "TestVendor", "TestModel", "scanner")]
-
-            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-                """Report resolution as a range and give no word list at all."""
-                return DeviceCapabilities(
-                    sources=["Flatbed", "Automatic Document Feeder"],
-                    resolutions=[],
-                    modes=["Color", "Gray"],
-                    resolution_range=(1.0, 1200.0, 1.0),
-                )
-
         runner, _ = _patch_cli(monkeypatch, scanner_cls=_RangeScanner)
 
         result = runner.invoke(cli, ["devices", "--capabilities"])
