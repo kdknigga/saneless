@@ -1359,7 +1359,7 @@ class TestPollTask:
         """
         A 0.05 s budget costs 0.05 s, not the 0.5 s first sleep.
 
-        0.5 s is exactly what the unclamped `time.sleep(delay)` cost
+        0.5 s is exactly what the unclamped first backoff sleep cost
         unconditionally, so that threshold is the regression this asserts.
         """
 

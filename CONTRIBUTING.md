@@ -96,6 +96,12 @@ All seven must exit 0. Fix what they report -- do not silence them. `# noqa`,
 `# type: ignore` and rule-disabling are not accepted, and both type checkers must be
 clean because they do not always report the same issues for the same code.
 
+Tests never sleep. A test that needs something to happen waits on a
+`threading.Event`, polls with `poll_until` from `tests/conftest.py`, or advances a fake
+clock. `tests/ruff.toml` extends the project's ruff settings with a `time.sleep` ban
+that covers `tests/` only, so `ruff check` fails on a new sleep in a test while
+production code, such as the Paperless upload backoff, may still sleep.
+
 The `test` job deselects the `browser` marker because the `browser` job runs those
 Playwright tests, with Chromium installed (`uv run playwright install --with-deps
 chromium`). They need no internet: every page is routed through an egress gate that
