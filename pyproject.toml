@@ -99,6 +99,17 @@ unfixable = []
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
+[tool.ruff.lint.flake8-type-checking]
+# FastAPI evaluates a route's annotations at runtime, when the decorator runs,
+# so ruff must not move the names they use under TYPE_CHECKING.
+runtime-evaluated-decorators = [
+    "fastapi.APIRouter.get",
+    "fastapi.APIRouter.post",
+    "fastapi.APIRouter.put",
+    "fastapi.APIRouter.patch",
+    "fastapi.APIRouter.delete",
+]
+
 [tool.ruff.format]
 # Like Black, use double quotes for strings.
 quote-style = "double"

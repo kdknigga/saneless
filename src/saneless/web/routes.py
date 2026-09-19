@@ -11,6 +11,12 @@ from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import JSONResponse
 
+# A runtime import although only annotations use it, because FastAPI resolves
+# each route's return annotation when the decorator runs, and a Response it
+# cannot resolve becomes a response model that makes app.openapi() raise.
+# runtime-evaluated-decorators in pyproject.toml tells ruff the same.
+from starlette.responses import Response
+
 from saneless.checks import (
     CHECKING_GLYPH,
     CHECKING_MESSAGE,
@@ -47,7 +53,6 @@ from saneless.web.errors import RequestRejected
 
 if TYPE_CHECKING:
     from starlette.datastructures import State
-    from starlette.responses import Response
 
     from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
