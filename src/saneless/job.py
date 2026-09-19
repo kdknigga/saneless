@@ -14,6 +14,7 @@ import contextlib
 import functools
 import json
 import logging
+import os
 import sqlite3
 import threading
 import uuid
@@ -33,6 +34,7 @@ from saneless.vocabulary import (
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Set as AbstractSet
+    from pathlib import Path
 
 __all__ = ["ErrorCategory", "Job", "JobResult", "JobState", "JobStore"]
 
@@ -594,7 +596,7 @@ class JobStore:
 
     """
 
-    def __init__(self, db_path: str = ":memory:") -> None:
+    def __init__(self, db_path: Path | str = ":memory:") -> None:
         """
         Open the job store, enable WAL, and run the migration ladder.
 
@@ -604,6 +606,7 @@ class JobStore:
                 names ``db_path``.
 
         """
+        db_path = os.fspath(db_path)
         self._lock = threading.RLock()
         self._conn = _open_connection(db_path)
         try:

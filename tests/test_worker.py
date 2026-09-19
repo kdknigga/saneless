@@ -1209,8 +1209,8 @@ def isolated_duplex_settings(default_settings: Settings, tmp_path: Path) -> Sett
 
     """
     settings = _manual_duplex_settings(default_settings)
-    settings.output.tmp_dir = str(tmp_path / "scratch")
-    settings.output.data_dir = str(tmp_path / "state")
+    settings.output.tmp_dir = tmp_path / "scratch"
+    settings.output.data_dir = tmp_path / "state"
     return settings
 
 

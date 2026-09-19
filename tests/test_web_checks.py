@@ -441,7 +441,9 @@ def counting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Count
     clock = _FakeClock()
     monkeypatch.setattr(app_module, "CheckCache", lambda: CheckCache(clock=clock))
 
-    def build_client(*, url: str, token: str, consume_dir: str = "") -> PaperlessClient:
+    def build_client(
+        *, url: str, token: str, consume_dir: Path | None = None
+    ) -> PaperlessClient:
         """
         Build the app's Paperless client over a mock transport.
 

@@ -84,7 +84,7 @@ class TestRunPipeline:
         tmp_path: Path,
     ) -> None:
         """Full pipeline: scan -> assemble -> upload succeeds."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         request = PipelineRequest(profile_name="default", title="Happy Path Doc")
         result = run_pipeline(
@@ -106,7 +106,7 @@ class TestRunPipeline:
         tmp_path: Path,
     ) -> None:
         """Scanner raises ScanError -> pipeline raises ScanError."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = ScanError("Device not found")
@@ -130,8 +130,8 @@ class TestRunPipeline:
         # data_dir is pointed at tmp_path too: a failing delivery now preserves
         # the assembled PDF into <data_dir>/failed/, and a test must not write
         # that into the shared default outside pytest's own temp directory.
-        default_settings.output.tmp_dir = str(tmp_path)
-        default_settings.output.data_dir = str(tmp_path / "state")
+        default_settings.output.tmp_dir = tmp_path
+        default_settings.output.data_dir = tmp_path / "state"
 
         paperless = MagicMock()
         paperless.upload_document.side_effect = PaperlessError("Upload failed")
@@ -153,7 +153,7 @@ class TestRunPipeline:
         tmp_path: Path,
     ) -> None:
         """After successful run, tmp_dir has no leftover scan files."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         request = PipelineRequest(profile_name="default", title="Cleanup Doc")
         run_pipeline(
@@ -173,7 +173,7 @@ class TestRunPipeline:
         self, default_settings: Settings, tmp_path: Path
     ) -> None:
         """After failed run, tmp_dir has no leftover scan files."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = ScanError("Boom")
@@ -200,7 +200,7 @@ class TestRunPipeline:
         tmp_path: Path,
     ) -> None:
         """After upload, pipeline calls poll_task with returned UUID."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         mock_paperless.upload_document.return_value = UploadResult(
             delivered_to_api=True, task_uuid="task-uuid-123"
         )
@@ -226,7 +226,7 @@ class TestRunPipeline:
         tmp_path: Path,
     ) -> None:
         """Pipeline calls status_callback with PipelineEvent enum values in order."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         events: list[PipelineEvent] = []
 
         request = PipelineRequest(
@@ -639,7 +639,7 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         The real ``assemble_pdf`` runs: the stand-in only redirects the output
         somewhere that outlives the job's workspace.
         """
-        default_settings.output.tmp_dir = str(tmp_path / "scratch")
+        default_settings.output.tmp_dir = tmp_path / "scratch"
         pages = [_distinct_page(index) for index in range(12)]
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -733,7 +733,7 @@ class TestPipelineThumbnail:
         tmp_path: Path,
     ) -> None:
         """Flatbed scan calls thumbnail_callback with non-empty base64 string."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         # Use a content image so it doesn't get filtered as empty
         mock_scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
@@ -763,7 +763,7 @@ class TestPipelineThumbnail:
         tmp_path: Path,
     ) -> None:
         """Pipeline uploads the scan when no thumbnail_callback is given."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         mock_scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
         request = PipelineRequest(
@@ -791,7 +791,7 @@ class TestPipelineEmptyPageFilter:
         tmp_path: Path,
     ) -> None:
         """Pipeline with 5 pages (3 content + 2 empty) assembles PDF with only 3."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         content_pages = [_make_content_image(c) for c in ["black", "red", "blue"]]
         empty_pages = [_make_empty_image(), _make_empty_image()]
@@ -830,7 +830,7 @@ class TestPipelineEmptyPageFilter:
         tmp_path: Path,
     ) -> None:
         """Custom thresholds from ProfileConfig are passed to filter_empty_pages."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].empty_page_mean_threshold = 200.0
         default_settings.profiles["default"].empty_page_stddev_threshold = 10.0
 
@@ -867,7 +867,7 @@ class TestPipelineEmptyPageFilter:
         EXC-03: the blank message is reserved for detection really removing
         every page, so it names what happened rather than an empty scan.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
@@ -1110,7 +1110,7 @@ class TestZeroPages:
         Assembly and upload are never reached, so img2pdf never sees an empty
         list (N-06).
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].enable_empty_page_detection = detection
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -1138,7 +1138,7 @@ class TestZeroPages:
         tmp_path: Path,
     ) -> None:
         """An empty manual-duplex pass A raises before the flip prompt (EXC-03)."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1218,7 +1218,7 @@ class TestZeroPages:
         tmp_path: Path,
     ) -> None:
         """Detection removing every page of a non-empty batch is "blank" (EXC-03)."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_empty_image()])
@@ -1249,7 +1249,7 @@ class TestZeroPages:
         The zero-page check runs on a returned batch, so it can never replace
         the backend's more specific feeder message.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = FeederEmptyError("No paper detected in feeder")
@@ -1276,7 +1276,7 @@ class TestManualDuplex:
         tmp_path: Path,
     ) -> None:
         """Manual duplex: 3 fronts + 3 backs -> 6 interleaved pages."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1313,7 +1313,7 @@ class TestManualDuplex:
         tmp_path: Path,
     ) -> None:
         """Pass A yields 3 pages, pass B yields 2 -> saves both as separate PDFs."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1365,7 +1365,7 @@ class TestManualDuplex:
         not reach paperless-ngx and must not claim SUCCESS -- that is precisely
         the lie ScanOutcome.FALLBACK exists to prevent (CTR-02).
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
         mock_paperless.upload_document.return_value = UploadResult(
@@ -1402,7 +1402,7 @@ class TestManualDuplex:
         tmp_path: Path,
     ) -> None:
         """A partially-delivered mismatch is still FALLBACK, not SUCCESS (CTR-02)."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
         mock_paperless.upload_document.side_effect = [
@@ -1439,7 +1439,7 @@ class TestManualDuplex:
         tmp_path: Path,
     ) -> None:
         """Matching front/back counts still interleave and upload single PDF."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1477,7 +1477,7 @@ class TestManualDuplex:
         tmp_path: Path,
     ) -> None:
         """Empty page detection runs on interleaved result, not individual passes."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1516,7 +1516,7 @@ class TestManualDuplex:
         tmp_path: Path,
     ) -> None:
         """Thumbnail generated from first front page in manual duplex."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1556,7 +1556,7 @@ class TestManualDuplex:
         ``AWAITING_FLIP`` is announced before the wait and ``SCANNING_REVERSE``
         only after it, and the timeout handed over is the configured one.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.output.flip_timeout_seconds = 42
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -1601,7 +1601,7 @@ class TestManualDuplex:
         ``ScanCancelledError`` -- never a ``ScanError`` -- and the worker and
         the CLI record a cancel rather than a scanner failure (D-01, D-02).
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -1744,7 +1744,7 @@ class TestManualDuplexPassCounts:
             continues.
 
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
         return PipelineRequest(
@@ -1924,7 +1924,7 @@ class TestDuplexStrategy:
         ``get_devices``. The refusal has to come before that call, and so before
         the first ``scan_pages`` call too.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.scanner.device = ""
         default_settings.profiles["default"] = ProfileConfig(
             source="ADF Front", duplex="manual"
@@ -1953,7 +1953,7 @@ class TestDuplexStrategy:
         tmp_path: Path,
     ) -> None:
         """An explicit ``duplex = "none"`` wins over a legacy-looking source."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"] = ProfileConfig(
             source="Manual Duplex", duplex="none"
         )
@@ -1976,7 +1976,7 @@ class TestDuplexStrategy:
         tmp_path: Path,
     ) -> None:
         """A ``duplex = "manual"`` profile on a plain feeder source scans twice."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"] = ProfileConfig(
             source="ADF Front", duplex="manual"
         )
@@ -2034,7 +2034,7 @@ class TestManualDuplexOverTheSharedFake:
         as the how-to teaches. Only resolving the feeder from the device's own
         list can make this pass (C-01, D-02).
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         profile = default_settings.profiles["default"]
         profile.source = "ADF"
         profile.duplex = "manual"
@@ -2097,7 +2097,7 @@ class TestManualDuplexOverTheSharedFake:
         snapshot per pass and report a green Complete. Now no page is taken,
         the operator is never asked to flip, and nothing is uploaded.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         profile = default_settings.profiles["default"]
         profile.source = "ADF"
         profile.duplex = "manual"
@@ -2149,7 +2149,7 @@ class TestExifStripped:
         and this asserts it where it is now decided -- on the spooled file the
         PDF embeds, read while that file still exists.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         img = _make_content_image()
         img.info["exif"] = b"fake-exif-data"
@@ -2187,7 +2187,7 @@ class TestEmptyPageDetectionToggle:
         tmp_path: Path,
     ) -> None:
         """When enable_empty_page_detection=False, every page is kept."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].enable_empty_page_detection = False
 
         # Use pages that would normally be filtered as empty
@@ -2226,7 +2226,7 @@ class TestFlatbedStillWorks:
         tmp_path: Path,
     ) -> None:
         """Single-page flatbed scan produces correct PDF with thumbnail."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling([_make_content_image()])
@@ -2254,12 +2254,12 @@ class TestDiskSpaceCheck:
 
     def test_disk_space_check_passes_when_sufficient(self, tmp_path: Path) -> None:
         """No exception when free space exceeds minimum."""
-        _check_disk_space(str(tmp_path), 1)
+        _check_disk_space(tmp_path, 1)
 
     def test_disk_space_check_fails_when_insufficient(self, tmp_path: Path) -> None:
         """Raises ScanError when free space below threshold."""
         with pytest.raises(ScanError, match="Insufficient disk space"):
-            _check_disk_space(str(tmp_path), 999_999_999)
+            _check_disk_space(tmp_path, 999_999_999)
 
     @pytest.mark.parametrize(
         "failing_call", ["mkdir", "disk_usage", "TemporaryDirectory"]
@@ -2282,12 +2282,12 @@ class TestDiskSpaceCheck:
         at start-up.  Nothing is scanned.
         """
         tmp_dir = tmp_path / "work"
-        default_settings.output.tmp_dir = str(tmp_dir)
+        default_settings.output.tmp_dir = tmp_dir
         failure = OSError(errno.ENOSPC, "No space left on device")
         if failing_call == "mkdir":
             (tmp_path / "blocker").write_text("")
             tmp_dir = tmp_path / "blocker" / "work"
-            default_settings.output.tmp_dir = str(tmp_dir)
+            default_settings.output.tmp_dir = tmp_dir
         elif failing_call == "disk_usage":
 
             def failing_disk_usage(*_args: object) -> object:
@@ -2336,7 +2336,7 @@ class TestPipelineEventEnum:
         tmp_path: Path,
     ) -> None:
         """All status_callback values are PipelineEvent instances, not strings."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         events: list[object] = []
 
         request = PipelineRequest(
@@ -2389,7 +2389,7 @@ class TestScanResultContract:
         tmp_path: Path,
     ) -> None:
         """Three pages scanned, one blank dropped, two uploaded."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         all_pages = [
             _make_content_image("black"),
@@ -2426,7 +2426,7 @@ class TestScanResultContract:
         tmp_path: Path,
     ) -> None:
         """With empty-page detection off nothing is removed, blanks included."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].enable_empty_page_detection = False
 
         all_pages = [_make_content_image(), _make_empty_image(), _make_empty_image()]
@@ -2458,7 +2458,7 @@ class TestScanResultContract:
         tmp_path: Path,
     ) -> None:
         """An upload that only reached the consume dir reports FALLBACK."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         mock_paperless.upload_document.return_value = UploadResult(
             delivered_to_api=False,
             consume_dir_path=tmp_path / "consume" / "doc.pdf",
@@ -2503,8 +2503,8 @@ def _isolate_dirs(settings: Settings, tmp_path: Path) -> Path:
         does not exist yet; the guard is responsible for creating it.
 
     """
-    settings.output.tmp_dir = str(tmp_path / "scratch")
-    settings.output.data_dir = str(tmp_path / "state")
+    settings.output.tmp_dir = tmp_path / "scratch"
+    settings.output.data_dir = tmp_path / "state"
     return settings.output.failed_dir
 
 
@@ -4730,7 +4730,7 @@ class TestTheDpiTheDeviceActuallyChose:
         tmp_path: Path,
     ) -> None:
         """A profile asking 600 on a device that gives 300 assembles at 300."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].resolution = 600
 
         scanner = MagicMock(spec=ScannerBackend)
@@ -4806,7 +4806,7 @@ class TestTheDpiTheDeviceActuallyChose:
         means the device changed its mind mid-job. Pass A's value is used and
         the difference is logged rather than swallowed.
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
 
@@ -4861,7 +4861,7 @@ class TestRejectedPagesAreNotBlankPages:
         tmp_path: Path,
     ) -> None:
         """Two integrity rejections and no blank pages: 0 removed, 2 reported."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
@@ -4890,7 +4890,7 @@ class TestRejectedPagesAreNotBlankPages:
         tmp_path: Path,
     ) -> None:
         """No rejections and no blank removals leaves nothing to warn about."""
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
@@ -5062,7 +5062,7 @@ class TestTitleLogEscaping:
             tmp_path: pytest's per-test temporary directory.
 
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
             [_make_content_image() for _ in range(2)]
@@ -5096,7 +5096,7 @@ class TestTitleLogEscaping:
             tmp_path: pytest's per-test temporary directory.
 
         """
-        default_settings.output.tmp_dir = str(tmp_path)
+        default_settings.output.tmp_dir = tmp_path
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
         scanner = MagicMock(spec=ScannerBackend)

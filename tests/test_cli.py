@@ -4379,5 +4379,5 @@ class TestServeLogging:
 
         assert result.exit_code == 0, result.output
         assert attached_to == [str(log_file)]
-        assert obj["log_file"] == str(log_file)
+        assert obj["log_file"] == log_file
         assert log_file.parent.is_dir()

@@ -819,8 +819,8 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     # sqlite3.connect does not create parent directories, so data_dir must
     # exist before JobStore opens the database. Deliberately not hidden inside
     # the db_path property: a property with a filesystem side effect surprises.
-    Path(settings.output.data_dir).mkdir(parents=True, exist_ok=True)
-    store = JobStore(db_path=str(settings.output.db_path))
+    settings.output.data_dir.mkdir(parents=True, exist_ok=True)
+    store = JobStore(db_path=settings.output.db_path)
     try:
         recent = store.list_recent(limit=limit)
         if as_json:

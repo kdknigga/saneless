@@ -366,7 +366,7 @@ class TestUploadDocument:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            consume_dir=str(consume_dir),
+            consume_dir=consume_dir,
             _transport=transport,
             max_retries=3,
         )
@@ -436,7 +436,9 @@ def _answering(response: httpx.Response) -> Callable[[int], httpx.Response]:
     return respond
 
 
-def _upload_client(handler: _CountingHandler, consume_dir: str = "") -> PaperlessClient:
+def _upload_client(
+    handler: _CountingHandler, consume_dir: Path | None = None
+) -> PaperlessClient:
     """Build a three-attempt upload client wired to the counting handler."""
     return PaperlessClient(
         url="http://paperless:8000",
@@ -471,7 +473,7 @@ class TestPaperlessUrlValidation:
                 "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
             ),
         ) as exc_info:
-            PaperlessClient("http://host:abc", "tok-SECRET-5d1", "")
+            PaperlessClient("http://host:abc", "tok-SECRET-5d1")
         assert isinstance(exc_info.value.__cause__, httpx.InvalidURL)
         assert "tok-SECRET-5d1" not in str(exc_info.value)
 
@@ -559,7 +561,7 @@ class TestUrlCredentialsNeverShown:
     def test_invalid_url_message_strips_the_password(self) -> None:
         """A URL httpx rejects is shown without its userinfo too."""
         with pytest.raises(PaperlessError) as exc_info:
-            PaperlessClient(f"http://scanner:{_URL_SECRET}@host:abc", _MOCK_AUTH, "")
+            PaperlessClient(f"http://scanner:{_URL_SECRET}@host:abc", _MOCK_AUTH)
         assert str(exc_info.value) == (
             "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
         )
@@ -664,7 +666,7 @@ class TestUploadFailureTranslation:
         """With a consume directory the exhausted retries take the fallback."""
         consume_dir = tmp_path / "consume"
         handler = _CountingHandler(_raising(exc_type("upstream went away")))
-        client = _upload_client(handler, consume_dir=str(consume_dir))
+        client = _upload_client(handler, consume_dir=consume_dir)
         try:
             result = client.upload_document(sample_pdf, title="Transient")
         finally:
@@ -742,7 +744,7 @@ class TestUploadFailureTranslation:
         consume_dir = tmp_path / "consume"
         failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler, consume_dir=str(consume_dir))
+        client = _upload_client(handler, consume_dir=consume_dir)
         try:
             result = client.upload_document(sample_pdf, title="No scheme")
         finally:
@@ -769,7 +771,7 @@ class TestUploadFailureTranslation:
         consume_dir = tmp_path / "consume"
         failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler, consume_dir=str(consume_dir))
+        client = _upload_client(handler, consume_dir=consume_dir)
         try:
             client.upload_document(sample_pdf, title="No scheme")
         finally:
@@ -814,7 +816,7 @@ class TestUploadFailureTranslation:
             )
         )
         client = _upload_client(
-            handler, consume_dir=str(tmp_path / consume_name) if consume_name else ""
+            handler, consume_dir=tmp_path / consume_name if consume_name else None
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -851,7 +853,7 @@ class TestUploadFailureTranslation:
             _answering(httpx.Response(301, headers={"location": target}))
         )
         client = _upload_client(
-            handler, consume_dir=str(tmp_path / consume_name) if consume_name else ""
+            handler, consume_dir=tmp_path / consume_name if consume_name else None
         )
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -899,7 +901,7 @@ class TestUploadFailureTranslation:
         """
         caplog.set_level(logging.WARNING, logger="saneless.paperless")
         handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
-        client = _upload_client(handler, consume_dir="")
+        client = _upload_client(handler)
         try:
             with pytest.raises(PaperlessError):
                 client.upload_document(sample_pdf, title="Down")
@@ -962,7 +964,7 @@ class TestUploadFailureTranslation:
         """A 503 on every attempt takes the fallback when one is configured."""
         consume_dir = tmp_path / "consume"
         handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
-        client = _upload_client(handler, consume_dir=str(consume_dir))
+        client = _upload_client(handler, consume_dir=consume_dir)
         try:
             result = client.upload_document(sample_pdf, title="Down")
         finally:
@@ -1006,7 +1008,7 @@ class TestUploadFailureTranslation:
         """
         missing = tmp_path / "gone.pdf"
         handler = _CountingHandler(_answering(httpx.Response(200, json="task-id")))
-        client = _upload_client(handler, consume_dir=str(tmp_path / "consume"))
+        client = _upload_client(handler, consume_dir=tmp_path / "consume")
         try:
             with pytest.raises(PaperlessError) as exc_info:
                 client.upload_document(missing, title="Gone")
@@ -1960,7 +1962,7 @@ class TestConsumeDir:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            consume_dir=str(consume_dir),
+            consume_dir=consume_dir,
             _transport=transport,
             max_retries=1,
         )
@@ -1988,7 +1990,7 @@ class TestConsumeDir:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            consume_dir=str(consume_dir),
+            consume_dir=consume_dir,
             _transport=transport,
             max_retries=1,
         )
@@ -2015,7 +2017,7 @@ class TestConsumeDir:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            consume_dir=str(consume_dir),
+            consume_dir=consume_dir,
             _transport=_make_transport(_always_refused),
             max_retries=1,
         )
@@ -2051,7 +2053,7 @@ class TestConsumeDir:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            consume_dir=str(consume_dir),
+            consume_dir=consume_dir,
             _transport=_make_transport(_always_refused),
             max_retries=1,
         )
@@ -2087,7 +2089,7 @@ class TestConsumeDir:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            consume_dir=str(consume_dir),
+            consume_dir=consume_dir,
             _transport=_make_transport(_always_refused),
             max_retries=1,
         )
@@ -2117,7 +2119,7 @@ class TestConsumeDir:
         client = PaperlessClient(
             url="http://paperless:8000",
             token=_MOCK_AUTH,
-            consume_dir=str(consume_dir),
+            consume_dir=consume_dir,
             _transport=transport,
             max_retries=1,
         )

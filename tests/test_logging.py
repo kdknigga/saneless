@@ -52,7 +52,7 @@ class TestConfigureLogging:
         """configure_logging adds a RotatingFileHandler to the root logger."""
         log_file = tmp_path / "logs" / "test.log"
         try:
-            configure_logging(log_file=str(log_file))
+            configure_logging(log_file=log_file)
             root = logging.getLogger()
             file_handlers = [
                 h
@@ -68,7 +68,7 @@ class TestConfigureLogging:
         """Log level DEBUG is applied to the root logger."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), log_level="DEBUG")
+            configure_logging(log_file=log_file, log_level="DEBUG")
             root = logging.getLogger()
             assert root.level == logging.DEBUG
         finally:
@@ -78,7 +78,7 @@ class TestConfigureLogging:
         """Log level INFO is applied to the root logger."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), log_level="INFO")
+            configure_logging(log_file=log_file, log_level="INFO")
             root = logging.getLogger()
             assert root.level == logging.INFO
         finally:
@@ -88,9 +88,9 @@ class TestConfigureLogging:
         """WARNING and CRITICAL resolve to their numeric levels (CFG-04)."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), log_level="WARNING")
+            configure_logging(log_file=log_file, log_level="WARNING")
             assert logging.getLogger().level == 30
-            configure_logging(log_file=str(log_file), log_level="CRITICAL")
+            configure_logging(log_file=log_file, log_level="CRITICAL")
             assert logging.getLogger().level == 50
         finally:
             self._cleanup_handlers()
@@ -104,7 +104,7 @@ class TestConfigureLogging:
         """
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), log_level="INFO", verbose=True)
+            configure_logging(log_file=log_file, log_level="INFO", verbose=True)
             assert (
                 logging.getLogger("saneless.pipeline").getEffectiveLevel()
                 == logging.DEBUG
@@ -118,7 +118,7 @@ class TestConfigureLogging:
         """A DEBUG record from a saneless logger is written under -v."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), log_level="INFO", verbose=True)
+            configure_logging(log_file=log_file, log_level="INFO", verbose=True)
             logging.getLogger("saneless.pipeline").debug("verbose-detail-7f3e")
             for handler in logging.getLogger().handlers:
                 handler.flush()
@@ -130,9 +130,9 @@ class TestConfigureLogging:
         """A later non-verbose configure_logging does not inherit -v's DEBUG."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), log_level="INFO", verbose=True)
+            configure_logging(log_file=log_file, log_level="INFO", verbose=True)
             self._remove_root_handlers()
-            configure_logging(log_file=str(log_file), log_level="WARNING")
+            configure_logging(log_file=log_file, log_level="WARNING")
             assert logging.getLogger("saneless").level == logging.NOTSET
             assert (
                 logging.getLogger("saneless.pipeline").getEffectiveLevel()
@@ -154,7 +154,7 @@ class TestConfigureLogging:
         log_file = tmp_path / "test.log"
         try:
             configure_logging(
-                log_file=str(log_file),
+                log_file=log_file,
                 max_bytes=1000,
                 backup_count=3,
             )
@@ -174,7 +174,7 @@ class TestConfigureLogging:
         """Log messages include timestamp, module name, and level."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), log_level="INFO")
+            configure_logging(log_file=log_file, log_level="INFO")
             logger = logging.getLogger("test_format")
             logger.info("test message")
             content = log_file.read_text()
@@ -186,7 +186,7 @@ class TestConfigureLogging:
         """verbose=True adds a StreamHandler alongside the file handler."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=str(log_file), verbose=True)
+            configure_logging(log_file=log_file, verbose=True)
             root = logging.getLogger()
             stream_handlers = [
                 h
@@ -203,7 +203,7 @@ class TestConfigureLogging:
         unwritable = tmp_path / "noperm"
         unwritable.mkdir()
         unwritable.chmod(0o000)
-        log_file = str(unwritable / "subdir" / "test.log")
+        log_file = unwritable / "subdir" / "test.log"
         try:
             # Must not raise
             configure_logging(log_file=log_file)
@@ -227,7 +227,7 @@ class TestConfigureLogging:
         """
         log_file = tmp_path / "logs" / "saneless.log"
         try:
-            attached = configure_logging(str(log_file), "INFO", 1024, 1)
+            attached = configure_logging(log_file, "INFO", 1024, 1)
             assert attached is True
             file_handlers = [
                 h
@@ -251,7 +251,7 @@ class TestConfigureLogging:
         """
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
-        log_file = str(blocker / "logs" / "saneless.log")
+        log_file = blocker / "logs" / "saneless.log"
         try:
             with caplog.at_level(logging.WARNING):
                 attached = configure_logging(log_file, "INFO", 1024, 1)
@@ -287,7 +287,7 @@ class TestConfigureLogging:
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
         try:
-            configure_logging(str(blocker / "logs" / "saneless.log"))
+            configure_logging(blocker / "logs" / "saneless.log")
             try:
                 _raise_runtime_error("kaboom-4c1d")
             except RuntimeError:
@@ -306,7 +306,7 @@ class TestConfigureLogging:
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
         try:
-            configure_logging(str(blocker / "logs" / "saneless.log"), verbose=True)
+            configure_logging(blocker / "logs" / "saneless.log", verbose=True)
             try:
                 _raise_runtime_error("kaboom-9e2a")
             except RuntimeError:
@@ -319,8 +319,13 @@ class TestConfigureLogging:
     def test_default_log_file_is_xdg_compliant(self) -> None:
         """OutputConfig.log_file default uses XDG state dir, not /var/log."""
         config = OutputConfig()
-        assert ".local/state/saneless" in config.log_file
-        assert "/var/log" not in config.log_file
+        assert config.log_file.parts[-4:] == (
+            ".local",
+            "state",
+            "saneless",
+            "saneless.log",
+        )
+        assert not config.log_file.is_relative_to("/var/log")
 
 
 def _stderr_stream_handlers() -> list[logging.Handler]:

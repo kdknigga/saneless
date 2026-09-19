@@ -150,54 +150,51 @@ def xdg_state_home() -> Path:
     return _xdg_base("XDG_STATE_HOME", ".local", "state")
 
 
-def _default_data_dir() -> str:
+def _default_data_dir() -> Path:
     """
     Compute the default ``output.data_dir``: ``$XDG_STATE_HOME/saneless``.
 
     Returns:
-        The default durable state directory, as a string.
+        The default durable state directory.
 
     """
-    return str(xdg_state_home() / "saneless")
+    return xdg_state_home() / "saneless"
 
 
-def _default_log_file() -> str:
+def _default_log_file() -> Path:
     """
     Compute the default ``output.log_file``, inside the default ``data_dir``.
 
     Returns:
-        ``$XDG_STATE_HOME/saneless/saneless.log``, as a string.
+        ``$XDG_STATE_HOME/saneless/saneless.log``.
 
     """
-    return str(xdg_state_home() / "saneless" / "saneless.log")
+    return xdg_state_home() / "saneless" / "saneless.log"
 
 
-def _expand_user(value: str) -> str:
+def _expand_user(value: Path) -> Path:
     """
-    Expand a leading ``~`` in a path setting (CFG-03, M-20).
+    Expand a leading ``~`` in a path setting.
 
     Only ``~`` is expanded, by decision: ``$VAR`` is left literal, so a value
-    cannot silently pick up an unrelated environment variable (T-27-26). An
-    empty value is returned unchanged -- for ``consume_dir`` it means disabled.
+    cannot silently pick up an unrelated environment variable.
 
     Args:
-        value: The configured path string.
+        value: The configured path.
 
     Returns:
-        The path with ``~`` expanded, or the empty string unchanged.
+        The path with ``~`` expanded.
 
     Raises:
         ValueError: ``~user`` names an unknown user, or ``~`` has no home
             directory to expand to. ``Path.expanduser`` raises RuntimeError,
-            which pydantic would let escape the D-10 renderer; as a
+            which pydantic would let escape the config error renderer; as a
             ValueError it becomes a validation error naming the section and
-            key (WR-03). The message never repeats the value (D-14).
+            key. The message never repeats the value, which may be private.
 
     """
-    if not value:
-        return value
     try:
-        return str(Path(value).expanduser())
+        return value.expanduser()
     except RuntimeError:
         msg = "cannot expand '~': unknown user or home directory"
         raise ValueError(msg) from None
@@ -311,22 +308,46 @@ class PaperlessConfig(BaseModel):
     # get_secret_value only where PaperlessClient is built: cli.py scan and
     # web/app.py create_app.
     token: SecretStr = SecretStr("")
-    consume_dir: str = ""
+    # None means the fallback copy is disabled.
+    consume_dir: Path | None = None
+
+    @field_validator("consume_dir", mode="before")
+    @classmethod
+    def _empty_consume_dir_is_disabled(cls, value: object) -> object:
+        """
+        Read an empty or whitespace-only ``consume_dir`` as disabled.
+
+        ``consume_dir = ""`` in a config file and an empty
+        ``SANELESS_PAPERLESS__CONSUME_DIR`` have always meant "no fallback".
+        Pydantic would turn ``""`` into ``Path(".")``, and the fallback copy
+        would then write scanned PDFs into the working directory. Anything
+        that is not a string is returned unchanged for pydantic to check.
+
+        Args:
+            value: The raw ``consume_dir`` input.
+
+        Returns:
+            None for a blank string, else the input unchanged.
+
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("consume_dir", mode="after")
     @classmethod
-    def _expand_consume_dir(cls, value: str) -> str:
+    def _expand_consume_dir(cls, value: Path | None) -> Path | None:
         """
-        Expand a leading ``~`` in ``consume_dir``; empty stays empty (CFG-03).
+        Expand a leading ``~`` in a configured ``consume_dir``.
 
         Args:
-            value: The validated ``consume_dir``.
+            value: The validated ``consume_dir``, None when disabled.
 
         Returns:
-            The value with ``~`` expanded; ``$VAR`` is not expanded.
+            The path with ``~`` expanded (``$VAR`` is not), or None.
 
         """
-        return _expand_user(value)
+        return None if value is None else _expand_user(value)
 
 
 class ProfileConfig(BaseModel):
@@ -448,13 +469,13 @@ class OutputConfig(BaseModel):
     # An unknown key is an error, not silently dropped (CFG-01, M-18).
     model_config = ConfigDict(extra="forbid")
 
-    tmp_dir: str = str(Path(tempfile.gettempdir()) / "saneless")
+    tmp_dir: Path = Path(tempfile.gettempdir()) / "saneless"
     # Durable state: the job database and preserved scans. Deliberately NOT
     # under tmp_dir, which is disposable scratch space. Phase 23 (D-14) kept
     # the data_dir and log_file defaults in step; both now follow
     # $XDG_STATE_HOME (CFG-03), computed per instance rather than at import.
     # The Dockerfile's SANELESS_OUTPUT__DATA_DIR still overrides data_dir.
-    data_dir: str = Field(default_factory=_default_data_dir)
+    data_dir: Path = Field(default_factory=_default_data_dir)
     # These three describe a rotating file, so they apply to one-shot CLI
     # commands only: `saneless serve` is a service, streams its records to
     # stderr and writes no file at all, which is what puts them in `docker
@@ -462,7 +483,7 @@ class OutputConfig(BaseModel):
     # serve is not an error and raises no warning -- the configuration
     # reference states the mode scope instead (D-39). log_level below is the
     # one log key that applies in both modes.
-    log_file: str = Field(default_factory=_default_log_file)
+    log_file: Path = Field(default_factory=_default_log_file)
     log_level: LogLevel = "INFO"
     log_max_bytes: int = 10_485_760
     log_backup_count: int = 5
@@ -485,16 +506,16 @@ class OutputConfig(BaseModel):
 
     @field_validator("tmp_dir", "data_dir", "log_file", mode="after")
     @classmethod
-    def _expand_paths(cls, value: str) -> str:
+    def _expand_paths(cls, value: Path) -> Path:
         """
-        Expand a leading ``~`` in the path settings (CFG-03, M-20).
+        Expand a leading ``~`` in the path settings.
 
         ``~/scans`` used to be taken literally. Only ``~`` is expanded, never
         ``$VAR``. The defaults are already absolute, so this does not run on
         them (no ``validate_default``).
 
         Args:
-            value: The validated path string.
+            value: The validated path.
 
         Returns:
             The value with ``~`` expanded.
@@ -537,7 +558,7 @@ class OutputConfig(BaseModel):
             The path to saneless.db inside data_dir.
 
         """
-        return Path(self.data_dir) / "saneless.db"
+        return self.data_dir / "saneless.db"
 
     @property
     def failed_dir(self) -> Path:
@@ -550,7 +571,7 @@ class OutputConfig(BaseModel):
             The path to the failed/ directory inside data_dir.
 
         """
-        return Path(self.data_dir) / "failed"
+        return self.data_dir / "failed"
 
 
 class WebConfig(BaseModel):
@@ -642,15 +663,18 @@ class Settings(BaseSettings):
         settings_cls: type[BaseSettings],
         init_settings: PydanticBaseSettingsSource,
         env_settings: PydanticBaseSettingsSource,
-        dotenv_settings: PydanticBaseSettingsSource,  # noqa: ARG003 -- pydantic-settings requires this signature param
-        file_secret_settings: PydanticBaseSettingsSource,  # noqa: ARG003 -- pydantic-settings requires this signature param
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
         """
         Configure settings sources with optional TOML file support.
 
         The _toml_file init kwarg is extracted and used to create a
-        TomlConfigSettingsSource if the file exists.
+        TomlConfigSettingsSource if the file exists. pydantic-settings calls
+        this by keyword, so the two unused sources keep their names.
         """
+        # saneless reads no .env file and no secrets directory.
+        del dotenv_settings, file_secret_settings
         # init_settings is always an InitSettingsSource at runtime
         init_src = cast("InitSettingsSource", init_settings)
         toml_file = init_src.init_kwargs.pop("_toml_file", None)
@@ -1305,10 +1329,10 @@ def validate_settings_dirs(settings: Settings) -> None:
         ConfigError: If any configured directory is not writable.
 
     """
-    _require_writable("tmp_dir", Path(settings.output.tmp_dir))
-    _require_writable("data_dir", Path(settings.output.data_dir))
-    if settings.paperless.consume_dir:
-        _require_writable("consume_dir", Path(settings.paperless.consume_dir))
+    _require_writable("tmp_dir", settings.output.tmp_dir)
+    _require_writable("data_dir", settings.output.data_dir)
+    if settings.paperless.consume_dir is not None:
+        _require_writable("consume_dir", settings.paperless.consume_dir)
 
 
 def config_search_paths() -> tuple[Path, ...]:

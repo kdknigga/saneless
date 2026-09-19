@@ -32,7 +32,6 @@ import socket
 import tempfile
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
 from string import ascii_letters, digits, hexdigits
 from time import monotonic
 from typing import TYPE_CHECKING, Final, assert_never
@@ -49,6 +48,7 @@ from saneless.vocabulary import (
 if TYPE_CHECKING:
     import threading
     from collections.abc import Iterable
+    from pathlib import Path
 
     from saneless.config import Settings
     from saneless.paperless import PaperlessClient
@@ -1646,7 +1646,7 @@ def _check_fallback(context: CheckContext) -> CheckResult:
 
     """
     consume_dir = context.settings.paperless.consume_dir
-    if not consume_dir:
+    if consume_dir is None:
         return CheckResult(
             key=CheckKey.FALLBACK,
             state=CheckState.WARN,
@@ -1656,7 +1656,7 @@ def _check_fallback(context: CheckContext) -> CheckResult:
                 "when paperless-ngx is down."
             ),
         )
-    if _directory_accepts_a_write(Path(consume_dir)):
+    if _directory_accepts_a_write(consume_dir):
         return CheckResult(
             key=CheckKey.FALLBACK,
             state=CheckState.OK,
@@ -1684,7 +1684,7 @@ def _check_data_dir(context: CheckContext) -> CheckResult:
         Exactly one result for ``CheckKey.DATA_DIR``.
 
     """
-    if _directory_accepts_a_write(Path(context.settings.output.data_dir)):
+    if _directory_accepts_a_write(context.settings.output.data_dir):
         return CheckResult(
             key=CheckKey.DATA_DIR,
             state=CheckState.OK,

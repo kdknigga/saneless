@@ -444,34 +444,35 @@ def _note_pass_count(request: PipelineRequest, label: str, count: int) -> None:
         )
 
 
-def _check_disk_space(tmp_dir: str, min_free_mb: int) -> None:
+def _check_disk_space(tmp_dir: Path, min_free_mb: int) -> None:
     """
     Raise ScanError if insufficient disk space in tmp_dir.
 
+    This only measures: ``_open_workspace`` creates the directory first.
+
     Args:
-        tmp_dir: Path to the temporary directory used for scanning.
+        tmp_dir: The existing temporary directory used for scanning.
         min_free_mb: Minimum free space required in megabytes.
 
     Raises:
         ScanError: If free space is below the required threshold.
-        OSError: If the directory cannot be created or measured; the caller
-            translates it (IN-07).
+        OSError: If the directory cannot be measured; the caller translates
+            it.
 
     """
-    path = Path(tmp_dir)
-    if not path.exists():
-        path.mkdir(parents=True, exist_ok=True)
-    usage = shutil.disk_usage(path)
+    usage = shutil.disk_usage(tmp_dir)
     free_mb = usage.free // (1024 * 1024)
     if free_mb < min_free_mb:
         msg = (
-            f"Insufficient disk space: {free_mb} MB free in {path}, "
+            f"Insufficient disk space: {free_mb} MB free in {tmp_dir}, "
             f"{min_free_mb} MB required (configure min_free_space_mb to adjust)"
         )
         raise ScanError(msg)
 
 
-def _open_workspace(tmp_dir: str, min_free_mb: int) -> tempfile.TemporaryDirectory[str]:
+def _open_workspace(
+    tmp_dir: Path, min_free_mb: int
+) -> tempfile.TemporaryDirectory[str]:
     """
     Create this run's temporary workspace under ``tmp_dir``, checking for room.
 
@@ -496,7 +497,7 @@ def _open_workspace(tmp_dir: str, min_free_mb: int) -> tempfile.TemporaryDirecto
 
     """
     try:
-        Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
         _check_disk_space(tmp_dir, min_free_mb)
         return tempfile.TemporaryDirectory(dir=tmp_dir)
     except OSError as exc:

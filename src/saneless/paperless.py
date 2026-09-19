@@ -15,12 +15,15 @@ import re
 import shutil
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from .exceptions import PaperlessError, PaperlessTimeoutError, describe
 from .vocabulary import ConnectionStatus
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 __all__ = ["PaperlessClient", "UploadResult"]
 
@@ -438,7 +441,8 @@ class PaperlessClient:
             Any ``user:password@`` in ``url`` is sent as Basic auth, exactly
             as httpx would send it, and is stripped from every message and
             log line.
-        consume_dir: Optional fallback directory for PDF upload failures.
+        consume_dir: Optional fallback directory for PDF upload failures;
+            None disables the fallback copy.
         max_retries: Maximum number of upload attempts, including the first.
         _transport: Optional httpx transport for testing.
 
@@ -451,7 +455,7 @@ class PaperlessClient:
         self,
         url: str,
         token: str,
-        consume_dir: str = "",
+        consume_dir: Path | None = None,
         max_retries: int = 3,
         _transport: httpx.BaseTransport | None = None,
     ) -> None:
@@ -586,8 +590,8 @@ class PaperlessClient:
                 logger.info("Upload succeeded, task ID: %s", task_id)
                 return UploadResult(delivered_to_api=True, task_uuid=task_id)
 
-        if self._consume_dir:
-            return self._fall_back_to_consume_dir(pdf_path)
+        if self._consume_dir is not None:
+            return self._fall_back_to_consume_dir(pdf_path, self._consume_dir)
 
         reason = (
             "no attempt was made"
@@ -706,12 +710,13 @@ class PaperlessClient:
         if attempt < self._max_retries - 1:
             time.sleep(2**attempt)
 
-    def _fall_back_to_consume_dir(self, pdf_path: Path) -> UploadResult:
+    def _fall_back_to_consume_dir(self, pdf_path: Path, dest_dir: Path) -> UploadResult:
         """
         Copy the PDF into the consume directory after the upload did not land.
 
         Args:
             pdf_path: The PDF that could not be uploaded.
+            dest_dir: The configured consume directory.
 
         Returns:
             An UploadResult naming the file the PDF was copied to.
@@ -721,7 +726,6 @@ class PaperlessClient:
                 fails, chained to the OSError (EXC-01).
 
         """
-        dest_dir = Path(self._consume_dir)
         dest = dest_dir / pdf_path.name
         try:
             if not dest_dir.exists():

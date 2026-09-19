@@ -16,7 +16,10 @@ from __future__ import annotations
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 __all__ = ["configure_logging"]
 
@@ -54,7 +57,7 @@ class _TracebackFreeFormatter(logging.Formatter):
 
 
 def configure_logging(
-    log_file: str | None,
+    log_file: Path | None,
     log_level: str = "INFO",
     max_bytes: int = 10_485_760,
     backup_count: int = 5,
@@ -126,7 +129,7 @@ def configure_logging(
         attached = False
     else:
         try:
-            Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+            log_file.parent.mkdir(parents=True, exist_ok=True)
             file_handler = RotatingFileHandler(
                 log_file,
                 maxBytes=max_bytes,
