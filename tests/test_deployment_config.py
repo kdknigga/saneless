@@ -44,6 +44,10 @@ scan example shows ``--title``, every ``source`` value is the spelling the
 profile model defaults to, and every documentation deep link names a page
 that exists (DOCS-02, D-45).
 
+The citation guard holds every source, template, style and script file under
+``src/`` to comments that give their own reasons, because the planning records
+they might otherwise point at do not ship with the product.
+
 Plain-text assertions only: the contract is what an operator copies, not what a
 YAML parser makes of it.
 """
@@ -1281,6 +1285,91 @@ def test_no_shipped_file_references_the_old_owner() -> None:
         "renames. Every project URL must use the kdknigga forms -- "
         "github.com/kdknigga/saneless, kdknigga.github.io/saneless and "
         "ghcr.io/kdknigga/saneless:\n" + "\n".join(offenders)
+    )
+
+
+# The planning directory is not part of the product. Someone reading src/
+# has no copy of it, and its identifiers mean nothing once its records move
+# on, so a comment in shipped source states its reason in words instead of
+# pointing there. This pattern matches the identifier shapes the planning
+# records use: decision, finding and requirement IDs, threat IDs, phase and
+# plan numbers, numbered research pitfalls and the planning file names. It
+# leaves ordinary text alone: UTF-8, ISO-8601, SHA-384, A4, "N-1" and a bare
+# PLAN (SQLite's EXPLAIN QUERY PLAN) do not match. The no-planning-citations
+# hook in .pre-commit-config.yaml carries the same pattern, and the test after
+# the guard keeps the two identical.
+PLANNING_CITATION = re.compile(
+    r"\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|"
+    r"API|APPL|CFG|CTR|DARK|DLVR|DOCS|DPLX|EXC|HARD|OUTC|ROBU|"
+    r"SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\bT-[0-9]+-[0-9]+\b|"
+    r"\b[Pp]hase [0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|"
+    r"\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|"
+    r"SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|"
+    r"[Pp]er user decision|\.planning/"
+)
+_SOURCE_PREFIX = "src/"
+_SOURCE_SUFFIXES = frozenset({".py", ".html", ".css", ".js"})
+# The vendored htmx and Pico files are upstream bytes pinned by an integrity
+# hash, so they are neither ours to comment nor ours to edit.
+_VENDOR_PREFIX = "src/saneless/web/static/vendor/"
+PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
+
+
+def _shipped_source_files() -> list[str]:
+    """
+    Return the tracked source, template, style and script files under src/.
+
+    Returns:
+        Repo-relative path names, vendored assets excluded.
+
+    """
+    return [
+        name
+        for name in _shipped_files()
+        if name.startswith(_SOURCE_PREFIX)
+        and Path(name).suffix in _SOURCE_SUFFIXES
+        and not name.startswith(_VENDOR_PREFIX)
+    ]
+
+
+def test_no_src_file_cites_a_planning_artefact() -> None:
+    """
+    No shipped source file points at the planning records for its reasons.
+
+    A comment that says only "see decision so-and-so" tells a reader of the
+    product nothing, because the planning directory does not ship with it.
+    Each comment in src/ has to carry its own reason in plain words.
+    """
+    offenders: list[str] = []
+    for name in _shipped_source_files():
+        # Two clauses rather than one tuple, for the reason given in the
+        # owner guard above.
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if PLANNING_CITATION.search(line)
+        )
+    assert not offenders, (
+        "a file under src/ cites a planning artefact. Replace the reference "
+        "with the reason it stood for, in words, or delete it where the "
+        "sentence is complete without it:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_citation_hook_uses_the_guard_pattern() -> None:
+    """The commit hook and the guard above match exactly the same text."""
+    text, name = _read(PRE_COMMIT_CONFIG)
+    entry = f"entry: '{PLANNING_CITATION.pattern}'"
+    assert entry in text, (
+        f"{name}'s no-planning-citations hook no longer carries the pattern "
+        "the guard test uses, so the two can disagree about what a citation "
+        "is. Copy PLANNING_CITATION.pattern into the hook's entry verbatim"
     )
 
 

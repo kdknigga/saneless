@@ -102,6 +102,12 @@ clock. `tests/ruff.toml` extends the project's ruff settings with a `time.sleep`
 that covers `tests/` only, so `ruff check` fails on a new sleep in a test while
 production code, such as the Paperless upload backoff, may still sleep.
 
+Comments in `src/` state their reasons in words and never cite planning IDs (decision,
+finding or requirement numbers, phase or plan numbers, planning file names), because the
+planning records do not ship with the product. The `no-planning-citations` hook fails a
+commit, merge or push that adds one, and a test in `tests/test_deployment_config.py`
+fails CI.
+
 The `test` job deselects the `browser` marker because the `browser` job runs those
 Playwright tests, with Chromium installed (`uv run playwright install --with-deps
 chromium`). They need no internet: every page is routed through an egress gate that
