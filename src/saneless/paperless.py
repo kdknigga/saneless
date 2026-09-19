@@ -45,7 +45,7 @@ _TERMINAL_STATUSES = frozenset({"SUCCESS", "FAILURE", "REVOKED"})
 
 # Upper bound on how much of an error response body is interpolated into an
 # error message.  That message is recorded verbatim in the job store and
-# rendered in the web status area and on the terminal (T-23-16, M-17), so an
+# rendered in the web status area and on the terminal, so an
 # upstream returning a multi-megabyte body or an HTML error page must not be
 # able to flood any of them.  The full body is logged at DEBUG instead.
 _MAX_BODY_LINE_CHARS = 200
@@ -148,11 +148,12 @@ def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
     of <title> (#id).``, and API v10 carries only ``result_data`` =
     ``{"duplicate_of": N, "duplicate_in_trash": bool}`` with no message at all.
 
-    D-10's accepted risk is why this is worth recognising: an upload retried
-    after its response was lost usually makes current paperless-ngx store a
-    silent second copy.  Only with ``CONSUMER_DELETE_DUPLICATES`` is the
-    duplicate reported as a failure, and then the user is told the document
-    may already be there, rather than being left to scan it again.
+    The accepted risk of retrying an upload, set out on ``PaperlessClient``,
+    is why this is worth recognising: an upload retried after its response
+    was lost usually makes current paperless-ngx store a silent second copy.
+    Only with ``CONSUMER_DELETE_DUPLICATES`` is the duplicate reported as a
+    failure, and then the user is told the document may already be there,
+    rather than being left to scan it again.
 
     Args:
         task: A task dict whose status is FAILURE or REVOKED.
@@ -173,7 +174,7 @@ def _one_line_reason(exc: BaseException) -> str:
     """
     Describe a failure cause as one line for a ``PaperlessError`` message.
 
-    A CLI or web message must be a single line (EXC-02), but httpx's own text
+    A CLI or web message must be a single line, but httpx's own text
     for an ``HTTPStatusError`` is two: ``Server error '503 ...' for url
     '...'`` followed by ``For more information check: <mdn url>``.  A status
     error is therefore rendered as its status, reason phrase and the body
@@ -255,16 +256,16 @@ def _render_error_body(response: httpx.Response) -> str:
     """
     Reduce a Paperless error response body to one bounded line.
 
-    This is the single body renderer for the client (D-09): the upload 4xx
-    and the task poll non-200 both use it.  A DRF JSON error is reduced to
-    its ``detail``, else its first field error, else the first entry of a
+    This is the single body renderer for the client: the upload 4xx and the
+    task poll non-200 both use it.  A DRF JSON error is reduced to its
+    ``detail``, else its first field error, else the first entry of a
     top-level list; anything else (an HTML proxy page, plain text) is used
     as it stands.  In every case the whitespace is collapsed, so no newline,
     tab or other whitespace control character from the upstream can forge an
-    extra CLI line (T-28-24), and the text is cut to
-    ``_MAX_BODY_LINE_CHARS`` characters plus an ellipsis, so the job store
-    and the web status area cannot be flooded (T-23-16).  The full body is
-    logged at DEBUG so it stays diagnosable.
+    extra CLI line, and the text is cut to ``_MAX_BODY_LINE_CHARS``
+    characters plus an ellipsis, so the job store and the web status area
+    cannot be flooded.  The full body is logged at DEBUG so it stays
+    diagnosable.
 
     Args:
         response: The error response.
@@ -297,7 +298,7 @@ def _without_userinfo(url: str) -> str:
     greedy: it cuts through the *last* ``@``, so a password holding a raw
     ``@`` or ``/`` cannot leave a fragment behind.  The cost is that a base
     URL whose path holds an ``@`` is shown shortened, which is display only;
-    a leaked credential cannot be taken back (WR-08).
+    a leaked credential cannot be taken back.
 
     Args:
         url: A configured or upstream-supplied URL.
@@ -315,7 +316,7 @@ def _bounded_line(text: str) -> str:
 
     Text from Paperless -- an error body, a redirect target -- is recorded in
     the job store and printed on the terminal, so no newline in it may forge
-    an extra line (T-28-24) and no length of it may flood either (T-23-16).
+    an extra line and no length of it may flood either.
 
     Args:
         text: Upstream text of any shape.
@@ -335,10 +336,10 @@ def _not_accepted_message(response: httpx.Response) -> str:
     """
     Say why a non-2xx upload response that is not a server error is final.
 
-    A 4xx is Paperless rejecting the upload, with its own reason (D-09).  A
+    A 4xx is Paperless rejecting the upload, with its own reason.  A
     redirect is almost always ``paperless.url`` pointing at the wrong address
     -- a plain ``http://`` URL behind a proxy that redirects to ``https://`` --
-    and retrying it cannot help, so it names where it was sent instead (WR-03).
+    and retrying it cannot help, so it names where it was sent instead.
     Anything else (a 1xx, or a 3xx with no target) is reported by its status.
 
     Args:
@@ -412,11 +413,11 @@ class PaperlessClient:
 
     Handles document uploads with metadata, task polling with
     exponential backoff, and connection testing.  The construction and
-    upload path is a module boundary (EXC-01): whatever goes wrong there
-    leaves as a ``PaperlessError`` naming the configured base URL and the
-    original text, chained to its cause, and never carrying the token (D-08).
+    upload path is a module boundary: whatever goes wrong there leaves as a
+    ``PaperlessError`` naming the configured base URL and the original text,
+    chained to its cause, and never carrying the token.
 
-    Upload failures fall into two groups (D-10, M-17):
+    Upload failures fall into two groups:
 
     * **Retried** with exponential backoff, for ``max_retries`` attempts in
       total: every transient ``httpx.TransportError`` -- ConnectError, the
@@ -434,7 +435,7 @@ class PaperlessClient:
     fallback, and a scan must never be lost.  A 4xx or a redirect is final
     and is not copied.
 
-    Accepted risk (D-10 amendment): a retry after a response that was lost
+    Accepted risk: a retry after a response that was lost
     in transit can make paperless-ngx v3, with its default settings, store a
     second copy of the document.  A duplicate is easy to delete; a lost scan
     is not.
@@ -473,7 +474,7 @@ class PaperlessClient:
         # The only form of the URL any message or log line may carry: a
         # paperless.url with user:password@ in it (Basic auth for a reverse
         # proxy) must not put that password in job.error, on the terminal or
-        # in the log (WR-08, D-08).
+        # in the log.
         self._display_url = _without_userinfo(base_url)
         auth: httpx.BasicAuth | None = None
         try:
@@ -517,8 +518,8 @@ class PaperlessClient:
         transport failure and every 5xx is retried with exponential backoff
         for ``max_retries`` attempts; a 4xx, a redirect or any other non-2xx
         that is not a 5xx, an unusable URL scheme, any
-        other httpx error and a non-JSON 200 end the attempts at once
-        (D-10, M-17).  When the attempts end without delivery -- exhausted,
+        other httpx error and a non-JSON 200 end the attempts at once.  When
+        the attempts end without delivery -- exhausted,
         or cut short by ``httpx.UnsupportedProtocol`` -- and a consume
         directory is configured, the PDF is copied there instead.  See the
         class docstring for the accepted duplicate-document risk of retrying.
@@ -565,7 +566,7 @@ class PaperlessClient:
                 # Only a server error is transient.  A 4xx rejection and a
                 # redirect (1xx and 3xx too: raise_for_status refuses every
                 # non-2xx) would only be answered the same way again, so they
-                # are final: no retry and no fallback (D-10, WR-03).
+                # are final: no retry and no fallback.
                 if not exc.response.is_server_error:
                     msg = _not_accepted_message(exc.response)
                     raise PaperlessError(msg) from exc
@@ -574,8 +575,7 @@ class PaperlessClient:
             except httpx.UnsupportedProtocol as exc:
                 # Logged here because no _back_off runs for it: with a consume
                 # directory the scan still ends FALLBACK, and this line is then
-                # the only place the operator learns the URL is the problem
-                # (WR-04).
+                # the only place the operator learns the URL is the problem.
                 logger.warning(
                     "Paperless URL %s cannot be used (%s); not retrying",
                     self._display_url,
@@ -664,7 +664,7 @@ class PaperlessClient:
         """
         # Only the open is guarded: an OSError here is the PDF itself, while
         # the request below raises httpx's own types, which upload_document
-        # sorts into retries (IN-08, EXC-01).
+        # sorts into retries.
         try:
             pdf_file = pdf_path.open("rb")
         except OSError as exc:
@@ -707,7 +707,7 @@ class PaperlessClient:
 
         """
         # _one_line_reason, not describe: httpx's text for a status error spans
-        # lines and names the full request URL (WR-03).
+        # lines and names the full request URL.
         logger.warning(
             "Upload attempt %d/%d failed: %s",
             attempt + 1,
@@ -730,7 +730,7 @@ class PaperlessClient:
 
         Raises:
             PaperlessError: If the directory cannot be created or the copy
-                fails, chained to the OSError (EXC-01).
+                fails, chained to the OSError.
 
         """
         dest = dest_dir / pdf_path.name
@@ -825,10 +825,11 @@ class PaperlessClient:
 
         A request-level error while polling (a connection refused, a reset,
         a read timeout, a proxy closing the connection, a body that cannot be
-        decoded) does *not* end the poll.  The upload has already been accepted, so failing the job now
-        would invite the user to scan the document again and create a
-        duplicate (D-11, M-17).  The error is logged and remembered, and the
-        poll backs off and asks again within the same monotonic deadline.
+        decoded) does *not* end the poll.  The upload has already been
+        accepted, so failing the job now would invite the user to scan the
+        document again and create a duplicate.  The error is logged and
+        remembered, and the poll backs off and asks again within the same
+        monotonic deadline.
 
         Args:
             task_id: Task UUID returned from upload.
@@ -843,11 +844,11 @@ class PaperlessClient:
         Raises:
             PaperlessError: If the task ends FAILURE or REVOKED, carrying
                 the message paperless-ngx supplied (plus a check-before-
-                rescanning hint when it was a duplicate, D-10); if any poll
+                rescanning hint when it was a duplicate); if any poll
                 returns a non-200 response, carrying the status code, the
                 reason phrase and the body reduced to one bounded line by
-                ``_render_error_body`` (D-09); or if a 200 body is not JSON,
-                chained to the ValueError (EXC-01).
+                ``_render_error_body``; or if a 200 body is not JSON,
+                chained to the ValueError.
             PaperlessTimeoutError: If the deadline passes before the task
                 reaches a terminal status. The message names the task id so
                 the task can be looked up in paperless-ngx directly, and,
@@ -860,7 +861,7 @@ class PaperlessClient:
         # RequestError rather than TransportError: DecodingError (a corrupt
         # compressed body) is a request-level failure that is not a transport
         # one, and it must neither escape this boundary as a raw httpx type nor
-        # fail an upload Paperless already accepted (WR-05, EXC-01, D-11).
+        # fail an upload Paperless already accepted.
         last_transport_error: httpx.RequestError | None = None
 
         while True:
@@ -878,7 +879,7 @@ class PaperlessClient:
                 )
             else:
                 # Paperless answered, so an earlier blip is no longer the story:
-                # a timeout after this names no stale transport error (IN-02).
+                # a timeout after this names no stale transport error.
                 last_transport_error = None
                 task = self._finished_task(task_id, response)
                 if task is not None:
@@ -886,7 +887,7 @@ class PaperlessClient:
 
             # Every path through the loop body reaches this check -- a
             # transport error included -- so the poll cannot outlive its
-            # deadline (T-28-38).
+            # deadline.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 logger.warning("Task %s did not finish within %ss", task_id, timeout)
@@ -920,7 +921,7 @@ class PaperlessClient:
         Raises:
             PaperlessError: If the response is not a 200, if its body is not
                 JSON, or if the task ended FAILURE or REVOKED.  Every message
-                is one line (EXC-02).
+                is one line.
 
         """
         if response.status_code != 200:
@@ -950,7 +951,7 @@ class PaperlessClient:
             full_failure = " ".join(_failure_message(task).split())
             # Bounded like an error body: a failure result can embed a whole
             # OCR or consumer traceback, and this text becomes job.error and
-            # the CLI line (IN-05, T-23-16).  The duplicate check reads the
+            # the CLI line.  The duplicate check reads the
             # whole text, so a hint past the cut is not lost.
             failure = _bounded_line(full_failure) or _NO_FAILURE_MESSAGE
             msg = f"Paperless task {task_id} ended {status}: {failure}"

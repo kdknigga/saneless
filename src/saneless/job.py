@@ -114,7 +114,7 @@ _ACTIVE_STATE_VALUES: tuple[str, ...] = tuple(sorted(s.value for s in ACTIVE_STA
 """The stored TEXT value of every job state that counts as still in flight.
 
 Derived from ``ACTIVE_STATES`` rather than written out, so a state added to that
-frozenset in a later phase is picked up by ``_FAIL_ACTIVE`` without anyone
+frozenset later is picked up by ``_FAIL_ACTIVE`` without anyone
 editing this module -- which is the whole point of the vocabulary owning the
 partition.  ``ACTIVE_STATES`` and ``TERMINAL_STATES`` partition ``JobState``, so
 what this tuple excludes is exactly the completed jobs.
@@ -198,7 +198,7 @@ _SELECT_LATEST_RUN = (
 """Read the newest jobs that were not rejected at submit, newest first.
 
 Two bound parameters: ``ErrorCategory.REJECTED.value`` and the row limit, an
-integer ``latest_run_job`` derives from how many ids it excludes (IN-08).
+integer ``latest_run_job`` derives from how many ids it excludes.
 Neither is ever written into the statement text.
 ``IS NOT`` rather than ``!=`` because it is NULL-safe in SQLite: ``NULL != 'X'``
 is NULL and would drop the row, while ``NULL IS NOT 'X'`` is true.  Every job
@@ -426,8 +426,8 @@ def _open_failure(db_path: str, exc: sqlite3.Error) -> StorageError:
         exc: The sqlite3 error that stopped the open.
 
     Returns:
-        A one-line StorageError naming the path and sqlite's reason (D-08).
-        The CLI guard maps StorageError to exit 2 by type (D-07 amendment).
+        A one-line StorageError naming the path and sqlite's reason.
+        The CLI guard maps StorageError to exit 2 by type.
 
     """
     return StorageError(
@@ -633,7 +633,7 @@ class JobStore:
             # the file handle with it, before the caller sees the failure.  A
             # rollback that fails too -- a disk I/O error on the same broken
             # file -- must not replace the migration's own error with a raw
-            # sqlite3 one, which would exit 5 instead of 2 (IN-06).
+            # sqlite3 one, which would exit 5 instead of 2.
             with contextlib.suppress(sqlite3.Error):
                 self._conn.rollback()
             self._conn.close()
@@ -749,18 +749,18 @@ class JobStore:
                     None,  # pages_removed
                     None,  # pages_uploaded
                     None,  # warning
-                    # owner_token's first and only writer (D-23).  The value is
-                    # an opaque session token minted by the web layer and kept
-                    # for exactly one purpose: rendering the flip prompt to the
+                    # owner_token's first and only writer.  The value is an
+                    # opaque session token minted by the web layer and kept for
+                    # exactly one purpose: rendering the flip prompt to the
                     # browser that submitted this job rather than to every
                     # browser watching it.  NULL means the row is unowned and
                     # the prompt is rendered for everyone -- which is every row
-                    # written before this phase, including a manual-duplex job
-                    # still in flight across an upgrade, so no migration
-                    # backfills it and none is needed.  It is a footgun guard,
-                    # not an authentication mechanism: the column already
-                    # existed unused, and guessing a token grants nothing a LAN
-                    # neighbour cannot already do.
+                    # written before the column had a writer, including a
+                    # manual-duplex job still in flight across an upgrade, so
+                    # no migration backfills it and none is needed.  It is a
+                    # footgun guard, not an authentication mechanism: the
+                    # column already existed unused, and guessing a token
+                    # grants nothing a LAN neighbour cannot already do.
                     owner_token,
                 ),
             )
@@ -787,17 +787,17 @@ class JobStore:
         Record a submit that was refused before any job row existed.
 
         The refused attempt still gets a row, so history shows the user that
-        their scan was not started and why (D-05).  The row is written already
+        their scan was not started and why.  The row is written already
         terminal -- ``ERROR`` with ``ErrorCategory.REJECTED`` -- and that marker
         is what :meth:`latest_run_job` skips, so the rejection never replaces
-        the job that just ended in the status area (D-06).
+        the job that just ended in the status area.
 
         One ``INSERT``, not :meth:`create_job` followed by :meth:`finish_job`.
         Those are two transactions: if the second one raised, the first would
         already have committed a ``PENDING`` row with no marker.  No worker ever
         saw that id and restart recovery never runs again, so the row would stay
         active for good, showing "Starting scan..." and disabling the Scan
-        button (WR-01).  With a single statement a failure leaves no row at all.
+        button.  With a single statement a failure leaves no row at all.
 
         Args:
             profile: Scan profile name the refused submit named.
@@ -1016,7 +1016,7 @@ class JobStore:
         No production caller wants this list *as* a list.  What production
         wants from the ordering is one job's place in it, which
         :meth:`queue_position` reports for the status area's "N ahead of you"
-        line (APPL-08).  Both methods read it through ``_pending_jobs``, so
+        line.  Both methods read it through ``_pending_jobs``, so
         this method is the ordering's public shape and its tests are the
         ordering's proof.
 
@@ -1036,7 +1036,7 @@ class JobStore:
         and answers ``0``.  The UI adds nothing to the number -- it renders
         ``(next in line)`` for ``0`` rather than ``(0 ahead of you)``, which is
         technically true and reads like a bug -- and ``(N ahead of you)`` for
-        anything higher (UI-SPEC S5, APPL-08).
+        anything higher.
 
         ``None`` means the job is not waiting.  A job that has left ``PENDING``
         and an id no row carries both answer ``None``, because both mean the
@@ -1072,12 +1072,12 @@ class JobStore:
         Fetch the newest job that was not rejected at submit.
 
         This is what the status area falls back to once no job is active, to
-        report the job that just ended (D-17).  ``list_recent(1)`` is the wrong
+        report the job that just ended.  ``list_recent(1)`` is the wrong
         answer there: a submit refused while a job runs -- queue full, worker
         down or degraded -- still writes a row marked
         ``ErrorCategory.REJECTED``, and that row is newer than the running job.
         Reading the newest row would let the rejection replace the job in the
-        status area the moment the job ends (D-06).  History keeps using
+        status area the moment the job ends.  History keeps using
         ``list_recent``, so the rejected row is still listed there.
 
         Excluded ids are filtered in Python, never interpolated into the SQL.
@@ -1088,9 +1088,9 @@ class JobStore:
             exclude_ids: Ids to treat as never run.  The web layer passes the
                 refused submits whose REJECTED write is still owed to the
                 worker, so their PENDING rows do not stand in for the job that
-                just ended (IN-08, D-06).  A set rather than any collection:
-                a bare id string is itself a collection of strings, and would
-                silently exclude its single characters instead (IN-10).
+                just ended.  A set rather than any collection: a bare id
+                string is itself a collection of strings, and would silently
+                exclude its single characters instead.
 
         Returns:
             The newest job whose error category is not REJECTED and whose id is
@@ -1114,7 +1114,7 @@ class JobStore:
         The write is what makes this a real probe: a read-only transaction can
         succeed against a store whose disk is full or whose file has gone
         read-only, but setting ``user_version`` -- even to the value it already
-        holds -- appends a WAL frame and so exercises the write path (D-12).
+        holds -- appends a WAL frame and so exercises the write path.
         Nothing observable changes on a healthy store.
 
         The worker's idle loop calls this while it is degraded; a clean return
@@ -1148,25 +1148,24 @@ class JobStore:
         The predicate is derived from ``ACTIVE_STATES`` rather than listed by
         hand, which buys two things: ``ACTIVE_STATES`` and ``TERMINAL_STATES``
         partition ``JobState``, so it provably cannot reach a completed job's
-        recorded history; and a state added to that frozenset in a later phase
-        is covered here with no edit to this method.
+        recorded history; and a state added to that frozenset later is covered
+        here with no edit to this method.
 
-        "FAILED" throughout STOR-05 and the roadmap criteria means this
-        ``JobState.ERROR``.  There is no ``JobState.FAILED``, and none is added:
-        the value is persisted as SQLite TEXT and read back through the enum
-        constructor, so adding or renaming a member is a data migration.
+        A job failed here is recorded as ``JobState.ERROR``.  There is no
+        ``JobState.FAILED``, and none is added: the value is persisted as
+        SQLite TEXT and read back through the enum constructor, so adding or
+        renaming a member is a data migration.
 
-        ``error_category`` is deliberately not written.  It is recorded by
-        ``update_state`` today and read by nothing, and the phase that gives it
-        a consumer has to decide whether the field earns its place at all -- a
-        second unread writer here would work against that.  ``UNKNOWN`` would
-        additionally be the wrong value: an interrupted restart is not an
-        unknown failure, it is a precisely known one.
+        ``error_category`` is deliberately not written.  With no category the
+        status area shows ``reason`` itself rather than a category's generic
+        sentence, and ``UNKNOWN`` would be the wrong value anyway: an
+        interrupted restart is not an unknown failure, it is a precisely known
+        one.
 
         Its caller is the web lifespan at startup, before the worker thread
-        begins, passing ``RESTART_REASON`` (ROBU-06); when that call raises,
-        the worker's recovery makes the same call once the store accepts
-        writes again (26-06).  The returned count is what lets the lifespan
+        begins, passing ``RESTART_REASON``; when that call raises, the worker's
+        recovery makes the same call once the store accepts writes again.  The
+        returned count is what lets the lifespan
         log how many jobs it failed without a second query.
 
         Args:
