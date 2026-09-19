@@ -3,17 +3,16 @@ One rendering rule for every error the web layer produces.
 
 Route-raised ``HTTPException``s, the router's and ``StaticFiles``' 404 and 405,
 request validation failures and any unhandled exception all end in
-``render_error`` (D-01).  An htmx request gets the error partial, retargeted
-into the page's ``#status-message`` slot so an error never lands in the element
-the request was aimed at (D-02, D-03) -- with one exemption, the polling status
-strip, whose failure has to land on itself to end the poll
-(``CHECKS_POLL_TARGET_ID``, R3-CR-02).  That exemption is for the strip
-fetching itself, so it is keyed on the method as well as the target: a GET
-aimed at the strip is its poll or its terminal-state reload, while a POST aimed
-at it is the ``Check again`` button, whose failure goes to the slot like any
-other click's (R4-WR-01).  Any other request gets
+``render_error``.  An htmx request gets the error partial, retargeted into the
+page's ``#status-message`` slot so an error never lands in the element the
+request was aimed at -- with one exemption, the polling status strip, whose
+failure has to land on itself to end the poll (``CHECKS_POLL_TARGET_ID``).
+That exemption is for the strip fetching itself, so it is keyed on the method
+as well as the target: a GET aimed at the strip is its poll or its
+terminal-state reload, while a POST aimed at it is the ``Check again`` button,
+whose failure goes to the slot like any other click's.  Any other request gets
 ``{"status": "error", "detail": <message>}`` with the same status code, and a
-429 carries ``Retry-After`` on both branches (D-04).
+429 carries ``Retry-After`` on both branches.
 
 Every message is a ``RequestRejection`` vocabulary constant.  No request input
 and no exception text reaches a response body from here.  The only request
@@ -70,7 +69,7 @@ RETRY_AFTER_SECONDS: Final = 30
 # target element's id in the ``HX-Target`` request header with no leading
 # ``#``, so this is compared against that header verbatim; it is the id
 # ``partials/checks.html`` gives its swap target, and a test asserts the two
-# agree (R3-CR-02).
+# agree.
 #
 # The status strip is the only element in this application that polls, and an
 # armed htmx poll is ended by exactly two things: the element leaving the DOM
@@ -87,7 +86,7 @@ RETRY_AFTER_SECONDS: Final = 30
 # is ``hx-post="/api/checks/refresh" hx-target="#checks-body"``, so its click
 # arrives carrying the same header, and exempting it too meant a failing click
 # wrote the error body over the strip -- five rows and the only button that
-# could bring them back, gone for the life of the tab (R4-WR-01).  So the
+# could bring them back, gone for the life of the tab.  So the
 # exemption also requires a GET (``_is_the_strip_fetching_itself``): the
 # strip's poll and its terminal-state reload are both ``GET /api/checks``, the
 # strip asking for its own body, and the one POST aimed at the strip is the
@@ -127,8 +126,8 @@ class RequestRejected(HTTPException):
                 was written, so a separate ``refresh_history`` flag was a
                 second degree of freedom that production never used
                 independently and that a reader had to check could not
-                disagree with the id (D-05).  The id is also one of only two
-                technical facts the error slot may carry (D-10): it is the row
+                disagree with the id.  The id is also one of only two
+                technical facts the error slot may carry: it is the row
                 the user will find in Job History a moment later, never an
                 arbitrary request value.
 
@@ -180,7 +179,7 @@ def _is_the_strip_fetching_itself(request: Request) -> bool:
     strip's poll and its terminal-state reload both fetch ``/api/checks``,
     while the only other request aimed at the strip is the ``Check again``
     button's POST, which is an action and not a fetch, and whose failure is
-    reported the way every other click's is (R4-WR-01).
+    reported the way every other click's is.
 
     Args:
         request: The request being answered.
@@ -208,21 +207,21 @@ def render_error(
 
     The htmx body offers a short "Technical details" disclosure carrying the
     status code and, when the refused attempt wrote a job row, that row's id.
-    Those two are the whole permitted vocabulary of the slot: Phase 26 D-10 and
-    ASVS V7 forbid exception text, request input and the log path from ever
-    reaching it, and a uniform affordance that sometimes lied about having
-    detail would be worse than one that says what it has (APPL-04, UI-SPEC S2).
+    Those two are the whole permitted vocabulary of the slot: exception text,
+    request input and the log path must never reach it (ASVS V7), and a
+    uniform affordance that sometimes lied about having detail would be worse
+    than one that says what it has.
 
     Whether Job History reloads is decided here rather than in the template, so
     the partial keeps no rule of its own: it reloads exactly when a row was
-    written, which is exactly when there is an id to name (D-05).
+    written, which is exactly when there is an id to name.
 
     One request is exempt from the retarget: a GET whose ``HX-Target`` is
     ``CHECKS_POLL_TARGET_ID`` -- the strip fetching itself -- gets its error
     body with no ``HX-Retarget`` and no ``HX-Reswap``, so the status strip's
-    own failure replaces the status strip (R3-CR-02).  The method is part of
-    the key because the ``Check again`` button targets the same id, and a
-    click's failure must not take the strip with it (R4-WR-01).  Two facts
+    own failure replaces the status strip.  The method is part of the key
+    because the ``Check again`` button targets the same id, and a click's
+    failure must not take the strip with it.  Two facts
     make the exemption the fix.  htmx 2.0.8 applies
     ``HX-Retarget`` to the response's target *before* it decides what to swap,
     so the header did not merely redirect the error -- it also spared
@@ -238,7 +237,7 @@ def render_error(
         status_code: The HTTP status code to send.
         job_id: The row the refused attempt wrote, or None when it wrote none.
         extra_headers: Headers the exception carries and the response must
-            keep, such as a 405's ``Allow`` (WR-08, RFC 9110 section 15.5.6).
+            keep, such as a 405's ``Allow`` (RFC 9110 section 15.5.6).
 
     Returns:
         The error partial for an htmx request, retargeted to
@@ -286,7 +285,7 @@ async def _http_exception(request: Request, exc: Exception) -> Response:
             job_id=exc.job_id,
         )
     # The exception's own headers are kept: the router's 405 carries the
-    # ``Allow`` header RFC 9110 requires on a 405 (WR-08).
+    # ``Allow`` header RFC 9110 requires on a 405.
     return render_error(
         request,
         rejection_for_status(exc.status_code),

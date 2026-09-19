@@ -1,7 +1,7 @@
 """
-Reject cross-site state-changing requests (ROBU-10).
+Reject cross-site state-changing requests.
 
-The check follows Go 1.25's ``net/http.CrossOriginProtection`` (D-20).
+The check follows Go 1.25's ``net/http.CrossOriginProtection``.
 ``GET``, ``HEAD`` and ``OPTIONS`` are always allowed; every other method goes
 through three branches:
 
@@ -20,7 +20,7 @@ Metadata spec appends ``Sec-Fetch-*`` headers only when the request URL is a
 ``http://<lan-ip>:8080`` never sends ``Sec-Fetch-Site``, and a rule built on it
 alone would protect nothing there.
 
-``X-Forwarded-Host`` is accepted as a match (D-21) because a cross-site form
+``X-Forwarded-Host`` is accepted as a match because a cross-site form
 cannot set it, and a cross-site ``fetch`` that sets it triggers a CORS
 preflight saneless never approves, so a browser cannot forge it.  Accepting it
 makes reverse proxies that add it work without configuration.
@@ -81,7 +81,7 @@ def _origin_matches_host(origin: str, headers: Headers) -> bool:
 
 def is_cross_origin_request(method: str, headers: Headers) -> bool:
     """
-    Return whether a request must be rejected as cross-site (D-20, D-21).
+    Return whether a request must be rejected as cross-site.
 
     Args:
         method: The request's HTTP method, upper case.
@@ -107,11 +107,11 @@ def is_cross_origin_request(method: str, headers: Headers) -> bool:
 
 class CrossOriginGuard:
     """
-    Pure ASGI middleware that answers a cross-site request with a 403 (D-22).
+    Pure ASGI middleware that answers a cross-site request with a 403.
 
     It is installed app-wide and inspects every HTTP request, so a
     state-changing route added later is covered without a per-route
-    dependency (D-23).
+    dependency.
 
     It is a plain ASGI class rather than ``BaseHTTPMiddleware``, which does
     not propagate ``contextvars`` changes and wraps streaming responses.

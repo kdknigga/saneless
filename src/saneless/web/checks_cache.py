@@ -15,14 +15,14 @@ if TYPE_CHECKING:
 
 __all__ = ["MIN_MANUAL_REFRESH_SECONDS", "CachedChecks", "CheckCache"]
 
-# The shortest gap between two honoured Refresh clicks (WR-05).  Two seconds is
-# below the interval a human clicks at -- nobody presses Check again twice in
-# the same two seconds and expects two different answers -- and far above the
-# rate at which a scripted loop is a problem, which is the only case this
-# exists for.  It does not break D-09's promise either: that promise is "do not
-# make somebody wait out a 30 s TTL after plugging the scanner back in", and a
-# 2 s floor leaves it intact.  Deliberately not configurable, and read at call
-# time, so a test can shorten it.
+# The shortest gap between two honoured Refresh clicks.  Two seconds is below
+# the interval a human clicks at -- nobody presses Check again twice in the
+# same two seconds and expects two different answers -- and far above the rate
+# at which a scripted loop is a problem, which is the only case this exists
+# for.  It does not break the Refresh button's promise either: that promise is
+# "do not make somebody wait out a 30 s TTL after plugging the scanner back
+# in", and a 2 s floor leaves it intact.  Deliberately not configurable, and
+# read at call time, so a test can shorten it.
 MIN_MANUAL_REFRESH_SECONDS: Final = 2.0
 
 
@@ -37,9 +37,9 @@ class CachedChecks:
     edit a value the next reader will also see.
 
     ``results`` is ``None`` only at cold start, before the refresher's first
-    tick -- that is the state D-06 renders as ``Checking…`` per row.  It is
-    never ``None`` again afterwards: an expired entry is marked ``stale`` and
-    returned unchanged rather than discarded, because D-08's
+    tick -- that is the state the strip renders as ``Checking…`` per row.  It
+    is never ``None`` again afterwards: an expired entry is marked ``stale``
+    and returned unchanged rather than discarded, because the strip's
     "Paused during scan -- last checked 14:02" needs the previous results *and*
     their age, and a cache that threw them away could offer neither.
 
@@ -105,7 +105,7 @@ class CheckCache:
 
     def __init__(
         self,
-        # D-03: 30 seconds is long enough that a reload and a few htmx swaps
+        # 30 seconds is long enough that a reload and a few htmx swaps
         # never re-probe the network, and short enough that unplugging the
         # scanner surfaces before the operator gives up; the Refresh button
         # covers impatience.  A default rather than a module constant, so it is
@@ -120,10 +120,10 @@ class CheckCache:
         # self._last_manual_claim, and nothing else; never a probe.  The entry
         # is a frozen _Entry rebound as a whole, so holding this for the rebind
         # is what makes "results, stamp and checked_at always belong to the
-        # same store" true for a concurrent reader (T-30-30).  The claim stamp
-        # shares it because its read-and-rebind has to be one step for two
-        # request threads arriving together to get one grant between them
-        # (T-30-26-01); the two pieces of state are otherwise unrelated.
+        # same store" true for a concurrent reader.  The claim stamp shares it
+        # because its read-and-rebind has to be one step for two request
+        # threads arriving together to get one grant between them; the two
+        # pieces of state are otherwise unrelated.
         self._lock = threading.Lock()
         self._entry: _Entry | None = None
         # When a manual refresh was last granted, or None for "never".  None
@@ -138,7 +138,7 @@ class CheckCache:
         Return the cached results, whether or not they are still fresh.
 
         This never discards and never probes, so a page render can call it
-        while the scanner host is unplugged and pay nothing (D-04).
+        while the scanner host is unplugged and pay nothing.
 
         Returns:
             The last-known-good snapshot, marked stale once the TTL has passed.
@@ -197,7 +197,7 @@ class CheckCache:
         """
         Say whether a manual refresh may probe right now, and record that it did.
 
-        This is a floor under a deliberate bypass, not a second TTL.  D-09's
+        This is a floor under a deliberate bypass, not a second TTL.  The
         Refresh button exists precisely to ignore :meth:`is_fresh`, so the TTL
         cannot bound its cost; without something that can, a click is an
         unbounded probe.  ``POST /api/checks/refresh`` is unauthenticated by
@@ -207,7 +207,7 @@ class CheckCache:
         request, up to N saned TCP dials and two filesystem writes.  The worst
         of that is not the traffic: ``ScanWorker._scan_job`` blocks on a
         scanner gate that is not a fair lock, so an unbounded loop can park a
-        submitted job whose row already reads ``SCANNING`` (WR-05).
+        submitted job whose row already reads ``SCANNING``.
 
         The claim stamp is deliberately not the entry's own timestamp.
         Conflating them would let a refused click reset the freshness of
@@ -257,8 +257,8 @@ class CheckCache:
         ``CheckRefresher.probe_now`` collapses into an in-flight probe and
         does nothing, and a click that collapsed spent the floor for no probe
         -- so the clicker's very next press, inside two seconds, was refused
-        for traffic nobody generated.  That is WR-03's second consequence: the
-        button appearing to do nothing, twice in a row.  This hands the claim
+        for traffic nobody generated: the button appeared to do nothing, twice
+        in a row.  This hands the claim
         back on exactly that branch.
 
         The clear is a compare-and-clear, so a caller can only ever give back
@@ -266,7 +266,7 @@ class CheckCache:
         :meth:`claim_manual_refresh` returned; the claim is cleared when that
         is still the recorded one and left alone when it is not, so a release
         arriving *after* somebody else's grant is a no-op rather than a hole
-        in the floor (R3-IN-03).  This used to be an argument instead of a
+        in the floor.  This used to be an argument instead of a
         check -- the one caller releases microseconds after its grant on the
         same thread, and a competing claimer inside that window is refused
         without writing -- and the argument was true of that call site and of
@@ -274,7 +274,7 @@ class CheckCache:
         second release would each have lowered a floor whose whole job is to
         bound what an unauthenticated LAN endpoint can make the appliance do.
 
-        It cannot be abused to defeat the floor (WR-05, T-30-29-01).  The
+        It cannot be abused to defeat the floor.  The
         release happens only where ``probe_now`` returned False, and that
         branch issued no Paperless request, no saned TCP dial and no
         filesystem write, so a scripted loop that always collides always gets

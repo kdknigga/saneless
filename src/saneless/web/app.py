@@ -70,7 +70,7 @@ def _build_templates() -> Jinja2Templates:
     because ``local_time`` here is the same object ``cli.py`` imports: the web
     table and the ``saneless doctor`` table cannot disagree about the zone or
     the format, and could not be made to without editing the one implementation
-    both read (APPL-12).
+    both read.
 
     Returns:
         The template environment every renderer in the app uses.
@@ -84,12 +84,12 @@ def _build_templates() -> Jinja2Templates:
     # The strip draws its rows with these three and not with the state lookups
     # they delegate to: a row the registry skipped carries `CheckState.OK` so
     # that `saneless doctor` keeps exiting 0, and a marker derived from the
-    # state alone therefore ticked a row nothing had looked at (R3-WR-03).
+    # state alone therefore ticked a row nothing had looked at.
     # `check_state_class`, `check_state_glyph` and `check_state_label` are
     # deliberately NOT registered as filters: no template uses them, the
     # delegation is in Python and needs no filter name, and a name in the
     # template namespace that draws a skipped row green is a trap for the next
-    # row's author (R4-IN-03).
+    # row's author.
     templates.env.filters["check_row_class"] = check_row_class
     templates.env.filters["check_row_glyph"] = check_row_glyph
     templates.env.filters["check_row_label"] = check_row_label
@@ -119,11 +119,11 @@ def _build_check_machinery(
 
     Neither reaches into ``app.state``: everything the refresher needs arrives
     through the context factory and the gate accessor built here, which is what
-    keeps it unit-testable with no FastAPI application at all (plan 30-07).
+    keeps it unit-testable with no FastAPI application at all.
 
     Nothing is started and nothing is probed.  The cache is returned cold, so
     the first render says ``Checking…`` and the refresher's first tick with a
-    watcher does the work (D-06).
+    watcher does the work.
 
     Args:
         settings: The loaded configuration every check reads.
@@ -140,8 +140,8 @@ def _build_check_machinery(
 
     """
     # No ttl is passed: unlike the Paperless metadata cache there is no config
-    # key for this one, and D-03 fixes the answer at the class default.  One
-    # default, read at call time, is what a test or a future setting overrides.
+    # key for this one, so the answer is the class default.  One default, read
+    # at call time, is what a test or a future setting overrides.
     checks_cache = CheckCache()
 
     def build_check_context() -> CheckContext:
@@ -150,7 +150,7 @@ def _build_check_machinery(
 
         ``profile_storage`` is read here rather than captured because the
         worker records it when it writes the generated profiles, which happens
-        after ``create_app`` has already returned (D-22).
+        after ``create_app`` has already returned.
         """
         return CheckContext(
             settings=settings,
@@ -180,8 +180,8 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
     The deadline is taken before either join and the two joins spend it
     between them, so whatever the worker's join used is gone from the
     refresher's share and the worst case stays one ``STOP_JOIN_SECONDS``
-    rather than one per thread (A-7, as corrected by WR-07: the joins are
-    sequential, so signalling both events first does not make them overlap).
+    rather than one per thread (the joins are sequential, so signalling both
+    events first does not make them overlap).
     The total is what matters because a refresher parked in an unbounded
     ``getaddrinfo`` or inside ``sane_get_devices`` is exactly the case the
     bound exists for, and exactly the case a per-thread bound would double --
@@ -191,9 +191,9 @@ def _stop_threads(worker: ScanWorker, refresher: CheckRefresher) -> tuple[bool, 
     refresher merely between ticks wakes on the event during that join and
     exits for free, so its own join is skipped entirely.  The worker goes
     first because it is the thread that must be confirmed stopped before any
-    resource closes (D-09), and its own stop blocks the event loop for at most
+    resource closes, and its own stop blocks the event loop for at most
     ``STOP_JOIN_SECONDS``, during lifespan shutdown, after uvicorn has stopped
-    serving (D-08).
+    serving.
 
     Args:
         worker: The scan worker to stop first.
@@ -246,7 +246,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         """
         Recover, prune and start the worker at startup; stop it at shutdown.
 
-        Startup runs in a fixed order (D-13): validate the directories, fail
+        Startup runs in a fixed order: validate the directories, fail
         every job a previous process left active, prune history, and only
         then start the worker.  Recovery comes before the worker so the
         worker never sees an orphan as live work, and so a queued job that
@@ -262,15 +262,15 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
 
         The check refresher starts last, after the worker, and never probes on
         the way up: the cache is cold, the first render says ``Checking…`` and
-        a self-stopping poll fills the strip in (D-06).  That is a deliberate
-        continuation of Phase 26's non-blocking startup -- an unplugged scanner
+        a self-stopping poll fills the strip in.  That is a deliberate
+        continuation of the worker's non-blocking startup -- an unplugged scanner
         host is a TCP connect that hangs until the OS gives up, and a server
         that would not finish starting because of one is a worse appliance than
         one that starts and says so.
 
         Shutdown stops both threads before closing anything, and closes the
         Paperless client, the job store and the scanner only when both confirm
-        they stopped (D-09, D-18, A-7).
+        they stopped.
         """
         validate_settings_dirs(settings)
         try:
@@ -303,12 +303,12 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         yield
         worker_stopped, refresher_stopped = _stop_threads(worker, refresher)
         if not (worker_stopped and refresher_stopped):
-            # D-09: the store closes only after a confirmed stop, so a stuck
-            # thread never hits "Cannot operate on a closed database".  D-07:
-            # the abandoned job is not written here -- that would race its own
-            # final write; the next startup's recovery records it.
+            # The store closes only after a confirmed stop, so a stuck thread
+            # never hits "Cannot operate on a closed database".  The abandoned
+            # job is not written here -- that would race its own final write;
+            # the next startup's recovery records it.
             #
-            # A-7 extends the same guarantee to the refresher, which holds this
+            # The same guarantee extends to the refresher, which holds this
             # same Paperless client and may be inside sane_get_devices:
             # paperless.close() would raise inside a live probe, and
             # scanner.close() would run sane_exit() with a SANE call
@@ -335,15 +335,15 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         # Last, and only here: closing the scanner shuts SANE down for the
         # whole process, and sane_exit() closes every open handle while
         # holding the GIL.  A worker that did not stop may still be inside a
-        # read, which is why the branch above returns instead (D-18).
+        # read, which is why the branch above returns instead.
         scanner.close()
         logger.info("App shutdown complete")
 
     app = FastAPI(lifespan=lifespan)
-    # Every error response the app sends is rendered there (D-01).
+    # Every error response the app sends is rendered there.
     install_error_handlers(app)
     # App-wide, on every method except GET, HEAD and OPTIONS, so a POST route
-    # added later cannot forget the cross-site check (D-23).  web_host still
+    # added later cannot forget the cross-site check.  web_host still
     # defaults to 0.0.0.0; the LAN exposure that implies is documented.
     app.add_middleware(CrossOriginGuard)
 
