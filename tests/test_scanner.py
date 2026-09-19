@@ -1970,22 +1970,43 @@ class TestSaneBackendPerPageTimeout:
     """Per-page timeout tests."""
 
     def test_page_timeout_raises_scan_error(
-        self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
+        self,
+        fake_sane_module: FakeSaneModule,
+        page_sink: SpooledPageSink,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """A page that takes too long raises ScanError naming the timeout."""
-        # A merely slow scanner is a real condition and the per-page timeout
-        # exists for exactly it, so the delay is armed on the one shared device
-        # rather than by a bespoke blocking iterator -- which was a device
-        # double of its own, and is what D-17 leaves only one of.
+        """
+        A page that takes too long raises ScanError naming the timeout, once.
+
+        The read is held on the shared fake's gate rather than slowed by a
+        sleep, so the per-page timeout fires at once and nothing waits it out.
+        The backend raises and leaves the logging to whoever handles the error
+        -- the worker or the CLI -- so the backend itself must not also log the
+        timeout at ERROR, or every timeout reads as two failures.
+        """
+        caplog.set_level(logging.DEBUG, logger=_BACKEND_LOGGER)
         mock_dev = fake_sane_module.open(_TEST_DEVICE)
-        mock_dev.set_page_delay(2.0)
+        mock_dev.block_read(ReadBlockMode.PARTIAL)
 
         backend = SaneBackend()
 
-        with pytest.raises(ScanError, match="timed out"):
-            backend._scan_adf_pages(
-                mock_dev, page_sink, _uncropped, timeout_per_page=0.1
-            )
+        try:
+            with pytest.raises(ScanError, match="timed out after"):
+                backend._scan_adf_pages(
+                    mock_dev, page_sink, _uncropped, timeout_per_page=0.05
+                )
+        finally:
+            mock_dev.release_read()
+            _join_sane_reader_threads()
+
+        timeout_errors = [
+            record
+            for record in caplog.records
+            if record.name == _BACKEND_LOGGER
+            and record.levelno >= logging.ERROR
+            and "timed out after" in record.getMessage()
+        ]
+        assert timeout_errors == []
 
     def test_pages_within_timeout_succeed(
         self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
@@ -4432,6 +4453,47 @@ class TestSaneBoundary:
 
         assert sane_backend_mod.require_sane() is None
         assert sane_backend_mod.sane is module
+
+    def test_ensure_sane_returns_the_patched_module(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A module patched into ``sane`` is what every SANE call goes through."""
+        module = FakeSaneModule()
+        monkeypatch.setattr(sane_backend_mod, "sane", module)
+
+        assert sane_backend_mod._ensure_sane() is module
+
+    def test_ensure_sane_imports_on_every_call_without_binding(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        With nothing patched in, each call imports afresh and binds no name.
+
+        Not caching is load-bearing: a test that evicts python-sane from
+        ``sys.modules`` after another test imported it must see the eviction,
+        and a remembered module would hide it.
+        """
+        first = FakeSaneModule()
+        second = FakeSaneModule()
+        monkeypatch.setattr(sane_backend_mod, "sane", None)
+        monkeypatch.setitem(sys.modules, "sane", first)
+
+        assert sane_backend_mod._ensure_sane() is first
+        assert sane_backend_mod.sane is None
+
+        monkeypatch.setitem(sys.modules, "sane", second)
+
+        assert sane_backend_mod._ensure_sane() is second
+
+    def test_scanner_package_does_not_offer_the_backend(self) -> None:
+        """
+        The package exports the abstraction only, never the SANE backend.
+
+        Callers import ``saneless.scanner.sane_backend`` by name, so the
+        package itself never has a reason to reach python-sane.
+        """
+        assert "SaneBackend" not in scanner_pkg.__all__
+        assert not hasattr(scanner_pkg, "SaneBackend")
 
     def test_require_sane_is_not_run_at_import(
         self, monkeypatch: pytest.MonkeyPatch
