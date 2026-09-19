@@ -82,7 +82,7 @@ from .web.app import create_app
 if TYPE_CHECKING:
     from .auto_profiles import ProfileWriteResult
     from .config import ProfileConfig
-    from .scanner.base import DeviceCapabilities, ScannerBackend
+    from .scanner.base import DeviceCapabilities, DeviceInfo, ScannerBackend
 
 __all__ = ["ClickFlipCoordinator", "_truncate", "cli"]
 
@@ -738,6 +738,161 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
                 click.echo(f"    {opt[1]}")
 
 
+def _capabilities_dict(caps: DeviceCapabilities) -> dict[str, object]:
+    """
+    Return one device's capabilities as the JSON object ``devices`` prints.
+
+    This is the machine contract scripts read, so it carries exactly what
+    ``_echo_capabilities`` shows and nothing it does not: a key appears only
+    when the device reported something for it, and the resolution support
+    keeps whichever shape the device gave, a list or a min/max/step range
+    with the floats as reported.
+
+    Args:
+        caps: The capabilities to convert.
+
+    Returns:
+        The capabilities, keyed in the order the text mode prints them.
+
+    """
+    result: dict[str, object] = {}
+    if caps.sources:
+        result["sources"] = list(caps.sources)
+    if caps.resolutions:
+        result["resolutions"] = list(caps.resolutions)
+    elif caps.resolution_range is not None:
+        low, high, step = caps.resolution_range
+        result["resolution_range"] = {"min": low, "max": high, "step": step}
+    if caps.modes:
+        result["modes"] = list(caps.modes)
+    raw_names = [opt[1] for opt in caps.raw_options if len(opt) >= 2]
+    if raw_names:
+        result["raw_options"] = raw_names
+    return result
+
+
+def _probe_capabilities(scanner: ScannerBackend, name: str) -> DeviceCapabilities | str:
+    """
+    Read one device's capabilities, or report why they could not be read.
+
+    Only a scanner error is caught: one device that will not answer must not
+    hide the others, so its reason is logged and printed as one stderr line
+    and the caller carries on. Anything else is a saneless bug and still
+    reaches the group guard.
+
+    Args:
+        scanner: The open backend.
+        name: The SANE device name to probe.
+
+    Returns:
+        The capabilities, or the one-line reason the probe failed.
+
+    """
+    try:
+        return scanner.get_capabilities(name)
+    except ScanError as exc:
+        reason = describe(exc)
+        logger.warning("Could not read capabilities for %s: %s", name, reason)
+        click.echo(f"Capabilities for {name}: {reason}", err=True)
+        return reason
+
+
+def _echo_device_table(device_list: list[DeviceInfo]) -> None:
+    """
+    Print the device list as a table sized to the terminal.
+
+    Args:
+        device_list: The devices SANE reported.
+
+    """
+    cols = shutil.get_terminal_size((80, 24)).columns
+    name_w = max(20, cols - 45)
+    vendor_w = 15
+    model_w = 20
+    header = f"{'Name':<{name_w}} {'Vendor':<{vendor_w}} {'Model':<{model_w}} {'Type'}"
+    click.echo(header)
+    click.echo("-" * min(len(header), cols))
+    for d in device_list:
+        click.echo(
+            f"{_truncate(d.name, name_w):<{name_w}} "
+            f"{_truncate(d.vendor, vendor_w):<{vendor_w}} "
+            f"{_truncate(d.model, model_w):<{model_w}} "
+            f"{d.device_type}"
+        )
+
+
+def _devices_as_json(
+    scanner: ScannerBackend, device_list: list[DeviceInfo], *, capabilities: bool
+) -> int:
+    """
+    Print the device list as one JSON document on stdout.
+
+    Without ``capabilities`` the document is the four keys it has always had,
+    in the same order, so scripts written against it see no change. With it,
+    each device also gets ``capabilities``, which is ``null`` alongside a
+    ``capabilities_error`` reason when that device's probe failed.
+
+    Args:
+        scanner: The open backend.
+        device_list: The devices SANE reported.
+        capabilities: Whether to probe and include each device's capabilities.
+
+    Returns:
+        The number of devices whose capabilities could not be read.
+
+    """
+    data: list[dict[str, object]] = [
+        {
+            "name": d.name,
+            "vendor": d.vendor,
+            "model": d.model,
+            "type": d.device_type,
+        }
+        for d in device_list
+    ]
+    failed = 0
+    if capabilities:
+        for entry, d in zip(data, device_list, strict=True):
+            probed = _probe_capabilities(scanner, d.name)
+            if isinstance(probed, str):
+                entry["capabilities"] = None
+                entry["capabilities_error"] = probed
+                failed += 1
+            else:
+                entry["capabilities"] = _capabilities_dict(probed)
+    click.echo(json.dumps(data, indent=2))
+    return failed
+
+
+def _devices_as_text(
+    scanner: ScannerBackend, device_list: list[DeviceInfo], *, capabilities: bool
+) -> int:
+    """
+    Print the device table, then each device's capabilities when asked.
+
+    Args:
+        scanner: The open backend.
+        device_list: The devices SANE reported.
+        capabilities: Whether to probe and print each device's capabilities.
+
+    Returns:
+        The number of devices whose capabilities could not be read.
+
+    """
+    _echo_device_table(device_list)
+    failed = 0
+    if capabilities:
+        click.echo()
+        for d in device_list:
+            probed = _probe_capabilities(scanner, d.name)
+            if isinstance(probed, str):
+                failed += 1
+                continue
+            click.echo(f"Capabilities for {d.name}:")
+            _echo_capabilities(probed)
+    return failed
+
+
 @cli.command()
 @click.option(
     "--json",
@@ -759,8 +914,10 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
     require_sane()
     _settings = _load_cli_settings(ctx)
 
+    # Status goes to stderr, so stdout carries only data in either mode and a
+    # pipe into jq or grep sees nothing else.
     if not as_json:
-        click.echo("Discovering scanners...")
+        click.echo("Discovering scanners...", err=True)
     scanner = SaneBackend(host=_settings.scanner.host)
     # Registered before the first SANE call, so an enumeration that fails still
     # leaves the process with SANE shut down (D-18).
@@ -771,42 +928,13 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
         click.echo("No scanners found." if not as_json else "[]")
         return
 
-    if as_json:
-        data = [
-            {
-                "name": d.name,
-                "vendor": d.vendor,
-                "model": d.model,
-                "type": d.device_type,
-            }
-            for d in device_list
-        ]
-        click.echo(json.dumps(data, indent=2))
-    else:
-        # Table header with terminal-aware column widths
-        cols = shutil.get_terminal_size((80, 24)).columns
-        name_w = max(20, cols - 45)
-        vendor_w = 15
-        model_w = 20
-        header = (
-            f"{'Name':<{name_w}} {'Vendor':<{vendor_w}} {'Model':<{model_w}} {'Type'}"
-        )
-        click.echo(header)
-        click.echo("-" * min(len(header), cols))
-        for d in device_list:
-            click.echo(
-                f"{_truncate(d.name, name_w):<{name_w}} "
-                f"{_truncate(d.vendor, vendor_w):<{vendor_w}} "
-                f"{_truncate(d.model, model_w):<{model_w}} "
-                f"{d.device_type}"
-            )
-
-    if capabilities:
-        click.echo()
-        for d in device_list:
-            caps = scanner.get_capabilities(d.name)
-            click.echo(f"Capabilities for {d.name}:")
-            _echo_capabilities(caps)
+    render = _devices_as_json if as_json else _devices_as_text
+    failed = render(scanner, device_list, capabilities=capabilities)
+    # A device whose capabilities could not be read is reported where it
+    # stands and the others still print; the exit code then says a scanner
+    # read failed, once everything has been written.
+    if failed:
+        ctx.exit(ExitCode.SCAN)
 
 
 @cli.command()

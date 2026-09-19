@@ -3223,7 +3223,13 @@ class TestExitCodes:
         result = runner.invoke(cli, [command])
 
         assert result.exit_code == 130
-        assert result.stderr.splitlines() == ["Cancelled (interrupted)"]
+        lines = result.stderr.splitlines()
+        # devices announces itself on stderr before it touches SANE; that
+        # status line is not part of the cancel report.
+        if command == "devices":
+            assert lines[0] == "Discovering scanners..."
+            lines = lines[1:]
+        assert lines == ["Cancelled (interrupted)"]
         assert "Aborted!" not in result.output
 
     def test_unexpected_error_exits_5_naming_the_log_file(
