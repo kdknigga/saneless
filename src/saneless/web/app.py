@@ -340,9 +340,9 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         logger.info("App shutdown complete")
 
     # No generated schema and no interactive documentation: an unauthenticated
-    # LAN appliance serving an HTMX UI has no API surface to advertise.  All
-    # three are named, so switching openapi_url back on later cannot bring
-    # /docs and /redoc back with it.
+    # LAN appliance serving an HTMX UI has no stable API contract to advertise;
+    # its endpoints are the UI's own.  All three are named, so switching
+    # openapi_url back on later cannot bring /docs and /redoc back with it.
     app = FastAPI(lifespan=lifespan, openapi_url=None, docs_url=None, redoc_url=None)
     # Every error response the app sends is rendered there.
     install_error_handlers(app)

@@ -625,7 +625,7 @@ def test_not_found_renders_on_both_branches(client: TestClient, path: str) -> No
 
 # The paths FastAPI registers for its generated schema and documentation.  The
 # app registers none of them: an unauthenticated LAN appliance serving an HTMX
-# UI has no API surface to advertise.
+# UI has no stable API contract to advertise; its endpoints are the UI's own.
 _SCHEMA_AND_DOCS_PATHS = ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc")
 
 
