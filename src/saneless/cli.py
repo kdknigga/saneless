@@ -10,6 +10,7 @@ that turns a failure into a single stderr line and a documented exit code.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import shutil
@@ -83,6 +84,8 @@ from .vocabulary import (
 from .web.app import create_app
 
 if TYPE_CHECKING:
+    from fastapi import FastAPI
+
     from .auto_profiles import ProfileWriteResult
     from .config import ProfileConfig
     from .scanner.base import DeviceCapabilities, DeviceInfo, ScannerBackend
@@ -1009,16 +1012,75 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
         store.close()
 
 
-def _bind_listening_socket(host: str, port: int) -> socket.socket:
+def _bind_listening_sockets(host: str, port: int) -> list[socket.socket]:
     """
-    Bind and listen on the address ``serve`` was given, before uvicorn starts.
+    Bind and listen on every address ``serve`` was given, before uvicorn starts.
 
-    The socket is bound here rather than by uvicorn so that the port saneless
-    reports is the port it holds: with port 0 the OS chooses one, and there is
-    no gap between checking a port and binding it for another process to take
-    it in. The address family comes from resolving the host, so an IPv6
-    address binds IPv6. Only the first address a name resolves to is bound,
-    so ``--host`` is meant to take an address.
+    The sockets are bound here rather than by uvicorn so that the port
+    saneless reports is the port it holds: with port 0 the OS chooses one,
+    and there is no gap between checking a port and binding it for another
+    process to take it in. The host is resolved, and every address it
+    resolves to is bound, each once, the way uvicorn bound a name itself:
+    ``localhost`` usually resolves to ``::1`` first and ``127.0.0.1`` second,
+    and a reverse proxy pointed at either must reach saneless. An address
+    literal resolves to itself alone. With port 0 the port the OS chose for
+    the first address is reused for the rest, so one port serves them all.
+
+    If any address cannot be bound, the sockets already bound are closed and
+    ``serve`` fails, rather than starting on only part of what was asked.
+
+    Args:
+        host: The address or name to bind.
+        port: The port to bind; 0 asks the OS for a free one.
+
+    Returns:
+        The bound, listening sockets, in the resolver's order.
+
+    Raises:
+        ConfigError: The host did not resolve or an address could not be
+            bound. That is a setup problem, so it exits 2 like any other
+            failure to start.
+
+    """
+    try:
+        infos = socket.getaddrinfo(
+            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )
+    except OSError as exc:
+        msg = f"Cannot bind to {host}:{port}: {describe(exc)}"
+        raise ConfigError(msg) from exc
+    sockets: list[socket.socket] = []
+    seen: set[tuple[int, str]] = set()
+    try:
+        for family, socktype, proto, _, sockaddr in infos:
+            address = str(sockaddr[0])
+            if (family, address) in seen:
+                continue
+            seen.add((family, address))
+            # The first bound socket fixes the port when the OS chose it.
+            bind_address = (
+                (address, sockets[0].getsockname()[1], *sockaddr[2:])
+                if sockets
+                else sockaddr
+            )
+            sockets.append(
+                _bind_one(host, port, (family, socktype, proto), bind_address)
+            )
+    except BaseException:
+        for sock in sockets:
+            sock.close()
+        raise
+    return sockets
+
+
+def _bind_one(
+    host: str,
+    port: int,
+    kind: tuple[int, int, int],
+    sockaddr: tuple[object, ...],
+) -> socket.socket:
+    """
+    Bind and listen on one resolved address.
 
     The options match what uvicorn's own bind set. SO_REUSEADDR lets a
     restart bind a port whose last connections are still closing. On IPv6,
@@ -1029,25 +1091,26 @@ def _bind_listening_socket(host: str, port: int) -> socket.socket:
     waits in the queue instead of being refused.
 
     Args:
-        host: The address to bind.
-        port: The port to bind; 0 asks the OS for a free one.
+        host: The address or name ``serve`` was given, for the message.
+        port: The port ``serve`` was given, for the message.
+        kind: The family, socket type and protocol the resolver gave.
+        sockaddr: The resolved address to bind.
 
     Returns:
         The bound, listening socket.
 
     Raises:
-        ConfigError: The host did not resolve or the address could not be
-            bound. That is a setup problem, so it exits 2 like any other
-            failure to start.
+        ConfigError: The address could not be bound. The message names the
+            resolved address too when the host was a name.
 
     """
+    family, socktype, proto = kind
+    address = str(sockaddr[0])
+    where = f"{host}:{port}" if address == host else f"{host}:{port} ({address})"
     try:
-        family, socktype, proto, _, sockaddr = socket.getaddrinfo(
-            host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
-        )[0]
         sock = socket.socket(family, socktype, proto)
     except OSError as exc:
-        msg = f"Cannot bind to {host}:{port}: {describe(exc)}"
+        msg = f"Cannot bind to {where}: {describe(exc)}"
         raise ConfigError(msg) from exc
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1057,9 +1120,25 @@ def _bind_listening_socket(host: str, port: int) -> socket.socket:
         sock.listen(_LISTEN_BACKLOG)
     except OSError as exc:
         sock.close()
-        msg = f"Cannot bind to {host}:{port}: {describe(exc)}"
+        msg = f"Cannot bind to {where}: {describe(exc)}"
         raise ConfigError(msg) from exc
     return sock
+
+
+def _socket_url(sock: socket.socket) -> str:
+    """
+    Return the URL a bound socket serves, with an IPv6 address bracketed.
+
+    Args:
+        sock: A bound socket.
+
+    Returns:
+        ``http://<address>:<port>``, bracketed so it pastes into a browser.
+
+    """
+    address, port = sock.getsockname()[:2]
+    shown = f"[{address}]" if sock.family == socket.AF_INET6 else address
+    return f"http://{shown}:{port}"
 
 
 @cli.command()
@@ -1100,12 +1179,33 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # no thread can still be inside SANE.
     app = create_app(settings, scanner)
 
-    sock = _bind_listening_socket(actual_host, actual_port)
-    bound_port = sock.getsockname()[1]
-    # An IPv6 address is bracketed so the URL can be pasted into a browser.
-    shown_host = f"[{actual_host}]" if ":" in actual_host else actual_host
-    click.echo(f"Serving on http://{shown_host}:{bound_port}", err=True)
-    logger.info("Serving on http://%s:%d", shown_host, bound_port)
+    sockets = _bind_listening_sockets(actual_host, actual_port)
+    # Every path out of here closes every socket, whatever raises between the
+    # bind and the end of Server.run.
+    try:
+        _run_server(app, sockets, settings.output.log_level)
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> None:
+    """
+    Announce the bound addresses and run uvicorn on the given sockets.
+
+    Args:
+        app: The ASGI app to serve.
+        sockets: The bound, listening sockets; the caller closes them.
+        log_level: The configured log level, which uvicorn follows.
+
+    Raises:
+        ConfigError: The server never started; uvicorn has already logged why.
+
+    """
+    urls = [_socket_url(sock) for sock in sockets]
+    for url in urls:
+        click.echo(f"Serving on {url}", err=True)
+        logger.info("Serving on %s", url)
 
     # uvicorn follows the configured log_level, not -v: -v is saneless's own
     # detail and must not turn on uvicorn's or httpx's debug output. The
@@ -1121,7 +1221,7 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
         uvicorn.Config(
             app,
             log_config=None,
-            log_level=settings.output.log_level.lower(),
+            log_level=log_level.lower(),
             access_log=True,
         )
     )
@@ -1130,18 +1230,14 @@ def serve(ctx: click.Context, host: str | None, port: int | None) -> None:
     # stopped is a normal stop, exit 0, so it is swallowed here; a Ctrl-C
     # before this point -- while settings load or the app is built -- is not
     # uvicorn's to handle and reaches the group guard, exit 130.
-    try:
-        server.run(sockets=[sock])
-    except KeyboardInterrupt:
-        pass
-    finally:
-        sock.close()
+    with contextlib.suppress(KeyboardInterrupt):
+        server.run(sockets=sockets)
     # Server.run returns quietly when start-up fails, such as the app's
     # lifespan raising; uvicorn has already logged why. Every command shares
     # one exit table, so that is a failure to start: one line, exit 2.
     if not server.started:
         msg = (
-            f"The web server could not start on http://{shown_host}:{bound_port}; "
+            f"The web server could not start on {', '.join(urls)}; "
             "the cause is in the preceding log lines"
         )
         raise ConfigError(msg)

@@ -2327,6 +2327,8 @@ class _ServerRun:
     reuseaddr: int | None = None
     reuseport: int | None = None
     listening: int | None = None
+    bound: list[tuple[int, str, int]] = dataclasses.field(default_factory=list)
+    v6only_flags: list[int] = dataclasses.field(default_factory=list)
 
 
 def _read_socket(run: _ServerRun, sock: socket.socket) -> None:
@@ -2380,6 +2382,13 @@ def _fake_server_run(
         run = _ServerRun(sockets=sockets, config=self.config)
         if sockets:
             _read_socket(run, sockets[0])
+            for sock in sockets:
+                address, port = sock.getsockname()[:2]
+                run.bound.append((sock.family, address, port))
+                if sock.family == socket.AF_INET6:
+                    run.v6only_flags.append(
+                        sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY)
+                    )
         runs.append(run)
         app = self.config.app
         if isinstance(app, FastAPI):
@@ -2392,6 +2401,76 @@ def _fake_server_run(
 
     monkeypatch.setattr(uvicorn.Server, "run", fake_run)
     return runs
+
+
+def _resolving_to(monkeypatch: pytest.MonkeyPatch, *addresses: str) -> None:
+    """
+    Make the resolver ``serve`` uses answer any name with ``addresses``.
+
+    The answer keeps the order given and the port asked for, the way
+    ``getaddrinfo`` does, so a test decides which families a name has
+    whatever this host's own resolver would say.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        addresses: The IPv4 or IPv6 literals to answer with, in order.
+
+    """
+
+    def fake_getaddrinfo(
+        _host: str, port: int, **_kwargs: int
+    ) -> list[tuple[int, int, int, str, tuple[str, int] | tuple[str, int, int, int]]]:
+        infos: list[
+            tuple[int, int, int, str, tuple[str, int] | tuple[str, int, int, int]]
+        ] = []
+        for address in addresses:
+            if ":" in address:
+                infos.append(
+                    (
+                        socket.AF_INET6,
+                        socket.SOCK_STREAM,
+                        socket.IPPROTO_TCP,
+                        "",
+                        (address, port, 0, 0),
+                    )
+                )
+            else:
+                infos.append(
+                    (
+                        socket.AF_INET,
+                        socket.SOCK_STREAM,
+                        socket.IPPROTO_TCP,
+                        "",
+                        (address, port),
+                    )
+                )
+        return infos
+
+    monkeypatch.setattr("saneless.cli.socket.getaddrinfo", fake_getaddrinfo)
+
+
+def _record_sockets(monkeypatch: pytest.MonkeyPatch) -> list[socket.socket]:
+    """
+    Record every socket ``serve`` creates, so a test can check each is closed.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+
+    Returns:
+        The list each new socket is appended to.
+
+    """
+    made: list[socket.socket] = []
+
+    class RecordingSocket(socket.socket):
+        """A real socket that notes itself in ``made`` when it is created."""
+
+        def __init__(self, *args: int) -> None:
+            super().__init__(*args)
+            made.append(self)
+
+    monkeypatch.setattr("saneless.cli.socket.socket", RecordingSocket)
+    return made
 
 
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
@@ -2527,6 +2606,107 @@ class TestServeCommand:
         assert run.family == socket.AF_INET6
         assert run.v6only == 1
         assert result.stderr.splitlines() == [f"Serving on http://[::1]:{run.port}"]
+
+    @pytest.mark.skipif(
+        not _ipv6_loopback_available(), reason="this host cannot bind ::1"
+    )
+    def test_serve_binds_every_address_a_name_resolves_to(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        ``--host localhost`` listens on ``::1`` and ``127.0.0.1``, one port.
+
+        A resolver lists ``::1`` first on a typical host.  Binding only that
+        would refuse a reverse proxy pointed at ``127.0.0.1``; binding every
+        address keeps what uvicorn did when it bound the name itself.  With
+        port 0 the OS picks the port once and every address shares it.
+        """
+        _resolving_to(monkeypatch, "::1", "127.0.0.1")
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "localhost", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        [(_, _, port), _] = run.bound
+        assert run.bound == [
+            (socket.AF_INET6, "::1", port),
+            (socket.AF_INET, "127.0.0.1", port),
+        ]
+        assert run.v6only_flags == [1]
+        assert result.stderr.splitlines() == [
+            f"Serving on http://[::1]:{port}",
+            f"Serving on http://127.0.0.1:{port}",
+        ]
+        assert run.sockets is not None
+        assert all(sock.fileno() == -1 for sock in run.sockets)
+
+    def test_serve_binds_a_repeated_address_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An address the resolver lists twice is bound once, not refused."""
+        _resolving_to(monkeypatch, "127.0.0.1", "127.0.0.1")
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "localhost", "--port", "0"])
+
+        assert result.exit_code == 0, result.output
+        [run] = runs
+        [(family, address, port)] = run.bound
+        assert (family, address) == (socket.AF_INET, "127.0.0.1")
+        assert result.stderr.splitlines() == [f"Serving on http://127.0.0.1:{port}"]
+
+    def test_serve_closes_the_bound_sockets_when_a_later_address_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        One address that cannot be bound fails ``serve``: exit 2, nothing leaks.
+
+        The first address is bound before the second fails, so its socket
+        must be closed on the way out.  192.0.2.1 is a documentation address
+        no host holds, so binding it fails with EADDRNOTAVAIL.
+        """
+        _resolving_to(monkeypatch, "127.0.0.1", "192.0.2.1")
+        made = _record_sockets(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        runs = _fake_server_run(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "twohomed", "--port", "0"])
+
+        assert result.exit_code == 2, result.output
+        [line] = _failure_lines(result)
+        assert line.startswith("Cannot bind to twohomed:0 (192.0.2.1): ")
+        assert runs == []
+        assert len(made) == 2
+        assert all(sock.fileno() == -1 for sock in made)
+
+    def test_serve_closes_the_sockets_when_start_up_raises_after_binding(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A failure between the bind and ``Server.run`` still closes the sockets.
+
+        Building uvicorn's config is the last step before the hand-over; a
+        bug there is exit 5, and the socket it never reached is closed.
+        """
+
+        def failing_config(*_args: object, **_kwargs: object) -> NoReturn:
+            msg = "config exploded"
+            raise RuntimeError(msg)
+
+        made = _record_sockets(monkeypatch)
+        self._stub_create_app(monkeypatch)
+        monkeypatch.setattr("saneless.cli.uvicorn.Config", failing_config)
+        runner, _ = _patch_cli(monkeypatch)
+
+        result = runner.invoke(cli, ["serve", "--host", "127.0.0.1", "--port", "0"])
+
+        assert result.exit_code == 5, result.output
+        assert len(made) == 1
+        assert made[0].fileno() == -1
 
     def test_serve_hands_over_a_listening_socket_without_reuseport(
         self, monkeypatch: pytest.MonkeyPatch
