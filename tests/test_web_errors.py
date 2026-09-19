@@ -623,6 +623,21 @@ def test_not_found_renders_on_both_branches(client: TestClient, path: str) -> No
     _assert_json_error(client.get(path), RequestRejection.NOT_FOUND, 404)
 
 
+# The paths FastAPI registers for its generated schema and documentation.  The
+# app registers none of them: an unauthenticated LAN appliance serving an HTMX
+# UI has no API surface to advertise.
+_SCHEMA_AND_DOCS_PATHS = ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc")
+
+
+@pytest.mark.parametrize("path", _SCHEMA_AND_DOCS_PATHS)
+def test_schema_and_docs_paths_are_not_found(client: TestClient, path: str) -> None:
+    """The schema and docs paths 404 like any unknown path, on both branches."""
+    _assert_htmx_error(
+        client.get(path, headers=HTMX_HEADERS), RequestRejection.NOT_FOUND, 404
+    )
+    _assert_json_error(client.get(path), RequestRejection.NOT_FOUND, 404)
+
+
 def test_method_not_allowed_renders_on_both_branches(client: TestClient) -> None:
     """A router 405 goes through the one renderer (D-01)."""
     rejection = RequestRejection.METHOD_NOT_ALLOWED

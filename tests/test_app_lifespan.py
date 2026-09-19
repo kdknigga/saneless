@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
 
@@ -859,11 +860,10 @@ def test_idle_worker_shutdown_closes_the_store(settings: Settings) -> None:
 # How every route the app exposes is called, so the proof below can drive all
 # of them.  A route the app serves and this map does not name fails the test
 # rather than being passed over in silence: that is what makes a route added
-# later covered on the day it lands, instead of quietly uncovered.
+# later covered on the day it lands, instead of quietly uncovered.  The reverse
+# holds too: an entry naming a route the app no longer serves fails the test,
+# so a removed route cannot leave a stale entry behind.
 _ROUTE_CALLS: dict[str, dict[str, Any]] = {
-    "/docs": {"method": "GET"},
-    "/docs/oauth2-redirect": {"method": "GET"},
-    "/redoc": {"method": "GET"},
     "/": {"method": "GET"},
     "/health": {"method": "GET"},
     "/api/paperless/test": {"method": "GET"},
@@ -903,13 +903,6 @@ _ROUTE_SKIPS: dict[str, str] = {
         "a StaticFiles mount rather than an endpoint: it serves bytes off disk "
         "through Starlette and runs no saneless code at all"
     ),
-    "/openapi.json": (
-        "FastAPI's generated schema, which this app cannot produce: the route "
-        "handlers annotate their returns as 'Response' under postponed "
-        "evaluation, and pydantic raises rather than resolving the forward "
-        "reference. It runs no saneless handler and opens no scanner, and the "
-        "500 predates this plan; recorded in deferred-items.md"
-    ),
 }
 
 
@@ -927,6 +920,9 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
 
     ``exit_while_blocked`` ties the proof to D-12/D-13: whatever the routes did,
     ``sane_exit`` never ran with a read outstanding.
+
+    The route map is checked in both directions: every served route is named
+    in it, and every entry in it names a route the app serves.
     """
     fake = FakeSaneModule(
         devices=[("test:device:001", "TestVendor", "TestModel", "scanner")]
@@ -960,6 +956,12 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     assert uncovered == set(), (
         f"routes {sorted(uncovered)} are neither driven nor skipped with a "
         f"reason; add them to _ROUTE_CALLS or _ROUTE_SKIPS"
+    )
+    served = {route.path for route in app.routes if isinstance(route, Route | Mount)}
+    stale = (_ROUTE_CALLS.keys() | _ROUTE_SKIPS.keys()) - served
+    assert stale == set(), (
+        f"the route map names {sorted(stale)}, which the app does not serve; "
+        f"remove them from _ROUTE_CALLS or _ROUTE_SKIPS"
     )
 
     with TestClient(app) as client:
@@ -997,3 +999,26 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     assert fake.init_call_count == 1
     assert fake.exit_call_count == 1
     assert fake.exit_while_blocked is False
+
+
+# --- The generated schema builds but is not served ----------------------------
+
+
+def test_the_schema_builds_in_process_and_is_not_served(settings: Settings) -> None:
+    """
+    app.openapi() builds from the real app, which serves no schema.
+
+    FastAPI resolves a route's return annotation when the decorator runs, so a
+    name imported only for type checking leaves a forward reference that makes
+    this call raise.  The call runs inside the lifespan so the job store is
+    closed afterwards.  The attribute check pins that all three URLs are
+    switched off, so switching openapi_url back on cannot quietly bring the
+    documentation pages back.
+    """
+    app = _build_app(settings)
+    with TestClient(app) as client:
+        schema = app.openapi()
+        served = {route.path for route in app.routes if isinstance(route, APIRoute)}
+        assert set(schema["paths"]) == served
+        assert client.get("/openapi.json").status_code == 404
+        assert (app.openapi_url, app.docs_url, app.redoc_url) == (None, None, None)
