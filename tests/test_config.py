@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import tempfile
@@ -10,7 +11,7 @@ import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, Any, TypedDict, Unpack
 
 import pytest
 from pydantic import ValidationError
@@ -391,6 +392,39 @@ class TestXdgBaseDirectories:
         assert output.log_file == state / "saneless.log"
 
 
+class _OpenOptions(TypedDict, total=False):
+    """The keyword arguments ``Path.open`` takes after its mode."""
+
+    buffering: int
+    encoding: str | None
+    errors: str | None
+    newline: str | None
+
+
+def _refuse_opening(monkeypatch: pytest.MonkeyPatch, refused: Path) -> None:
+    """
+    Make opening ``refused`` fail with EACCES; every other open still works.
+
+    Injecting the failure rather than taking the file's permissions away keeps
+    the test meaningful as root, whom file modes do not stop.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        refused: The file whose opening must be refused.
+
+    """
+    real_open = Path.open
+
+    def refusing(
+        self: Path, mode: str = "r", **options: Unpack[_OpenOptions]
+    ) -> IO[Any]:
+        if self == refused:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(self))
+        return real_open(self, mode, **options)
+
+    monkeypatch.setattr(Path, "open", refusing)
+
+
 class TestInvalidToml:
     """
     A config file that cannot be read or parsed is a ConfigError (D-12, EXC-01).
@@ -480,18 +514,16 @@ class TestInvalidToml:
             load_settings(config_path=str(bad_file))
         self._assert_token_absent(exc_info.value, token)
 
-    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
-    def test_unreadable_config_file_is_config_error(self, tmp_config_dir: Path) -> None:
+    def test_unreadable_config_file_is_config_error(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A file that cannot be opened is one ``cannot read the file`` row (D-12)."""
         token = "tok-SECRET-91fe"
         bad_file = tmp_config_dir / "unreadable.toml"
         bad_file.write_text(f'[paperless]\ntoken = "{token}"\n')
-        bad_file.chmod(0o000)
-        try:
-            with pytest.raises(ConfigError) as exc_info:
-                load_settings(config_path=str(bad_file))
-        finally:
-            bad_file.chmod(0o600)
+        _refuse_opening(monkeypatch, bad_file)
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings(config_path=str(bad_file))
         lines = str(exc_info.value).splitlines()
         assert lines[0] == f"Configuration error in {bad_file}:"
         assert lines[1].startswith("  cannot read the file:")
@@ -1781,6 +1813,29 @@ class TestAutoSourceMode:
             ProfileConfig.model_validate({"auto_source_mode": "invalid"})
 
 
+def _deny_write_access(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """
+    Make ``os.access`` report ``denied`` unwritable; every other path is asked for real.
+
+    The directory check asks ``os.access``, so answering for it is the whole
+    failure.  Injecting it rather than taking the directory's write bit away
+    keeps the test meaningful as root, for whom ``os.access`` ignores modes.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        denied: The directory to report as not writable.
+
+    """
+    real_access = os.access
+
+    def access(path: str | os.PathLike[str], mode: int) -> bool:
+        if Path(path) == denied and mode & os.W_OK:
+            return False
+        return real_access(path, mode)
+
+    monkeypatch.setattr("saneless.config.os.access", access)
+
+
 class TestValidateSettingsDirs:
     """Writability validation via validate_settings_dirs."""
 
@@ -1794,20 +1849,18 @@ class TestValidateSettingsDirs:
         assert list(tmp_path.iterdir()) == []
 
     def test_validate_unwritable_tmp_dir_fails_with_config_error(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Unwritable tmp_dir raises ConfigError with 'not writable' message."""
         unwritable = tmp_path / "readonly"
         unwritable.mkdir()
-        unwritable.chmod(0o444)
+        _deny_write_access(monkeypatch, unwritable)
         settings = Settings(
             output=OutputConfig(tmp_dir=str(unwritable)),
             profiles={"default": ProfileConfig()},
         )
-        with pytest.raises(ConfigError, match="not writable"):
+        with pytest.raises(ConfigError, match="tmp_dir is not writable"):
             validate_settings_dirs(settings)
-        # Restore permissions for cleanup
-        unwritable.chmod(0o755)
 
     def test_validate_writable_data_dir_passes(self, tmp_path: Path) -> None:
         """No error when data_dir is writable, and the check writes nothing there."""
@@ -1819,42 +1872,38 @@ class TestValidateSettingsDirs:
         assert list(tmp_path.iterdir()) == []
 
     def test_validate_unwritable_data_dir_fails_with_config_error(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Unwritable data_dir raises ConfigError with 'not writable' message."""
         unwritable = tmp_path / "readonly"
         unwritable.mkdir()
-        unwritable.chmod(0o444)
+        _deny_write_access(monkeypatch, unwritable)
         settings = Settings(
             output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(unwritable)),
             profiles={"default": ProfileConfig()},
         )
-        with pytest.raises(ConfigError, match="not writable"):
+        with pytest.raises(ConfigError, match="data_dir is not writable"):
             validate_settings_dirs(settings)
-        # Restore permissions for cleanup
-        unwritable.chmod(0o755)
 
     def test_validate_missing_data_dir_unwritable_parent_fails(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A missing data_dir under an unwritable parent raises ConfigError."""
         parent = tmp_path / "readonly"
         parent.mkdir()
-        parent.chmod(0o444)
+        _deny_write_access(monkeypatch, parent)
         settings = Settings(
             output=OutputConfig(
                 tmp_dir=str(tmp_path), data_dir=str(parent / "saneless")
             ),
             profiles={"default": ProfileConfig()},
         )
-        with pytest.raises(ConfigError, match="not writable"):
+        with pytest.raises(ConfigError, match="data_dir parent is not writable"):
             validate_settings_dirs(settings)
-        # Restore permissions for cleanup
-        parent.chmod(0o755)
 
     @pytest.mark.parametrize("label", ["tmp_dir", "data_dir", "consume_dir"])
     def test_validate_deep_missing_dir_under_unwritable_ancestor_fails(
-        self, tmp_path: Path, label: str
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str
     ) -> None:
         """
         A deep missing directory is checked against its nearest ancestor (M-20).
@@ -1862,8 +1911,6 @@ class TestValidateSettingsDirs:
         Only the immediate parent used to be checked, and only when it existed,
         so ``<unwritable>/a/b/c`` passed at startup and failed mid-scan.
         """
-        if os.geteuid() == 0:
-            pytest.skip("root ignores directory permissions")
         ancestor = tmp_path / "readonly"
         ancestor.mkdir()
         deep = str(ancestor / "a" / "b" / "c")
@@ -1877,12 +1924,9 @@ class TestValidateSettingsDirs:
             ),
             profiles={"default": ProfileConfig()},
         )
-        ancestor.chmod(0o555)
-        try:
-            with pytest.raises(ConfigError, match="not writable") as exc_info:
-                validate_settings_dirs(settings)
-        finally:
-            ancestor.chmod(0o755)
+        _deny_write_access(monkeypatch, ancestor)
+        with pytest.raises(ConfigError, match="not writable") as exc_info:
+            validate_settings_dirs(settings)
         message = str(exc_info.value)
         assert message.startswith(label)
         assert str(ancestor) in message

@@ -22,9 +22,11 @@ already proven.  No test here sleeps.
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import socket
+import tempfile
 import threading
 from dataclasses import FrozenInstanceError
 from itertools import pairwise
@@ -84,11 +86,32 @@ _PROBE_BUDGET = 0.5
 # A token that is not a placeholder, so the Paperless check reaches its probe.
 _REAL_TOKEN = "a-real-looking-token"
 
-# Skips the two writability tests when the suite runs as root, for whom a
-# directory with no write bit is writable anyway.
-_NOT_ROOT = pytest.mark.skipif(
-    os.geteuid() == 0, reason="root ignores the write bit, so the case cannot exist"
-)
+
+def _refuse_temp_files_in(monkeypatch: pytest.MonkeyPatch, folder: Path) -> None:
+    """
+    Make creating a temporary file in ``folder`` fail with EACCES.
+
+    Every other directory still gets a real temporary file.  Injecting the
+    refusal rather than taking the folder's write bit away keeps the test
+    meaningful as root, whom file modes do not stop.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        folder: The directory that must refuse the probe's file.
+
+    """
+    real_named_temporary_file = tempfile.NamedTemporaryFile
+
+    def refusing(**kwargs: str | Path) -> object:
+        """Refuse a file in ``folder``; create any other for real."""
+        directory = Path(kwargs["dir"])
+        if directory == folder:
+            raise PermissionError(
+                errno.EACCES, os.strerror(errno.EACCES), str(directory)
+            )
+        return real_named_temporary_file(dir=directory, prefix=str(kwargs["prefix"]))
+
+    monkeypatch.setattr("saneless.checks.tempfile.NamedTemporaryFile", refusing)
 
 
 @pytest.fixture(autouse=True)
@@ -2426,23 +2449,26 @@ class TestFallbackCheck:
         assert row.message == "The fallback folder cannot be written to."
         assert row.next_step == "Check the folder exists and saneless can write to it."
 
-    @_NOT_ROOT
-    def test_an_unwritable_fallback_folder_is_red(self, tmp_path: Path) -> None:
+    def test_an_unwritable_fallback_folder_is_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """
         Writability is probed by writing, not by asking ``os.access``.
 
+        The folder's mode is left alone, so ``os.access`` still says it is
+        writable: only the refused write can turn the row red.
+
         Args:
             tmp_path: The test's own directory.
+            monkeypatch: The test's monkeypatch fixture.
 
         """
         folder = tmp_path / "readonly-consume"
         folder.mkdir()
-        folder.chmod(0o500)
-        try:
-            settings = _settings(tmp_path, consume_dir=str(folder))
-            row = _row(run_checks(_context(settings)), CheckKey.FALLBACK)
-        finally:
-            folder.chmod(0o700)
+        _refuse_temp_files_in(monkeypatch, folder)
+        settings = _settings(tmp_path, consume_dir=str(folder))
+        row = _row(run_checks(_context(settings)), CheckKey.FALLBACK)
+        assert os.access(folder, os.W_OK)
         assert row.state is CheckState.FAIL
 
     def test_no_row_renders_the_folder_path(self, tmp_path: Path) -> None:
@@ -2476,23 +2502,22 @@ class TestDataDirCheck:
         assert row.state is CheckState.OK
         assert row.message == "The data folder is writable."
 
-    @_NOT_ROOT
-    def test_an_unwritable_data_folder_is_red(self, tmp_path: Path) -> None:
+    def test_an_unwritable_data_folder_is_red(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """
         A data folder that refuses a write stops saneless recording anything.
 
         Args:
             tmp_path: The test's own directory.
+            monkeypatch: The test's monkeypatch fixture.
 
         """
         folder = tmp_path / "readonly-data"
         folder.mkdir()
-        folder.chmod(0o500)
-        try:
-            settings = _settings(tmp_path, data_dir=str(folder))
-            row = _row(run_checks(_context(settings)), CheckKey.DATA_DIR)
-        finally:
-            folder.chmod(0o700)
+        _refuse_temp_files_in(monkeypatch, folder)
+        settings = _settings(tmp_path, data_dir=str(folder))
+        row = _row(run_checks(_context(settings)), CheckKey.DATA_DIR)
         assert row.state is CheckState.FAIL
         assert row.message == "The data folder cannot be written to."
         assert row.next_step == (

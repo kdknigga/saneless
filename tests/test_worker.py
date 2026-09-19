@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import pytest
 from PIL import Image, ImageDraw
 
+from saneless import auto_profiles as auto_profiles_module
 from saneless import worker as worker_module
 from saneless.auto_profiles import (
     ProfileWriteResult,
@@ -4023,25 +4024,30 @@ class TestStartupProfileGeneration:
     def test_startup_generation_keeps_profiles_when_the_file_is_unwritable(
         self,
         mock_scanner: MagicMock,
-        mock_paperless: MagicMock,
-        default_settings: Settings,
+        worker_for: Callable[[JobStore], ScanWorker],
         tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """D-18: an OSError writing the loaded file keeps the profiles in memory."""
-        if os.geteuid() == 0:
-            pytest.skip("root bypasses file permissions")
         self._mock_caps_scanner(mock_scanner)
-        locked = tmp_path / "locked"
-        locked.mkdir()
-        config_file = locked / "saneless.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text("# read-only\n")
-        config_file.chmod(0o400)
-        locked.chmod(0o500)
-        default_settings._config_path = config_file
+        real_replace = auto_profiles_module.replace_file_atomically
+
+        def refusing(path: Path, text: str) -> Path:
+            """Refuse the loaded file the way the kernel would; write any other."""
+            if path == config_file:
+                raise PermissionError(
+                    errno.EACCES, os.strerror(errno.EACCES), str(path)
+                )
+            return real_replace(path, text)
+
+        monkeypatch.setattr(auto_profiles_module, "replace_file_atomically", refusing)
 
         store = JobStore()
-        worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+        worker = worker_for(store)
+        worker._settings._config_path = config_file
         try:
             worker.start()
             generated = poll_until(
@@ -4050,8 +4056,6 @@ class TestStartupProfileGeneration:
         finally:
             worker.stop()
             store.close()
-            locked.chmod(0o700)
-            config_file.chmod(0o600)
 
         assert generated
         assert config_file.read_text() == "# read-only\n"

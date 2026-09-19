@@ -77,6 +77,30 @@ def _record_mkstemp(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     return directories
 
 
+def _deny_write_access(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
+    """
+    Make ``os.access`` report ``denied`` unwritable; every other path is asked for real.
+
+    The pre-check asks ``os.access``, so answering for the file is the whole
+    failure.  Injecting it rather than taking the file's write bit away keeps
+    the test meaningful as root, for whom ``os.access`` ignores modes.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        denied: The file to report as not writable.
+
+    """
+    real_access = os.access
+    resolved = denied.resolve()
+
+    def access(path: str | os.PathLike[str], mode: int) -> bool:
+        if Path(path).resolve() == resolved and mode & os.W_OK:
+            return False
+        return real_access(path, mode)
+
+    monkeypatch.setattr("saneless.atomic_write.os.access", access)
+
+
 def _is_directory_fd(fd: int) -> bool:
     """Return True when ``fd`` refers to a directory."""
     return stat.S_ISDIR(os.fstat(fd).st_mode)
@@ -280,27 +304,22 @@ class TestSymlinkAndReadonly:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """
-        A chmod 0444 config is not silently replaced.
+        A config this process may not write is not silently replaced.
 
         ``rename(2)`` checks only the directory, so without a pre-check the
         documented "config cannot be written" case would quietly succeed.
         """
-        if os.geteuid() == 0:
-            pytest.skip("root bypasses file permissions")
         target = tmp_path / "config.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
-        target.chmod(0o444)
+        _deny_write_access(monkeypatch, target)
         directories = _record_mkstemp(monkeypatch)
 
-        try:
-            with pytest.raises(PermissionError):
-                replace_file_atomically(target, _NEW)
+        with pytest.raises(PermissionError):
+            replace_file_atomically(target, _NEW)
 
-            assert target.read_bytes() == _ORIGINAL.encode("utf-8")
-            assert directories == [], "a temp file was created before refusing"
-            _leftovers(tmp_path)
-        finally:
-            target.chmod(0o600)
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
+        assert directories == [], "a temp file was created before refusing"
+        _leftovers(tmp_path)
 
 
 class TestReadOnlyMount:
@@ -370,19 +389,15 @@ class TestReadOnlyMount:
     def test_writable_mount_read_only_file_is_still_permission_error(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A chmod 0444 file on a writable mount is refused as read-only."""
-        if os.geteuid() == 0:
-            pytest.skip("root bypasses file permissions")
+        """An unwritable file on a writable mount is refused as read-only."""
         target = tmp_path / "config.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
-        target.chmod(0o444)
+        _deny_write_access(monkeypatch, target)
         self._fake_read_only(monkeypatch, set())
 
-        try:
-            with pytest.raises(PermissionError):
-                replace_file_atomically(target, _NEW)
-        finally:
-            target.chmod(0o600)
+        with pytest.raises(PermissionError):
+            replace_file_atomically(target, _NEW)
+        assert target.read_bytes() == _ORIGINAL.encode("utf-8")
 
 
 class TestModeAndOwner:
