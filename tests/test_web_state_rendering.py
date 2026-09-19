@@ -56,7 +56,7 @@ from saneless.vocabulary import (
 )
 from saneless.web import app as app_module
 from saneless.web.app import create_app
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, poll_until
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1127,22 +1127,6 @@ _OWED_WRITE_BUDGET = 2.0
 _DISK_ERROR = "disk I/O error"
 
 
-def _poll_until(predicate: Callable[[], bool], budget: float) -> bool:
-    """
-    Poll ``predicate`` until it holds or ``budget`` seconds pass.
-
-    Returns:
-        Whether the predicate held before the budget ran out.
-
-    """
-    deadline = time.monotonic() + budget
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return predicate()
-
-
 class _BreakableWrite:
     """
     A job store write that raises ``sqlite3.OperationalError`` while broken.
@@ -1217,7 +1201,7 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
         job_id = job_store.list_recent(limit=1)[0].id
 
         # The guard's write, then at least one idle-tick retry.
-        assert _poll_until(lambda: finishes.calls >= 2, _OWED_WRITE_BUDGET)
+        assert poll_until(lambda: finishes.calls >= 2, _OWED_WRITE_BUDGET)
         stuck = _only_scan_button(tc.get("/api/jobs/current/status").text)
         assert "disabled" in stuck.group("attrs")
         assert tc.get("/health").status_code == 200
@@ -1228,7 +1212,7 @@ def test_status_poll_reenables_the_scan_button_once_an_owed_failure_is_written(
             text = tc.get("/api/jobs/current/status").text
             return "disabled" not in _only_scan_button(text).group("attrs")
 
-        assert _poll_until(button_enabled, _OWED_WRITE_BUDGET)
+        assert poll_until(button_enabled, _OWED_WRITE_BUDGET)
         finished = job_store.get_job(job_id)
         assert finished is not None
         assert finished.state is JobState.ERROR
@@ -1266,7 +1250,7 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
         assert response.status_code == 200
         job_id = job_store.list_recent(limit=1)[0].id
 
-        assert _poll_until(
+        assert poll_until(
             lambda: tc.get("/health").status_code == 503, _OWED_WRITE_BUDGET
         )
         assert tc.get("/health").json() == {
@@ -1278,7 +1262,7 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
 
         broken.clear()
 
-        assert _poll_until(
+        assert poll_until(
             lambda: tc.get("/health").status_code == 200, _OWED_WRITE_BUDGET
         )
 
@@ -1286,7 +1270,7 @@ def test_health_reports_the_job_store_failing_while_an_owed_failure_cannot_be_wr
             text = tc.get("/api/jobs/current/status").text
             return "disabled" not in _only_scan_button(text).group("attrs")
 
-        assert _poll_until(button_enabled, _OWED_WRITE_BUDGET)
+        assert poll_until(button_enabled, _OWED_WRITE_BUDGET)
         finished = job_store.get_job(job_id)
         assert finished is not None
         assert finished.state is JobState.ERROR

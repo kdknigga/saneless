@@ -22,7 +22,6 @@ import json
 import logging
 import re
 import sqlite3
-import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
@@ -57,7 +56,7 @@ from saneless.web import errors
 from saneless.web.app import create_app
 from saneless.web.routes import OWNER_COOKIE
 from saneless.worker import ScanWorker
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, poll_until
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1166,14 +1165,14 @@ def test_a_refused_submit_whose_rejection_write_fails_is_recorded_by_the_worker(
     assert response.status_code == status
     assert "/api/jobs/history" not in response.text
 
-    deadline = time.monotonic() + _OWED_REJECTION_BUDGET
-    newest = store.list_recent(limit=1)
-    while newest[0].state is not JobState.ERROR and time.monotonic() < deadline:
-        time.sleep(0.01)
-        newest = store.list_recent(limit=1)
-    assert newest[0].state is JobState.ERROR, (
-        f"row still {newest[0].state.value} after {_OWED_REJECTION_BUDGET}s"
-    )
+    def newest_state() -> JobState:
+        """Read the state of the most recent job row."""
+        return store.list_recent(limit=1)[0].state
+
+    assert poll_until(
+        lambda: newest_state() is JobState.ERROR, _OWED_REJECTION_BUDGET
+    ), f"row still {newest_state().value} after {_OWED_REJECTION_BUDGET}s"
+
     _assert_rejected_row(fast_tick_client, error)
     assert store.latest_run_job() is None
 

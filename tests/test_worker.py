@@ -46,7 +46,7 @@ from saneless.vocabulary import (
     classify_error,
 )
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend, scan_batch
+from tests.conftest import StubScannerBackend, poll_until, scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -387,10 +387,10 @@ def _captured_flip_coordinator(
         worker.start()
         job = store.create_job(profile_name, "Coordinator Capture")
         worker.submit(job)
-        for _ in range(100):
-            if captured and _get(store, job.id).state in TERMINAL_STATES:
-                break
-            time.sleep(0.02)
+        assert poll_until(
+            lambda: bool(captured) and _get(store, job.id).state in TERMINAL_STATES,
+            2.0,
+        ), "the job never finished with its flip coordinator captured"
         worker.stop()
     finally:
         store.close()
@@ -624,12 +624,9 @@ class TestScanWorkerManualDuplex:
             job = store.create_job("duplex", "Track Test")
             worker.submit(job)
 
-            # Wait for AWAITING_FLIP
-            for _ in range(50):
-                time.sleep(0.05)
-                if worker.current_job_id is not None:
-                    break
-
+            assert poll_until(lambda: worker.current_job_id is not None, 2.5), (
+                "the worker never picked up the job"
+            )
             assert worker.current_job_id == job.id
 
             # Continue counts only at the flip prompt (CR-01), so reach it first.
@@ -2090,22 +2087,6 @@ class _StoreFault:
         return self._original(*args, **kwargs)
 
 
-def _wait_until(predicate: Callable[[], bool], budget: float) -> bool:
-    """
-    Poll ``predicate`` until it holds or ``budget`` seconds pass.
-
-    Returns:
-        Whether the predicate held before the budget ran out.
-
-    """
-    deadline = time.monotonic() + budget
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return predicate()
-
-
 # Idle ticks a test that asserts nothing happened waits for before asserting.
 _QUIET_TICKS = 10
 
@@ -2298,7 +2279,7 @@ class TestWorkerGuard:
         worker = worker_for(store)
         try:
             worker.start()
-            pruned = _wait_until(lambda: len(fault.calls) >= 1, _STATE_BUDGET)
+            pruned = poll_until(lambda: len(fault.calls) >= 1, _STATE_BUDGET)
             jobs = [store.create_job("default", f"Around Prune {n}") for n in (1, 2)]
             for job in jobs:
                 worker.submit(job)
@@ -2368,7 +2349,7 @@ class TestWorkerGuard:
         worker = worker_for(store)
         try:
             worker.start()
-            pruned = _wait_until(lambda: len(spy.calls) >= 1, 1.0)
+            pruned = poll_until(lambda: len(spy.calls) >= 1, 1.0)
         finally:
             worker.stop()
             store.close()
@@ -2397,7 +2378,7 @@ class TestWorkerGuard:
             worker.start()
             # A window in which nothing may happen, measured in idle ticks the
             # worker actually took rather than in wall time (IN-03).
-            ticked = _wait_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
+            ticked = poll_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
         finally:
             worker.stop()
             store.close()
@@ -2478,9 +2459,7 @@ class TestWorkerGuard:
             worker.start()
             job = _submit_jobs(worker, store, 1)[0]
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            drained = _wait_until(
-                lambda: not worker._unrecorded_failures, _STATE_BUDGET
-            )
+            drained = poll_until(lambda: not worker._unrecorded_failures, _STATE_BUDGET)
         finally:
             worker.stop()
             store.close()
@@ -2621,7 +2600,7 @@ class TestWorkerGuard:
             worker.start()
             jobs = _submit_jobs(worker, store, stranded)
             # The guard's write per job, then at least two idle-tick retries.
-            retried = _wait_until(
+            retried = poll_until(
                 lambda: len(finishes.calls) >= stranded + 2, _STATE_BUDGET
             )
             still_active = [_get(store, job.id).is_active for job in jobs]
@@ -2635,7 +2614,7 @@ class TestWorkerGuard:
             ]
             latest = store.latest_run_job()
             # The flush drops an entry just after its write lands.
-            assert _wait_until(lambda: not worker._unrecorded_failures, _STATE_BUDGET)
+            assert poll_until(lambda: not worker._unrecorded_failures, _STATE_BUDGET)
             with worker._unrecorded_lock:
                 owed_after = dict(worker._unrecorded_failures)
             health_after = worker.health
@@ -2731,7 +2710,7 @@ class TestOwedRejections:
             worker.start()
             job = store.create_job("default", "Refused While Failing")
             worker.owe_rejection(job.id, "queue full")
-            retried = _wait_until(lambda: len(finishes.calls) >= 3, _STATE_BUDGET)
+            retried = poll_until(lambda: len(finishes.calls) >= 3, _STATE_BUDGET)
             state_before = _get(store, job.id).state
             failures_before = worker._consecutive_loop_failures
             health_before = worker.health
@@ -2797,7 +2776,7 @@ class TestOwedRejections:
                 )
                 return written and not worker._unrecorded_failures
 
-            recorded = _wait_until(all_recorded, _MANY_OWED_BUDGET)
+            recorded = poll_until(all_recorded, _MANY_OWED_BUDGET)
             rows = [_get(store, job_id) for job_id in ids]
             owed_after = dict(worker._unrecorded_failures)
         finally:
@@ -2861,7 +2840,7 @@ class TestOwedRejections:
             assert entered.wait(_STATE_BUDGET)
             worker.owe_rejection(job.id, second_error)
             release.set()
-            rewritten = _wait_until(
+            rewritten = poll_until(
                 lambda: (
                     _get(store, job.id).error == second_error
                     and not worker.owed_rejection_ids()
@@ -2911,7 +2890,7 @@ class TestOwedRejections:
         try:
             worker.start()
             guard = _submit_jobs(worker, store, 1)[0]
-            assert _wait_until(
+            assert poll_until(
                 lambda: guard.id in worker._unrecorded_failures, _STATE_BUDGET
             )
             refused = store.create_job("default", "Refused")
@@ -2919,7 +2898,7 @@ class TestOwedRejections:
             owed = worker.owed_rejection_ids()
             finishes.heal()
             wait_for_state(store, refused.id, JobState.ERROR, _STATE_BUDGET)
-            assert _wait_until(lambda: not worker.owed_rejection_ids(), _STATE_BUDGET)
+            assert poll_until(lambda: not worker.owed_rejection_ids(), _STATE_BUDGET)
             after = worker.owed_rejection_ids()
         finally:
             worker.stop()
@@ -3046,11 +3025,11 @@ class TestOwedWriteStreak:
             else:
                 job = store.create_job("default", "Refused While Broken")
                 worker.owe_rejection(job.id, "queue full")
-            degraded = _wait_until(
+            degraded = poll_until(
                 lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET
             )
             assert degraded
-            probed = _wait_until(lambda: len(probes.calls) >= 1, _STATE_BUDGET)
+            probed = poll_until(lambda: len(probes.calls) >= 1, _STATE_BUDGET)
             streak = worker._failed_flush_ticks
             loop_failures = worker._consecutive_loop_failures
             row = _get(store, job.id)
@@ -3111,20 +3090,18 @@ class TestOwedWriteStreak:
         try:
             worker.start()
             first = _owe_one_write(worker, store, debt)
-            degraded = _wait_until(
+            degraded = poll_until(
                 lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET
             )
             assert degraded
             owed_while_degraded = worker.owed_rejection_ids()
             finishes.heal()
-            recovered = _wait_until(
+            recovered = poll_until(
                 lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
             )
             row = wait_for_state(store, first.id, JobState.ERROR, _STATE_BUDGET)
             # The flush drops an entry just after its write lands.
-            drained = _wait_until(
-                lambda: not worker._unrecorded_failures, _STATE_BUDGET
-            )
+            drained = poll_until(lambda: not worker._unrecorded_failures, _STATE_BUDGET)
             with worker._unrecorded_lock:
                 owed_after = dict(worker._unrecorded_failures)
             owed_rejections_after = worker.owed_rejection_ids()
@@ -3184,7 +3161,7 @@ class TestOwedWriteStreak:
             worker.start()
             job = _submit_jobs(worker, store, 1)[0]
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            reset = _wait_until(lambda: worker._failed_flush_ticks == 0, _STATE_BUDGET)
+            reset = poll_until(lambda: worker._failed_flush_ticks == 0, _STATE_BUDGET)
             health = worker.health
         finally:
             worker.stop()
@@ -3239,9 +3216,7 @@ class TestOwedWriteStreak:
             first_row = wait_for_state(store, first.id, JobState.ERROR, _STATE_BUDGET)
             second = _submit_jobs(worker, store, 1)[0]
             second_row = wait_for_state(store, second.id, JobState.ERROR, _STATE_BUDGET)
-            drained = _wait_until(
-                lambda: not worker._unrecorded_failures, _STATE_BUDGET
-            )
+            drained = poll_until(lambda: not worker._unrecorded_failures, _STATE_BUDGET)
             health = worker.health
         finally:
             worker.stop()
@@ -3309,7 +3284,7 @@ def _degrade(worker: ScanWorker, store: JobStore) -> list[Job]:
 
     """
     jobs = _submit_jobs(worker, store, _DEGRADING_JOBS)
-    assert _wait_until(lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET)
+    assert poll_until(lambda: worker.health is WorkerHealth.DEGRADED, _STATE_BUDGET)
     return jobs
 
 
@@ -3441,11 +3416,11 @@ class TestWorkerDegradedHealth:
         try:
             worker.start()
             _degrade(worker, store)
-            probed = _wait_until(lambda: len(probes.calls) >= 3, _STATE_BUDGET)
+            probed = poll_until(lambda: len(probes.calls) >= 3, _STATE_BUDGET)
             still_degraded = worker.health
             updates.heal()
             probes.heal()
-            recovered = _wait_until(
+            recovered = poll_until(
                 lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
             )
             job = store.create_job("default", "After Recovery")
@@ -3495,7 +3470,7 @@ class TestWorkerDegradedHealth:
             jobs = _degrade(worker, store)
             for fault in faults:
                 fault.heal()
-            recovered = _wait_until(
+            recovered = poll_until(
                 lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
             )
             rows = [_get(store, job.id) for job in jobs]
@@ -3534,7 +3509,7 @@ class TestWorkerDegradedHealth:
             at_start = worker.health
             rejected = worker.submit(store.create_job("default", "Too Soon"))
             probes.heal()
-            recovered = _wait_until(
+            recovered = poll_until(
                 lambda: worker.health is WorkerHealth.HEALTHY, _STATE_BUDGET
             )
             row = _get(store, orphan.id)
@@ -3564,7 +3539,7 @@ class TestWorkerDegradedHealth:
             worker.start()
             # A window in which nothing may happen, measured in idle ticks the
             # worker actually took rather than in wall time (IN-03).
-            ticked = _wait_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
+            ticked = poll_until(lambda: ticks() >= _QUIET_TICKS, _STATE_BUDGET)
             health = worker.health
         finally:
             worker.stop()
@@ -3876,7 +3851,7 @@ class TestStartupProfileGeneration:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
         finally:
@@ -3917,7 +3892,7 @@ class TestStartupProfileGeneration:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
             in_memory_default = worker.get_profile("default")
@@ -3985,7 +3960,7 @@ class TestStartupProfileGeneration:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: bool(_worker_records(caplog, logging.INFO, "Added: ")),
                 _STATE_BUDGET,
             )
@@ -4029,7 +4004,7 @@ class TestStartupProfileGeneration:
         assert worker._settings.config_path is None
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
         finally:
@@ -4069,7 +4044,7 @@ class TestStartupProfileGeneration:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
         finally:
@@ -4104,7 +4079,7 @@ class TestStartupProfileGeneration:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
         finally:
@@ -4149,7 +4124,7 @@ class TestStartupProfileGeneration:
         worker._settings._config_path = config_file
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
             in_memory = worker.get_profile("flatbed")
@@ -4183,7 +4158,7 @@ class TestStartupProfileGeneration:
         worker._settings._config_path = config_file
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
         finally:
@@ -4216,7 +4191,7 @@ class TestStartupProfileGeneration:
         worker._settings._config_path = config_file
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
         finally:
@@ -4266,7 +4241,7 @@ class TestStartupProfileGeneration:
         worker._settings._config_path = config_file
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
             alive = worker.is_alive
@@ -4303,7 +4278,7 @@ class TestStartupProfileGeneration:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            warned = _wait_until(
+            warned = poll_until(
                 lambda: bool(_worker_records(caplog, logging.WARNING, "ScanError")),
                 _STATE_BUDGET,
             )
@@ -4333,7 +4308,7 @@ class TestStartupProfileGeneration:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            warned = _wait_until(
+            warned = poll_until(
                 lambda: bool(
                     _worker_records(caplog, logging.WARNING, "no scanners found")
                 ),
@@ -4459,9 +4434,11 @@ class TestStartupProfileGeneration:
             assert entered.wait(_STATE_BUDGET)
             job = store.create_job("default", "First Job")
             submitted = worker.submit(job)
-            # A bounded hold: long enough for a worker that skipped ahead to
-            # the queue to have started the job.
-            time.sleep(0.2)
+            # A fixed window, not a poll: this is a negative observation.  The
+            # worker is blocked on ``release``, so nothing should happen; the
+            # window only gives a worker that skipped ahead to the queue time to
+            # start the job and be caught.  The Event is never set.
+            threading.Event().wait(0.2)
             held_state = _get(store, job.id).state
             runs_while_held = len(seen)
             release.set()
@@ -5411,7 +5388,7 @@ class TestFrontPages:
             worker.continue_flip(job.id)
             scanner.release_pass_b.set()
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            cleared = _wait_until(lambda: worker.front_pages is None, _STATE_BUDGET)
+            cleared = poll_until(lambda: worker.front_pages is None, _STATE_BUDGET)
         finally:
             scanner.release_pass_b.set()
             worker.stop()
@@ -5438,7 +5415,7 @@ class TestFrontPages:
             worker.continue_flip(job.id)
             scanner.release_pass_b.set()
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            cleared = _wait_until(lambda: worker.front_pages is None, _STATE_BUDGET)
+            cleared = poll_until(lambda: worker.front_pages is None, _STATE_BUDGET)
         finally:
             scanner.release_pass_b.set()
             worker.stop()
@@ -5465,7 +5442,7 @@ class TestFrontPages:
             at_prompt = worker.front_pages
             worker.abort_flip(job.id)
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            cleared = _wait_until(lambda: worker.front_pages is None, _STATE_BUDGET)
+            cleared = poll_until(lambda: worker.front_pages is None, _STATE_BUDGET)
         finally:
             scanner.release_pass_b.set()
             worker.stop()
@@ -5602,7 +5579,7 @@ class TestScannerGate:
             worker.continue_flip(job.id)
             scanner.release_pass_b.set()
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            freed = _wait_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
+            freed = poll_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
         finally:
             scanner.release_pass_b.set()
             worker.stop()
@@ -5628,7 +5605,7 @@ class TestScannerGate:
             worker.continue_flip(job.id)
             scanner.release_pass_b.set()
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            freed = _wait_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
+            freed = poll_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
         finally:
             scanner.release_pass_b.set()
             worker.stop()
@@ -5653,7 +5630,7 @@ class TestScannerGate:
             wait_for_state(store, job.id, JobState.AWAITING_FLIP, _STATE_BUDGET)
             worker.abort_flip(job.id)
             finished = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
-            freed = _wait_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
+            freed = poll_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
         finally:
             scanner.release_pass_b.set()
             worker.stop()
@@ -5683,7 +5660,7 @@ class TestScannerGate:
             assert scanner.entered.wait(_PASS_B_GATE_CEILING)
             during = _gate_is_free(worker)
             scanner.release_devices.set()
-            freed = _wait_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
+            freed = poll_until(lambda: _gate_is_free(worker), _STATE_BUDGET)
         finally:
             scanner.release_devices.set()
             worker.stop()
@@ -5766,7 +5743,7 @@ class TestProfileStorage:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
             storage = worker.profile_storage
@@ -5789,7 +5766,7 @@ class TestProfileStorage:
         assert worker._settings.config_path is None
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
             storage = worker.profile_storage
@@ -5830,7 +5807,7 @@ class TestProfileStorage:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
             storage = worker.profile_storage
@@ -5877,7 +5854,7 @@ class TestProfileStorage:
         worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
         try:
             worker.start()
-            generated = _wait_until(
+            generated = poll_until(
                 lambda: "flatbed" in worker.profile_names(), _STATE_BUDGET
             )
             storage = worker.profile_storage
