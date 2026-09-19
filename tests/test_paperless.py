@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
 import shutil
@@ -176,6 +177,28 @@ def _always_refused(_request: httpx.Request) -> httpx.Response:
 # ---------------------------------------------------------------------------
 # Upload tests
 # ---------------------------------------------------------------------------
+
+
+class TestClientSignature:
+    """The client's injection seam and its timeout are part of its API shape."""
+
+    def test_transport_is_a_keyword_only_parameter_defaulting_to_none(self) -> None:
+        """``transport`` mirrors ``httpx.Client(transport=...)``, keyword-only."""
+        parameter = inspect.signature(PaperlessClient.__init__).parameters["transport"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+
+    def test_the_private_transport_spelling_is_gone(self) -> None:
+        """No ``_transport`` parameter remains alongside the public one."""
+        assert (
+            "_transport" not in inspect.signature(PaperlessClient.__init__).parameters
+        )
+
+    def test_poll_task_timeout_is_required_and_keyword_only(self) -> None:
+        """The configured task timeout is the only source; there is no default."""
+        parameter = inspect.signature(PaperlessClient.poll_task).parameters["timeout"]
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
 
 
 class TestUploadDocument:
