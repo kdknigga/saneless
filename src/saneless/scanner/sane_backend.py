@@ -6,13 +6,18 @@ physical scanners through the SANE (Scanner Access Now Easy) library.
 Key safety measures:
 - sane.init() runs once per process, behind a module-level guard: the first
   SaneBackend built initialises SANE and every later one does not, and after
-  shutdown() a later init is allowed again (Pitfall #1, HARD-05, D-17)
-- Device handles managed via context manager with cancel+close (Pitfall #4),
-  skipped entirely while a read is still inside SANE (HARD-03, D-12/D-13)
-- No progress callbacks to snap() (Pitfall #2)
-- Source option validated against device capabilities (Pitfall #5)
+  shutdown() a later init is allowed again.  python-sane leaks file
+  descriptors on every init/exit cycle, so re-initialising per backend would
+  grow the process's fd count without bound.
+- Device handles managed via context manager with cancel+close, so an
+  exception cannot skip the close and leave the scanner reporting "device
+  busy" to the next scan; skipped entirely while a read is still inside SANE,
+  because SANE allows no other call on a device while a read is outstanding
+- No progress callbacks to snap(): the C extension does not validate them,
+  and a wrong signature or a raising callback segfaults the process
+- Source option validated against device capabilities
 - Every blocking acquisition, fed or flatbed, runs on a daemon thread under
-  one per-page timeout, with inline validation (HARD-03, HARD-04)
+  one per-page timeout, with inline validation
 """
 
 from __future__ import annotations
@@ -78,7 +83,7 @@ def require_sane() -> None:
     Import python-sane, or fail at once with an install hint.
 
     This is the single python-sane availability check the SANE-using CLI
-    commands run first (D-05).  A failure is a setup problem, not a scan
+    commands run first.  A failure is a setup problem, not a scan
     problem, so it is a ``ConfigError`` and exits 2 through that category.
 
     It is never called at import, so ``--help`` and every command that does not
@@ -114,7 +119,7 @@ def require_sane() -> None:
 #
 # It bounds one page on BOTH acquisition paths: one fed sheet's next(iterator)
 # and one flatbed sheet's start()+snap() alike, with no second constant and no
-# config key of its own (HARD-04, D-14).
+# config key of its own.
 _DEFAULT_PAGE_TIMEOUT_SECONDS: float = 120.0
 
 # How long the timeout path waits for a cancelled read to come back before it
@@ -131,8 +136,8 @@ _DEFAULT_PAGE_TIMEOUT_SECONDS: float = 120.0
 #   read then sees EOF.
 # - A `net` backend with a dead link will not return within ANY grace. A
 #   longer wait therefore buys nothing except a later error message for the
-#   operator, and D-13 already makes the resulting wedge recover by itself the
-#   moment the read does come back.
+#   operator, and the resulting wedge already recovers by itself the moment
+#   the read does come back.
 #
 # 10 s also sits inside pytest-timeout's 60 s, so a test that hits the whole
 # grace still fails as an assertion rather than as a session timeout, and
@@ -149,7 +154,7 @@ _CANCEL_GRACE_SECONDS: float = 10.0
 # 80x100 mm bed, the least data a real device in this project produces. That is
 # nearly 7x this threshold, and a 300 dpi colour page is 3.3 MB. The check
 # therefore demonstrably does not fire on legitimate small pages, which is the
-# only way a size floor can be safe (24-RESEARCH.md Finding 2, Q2).
+# only way a size floor can be safe.
 _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 
 # Upper bound on the number of pages one scan_pages() call will acquire.
@@ -159,32 +164,31 @@ _MIN_PAGE_BYTES: int = 10_000  # 10 KB
 # start()/snap() keep succeeding, so the iterator re-scans the platen and the
 # loop never terminates on its own -- reproduced live against a Flatbed source.
 # The per-page timeout is no defence: a scan that succeeds satisfies it every
-# iteration. This cap is what stops that loop (Phase 21 security finding W-01).
+# iteration. This cap is what stops that loop.
 #
 # WHAT IT DOES NOT BOUND: memory. At A4 300 dpi colour a page is roughly 26 MB,
 # so at 500 pages a backend that accumulated them would hold roughly 13 GB.
 # This cap must not be described as a memory bound, because it is not one: the
 # bound is that a page is handed to the sink and forgotten as it arrives, so
-# peak memory is a small constant number of decoded pages whatever this cap is
-# (HARD-01, D-01). The two are independent, and raising this one is not a
-# memory decision.
+# peak memory is a small constant number of decoded pages whatever this cap is.
+# The two are independent, and raising this one is not a memory decision.
 #
 # WHAT IT STILL BOUNDS, INDIRECTLY: spool disk. Every page this loop acquires
 # is written to the job's spool, so the page count fixed here is also the
 # ceiling on how much of the workspace one runaway pass can consume. It is a
 # ceiling, not the check: SpooledPageSink._check_room_for refuses each page
 # individually, against that page's decoded size plus the operator's
-# min_free_space_mb reserve, and that is what actually protects the disk
-# (D-07). This cap's contribution is only that the loop cannot keep asking
+# min_free_space_mb reserve, and that is what actually protects the disk.
+# This cap's contribution is only that the loop cannot keep asking
 # forever while that check does its work.
 #
-# SCOPE: the cap is per scan_pages() call. Phase 25's two manual-duplex passes
+# SCOPE: the cap is per scan_pages() call. The two manual-duplex passes
 # each call scan_pages() separately, so this is a per-pass cap, not a per-job
 # one.
 #
 # The value matches the largest production ADF hoppers, so no real stack should
-# reach it. That is assumption A1 in 24-RESEARCH.md, recorded at LOW confidence
-# and cheap to revise precisely because the error names the cap.
+# reach it. That is a judgement about hardware, not a measurement, and it is
+# cheap to revise precisely because the error names the cap.
 _MAX_ADF_PAGES: int = 500
 
 # The one message reported when a feeder produced no pages at all.
@@ -294,8 +298,8 @@ def _as_span(constraint: object) -> tuple[float, float, float] | None:
     The constraint comes from the device, so nothing guarantees it is one of
     the three shapes SANE defines. A tuple of the wrong arity, or one whose
     members are not numbers, yields None rather than a guessed value, and this
-    never raises: a malformed constraint must not take down a capability query
-    (T-24-27).
+    never raises: a malformed constraint must not take down a capability
+    query.
 
     Args:
         constraint: The constraint object the device reported.
@@ -326,7 +330,7 @@ def _constraint(raw_options: list[tuple], name: str) -> _OptionConstraint:
     This is the single place any option constraint is parsed. Two call sites
     used to carry their own copy of the word-list case and neither handled the
     other two shapes, so a range-reporting device's answer was discarded twice
-    over -- the whole of N-01. A third copy would be that defect's third life.
+    over. A third copy would give that defect a third life.
 
     Presence and constraint are reported separately because they are different
     facts; see :class:`_OptionConstraint`.
@@ -396,8 +400,8 @@ def _units_per_mm(unit: GeometryUnit, resolution: int) -> float | None:
         unit: The unit the device reports for its scan-area options.
         resolution: The resolution the device actually reported, in dpi.  Read
             back from the device, never the requested value -- converting with
-            a resolution the device silently refused would reintroduce M-16's
-            substitution one layer further down.
+            a resolution the device silently refused would reintroduce the
+            silent resolution substitution one layer further down.
 
     Returns:
         The number of device units in one millimetre, or None when saneless
@@ -432,7 +436,7 @@ def _geometry_unit(raw_options: list[tuple]) -> GeometryUnit | None:
     Read the unit the device reports for its scan-area options.
 
     The unit lives at index 5 of the option tuple, which the geometry
-    arithmetic used to ignore entirely, assuming millimetres (N-03).
+    arithmetic used to ignore entirely, assuming millimetres.
 
     ``br-x`` is the option read: the four scan-area options describe one box,
     and a device reports one unit for all of them.
@@ -521,7 +525,7 @@ def _area_matches(
     tolerance: float,
 ) -> bool:
     """
-    Check that the device kept the scan area it was given (D-19).
+    Check that the device kept the scan area it was given.
 
     Accepting an assignment is not the same as honouring it.  Measured: writing
     A4's 210 mm to a device whose ``br-x`` range is ``(0.0, 200.0, 1.0)`` stores
@@ -582,7 +586,7 @@ def _set_geometry(
     no device call, no validation, no raise (``sane.py:188``).  So on a scanner
     with no scan-area options, ``dev.br_y = 297.0`` *succeeds*, this function
     used to return True, and ``_maybe_crop`` never ran: ``paper_size`` was
-    silently ignored and the user got a full-bed scan (M-15).  Asking the
+    silently ignored and the user got a full-bed scan.  Asking the
     device's own option list first is the only way to tell the two cases apart.
 
     Args:
@@ -625,14 +629,14 @@ def _set_geometry(
     except Exception as exc:
         # Name what was swallowed.  A device that reports the options and then
         # refuses them is a different fault from one that never had them, and
-        # a bare "does not support geometry" hid which had happened (M-15).
+        # a bare "does not support geometry" hid which had happened.
         logger.warning(
             "Scanner rejected the scan-area options (%s), will crop after scanning",
             exc,
         )
         return False
     # A device can accept all four assignments and still quietly shrink the
-    # area, so what it reports back is what decides (D-19).
+    # area, so what it reports back is what decides.
     if not _area_matches(actual, expected, _AREA_TOLERANCE_MM * scale):
         return False
     logger.info(
@@ -661,7 +665,7 @@ def _maybe_crop(
             Deliberately not the requested one: the crop arithmetic and the
             device's real sampling rate have to agree, or a silently clamped
             resolution yields a cut-off page even when this fallback runs
-            exactly as intended (M-16).
+            exactly as intended.
         geometry_set: Whether the scan area was already set on the device.
 
     Returns:
@@ -684,7 +688,7 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     That byte count is arithmetic over the page's dimensions and band count,
     never a materialised copy of its raw buffer: measuring the length of one
     copied a whole 26 MB page to learn a number that width, height and band
-    count already give (M-08's cheap win, D-06). The product is exact for
+    count already give. The product is exact for
     ``L`` and ``RGB``, which are the only two modes a SANE ``snap()`` produces
     on either path here. It would be eight times too large for mode ``"1"``,
     where Pillow packs eight pixels into a byte, and a bilevel page would
@@ -696,9 +700,9 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     Blank-page policy deliberately does not live here. The profile exposes
     ``enable_empty_page_detection`` along with user-visible mean and stddev
     thresholds, so a page discarded at this level would be discarded behind the
-    user's back and would make that toggle untrue -- which is precisely what
-    M-14 found, and what broke manual-duplex parity. Content is judged in
-    exactly one place, ``pipeline._drop_empty_pages`` (D-05).
+    user's back and would make that toggle untrue -- which is precisely how
+    real pages used to vanish, and what broke manual-duplex parity. Content is
+    judged in exactly one place, ``pipeline._drop_empty_pages``.
 
     Args:
         page_image: The acquired page.
@@ -824,7 +828,7 @@ _READER_THREAD_PREFIX = "sane-read-"
 
 def _ensure_initialised(host: str) -> object:
     """
-    Initialise SANE, once per process, whoever asks (HARD-05, D-17).
+    Initialise SANE, once per process, whoever asks.
 
     ``sane_init`` is a process-global call, not a per-object one, so the
     guard is here rather than in ``SaneBackend.__init__``: three one-shot CLI
@@ -838,14 +842,14 @@ def _ensure_initialised(host: str) -> object:
     rather than silence.  The sane-net backend reads ``SANE_NET_HOSTS`` when it
     is initialised and never again, so the second host is not merely redundant:
     it does nothing at all, while the operator who configured it has every
-    reason to believe it is in effect (N-04).  Only the hostnames from the
+    reason to believe it is in effect.  Only the hostnames from the
     operator's own configuration are named, which the existing INFO line
     already logs; no credential is in scope here (ASVS V7).
 
     The failure translation is ``ScanError`` because a SANE that will not start
     is a scanning failure the caller reports, and it catches ``Exception``
     because python-sane raises ``_sane.error``, ``RuntimeError`` or
-    ``AttributeError`` with no shared base (D-08).  A failed init records
+    ``AttributeError`` with no shared base.  A failed init records
     nothing, so the next construction tries again rather than assuming an
     initialised SANE that is not there.
 
@@ -889,7 +893,7 @@ def _ensure_initialised(host: str) -> object:
             version = _ensure_sane().init()
         except Exception as exc:
             # python-sane raises _sane.error, RuntimeError or AttributeError,
-            # with no shared base, so the boundary catches Exception (D-08).
+            # with no shared base, so the boundary catches Exception.
             init_msg = f"Could not initialise SANE: {describe(exc)}"
             raise ScanError(init_msg) from exc
         _INIT.done = True
@@ -916,7 +920,7 @@ def _read_outstanding() -> bool:
 
 def shutdown() -> None:
     """
-    Shut SANE down for this process, or explain why it was not (D-18).
+    Shut SANE down for this process, or explain why it was not.
 
     Called at an entry point's shutdown and nowhere else: never from a request
     path, and never from an interpreter-exit hook, which would run while a
@@ -933,7 +937,7 @@ def shutdown() -> None:
     - **A read has not returned.** ``sane_exit`` closes every open handle by
       specification, and ``PySane_exit`` runs holding the GIL while
       ``sane_read`` has released it -- exactly the close-while-reading sequence
-      ``_open_device`` already refuses on one handle (D-12, D-13), applied to
+      ``_open_device`` already refuses on one handle, applied to
       all of them at once.  The process is ending anyway, so an un-exited SANE
       costs nothing next to a segfault on the way out.
 
@@ -988,7 +992,7 @@ def _cancel_and_settle(dev: SaneDevice, done: threading.Event, grace: float) -> 
     the control wire, issued before the local data fd is closed -- so against a
     saned that has stopped answering it hangs whoever calls it.  Whoever calls
     it here is the worker thread running the whole job, so the grace would
-    bound nothing at all (``backend/net.c``; 29-RESEARCH.md Pitfall 2).
+    bound nothing at all (``backend/net.c``).
 
     It is sound to call at all only because ``sane_cancel`` releases the GIL,
     as ``sane_read`` does, which is what lets one Python thread cancel what
@@ -1142,7 +1146,7 @@ def _name_wedged_device(dev: SaneDevice, device_id: str) -> bool:
 
 def _refuse_if_wedged(device_id: str, operation: str) -> None:
     """
-    Refuse a new SANE operation while a read is still outstanding (D-13).
+    Refuse a new SANE operation while a read is still outstanding.
 
     Called before anything is opened, because the refusal is worthless
     otherwise: ``sane_open`` on a device whose previous read never returned is
@@ -1179,7 +1183,7 @@ def _settle_or_wedge(
     dev: SaneDevice, done: threading.Event, grace: float, label: str
 ) -> bool:
     """
-    Run the D-12 tail: cancel, wait out the grace, then close or wedge.
+    Run the cancel tail: cancel, wait out the grace, then close or wedge.
 
     Args:
         dev: The handle the blocked read is inside.
@@ -1215,7 +1219,7 @@ def _acquire_with_timeout(
     grace: float = _CANCEL_GRACE_SECONDS,
 ) -> Image.Image:
     """
-    Run one blocking SANE acquisition under a wall-clock bound (D-11, D-12).
+    Run one blocking SANE acquisition under a wall-clock bound.
 
     ``signal.alarm`` is not safe off the main thread, so the bound has to come
     from a second thread either way.  What changed is *which* second thread.
@@ -1240,23 +1244,23 @@ def _acquire_with_timeout(
     measured on real libsane, a cancelled ``snap()`` hands back a truncated
     image rather than raising -- 3779x242 of a full page -- and that image
     clears ``_validate_page_image``, so "use it, it arrived after all" would
-    put one more page in the PDF than the error message claims (Pitfall 1).
+    put one more page in the PDF than the error message claims.
 
     A ``KeyboardInterrupt`` arriving while this waits takes the identical path
     and is then re-raised, so Ctrl-C during a read leaves the device in the
-    same state a timeout does (D-15).
+    same state a timeout does.
 
     ``reader.start()`` is inside the guarded block, so an interrupt landing
     once the thread exists cannot abandon it with no cancel ever fired.  The
-    handler then asks whether there *is* a reader before running the D-12 tail,
-    because the other end of that window is real too and worse: an interrupt
-    arriving before the thread was created would otherwise fire ``dev.cancel()``
-    on a handle with no read in progress, block for the whole grace on an event
-    nothing will ever set, and then mark a wedge that nothing could ever clear
-    -- ``_release_wedge`` is only called from a reader's ``finally``, and there
-    would be no reader.  Every later ``scan_pages`` and ``get_capabilities``
-    would refuse and ``shutdown()`` would permanently skip ``sane.exit()``
-    (WR-05).
+    handler then asks whether there *is* a reader before running the cancel
+    tail, because the other end of that window is real too and worse: an
+    interrupt arriving before the thread was created would otherwise fire
+    ``dev.cancel()`` on a handle with no read in progress, block for the whole
+    grace on an event nothing will ever set, and then mark a wedge that nothing
+    could ever clear -- ``_release_wedge`` is only called from a reader's
+    ``finally``, and there would be no reader.  Every later ``scan_pages`` and
+    ``get_capabilities`` would refuse and ``shutdown()`` would permanently skip
+    ``sane.exit()``.
 
     ``started`` and ``is_alive()`` are both consulted because they answer for
     different halves of that window: the flag for an interrupt after
@@ -1337,13 +1341,12 @@ def _acquire_pages(
     Spool the validated ADF pages, and report how many sheets were skipped.
 
     A page flows device -> validate -> crop -> ``sink.add`` -> record, one at a
-    time, and no list of images exists anywhere along it (HARD-01, D-01).  The
+    time, and no list of images exists anywhere along it.  The
     only image-typed name that outlives a loop iteration is the one page being
     acquired, which is why the live-page high-water mark a 12-page scan
     measures is 2 and not 1: the loop variable still references page *k-1*
     while page *k* is being read.  That is left alone deliberately -- a ``del``
-    added to make the number 1 would exist only to satisfy a test
-    (29-RESEARCH.md Finding 4).
+    added to make the number 1 would exist only to satisfy a test.
 
     ``multi_scan()`` returns an iterator object and cannot raise, so the call
     is not guarded.  python-sane's ``_SaneIterator.__next__`` converts exactly
@@ -1356,22 +1359,23 @@ def _acquire_pages(
     that produced no pages at all genuinely has no paper in it.  Do not
     re-introduce a first-page special case; inferring "the feeder is empty"
     from "it failed on iteration zero" is what made a jam, an open cover and a
-    busy device all tell the operator to load paper (M-11, D-03).
+    busy device all tell the operator to load paper.
 
     A page that fails its integrity checks is skipped and counted, not fatal:
-    one corrupt sheet must not fail a fifty-sheet job (D-06).  A batch in which
+    one corrupt sheet must not fail a fifty-sheet job.  A batch in which
     *every* fed page was rejected does raise, because returning an empty list
     would reach ``assemble_pdf([])`` and record a job that produced nothing as
     a success.
 
-    **D-08, accepted and recorded deliberately.** One skipped front makes
-    ``len(front_pages) != len(back_pages)``, which ``pipeline.py`` routes to
+    **A skipped page may break manual-duplex parity, and that is accepted
+    deliberately.** One skipped front makes ``len(front_pages) !=
+    len(back_pages)``, which ``pipeline.py`` routes to
     ``_handle_duplex_mismatch`` -- two partial PDFs plus a warning instead of
     one interleaved document.  That is the honest response: a page the device
     could not read genuinely means the two manual-duplex passes no longer
-    correspond.  SCNR-03's "manual duplex page parity survives" forbids parity
-    broken by *policy* -- the backend silently discarding a clean blank back
-    page -- and not parity broken by a page that could not be read at all.
+    correspond.  The promise that manual-duplex page parity survives forbids
+    parity broken by *policy* -- the backend silently discarding a clean blank
+    back page -- and not parity broken by a page that could not be read at all.
     Parity broken that way is reported, never hidden.
 
     Args:
@@ -1392,7 +1396,7 @@ def _acquire_pages(
     Returns:
         The records the sink returned, in acquisition order, and how many fed
         sheets were skipped for failing their integrity checks.  The count
-        leaves the backend inside D-12's ``ScanBatch`` and by no other route.
+        leaves the backend inside ``ScanBatch`` and by no other route.
 
     Raises:
         FeederEmptyError: If the feeder produced no pages at all.
@@ -1405,12 +1409,12 @@ def _acquire_pages(
 
     records: list[PageRecord] = []
     page_num = 0
-    # Returned to the caller now rather than kept local: surfacing this count is
-    # D-07, and its channel is D-12's ScanBatch and no second mechanism. It is
-    # deliberately kept out of the pipeline's blank-page removal count: Phase 23
-    # defined that field as empty-page detection and Phase 30 renders it to
-    # users as pages removed for being blank, so reporting a corrupt page
-    # through it would be a new small lie in a phase about removing them.
+    # Returned to the caller rather than kept local: the operator is told how
+    # many sheets were skipped, not left to find it in a log line, and
+    # ScanBatch is that count's one channel. It is deliberately kept out of the
+    # pipeline's blank-page removal count: that field means empty-page
+    # detection and is shown to users as pages removed for being blank, so
+    # reporting a corrupt page through it would tell them something untrue.
     rejected_pages = 0
     try:
         while True:
@@ -1458,14 +1462,15 @@ def _acquire_pages(
             # Cropped here, per page, instead of over a finished list
             # afterwards.  The sink is where this page stops being ours, so
             # everything that has to happen to it happens before the hand-off
-            # -- and what is spooled is exactly what the PDF embeds (D-03).
+            # -- and what is spooled is exactly what the PDF embeds.
             records.append(sink.add(crop(page_image)))
     finally:
-        # Pitfall #1's ``del iterator`` was a cleanup; on the wedge path it is
-        # the hazard, and this branch is that reversal. Dropping the last
+        # ``del iterator`` is a cleanup everywhere except the wedge path, where
+        # it is the hazard, and this branch is that reversal. Dropping the last
         # reference runs ``_SaneIterator.__del__``, which calls
         # ``device.cancel()`` -- a SANE call on a handle a read is still
-        # inside, which is the one thing D-12 exists to prevent. When the
+        # inside, which is the one thing the timeout sequence exists to
+        # prevent. When the
         # device is wedged the record takes the reference instead, and the
         # reader thread drops it when it finally returns. On every other path
         # the ``del`` is exactly what it always was.
@@ -1477,7 +1482,7 @@ def _acquire_pages(
 
     # Paper was fed but none of it was readable. This is a distinct condition
     # from an empty feeder and is reported distinctly: the operator needs to
-    # hear "unreadable", not "load paper" (M-14, D-06).
+    # hear "unreadable", not "load paper".
     if rejected_pages == page_num:
         all_rejected_msg = (
             f"All {page_num} page(s) fed were unreadable and were skipped "
@@ -1502,24 +1507,24 @@ def _resolve_feeder_source(available_sources: list[str], requested: str) -> str:
     hardware manual duplex exists for.
 
     Whether a source feeds, and whether it scans both sides, is asked of
-    ``classify_source`` and nothing else; Phase 24's D-01 makes it the only
-    classification rule.
+    ``classify_source`` and nothing else, so no call site can classify a
+    source differently from another.
 
     A feeder that scans both sides (``SourceKind.FEEDER_DUPLEX``) is never
-    used (WR-02). Each pass through it returns 2N pages, the two passes'
-    counts agree, ``_interleave_duplex`` pairs a front+back sequence with a
-    reversed back+front one, and the job reports ``DONE`` with 4N pages in
-    scrambled order. This narrows D-02's "``FEEDER`` or ``FEEDER_DUPLEX``"
-    wording on purpose: when the operator named a both-sides source and a
-    single-sided one exists, the single-sided one is used with a WARNING
-    naming both; when every feeder scans both sides, manual duplex is refused
-    before any page, because a WARNING beside a green ``DONE`` on an
-    unattended appliance is still the silent corruption D-02 exists to stop.
+    used. Each pass through it returns 2N pages, the two passes' counts agree,
+    ``_interleave_duplex`` pairs a front+back sequence with a reversed
+    back+front one, and the job reports ``DONE`` with 4N pages in scrambled
+    order. So "any feeder" is deliberately not good enough: when the operator
+    named a both-sides source and a single-sided one exists, the single-sided
+    one is used with a WARNING naming both; when every feeder scans both sides,
+    manual duplex is refused before any page, because a WARNING beside a green
+    ``DONE`` on an unattended appliance is still silent corruption.
 
     There is deliberately no ``Auto`` fallback here. ``Auto`` does not feed,
     and with ``auto_source_mode`` at its ``"flatbed"`` default substituting it
-    takes one platen snapshot per pass and reports success -- C-01's exact
-    failure. A device with no feeder is refused instead, before any page.
+    takes one platen snapshot per pass and reports success, so manual duplex
+    silently does not work at all. A device with no feeder is refused instead,
+    before any page.
 
     Args:
         available_sources: The source names the device reports. Empty when
@@ -1585,7 +1590,7 @@ def _resolve_source(
     profile's ``auto_source_mode``, which defaults to ``"flatbed"``: a profile
     asking for ``"ADF Duplex"`` on a device offering only ``Flatbed`` and
     ``Auto`` quietly returns one page from a whole stack.  The comparable
-    resolution substitution has been visible since M-16, and a substitution
+    resolution substitution is already logged as a WARNING, and a substitution
     that silently drops pages cannot be the quieter of the two.
 
     Args:
@@ -1613,12 +1618,13 @@ def _resolve_source(
 
     # A disjoint early branch, not a guard inside the flow below: returning
     # here makes the Auto substitution structurally unreachable for manual
-    # duplex rather than merely conditioned off, and that substitution is
-    # C-01's mechanism. A device with no source option at all feeds without
+    # duplex rather than merely conditioned off, and that substitution is what
+    # turned each pass into one platen snapshot reported as success. A device
+    # with no source option at all feeds without
     # being told and nothing is assigned to it, so the both-sides concern
     # cannot arise; the simplex path already trusts the classifier on the
-    # configured name for such a device, and manual duplex does the same
-    # (WR-03), which keeps a legacy "Manual Duplex" profile working there.
+    # configured name for such a device, and manual duplex does the same,
+    # which keeps a legacy "Manual Duplex" profile working there.
     if resolve_feeder:
         if not has_source_option:
             if classify_source(requested).uses_feeder:
@@ -1660,7 +1666,7 @@ def _configure_device(
     device_id: str,
 ) -> int:
     """
-    Assign the scan options to the open device, source first (D-11).
+    Assign the scan options to the open device, source first.
 
     **Order is load-bearing.**  ``sane.py:188-213`` reloads every option
     descriptor when a ``set_option`` reports ``INFO_RELOAD_OPTIONS``, and a
@@ -1673,9 +1679,9 @@ def _configure_device(
     The resolution is then read back, because SANE substitutes silently:
     measured against the real ``test`` backend, ``5000`` comes back as
     ``1200.0`` and ``0`` as ``1.0``, with no error and no signal to the caller.
-    Since Phase 23 made the resolution authoritative for the PDF's page
-    geometry, an unnoticed substitution yields both a mis-cropped page and a
-    wrong MediaBox, so the substitution has to be visible (M-16, T-24-15).
+    Because the resolution is authoritative for the PDF's page geometry, an
+    unnoticed substitution yields both a mis-cropped page and a wrong
+    MediaBox, so the substitution has to be visible.
 
     Args:
         dev: Open SANE device handle.
@@ -1695,7 +1701,7 @@ def _configure_device(
             ``_sane.error`` for a bad value and ``AttributeError`` for an
             inactive option -- or the resolution cannot be read back.  The
             message names the option, the value (``!r``, so control characters
-            are escaped) and the device, and the original is the cause (D-08).
+            are escaped) and the device, and the original is the cause.
 
     """
     # One try per assignment, in order, so the message names the option that
@@ -1744,7 +1750,7 @@ def _read_options(dev: SaneDevice, device_id: str) -> list:
 
     Raises:
         ScanError: If the device cannot report its options, naming the device
-            and chained to the original (D-08).
+            and chained to the original.
 
     """
     try:
@@ -1768,7 +1774,7 @@ class _PageBudget:
     constraint.
 
     Both defaults are the module constants the ADF path uses, so "one sheet is
-    one sheet, whichever way it was presented" (D-14) is expressed in the
+    one sheet, whichever way it was presented" is expressed in the
     default rather than merely asserted about it.
 
     Attributes:
@@ -1803,16 +1809,16 @@ def _snap_flatbed(
     ``_DEFAULT_PAGE_TIMEOUT_SECONDS`` a fed sheet gets and with no config key
     of its own: one sheet is one sheet, whichever way it was presented, and a
     platen that stops answering used to hang the job forever while the
-    identical failure on a feeder was reported in two minutes (HARD-04, D-14).
+    identical failure on a feeder was reported in two minutes.
 
     The validate-crop-spool sequence that follows is deliberately outside that
     guard: it is the same sequence the feeder path runs, so one page reaches
-    the sink the same way however it was acquired (HARD-04's validation half).
+    the sink the same way however it was acquired.
 
     The one message python-sane's own ADF iterator treats as the end of the
     feed (``sane.py:130``) is mapped to ``FeederEmptyError`` by the same exact
     string test, so a device routed here while reporting an empty feeder still
-    tells the operator to load paper (Phase 24 D-03).  Every other failure --
+    tells the operator to load paper.  Every other failure --
     ``_sane.error`` from ``start()``, ``RuntimeError("Scanner returned no
     data")`` from ``snap()`` -- is a ``ScanError`` naming the device.
 
@@ -1827,8 +1833,8 @@ def _snap_flatbed(
             reason ``_acquire_pages``' are: a test proving the
             unresponsive-cancel path must not wait out the module's real ten
             seconds, and without an injectable grace there could be no fast
-            flatbed equivalent of ``test_did_not_respond_to_cancel`` at all
-            (WR-10).
+            flatbed equivalent of ``test_did_not_respond_to_cancel`` at
+            all.
 
     Returns:
         The record the sink returned for the one scanned page.
@@ -1837,7 +1843,7 @@ def _snap_flatbed(
         FeederEmptyError: If SANE reports the feeder out of documents.
         ScanError: If the sheet did not arrive within the timeout, if the page
             fails its integrity checks, or for any other failure, chained to
-            the original (D-08).
+            the original.
 
     """
 
@@ -1895,8 +1901,8 @@ class SaneDevice(Protocol):
 
     # Read-only in python-sane: __setattr__ rejects this name outright.
     # Declaring it a property is what makes that read-only-ness true for the
-    # type checkers as well, rather than only at runtime.  D-19 reads it back
-    # to catch an area the device silently clamped.
+    # type checkers as well, rather than only at runtime.  The geometry check
+    # reads it back to catch an area the device silently clamped.
     @property
     def area(self) -> tuple[tuple[float, float], tuple[float, float]]: ...
 
@@ -1943,7 +1949,7 @@ class SaneBackend(ScannerBackend):
 
     def close(self) -> None:
         """
-        Shut this process's SANE down, through the backend abstraction (D-18).
+        Shut this process's SANE down, through the backend abstraction.
 
         The work is ``shutdown()``'s, and it is process-level rather than
         per-object: what is released is the one ``sane_init`` this process
@@ -1972,7 +1978,7 @@ class SaneBackend(ScannerBackend):
         standard forbids any other operation while one is outstanding, and
         ``sane_close`` additionally runs holding the GIL while ``sane_read``
         has released it, so a close racing a blocked read is the one sequence
-        python-sane cannot survive (D-12).  The handle is released later by
+        python-sane cannot survive.  The handle is released later by
         the reader thread itself, and until then the wedge record holds it.
 
         Args:
@@ -2008,7 +2014,7 @@ class SaneBackend(ScannerBackend):
                 except Exception:
                     # Logged, never raised: an exception from close() here
                     # would replace the one that ended the scan, which is the
-                    # error the operator needs to see (T-28-16).
+                    # error the operator needs to see.
                     logger.warning(
                         "Could not close scanner %s", device_id, exc_info=True
                     )
@@ -2018,22 +2024,22 @@ class SaneBackend(ScannerBackend):
         Enumerate available scanning devices.
 
         Refuses while a read is outstanding, exactly as ``scan_pages`` and
-        ``get_capabilities`` do (D-13). ``sane_get_devices`` is not a
-        handle-level call, but the phase's own rule is "never call another SANE
-        operation while one is outstanding", and on the ``net`` backend
+        ``get_capabilities`` do. ``sane_get_devices`` is not a handle-level
+        call, but the rule is "never call another SANE operation while one is
+        outstanding", and on the ``net`` backend
         enumeration is an RPC on the same control wire the stuck read is on.
 
         The path is not hypothetical: ``_resolve_device`` calls this whenever
         ``scanner.device`` is empty -- the documented auto-detection default --
         and it does so *before* ``scan_pages``, which is to say before the
-        refusal that would otherwise have stopped the job (WR-04).
+        refusal that would otherwise have stopped the job.
 
         Returns:
             List of DeviceInfo objects for each discovered device.
 
         Raises:
             ScanError: If a previous read has not returned, in which case no
-                SANE call is made at all (D-13); or if SANE cannot enumerate
+                SANE call is made at all; or if SANE cannot enumerate
                 devices, chained to its error.
 
         """
@@ -2075,7 +2081,7 @@ class SaneBackend(ScannerBackend):
 
         Raises:
             ScanError: If a previous read has not returned, in which case no
-                SANE call is made at all (D-13).
+                SANE call is made at all.
 
         """
         _refuse_if_wedged(device_id, "read the capabilities of")
@@ -2104,15 +2110,16 @@ class SaneBackend(ScannerBackend):
         """
         Spool the validated ADF pages, with a per-page timeout.
 
-        Per user decision: "Wrap ADF iteration with per-page timeout (not per-job)
-        -- cancel if single page takes longer than 2-3x expected duration."
+        The timeout is per page, not per job: one page is cancelled if it takes
+        longer than two to three times its expected duration, so a long stack
+        is never cut short merely for being long.
 
         The work lives in the module-level ``_acquire_pages``, which runs each
         blocking ``next(iterator)`` on a fresh ``daemon=True`` thread and waits
         on an event: ``signal.alarm`` is not safe off the main thread, and the
         thread pool this replaced left non-daemon workers that
         ``concurrent.futures`` joins at interpreter exit, so one stuck read
-        stopped the process from exiting at all (D-11).
+        stopped the process from exiting at all.
 
         Args:
             dev: Open SANE device handle.
@@ -2137,15 +2144,15 @@ class SaneBackend(ScannerBackend):
         Opens the device, validates the requested source against
         available options, sets scan parameters, and returns the finished
         batch. Uses multi_scan() for ADF sources, snap() for flatbed.
-        Does NOT pass a progress callback to snap() to prevent
-        segfaults (Pitfall #2).
+        Does NOT pass a progress callback to snap(): python-sane does not
+        validate callbacks, and a bad one segfaults the process.
 
         Acquisition is eager, and that is what lets the two facts this backend
         measures leave it at all: a generator hands back images only, and its
         return value is discarded by the ``list()`` every caller wrapped it in.
 
         Eager is not the same as accumulating, though, and this method holds no
-        list of images on either path (HARD-01, D-01). Each page is validated,
+        list of images on either path. Each page is validated,
         cropped and handed to ``sink`` as it arrives, and what comes back is a
         record: where the page was written and what was measured about it. The
         sink belongs to the caller because where a page lands is a pipeline
@@ -2156,7 +2163,7 @@ class SaneBackend(ScannerBackend):
         of that, not a goal -- the handle previously stayed open until the
         generator was drained or garbage-collected. The one exception is a
         read that never returned: the handle is then deliberately left open
-        and this method refuses outright until it does (D-12, D-13).
+        and this method refuses outright until it does.
 
         Args:
             device_id: SANE device identifier string.
@@ -2171,7 +2178,7 @@ class SaneBackend(ScannerBackend):
 
         Raises:
             ScanError: If a previous read has not returned, in which case no
-                SANE call is made at all (D-13); if the device does not
+                SANE call is made at all; if the device does not
                 support the requested source; if a page times out; if a
                 flatbed scan returns a page that fails its integrity checks --
                 unlike a fed sheet, there is no next page to skip to -- or if
@@ -2205,8 +2212,8 @@ class SaneBackend(ScannerBackend):
             )
 
             # Constrain the scan area to the paper size, if the device reports
-            # the options to do it with (D-09), scaling by the unit it reports
-            # (D-10) at the resolution it actually chose (D-11).
+            # the options to do it with, scaling by the unit it reports at the
+            # resolution it actually chose.
             geometry_set = _set_geometry(
                 dev, settings.paper_size, raw_options, actual_resolution
             )
