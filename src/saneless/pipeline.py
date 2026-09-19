@@ -73,7 +73,7 @@ class PipelineEvent(StrEnum):
         second pass of a manual-duplex scan is persisted as its own busy state
         and the job leaves ``AWAITING_FLIP`` the moment pass B starts -- which
         is what takes the flip prompt, and its Continue and Abort controls, off
-        the screen while the backs feed (DPLX-06).
+        the screen while the backs feed.
 
         Note that the returned state is not an instruction to write it:
         ``DONE`` is terminal and the worker writes it only after the
@@ -108,7 +108,7 @@ logger = logging.getLogger(__name__)
 
 # The spool's subdirectory inside the job workspace, and the per-pass prefix
 # each acquisition pass's file names carry: ``a-0001.png`` for a simplex job or
-# a duplex job's fronts, ``b-0001.png`` for its backs (D-02).  The labels are
+# a duplex job's fronts, ``b-0001.png`` for its backs.  The labels are
 # for telling two passes apart in one directory; document order comes from the
 # record list and never from these names.
 #
@@ -148,7 +148,7 @@ _PARTIAL_DIR_NAME: Final = "partial"
 # spelling is the one ``_handle_duplex_mismatch`` already delivers, and the two
 # paths have to agree: an operator looking in ``failed/`` should not have to
 # learn that a pass-B failure and a page-count mismatch name their halves
-# differently (D-10).  ``(partial)`` is the simplex and single-pass form.
+# differently.  ``(partial)`` is the simplex and single-pass form.
 _PARTIAL_SUFFIX: Final = "(partial)"
 _FRONTS_SUFFIX: Final = "(fronts)"
 _BACKS_SUFFIX: Final = "(backs)"
@@ -177,8 +177,8 @@ class FlipCoordinator(ABC):
     observable in the tree: ``Protocol`` describes shapes this project does not
     own (``SaneDevice`` for python-sane's handle, ``_SettingsFactory`` for
     pydantic's constructor), while ``ABC`` defines seams the project implements
-    itself (``ScannerBackend``).  DPLX-04's lowercase "protocol" means
-    "contract", not ``typing.Protocol``.
+    itself (``ScannerBackend``).  Where this seam is called a "protocol" in
+    lower case, the word means "contract", not ``typing.Protocol``.
     """
 
     @abstractmethod
@@ -188,7 +188,7 @@ class FlipCoordinator(ABC):
 
         An implementation answers once, and its answer is final: whichever of
         Continue, Abort or the clock resolves the wait first is what this
-        returns, and a signal arriving after that is dropped (D-16).
+        returns, and a signal arriving after that is dropped.
 
         Args:
             timeout: The longest the wait may hold the calling thread, in
@@ -209,12 +209,11 @@ class FlipCoordinator(ABC):
         An ``ABORTED`` answer usually means someone gave up at the prompt, and
         the pipeline reports that as a cancellation.  But a coordinator can
         also answer ``ABORTED`` because its prompt broke -- a read error such as
-        an I/O error or undecodable input (WR-08) -- and nobody chose to stop.
-        End of input, a closed terminal included, is not such a break: it is
-        the operator's cancel (D-02).  Such a
-        coordinator returns the exception here, so the pipeline records a
-        failure rather than a cancellation without a fourth ``FlipOutcome``
-        member (Phase 25 D-09, D-02).
+        an I/O error or undecodable input -- and nobody chose to stop.  End of
+        input, a closed terminal included, is not such a break: it is the
+        operator's cancel.  Such a coordinator returns the exception here, so
+        the pipeline records a failure rather than a cancellation without a
+        fourth ``FlipOutcome`` member.
 
         Concrete rather than abstract, so a coordinator whose aborts are always
         an operator's needs no change.
@@ -233,10 +232,10 @@ class FlipAnswerSlot:
 
     The web worker's and the CLI's coordinators differ in where an answer comes
     from -- the Continue and Abort routes, or a terminal prompt -- but not in
-    how it is claimed.  That claim lives here, once, so a fix to it reaches both
-    (IN-02).  This is a concrete helper the coordinators compose, not a second
-    seam: ``FlipCoordinator`` stays the only contract the pipeline waits on
-    (D-09), and anything a coordinator adds on top -- the web one's arming, for
+    how it is claimed.  That claim lives here, once, so a fix to it reaches
+    both.  This is a concrete helper the coordinators compose, not a second
+    seam: ``FlipCoordinator`` stays the only contract the pipeline waits on,
+    and anything a coordinator adds on top -- the web one's arming, for
     instance -- stays in that coordinator.
 
     The answer is written under the lock *before* the event is set, so a waiter
@@ -261,7 +260,7 @@ class FlipAnswerSlot:
         """
         Claim the answer with ``outcome`` if nothing has claimed it yet.
 
-        An offer that loses leaves the slot and the event untouched (D-16).
+        An offer that loses leaves the slot and the event untouched.
 
         Args:
             outcome: The answer this caller is offering.
@@ -370,7 +369,7 @@ class PipelineRequest:
     status_callback: Callable[[PipelineEvent], None] | None = None
     thumbnail_callback: Callable[[str], None] | None = None
     # How many pages a manual-duplex pass produced, announced while the run is
-    # still going (Amendment A-4).  Its own channel, mirroring
+    # still going.  Its own channel, mirroring
     # ``thumbnail_callback``, because the three alternatives are all worse:
     # ``status_callback`` is ``Callable[[PipelineEvent], None]`` and carries no
     # payload, so ``SCANNING_REVERSE`` cannot carry ``len(front_pages)``;
@@ -382,7 +381,8 @@ class PipelineRequest:
     pass_count_callback: Callable[[str, int], None] | None = None
     # One field, one atomic answer.  This replaced a flip event and an abort
     # event, where an Abort set both so the waiter woke and then had to inspect
-    # the second to learn why -- the two-step M-02's dead Abort lived in.
+    # the second to learn why -- the two-step that once left an Abort pressed
+    # during pass B doing nothing at all.
     flip_coordinator: FlipCoordinator | None = None
 
 
@@ -479,7 +479,7 @@ def _open_workspace(
     Each of the three steps can raise a raw ``OSError`` -- a full disk, or a
     ``tmp_dir`` removed since start-up.  That is the setup problem
     ``validate_settings_dirs`` reports at start-up, so it is a ``ConfigError``
-    here too, not an UNKNOWN error the CLI would call a saneless bug (IN-07).
+    here too, not an UNKNOWN error the CLI would call a saneless bug.
     Only the workspace's creation is guarded: an ``OSError`` from the scan run
     inside it keeps its own translation.
 
@@ -509,12 +509,12 @@ def _require_pages(batch: ScanBatch) -> None:
     """
     Raise ScanError if a scanner pass came back with no pages at all.
 
-    This is the pipeline's own contract check against any ``ScannerBackend``
-    (EXC-03, N-06). Without it an empty batch was misreported as "all pages
+    This is the pipeline's own contract check against any ``ScannerBackend``.
+    Without it an empty batch was misreported as "all pages
     blank" with empty-page detection on, and leaked img2pdf's bare
     ``ValueError`` with detection off or on an empty manual-duplex half.
 
-    It never pre-empts Phase 24 D-03's truthful feeder message: the SANE
+    It never pre-empts the backend's truthful feeder message: the SANE
     backend raises its own, more specific ``FeederEmptyError`` for an empty
     feeder, or an all-unreadable ``ScanError``, before it ever returns a
     batch. What it guarantees is that ``_drop_empty_pages`` and
@@ -560,21 +560,21 @@ def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     anything in that directory: every file in it is a document that reached
     paper and never reached paperless-ngx, and automatically deleting one
     would be precisely the data loss the preservation guard exists to prevent.
-    The control here is operator visibility, not enforcement (T-23-29). A
+    The control here is operator visibility, not enforcement. A
     retention policy would need a config key and a user story that do not
     exist yet.
 
     **This function must never raise.** It is called from inside the
     preservation guard's exception handler, while a delivery exception is
     already in flight; a raise here would replace the real failure with a
-    bookkeeping error and lose the message OUTC-04 requires the job to carry.
+    bookkeeping error and lose the failure message the job has to carry.
     Any filesystem trouble -- a permission change, a race, the directory
     disappearing underneath us -- ends the check silently instead.
 
     ``failed_dir`` holds two kinds of artefact, and both count. A preserved
     scan is usually a PDF, but an assembly failure has no PDF to keep and
-    preserves the spooled page files themselves, as a job-keyed *directory*
-    (D-10). Counting only ``*.pdf`` would let a directory fill up with those
+    preserves the spooled page files themselves, as a job-keyed *directory*.
+    Counting only ``*.pdf`` would let a directory fill up with those
     and report nothing, which is precisely the silence this warning exists to
     break -- so a directory counts as one preserved scan and contributes its
     whole recursive size to the total.
@@ -629,10 +629,10 @@ def _preservation_failure_message(
     failure ``_preserving``'s own docstring warns about -- told nothing was
     saved when some of it was -- and it is the more expensive half of the
     pair: an operator who believes it rescans and never looks in ``failed/``,
-    which saneless never prunes (WR-02).
+    which saneless never prunes.
 
     The wording when nothing survived is left exactly as it was, because that
-    sentence is true and is quoted in this phase's own record.
+    sentence is true.
 
     Args:
         exc: The original failure the guard was covering.
@@ -664,7 +664,7 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
     poll, still *inside* that directory, and relocates every PDF it was given
     to ``failed_dir`` before letting the exception continue. A guard opened
     outside the temporary directory would run after the scan was already gone,
-    which is the trap this whole phase is named after.
+    which is the very loss this guard exists to prevent.
 
     **The caught type is ``Exception``, deliberately.** The guard is narrow in
     *span* -- it covers the upload and the poll and nothing else -- and broad
@@ -672,8 +672,8 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
     scan most needs keeping, and nothing is masked, because the exception is
     always re-raised with the original chained on ``__cause__``.
     ``KeyboardInterrupt`` and ``SystemExit`` derive from ``BaseException`` and
-    pass through untouched. D-06's 2026-09-11 amendment settled this against
-    the narrower ``PaperlessError`` alternative; narrowing it later would be a
+    pass through untouched. Catching only the narrower ``PaperlessError`` was
+    weighed and rejected for exactly that reason; narrowing it later would be a
     change of behaviour, not a tidy-up, so please do not relitigate it here.
 
     The relocation goes through ``shutil`` rather than a bare rename:
@@ -801,7 +801,7 @@ class _SpoolLedger:
 
         An empty pass is dropped rather than preserved as a zero-page PDF:
         ``assemble_pdf`` cannot build one, and a pass B that fed nothing is
-        exactly the case D-10 answers by keeping the fronts alone.
+        exactly the case that is answered by keeping the fronts alone.
 
         Returns:
             One ``(title suffix, records)`` pair per non-empty pass, in pass
@@ -831,8 +831,8 @@ def _preserve_partial_passes(
     """
     Assemble every spooled pass, unfiltered, and move it into ``failed_dir``.
 
-    Nothing is blank-filtered, following the duplex-mismatch precedent (D-08 of
-    Phases 23 and 24): an anomaly is delivered whole for a human to look at,
+    Nothing is blank-filtered, following the duplex-mismatch precedent: an
+    anomaly is delivered whole for a human to look at,
     and ``_drop_empty_pages`` would additionally raise "All pages were blank"
     on an all-faint batch and destroy the very evidence being preserved.
 
@@ -840,7 +840,7 @@ def _preserve_partial_passes(
     directory, for the reason ``_preserving``'s docstring sets out at length:
     handed a directory, ``shutil`` raises ``shutil.Error`` on a basename
     collision, and ``shutil.Error`` does not inherit from ``OSError``, so it
-    would escape the caller's handler and mask the scan failure (T-29-35).
+    would escape the caller's handler and mask the scan failure.
     ``shutil`` rather than ``Path.rename`` because ``tmp_dir`` and ``data_dir``
     are independent settings that may sit on different filesystems.
 
@@ -855,7 +855,7 @@ def _preserve_partial_passes(
             out-parameter rather than a return value on purpose: when this
             raises on the second of two passes, the caller still has to be
             able to say which one it kept, and a return value it never
-            received cannot tell it (WR-02).
+            received cannot tell it.
 
     Raises:
         OSError: If the directory cannot be created or a move fails.
@@ -883,13 +883,13 @@ def _preserving_partial_scan(
     failed_dir: Path,
 ) -> Iterator[None]:
     """
-    Keep the pages an interrupted scan already spooled, then re-raise (D-09).
+    Keep the pages an interrupted scan already spooled, then re-raise.
 
     A jam on page 40 of a 50-sheet stack used to discard the 39 sheets the
     operator had already fed. The spool holds them, so this guard assembles
     them into a partial PDF under ``failed_dir`` and names the count and the
     destination in the exception it re-raises. Nothing is uploaded: a partial
-    document landing in paperless-ngx marked green was N-02's alternative and
+    document landing in paperless-ngx marked green was the alternative, and it
     was rejected, because the user rescans the stack anyway.
 
     **It is a separate helper and not a call to ``_preserving``, deliberately.**
@@ -902,7 +902,7 @@ def _preserving_partial_scan(
     **The exception's type survives**, via ``type(exc)(msg) from exc``. That is
     not a detail: ``classify_error`` reads the type, so a ``ScanError`` that
     stayed a ``ScanError`` still yields ``ErrorCategory.SCANNER`` and still
-    exits 1 at the CLI (Phase 28 D-07). A partial scan is a failed scan with
+    exits 1 at the CLI. A partial scan is a failed scan with
     its pages kept, not a new kind of failure.
 
     **A cancel preserves nothing, and that is settled.** See the first handler
@@ -935,7 +935,8 @@ def _preserving_partial_scan(
     try:
         yield
     except ScanCancelledError:
-        # D-10, and the first thing this guard does, deliberately.
+        # A cancel keeps nothing, and this is the first thing this guard
+        # checks, deliberately.
         # ScanCancelledError is an ordinary Exception -- a direct SanelessError
         # child rather than a ScanError -- so the broad `except Exception`
         # below would otherwise file a scan the operator chose to abandon into
@@ -960,13 +961,12 @@ def _preserving_partial_scan(
             )
         except (OSError, PdfError) as keep_exc:
             msg = _preservation_failure_message(exc, keep_exc, failed_dir, destinations)
-            # D-10's page-file fallback, which until now was wired only around
+            # The page-file fallback, which until now was wired only around
             # run_pipeline's main assembly.  The realistic trigger is the one
-            # that caused the partial in the first place: D-07's per-page check
-            # refuses a page because the disk is full, this guard fires, and
-            # the partial PDF cannot be written either.  Without this, the N
-            # pages the guard exists to keep went out with the workspace
-            # (WR-03).
+            # that caused the partial in the first place: the per-page disk
+            # check refuses a page because the disk is full, this guard fires,
+            # and the partial PDF cannot be written either.  Without this, the
+            # N pages the guard exists to keep went out with the workspace.
             kept_pages = _preserve_page_files_after_partial_failure(
                 _spool_dir_of(tmp_path), failed_dir, request
             )
@@ -990,11 +990,11 @@ def _preserving_partial_scan(
 
 def _move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> None:
     """
-    Move every spooled page file into ``destination`` (D-10).
+    Move every spooled page file into ``destination``.
 
     A plain function and not only a guard, because two failure windows want
     it: the assembly ``_preserving_page_files`` wraps, and the *partial*
-    assembly ``_preserving_partial_scan`` falls back to it from (WR-03).
+    assembly ``_preserving_partial_scan`` falls back to it from.
 
     Each page moves to its own **explicit** destination path rather than into
     the bare directory, for the reason ``_preserving``'s docstring sets out:
@@ -1011,7 +1011,7 @@ def _move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> N
         moved: Appended to as each page lands, in name order. An out-parameter
             for the same reason ``_preserve_partial_passes`` has one: when this
             raises on page 7 of 12, the caller still has to be able to say
-            which six it kept (WR-02).
+            which six it kept.
 
     Raises:
         OSError: If the directory cannot be created or a move fails. Whatever
@@ -1039,12 +1039,12 @@ def _preserve_page_files_after_partial_failure(
     """
     Keep the page files when the *partial* PDF could not be built either.
 
-    D-10 wires the page-file fallback around ``run_pipeline``'s main assembly,
+    The page-file fallback is wired around ``run_pipeline``'s main assembly,
     and the partial assembly inside ``_preserve_partial_passes`` had none: a
     disk that filled up mid-scan refused the page, fired the partial-scan
     guard, refused the partial PDF as well, and every page was then deleted
-    with the workspace at exactly the moment the operator most needed them
-    (WR-03). The pages are what the guard exists to keep; the partial PDF was
+    with the workspace at exactly the moment the operator most needed them.
+    The pages are what the guard exists to keep; the partial PDF was
     only ever the convenient shape to keep them in.
 
     A pass that *did* assemble is therefore preserved twice over -- once as its
@@ -1087,16 +1087,16 @@ def _preserving_page_files(spool_dir: Path, destination: Path) -> Iterator[None]
     """
     Keep the spooled page files when the PDF they belong to cannot be built.
 
-    Phase 28 deferred this case; D-10 answers it. There is no PDF to preserve,
-    because building one is exactly what failed, so the pages themselves move
-    out of the workspace instead -- into a job-keyed directory under
+    There is no PDF to preserve, because building one is exactly what failed,
+    so the pages themselves move out of the workspace instead -- into a
+    job-keyed directory under
     ``failed/``, which is a second *kind* of artefact that directory has never
     held before. ``_warn_if_failed_dir_growing`` counts it.
 
     The destination's name is derived from ``build_pdf_filename``'s output, so
     the directory inherits that function's uniqueness argument unchanged: a UTC
-    timestamp, a truncated job-id segment and a sanitised, length-capped title
-    (T-29-34). Two jobs with the same title cannot collide, which matters here
+    timestamp, a truncated job-id segment and a sanitised, length-capped
+    title. Two jobs with the same title cannot collide, which matters here
     because a collision would bury one failure's pages inside another's.
 
     Args:
@@ -1148,7 +1148,7 @@ def _drop_empty_pages(
     Drop blank pages when the profile enables empty-page detection.
 
     Records in, records out. The judgement is made from the statistics each
-    record already carries, measured once when the page was spooled (D-06);
+    record already carries, measured once when the page was spooled;
     nothing here re-opens a page file, and nothing here deletes one.
 
     Args:
@@ -1186,8 +1186,8 @@ def _consume_dir_warning(destination: Path | None) -> str:
     """
     Describe what a consume-directory delivery cost the document.
 
-    OUTC-02 asks a fallback to be recorded "in the FALLBACK state with a
-    warning", and the two halves carry different information: the state says
+    A fallback is recorded in the FALLBACK state *with* a warning, because the
+    two halves carry different information: the state says
     the document took the other route, and the warning says what that route
     did not do.  ``docs/explanation/consume-directory-fallback.md`` documents
     the same consequence -- paperless-ngx applies its own matching rules to a
@@ -1264,9 +1264,9 @@ class _AcquisitionContext:
             the job's workspace, so the page files are deleted with it.
         min_free_space_mb: The reserve each per-page disk check keeps free for
             assembly -- the operator's own ``min_free_space_mb``, the same
-            value the up-front check uses (D-07).
+            value the up-front check uses.
         ledger: Where each pass registers its sink before it starts, so a
-            mid-batch fault can still find the pages already spooled (D-09).
+            mid-batch fault can still find the pages already spooled.
             Mutable, unlike the rest of this record; ``frozen=True`` stops the
             field being rebound, which is the guarantee that matters here.
 
@@ -1342,7 +1342,7 @@ def _rejected_pages_warning(count: int) -> str | None:
     Describe sheets the scanner could not read, and log them, if there were any.
 
     Worded so it cannot be mistaken for blank-page removal. The pipeline's blank
-    count is empty-page detection, which Phase 30 renders to users as pages
+    count is empty-page detection, which the web UI shows users as pages
     removed for being blank; a sheet that failed its integrity checks is a
     different event with a different remedy, and the two must not be conflated.
 
@@ -1376,7 +1376,7 @@ def _join_warnings(*parts: str | None) -> str | None:
     ``ScanResult`` has one warning field and a run can have more than one thing
     to report: a consume-directory fallback and an unreadable sheet are
     independent events that can both happen. Letting either overwrite the other
-    would be the kind of small silence this phase exists to remove.
+    would silently drop something the operator needed to know.
 
     Args:
         parts: The candidate warnings, any of which may be None.
@@ -1428,13 +1428,13 @@ def _handle_duplex_mismatch(
         on either one raises rather than returning -- a half that failed
         consumption is not a half that was delivered, and this path is already
         an anomaly, which makes it the one most likely to be holding a document
-        the user actually needs (D-08).
+        the user actually needs.
 
     Raises:
         PdfError: If either half cannot be assembled. The spooled page files of
             both passes are moved into a job-keyed directory under
             ``delivery.failed_dir`` first, and the message names the count and
-            that directory (D-10, CR-01).
+            that directory.
         PaperlessError: If either upload or either poll fails. Both partial
             PDFs are moved to ``delivery.failed_dir`` first, and the message
             names them.
@@ -1445,7 +1445,7 @@ def _handle_duplex_mismatch(
     # and the caller is already handing us the request it comes from.
     notify = request.status_callback or _noop_callback
     notify(PipelineEvent.ASSEMBLING)
-    # The page-file guard, over the assembly and over nothing else (D-10).
+    # The page-file guard, over the assembly and over nothing else.
     #
     # This arm returns early from run_pipeline, so neither guard that function
     # opens is in scope here: the partial-scan guard closes before the dispatch
@@ -1457,7 +1457,7 @@ def _handle_duplex_mismatch(
     # document the user actually needs".
     #
     # It stops at the assembly deliberately.  The upload below carries its own
-    # _preserving over both halves at once (D-08), and nesting this guard
+    # _preserving over both halves at once, and nesting this guard
     # around that one would preserve the same two passes twice: once as the two
     # partial PDFs, and again as the page files they were built from.
     with _preserving_page_files(
@@ -1487,7 +1487,7 @@ def _handle_duplex_mismatch(
     created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     title = request.title
     # One guard over both halves: they are a single document between them, so
-    # a failure on either one has to keep both (D-08).
+    # a failure on either one has to keep both.
     with _preserving([fronts_pdf, backs_pdf], delivery.failed_dir):
         fronts_result = paperless.upload_document(
             fronts_pdf,
@@ -1572,7 +1572,7 @@ def _finish_duplex_mismatch(
     notify(PipelineEvent.DONE)
     logger.info("Pipeline complete for %r (duplex mismatch recovery)", request.title)
     mismatch_pages = len(mismatch.fronts) + len(mismatch.backs)
-    # The mismatch path does not run _drop_empty_pages, on purpose (D-08), so
+    # The mismatch path does not run _drop_empty_pages, on purpose, so
     # pages_removed is a hardcoded 0.  A mismatched run is an anomaly sent to a
     # person for manual review, and a blank back side is evidence about why
     # the two passes disagreed.  Removing it would destroy the information the
@@ -1581,12 +1581,12 @@ def _finish_duplex_mismatch(
     # Filtering here was considered and rejected because it is dangerous:
     # _drop_empty_pages raises ScanError when every page is empty, so an
     # all-blank backs pass would fail the run and lose the fronts too.  That
-    # turns a recoverable anomaly into exactly the data loss Phase 23 spent a
-    # phase removing.  Because nothing is filtered, pages_removed=0 is simply
-    # true.
+    # turns a recoverable anomaly into exactly the data loss the preservation
+    # guards exist to prevent.  Because nothing is filtered, pages_removed=0 is
+    # simply true.
     #
-    # Per Phase 24 D-04, _MAX_ADF_PAGES applies to each scan_pages call, so to
-    # each pass: each pass can feed up to that many sheets.
+    # _MAX_ADF_PAGES applies to each scan_pages call, so to each pass: each
+    # pass can feed up to that many sheets.
     return ScanResult(
         outcome=ScanOutcome.SUCCESS if delivered else ScanOutcome.FALLBACK,
         pages_scanned=mismatch_pages,
@@ -1612,7 +1612,7 @@ def _interleave_duplex(
     Records are reordered, never files. Nothing is renamed, moved or rewritten
     on the spool: after this runs, the ``a-`` and ``b-`` file names no longer
     sort into document order at all, and that is precisely why document order
-    is the order of this list and never the directory's (D-02, D-04).
+    is the order of this list and never the directory's.
 
     Args:
         fronts: Front-side records from pass A.
@@ -1647,18 +1647,18 @@ def _scan_manual_duplex(
 
     Between the passes the run waits on ``flip.coordinator``, bounded by
     ``flip.timeout``, so a forgotten flip prompt fails this job instead of
-    parking the single worker thread forever (M-07).
+    parking the single worker thread forever.
 
     Each pass gets its own sink, labelled ``a`` for the fronts and ``b`` for
     the backs, so the two passes spool into names that can be told apart while
     sharing one directory. That is for debuggability only: document order comes
-    from the record list, never from those names (D-02). Only pass A's sink
+    from the record list, never from those names. Only pass A's sink
     carries the thumbnail callback, so the strip shows the first front and
-    fires exactly once per job (D-05).
+    fires exactly once per job.
 
     Both sinks register themselves with ``acquisition.ledger`` before their
     pass starts, so every ending below that is not the operator's own decision
-    keeps whatever reached the spool (D-10): a fault in either pass, an empty
+    keeps whatever reached the spool: a fault in either pass, an empty
     pass B, a flip-wait timeout and a broken flip prompt all leave pass A's
     fronts -- and any backs already fed -- as the two separately named partial
     PDFs the mismatch recovery also produces. The exception itself is unchanged
@@ -1680,7 +1680,7 @@ def _scan_manual_duplex(
     Raises:
         ScanCancelledError: If the operator aborts at the flip prompt.  Raised
             before pass B starts, and the one ending here that preserves
-            nothing, because somebody chose to stop (D-10).
+            nothing, because somebody chose to stop.
         ScanError: ``No pages were scanned`` if pass A returns no pages, before
             anyone is asked to flip; ``No back pages were scanned in pass B``,
             naming pass A's count, if pass B returns none, before the count
@@ -1696,7 +1696,7 @@ def _scan_manual_duplex(
 
     # Pass A: scan fronts.  The thumbnail callback rides on this sink, which
     # fires it while pass A is still running rather than after it returns
-    # (D-05) -- the page is in memory at that moment, and re-opening a 26 MB
+    # -- the page is in memory at that moment, and re-opening a 26 MB
     # page later to make a 300 px strip would be a second decode.
     front_sink = SpooledPageSink(
         directory=acquisition.spool_dir,
@@ -1706,13 +1706,13 @@ def _scan_manual_duplex(
     )
     # Registered before the pass runs, under the same ``(fronts)`` name the
     # mismatch recovery gives this half, so every way pass A's sheets can be
-    # lost from here on keeps them (D-10).  Registering afterwards would miss
+    # lost from here on keeps them.  Registering afterwards would miss
     # the case the registration exists for: a fault part-way through pass A.
     acquisition.ledger.register(_FRONTS_SUFFIX, front_sink)
     front_batch = scanner.scan_pages(
         acquisition.device_id, acquisition.settings, front_sink
     )
-    # Before the flip prompt, so nobody is asked to flip nothing (EXC-03).
+    # Before the flip prompt, so nobody is asked to flip nothing.
     _require_pages(front_batch)
     # Pass A's answer is the better resolution to preserve at than the one the
     # profile asked for, and it is the same value _duplex_resolution goes on to
@@ -1722,7 +1722,7 @@ def _scan_manual_duplex(
     logger.info("Pass A: scanned %d front page(s)", len(front_pages))
     # Before AWAITING_FLIP, and so before SCANNING_REVERSE: an observer that
     # re-renders on either of those events must already hold the number, or the
-    # render it triggers shows the count one transition late (D-33).
+    # render it triggers shows the count one transition late.
     _note_pass_count(request, SCAN_LABEL_FRONT, len(front_pages))
 
     notify(PipelineEvent.AWAITING_FLIP)
@@ -1730,11 +1730,11 @@ def _scan_manual_duplex(
     # A match with assert_never rather than an if-chain: a fourth FlipOutcome
     # member then fails ty and pyrefly at edit time instead of falling through
     # into pass B.  An explicit abort -- web Abort, n, Ctrl-D, Ctrl-C -- is a
-    # cancellation, not a scanner failure (EXC-04, N-08).  A broken prompt
-    # (an ABORTED that carries an abort_cause) and a timeout are failures,
-    # because nobody chose to stop (D-02).  A shutdown-claimed abort also
-    # arrives here as ScanCancelledError; the worker records it as a restart
-    # by checking aborted_by_shutdown before anything else (WR-06).
+    # cancellation, not a scanner failure.  A broken prompt (an ABORTED that
+    # carries an abort_cause) and a timeout are failures, because nobody chose
+    # to stop.  A shutdown-claimed abort also arrives here as
+    # ScanCancelledError; the worker records it as a restart by checking
+    # aborted_by_shutdown before anything else.
     match outcome:
         case FlipOutcome.CONTINUED:
             pass
@@ -1744,12 +1744,12 @@ def _scan_manual_duplex(
                 msg = f"Flip prompt failed: {describe(cause)}"
                 raise ScanError(msg) from cause
             # The one ending here that keeps NOTHING, and the asymmetry is
-            # policy rather than oversight: D-10 preserves pass A's fronts
+            # policy rather than oversight: pass A's fronts are preserved
             # after a flip timeout or a broken prompt precisely because nobody
-            # chose to stop, and refuses to preserve them here because somebody
-            # did.  ``failed/`` is never pruned automatically, so filing an
-            # abandoned scan into it would leave the operator tidying up after
-            # a decision they already made.  _preserving_partial_scan excludes
+            # chose to stop, and are deliberately not preserved here because
+            # somebody did.  ``failed/`` is never pruned automatically, so
+            # filing an abandoned scan into it would leave the operator tidying
+            # up after a decision they already made.  _preserving_partial_scan excludes
             # this exception explicitly, by type; do not turn it into a
             # ScanError to "simplify" the handler.
             msg = "Manual duplex scan cancelled at the flip prompt"
@@ -1774,14 +1774,14 @@ def _scan_manual_duplex(
     # Registered under ``(backs)``, again before the pass runs.  The two halves
     # are a single document between them, so a failure on either has to keep
     # both -- the same rule, and the same two names, that the mismatch recovery
-    # already applies under its one shared guard (D-10).
+    # already applies under its one shared guard.
     acquisition.ledger.register(_BACKS_SUFFIX, back_sink)
     back_batch = scanner.scan_pages(
         acquisition.device_id, acquisition.settings, back_sink
     )
     # Before the count comparison, so no half is assembled from an empty list.
     # Not _require_pages: "No pages were scanned" is false once pass A fed the
-    # fronts, so the message names the pass and what pass A scanned (IN-01).
+    # fronts, so the message names the pass and what pass A scanned.
     if not back_batch.pages:
         msg = (
             "No back pages were scanned in pass B "
@@ -1800,7 +1800,8 @@ def _scan_manual_duplex(
     # Summed, not picked: a sheet lost on either pass is a sheet lost.
     rejected = front_batch.pages_rejected + back_batch.pages_rejected
 
-    # Raw count validation BEFORE empty page detection (SCAN-07)
+    # Compare the raw counts BEFORE empty-page detection: filtering first
+    # could drop a blank back and turn two matching passes into a mismatch.
     if len(front_pages) != len(back_pages):
         return _DuplexMismatch(
             fronts=front_pages,
@@ -1837,7 +1838,7 @@ def _flip_context(request: PipelineRequest, settings: Settings) -> _FlipContext:
     """
     if request.flip_coordinator is None:
         # Refusing is the only safe answer: with no coordinator, pass B would
-        # start the instant pass A ends and re-feed an empty tray (C-02).
+        # start the instant pass A ends and re-feed an empty tray.
         # Starting anyway would turn a bad request into lost pages.
         msg = (
             f"Profile '{request.profile_name}' is manual duplex, which needs a "
@@ -1868,7 +1869,7 @@ def _scan_simplex(
     the first page is being spooled, which is both cheaper -- the page is in
     memory at that moment, rather than needing a second decode afterwards --
     and visibly earlier, since the strip appears during acquisition instead of
-    after the last sheet (D-05).
+    after the last sheet.
 
     Args:
         scanner: Scanner backend instance.
@@ -1892,7 +1893,7 @@ def _scan_simplex(
     )
     # Registered before the pass runs, not after it returns: the whole point is
     # the case where it never returns, and a fault part-way through has to find
-    # the sink that has been collecting pages all along (D-09).
+    # the sink that has been collecting pages all along.
     acquisition.ledger.register(_PARTIAL_SUFFIX, sink)
     batch = scanner.scan_pages(acquisition.device_id, acquisition.settings, sink)
     _require_pages(batch)
@@ -1957,17 +1958,17 @@ def _deliver(
         # `delivered_to_api` and additionally narrows the id to str.
         task_uuid = upload_result.task_uuid
         if task_uuid is not None:
-            # The return value is discarded on purpose, and that is now correct
-            # rather than a bug: since plan 23-04 a successful poll means "it
-            # returned" and a failed one means "it raised".  Do not re-add a
-            # status check on the result.
+            # The return value is discarded on purpose, and that is correct
+            # rather than a bug: poll_task raises on every failed task, so a
+            # successful poll means "it returned" and a failed one means "it
+            # raised".  Do not re-add a status check on the result.
             paperless.poll_task(
                 task_uuid,
                 timeout=settings.output.paperless_task_timeout,
             )
             return ScanOutcome.SUCCESS, None
         # A state alone would leave the user to work out for themselves why the
-        # title and tags they chose never appeared in paperless-ngx (OUTC-02).
+        # title and tags they chose never appeared in paperless-ngx.
         return ScanOutcome.FALLBACK, _consume_dir_warning(
             upload_result.consume_dir_path
         )
@@ -2017,9 +2018,9 @@ def run_pipeline(
     preservation guard that relocates the finished scan to
     ``settings.output.failed_dir``; acquisition runs inside a second guard that
     assembles the pages already spooled into a partial PDF and relocates that
-    instead (D-09). Both name their destination in the exception they re-raise,
+    instead. Both name their destination in the exception they re-raise,
     both keep that exception's own type, and neither one runs for a cancel --
-    the operator chose to stop, and ``failed/`` is never pruned (D-10).
+    the operator chose to stop, and ``failed/`` is never pruned.
 
     Args:
         scanner: Scanner backend instance.
@@ -2045,7 +2046,7 @@ def run_pipeline(
         PdfError: If the PDF cannot be assembled. The spooled page files are
             moved into a job-keyed directory under
             ``settings.output.failed_dir`` first, and the message names the
-            count and that directory (D-10).
+            count and that directory.
         PaperlessError: If upload or polling fails. The message names where
             the assembled PDF was preserved, or -- if preservation failed
             too -- reports both failures.
@@ -2060,7 +2061,7 @@ def run_pipeline(
     profile = settings.profiles[request.profile_name]
 
     # The one place saneless decides a scan is manual duplex, and it reads
-    # profile.duplex -- never source, which is a pure SANE value (DPLX-03).
+    # profile.duplex -- never source, which is a pure SANE value.
     #
     # _flip_context refuses a manual-duplex request that has no flip
     # coordinator, and where it is called matters: it must come before
@@ -2079,7 +2080,7 @@ def run_pipeline(
         mode=profile.mode,
         auto_source_mode=profile.auto_source_mode,
         # The single conversion point from the config Literal to the scanner's
-        # feeder-resolution flag (D-02). Do not add a second: the scanner
+        # feeder-resolution flag. Do not add a second: the scanner
         # package never sees ProfileConfig.duplex or the job vocabulary.
         resolve_feeder_source=manual_duplex,
         paper_size=profile.paper_size,
@@ -2144,15 +2145,15 @@ def run_pipeline(
         # both, at edit time, before a third result type can fall silently
         # through an else.
         #
-        # This dispatch is what closes N-07.  N-07's other half -- "replace the
-        # tuple with a result dataclass" -- was already done in an earlier
-        # phase, when the (fronts, backs) tuple became _DuplexMismatch.
+        # This dispatch replaced an isinstance switch over a list or a
+        # (fronts, backs) tuple; the other half of that fix turned the tuple
+        # into the _DuplexMismatch record, so each variant is a named type.
         match acquired:
             case ScanBatch():
                 batch = acquired
             case _DuplexMismatch():
                 # Returns early and deliberately skips _drop_empty_pages
-                # below -- see _finish_duplex_mismatch for why (D-08).
+                # below -- see _finish_duplex_mismatch for why.
                 return _finish_duplex_mismatch(
                     acquired, tmp_path, paperless, request, settings
                 )
@@ -2171,7 +2172,7 @@ def run_pipeline(
         # thumbnail's JPEG save ever does.  An orientation tag that img2pdf
         # or a browser would act on therefore cannot reach either file.
 
-        # Step 2: Filter empty pages (gated on profile toggle, per D-17)
+        # Step 2: Filter empty pages (gated on the profile's toggle)
         filtered = _drop_empty_pages(records, profile)
 
         # Step 3: Assemble PDF
@@ -2182,12 +2183,12 @@ def run_pipeline(
         # same one the backend's crop arithmetic used, so the cropped shape and
         # the declared page size cannot disagree. A device that substitutes
         # would otherwise produce both a mis-cropped page and a MediaBox at odds
-        # with its own content, re-opening part of OUTC-06.
+        # with its own content: an A4 page whose MediaBox is not A4.
         pdf_filename = build_pdf_filename(request.job_id, request.title)
         # The same name, minus its extension, for the directory the pages fall
         # back to when no PDF can be built: one composition, so the two
         # artefacts a single job can leave in failed/ are named consistently
-        # and inherit the same uniqueness argument (D-10).  Composed once, not
+        # and inherit the same uniqueness argument.  Composed once, not
         # twice, because build_pdf_filename stamps the current second.
         with _preserving_page_files(
             spool_dir, settings.output.failed_dir / Path(pdf_filename).stem
@@ -2207,7 +2208,7 @@ def run_pipeline(
             outcome=outcome,
             pages_scanned=len(records),
             # Blank-page detection only. A sheet the scanner could not read is
-            # reported through the warning instead, because Phase 30 renders
+            # reported through the warning instead, because the web UI shows
             # this number to users as pages removed for being blank.
             pages_removed=len(records) - len(filtered),
             pages_uploaded=len(filtered),
