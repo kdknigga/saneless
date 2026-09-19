@@ -572,6 +572,20 @@ def test_list_recent() -> None:
         store.close()
 
 
+def test_history_limits_are_named_in_the_job_module() -> None:
+    """
+    The web page and the CLI read their history lengths from one place.
+
+    They differ by design, 50 rows on the page and 20 in ``saneless jobs``,
+    so each is a named constant rather than a bare number at its call sites.
+    """
+    assert job_module.WEB_HISTORY_LIMIT == 50
+    assert job_module.CLI_JOBS_DEFAULT_LIMIT == 20
+    assert {"WEB_HISTORY_LIMIT", "CLI_JOBS_DEFAULT_LIMIT"} <= set(job_module.__all__)
+    limit = inspect.signature(JobStore.list_recent).parameters["limit"]
+    assert limit.default == job_module.WEB_HISTORY_LIMIT
+
+
 def test_list_recent_empty() -> None:
     """List recent jobs returns empty list when no jobs exist (UI-05)."""
     store = JobStore()
