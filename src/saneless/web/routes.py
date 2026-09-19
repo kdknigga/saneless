@@ -506,7 +506,7 @@ def _get_cached_or_fetch(
 
 
 def _tag_list_context(
-    state: State, *, q: str, selected: list[int], on_page_load: bool = False
+    state: State, *, q: str, selected: list[int]
 ) -> dict[str, object]:
     """
     Build the tag checkbox list's context: the filtered list and pinned ticks.
@@ -532,13 +532,10 @@ def _tag_list_context(
         state: Application state, for the metadata cache and Paperless client.
         q: The filter text, matched case-insensitively against tag names.
         selected: The tag ids the request reports as currently ticked.
-        on_page_load: True only for a full page render, which is the one
-            response whose wrapper may carry a load trigger.  See below.
 
     Returns:
         The context ``partials/tags.html`` renders: the pinned ticks, the
-        filtered list, the ticked ids, whether any tag exists at all, and
-        whether the wrapper should ask for itself once it is parsed.
+        filtered list, the ticked ids, and whether any tag exists at all.
 
     """
     # IN-01.  With ``[web] show_tags`` off the tag markup is never emitted, so
@@ -556,7 +553,6 @@ def _tag_list_context(
             "tags": [],
             "selected_tags": set(),
             "any_tags": False,
-            "tags_load_on_render": False,
         }
     everything = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     needle = q.casefold()
@@ -581,14 +577,6 @@ def _tag_list_context(
         # has no tags" and "your filter matched none of them" are different
         # facts and only one of them is the reader's to fix.
         "any_tags": bool(everything),
-        # The load trigger goes on the full page render and on nothing else.
-        # The partial renders the wrapper that the swap replaces, so a wrapper
-        # that came *from* a swap and still asked to load itself would swap
-        # itself again the moment htmx parsed it, for ever -- observed in
-        # Chromium as a tag list whose checkboxes detach from under the cursor.
-        # Nothing is lost by dropping it afterwards: the filter, the refresh
-        # button and the filter form each carry their own request.
-        "tags_load_on_render": on_page_load,
     }
 
 
@@ -931,7 +919,7 @@ def index(request: Request) -> Response:
     # A full page render is the unfiltered, nothing-ticked case of the same
     # context the filter route builds, so it goes through the same function
     # rather than a second shape the two could drift apart on.
-    tag_list = _tag_list_context(state, q="", selected=[], on_page_load=True)
+    tag_list = _tag_list_context(state, q="", selected=[])
     # The correspondent half of the same saving (IN-01).  ``show_correspondent``
     # off means the select is left out of the markup, so this fetch would be a
     # second cold-cache round trip for a list nobody can be shown.  The key
@@ -1307,6 +1295,7 @@ def start_scan(
                     ),
                     "clear_message": True,
                     "refresh_checks": True,
+                    "terminal_reload": True,
                     **_checks_context(state),
                 },
             )
@@ -1351,7 +1340,10 @@ def current_job_status(request: Request) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        _status_context(state.worker, state.job_store, _status_facts(request)),
+        {
+            **_status_context(state.worker, state.job_store, _status_facts(request)),
+            "terminal_reload": True,
+        },
     )
 
 
@@ -1386,11 +1378,14 @@ def followed_job_status(request: Request, job_id: str) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        _status_context(
-            state.worker,
-            state.job_store,
-            _status_facts(request, followed_job_id=job_id),
-        ),
+        {
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(request, followed_job_id=job_id),
+            ),
+            "terminal_reload": True,
+        },
     )
 
 
@@ -1765,14 +1760,17 @@ def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        _status_context(
-            state.worker,
-            state.job_store,
-            _status_facts(
-                request,
-                claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
+        {
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(
+                    request,
+                    claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
+                ),
             ),
-        ),
+            "terminal_reload": True,
+        },
     )
 
 
@@ -1806,12 +1804,15 @@ def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     return state.templates.TemplateResponse(
         request,
         "partials/status_response.html",
-        _status_context(
-            state.worker,
-            state.job_store,
-            _status_facts(
-                request,
-                claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+        {
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(
+                    request,
+                    claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+                ),
             ),
-        ),
+            "terminal_reload": True,
+        },
     )

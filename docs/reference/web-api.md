@@ -104,7 +104,7 @@ Returns the current or most recent job status. Used by HTMX polling to update th
 
 **Response:** HTML partial with job state. Possible states: `PENDING`, `SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`, `ERROR`, `FALLBACK`, `CANCELLED`.
 
-`DONE`, `ERROR`, `FALLBACK` and `CANCELLED` are terminal: once the job reaches one of them the partial stops polling and the Scan button is enabled again. `CANCELLED` means the operator stopped the scan on purpose, such as with Abort scan at the flip prompt. The web UI shows it as `Cancelled: <title>` in muted grey, not as an error.
+`DONE`, `ERROR`, `FALLBACK` and `CANCELLED` are terminal: once the job reaches one of them the partial stops polling and the Scan button is enabled again. The terminal partial also reloads the job history table and the checks strip once, so the finished job's row appears and the strip stops saying a scan is running. The main page (`GET /`) renders the same job without that reload, because it has just rendered both. `CANCELLED` means the operator stopped the scan on purpose, such as with Abort scan at the flip prompt. The web UI shows it as `Cancelled: <title>` in muted grey, not as an error.
 
 ---
 

@@ -7,7 +7,10 @@
    one response that has news for it -- the scanner has just become busy, so
    D-08's paused note is due immediately -- while a poll carrying it would
    re-render five rows every second for no new information, and a flip answer
-   changes the job, not the appliance's health. #}
+   changes the job, not the appliance's health.
+   Every one of these responses sets terminal_reload, so a job that has just
+   ended reloads the history table and the strip; the full page does not set
+   it, because it has just rendered both. #}
 {% include "partials/status.html" %}
 {% with oob = true %}{% include "partials/scan_button.html" %}{% endwith %}
 {% if clear_message %}<div id="status-message" hx-swap-oob="innerHTML"></div>{% endif %}

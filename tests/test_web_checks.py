@@ -2427,12 +2427,35 @@ def _templates_containing(needle: str) -> list[str]:
     )
 
 
-def _finish_a_job(client: TestClient, state: JobState) -> None:
-    """Create a job, drive it to `state`, and make it the worker's current."""
+def _finish_a_job(client: TestClient, state: JobState) -> str:
+    """
+    Create a job, drive it to `state`, and make it the worker's current.
+
+    Returns:
+        The job's id, for a route that names the job in its URL or form.
+
+    """
     job_store = _app(client).state.job_store
     job = job_store.create_job(profile="default", title="Terminal")
     job_store.update_state(job.id, state, error="disk on fire")
     _adopt_as_current_job(client, job.id)
+    return job.id
+
+
+# The two loaders exactly as terminal_reload.html renders them.  Matched whole,
+# not by their hx-get alone: the strip's own cold-start poll also asks
+# /api/checks, and that one belongs on the full page.
+_HISTORY_RELOAD_DIV = (
+    '<div hx-get="/api/jobs/history" hx-target="#history-body" '
+    'hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>'
+)
+_STRIP_RELOAD_DIV = (
+    '<div hx-get="/api/checks" hx-target="#checks-body" '
+    'hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>'
+)
+_GUARDED_TERMINAL_RELOAD = (
+    '{% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}'
+)
 
 
 class TestTerminalReloadPartial:
@@ -2462,6 +2485,73 @@ class TestTerminalReloadPartial:
         """DONE, FALLBACK, CANCELLED and ERROR all reload the same way."""
         source = _STATUS_TEMPLATE.read_text(encoding="utf-8")
         assert source.count('include "partials/terminal_reload.html"') == 4
+
+    def test_every_include_is_behind_the_terminal_reload_flag(self) -> None:
+        """
+        The partial is included only when the route asks for it.
+
+        The full page has just rendered history and the strip, so a reload
+        there would fetch both again the moment the page is parsed.  Each of the
+        four includes has to sit alone inside ``{% if terminal_reload %}``; one
+        that did not would reload on the full page for its state alone.
+        """
+        source = _STATUS_TEMPLATE.read_text(encoding="utf-8")
+        assert source.count(_GUARDED_TERMINAL_RELOAD) == 4
+
+    def test_every_status_poll_response_sets_the_flag(self) -> None:
+        """
+        Each route rendering the status-poll partial asks for the reload.
+
+        A new route that renders it without the flag would leave a finished
+        scan's history row and the strip's paused note on screen until the
+        next page load, so the two are counted against each other.
+        """
+        source = inspect.getsource(routes_module)
+        renders = source.count('"partials/status_response.html"')
+        assert renders >= 1
+        assert source.count('"terminal_reload": True') == renders
+
+    @pytest.mark.parametrize(
+        "state",
+        [JobState.DONE, JobState.FALLBACK, JobState.CANCELLED, JobState.ERROR],
+    )
+    def test_the_full_page_does_not_reload_what_it_just_rendered(
+        self, client: TestClient, state: JobState
+    ) -> None:
+        """GET / with a finished current job carries neither loader."""
+        _finish_a_job(client, state)
+        page = client.get("/").text
+        assert 'id="history-body"' in page
+        assert 'id="checks-body"' in page
+        assert _HISTORY_RELOAD_DIV not in page
+        assert _STRIP_RELOAD_DIV not in page
+
+    @pytest.mark.parametrize(
+        ("method", "path"),
+        [
+            ("GET", "/api/jobs/current/status"),
+            ("GET", "/api/jobs/{job_id}/status"),
+            ("POST", "/api/flip/continue"),
+            ("POST", "/api/flip/abort"),
+        ],
+    )
+    def test_every_status_response_for_a_finished_job_reloads_both(
+        self, client: TestClient, method: str, path: str
+    ) -> None:
+        """
+        The same finished job, rendered as a status response, carries both.
+
+        A flip answer for a job that is no longer waiting claims nothing and
+        renders the current job, which is the finished one here.
+        """
+        job_id = _finish_a_job(client, JobState.DONE)
+        if method == "GET":
+            response = client.get(path.format(job_id=job_id))
+        else:
+            response = client.post(path, data={"job_id": job_id})
+        assert response.status_code == 200
+        assert _HISTORY_RELOAD_DIV in response.text
+        assert _STRIP_RELOAD_DIV in response.text
 
     def test_the_history_loader_lives_in_exactly_two_templates(self) -> None:
         """

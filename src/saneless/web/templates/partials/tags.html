@@ -1,8 +1,8 @@
 {# The whole swap target, wrapper and all.  The swap moved from innerHTML on a
-   multi-select to outerHTML on this div, so the element that carries the id,
-   the class and the load trigger has to be rendered here: an outerHTML swap
-   replaces the target, and a partial that rendered only the rows would put
-   them where the wrapper was and lose all three on the first refresh.
+   multi-select to outerHTML on this div, so the element that carries the id
+   and the class has to be rendered here: an outerHTML swap replaces the
+   target, and a partial that rendered only the rows would put them where the
+   wrapper was and lose both on the first refresh.
 
    Two loops, not one, and that is Amendment A-5 made visible.  The first holds
    the ticks the filter excludes, pinned above the list so a tick can never
@@ -17,14 +17,9 @@
    The label is the tap target, not the box: app.css gives every row the full
    width and a finger-sized height (UI-SPEC S6).
 
-   The request attributes are on the full page render alone.  A wrapper that
-   arrived through a swap and still asked to fetch itself on parse would swap
-   itself again immediately, and then again -- an endless loop, which in
-   Chromium looks like checkboxes detaching from under the cursor.  Nothing is
-   lost by dropping them: the filter box, the refresh button and the filter
-   form each carry their own request. #}
-<div id="tags-list" class="tag-list"
-     {%- if tags_load_on_render %} hx-get="/api/tags" hx-trigger="load" hx-target="this" hx-swap="outerHTML"{% endif %}>
+   The wrapper carries no request of its own: the list is server-rendered, and
+   the filter box, the refresh button and the filter form each carry theirs. #}
+<div id="tags-list" class="tag-list">
     {%- for tag in pinned %}
     <label class="tag-option"><input type="checkbox" name="tags" value="{{ tag.id }}" checked> {{ tag.name }}</label>
     {%- endfor %}

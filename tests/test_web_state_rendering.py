@@ -1992,6 +1992,9 @@ _TAG_FILTER_FORM = re.compile(
 
 # The tag list's wrapper, which the partial renders and every swap replaces.
 _TAGS_LIST = re.compile(r'<div id="tags-list"[^>]*>')
+_CORRESPONDENT_SELECT = re.compile(
+    r'<select name="correspondent" id="correspondent-select"(?P<attrs>[^>]*)>'
+)
 
 
 class TestFormHelpTextAndTagPicker:
@@ -2097,21 +2100,42 @@ class TestFormHelpTextAndTagPicker:
         ):
             assert attribute in match.group("attrs"), attribute
 
-    def test_the_tag_list_loads_itself_and_swaps_its_whole_wrapper(
+    def test_the_tag_list_wrapper_asks_for_nothing_on_the_full_page(
         self, client: TestClient
     ) -> None:
-        """The swap target is the div, so the swap has to be outerHTML."""
-        match = _TAGS_LIST.search(client.get("/").text)
+        """
+        The page renders the list itself, so the wrapper carries no request.
+
+        The list comes from the same cache ``/api/tags`` reads, so a load
+        trigger here would only fetch what the page already holds.  The filter
+        box, the refresh button and the filter form each keep their own.
+        """
+        page = client.get("/").text
+        match = _TAGS_LIST.search(page)
 
         assert match is not None, "tag list wrapper not rendered"
-        for attribute in (
-            'class="tag-list"',
-            'hx-get="/api/tags"',
-            'hx-trigger="load"',
-            'hx-target="this"',
-            'hx-swap="outerHTML"',
-        ):
-            assert attribute in match.group(0), attribute
+        assert match.group(0) == '<div id="tags-list" class="tag-list">'
+        assert 'hx-post="/api/cache/invalidate?resource=tags"' in page
+        assert 'hx-get="/api/tags" hx-target="#tags-list"' in page
+
+    def test_the_correspondent_select_asks_for_nothing_on_the_full_page(
+        self, client: TestClient
+    ) -> None:
+        """
+        The options are server-rendered; only the refresh button fetches them.
+
+        The page reads the same cache ``/api/correspondents`` does, so asking
+        for the options again once the select is parsed would repeat the page's
+        own work.
+        """
+        _app(client).state.cache.set("correspondents", [{"id": 7, "name": "Acme"}])
+        page = client.get("/").text
+        match = _CORRESPONDENT_SELECT.search(page)
+
+        assert match is not None, "correspondent select not rendered"
+        assert "hx-" not in match.group("attrs")
+        assert '<option value="7">Acme</option>' in page
+        assert 'hx-post="/api/cache/invalidate?resource=correspondents"' in page
 
     def test_the_tag_block_adds_no_attribute_to_the_scan_form(self) -> None:
         """

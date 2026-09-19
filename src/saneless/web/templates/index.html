@@ -157,8 +157,7 @@
                     aria-label="Refresh correspondents">&#x21bb;<span class="sr-only">Refresh correspondents</span></button>
         </label>
         <select name="correspondent" id="correspondent-select"
-                aria-describedby="correspondent-help"
-                hx-get="/api/correspondents" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
+                aria-describedby="correspondent-help">
             <option value="">No correspondent</option>
             {% for c in correspondents %}
             <option value="{{ c.id }}">{{ c.name }}</option>
@@ -221,7 +220,7 @@
 <article>
     <h2>Job History</h2>
     <div class="history-table-wrap">
-        <table role="grid">
+        <table>
             <thead>
                 <tr>
                     <th>Time</th>

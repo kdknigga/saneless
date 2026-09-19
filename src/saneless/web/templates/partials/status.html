@@ -66,7 +66,7 @@
       <p class="status-done">&#10003; Done: {{ job.title }}</p>
       {% set counts = job | page_counts %}
       {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
-      {% include "partials/terminal_reload.html" %}
+      {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% elif job.state == JobState.FALLBACK %}
       <p class="status-fallback">&#8594; Saved to folder: {{ job.title }}</p>
       {% if job.warning %}
@@ -76,11 +76,11 @@
          scan's fate, the counts are only about its size. #}
       {% set counts = job | page_counts %}
       {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
-      {% include "partials/terminal_reload.html" %}
+      {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% elif job.state == JobState.CANCELLED %}
       {# D-01: a cancel is a deliberate stop, not a failure, so it is not announced as an alert. #}
       <p class="status-cancelled">&#8856; Cancelled: {{ job.title }}</p>
-      {% include "partials/terminal_reload.html" %}
+      {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% elif job.state == JobState.ERROR %}
       {# Three things a reader of this branch will question, answered here.
 
@@ -116,7 +116,7 @@
       {% else %}
       <p role="alert" class="status-error">&#10007; Error: {{ job.error }}</p>
       {% endif %}
-      {% include "partials/terminal_reload.html" %}
+      {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% endif %}
     {% if job.thumbnail %}
       <img src="data:image/jpeg;base64,{{ job.thumbnail }}" alt="First page preview" class="thumbnail">
