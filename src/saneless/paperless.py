@@ -121,6 +121,39 @@ def _usable_count(page: dict[object, object]) -> int | None:
     return count
 
 
+def _metadata_items(value: object, prefix: str, page: int) -> list[dict[str, object]]:
+    """
+    Return one metadata page's items, checked to be a list of objects.
+
+    A ``results`` of ``null`` would otherwise raise a TypeError out of the
+    client, and a string or an object would be taken apart into its
+    characters or keys.
+
+    Args:
+        value: The page's items: a bare-list body or a page's ``results``.
+        prefix: The message prefix naming the collection and base URL.
+        page: The page number, for the message.
+
+    Returns:
+        The items, each an object.
+
+    Raises:
+        PaperlessError: ``<prefix>: page <N> did not hold a list of
+            objects``.
+
+    """
+    if not isinstance(value, list):
+        msg = f"{prefix}: page {page} did not hold a list of objects"
+        raise PaperlessError(msg)
+    items: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            msg = f"{prefix}: page {page} did not hold a list of objects"
+            raise PaperlessError(msg)
+        items.append({str(key): field for key, field in item.items()})
+    return items
+
+
 def _task_status(task: dict[str, object]) -> str:
     """
     Return the task status in the v9 uppercase spelling.
@@ -1101,7 +1134,9 @@ class PaperlessClient:
         requested: a server behind a misconfigured reverse proxy builds it
         from the wrong host or scheme, and following it would send the API
         token there.  A redirect is not followed either; it fails the fetch.
-        A bare-list response is the whole collection.
+        A bare-list response on page 1 is the whole collection; on a later
+        page it fails the fetch rather than replacing the pages collected.
+        Each page's items must be a list of objects.
 
         The client does not take the server's word alone that it is making
         progress.  A proxy that drops the query string, or a server that
@@ -1125,7 +1160,7 @@ class PaperlessClient:
         Raises:
             PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
                 <reason>``, chained to the httpx error or the ValueError, or
-                unchained when the body is neither a list nor an object, the
+                unchained when a body or its items have the wrong shape, the
                 server repeats a page, or it needs more pages than its
                 ``count`` allows.
 
@@ -1138,11 +1173,14 @@ class PaperlessClient:
         while True:
             data = self._fetch_page(path, page, prefix)
             if isinstance(data, list):
-                return data
+                if page > 1:
+                    msg = f"{prefix}: page {page} was a bare list, which only page 1 may be"
+                    raise PaperlessError(msg)
+                return _metadata_items(data, prefix, page)
             if not isinstance(data, dict):
                 msg = f"{prefix}: the response was neither a list nor an object"
                 raise PaperlessError(msg)
-            batch = data.get("results", [])
+            batch = _metadata_items(data.get("results"), prefix, page)
             if not batch:
                 return results
             if batch == previous:

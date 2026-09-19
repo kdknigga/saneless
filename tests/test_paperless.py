@@ -1982,6 +1982,89 @@ class TestMetadataPagination:
         )
 
 
+class TestMetadataResponseShape:
+    """A metadata page of the wrong shape is a PaperlessError, not a raw error."""
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    @pytest.mark.parametrize(
+        "results",
+        [None, "abc", {"id": 1}, [1, 2], [{"id": 1}, "two"]],
+        ids=["null", "string", "object", "numbers", "one-not-an-object"],
+    )
+    def test_a_page_whose_results_are_not_a_list_of_objects_fails(
+        self, method: str, noun: str, results: object
+    ) -> None:
+        """
+        ``results`` must be a list of objects.
+
+        ``null`` used to raise a TypeError out of the client, and a string or
+        an object was taken apart into its characters or keys.
+        """
+        handler = _PagedHandler(
+            {
+                1: httpx.Response(
+                    200, json={"count": 1, "next": None, "results": results}
+                )
+            }
+        )
+        with pytest.raises(PaperlessError) as exc_info:
+            _fetch(handler, method)
+        assert str(exc_info.value) == (
+            f"Could not fetch {noun} from Paperless at "
+            f"http://{_CONFIGURED_HOST}:8000: page 1 did not hold a list of objects"
+        )
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_a_page_without_results_fails(self, method: str, noun: str) -> None:
+        """A paginated page with no ``results`` key is malformed, not empty."""
+        handler = _PagedHandler(
+            {1: httpx.Response(200, json={"count": 0, "next": None})}
+        )
+        with pytest.raises(PaperlessError, match="page 1 did not hold a list"):
+            _fetch(handler, method)
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_a_bare_list_of_non_objects_fails(self, method: str, noun: str) -> None:
+        """A bare list must hold objects too."""
+        handler = _PagedHandler({1: httpx.Response(200, json=["one", "two"])})
+        with pytest.raises(PaperlessError, match="page 1 did not hold a list"):
+            _fetch(handler, method)
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_a_bare_list_after_page_one_fails(self, method: str, noun: str) -> None:
+        """
+        A bare list is the whole collection only on page 1.
+
+        On a later page it used to be returned alone, throwing away the pages
+        already collected.
+        """
+        handler = _PagedHandler(
+            {
+                1: httpx.Response(
+                    200, json=_page_payload(_items(noun, 1, 2), _next_link(noun, 2))
+                ),
+                2: httpx.Response(200, json=_items(noun, 3, 2)),
+            }
+        )
+        with pytest.raises(PaperlessError) as exc_info:
+            _fetch(handler, method)
+        assert str(exc_info.value).endswith(
+            "page 2 was a bare list, which only page 1 may be"
+        )
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    @pytest.mark.parametrize("body", [42, "tags", True])
+    def test_a_body_that_is_neither_a_list_nor_an_object_fails(
+        self, method: str, noun: str, body: object
+    ) -> None:
+        """A scalar body is a PaperlessError naming the collection."""
+        handler = _PagedHandler({1: httpx.Response(200, json=body)})
+        with pytest.raises(PaperlessError) as exc_info:
+            _fetch(handler, method)
+        assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
+        assert str(exc_info.value).endswith("neither a list nor an object")
+
+
 class _EndlessHandler:
     """
     A mock server that always names a next page, whatever page is asked for.
