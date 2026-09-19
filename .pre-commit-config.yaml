@@ -21,6 +21,24 @@ exclude: ^src/saneless/web/static/vendor/
 # which this config does not use yet. Read the upstream manifest before adding a hook:
 # if it declares `stages:`, the pin here is what keeps it off merge and push.
 default_stages: [pre-commit]
+
+# Every hook below whose `language` is python gets its interpreter from here.
+# Without this pin prek builds each hook environment with whatever interpreter
+# it happens to find, which is not the project's: measured on this machine,
+# hook environments existed at 3.12.4, 3.13.9 AND 3.14.2 simultaneously.
+#
+# That is not a cosmetic inconsistency. `check-ast` and `debug-statements`
+# parse this project's source with their OWN interpreter, so a hook built on
+# anything below 3.14 rejects syntax that is valid here. PEP 758's bracketless
+# `except ValueError, TypeError:` -- which `ruff format` PRODUCES at
+# target-version = "py314" -- fails to parse on both 3.12 and 3.13 with
+# "SyntaxError: multiple exception types must be parenthesized". The suite
+# would then reject code ruff had just written, and the only ways out are a
+# suppression or hand-mangling the source, both of which this project forbids.
+#
+# pinned by tests/test_deployment_config.py
+default_language_version:
+  python: python3.14
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
