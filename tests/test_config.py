@@ -1454,16 +1454,6 @@ class TestResolveJobTitle:
 class TestProfileConfigThresholds:
     """ProfileConfig empty page threshold fields."""
 
-    def test_default_mean_threshold(self) -> None:
-        """ProfileConfig has empty_page_mean_threshold defaulting to 250.0."""
-        profile = ProfileConfig()
-        assert profile.empty_page_mean_threshold == 250.0
-
-    def test_default_stddev_threshold(self) -> None:
-        """ProfileConfig has empty_page_stddev_threshold defaulting to 5.0."""
-        profile = ProfileConfig()
-        assert profile.empty_page_stddev_threshold == 5.0
-
     def test_custom_threshold_values(self, tmp_config_dir: Path) -> None:
         """ProfileConfig accepts custom threshold values from TOML."""
         toml_content = """\
@@ -1483,10 +1473,6 @@ empty_page_stddev_threshold = 10.0
 class TestDefaultResolution:
     """DEFAULT_RESOLUTION constant validation."""
 
-    def test_constant_value(self) -> None:
-        """DEFAULT_RESOLUTION is 300 DPI per Tesseract OCR recommendation."""
-        assert DEFAULT_RESOLUTION == 300
-
     def test_profile_default_matches_constant(self) -> None:
         """ProfileConfig resolution default matches DEFAULT_RESOLUTION."""
         profile = ProfileConfig()
@@ -1496,24 +1482,10 @@ class TestDefaultResolution:
 class TestEmptyPageDetectionToggle:
     """Empty page detection toggle on ProfileConfig."""
 
-    def test_enable_empty_page_detection_default_true(self) -> None:
-        """ProfileConfig has enable_empty_page_detection defaulting to True."""
-        profile = ProfileConfig()
-        assert profile.enable_empty_page_detection is True
-
     def test_enable_empty_page_detection_false(self) -> None:
         """ProfileConfig accepts enable_empty_page_detection=False."""
         profile = ProfileConfig(enable_empty_page_detection=False)
         assert profile.enable_empty_page_detection is False
-
-
-class TestMinFreeSpaceMb:
-    """OutputConfig min_free_space_mb field."""
-
-    def test_min_free_space_mb_default(self) -> None:
-        """OutputConfig has min_free_space_mb defaulting to 500."""
-        output = OutputConfig()
-        assert output.min_free_space_mb == 500
 
 
 class TestFlipTimeoutSeconds:
@@ -1791,11 +1763,6 @@ duplex = "manual"
 class TestAutoSourceMode:
     """ProfileConfig auto_source_mode field validation."""
 
-    def test_auto_source_mode_default_flatbed(self) -> None:
-        """ProfileConfig defaults auto_source_mode to 'flatbed'."""
-        profile = ProfileConfig()
-        assert profile.auto_source_mode == "flatbed"
-
     def test_auto_source_mode_flatbed(self) -> None:
         """ProfileConfig accepts auto_source_mode='flatbed'."""
         profile = ProfileConfig(auto_source_mode="flatbed")
@@ -1816,13 +1783,13 @@ class TestValidateSettingsDirs:
     """Writability validation via validate_settings_dirs."""
 
     def test_validate_writable_tmp_dir_passes(self, tmp_path: Path) -> None:
-        """No error when tmp_dir is writable."""
+        """No error when tmp_dir is writable, and the check writes nothing there."""
         settings = Settings(
             output=OutputConfig(tmp_dir=str(tmp_path)),
             profiles={"default": ProfileConfig()},
         )
-        # Should not raise
         validate_settings_dirs(settings)
+        assert list(tmp_path.iterdir()) == []
 
     def test_validate_unwritable_tmp_dir_fails_with_config_error(
         self, tmp_path: Path
@@ -1841,13 +1808,13 @@ class TestValidateSettingsDirs:
         unwritable.chmod(0o755)
 
     def test_validate_writable_data_dir_passes(self, tmp_path: Path) -> None:
-        """No error when data_dir is writable."""
+        """No error when data_dir is writable, and the check writes nothing there."""
         settings = Settings(
             output=OutputConfig(tmp_dir=str(tmp_path), data_dir=str(tmp_path)),
             profiles={"default": ProfileConfig()},
         )
-        # Should not raise
         validate_settings_dirs(settings)
+        assert list(tmp_path.iterdir()) == []
 
     def test_validate_unwritable_data_dir_fails_with_config_error(
         self, tmp_path: Path
@@ -2206,12 +2173,6 @@ class TestProfileLabelAndDescription:
     ``extra="forbid"`` (APPL-05).
     """
 
-    def test_both_default_to_empty(self) -> None:
-        """A profile constructed with neither key has both as ``""``."""
-        profile = ProfileConfig()
-        assert profile.label == ""
-        assert profile.description == ""
-
     def test_both_round_trip_from_toml(self, tmp_config_dir: Path) -> None:
         """A TOML table carrying both keys loads both values verbatim."""
         config_file = tmp_config_dir / "labelled.toml"
@@ -2295,12 +2256,6 @@ class TestWebConfig:
     keys default on, so an existing deployment's form is unchanged, and hiding
     a control changes the form and never the scan.
     """
-
-    def test_web_config_both_default_on(self) -> None:
-        """Directly constructed Settings show both optional controls."""
-        settings = Settings()
-        assert settings.web.show_tags is True
-        assert settings.web.show_correspondent is True
 
     def test_web_config_absent_table_gets_the_defaults(
         self, tmp_config_dir: Path

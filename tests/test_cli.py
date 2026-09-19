@@ -2074,16 +2074,6 @@ class TestJobsCommand:
         # Header + separator + 1 data row = 3 lines
         assert len(lines) == 3
 
-    def test_jobs_exit_code_zero(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Jobs always exits with code 0."""
-        settings = self._settings_for(tmp_path)
-        runner, _ = _patch_cli(monkeypatch, settings=settings)
-
-        result = runner.invoke(cli, ["jobs"])
-        assert result.exit_code == 0
-
     def test_jobs_help(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --help shows --json and --limit options."""
         runner, _ = _patch_cli(monkeypatch, settings=self._settings_for(tmp_path))

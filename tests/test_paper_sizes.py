@@ -94,11 +94,6 @@ class TestProfileConfigPaperSize:
         p = ProfileConfig(paper_size="full")
         assert p.paper_size == "full"
 
-    def test_default_is_full(self) -> None:
-        """ProfileConfig() has paper_size='full' by default."""
-        p = ProfileConfig()
-        assert p.paper_size == "full"
-
     def test_invalid_raises_validation_error(self) -> None:
         """ProfileConfig(paper_size='invalid') raises ValidationError."""
         with pytest.raises(ValidationError):

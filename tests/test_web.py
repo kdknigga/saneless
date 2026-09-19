@@ -148,16 +148,10 @@ def test_page_loads(client: TestClient) -> None:
 
 
 def test_health_endpoint_ok(client: TestClient) -> None:
-    """GET /health returns 200 with status ok when worker alive (HLTH-01)."""
+    """GET /health returns 200 with status ok, and needs no authentication (HLTH-01)."""
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
-
-
-def test_health_endpoint_no_auth(client: TestClient) -> None:
-    """GET /health requires no authentication (HLTH-02)."""
-    response = client.get("/health")
-    assert response.status_code == 200
 
 
 def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:

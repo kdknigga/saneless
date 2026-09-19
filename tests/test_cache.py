@@ -38,9 +38,12 @@ def test_cache_invalidate() -> None:
 
 
 def test_cache_invalidate_nonexistent() -> None:
-    """Invalidating a missing key does not raise (PLSS-05)."""
+    """Invalidating a missing key does not raise or touch other entries (PLSS-05)."""
     cache = MetadataCache(ttl=60)
+    cache.set("correspondents", [{"id": 1, "name": "ACME Corp"}])
     cache.invalidate("tags")
+    assert cache.get("tags") is None
+    assert cache.get("correspondents") == [{"id": 1, "name": "ACME Corp"}]
 
 
 def test_cache_per_resource() -> None:

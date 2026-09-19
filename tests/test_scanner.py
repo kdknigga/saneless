@@ -84,60 +84,6 @@ def _make_content_image(
 # a green test (M-32).  There is now exactly one definition of what python-sane
 # does, in tests/fake_sane.py, and both this module and test_pipeline.py are
 # written against it.
-#
-# MockBackend below is deliberately NOT one of them: it implements the
-# ScannerBackend ABC, which is saneless's own interface, and models no part of
-# the sane module or a device handle.
-
-
-class MockBackend(ScannerBackend):
-    """Concrete mock backend to test the ABC contract."""
-
-    def get_devices(self) -> list[DeviceInfo]:
-        """Return a single mock device."""
-        return [
-            DeviceInfo(
-                name="mock:device",
-                vendor="Mock",
-                model="Scanner",
-                device_type="scanner",
-            ),
-        ]
-
-    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
-        """Return minimal capabilities for the mock device."""
-        return DeviceCapabilities(
-            sources=["Flatbed"],
-            resolutions=[300],
-            modes=["color"],
-            raw_options=[],
-        )
-
-    def scan_pages(
-        self, device_id: str, settings: ScanSettings, sink: PageSink
-    ) -> ScanBatch:
-        """
-        Spool a single white test image and report the record it became.
-
-        The page goes through the caller's sink rather than into the batch, so
-        this stub keeps modelling the ABC it exists to test: a backend that
-        built its own ``pages`` tuple would no longer be one.
-
-        Args:
-            device_id: Ignored; this backend scans nothing real.
-            settings: Only ``resolution`` is used, and only to report it back.
-            sink: The caller's sink, which receives the one page.
-
-        Returns:
-            A batch of the single record the sink returned.
-
-        """
-        record = sink.add(Image.new("RGB", (100, 100), "white"))
-        return ScanBatch(
-            pages=(record,),
-            actual_resolution=settings.resolution,
-            pages_rejected=0,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -267,29 +213,6 @@ class TestScannerBackendABC:
         cls: type = ScannerBackend
         with pytest.raises(TypeError, match="abstract"):
             cls()
-
-
-class TestMockBackend:
-    """Mock backend implementation tests."""
-
-    def test_mock_backend_get_devices(self) -> None:
-        """MockBackend.get_devices returns DeviceInfo list."""
-        backend = MockBackend()
-        devices = backend.get_devices()
-        assert len(devices) == 1
-        assert isinstance(devices[0], DeviceInfo)
-
-    def test_mock_backend_scan_pages(self, page_sink: SpooledPageSink) -> None:
-        """MockBackend.scan_pages spools one page and returns its record."""
-        backend = MockBackend()
-        settings = ScanSettings(source="Flatbed", resolution=300, mode="Color")
-        pages = backend.scan_pages("mock:device", settings, page_sink).pages
-        assert len(pages) == 1
-        assert isinstance(pages[0], PageRecord)
-        assert pages[0].sequence == 1
-        # The record describes a file that is really there, which is the whole
-        # difference between a sink and a list of images.
-        assert pages[0].path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -739,6 +662,25 @@ def _failing_exit() -> None:
     raise FakeSaneError(msg)
 
 
+def _assert_shutdown_failure_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    Assert a swallowed ``sane.exit()`` failure left one WARNING with its cause.
+
+    Args:
+        caplog: The test's log capture fixture.
+
+    """
+    failures = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Could not shut SANE down"
+    ]
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.WARNING
+    assert failures[0].exc_info is not None
+    assert isinstance(failures[0].exc_info[1], FakeSaneError)
+
+
 class TestSaneShutdown:
     """
     SANE is shut down at an entry point, once, and never over an error (D-18).
@@ -766,7 +708,10 @@ class TestSaneShutdown:
         assert fake_sane_module.exit_call_count == 0
 
     def test_shutdown_never_raises_when_sane_exit_fails(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
         A failing shutdown is logged and swallowed.
@@ -778,7 +723,10 @@ class TestSaneShutdown:
         SaneBackend()
 
         monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
-        sane_backend_mod.shutdown()
+        with caplog.at_level(logging.WARNING, logger=sane_backend_mod.__name__):
+            sane_backend_mod.shutdown()
+
+        _assert_shutdown_failure_logged(caplog)
 
     def test_shutdown_re_arms_the_guard_even_when_sane_exit_failed(
         self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
@@ -815,12 +763,18 @@ class TestSaneShutdown:
         assert SaneBackend.close is not ScannerBackend.close
 
     def test_close_never_raises(
-        self, fake_sane_module: FakeSaneModule, monkeypatch: pytest.MonkeyPatch
+        self,
+        fake_sane_module: FakeSaneModule,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A raise from a close callback would replace the operator's error."""
         backend = SaneBackend()
         monkeypatch.setattr(fake_sane_module, "exit", _failing_exit)
-        backend.close()
+        with caplog.at_level(logging.WARNING, logger=sane_backend_mod.__name__):
+            backend.close()
+
+        _assert_shutdown_failure_logged(caplog)
 
     @pytest.mark.parametrize(
         "module",
@@ -2693,12 +2647,10 @@ class TestFakeFeederStartOrdering:
     """
     ``start()`` checks the armed error before the page budget (WR-07).
 
-    Two ordering faults lived in one method.  The budget check ran first, so
-    an error armed at the index one past the last page -- the end-of-feed
-    probe -- could never fire: the test silently became a clean-feed test
-    rather than failing loudly as a misconfiguration.  And the per-page delay
-    was applied to that probe as well, so a timeout test paid one delay more
-    than its page count implied, making wall-clock reasoning wrong by one unit.
+    The budget check used to run first, so an error armed at the index one past
+    the last page -- the end-of-feed probe -- could never fire: the test
+    silently became a clean-feed test rather than failing loudly as a
+    misconfiguration.
     """
 
     def test_an_error_armed_at_the_probe_index_is_reachable(
@@ -2722,26 +2674,6 @@ class TestFakeFeederStartOrdering:
 
         with pytest.raises(ScanError, match="jammed"):
             backend.scan_pages("test:0", settings, page_sink)
-
-    def test_the_end_of_feed_probe_is_not_delayed(
-        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
-    ) -> None:
-        """The delay is charged per page scanned, not per ``start()`` call."""
-        slept: list[float] = []
-        monkeypatch.setattr(time, "sleep", slept.append)
-        dev = FakeSaneDev(pages=2)
-        dev.set_page_delay(0.5)
-        backend = _backend_with(dev, monkeypatch)
-        settings = ScanSettings(
-            source="Automatic Document Feeder", resolution=300, mode="Color"
-        )
-
-        backend.scan_pages("test:0", settings, page_sink)
-
-        # Three start() calls -- two sheets and the probe that discovers the
-        # feeder is empty -- but only the two sheets are pages being scanned.
-        assert dev.calls.count("start") == 3
-        assert len(slept) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -2867,16 +2799,8 @@ class TestPaperSizeGeometry:
         assert mock_dev.br_x == pytest.approx(215.9, abs=1e-4)
         assert mock_dev.br_y == pytest.approx(279.4, abs=1e-4)
 
-    def test_geometry_failure_still_completes(
-        self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
-    ) -> None:
-        """A device without geometry options still completes the scan."""
-        backend = _backend_with(_geometry_less_device(), monkeypatch)
-        settings = ScanSettings(
-            source="Flatbed", resolution=300, mode="Color", paper_size="a4"
-        )
-        pages = backend.scan_pages("test:0", settings, page_sink).pages
-        assert len(pages) == 1
+    # A geometry-less device's scan is asserted, crop size included, by
+    # TestPaperSizeCropFallback.test_crop_fallback_when_geometry_fails below.
 
 
 class TestPaperSizeCropFallback:

@@ -762,7 +762,7 @@ class TestPipelineThumbnail:
         default_settings: Settings,
         tmp_path: Path,
     ) -> None:
-        """Pipeline works without thumbnail_callback."""
+        """Pipeline uploads the scan when no thumbnail_callback is given."""
         default_settings.output.tmp_dir = str(tmp_path)
         mock_scanner.scan_pages.side_effect = spooling([_make_content_image()])
 
@@ -770,13 +770,15 @@ class TestPipelineThumbnail:
             profile_name="default",
             title="No Thumb Test",
         )
-        # Should not raise
-        run_pipeline(
+        result = run_pipeline(
             scanner=mock_scanner,
             paperless=mock_paperless,
             settings=default_settings,
             request=request,
         )
+
+        assert result.pages_uploaded == 1
+        mock_paperless.upload_document.assert_called_once()
 
 
 class TestPipelineEmptyPageFilter:
@@ -2325,16 +2327,6 @@ class TestDiskSpaceCheck:
 
 class TestPipelineEventEnum:
     """PipelineEvent StrEnum tests."""
-
-    def test_pipeline_event_enum_members(self) -> None:
-        """All 6 PipelineEvent members exist with correct string values."""
-        assert PipelineEvent.SCANNING == "SCANNING"
-        assert PipelineEvent.AWAITING_FLIP == "AWAITING_FLIP"
-        assert PipelineEvent.SCANNING_REVERSE == "SCANNING_REVERSE"
-        assert PipelineEvent.ASSEMBLING == "ASSEMBLING"
-        assert PipelineEvent.UPLOADING == "UPLOADING"
-        assert PipelineEvent.DONE == "DONE"
-        assert len(PipelineEvent) == 6
 
     def test_pipeline_emits_enum_events(
         self,

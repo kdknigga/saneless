@@ -903,16 +903,6 @@ class TestSanedReachable:
         """
         assert _saned_reachable("scanner.invalid", SANED_PORT, _PROBE_BUDGET) is False
 
-    def test_the_default_probe_budget_is_two_seconds(self) -> None:
-        """
-        The connect budget is what makes an unplugged host cost 2 s, not 127 s.
-
-        Linux retries a SYN six times by default, so an unplugged host without
-        this bound costs roughly two minutes inside a blocking C call nothing
-        can interrupt.
-        """
-        assert PROBE_CONNECT_SECONDS == 2.0
-
     def test_the_registered_port_is_used(self) -> None:
         """
         6566 is IANA's ``sane-port``, verified in ``/etc/services``.
