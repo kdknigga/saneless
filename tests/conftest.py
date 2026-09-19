@@ -14,6 +14,7 @@ import httpx
 import pytest
 from PIL import Image, ImageDraw
 
+from saneless import paperless as paperless_module
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -367,7 +368,9 @@ def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
         )
 
     monkeypatch.setattr("saneless.web.app.PaperlessClient", build_client)
-    monkeypatch.setattr("saneless.paperless.time.sleep", delays.append)
+    # ``saneless.paperless`` reaches its backoff through the ``time`` module, so
+    # this swaps that module's ``sleep`` for the length of the test.
+    monkeypatch.setattr(paperless_module.time, "sleep", delays.append)
     return delays
 
 
