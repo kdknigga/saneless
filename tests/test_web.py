@@ -16,12 +16,12 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from httpx import Response
 
@@ -72,6 +72,10 @@ from saneless.web.routes import _profile_options, _ProfileOption
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
 from tests.conftest import StubScannerBackend
 
+# Every app built in this module, fixture or helper, talks to a Paperless client
+# whose requests fail inside the process: nothing reaches localhost:8000.
+pytestmark = pytest.mark.usefixtures("offline_paperless")
+
 
 def _app(client: TestClient) -> FastAPI:
     """Extract the FastAPI app from a TestClient, helping the type checker."""
@@ -83,19 +87,9 @@ def _app(client: TestClient) -> FastAPI:
 
 
 @pytest.fixture
-def test_settings(tmp_path: Path) -> Settings:
-    """Create Settings with test-safe defaults and tmp_path for output."""
-    auth = "test-token"
-    return Settings(
-        scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(
-            url="http://localhost:8000",
-            token=auth,
-        ),
-        output=OutputConfig(
-            tmp_dir=str(tmp_path),
-            data_dir=str(tmp_path),
-        ),
+def web_settings(make_settings: Callable[..., Settings]) -> Settings:
+    """Build the web app's settings: the suite defaults plus a ``duplex`` profile."""
+    return make_settings(
         profiles={
             "default": ProfileConfig(),
             "duplex": ProfileConfig(source="ADF Duplex"),
@@ -110,9 +104,9 @@ def web_scanner() -> StubScannerBackend:
 
 
 @pytest.fixture
-def app(test_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
+def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
     """Create the FastAPI app with test settings and stub scanner."""
-    return create_app(test_settings, web_scanner)
+    return create_app(web_settings, web_scanner)
 
 
 @pytest.fixture
@@ -171,9 +165,11 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
 def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
     """/health answers promptly while another request is blocked in I/O (ROBU-05)."""
     gate = threading.Event()
+    entered = threading.Event()
     app = _app(client)
 
     def blocking_get_tags() -> list[dict[str, object]]:
+        entered.set()
         gate.wait(5)
         return []
 
@@ -182,7 +178,7 @@ def test_health_answers_while_a_request_blocks(client: TestClient) -> None:
     slow = threading.Thread(target=lambda: client.get("/api/tags"))
     slow.start()
     try:
-        time.sleep(0.2)
+        assert entered.wait(5)
         started = time.monotonic()
         response = client.get("/health")
         elapsed = time.monotonic() - started
@@ -242,10 +238,10 @@ def test_health_reports_down_worker(client: TestClient) -> None:
     assert response.json() == {"status": "error", "detail": "worker thread is down"}
 
 
-def test_profile_dropdown(client: TestClient, test_settings: Settings) -> None:
+def test_profile_dropdown(client: TestClient, web_settings: Settings) -> None:
     """Profile names from settings appear in dropdown (PROF-03)."""
     response = client.get("/")
-    for profile_name in test_settings.profiles:
+    for profile_name in web_settings.profiles:
         assert profile_name in response.text
 
 
@@ -896,10 +892,10 @@ def test_paperless_test_502_sanitizes_exception(client: TestClient) -> None:
     assert "abc123" not in response.text
 
 
-def _raise_factory(exc_type: type[Exception], msg: str):  # noqa: ANN202 -- return type is dynamic callable
+def _raise_factory(exc_type: type[Exception], msg: str) -> Callable[[], NoReturn]:
     """Create a callable that raises the given exception with the given message."""
 
-    def _raise() -> None:
+    def _raise() -> NoReturn:
         raise exc_type(msg)
 
     return _raise
@@ -920,10 +916,10 @@ class TestAppComposition:
 
     @pytest.fixture
     def unstarted_app(
-        self, test_settings: Settings, web_scanner: StubScannerBackend
+        self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> Iterator[FastAPI]:
         """Build the app and never enter its lifespan, closing what it opened."""
-        built = create_app(test_settings, web_scanner)
+        built = create_app(web_settings, web_scanner)
         try:
             yield built
         finally:
@@ -998,13 +994,13 @@ class TestAppComposition:
         assert cached.checked_at is None
 
     def test_the_existing_state_entries_and_filters_are_unchanged(
-        self, unstarted_app: FastAPI, test_settings: Settings
+        self, unstarted_app: FastAPI, web_settings: Settings
     ) -> None:
         """The five earlier injections and three earlier filters still hold."""
         state = unstarted_app.state
         assert isinstance(state.worker, ScanWorker)
         assert isinstance(state.job_store, JobStore)
-        assert state.settings is test_settings
+        assert state.settings is web_settings
         assert state.paperless is not None
         assert state.cache is not None
         filters = state.templates.env.filters

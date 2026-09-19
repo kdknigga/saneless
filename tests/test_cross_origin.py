@@ -36,10 +36,7 @@ from markupsafe import escape
 from starlette.datastructures import Headers
 
 from saneless.config import (
-    OutputConfig,
-    PaperlessConfig,
     ProfileConfig,
-    ScannerConfig,
     Settings,
 )
 from saneless.vocabulary import RequestRejection, rejection_message
@@ -48,11 +45,15 @@ from saneless.web.cross_origin import CrossOriginGuard, is_cross_origin_request
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from pathlib import Path
+    from collections.abc import Callable, Iterator
 
     from fastapi import FastAPI
     from starlette.types import Message, Receive, Scope, Send
+
+# Every app built in this module, fixture or helper, talks to a Paperless client
+# whose requests fail inside the process: nothing reaches localhost:8000.
+pytestmark = pytest.mark.usefixtures("offline_paperless")
+
 
 LAN_HOST = "192.168.1.5:8080"
 LAN_ORIGIN = f"http://{LAN_HOST}"
@@ -244,19 +245,9 @@ def _new_route() -> dict[str, str]:
 
 
 @pytest.fixture
-def test_settings(tmp_path: Path) -> Settings:
-    """Create Settings with test-safe defaults and tmp_path for output."""
-    auth = "test-token"
-    return Settings(
-        scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(
-            url="http://localhost:8000",
-            token=auth,
-        ),
-        output=OutputConfig(
-            tmp_dir=str(tmp_path),
-            data_dir=str(tmp_path),
-        ),
+def web_settings(make_settings: Callable[..., Settings]) -> Settings:
+    """Build the web app's settings: the suite defaults plus a ``duplex`` profile."""
+    return make_settings(
         profiles={
             "default": ProfileConfig(),
             "duplex": ProfileConfig(source="ADF Duplex"),
@@ -271,9 +262,9 @@ def web_scanner() -> StubScannerBackend:
 
 
 @pytest.fixture
-def app(test_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
+def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
     """Create the production FastAPI app."""
-    return create_app(test_settings, web_scanner)
+    return create_app(web_settings, web_scanner)
 
 
 @pytest.fixture

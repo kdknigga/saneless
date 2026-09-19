@@ -57,3 +57,14 @@ def test_no_saneless_variable_leaks_in() -> None:
 def test_playwright_browsers_path_is_pinned() -> None:
     """The browser tests still find Chromium once HOME is a fake directory."""
     assert os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+
+
+def test_no_test_module_names_a_fixed_temp_path() -> None:
+    """No test builds its settings on one shared, process-wide temp directory."""
+    fixed = "saneless" + "-test"
+    offenders = sorted(
+        path.name
+        for path in _TESTS.glob("*.py")
+        if fixed in path.read_text(encoding="utf-8")
+    )
+    assert offenders == []

@@ -12,13 +12,12 @@ import os
 import re
 import sqlite3
 import sys
-import tempfile
 import threading
 import time
 import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import click
@@ -34,7 +33,6 @@ from saneless.config import (
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
-    ScannerConfig,
     Settings,
 )
 from saneless.exceptions import (
@@ -67,7 +65,7 @@ from saneless.vocabulary import (
     local_time,
     state_label,
 )
-from tests.conftest import StubScannerBackend, scan_batch
+from tests.conftest import StubScannerBackend, build_settings, scan_batch
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -75,11 +73,6 @@ if TYPE_CHECKING:
     from click.testing import Result
 
     from saneless.scanner.base import PageSink, ScanSettings
-
-_TEST_TMP = str(Path(tempfile.gettempdir()) / "saneless-test")
-# Keeps the suite out of the developer's real ~/.local/state/saneless.
-_TEST_DATA = str(Path(tempfile.gettempdir()) / "saneless-test" / "data")
-_TEST_LOG = str(Path(tempfile.gettempdir()) / "saneless-test" / "saneless.log")
 
 
 def _inked_page() -> Image.Image:
@@ -95,27 +88,23 @@ def _inked_page() -> Image.Image:
     return page
 
 
-def _make_settings(**overrides: object) -> Settings:
-    """Create a Settings instance with test defaults."""
-    auth = "test-token"
-    defaults: dict[str, Any] = {
-        "scanner": ScannerConfig(device="test:device:001"),
-        "paperless": PaperlessConfig(
-            url="http://localhost:8000",
-            token=auth,
-        ),
-        "output": OutputConfig(
-            tmp_dir=_TEST_TMP,
-            data_dir=_TEST_DATA,
-            log_file=_TEST_LOG,
-        ),
-        "profiles": {
-            "default": ProfileConfig(),
-            "photo": ProfileConfig(resolution=600, mode="color"),
-        },
+def _make_settings(tmp_path: Path, **overrides: object) -> Settings:
+    """
+    Build the suite's test settings plus a ``photo`` profile.
+
+    Args:
+        tmp_path: The test's own temporary directory, for every path setting.
+        **overrides: Whole sections to use instead of the defaults.
+
+    Returns:
+        A fresh Settings instance.
+
+    """
+    profiles = {
+        "default": ProfileConfig(),
+        "photo": ProfileConfig(resolution=600, mode="color"),
     }
-    defaults.update(overrides)
-    return Settings(**defaults)
+    return build_settings(tmp_path, **({"profiles": profiles} | overrides))
 
 
 def _patch_cli(
@@ -127,9 +116,12 @@ def _patch_cli(
     """
     Patch cli module dependencies for testing.
 
+    Without ``settings`` the defaults are built on the working directory, which
+    the suite's autouse ``hermetic_env`` makes the test's own ``tmp_path``.
+
     Returns (runner, settings_used).
     """
-    settings = settings or _make_settings()
+    settings = settings or _make_settings(Path.cwd())
 
     def _fake_load_settings(config_path: str | None = None) -> Settings:
         """
@@ -384,7 +376,7 @@ class TestScanCommand:
 
     @staticmethod
     def _capture_title_run(
-        monkeypatch: pytest.MonkeyPatch, args: list[str]
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path, args: list[str]
     ) -> tuple[Result, PipelineRequest | None]:
         """
         Run ``scan`` against a ``receipt`` profile titled "Receipt".
@@ -394,6 +386,7 @@ class TestScanCommand:
 
         Args:
             monkeypatch: The test's monkeypatch fixture.
+            tmp_path: The test's own temporary directory.
             args: The CLI arguments.
 
         Returns:
@@ -401,10 +394,11 @@ class TestScanCommand:
 
         """
         settings = _make_settings(
+            tmp_path,
             profiles={
                 "default": ProfileConfig(),
                 "receipt": ProfileConfig(title="Receipt"),
-            }
+            },
         )
         runner, _ = _patch_cli(monkeypatch, settings=settings)
         captured: list[PipelineRequest] = []
@@ -425,14 +419,14 @@ class TestScanCommand:
 
     @pytest.mark.parametrize("typed", [None, "", "   "])
     def test_scan_blank_title_uses_the_profile_title(
-        self, monkeypatch: pytest.MonkeyPatch, typed: str | None
+        self, monkeypatch: pytest.MonkeyPatch, typed: str | None, tmp_path: Path
     ) -> None:
         """An omitted or blank ``--title`` resolves to the profile's title (D-16)."""
         args = ["scan", "--profile", "receipt"]
         if typed is not None:
             args += ["--title", typed]
 
-        result, request = self._capture_title_run(monkeypatch, args)
+        result, request = self._capture_title_run(monkeypatch, tmp_path, args)
 
         assert result.exit_code == 0, result.output
         assert request is not None
@@ -440,11 +434,11 @@ class TestScanCommand:
         assert "Done: Receipt" in result.output
 
     def test_scan_typed_title_beats_the_profile_title(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A non-blank ``--title`` is kept as typed."""
         result, request = self._capture_title_run(
-            monkeypatch, ["scan", "--profile", "receipt", "--title", "Typed"]
+            monkeypatch, tmp_path, ["scan", "--profile", "receipt", "--title", "Typed"]
         )
 
         assert result.exit_code == 0, result.output
@@ -453,11 +447,11 @@ class TestScanCommand:
         assert "Done: Typed" in result.output
 
     def test_scan_unknown_profile_exits_2_before_title_resolution(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """An unknown profile is still refused with exit 2 and no pipeline run."""
         result, request = self._capture_title_run(
-            monkeypatch, ["scan", "--profile", "nope"]
+            monkeypatch, tmp_path, ["scan", "--profile", "nope"]
         )
 
         assert result.exit_code == 2
@@ -557,11 +551,8 @@ class TestScanCommand:
         """
         Pipeline raises PaperlessError -> exit code 3.
 
-        The directories are repointed at ``tmp_path`` because the failed upload
-        preserves the assembled PDF: with ``_make_settings``' defaults that
-        wrote a real file into the suite's shared ``/tmp/saneless-test/data``,
-        once per run, where nothing ever removes it (WR-07's sibling leak, and
-        the one that pre-dates this phase).
+        The failed upload preserves the assembled PDF, into this test's own
+        ``data_dir``.
         """
 
         class FailPaperless:
@@ -578,13 +569,7 @@ class TestScanCommand:
             def close(self) -> None:
                 """No-op close."""
 
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path / "scratch"),
-                data_dir=str(tmp_path / "state"),
-                log_file=_TEST_LOG,
-            ),
-        )
+        settings = _make_settings(tmp_path)
         runner, _ = _patch_cli(
             monkeypatch, settings=settings, paperless_cls=FailPaperless
         )
@@ -649,13 +634,7 @@ class TestScanCommand:
             def close(self) -> None:
                 """No-op close."""
 
-        settings = _make_settings(
-            output=OutputConfig(
-                tmp_dir=str(tmp_path / "scratch"),
-                data_dir=str(tmp_path / "state"),
-                log_file=_TEST_LOG,
-            ),
-        )
+        settings = _make_settings(tmp_path)
         runner, _ = _patch_cli(
             monkeypatch, settings=settings, paperless_cls=FailPaperless
         )
@@ -702,6 +681,7 @@ def _duplex_settings(tmp_path: Path, flip_timeout_seconds: int = 600) -> Setting
 
     """
     return _make_settings(
+        tmp_path,
         output=OutputConfig(
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
@@ -1427,14 +1407,14 @@ class TestCliFlags:
         assert saneless_level == logging.DEBUG
         assert "verbose-probe-5c1d" in result.stderr
 
-    def test_config_flag(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_config_flag(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """--config /path/to/config -> load_settings called with that path."""
         captured: dict[str, object] = {}
 
         def capture_load(config_path: str | None = None) -> Settings:
             """Record the config_path argument."""
             captured["config_path"] = config_path
-            return _make_settings()
+            return _make_settings(tmp_path)
 
         runner = CliRunner()
         monkeypatch.setattr("saneless.cli.load_settings", capture_load)
@@ -1698,10 +1678,10 @@ class TestLazySettingsLoading:
         assert isinstance(result.exception, SystemExit)
 
     def test_settings_loaded_and_logging_configured_once(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A second request for settings reuses the first load (memoised)."""
-        settings = _make_settings()
+        settings = _make_settings(tmp_path)
         counts = {"load": 0, "logging": 0}
 
         def counting_load(*_args: object, **_kwargs: object) -> Settings:
@@ -1866,6 +1846,7 @@ class TestRequireSane:
         """
         data_dir = tmp_path / "new"
         settings = _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(data_dir),
@@ -1920,6 +1901,7 @@ class TestJobsCommand:
         OutputConfig is built in exactly one place.
         """
         return _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),
@@ -2148,6 +2130,7 @@ class TestServeCommand:
 
     def test_serve_custom_host_port(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Serve --host/--port overrides config defaults."""
+        self._mock_socket(monkeypatch)
         captured = self._capture_uvicorn(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)
 
@@ -2213,16 +2196,11 @@ class TestServeCommand:
         assert captured["app"] is not None
 
     @staticmethod
-    def _loopback_settings() -> Settings:
+    def _loopback_settings(tmp_path: Path) -> Settings:
         """Build settings that serve on 127.0.0.1, port left at its 8080 default."""
-        return _make_settings(
-            output=OutputConfig(
-                tmp_dir=_TEST_TMP,
-                data_dir=_TEST_DATA,
-                log_file=_TEST_LOG,
-                web_host="127.0.0.1",
-            ),
-        )
+        settings = _make_settings(tmp_path)
+        settings.output.web_host = "127.0.0.1"
+        return settings
 
     @staticmethod
     def _stub_create_app(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2246,7 +2224,7 @@ class TestServeCommand:
         return calls
 
     def test_serve_bind_failure_exits_2_with_one_line(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
         A port that cannot be bound is a setup problem: one line, exit 2.
@@ -2259,7 +2237,7 @@ class TestServeCommand:
         monkeypatch.setattr("saneless.cli.socket.socket", lambda *_a, **_kw: sock)
         self._stub_create_app(monkeypatch)
         runs = self._uvicorn_exits(monkeypatch, 0)
-        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
@@ -2272,7 +2250,7 @@ class TestServeCommand:
         sock.close.assert_called_once()
 
     def test_serve_uvicorn_startup_failure_exits_2_not_3(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
         A uvicorn startup failure (its own exit 3) becomes exit 2 (D-07 amendment).
@@ -2283,7 +2261,7 @@ class TestServeCommand:
         self._mock_socket(monkeypatch)
         self._stub_create_app(monkeypatch)
         runs = self._uvicorn_exits(monkeypatch, 3)
-        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
@@ -2297,13 +2275,13 @@ class TestServeCommand:
 
     @pytest.mark.parametrize("code", [0, None])
     def test_serve_uvicorn_clean_system_exit_stays_0(
-        self, monkeypatch: pytest.MonkeyPatch, code: int | None
+        self, monkeypatch: pytest.MonkeyPatch, code: int | None, tmp_path: Path
     ) -> None:
         """A ``SystemExit`` with no failure status from uvicorn still exits 0."""
         self._mock_socket(monkeypatch)
         self._stub_create_app(monkeypatch)
         self._uvicorn_exits(monkeypatch, code)
-        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
@@ -2311,7 +2289,7 @@ class TestServeCommand:
         assert result.stderr == ""
 
     def test_serve_normal_stop_exits_0_not_cancelled(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
         Ctrl-C on ``serve`` is a normal stop, exit 0, not a cancel (D-03).
@@ -2327,7 +2305,7 @@ class TestServeCommand:
             calls.append("uvicorn.run")
 
         monkeypatch.setattr("saneless.cli.uvicorn.run", returning_run)
-        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
@@ -2336,7 +2314,7 @@ class TestServeCommand:
         assert "Cancelled" not in result.output
 
     def test_serve_sane_init_failure_exits_2_not_1(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
         SANE failing to initialise stops ``serve`` starting: exit 2, not 1 (WR-07).
@@ -2356,7 +2334,7 @@ class TestServeCommand:
 
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=self._loopback_settings(),
+            settings=self._loopback_settings(tmp_path),
             scanner_cls=FailingSaneBackend,
         )
 
@@ -2370,7 +2348,7 @@ class TestServeCommand:
         assert runs == []
 
     def test_serve_ctrl_c_before_the_server_starts_exits_130(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """
         Ctrl-C during start-up, before uvicorn owns the signal, is a cancel (D-03).
@@ -2384,7 +2362,7 @@ class TestServeCommand:
             raise KeyboardInterrupt
 
         monkeypatch.setattr("saneless.cli.create_app", interrupted_create_app)
-        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
@@ -2393,7 +2371,7 @@ class TestServeCommand:
         assert runs == []
 
     def test_serve_malformed_paperless_url_exits_3(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A Paperless URL the client cannot parse is a Paperless error, exit 3."""
         self._mock_socket(monkeypatch)
@@ -2404,7 +2382,7 @@ class TestServeCommand:
             raise PaperlessError(msg)
 
         monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
-        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings())
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
         result = runner.invoke(cli, ["serve"])
 
@@ -2744,6 +2722,7 @@ class TestTruncation:
         """Jobs table truncates long titles with ellipsis."""
         long_title = "T" * 50
         settings = _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),
@@ -2844,6 +2823,7 @@ def _tmp_settings(tmp_path: Path) -> Settings:
 
     """
     return _make_settings(
+        tmp_path,
         output=OutputConfig(
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
@@ -3217,6 +3197,7 @@ class TestExitCodes:
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
         settings = _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),
@@ -3246,6 +3227,7 @@ class TestExitCodes:
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
         settings = _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),
@@ -3337,7 +3319,7 @@ class TestExitCodes:
         assert records[0].exc_info[1] is exc
 
     def test_help_exits_0_without_running_the_command(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """``scan --help`` is click's Exit, re-raised by the guard: exit 0."""
         runner, _ = _patch_cli(monkeypatch)
@@ -3345,7 +3327,7 @@ class TestExitCodes:
 
         def recording_load(*_args: object, **_kwargs: object) -> Settings:
             calls.append("load_settings")
-            return _make_settings()
+            return _make_settings(tmp_path)
 
         monkeypatch.setattr("saneless.cli.load_settings", recording_load)
 
@@ -3789,11 +3771,12 @@ def _open_counting_scanner(opens: list[str]) -> type[ScannerBackend]:
     return _CountingScanner
 
 
-def _token_settings(value: str, consume_dir: str = "") -> Settings:
+def _token_settings(tmp_path: Path, value: str, consume_dir: str = "") -> Settings:
     """
     Build settings carrying ``value`` as the paperless-ngx token.
 
     Args:
+        tmp_path: The test's own temporary directory.
         value: The configured token, placeholder or not.
         consume_dir: A fallback consume directory, when the test needs one.
 
@@ -3802,6 +3785,7 @@ def _token_settings(value: str, consume_dir: str = "") -> Settings:
 
     """
     return _make_settings(
+        tmp_path,
         paperless=PaperlessConfig(
             url="http://localhost:8000",
             token=value,
@@ -3819,13 +3803,13 @@ class TestScanTokenRefusal:
     """
 
     def test_a_blank_token_is_a_placeholder_and_exits_2_before_the_scanner(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """An unset token refuses with exit 2 and zero scanner opens."""
         opens: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_token_settings(""),
+            settings=_token_settings(tmp_path, ""),
             scanner_cls=_open_counting_scanner(opens),
             paperless_cls=_refusing_paperless(),
         )
@@ -3837,13 +3821,13 @@ class TestScanTokenRefusal:
 
     @pytest.mark.parametrize("value", ["changeme", "your-api-token-here", "   "])
     def test_a_placeholder_token_exits_2_before_the_scanner(
-        self, monkeypatch: pytest.MonkeyPatch, value: str
+        self, monkeypatch: pytest.MonkeyPatch, value: str, tmp_path: Path
     ) -> None:
         """Every member of the literal set refuses the same way."""
         opens: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_token_settings(value),
+            settings=_token_settings(tmp_path, value),
             scanner_cls=_open_counting_scanner(opens),
             paperless_cls=_refusing_paperless(),
         )
@@ -3854,10 +3838,12 @@ class TestScanTokenRefusal:
         assert opens == []
 
     def test_a_real_token_is_not_a_placeholder_and_scans(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A real-looking token leaves ``scan`` exactly as it was."""
-        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("a-real-token"))
+        runner, _ = _patch_cli(
+            monkeypatch, settings=_token_settings(tmp_path, "a-real-token")
+        )
 
         result = runner.invoke(cli, ["scan", "--title", "Tax return"])
 
@@ -3871,7 +3857,7 @@ class TestScanTokenRefusal:
         opens: list[str] = []
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_token_settings("changeme", consume_dir=str(tmp_path)),
+            settings=_token_settings(tmp_path, "changeme", consume_dir=str(tmp_path)),
             scanner_cls=_open_counting_scanner(opens),
             paperless_cls=_refusing_paperless(),
         )
@@ -3882,12 +3868,12 @@ class TestScanTokenRefusal:
         assert opens == []
 
     def test_the_placeholder_refusal_names_the_title_and_profile_then_advises(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """It is a ConfigError, so it wears the D-08 shape and the D-12 advice."""
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_token_settings("changeme"),
+            settings=_token_settings(tmp_path, "changeme"),
             scanner_cls=_open_counting_scanner([]),
             paperless_cls=_refusing_paperless(),
         )
@@ -3902,13 +3888,13 @@ class TestScanTokenRefusal:
         assert lines[1] == f"Try: {error_next_step(ErrorCategory.CONFIG)}"
 
     def test_the_placeholder_refusal_never_echoes_the_value(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """ASVS V7: the token is passed to the predicate, never rendered."""
         secret = "your-token-here"
         runner, _ = _patch_cli(
             monkeypatch,
-            settings=_token_settings(secret),
+            settings=_token_settings(tmp_path, secret),
             scanner_cls=_open_counting_scanner([]),
             paperless_cls=_refusing_paperless(),
         )
@@ -3920,10 +3906,12 @@ class TestScanTokenRefusal:
         assert secret not in result.stderr
 
     def test_devices_is_unaffected_by_a_placeholder_token(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """``devices`` never talks to paperless-ngx, so it still exits 0."""
-        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("changeme"))
+        runner, _ = _patch_cli(
+            monkeypatch, settings=_token_settings(tmp_path, "changeme")
+        )
 
         result = runner.invoke(cli, ["devices"])
 
@@ -3934,7 +3922,7 @@ class TestScanTokenRefusal:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """``jobs`` reads the local database only, so it still exits 0."""
-        settings = _token_settings("changeme")
+        settings = _token_settings(tmp_path, "changeme")
         settings.output = OutputConfig(
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
@@ -3947,10 +3935,12 @@ class TestScanTokenRefusal:
         assert result.exit_code == 0, result.output
 
     def test_auto_profiles_is_unaffected_by_a_placeholder_token(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """``auto-profiles`` only reads the scanner, so it still exits 0."""
-        runner, _ = _patch_cli(monkeypatch, settings=_token_settings("changeme"))
+        runner, _ = _patch_cli(
+            monkeypatch, settings=_token_settings(tmp_path, "changeme")
+        )
 
         with runner.isolated_filesystem():
             result = runner.invoke(cli, ["auto-profiles"])
@@ -4008,6 +3998,7 @@ class TestJobsTableWidth:
     def _settings_for(tmp_path: Path) -> Settings:
         """Build Settings whose data_dir -- and so db_path -- is tmp_path."""
         return _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),
@@ -4090,6 +4081,7 @@ class TestJobsJsonContract:
     def _settings_for(tmp_path: Path) -> Settings:
         """Build Settings whose data_dir -- and so db_path -- is tmp_path."""
         return _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),
@@ -4178,6 +4170,7 @@ class TestServeLogging:
 
         """
         return _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),
@@ -4352,6 +4345,7 @@ class TestServeLogging:
         """
         log_file = tmp_path / "logs" / "saneless.log"
         settings = _make_settings(
+            tmp_path,
             output=OutputConfig(
                 tmp_dir=str(tmp_path),
                 data_dir=str(tmp_path),

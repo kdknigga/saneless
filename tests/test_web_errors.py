@@ -35,10 +35,8 @@ from fastapi.testclient import TestClient
 from markupsafe import escape
 
 from saneless.config import (
-    OutputConfig,
     PaperlessConfig,
     ProfileConfig,
-    ScannerConfig,
     Settings,
 )
 from saneless.vocabulary import (
@@ -68,6 +66,11 @@ if TYPE_CHECKING:
     from starlette.responses import Response
 
     from saneless.job import Job, JobStore
+
+# Every app built in this module, fixture or helper, talks to a Paperless client
+# whose requests fail inside the process: nothing reaches localhost:8000.
+pytestmark = pytest.mark.usefixtures("offline_paperless")
+
 
 HTMX_HEADERS = {"HX-Request": "true"}
 
@@ -123,28 +126,19 @@ def _raise_runtime_error() -> None:
 
 
 @pytest.fixture
-def test_settings(tmp_path: Path) -> Settings:
-    """Create Settings with test-safe defaults and tmp_path for output."""
-    auth = "test-token"
-    return Settings(
-        scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(
-            url="http://localhost:8000",
-            token=auth,
-        ),
-        output=OutputConfig(
-            tmp_dir=str(tmp_path),
-            data_dir=str(tmp_path),
-            # Named distinctively so the slot can be searched for it and mean
-            # something: the default is a path fragment that could collide with
-            # tmp_path itself and pass on nothing.
-            log_file=str(tmp_path / LOG_FILE_NAME),
-        ),
+def web_settings(make_settings: Callable[..., Settings], tmp_path: Path) -> Settings:
+    """Build the web app's settings: the suite defaults plus a ``duplex`` profile."""
+    settings = make_settings(
         profiles={
             "default": ProfileConfig(),
             "duplex": ProfileConfig(source="ADF Duplex"),
         },
     )
+    # Named distinctively so the slot can be searched for it and mean
+    # something: the default is a path fragment that could collide with
+    # tmp_path itself and pass on nothing.
+    settings.output.log_file = tmp_path / LOG_FILE_NAME
+    return settings
 
 
 @pytest.fixture
@@ -154,9 +148,9 @@ def web_scanner() -> StubScannerBackend:
 
 
 @pytest.fixture
-def app(test_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
+def app(web_settings: Settings, web_scanner: StubScannerBackend) -> FastAPI:
     """Create the FastAPI app with the test-only error routes added."""
-    application = create_app(test_settings, web_scanner)
+    application = create_app(web_settings, web_scanner)
     # Served on POST as well as GET so the retarget exemption, which is keyed
     # on the method, can be pinned for every rejection in both directions
     # (R4-WR-01).
@@ -1334,13 +1328,13 @@ class TestPlaceholderTokenRefusal:
     )
     def test_placeholder_token_submit_is_503_with_the_unset_message(
         self,
-        test_settings: Settings,
+        web_settings: Settings,
         web_scanner: StubScannerBackend,
         credential: str,
     ) -> None:
         """Every placeholder shape is one 503 carrying the unset-token sentence."""
         with _appliance_with_credential(
-            test_settings, web_scanner, credential
+            web_settings, web_scanner, credential
         ) as client:
             response = client.post(
                 "/api/scan",
@@ -1360,13 +1354,13 @@ class TestPlaceholderTokenRefusal:
     )
     def test_placeholder_token_writes_the_rejected_row(
         self,
-        test_settings: Settings,
+        web_settings: Settings,
         web_scanner: StubScannerBackend,
         credential: str,
     ) -> None:
         """The refused attempt is recorded, not silently dropped (D-05)."""
         with _appliance_with_credential(
-            test_settings, web_scanner, credential
+            web_settings, web_scanner, credential
         ) as client:
             client.post(
                 "/api/scan",
@@ -1376,7 +1370,7 @@ class TestPlaceholderTokenRefusal:
             _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
 
     def test_placeholder_token_refusal_appears_in_job_history(
-        self, test_settings: Settings, web_scanner: StubScannerBackend
+        self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
         The attempt is visible in Job History end to end (Phase 26 D-05).
@@ -1386,7 +1380,7 @@ class TestPlaceholderTokenRefusal:
         household member actually looks at.
         """
         with _appliance_with_credential(
-            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+            web_settings, web_scanner, _SHIPPED_PLACEHOLDER
         ) as client:
             client.post(
                 "/api/scan",
@@ -1400,7 +1394,7 @@ class TestPlaceholderTokenRefusal:
 
     def test_placeholder_token_refuses_before_any_job_is_offered_to_the_worker(
         self,
-        test_settings: Settings,
+        web_settings: Settings,
         web_scanner: StubScannerBackend,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -1412,7 +1406,7 @@ class TestPlaceholderTokenRefusal:
         that never started.
         """
         with _appliance_with_credential(
-            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+            web_settings, web_scanner, _SHIPPED_PLACEHOLDER
         ) as client:
             offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
             response = client.post(
@@ -1428,7 +1422,7 @@ class TestPlaceholderTokenRefusal:
             assert rows[0].error_category is ErrorCategory.REJECTED
 
     def test_placeholder_token_refuses_even_with_a_consume_dir_configured(
-        self, test_settings: Settings, web_scanner: StubScannerBackend, tmp_path: Path
+        self, web_settings: Settings, web_scanner: StubScannerBackend, tmp_path: Path
     ) -> None:
         """
         The refusal is unconditional, not contingent on the upload route.
@@ -1438,7 +1432,7 @@ class TestPlaceholderTokenRefusal:
         the predicate is the whole condition.
         """
         with _appliance_with_credential(
-            test_settings,
+            web_settings,
             web_scanner,
             _SHIPPED_PLACEHOLDER,
             consume_dir=str(tmp_path),
@@ -1452,7 +1446,7 @@ class TestPlaceholderTokenRefusal:
             _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
 
     def test_placeholder_token_never_says_the_scan_service_was_unavailable(
-        self, test_settings: Settings, web_scanner: StubScannerBackend
+        self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
         WORKER_DEGRADED is not reused for this refusal (D-15, T-30-67).
@@ -1462,7 +1456,7 @@ class TestPlaceholderTokenRefusal:
         server.  That untruth is what this milestone removes.
         """
         with _appliance_with_credential(
-            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+            web_settings, web_scanner, _SHIPPED_PLACEHOLDER
         ) as client:
             response = client.post(
                 "/api/scan",
@@ -1479,7 +1473,7 @@ class TestPlaceholderTokenRefusal:
             assert newest.error != WORKER_DEGRADED_JOB_ERROR
 
     def test_placeholder_token_refuses_a_post_that_sends_no_htmx_header(
-        self, test_settings: Settings, web_scanner: StubScannerBackend
+        self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
         curl, a script, and a browser with ``disabled`` stripped are all refused.
@@ -1488,7 +1482,7 @@ class TestPlaceholderTokenRefusal:
         stands in for every client the courtesy cannot reach (T-30-64).
         """
         with _appliance_with_credential(
-            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+            web_settings, web_scanner, _SHIPPED_PLACEHOLDER
         ) as client:
             response = client.post(
                 "/api/scan", data={"profile": "default", "title": "Raw Post"}
@@ -1497,7 +1491,7 @@ class TestPlaceholderTokenRefusal:
             _assert_rejected_row(client, TOKEN_UNSET_JOB_ERROR)
 
     def test_placeholder_token_refusal_mints_no_owner_cookie(
-        self, test_settings: Settings, web_scanner: StubScannerBackend
+        self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """
         A refused submit owns no job, so it is handed no owner token (D-23).
@@ -1506,7 +1500,7 @@ class TestPlaceholderTokenRefusal:
         never started anything from collecting a session cookie.
         """
         with _appliance_with_credential(
-            test_settings, web_scanner, _SHIPPED_PLACEHOLDER
+            web_settings, web_scanner, _SHIPPED_PLACEHOLDER
         ) as client:
             response = client.post(
                 "/api/scan",
@@ -1516,11 +1510,11 @@ class TestPlaceholderTokenRefusal:
             assert OWNER_COOKIE not in response.headers.get("set-cookie", "")
 
     def test_a_real_token_is_no_placeholder_token_and_still_starts_the_scan(
-        self, test_settings: Settings, web_scanner: StubScannerBackend
+        self, web_settings: Settings, web_scanner: StubScannerBackend
     ) -> None:
         """A configured appliance is untouched, owner-cookie mint included."""
         with _appliance_with_credential(
-            test_settings, web_scanner, _ACCEPTED_CREDENTIAL
+            web_settings, web_scanner, _ACCEPTED_CREDENTIAL
         ) as client:
             response = client.post(
                 "/api/scan",

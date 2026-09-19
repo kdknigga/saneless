@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from PIL import Image, ImageDraw
 
@@ -251,30 +253,122 @@ def hermetic_env(
     monkeypatch.chdir(tmp_path)
 
 
-@pytest.fixture
-def default_settings(tmp_path: Path) -> Settings:
+def build_settings(tmp_path: Path, **overrides: object) -> Settings:
     """
-    Return a Settings instance with test-safe defaults.
+    Build Settings with test-safe defaults, every directory under ``tmp_path``.
 
-    Scratch space and durable state sit on separate subtrees of ``tmp_path``,
-    as they do in a real deployment. Temp-cleanup assertions walk ``tmp_dir``
-    demanding that nothing survives a run, and ``failed/`` under ``data_dir`` is
-    meant to survive, so the two must not share a root.
+    Scratch space and durable state sit on separate subtrees, as they do in a
+    real deployment. Temp-cleanup assertions walk ``tmp_dir`` demanding that
+    nothing survives a run, and ``failed/`` under ``data_dir`` is meant to
+    survive, so the two must not share a root.
+
+    A keyword replaces its whole section, so a test overriding ``output`` must
+    supply its own paths; most tests instead mutate one field of the result.
+
+    Import it as ``from tests.conftest import build_settings`` where a
+    module-level helper needs it, or request the ``make_settings`` fixture.
+
+    Args:
+        tmp_path: The test's own temporary directory.
+        **overrides: Whole sections (``scanner``, ``paperless``, ``output``,
+            ``profiles``, ...) to use instead of the defaults.
+
+    Returns:
+        A fresh Settings instance.
+
     """
     auth = "test-token"
-    return Settings(
-        scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(
-            url="http://localhost:8000",
-            token=auth,
-        ),
-        output=OutputConfig(
+    sections: dict[str, Any] = {
+        "scanner": ScannerConfig(device="test:device:001"),
+        "paperless": PaperlessConfig(url="http://localhost:8000", token=auth),
+        "output": OutputConfig(
             tmp_dir=tmp_path / "tmp",
             data_dir=tmp_path / "data",
             log_file=tmp_path / "data" / "saneless.log",
         ),
-        profiles={"default": ProfileConfig()},
-    )
+        "profiles": {"default": ProfileConfig()},
+    }
+    sections.update(overrides)
+    return Settings(**sections)
+
+
+@pytest.fixture
+def make_settings(tmp_path: Path) -> Callable[..., Settings]:
+    """
+    Hand a test ``build_settings`` already bound to its own ``tmp_path``.
+
+    Returns:
+        A callable taking the same section overrides as ``build_settings``.
+
+    """
+    return functools.partial(build_settings, tmp_path)
+
+
+@pytest.fixture
+def default_settings(tmp_path: Path) -> Settings:
+    """Return a Settings instance with test-safe defaults under ``tmp_path``."""
+    return build_settings(tmp_path)
+
+
+def _refuse_every_request(request: httpx.Request) -> httpx.Response:
+    """
+    Fail a Paperless request the way an unreachable server does.
+
+    Args:
+        request: The request the client tried to send.
+
+    Raises:
+        httpx.ConnectError: Always, as a refused connection would.
+
+    """
+    msg = "paperless unreachable in tests"
+    raise httpx.ConnectError(msg, request=request)
+
+
+@pytest.fixture
+def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """
+    Give the web app a Paperless client that never leaves the process.
+
+    The web settings name ``http://localhost:8000``, so a test that submits a
+    scan used to have its worker really connect there: refused on most
+    machines, then backed off for a real one and two seconds -- and on a
+    developer machine running Paperless, delivered with the test token.
+
+    ``create_app`` still builds a real ``PaperlessClient``; only its transport
+    is replaced, by one that fails every request with the same ``ConnectError``
+    a refused connection raises. The upload backoff is recorded instead of
+    slept. Tests that replace ``app.state.paperless`` methods are unaffected.
+
+    Args:
+        monkeypatch: Undoes both patches after the test.
+
+    Returns:
+        The backoff delays the client asked for, in order.
+
+    """
+    delays: list[float] = []
+
+    def build_client(
+        *, url: str, token: str, consume_dir: Path | None = None
+    ) -> PaperlessClient:
+        """
+        Build the app's Paperless client over the refusing transport.
+
+        Returns:
+            A real client whose every request fails without a socket.
+
+        """
+        return PaperlessClient(
+            url=url,
+            token=token,
+            consume_dir=consume_dir,
+            transport=httpx.MockTransport(_refuse_every_request),
+        )
+
+    monkeypatch.setattr("saneless.web.app.PaperlessClient", build_client)
+    monkeypatch.setattr("saneless.paperless.time.sleep", delays.append)
+    return delays
 
 
 def _inked_page() -> Image.Image:
