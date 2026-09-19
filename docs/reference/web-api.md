@@ -2,6 +2,8 @@
 
 saneless exposes a web API at the configured host and port (default `0.0.0.0:8080`). The web UI uses these endpoints via HTMX. They exist for the web UI: most return HTML fragments for HTMX to swap into the page rather than JSON, so their responses change along with the UI. Only `GET /health` and `GET /api/paperless/test` return JSON on success. Error responses are different: every endpoint answers a request without `HX-Request: true` with a JSON error body, as described under [Errors](#errors).
 
+Direct calls, such as from `curl` or a script, work too, but only those two JSON endpoints and the JSON error body have a stable shape to build on.
+
 ## Endpoint Overview
 
 | Method | Endpoint | Purpose |
