@@ -22,13 +22,13 @@
       probe is coming.  A probe holding the refresher's single-flight lock is the
       second: results exist, but this render is of the pre-probe entry and the
       probe's own `store` is seconds away, so without the ask nothing on the page
-      would ever collect it and Check again could visibly do nothing (WR-03).
+      would ever collect it and Check again could visibly do nothing.
       Once both are false the strip is refetched only by Check again, by the
       terminal-state reload, or by a page load.  Every chain of asks is bounded
       by one of the two caps above whichever condition started it, so neither
-      one is a steady-state poll: a permanent poll would keep D-05's lazy refresher
-      awake for every abandoned browser tab, which is the exact cost D-05 exists
-      to avoid.
+      one is a steady-state poll: a permanent poll would keep the lazy refresher
+      awake for every abandoned browser tab, which is the exact cost its laziness
+      exists to avoid.
 
    The attributes stay INSIDE the conditional.  This is an outerHTML swap target,
    so an unconditional htmx request attribute here is a body that re-arms itself
@@ -56,9 +56,9 @@
    The filters the results branch reaches for take the WHOLE result rather than
    its state, because the state is not on its own enough to draw the row: a
    result the registry skipped carries CheckState.OK so that `saneless doctor`
-   keeps exiting 0 for a probe nobody took (D-01), and drawing from that state
+   keeps exiting 0 for a probe nobody took, and drawing from that state
    put a green tick in front of "Not checked while a scan is running."
-   (R3-WR-03).  Choosing the marker from the result, `skipped` flag included,
+   Choosing the marker from the result, `skipped` flag included,
    is a Python decision in check_row_class / check_row_glyph / check_row_label
    -- which is what keeps the rule out of here and keeps `doctor` reading the
    same flag through cli._row_marker. #}

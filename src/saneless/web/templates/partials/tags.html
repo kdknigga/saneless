@@ -4,18 +4,18 @@
    target, and a partial that rendered only the rows would put them where the
    wrapper was and lose both on the first refresh.
 
-   Two loops, not one, and that is Amendment A-5 made visible.  The first holds
-   the ticks the filter excludes, pinned above the list so a tick can never
-   leave the DOM and therefore can never be dropped from the next submit.  The
-   second is the filtered list; a tag that is both ticked and matched is
-   rendered by that loop alone, so it appears once rather than twice.
+   Two loops, not one.  The first holds the ticks the filter excludes, pinned
+   above the list so a tick can never leave the DOM and therefore can never be
+   dropped from the next submit.  The second is the filtered list; a tag that is
+   both ticked and matched is rendered by that loop alone, so it appears once
+   rather than twice.
 
    The filter text itself appears nowhere in this file.  It is a filter, not a
    label, and nothing the client typed is rendered back (ASVS V5).  The tag
    names are upstream text and stay autoescaped; nothing here is marked safe.
 
    The label is the tap target, not the box: app.css gives every row the full
-   width and a finger-sized height (UI-SPEC S6).
+   width and a finger-sized height.
 
    The wrapper carries no request of its own: the list is server-rendered, and
    the filter box, the refresh button and the filter form each carry theirs. #}

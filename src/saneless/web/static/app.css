@@ -12,10 +12,10 @@
    status area's own left border and padding so the two lines start at the
    same x. The border is transparent: the error colour stays text-only.
 
-   Both of the slot's children are inset, not just the paragraph: Phase 30 put
-   a "Technical details" disclosure beside the message (UI-SPEC S2), and a
-   disclosure that hung a rem to the left of the sentence it explains would
-   read as though it belonged to something else. */
+   Both of the slot's children are inset, not just the paragraph: a "Technical
+   details" disclosure sits beside the message, and a disclosure that hung a
+   rem to the left of the sentence it explains would read as though it belonged
+   to something else. */
 #status-message > p,
 #status-message > details {
     padding-left: 1rem;
@@ -32,9 +32,10 @@
 }
 
 /* Cancelled: a deliberate stop by the operator, so neutral and muted, never
-   the error red (D-01, N-08). Pico's muted token already swaps per scheme --
-   light, automatic dark and forced dark -- so it is used directly, with no
-   app-owned pair and no fallback (UI-SPEC dark-scheme convention rule 4). */
+   the error red. Pico's muted token already swaps per scheme -- light,
+   automatic dark and forced dark -- so it is used directly, with no app-owned
+   pair and no fallback: a Pico token that swaps on its own is never
+   redeclared. */
 .status-cancelled {
     color: var(--pico-muted-color);
 }
@@ -261,7 +262,7 @@ details.tech-details > summary {
    margins behind as a stray gap. The route answers with a byte-empty body for
    exactly this reason: a single whitespace text node is a child, and :empty
    would stop matching. The rule hides an element and introduces no colour
-   value of its own (UI-SPEC S4). */
+   value of its own. */
 #profile-description:empty {
     display: none;
 }

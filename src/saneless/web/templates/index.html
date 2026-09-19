@@ -2,13 +2,13 @@
 {% block content %}
 
 {# --- Section 0: System status --- #}
-{# First in the block, for three reasons in this order (UI-SPEC S1 Placement):
-   1. The phase goal is that a household member can tell AT A GLANCE whether
+{# First in the block, for three reasons in this order:
+   1. The strip exists so a household member can tell AT A GLANCE whether
       the appliance is healthy, and at a glance means first.
    2. It is outside <form hx-post="/api/scan">, so the hx-disabled-elt /
       hx-disinherit landmine cannot reach it.  No attribute is added to the
-      form element; the C-10 fix below stays exactly as written.
-   3. Phase 26's invariant -- #status-message is the immediate sibling above
+      form element; the inheritance fix below stays exactly as written.
+   3. The error slot's invariant -- #status-message is the immediate sibling above
       #status-area -- is preserved untouched.
    #checks-strip is the persistent live region and #checks-body is the swap
    target: the container survives every swap, which is what makes aria-live
@@ -30,14 +30,14 @@
        hx-disinherit is mandatory: the tags/correspondent selects and refresh
        buttons inside this form issue their own requests and, on htmx 2.0.8, an
        inherited hx-disabled-elt strips disabled from a server-disabled button
-       when they finish (C-10 again; fixed only in 2.0.9). #}
+       when they finish (an htmx bug, fixed only in 2.0.9). #}
     <form hx-post="/api/scan"
           hx-target="#status-area"
           hx-swap="outerHTML"
           hx-disabled-elt="#scan-btn"
           hx-disinherit="hx-disabled-elt">
 
-        {# UI-SPEC S4. Three things a reader will question, answered here.
+        {# Three things a reader will question, answered here.
 
            1. The swap is innerHTML and never outerHTML. The help slot below
               carries the id that aria-describedby points at, the polite live
@@ -47,17 +47,17 @@
            2. The option value stays the profile name. That is the wire
               contract POST /api/scan already takes, so only the text a
               household member reads is new. The human name falls back to the
-              name itself, because a config whose profiles predate this phase
-              carries none until auto-profiles --force is run (Amendment A-3).
+              name itself, because a config whose profiles predate the label
+              key carries none until auto-profiles --force is run.
            3. This select issues its own GET, but it declares no
               disable-during-request attribute of its own, and the form's
               existing hx-disinherit already covers the one the form declares,
-              so NO attribute is added to the form element above. The C-10 fix
+              so NO attribute is added to the form element above. The inheritance fix
               stays exactly as written. (The attribute is named in prose rather
               than quoted so a grep for it still counts only the places that
               set it.)
 
-           The slot doubles as this control's one line of help text (APPL-10);
+           The slot doubles as this control's one line of help text;
            there is deliberately no second one. #}
         <label for="profile-select">Profile</label>
         <select name="profile" id="profile-select"
@@ -75,7 +75,7 @@
         {# Every control below gets one line of help in plain words, each one an
            adjacent <small> its control points at with aria-describedby: that
            adjacency is both Pico's own help-text pattern and what makes a
-           screen reader announce the sentence with the control (UI-SPEC S6).
+           screen reader announce the sentence with the control.
            The placeholder and the help line deliberately say different things,
            so neither is a restatement of the other.  Profile is not given one
            here: its live description already is its help line, and a second
@@ -86,7 +86,7 @@
                placeholder="Document title (auto-generated if empty)">
         <small id="title-help">What this document should be called in paperless-ngx.</small>
 
-        {# UI-SPEC S6.  The multi-select is gone: a checkbox list is one control
+        {# The multi-select is gone: a checkbox list is one control
            a thumb can actually hit, and the list is now a group of controls
            rather than one, so it is a fieldset with a legend and no longer a
            label pointing at a single element.  The wrapper the refresh targets
@@ -99,20 +99,20 @@
            The filter box names a different form than the one it sits inside.
            An input with a form attribute is owned by the form it names, so the
            filter text is never submitted with a scan and pressing Enter in it
-           filters the list instead of starting one (Amendment A-6).  The
+           filters the list instead of starting one.  The
            debounce is htmx's own: a keyup that changed the value, delayed, so
            a household member typing three letters makes one request and not
            three.  The include is mandatory on a GET -- htmx does not gather the
            enclosing form for one -- and it is what carries the current ticks to
-           the server so the swap can re-render them ticked (Amendment A-5).
+           the server so the swap can re-render them ticked.
 
-           The whole block is behind a config key (D-28): one appliance, one
+           The whole block is behind a config key: one appliance, one
            form shape, not a per-browser toggle a household member could switch
            by accident.  The controls are ABSENT from the rendered page when it
            is off, never present and hidden with a stylesheet -- what is not in
            the markup cannot be re-shown in devtools, cannot be read by a screen
            reader and cannot be tabbed into.  Turning the block off changes the
-           form and never the scan (D-29): the profile's default tags still
+           form and never the scan: the profile's default tags still
            apply, exactly as a blank title already falls back to the profile's
            title through resolve_job_title. #}
         {% if show_tags %}
@@ -168,20 +168,21 @@
 
         {% include "partials/scan_button.html" %}
         {# Why the button above is greyed out, as visible text in the reading
-           order directly after it (UI-SPEC S8).  Not a title tooltip, and not
+           order directly after it.  Not a title tooltip, and not
            the ARIA disabled-state attribute -- named in prose here so a grep
            forbidding it across these templates still returns nothing.  A
            disabled button cannot be focused, so aria-describedby on it is
            never announced on focus and a tooltip is unreachable by keyboard
            and unreliable on touch; keeping the button focusable by swapping
            the real disabled attribute for the ARIA one is forbidden, because
-           it would break Phase 26's disabled contract and hx-disabled-elt.
+           it would break the rule that the server alone decides the real
+           disabled state, and hx-disabled-elt with it.
            It renders only when blocked, so it is never an out-of-band swap
            target and never has to exist as an empty placeholder: the verdict
            comes from Settings, which cannot change while the process runs.
            The sentence is a developer constant from vocabulary.py; this
            template composes no prose.  No attribute is added to the form
-           element above, so the C-10 inheritance fix stays exactly as written.
+           element above, so the inheritance fix stays exactly as written.
            #}
         {% if scan_blocked %}<small id="scan-blocked-reason" class="status-error">{{ scan_blocked_reason }}</small>{% endif %}
     </form>
@@ -197,7 +198,7 @@
        drop the filter field on the way out of the scan form with a parameter
        filter on the form element.  That would have meant adding an attribute
        to the scan form, and every attribute added there has to be added to the
-       hx-disinherit list as well or the C-10 inheritance trap re-opens.
+       hx-disinherit list as well or the htmx 2.0.8 inheritance trap re-opens.
        Nothing is added to the scan form element at all, so the fix above stays
        exactly as written (the attribute names are in prose here so a grep for
        the places that set them still counts only those).

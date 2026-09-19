@@ -38,19 +38,19 @@
     </div>
   </div>
 
-  {# D-27: Abort asks first, through the native browser confirmation -- which is
+  {# Abort asks first, through the native browser confirmation -- which is
      focus-trapped, keyboard-operable and announced by every screen reader, so
      there is no modal partial, no extra route and no script.
 
      The attribute sits on the BUTTON, which lives outside
      <form hx-post="/api/scan">.  On the form it would make every child request
      confirm and would need the form's inheritance list extended, which is the
-     exact C-10 landmine Phase 26 spent a regression test on; that list must not
-     be touched.
+     exact htmx 2.0.8 inheritance landmine a regression test already guards;
+     that list must not be touched.
 
      The wording is one question and one consequence.  It deliberately does not
      claim the pages already scanned are kept: that is a promise this contract
-     cannot verify, and unverifiable promises are what this milestone removes. #}
+     cannot verify, and the page makes no promise it cannot verify. #}
   <div role="group">
     <button hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
     <button hx-post="/api/flip/abort"
