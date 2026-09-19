@@ -1,11 +1,14 @@
 """
-Job model with state machine and SQLite persistence.
+Scan jobs and their SQLite persistence.
 
-Tracks scan jobs through their lifecycle (PENDING -> SCANNING ->
-ASSEMBLING -> UPLOADING -> DONE) and persists them in SQLite for
-history.  A job survives the process that ran it only as a row: on
-startup the web app fails every job still in an active state through
-``fail_active_jobs`` before the worker starts (ROBU-06).
+Each job carries a persisted ``state`` column that the worker drives through
+the lifecycle, from PENDING through scanning, assembling and uploading to a
+terminal state such as DONE or ERROR.  The store records each transition it is
+given and does not check that it is a legal one; the order lives in the
+worker.  The rows are also the
+history.  A job survives the process that ran it only as a row: on startup the
+web app fails every job still in an active state through ``fail_active_jobs``
+before the worker starts.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Concatenate
+from typing import TYPE_CHECKING, Concatenate, Final
 
 from saneless.exceptions import StorageError, describe
 from saneless.vocabulary import (
@@ -36,7 +39,15 @@ if TYPE_CHECKING:
     from collections.abc import Set as AbstractSet
     from pathlib import Path
 
-__all__ = ["ErrorCategory", "Job", "JobResult", "JobState", "JobStore"]
+__all__ = [
+    "CLI_JOBS_DEFAULT_LIMIT",
+    "WEB_HISTORY_LIMIT",
+    "ErrorCategory",
+    "Job",
+    "JobResult",
+    "JobState",
+    "JobStore",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +62,12 @@ ruff's ``B010`` and both type checkers quiet -- a direct
 function has no such attribute, and a string literal in ``setattr`` trips
 ``B010``.
 """
+
+# How many jobs each history view shows.  The web page and ``saneless jobs``
+# show different amounts by design -- a page has room for a longer list than a
+# terminal -- so they are two constants, not one.  Neither is configurable.
+WEB_HISTORY_LIMIT: Final = 50
+CLI_JOBS_DEFAULT_LIMIT: Final = 20
 
 _COLUMNS: tuple[str, ...] = (
     "id",
@@ -945,7 +962,7 @@ class JobStore:
             )
 
     @_locked
-    def list_recent(self, limit: int = 50) -> list[Job]:
+    def list_recent(self, limit: int = WEB_HISTORY_LIMIT) -> list[Job]:
         """
         Fetch the most recent jobs ordered newest-first.
 

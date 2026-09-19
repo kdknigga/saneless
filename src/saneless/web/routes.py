@@ -23,6 +23,7 @@ from saneless.checks import (
     CheckKey,
 )
 from saneless.config import is_placeholder_token, resolve_job_title
+from saneless.job import WEB_HISTORY_LIMIT
 from saneless.scanner.base import SourceKind, classify_source
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
@@ -933,7 +934,7 @@ def index(request: Request) -> Response:
 
     status = _status_context(state.worker, state.job_store, _status_facts(request))
 
-    jobs = state.job_store.list_recent(limit=50)
+    jobs = state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
 
     return state.templates.TemplateResponse(
         request,
@@ -1708,7 +1709,7 @@ def job_history(request: Request) -> Response:
     HTMX swap into the history table.
     """
     state = request.app.state
-    jobs = state.job_store.list_recent(limit=50)
+    jobs = state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
     return state.templates.TemplateResponse(
         request,
         "partials/history.html",

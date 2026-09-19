@@ -54,7 +54,7 @@ from .exceptions import (
     StorageError,
     describe,
 )
-from .job import JobStore
+from .job import CLI_JOBS_DEFAULT_LIMIT, JobStore
 from .logging_config import configure_logging
 from .paperless import PaperlessClient
 from .pipeline import (
@@ -811,7 +811,9 @@ def devices(ctx: click.Context, *, as_json: bool, capabilities: bool) -> None:
 
 @cli.command()
 @click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
-@click.option("--limit", default=20, type=int, help="Maximum jobs to show.")
+@click.option(
+    "--limit", default=CLI_JOBS_DEFAULT_LIMIT, type=int, help="Maximum jobs to show."
+)
 @click.pass_context
 def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     """List recent scan job history."""
