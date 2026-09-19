@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import errno
+import inspect
 import logging
 import logging.handlers
+import os
 import re
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import pytest
 
 from saneless.config import OutputConfig
 from saneless.logging_config import configure_logging
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
+    from collections.abc import Iterator
 
 
 def _raise_runtime_error(message: str) -> None:
@@ -29,6 +33,30 @@ def _raise_runtime_error(message: str) -> None:
 
     """
     raise RuntimeError(message)
+
+
+def _deny_mkdir(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
+    """
+    Make creating ``directory`` fail with EACCES; every other mkdir still works.
+
+    Injecting the failure rather than chmod-ing a directory keeps the test
+    meaningful as root, whom file modes do not stop.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        directory: The directory whose creation must be refused.
+
+    """
+    real_mkdir = Path.mkdir
+
+    def denied(
+        self: Path, mode: int = 0o777, *, parents: bool = False, exist_ok: bool = False
+    ) -> None:
+        if self == directory:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(self))
+        real_mkdir(self, mode, parents=parents, exist_ok=exist_ok)
+
+    monkeypatch.setattr(Path, "mkdir", denied)
 
 
 class TestConfigureLogging:
@@ -52,7 +80,7 @@ class TestConfigureLogging:
         """configure_logging adds a RotatingFileHandler to the root logger."""
         log_file = tmp_path / "logs" / "test.log"
         try:
-            configure_logging(log_file=log_file)
+            configure_logging(log_file=log_file, max_bytes=1024, backup_count=1)
             root = logging.getLogger()
             file_handlers = [
                 h
@@ -68,7 +96,9 @@ class TestConfigureLogging:
         """Log level DEBUG is applied to the root logger."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, log_level="DEBUG")
+            configure_logging(
+                log_file=log_file, log_level="DEBUG", max_bytes=1024, backup_count=1
+            )
             root = logging.getLogger()
             assert root.level == logging.DEBUG
         finally:
@@ -78,7 +108,9 @@ class TestConfigureLogging:
         """Log level INFO is applied to the root logger."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, log_level="INFO")
+            configure_logging(
+                log_file=log_file, log_level="INFO", max_bytes=1024, backup_count=1
+            )
             root = logging.getLogger()
             assert root.level == logging.INFO
         finally:
@@ -88,9 +120,13 @@ class TestConfigureLogging:
         """WARNING and CRITICAL resolve to their numeric levels (CFG-04)."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, log_level="WARNING")
+            configure_logging(
+                log_file=log_file, log_level="WARNING", max_bytes=1024, backup_count=1
+            )
             assert logging.getLogger().level == 30
-            configure_logging(log_file=log_file, log_level="CRITICAL")
+            configure_logging(
+                log_file=log_file, log_level="CRITICAL", max_bytes=1024, backup_count=1
+            )
             assert logging.getLogger().level == 50
         finally:
             self._cleanup_handlers()
@@ -104,7 +140,13 @@ class TestConfigureLogging:
         """
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, log_level="INFO", verbose=True)
+            configure_logging(
+                log_file=log_file,
+                log_level="INFO",
+                max_bytes=1024,
+                backup_count=1,
+                verbose=True,
+            )
             assert (
                 logging.getLogger("saneless.pipeline").getEffectiveLevel()
                 == logging.DEBUG
@@ -118,7 +160,13 @@ class TestConfigureLogging:
         """A DEBUG record from a saneless logger is written under -v."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, log_level="INFO", verbose=True)
+            configure_logging(
+                log_file=log_file,
+                log_level="INFO",
+                max_bytes=1024,
+                backup_count=1,
+                verbose=True,
+            )
             logging.getLogger("saneless.pipeline").debug("verbose-detail-7f3e")
             for handler in logging.getLogger().handlers:
                 handler.flush()
@@ -130,9 +178,17 @@ class TestConfigureLogging:
         """A later non-verbose configure_logging does not inherit -v's DEBUG."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, log_level="INFO", verbose=True)
+            configure_logging(
+                log_file=log_file,
+                log_level="INFO",
+                max_bytes=1024,
+                backup_count=1,
+                verbose=True,
+            )
             self._remove_root_handlers()
-            configure_logging(log_file=log_file, log_level="WARNING")
+            configure_logging(
+                log_file=log_file, log_level="WARNING", max_bytes=1024, backup_count=1
+            )
             assert logging.getLogger("saneless").level == logging.NOTSET
             assert (
                 logging.getLogger("saneless.pipeline").getEffectiveLevel()
@@ -174,7 +230,9 @@ class TestConfigureLogging:
         """Log messages include timestamp, module name, and level."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, log_level="INFO")
+            configure_logging(
+                log_file=log_file, log_level="INFO", max_bytes=1024, backup_count=1
+            )
             logger = logging.getLogger("test_format")
             logger.info("test message")
             content = log_file.read_text()
@@ -186,7 +244,9 @@ class TestConfigureLogging:
         """verbose=True adds a StreamHandler alongside the file handler."""
         log_file = tmp_path / "test.log"
         try:
-            configure_logging(log_file=log_file, verbose=True)
+            configure_logging(
+                log_file=log_file, max_bytes=1024, backup_count=1, verbose=True
+            )
             root = logging.getLogger()
             stream_handlers = [
                 h
@@ -198,25 +258,26 @@ class TestConfigureLogging:
         finally:
             self._cleanup_handlers()
 
-    def test_unwritable_directory_falls_back_to_stderr(self, tmp_path: Path) -> None:
-        """configure_logging with unwritable dir does not raise, falls back to stderr."""
-        unwritable = tmp_path / "noperm"
-        unwritable.mkdir()
-        unwritable.chmod(0o000)
-        log_file = unwritable / "subdir" / "test.log"
+    def test_unwritable_directory_falls_back_to_stderr(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A log directory that cannot be created falls back to stderr, no raise.
+
+        The PermissionError is injected at the directory creation, so the test
+        means the same thing when it runs as root, where a mode-0 directory
+        would not stop anything.
+        """
+        log_file = tmp_path / "noperm" / "subdir" / "test.log"
+        _deny_mkdir(monkeypatch, log_file.parent)
         try:
-            # Must not raise
-            configure_logging(log_file=log_file)
-            root = logging.getLogger()
-            stream_handlers = [
-                h
-                for h in root.handlers
-                if isinstance(h, logging.StreamHandler)
-                and not isinstance(h, logging.handlers.RotatingFileHandler)
-            ]
-            assert len(stream_handlers) >= 1, "Expected stderr fallback handler"
+            attached = configure_logging(
+                log_file=log_file, max_bytes=1024, backup_count=1
+            )
+            assert attached is False
+            assert not log_file.parent.exists()
+            assert len(_stderr_stream_handlers()) == 1, "Expected stderr fallback"
         finally:
-            unwritable.chmod(0o700)
             self._cleanup_handlers()
 
     def test_returns_true_when_the_file_handler_attached(self, tmp_path: Path) -> None:
@@ -227,7 +288,9 @@ class TestConfigureLogging:
         """
         log_file = tmp_path / "logs" / "saneless.log"
         try:
-            attached = configure_logging(log_file, "INFO", 1024, 1)
+            attached = configure_logging(
+                log_file, "INFO", max_bytes=1024, backup_count=1
+            )
             assert attached is True
             file_handlers = [
                 h
@@ -254,7 +317,9 @@ class TestConfigureLogging:
         log_file = blocker / "logs" / "saneless.log"
         try:
             with caplog.at_level(logging.WARNING):
-                attached = configure_logging(log_file, "INFO", 1024, 1)
+                attached = configure_logging(
+                    log_file, "INFO", max_bytes=1024, backup_count=1
+                )
             assert attached is False
             root = logging.getLogger()
             assert not [
@@ -287,7 +352,9 @@ class TestConfigureLogging:
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
         try:
-            configure_logging(blocker / "logs" / "saneless.log")
+            configure_logging(
+                blocker / "logs" / "saneless.log", max_bytes=1024, backup_count=1
+            )
             try:
                 _raise_runtime_error("kaboom-4c1d")
             except RuntimeError:
@@ -306,7 +373,12 @@ class TestConfigureLogging:
         blocker = tmp_path / "not-a-directory"
         blocker.write_text("")
         try:
-            configure_logging(blocker / "logs" / "saneless.log", verbose=True)
+            configure_logging(
+                blocker / "logs" / "saneless.log",
+                max_bytes=1024,
+                backup_count=1,
+                verbose=True,
+            )
             try:
                 _raise_runtime_error("kaboom-9e2a")
             except RuntimeError:
@@ -376,7 +448,7 @@ class TestConfigureLoggingStreamMode:
         ``tests/test_cli.py::TestServeLogging``.
         """
         try:
-            configure_logging(None)
+            configure_logging(None, max_bytes=1024, backup_count=1)
             root = logging.getLogger()
             assert not [h for h in root.handlers if isinstance(h, logging.FileHandler)]
         finally:
@@ -387,7 +459,7 @@ class TestConfigureLoggingStreamMode:
     ) -> None:
         """Exactly one stderr handler, root at the configured level (D-36)."""
         try:
-            configure_logging(None, "DEBUG")
+            configure_logging(None, "DEBUG", max_bytes=1024, backup_count=1)
             assert len(_stderr_stream_handlers()) == 1
             assert logging.getLogger().level == logging.DEBUG
         finally:
@@ -402,7 +474,7 @@ class TestConfigureLoggingStreamMode:
         service that writes no file.
         """
         try:
-            assert configure_logging(None) is False
+            assert configure_logging(None, max_bytes=1024, backup_count=1) is False
         finally:
             self._cleanup_handlers()
 
@@ -417,7 +489,7 @@ class TestConfigureLoggingStreamMode:
         traceback instead.
         """
         try:
-            configure_logging(None)
+            configure_logging(None, max_bytes=1024, backup_count=1)
             try:
                 _raise_runtime_error("kaboom-71bd")
             except RuntimeError:
@@ -434,7 +506,7 @@ class TestConfigureLoggingStreamMode:
     ) -> None:
         """With ``-v`` the serve stream renders the traceback exactly once."""
         try:
-            configure_logging(None, verbose=True)
+            configure_logging(None, max_bytes=1024, backup_count=1, verbose=True)
             try:
                 _raise_runtime_error("kaboom-3f0e")
             except RuntimeError:
@@ -455,9 +527,143 @@ class TestConfigureLoggingStreamMode:
         root logger must keep the configured level in this mode too.
         """
         try:
-            configure_logging(None, "INFO", verbose=True)
+            configure_logging(
+                None, "INFO", max_bytes=1024, backup_count=1, verbose=True
+            )
             assert logging.getLogger("saneless").level == logging.DEBUG
             assert logging.getLogger().level == logging.INFO
             assert len(_stderr_stream_handlers()) == 1
         finally:
             self._cleanup_handlers()
+
+
+def _handlers_named(name: str) -> list[logging.Handler]:
+    """
+    Return the root logger's handlers carrying ``name``.
+
+    Args:
+        name: The handler name to match exactly.
+
+    Returns:
+        The matching handlers, in root-logger order.
+
+    """
+    return [h for h in logging.getLogger().handlers if h.get_name() == name]
+
+
+class TestConfigureLoggingIsIdempotent:
+    """Repeated calls replace saneless's own handlers and leave the rest alone."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_root(self) -> Iterator[None]:
+        """
+        Remove every handler the test added and reset the levels it changed.
+
+        Handlers that were on the root before the test (pytest's capture
+        handlers) are left in place.
+
+        Yields:
+            Nothing; the restore runs after the test.
+
+        """
+        root = logging.getLogger()
+        before = root.handlers[:]
+        level = root.level
+        yield
+        for handler in root.handlers[:]:
+            if handler not in before:
+                handler.close()
+                root.removeHandler(handler)
+        root.setLevel(level)
+        logging.getLogger("saneless").setLevel(logging.NOTSET)
+
+    def test_two_file_mode_calls_leave_one_file_handler(self, tmp_path: Path) -> None:
+        """A second call replaces the first call's file handler, not adds to it."""
+        log_file = tmp_path / "logs" / "saneless.log"
+        configure_logging(log_file, max_bytes=1024, backup_count=1)
+        configure_logging(log_file, max_bytes=1024, backup_count=1)
+
+        file_handlers = _handlers_named("saneless.file")
+        assert len(file_handlers) == 1
+        assert isinstance(file_handlers[0], logging.handlers.RotatingFileHandler)
+        assert _stderr_stream_handlers() == []
+
+    def test_a_handler_saneless_did_not_install_survives(self, tmp_path: Path) -> None:
+        """Only handlers configure_logging installed are removed by a later call."""
+        foreign = logging.Handler()
+        logging.getLogger().addHandler(foreign)
+        log_file = tmp_path / "saneless.log"
+
+        configure_logging(log_file, max_bytes=1024, backup_count=1)
+        configure_logging(log_file, max_bytes=1024, backup_count=1)
+
+        assert foreign in logging.getLogger().handlers
+
+    def test_two_service_mode_calls_leave_one_stream_handler(self) -> None:
+        """Two service-mode calls leave one stderr stream, so no record doubles."""
+        configure_logging(None, max_bytes=1024, backup_count=1)
+        configure_logging(None, max_bytes=1024, backup_count=1)
+
+        assert len(_handlers_named("saneless.stream")) == 1
+        assert len(_stderr_stream_handlers()) == 1
+
+    def test_unwritable_log_with_verbose_prints_each_record_once(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """
+        With no log file and -v, one stderr handler prints message and traceback.
+
+        Two stderr handlers would print every record twice to the same stream.
+        """
+        log_file = tmp_path / "logs" / "saneless.log"
+        _deny_mkdir(monkeypatch, log_file.parent)
+
+        configure_logging(log_file, max_bytes=1024, backup_count=1, verbose=True)
+        try:
+            _raise_runtime_error("kaboom-5a17")
+        except RuntimeError:
+            logging.getLogger("saneless.test").exception("it failed 5a17")
+
+        assert len(_stderr_stream_handlers()) == 1
+        err = capsys.readouterr().err
+        assert err.count("it failed 5a17") == 1
+        assert err.count("Traceback") == 1
+        assert err.count("Cannot write to") == 1
+
+    def test_unwritable_log_without_verbose_prints_no_traceback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Without -v the one stderr handler still keeps tracebacks off the terminal."""
+        log_file = tmp_path / "logs" / "saneless.log"
+        _deny_mkdir(monkeypatch, log_file.parent)
+
+        configure_logging(log_file, max_bytes=1024, backup_count=1)
+        try:
+            _raise_runtime_error("kaboom-2b64")
+        except RuntimeError:
+            logging.getLogger("saneless.test").exception("it failed 2b64")
+
+        assert len(_stderr_stream_handlers()) == 1
+        err = capsys.readouterr().err
+        assert err.count("it failed 2b64") == 1
+        assert "Traceback" not in err
+
+
+def test_rotation_values_have_no_default() -> None:
+    """
+    max_bytes and backup_count come from the configuration, never a default.
+
+    OutputConfig's log_max_bytes and log_backup_count are the one place those
+    numbers are defined; a second default here could drift from them.
+    """
+    parameters = inspect.signature(configure_logging).parameters
+
+    assert parameters["max_bytes"].default is inspect.Parameter.empty
+    assert parameters["backup_count"].default is inspect.Parameter.empty
+    assert len(parameters) == 5
