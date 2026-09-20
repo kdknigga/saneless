@@ -4348,7 +4348,15 @@ class TestTwoBrowsersOneStack:
             owner_ctx.close()
             viewer_ctx.close()
             # One list, two contexts: this single assertion speaks for both,
-            # which is the contract _make_gate's note states.
+            # which is the contract _make_gate's note states. Order matters for
+            # the same reason it does in the context fixture -- these two are
+            # built by hand, so an assertion on ``blocked`` alone would give a
+            # clean bill of health to contexts whose routing was never
+            # installed, which is the hole the gate exists to close.
+            assert seen, (
+                "neither gate handled a request, so the no-egress assertion "
+                "below would have passed for two contexts that were never gated"
+            )
             assert blocked == [], f"a page tried to reach the network: {blocked}"
 
     def test_abort_asks_first_and_does_nothing_when_the_answer_is_no(
