@@ -157,6 +157,19 @@ docstring-code-format = false
 # enabled.
 docstring-code-line-length = "dynamic"
 
+# Keep the formatter out of the planning archive.  That directory is a
+# historical record of decisions already made, not source this formatter
+# owns, and ruff formats fenced Python blocks inside Markdown, so leaving it
+# in scope would rewrite a finished audit trail.  The scope is deliberately
+# Markdown under that one directory: `docs/` and `README.md` keep being
+# formatted, and so does the one Python file that lives under `.planning/`.
+# The glob has to reach the files themselves -- this is the formatter's own
+# `exclude`, which matches files rather than directories, so a bare
+# directory name here would exclude nothing.  Linting is unaffected: the
+# top-level `[tool.ruff] exclude` is not touched, so `.planning/` stays
+# linted.
+exclude = [".planning/**/*.md"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
     "S101",   # assert is the test mechanism
