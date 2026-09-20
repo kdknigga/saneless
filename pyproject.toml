@@ -1,20 +1,20 @@
 [project]
 name = "saneless"
-version = "0.1.0"
+version = "0.2.0-rc.3"
 description = "SANE scanner to paperless-ngx bridge"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Kris Knigga", email = "kris@knigga.com" }
 ]
 requires-python = ">=3.14"
 keywords = ["sane", "scanner", "paperless-ngx", "scanning", "document"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 3 - Alpha",
     "Environment :: Web Environment",
     "Framework :: FastAPI",
     "Intended Audience :: End Users/Desktop",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.14",
@@ -26,6 +26,7 @@ dependencies = [
     "httpx>=0.28.1",
     "img2pdf>=0.6.3",
     "jinja2>=3.1.6",
+    "pikepdf>=10.5.1",
     "pillow>=12.1.1",
     "pydantic-settings[toml]>=2.13.1",
     "python-multipart>=0.0.22",
@@ -38,9 +39,9 @@ dependencies = [
 saneless = "saneless:main"
 
 [project.urls]
-Homepage = "https://github.com/kris-knigga/saneless"
-Repository = "https://github.com/kris-knigga/saneless"
-Issues = "https://github.com/kris-knigga/saneless/issues"
+Homepage = "https://github.com/kdknigga/saneless"
+Repository = "https://github.com/kdknigga/saneless"
+Issues = "https://github.com/kdknigga/saneless/issues"
 
 [build-system]
 requires = ["uv_build>=0.10.3,<0.11.0"]
@@ -98,6 +99,37 @@ unfixable = []
 # Allow unused variables when underscore-prefixed.
 dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
 
+[tool.ruff.lint.flake8-type-checking]
+# FastAPI evaluates a route's annotations at runtime, when the decorator runs,
+# so ruff must not move the names they use under TYPE_CHECKING.  Every route
+# decorator on both APIRouter and FastAPI is listed, so a route added through
+# any of them is covered.  Ruff resolves the receiver (`router`, `app`) only
+# through an assignment in the same module, so the APIRouter or FastAPI must be
+# constructed in the module that decorates with it; one imported from another
+# module is not recognised, and the exemption silently stops applying.
+runtime-evaluated-decorators = [
+    "fastapi.APIRouter.get",
+    "fastapi.APIRouter.post",
+    "fastapi.APIRouter.put",
+    "fastapi.APIRouter.patch",
+    "fastapi.APIRouter.delete",
+    "fastapi.APIRouter.head",
+    "fastapi.APIRouter.options",
+    "fastapi.APIRouter.trace",
+    "fastapi.APIRouter.api_route",
+    "fastapi.APIRouter.websocket",
+    "fastapi.FastAPI.get",
+    "fastapi.FastAPI.post",
+    "fastapi.FastAPI.put",
+    "fastapi.FastAPI.patch",
+    "fastapi.FastAPI.delete",
+    "fastapi.FastAPI.head",
+    "fastapi.FastAPI.options",
+    "fastapi.FastAPI.trace",
+    "fastapi.FastAPI.api_route",
+    "fastapi.FastAPI.websocket",
+]
+
 [tool.ruff.format]
 # Like Black, use double quotes for strings.
 quote-style = "double"
@@ -137,11 +169,21 @@ docstring-code-line-length = "dynamic"
 [tool.ty.src]
 
 [tool.pyrefly]
+# "src" must come first. Pyrefly infers a single import root from the project
+# layout ("src"), which leaves `tests` unresolvable -- `tests/test_scanner.py`
+# imports the shared fake as `tests.fake_sane`, the only form that works under
+# pytest 9's importlib mode. Adding "." alone is not the fix: it lets
+# `src/saneless` resolve as both `saneless.*` and `src.saneless.*`, and the two
+# identities are not assignable to each other (measured: 14 bad-argument-type
+# errors). Listing "src" first pins each source file to one module name and
+# leaves "." to resolve `tests` only.
+search-path = ["src", "."]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
     "browser: Playwright browser tests (requires chromium)",
+    "sane_hardware: tests that drive the real SANE test backend (requires libsane-dev)",
 ]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 strict_markers = true
@@ -150,6 +192,14 @@ xfail_strict = true
 filterwarnings = ["error"]
 timeout = 60
 timeout_method = "signal"
+# Two tests measure rather than assert -- how many requests an abandoned status
+# strip really issues, and how long its poll chain gets -- and report the number
+# through `record_property`. pytest's default junit_family, "xunit2", has no
+# place to put a per-test property and raises a PytestWarning when one is
+# recorded; `filterwarnings = ["error"]` above turns that into a collection
+# error, so a `--junitxml` run would fail on the very tests whose output it was
+# asked to capture. "legacy" is the family that carries them.
+junit_family = "legacy"
 
 [dependency-groups]
 dev = [
@@ -163,4 +213,6 @@ dev = [
     "ty>=0.0.80",
     "mkdocs-material>=9.7.6",
     "pytest-timeout>=2.4.0",
+    "zizmor>=1.30.1",
+    "pytest-cov>=7.1.0",
 ]

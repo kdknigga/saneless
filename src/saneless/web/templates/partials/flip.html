@@ -8,7 +8,7 @@
   <div class="flip-illustration">
     {# Correct: long-edge flip (left/right) #}
     <div>
-      <svg viewBox="0 0 120 100" xmlns="http://www.w3.org/2000/svg" aria-label="Correct: flip over long edge">
+      <svg viewBox="0 0 120 100" aria-label="Correct: flip over long edge">
         {# Paper stack #}
         <rect x="10" y="20" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
         <rect x="14" y="16" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 2"/>
@@ -23,7 +23,7 @@
 
     {# Incorrect: short-edge flip (top/bottom) #}
     <div>
-      <svg viewBox="0 0 120 100" xmlns="http://www.w3.org/2000/svg" aria-label="Incorrect: flip over short edge">
+      <svg viewBox="0 0 120 100" aria-label="Incorrect: flip over short edge">
         {# Paper stack #}
         <rect x="10" y="20" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
         <rect x="14" y="16" width="50" height="70" rx="2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-dasharray="4 2"/>
@@ -38,8 +38,26 @@
     </div>
   </div>
 
+  {# Abort asks first, through the native browser confirmation -- which is
+     focus-trapped, keyboard-operable and announced by every screen reader, so
+     there is no modal partial, no extra route and no script.
+
+     The attribute sits on the BUTTON, which lives outside
+     <form hx-post="/api/scan">.  On the form it would make every child request
+     confirm and would need the form's inheritance list extended, which is the
+     exact htmx 2.0.8 inheritance landmine a regression test already guards;
+     that list must not be touched.
+
+     The wording is one question and one consequence.  It deliberately does not
+     claim the pages already scanned are kept: that is a promise this contract
+     cannot verify, and the page makes no promise it cannot verify. #}
   <div role="group">
-    <button hx-post="/api/flip/continue" hx-target="#status-area" hx-swap="outerHTML">Continue</button>
-    <button hx-post="/api/flip/abort" hx-target="#status-area" hx-swap="outerHTML" class="secondary">Abort scan</button>
+    <button hx-post="/api/flip/continue" hx-vals='{{ {"job_id": job.id} | tojson }}' hx-target="#status-area" hx-swap="outerHTML">Continue</button>
+    <button hx-post="/api/flip/abort"
+            hx-vals='{{ {"job_id": job.id} | tojson }}'
+            hx-target="#status-area"
+            hx-swap="outerHTML"
+            hx-confirm="Abort this scan? It will stop and cannot be resumed."
+            class="secondary">Abort scan</button>
   </div>
 </div>

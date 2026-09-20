@@ -1,0 +1,14 @@
+# Lint settings for tests/ only: everything in pyproject.toml, plus a ban on
+# time.sleep. Production code may sleep (the Paperless upload backoff does),
+# so the ban cannot live in pyproject.toml.
+extend = "../pyproject.toml"
+
+# The default src is relative to this file's directory, which would stop
+# isort from recognising saneless and tests as first-party imports.
+src = ["..", "../src"]
+
+# Share the repository's cache instead of growing a second one in tests/.
+cache-dir = "../.ruff_cache"
+
+[lint.flake8-tidy-imports.banned-api]
+"time.sleep".msg = "tests must not sleep: wait on an Event, poll_until, or move a fake clock"

@@ -32,7 +32,7 @@ Set `SANELESS_SCANNER__HOST` in your `docker-compose.yml`:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kris-knigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:latest
     environment:
       - SANELESS_SCANNER__HOST=192.168.1.50
 ```
@@ -91,3 +91,5 @@ sudo ufw allow 6566/tcp
 **Scanner host not in net mode**
 
 Some scanners need to be explicitly configured in `saned` for network sharing. Check that the scanner appears in `scanimage -L` on the scanner host itself before attempting network discovery.
+
+For a scan that fails after the scanner is discovered, see [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md).

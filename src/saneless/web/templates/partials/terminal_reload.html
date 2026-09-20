@@ -1,0 +1,16 @@
+{# What a terminal job state reloads, in one place.
+
+   A done, saved-to-folder, cancelled or failed job means the scan has ended.
+   History has gained a row, so the history table is fetched again.  The
+   scanner is free again, so the checks strip is fetched again too and
+   un-pauses at once instead of showing "Paused during scan" until its cache
+   entry expires.  Each is a one-shot load trigger with no interval, so this
+   adds no poll.
+
+   status.html includes this only for a status-poll response.  The full page
+   has just rendered history and the strip itself, so fetching them again on
+   load would repeat the work for nothing.
+
+   Both reuse .htmx-hidden (app.css); this partial adds no class of its own. #}
+<div hx-get="/api/jobs/history" hx-target="#history-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>
+<div hx-get="/api/checks" hx-target="#checks-body" hx-swap="outerHTML" hx-trigger="load" class="htmx-hidden"></div>

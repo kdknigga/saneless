@@ -6,9 +6,9 @@ If paperless-ngx is temporarily unavailable -- during maintenance, a restart, or
 
 ## The Solution
 
-When a `consume_dir` is configured and the API upload fails after all retry attempts are exhausted, saneless deposits the assembled PDF into the consume directory instead of raising an error.
+When a `consume_dir` is configured and the API upload cannot get through, saneless deposits the assembled PDF into the consume directory instead of raising an error.
 
-The pipeline retries uploads with exponential backoff (up to 3 attempts by default) before falling back. This means transient network blips are handled by retries, and only sustained outages trigger the fallback.
+The upload is attempted up to 3 times, with exponential backoff between attempts, whenever paperless-ngx cannot be reached or answers with a server error: a connection that is refused or reset, a timeout, a reverse proxy closing the connection, or a 5xx response. This means transient network blips are handled by retries, and only sustained outages trigger the fallback.
 
 ## How Paperless-ngx Picks It Up
 
@@ -51,11 +51,33 @@ volumes:
 
 The fallback activates only when **all** of these conditions are true:
 
-1. The API upload fails (connection refused, timeout, or server error).
-2. All retry attempts are exhausted.
+1. The API upload fails in one of the ways listed above -- a connection refused or reset, a timeout, a reverse proxy closing the connection, or a server error -- or `paperless.url` is malformed, with no usable `http://` or `https://` scheme.
+2. All attempts are exhausted. A malformed URL is the exception: it is not retried, because retrying cannot help, but it still falls back so the scan is not lost.
 3. A `consume_dir` is configured (non-empty string).
 
+**A rejected or redirected upload never falls back.** When paperless-ngx answers with a 4xx -- a bad token, or a field it refuses, such as an invalid title -- the upload is not retried and nothing is copied to the consume directory. The scan fails at once with Paperless's reason, because the same request would only be rejected again. A redirect (a 3xx) is treated the same way: it almost always means `paperless.url` points at the wrong address, such as an `http://` URL behind a proxy that redirects to `https://`, so the scan fails at once and the error names where the upload was redirected to.
+
 If no `consume_dir` is configured, the upload error propagates and the scan job enters the ERROR state. The user sees the error in the web UI or CLI output.
+
+**The scanned document is not lost when that happens.** Before the error propagates, saneless moves the assembled PDF into `failed/` inside its data directory -- durable storage, deliberately separate from the disposable scratch directory the scan was built in -- and appends the full path of the preserved file to the job's error message. The error text shown in the web UI therefore names the file to go and find. The same preservation happens when the upload reaches paperless-ngx but the consumption task then reports a failure, and when the task has not finished before `paperless_task_timeout` expires. See [Docker volumes](../reference/docker.md#volumes) for where that directory lives in a container and how to drain it.
+
+`failed/` is where every scan saneless could not deliver ends up, not only the ones an upload lost, so it holds three kinds of thing:
+
+- **Complete PDFs** from a scan that was assembled but could not be delivered -- the case described above.
+- **Partial PDFs** from a scan that stopped part-way. A scanner fault after some sheets had been fed keeps those sheets; a manual duplex job whose second pass or flip failed keeps the fronts. Both are PDFs, named so you can tell them apart from a complete one, and both are unfiltered -- empty page detection is not applied to them, because what the feeder actually picked up is the evidence.
+- **Directories of page files** from a scan that could not be assembled into a PDF at all, or whose partial PDF could not be built either. Each is named after the job and holds one PNG per sheet, under the names the spool gave them: `a-0001.png`, `a-0002.png`, ... for the first pass and `b-0001.png`, ... for a second. **That is acquisition order, one pass at a time, and it is not always document order.** For a simplex scan the two are the same. For a [manual duplex](../how-to/set-up-adf-duplex.md) job they are not: you turned the stack over between the passes, so the backs came back reversed and the document reads `a-0001`, `b-000N`, `a-0002`, `b-000N-1`, and so on -- the last back page belongs behind the first front page. Interleave them that way before assembling, or rescan the stack.
+
+The rule is the same for all three: a failure keeps everything it can, because you cannot get the paper back without feeding it again. An operator's cancel keeps nothing, because stopping was the decision. Nothing in `failed/` is ever deleted, moved or rotated by saneless.
+
+### Network blips after the upload
+
+Once paperless-ngx has accepted the upload, saneless waits for its consumption task to finish. A network error while checking on that task does not fail the scan: saneless keeps checking until `paperless_task_timeout` expires, and only then reports a timeout. When the last check failed with a network error, the timeout names that error; a blip that later checks got past is not blamed.
+
+### Duplicates
+
+A retry can create a duplicate document. If the connection drops after paperless-ngx has received the file but before its answer reaches saneless, saneless cannot tell the upload arrived and sends it again. On default paperless-ngx settings that stores a second copy of the document, which you can delete. saneless accepts this trade: a duplicate is easy to remove, a lost scan is not.
+
+When paperless-ngx is set to reject duplicates, the second upload's task fails instead, and the failure says the document may already be in Paperless. Check paperless-ngx before scanning again.
 
 ## Limitations
 
@@ -63,4 +85,23 @@ If no `consume_dir` is configured, the upload error propagates and the scan job 
 
 This is a deliberate trade-off: saving the document without metadata is better than losing the document entirely. If metadata is critical, re-upload the document through paperless-ngx's web interface after it comes back online.
 
-**The job status shows FALLBACK.** When the consume directory fallback is used, the scan job's final status is `FALLBACK` rather than `DONE`, so users can identify which documents may need metadata corrections in paperless-ngx.
+## How the Job Reports It
+
+**The job status distinguishes the two paths.** A scan that fell back to the consume directory ends in the `FALLBACK` state -- terminal, and distinct from both `DONE` and `ERROR`. It is labelled **Saved to folder** everywhere a job state is rendered:
+
+- The web UI status area shows `Saved to folder: <title>` in amber, visually distinct from the green Complete and the red Failed.
+- The job history table renders the same amber label in its status column.
+- `saneless jobs` prints `Saved to folder` in the Status column.
+- `saneless jobs --json` reports `"state": "FALLBACK"` and `"outcome": "FALLBACK"`. The JSON output is deliberately not humanised: it stays the raw enum value, so scripts can compare against it.
+
+So the job history does mark which documents arrived without metadata. You no longer have to spot them from the paperless-ngx side.
+
+A job also carries a `warning` field, which the status area prints beneath the status line when it is set and `saneless jobs --json` reports as `"warning"`. Two situations fill it in.
+
+A consume-directory fallback records where the file went and what that route cost:
+
+> Saved to the paperless-ngx consume directory at `<path>` instead of uploading through the API, so the title, tags and correspondent chosen for this scan were not applied -- paperless-ngx will apply its own matching rules to the file instead.
+
+The `FALLBACK` state says the document took the other route; the warning says what that route cost. The metadata consequence described under Limitations above is therefore also stated per job, on the job itself, rather than only in this document.
+
+The second case is an ADF duplex scan whose front and back page counts did not match, which records the two counts and notes that partial PDFs were saved.

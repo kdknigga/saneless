@@ -1,19 +1,67 @@
+# SHAs resolved 2026-09-18 via gh api; comments must carry the full version.
 name: Docs
 
 on:
   push:
-    branches: [main]
+    # This repository's default branch is `master`. The trigger here named a
+    # branch that does not exist, which is why the documentation site has never
+    # deployed once and why every deep link into it returns 404.
+    branches: [master]
 
+# The site is published as a Pages artifact rather than by pushing a branch, so
+# nothing in this workflow needs a writable `contents` scope. Only the deploy
+# job below widens anything, and only to what Pages itself requires.
 permissions:
-  contents: write
+  contents: read
+
+# One publish at a time, and never cancel one in flight: a half-applied
+# deployment is worse than a queued one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  build:
+    name: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          python-version: "3.x"
-      - run: pip install mkdocs-material
-      - run: mkdocs gh-deploy --force
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      # Both flags are load-bearing. `--only-group dev` takes the documentation
+      # toolchain out of the lockfile at the exact versions the lockfile pins,
+      # and `--no-install-project` skips building saneless itself -- which
+      # means python-sane is never compiled here, which means this job needs no
+      # SANE development headers apt step at all, unlike every job in CI.
+      - run: uv sync --locked --only-group dev --no-install-project
+      # Strict mode is deliberate: a broken nav entry or a dead internal link
+      # fails the build instead of shipping a site with holes in it.
+      - run: uv run mkdocs build --strict
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  # Publishing the artifact requires the repository setting
+  # Settings -> Pages -> Source: GitHub Actions. There is no published branch
+  # anywhere in this flow, so selecting a branch source instead leaves the site
+  # permanently empty. GitHub also auto-creates a `github-pages` environment
+  # the first time this runs, alongside the two publish environments the
+  # release workflow uses.
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        id: deployment

@@ -1,0 +1,4 @@
+# The vendored htmx and Pico files are pinned by SHA-384 `integrity` attributes in
+# base.html. Git must never convert their line endings on any checkout, or the hash
+# stops matching and browsers refuse to load them. See tests/test_vendor_assets.py.
+src/saneless/web/static/vendor/** -text

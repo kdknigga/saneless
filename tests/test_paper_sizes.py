@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from typing import get_args
+from typing import cast, get_args
 
 import pytest
 from PIL import Image
 from pydantic import ValidationError
 
+import saneless.vocabulary as vocabulary_module
 from saneless.config import ProfileConfig
 from saneless.paper_sizes import PAPER_SIZES_MM, PaperSize, crop_to_paper_size
 from saneless.scanner.base import ScanSettings
@@ -20,6 +21,28 @@ class TestPaperSizeLiteral:
         """PaperSize Literal includes full, a3, a4, a5, letter, legal."""
         args = get_args(PaperSize)
         assert set(args) == {"full", "a3", "a4", "a5", "letter", "legal"}
+
+
+class TestPaperSizeHasOneDefinition:
+    """
+    The paper-size names are defined once and the lookup table cannot drift.
+
+    ``PaperSize`` lives in the vocabulary module, and every other module uses
+    that one object.  ``PAPER_SIZES_MM`` has an entry for every name except
+    ``"full"``, which means the whole bed and so has no dimensions.
+    """
+
+    def test_the_table_covers_every_size_but_full(self) -> None:
+        """Every non-full paper size has dimensions, and nothing else does."""
+        assert set(PAPER_SIZES_MM) == set(get_args(vocabulary_module.PaperSize)) - {
+            "full"
+        }
+
+    def test_the_other_modules_use_the_vocabulary_definition(self) -> None:
+        """The paper-size module and the profile field share the one Literal."""
+        assert PaperSize is vocabulary_module.PaperSize
+        field = ProfileConfig.model_fields["paper_size"]
+        assert field.annotation is vocabulary_module.PaperSize
 
 
 class TestPaperSizesMM:
@@ -62,7 +85,9 @@ class TestCropToPaperSize:
     def test_unknown_size_returns_unchanged(self) -> None:
         """crop_to_paper_size returns image unchanged when paper_size not in PAPER_SIZES_MM."""
         img = Image.new("RGB", (3000, 4000), "red")
-        result = crop_to_paper_size(img, "unknown_size", 300)
+        # Past the type, as an unvalidated caller would: the guard is for them.
+        unknown = cast("PaperSize", "unknown_size")
+        result = crop_to_paper_size(img, unknown, 300)
         assert result is img
 
     def test_a4_at_300dpi_crops_correctly(self) -> None:
@@ -92,11 +117,6 @@ class TestProfileConfigPaperSize:
     def test_full_validates(self) -> None:
         """ProfileConfig(paper_size='full') validates successfully."""
         p = ProfileConfig(paper_size="full")
-        assert p.paper_size == "full"
-
-    def test_default_is_full(self) -> None:
-        """ProfileConfig() has paper_size='full' by default."""
-        p = ProfileConfig()
         assert p.paper_size == "full"
 
     def test_invalid_raises_validation_error(self) -> None:

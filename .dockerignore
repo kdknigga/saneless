@@ -1,0 +1,29 @@
+# Docker build context -- an ALLOW-LIST, not a deny-list (D-29, DLVR-06).
+#
+# The `*` below must stay the first line. It excludes the entire working tree;
+# each `!` line under it re-includes exactly one path the wheel build reads.
+# Move `*` down, or drop it, and every `!` line becomes decoration while the
+# whole working tree is sent to the daemon -- including a real config.toml with
+# a live paperless-ngx token, which is then recoverable from the build cache and
+# from the discarded builder stage.
+#
+# This is one of TWO independent gates. The other is the explicit `COPY` lines
+# in the builder stage of the Dockerfile, which replaced `COPY . .`. A mistake
+# in either one alone cannot leak a secret into a layer; both would have to be
+# wrong at once.
+#
+# README.md and LICENSE are NOT optional. pyproject.toml declares
+# `readme = "README.md"` and the PEP 639 `license-files = ["LICENSE"]`, and
+# `uv build --wheel` fails outright when either file is missing from the
+# context. uv.lock is not read by the wheel build, but it costs nothing and
+# keeps a future `uv sync --locked` in the builder stage possible.
+#
+# `!src/` re-includes the directory and everything beneath it; `!src/**` is not
+# needed. Pinned by tests/test_deployment_config.py -- nothing else in CI would
+# notice this list being weakened (D-30).
+*
+!src/
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE

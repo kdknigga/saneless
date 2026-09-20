@@ -3,37 +3,481 @@
 from __future__ import annotations
 
 import logging
+import secrets
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import JSONResponse
 
-if TYPE_CHECKING:
-    from starlette.responses import Response
+# A runtime import although only annotations use it, because FastAPI resolves
+# each route's return annotation when the decorator runs, and a Response it
+# cannot resolve becomes a response model that makes app.openapi() raise.
+# runtime-evaluated-decorators in pyproject.toml tells ruff the same.
+from starlette.responses import Response
 
+from saneless.checks import (
+    CHECKING_GLYPH,
+    CHECKING_MESSAGE,
+    CHECKING_STATE_CLASS,
+    CHECKING_STATE_LABEL,
+    POLL_ATTEMPT_CAP,
+    POLL_GAVE_UP_LINE,
+    POLL_PROBE_ATTEMPT_CAP,
+    POLL_STILL_CHECKING_LINE,
+    CheckKey,
+)
+from saneless.config import is_placeholder_token, resolve_job_title
+from saneless.exceptions import PaperlessError, describe
+from saneless.job import WEB_HISTORY_LIMIT
+from saneless.scanner.base import SourceKind, classify_source
+from saneless.vocabulary import (
+    QUEUE_FULL_JOB_ERROR,
+    SCAN_BLOCKED_REASON,
+    TITLE_MAX_LENGTH,
+    TOKEN_UNSET_JOB_ERROR,
+    WORKER_DEGRADED_JOB_ERROR,
+    WORKER_DOWN_JOB_ERROR,
+    ErrorCategory,
+    FlipOutcome,
+    JobState,
+    RequestRejection,
+    SubmitResult,
+    WorkerHealth,
+    busy_line,
+    local_time,
+    worker_health_detail,
+)
+from saneless.web.errors import RequestRejected
+
+if TYPE_CHECKING:
+    from starlette.datastructures import State
+
+    from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
     from saneless.web.cache import MetadataCache
+    from saneless.web.checks_cache import CachedChecks
+    from saneless.worker import ScanWorker
 
 __all__ = ["router"]
 
 logger = logging.getLogger(__name__)
 
+# Every handler below is a plain ``def`` on purpose.  Each one calls blocking
+# code -- sync httpx to Paperless, sqlite through the job store, the worker --
+# and FastAPI runs ``def`` handlers on its threadpool, so a slow Paperless call
+# cannot stall ``/health`` or the status poll.  The shared state
+# they touch is locked: the JobStore's RLock, the worker's profile lock and the
+# metadata cache's per-key locks.
 router = APIRouter()
 
 _TAGS_FORM_DEFAULT = Form(default=[])
+
+# The same "no tags ticked" default, for the GET that renders the list.  htmx
+# sends an ``hx-include``'s values in the query string of a GET and in the body
+# of a POST, so the two methods need one of these each.  Both are module-level
+# constants so the parameter defaults themselves stay call-free (B008).
+_TAGS_QUERY_DEFAULT = Query(default=[])
+
+TAG_FILTER_MAX_LENGTH: Final = 100
+"""
+The cap on the tag filter, applied at the boundary before any work.
+
+A hundred characters is far more than a tag name and far less than a payload:
+the value is a substring test against names the operator chose, so anything
+longer cannot be a filter and is either a mistake or an attempt to make the
+server do work for nothing.  ``Query(max_length=...)`` turns it into a 422
+before the handler body runs, which is the same "validate at the boundary"
+shape ``MetadataResource`` uses for ``resource``.
+"""
+
+# The only metadata resources the cache holds.  A runtime alias, not a
+# TYPE_CHECKING import, because FastAPI reads it to validate the ``resource``
+# query parameter: anything else is a 422 instead of reaching the cache.
+MetadataResource = Literal["tags", "correspondents"]
+
+# The cookie naming the browser that started a scan.  Every attribute it
+# is set with is deliberate: ``HttpOnly`` so no script can read it -- there is
+# no script file in this application at all; ``SameSite=Lax`` so the browser
+# withholds it on any cross-site POST; no lifetime attribute, so it is a
+# session cookie that dies when the browser closes; and deliberately no
+# ``Secure``, because the appliance is served over plain HTTP on a LAN and that
+# flag would silently stop the cookie being sent rather than harden it.
+#
+# The token's position, recorded here so a later reader does not mistake this
+# for something it is not: the token is a footgun guard for the flip prompt,
+# not an authentication mechanism.  ``CrossOriginGuard`` allows a POST that
+# carries neither ``Sec-Fetch-Site`` nor ``Origin``, so a scripted client that
+# sends a guessed cookie of its own can answer a flip.  That is accepted on a
+# trusted LAN, not overlooked.  What the token stops is the household member
+# standing at the same appliance pressing Continue on a stack they did not
+# load, which is the failure the token exists to close.
+OWNER_COOKIE: Final = "saneless_owner"
+
+
+def _presented_owner(request: Request) -> str | None:
+    """
+    Return the owner token this request carries, or None when it carries none.
+
+    A blank or whitespace-only value counts as none.  A browser holding one has
+    no usable identity, and treating it as a token would make every such
+    browser the same owner as every other.
+
+    Args:
+        request: The incoming request.
+
+    Returns:
+        The token, or None.
+
+    """
+    presented = request.cookies.get(OWNER_COOKIE, "").strip()
+    return presented or None
+
+
+def _is_owner(presented: str | None, recorded: str | None) -> bool:
+    """
+    Report whether a presented token speaks for the job that recorded one.
+
+    A NULL recorded token means the job is unowned and everyone may answer it.
+    Every row written before owner tokens existed has one, including a
+    manual-duplex job that was in flight across an upgrade, and a strict rule
+    would leave such a job un-continuable until the manual-duplex flip timeout
+    fired it away.  Nothing creates a NULL-token job any more, so the exception
+    has a closed lifetime.
+
+    The comparison goes through ``secrets.compare_digest`` so no timing
+    difference can be read off it.  Both sides are encoded first:
+    the presented value arrives as text out of a header and ``compare_digest``
+    refuses a non-ASCII ``str``, while it compares bytes of any two lengths
+    safely.
+
+    Args:
+        presented: The token this request carries, or None.
+        recorded: The token stored on the job row, or None when unowned.
+
+    Returns:
+        Whether this request may answer for the job.
+
+    """
+    if recorded is None:
+        return True
+    if presented is None:
+        return False
+    return secrets.compare_digest(presented.encode(), recorded.encode())
+
+
+def _owner_answers(presented: str | None, job: Job | None) -> bool:
+    """
+    Report whether this request may answer the named job's flip prompt.
+
+    An unknown job id answers False: there is nothing to own, and the worker
+    would have dropped the answer anyway.  The outcome is logged as a match or
+    a mismatch and never as a value -- the token is not allowed into a log
+    line any more than into the markup.
+
+    Args:
+        presented: The token this request carries, or None.
+        job: The job the answer names, or None when no such row exists.
+
+    Returns:
+        Whether the answer should be passed to the worker.
+
+    """
+    if job is None:
+        return False
+    matched = _is_owner(presented, job.owner_token)
+    logger.debug(
+        "Flip answer for job %s: owner %s",
+        job.id,
+        "matched" if matched else "did not match",
+    )
+    return matched
+
+
+# The freshness line's four variants, composed here rather than in the
+# template: the strip's templates own no vocabulary, and a page that assembled
+# its own prose would be a second place for the copy to drift.  The dash is
+# U+2014 with spaces on both sides.
+_PAUSED_PREFIX: Final = "Paused during scan — "
+_COLD_PAUSED_LINE: Final = f"{_PAUSED_PREFIX}not checked yet."
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckingRow:
+    """
+    One cold-start placeholder row, before any probe has happened.
+
+    It is not a :class:`~saneless.checks.CheckResult` because "we have not
+    looked yet" is not one of the three ``CheckState`` members, and inventing a
+    fourth would owe an exit-code rule to ``saneless doctor`` for a state the
+    CLI cannot ever be in -- it probes synchronously and always has an answer.
+    So the row carries the class, glyph and screen-reader word directly, and
+    every one of them is a constant imported from ``saneless.checks``: the
+    template still authors none of them.
+
+    Only ``key`` varies, so the five rows are built once at import.
+
+    Attributes:
+        key: Which check this row is standing in for.
+        state_class: The muted colour class the glyph is drawn in.
+        glyph: The neutral cold-start marker.
+        state_label: The word a screen reader hears in the glyph's place.
+        message: The cold-start copy.
+
+    """
+
+    key: CheckKey
+    state_class: str = CHECKING_STATE_CLASS
+    glyph: str = CHECKING_GLYPH
+    state_label: str = CHECKING_STATE_LABEL
+    message: str = CHECKING_MESSAGE
+
+
+# One placeholder per CheckKey, in member order, so a cold strip still renders
+# five *named* rows rather than an empty list that reads as "nothing to report".
+_CHECKING_ROWS: Final = tuple(_CheckingRow(key=key) for key in CheckKey)
+
+
+def _freshness_line(cached: CachedChecks, *, scan_active: bool) -> str:
+    """
+    Compose the one sentence under the rows, for the four situations.
+
+    Two axes produce the four variants: whether any results exist yet, and
+    whether a scan is holding the scanner.  The paused wording is why the
+    checks can be skipped during a scan at all -- a strip that silently showed a
+    half-hour-old Scanner row during a scan would be lying by omission, and one
+    that blanked would throw away the four rows that are still true.
+
+    The timestamp goes through the shared ``local_time`` filter, which is the
+    same object ``saneless doctor``'s table uses, so the two surfaces cannot
+    disagree about the zone or the format.
+
+    Args:
+        cached: The cache snapshot this render is showing.
+        scan_active: Whether the worker currently has a job in flight.
+
+    Returns:
+        The exact sentence for this situation.
+
+    """
+    if cached.results is None or cached.checked_at is None:
+        return _COLD_PAUSED_LINE if scan_active else CHECKING_MESSAGE
+    stamp = local_time(cached.checked_at)
+    if scan_active:
+        return f"{_PAUSED_PREFIX}last checked {stamp}."
+    return f"Last checked {stamp}."
+
+
+def _poll_line(
+    cached: CachedChecks,
+    *,
+    scan_active: bool,
+    gave_up: bool,
+    still_checking: bool,
+) -> str:
+    """
+    Pick the sentence under the rows once the poll's own endings are counted.
+
+    ``_freshness_line`` answers "how fresh is what is on the page", which is
+    the question whenever the poll is still an ordinary one.  Two endings
+    replace it, and neither is about freshness at all.
+
+    A chain that ran out of attempts with nothing in flight says so and points
+    at the ``Check again`` button, which is the one way forward left.  A chain
+    that is still asking because a probe demonstrably holds the single-flight
+    lock says the first check is still running instead: the button that
+    ``POLL_GAVE_UP_LINE`` names starts the very probe that is already running,
+    so naming it there would be advice that cannot help.  Once the
+    larger cap is reached the give-up line comes back even over a probe that is
+    still held, because the chain has stopped: the button is again the only
+    thing that can put an answer on the page, and a lock a dead thread holds
+    stays held forever.  The two flags are mutually exclusive by construction
+    -- ``still_checking`` is false whenever ``gave_up`` is true -- so the order
+    here does not decide between them.
+
+    Args:
+        cached: The cache snapshot this render is showing.
+        scan_active: Whether the worker currently has a job in flight.
+        gave_up: Whether the chain ended with nothing in flight and nothing
+            ever checked.
+        still_checking: Whether the chain is past ``POLL_ATTEMPT_CAP`` on a
+            cold cache with a probe demonstrably in flight.
+
+    Returns:
+        The exact sentence this render puts under the rows.
+
+    """
+    if gave_up:
+        return POLL_GAVE_UP_LINE
+    if still_checking:
+        return POLL_STILL_CHECKING_LINE
+    return _freshness_line(cached, scan_active=scan_active)
+
+
+def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
+    """
+    Build the context ``partials/checks.html`` renders from, without probing.
+
+    This reads the cache and never probes.  Probing inside a request handler is
+    what an unplugged scanner host would make hang -- a sane-net connect that
+    Linux retries six times costs roughly two minutes inside a blocking C call,
+    and a page that waited for it would be a page that never arrives.  The
+    background refresher is what fills the cache; this only reads what is
+    already there.
+
+    ``checks`` is ``None`` on a cold cache, and that is the primary fact the
+    template branches on: no results means the placeholder rows are drawn,
+    results means the real ones.
+
+    ``poll_attempt`` is the second.  It is the number the *next* request should
+    carry, or ``None`` when there is to be no next request -- either because
+    there is nothing left to wait for, which is the cold-start ending and still
+    the one that matters, or because the applicable cap has been reached, which
+    is how a chain ends when results never arrive.  The template emits its
+    request attributes only when this is set, so "should the browser ask
+    again" is decided here and never in the markup.
+
+    There are two caps, and which one applies is decided by the same
+    ``probe_in_flight`` read the disjunct below uses.  With nothing
+    in flight the bound is ``POLL_ATTEMPT_CAP`` -- ten attempts, about twenty
+    seconds -- which is the case that cap was sized for: a refresher thread
+    that has died and a tab left open in front of it.  While a checker
+    demonstrably holds the single-flight lock the bound is
+    ``POLL_PROBE_ATTEMPT_CAP`` instead, about three minutes, because the worst
+    case this application's own probe can cost is the ~127 s ``get_devices()``
+    ``checks.py`` documents plus unbounded name resolution, and a chain that
+    stopped at twenty seconds never collected the answer it was waiting for.
+    The larger window is still a cap: ``Lock.locked()`` stays true forever if
+    the holder dies.
+
+    "Nothing left to wait for" is two facts, not one.
+    An empty cache is the cold start.  A probe in flight is the case where
+    results *do* exist but the answer on the page is about to be superseded: the
+    probe has not stored yet, so this render is of the pre-probe entry, and with
+    only the first fact nothing on the page was ever going to fetch the result
+    the probe lands a second later.  The strip was refetched by another click,
+    the terminal-state reload, or a page load -- so the Check again button could
+    visibly do nothing.  What the disjunct costs: a render landing during a
+    background probe issues a small, capped number of extra cache reads before
+    it settles.  Each is a cache read and never a probe, and the count is
+    bounded by ``POLL_PROBE_ATTEMPT_CAP``.
+    ``probe_in_flight`` is a ``locked()`` read and never an acquire, so no
+    request thread can be parked behind the probe it is asking about.
+
+    ``gave_up`` means "this cold chain has stopped", and it is measured against
+    the *applicable* cap rather than always against ``POLL_ATTEMPT_CAP``.  It
+    still requires a cold cache, because its line says the checks have not run
+    yet and that would be a lie printed beside five rows that did run -- so a
+    settling poll that runs out of attempts leaves the normal last-checked line
+    alone.  What changed is that a cold chain at ``POLL_ATTEMPT_CAP`` with a
+    probe in flight has *not* stopped: it keeps asking up to
+    ``POLL_PROBE_ATTEMPT_CAP`` and shows ``POLL_STILL_CHECKING_LINE`` in place
+    of the cold-start ``Checking…`` line.  The give-up line is
+    withheld there because it points at the ``Check again`` button, and a click
+    on that button while a probe holds the lock collapses into the probe
+    already running -- advice that cannot help.  At the larger cap it comes
+    back, because by then the chain really has stopped and the button really is
+    the only way forward.  At whichever cap ends the chain on a cold cache the
+    freshness line is replaced rather than augmented: there is no freshness to
+    report, because nothing has ever been checked.
+
+    Args:
+        state: The application state holding the cache and the worker.
+        attempt: Which attempt produced this render.  Zero for a page render
+            and for the out-of-band strip, both of which start a fresh chain;
+            the browser carries the rest back in the query string.
+
+    Returns:
+        ``checks``, ``checking_rows``, ``freshness_line``, ``scan_active`` and
+        ``poll_attempt``.
+
+    """
+    cached: CachedChecks = state.checks.current()
+    # The worker's own record of a job in flight, not the scanner gate: reading
+    # the gate would mean acquiring it, and a render is not allowed to contend
+    # for the lock a live scan holds.
+    scan_active = state.worker.current_job_id is not None
+    # Read once, so the two decisions below cannot disagree about it.  This is
+    # `Lock.locked()`: an observation, never an acquire.
+    probe_in_flight = state.refresher.probe_in_flight
+    # Which cap applies is the probe's decision, and it is taken once from the
+    # one read above so the line and the trigger cannot disagree about it.
+    applicable_cap = POLL_PROBE_ATTEMPT_CAP if probe_in_flight else POLL_ATTEMPT_CAP
+    cold = cached.results is None
+    gave_up = cold and attempt >= applicable_cap
+    still_checking = (
+        cold and probe_in_flight and not gave_up and attempt >= POLL_ATTEMPT_CAP
+    )
+    keep_asking = cold or probe_in_flight
+    return {
+        "checks": cached.results,
+        "checking_rows": _CHECKING_ROWS,
+        "freshness_line": _poll_line(
+            cached,
+            scan_active=scan_active,
+            gave_up=gave_up,
+            still_checking=still_checking,
+        ),
+        "scan_active": scan_active,
+        "poll_attempt": (
+            attempt + 1 if keep_asking and attempt < applicable_cap else None
+        ),
+    }
+
+
+def _checks_fallback_context() -> dict[str, object]:
+    """
+    Build the strip the route falls back to when its own render raises.
+
+    Every value here is a developer-authored constant, and that is the whole
+    point: this body is rendered on a page the whole LAN can read, so no part
+    of the exception that produced it may reach the context (ASVS V7).  The
+    exception goes to ``logger.exception`` instead.
+
+    ``checks`` is ``None`` and ``checking_rows`` is the cold-start five, so the
+    strip shows five *named* rows rather than an empty list that would read as
+    "nothing to report".  ``freshness_line`` is ``POLL_GAVE_UP_LINE``, and not
+    because nothing has been checked: the guard around this body covers the
+    whole render, so a raise from the worker's job lookup, the refresher's
+    lock or the clock produces it on an appliance whose cache may well hold
+    five true rows.  It is chosen because the render that would have read the
+    cache is the one that failed, so this body asserts nothing about the cache
+    beyond the fact that it could not be shown -- and the line names the
+    ``Check again`` button that is still on the page, which is the one way
+    forward left.  ``scan_active`` is ``False`` for the same
+    reason: the render that would have read the worker is the one that failed.
+    ``poll_attempt`` is ``None``, and that is what ends the chain: the template
+    emits its request attributes only when it is set, so the body this context
+    renders carries no trigger and the browser stops asking.
+
+    Returns:
+        The same five keys ``_checks_context`` returns.
+
+    """
+    return {
+        "checks": None,
+        "checking_rows": _CHECKING_ROWS,
+        "freshness_line": POLL_GAVE_UP_LINE,
+        "scan_active": False,
+        "poll_attempt": None,
+    }
 
 
 def _get_cached_or_fetch(
     cache: MetadataCache,
     paperless: PaperlessClient,
-    resource: str,
+    resource: MetadataResource,
 ) -> list[dict[str, object]]:
     """
     Retrieve metadata from cache or fetch from paperless-ngx.
 
-    Falls back to an empty list if the paperless API is unreachable,
-    ensuring the UI always loads even when paperless-ngx is down.
+    The fetch goes through the cache's single-flight ``get_or_fetch``, so
+    concurrent requests for the same resource make one Paperless call.  When
+    a refresh fails, the cache serves the last list fetched successfully;
+    only when there has never been one does the error reach this function,
+    which logs its cause and falls back to an empty list, so the UI always
+    loads even when paperless-ngx is down.
 
     Args:
         cache: Metadata cache instance.
@@ -41,83 +485,522 @@ def _get_cached_or_fetch(
         resource: Resource name ('tags' or 'correspondents').
 
     Returns:
-        List of metadata dicts, or empty list on error.
+        List of metadata dicts: fresh, the last good list, or empty.
 
     """
-    data = cache.get(resource)
-    if data is not None:
-        return data
+    fetch = paperless.get_tags if resource == "tags" else paperless.get_correspondents
     try:
-        if resource == "tags":
-            data = paperless.get_tags()
-        else:
-            data = paperless.get_correspondents()
-        cache.set(resource, data)
-    except Exception:
+        data = cache.get_or_fetch(resource, fetch)
+    except PaperlessError as exc:
         logger.warning(
-            "Failed to fetch %s from paperless-ngx, using empty list",
+            "Failed to fetch %s from paperless-ngx, using empty list: %s",
             resource,
+            describe(exc),
+        )
+        data = []
+    except Exception as exc:
+        logger.warning(
+            "Failed to fetch %s from paperless-ngx, using empty list: %s",
+            resource,
+            describe(exc),
+            exc_info=True,
         )
         data = []
     return data
 
 
+def _tag_list_context(
+    state: State, *, q: str, selected: list[int]
+) -> dict[str, object]:
+    """
+    Build the tag checkbox list's context: the filtered list and pinned ticks.
+
+    Two lists, not one, and that is the whole design.  The filter
+    request carries the currently ticked ids with it -- ``hx-include`` over a
+    checkbox list gathers only the boxes that are checked -- so this function
+    can re-render every one of them ticked, and pin the ones the filter
+    excludes *above* the filtered list.  A tick therefore cannot leave the DOM,
+    and a tick that cannot leave the DOM cannot be silently dropped from the
+    next submit.  A tag that is both ticked and matched is rendered by the
+    filtered loop alone, so it appears once rather than twice.
+
+    ``q`` is a Python-side substring test over the already-cached list and
+    nothing else (ASVS V5).  It is never interpolated into a paperless-ngx
+    query URL -- the cache holds the whole list, so there is nothing to ask
+    upstream and the filter costs no request at all -- and it is
+    deliberately absent from the context this returns, so it cannot be echoed
+    back into the page.  Its length is already bounded by the route's
+    ``max_length`` before this runs.
+
+    Args:
+        state: Application state, for the metadata cache and Paperless client.
+        q: The filter text, matched case-insensitively against tag names.
+        selected: The tag ids the request reports as currently ticked.
+
+    Returns:
+        The context ``partials/tags.html`` renders: the pinned ticks, the
+        filtered list, the ticked ids, and whether any tag exists at all.
+
+    """
+    # With ``[web] show_tags`` off the tag markup is never emitted, so
+    # a fetch here buys nothing and costs a paperless-ngx round trip on every
+    # cold-cache page load -- and the flag that would hide the list is the same
+    # flag that decides whether the data can ever be seen.  The guard sits in
+    # this function rather than in ``index`` so it covers all three call sites,
+    # including the filter and refresh routes, which have the same reason to
+    # skip.  The key set below is the normal path's, emptied: ``index`` spreads
+    # this with ``**``, so a missing key would leave an undefined name in a
+    # template that has nothing to do with tags.
+    if not state.settings.web.show_tags:
+        return {
+            "pinned": [],
+            "tags": [],
+            "selected_tags": set(),
+            "any_tags": False,
+        }
+    everything = _get_cached_or_fetch(state.cache, state.paperless, "tags")
+    needle = q.casefold()
+    ticked = set(selected)
+    matched = [
+        tag for tag in everything if needle in str(tag.get("name", "")).casefold()
+    ]
+    matched_ids = {tag.get("id") for tag in matched}
+    pinned = [
+        tag
+        for tag in everything
+        if tag.get("id") in ticked and tag.get("id") not in matched_ids
+    ]
+    return {
+        "pinned": pinned,
+        "tags": matched,
+        # Not ``selected``: the index context already uses that name for the
+        # profile the page opens on, and an include shares its parent's
+        # context, so the two would collide on the full-page render.
+        "selected_tags": ticked,
+        # Which empty state to render when both lists are empty: "paperless-ngx
+        # has no tags" and "your filter matched none of them" are different
+        # facts and only one of them is the reader's to fix.
+        "any_tags": bool(everything),
+    }
+
+
+def _current_or_recent_job(worker: ScanWorker, job_store: JobStore) -> Job | None:
+    """
+    Find the job the status area should report: the current one, else the latest.
+
+    The worker clears its current job id in ``_process_job``'s ``finally``, so a
+    request landing as a job ends -- a flip Continue or Abort in particular --
+    finds no current job.  Falling back to the most recent job makes that
+    request report the job that just ended instead of the idle "Ready to scan."
+    copy, which would claim nothing happened.  Every route that renders the
+    status area uses this one lookup, so none of them can drift.
+
+    The fallback skips rows rejected at submit.  A refused submit --
+    queue full, worker down or degraded -- writes a REJECTED row that is newer
+    than the job running at the time, yet it never ran, so it cannot be "the
+    job that just ended".  ``JobStore.latest_run_job`` leaves those rows out;
+    the lookup's contract is otherwise unchanged, and history still lists them.
+
+    The fallback also skips a refused submit whose REJECTED write the request
+    could not make and owed to the worker.  Until the worker writes it,
+    that row is PENDING with no marker and would render as "Starting scan..."
+    with the Scan button disabled, for a scan that never ran.  The
+    accepted residual window is a poll landing during the request's own write
+    attempt, between ``create_job`` and that write or the ``owe_rejection``
+    call after it failed.
+
+    Args:
+        worker: The scan worker, for the id of the job in flight.
+        job_store: The job store to read the job from.
+
+    Returns:
+        The current job, else the most recent job that ran, else None when no
+        job has ever run.
+
+    """
+    job = None
+    if worker.current_job_id:
+        job = job_store.get_job(worker.current_job_id)
+    if job is None:
+        job = job_store.latest_run_job(exclude_ids=worker.owed_rejection_ids())
+    return job
+
+
+def _busy_line(worker: ScanWorker, job_store: JobStore, job: Job | None) -> str | None:
+    """
+    Compose the one line the status area shows while the rendered job works.
+
+    Built here rather than composed in the template, because templates own no
+    vocabulary: a page that assembled its own sentence would be a second place
+    for the copy to drift from what ``vocabulary.busy_line`` says.
+
+    Three situations, in the precedence ``busy_line`` itself documents.  A
+    PENDING job while the worker runs a *different* one is waiting in the
+    queue, and is told what it is waiting for and how many jobs are ahead.
+    The job the worker is actually running, on its second
+    manual-duplex pass, leads with the pages counted on the first.  Everything
+    else is the plain progress prose, unchanged.
+
+    The zero case reads as being next in line; a count of none ahead is never
+    spelled out as a number, because it is technically true and reads like a
+    bug.  That rule lives in ``vocabulary.busy_line``, so this
+    function passes the count through and does not restate it.
+
+    Args:
+        worker: The scan worker, for the job in flight and its front count.
+        job_store: The job store, for the running job's title and the position.
+        job: The job being rendered, or None when nothing has ever run.
+
+    Returns:
+        One line of plain text, or None when there is no job to describe.
+
+    """
+    if job is None:
+        return None
+    running_id = worker.current_job_id
+    if job.state is JobState.PENDING and running_id not in (None, job.id):
+        running = job_store.get_job(running_id) if running_id else None
+        ahead = job_store.queue_position(job.id)
+        if running is not None and ahead is not None:
+            return busy_line(job.state, queue_title=running.title, queue_ahead=ahead)
+    if job.id == running_id and job.state is JobState.SCANNING_REVERSE:
+        return busy_line(job.state, front_pages=worker.front_pages)
+    return busy_line(job.state)
+
+
+@dataclass(frozen=True, slots=True)
+class _StatusFacts:
+    """
+    The per-request facts a status render needs beyond the worker and store.
+
+    Bundled rather than passed one by one because passing them separately
+    would take ``_status_context`` past ``PLR0913``'s five-parameter ceiling.
+    A suppression is forbidden (CLAUDE.md), and ``create_job`` already
+    had to take the same route, so the frozen dataclass is the established
+    answer here.
+
+    Every field is read off the request in ``_status_facts`` and nowhere else,
+    which is what stops a route added later from acquiring or losing a fact by
+    forgetting about it -- the same discipline ``refresh_checks`` and
+    ``is_owner`` already follow.
+    """
+
+    claimed: tuple[str, FlipOutcome] | None = None
+    followed_job_id: str | None = None
+    owner_token: str | None = None
+    scan_blocked: bool = False
+
+
+def _status_facts(
+    request: Request,
+    *,
+    claimed: tuple[str, FlipOutcome] | None = None,
+    followed_job_id: str | None = None,
+) -> _StatusFacts:
+    """
+    Read every per-request status fact off the request, in one place.
+
+    ``owner_token`` and ``scan_blocked`` are both derived here rather than at
+    each call site, so a new status-rendering route cannot silently lose the
+    owner's flip prompt or hand back an enabled Scan button on a blocked
+    appliance.  Only the two facts a route genuinely knows
+    about itself -- the answer it just claimed, and the job the browser is
+    following -- are passed in.
+
+    ``scan_blocked`` is derived from ``Settings``, which is loaded once at
+    process start, so it cannot change while the process runs: there is no live
+    flip to orchestrate and ``POST /api/checks/refresh`` deliberately carries
+    neither the button nor the reason line, because re-running the checks
+    cannot change a verdict that was never read from them.
+
+    This unwraps the configured token, and the value goes to the predicate and
+    nowhere else: it is never logged, rendered or echoed, and the flag that
+    reaches the template is a bool (ASVS V7).
+
+    Args:
+        request: The incoming request, for its cookies and the app's settings.
+        claimed: The job id and answer this request itself claimed, if any.
+        followed_job_id: The job this browser submitted, if it submitted one.
+
+    Returns:
+        The bundle ``_status_context`` reads.
+
+    """
+    settings = request.app.state.settings
+    return _StatusFacts(
+        claimed=claimed,
+        followed_job_id=followed_job_id,
+        owner_token=_presented_owner(request),
+        scan_blocked=is_placeholder_token(settings.paperless.token.get_secret_value()),
+    )
+
+
+def _status_context(
+    worker: ScanWorker,
+    job_store: JobStore,
+    facts: _StatusFacts,
+) -> dict[str, object]:
+    """
+    Build the context ``partials/status.html`` renders from.
+
+    The job comes from ``_current_or_recent_job``, and the store's recorded
+    state still selects the branch the partial renders, so no route asserts a
+    state the store has not recorded.  What this adds is ``flip_answer``: for a
+    job the store still reads as ``AWAITING_FLIP``, whether its flip wait has
+    already been answered, and with what.  That is a fact the worker genuinely
+    holds, and it lets the partial acknowledge the answer instead of
+    re-rendering the Continue and Abort buttons as though the click did
+    nothing.
+
+    ``claimed`` exists because the worker may already have cleared its flip
+    coordinator by the time the route reads it: a route that just claimed an
+    answer is authoritative for its own job.  It is used only when it names
+    the job being rendered, so a posted foreign job id cannot acknowledge a
+    job nobody answered.
+
+    ``followed_job_id`` is the second such extra fact: the job this browser
+    submitted, baked into its poll URL by ``start_scan``.  It is used only to
+    select which job is rendered, and when it names no existing row the
+    function falls back to ``_current_or_recent_job``, so a browser whose job
+    has been pruned degrades to today's behaviour instead of meeting a 404.
+    The context key echoes back only an id that was actually found,
+    which is what keeps that fallback rendering byte-identical to the one
+    ``GET /api/jobs/current/status`` produces.
+
+    Args:
+        worker: The scan worker, for the job in flight and its flip answer.
+        job_store: The job store to read the job from.
+        facts: The per-request bundle ``_status_facts`` built.
+
+    ``refresh_checks`` is False here for every caller, and that is the whole of
+    the flag's policy: ``start_scan`` sets it True on its own, so a status poll
+    or a flip answer cannot carry an out-of-band strip.  Defaulting it in this
+    one builder rather than at each call site is what stops a route added later
+    from acquiring the behaviour by forgetting to say no.
+
+    ``is_owner`` is decided here, once, rather than at each call site, for the
+    same reason ``refresh_checks`` is: a route added later must not be able to
+    acquire or lose the gate by forgetting about it.  The partial reads the
+    flag and never the token, so the value itself has no path into the
+    markup.
+
+    ``scan_blocked`` rides along for the same reason again, and it is why every
+    out-of-band ``#scan-btn`` -- the scan submit's own response, both status
+    polls and both flip answers -- carries the blocked state: they all render
+    ``partials/scan_button.html`` from this one context, so no status response
+    can hand back an enabled button on an appliance that cannot upload.  On a
+    blocked appliance ``POST /api/scan`` is refused before it reaches its
+    success branch, so that one is unreachable today; it is included anyway,
+    because the property being defended is that the flag lives in one partial
+    fed from one builder, not that each caller remembered.
+
+    Returns:
+        The job, its flip answer, the followed job's id, the one busy line,
+        whether this viewer owns the job, whether the Scan button is blocked
+        and a false strip-refresh flag.  ``flip_answer`` is None unless the
+        rendered job is ``AWAITING_FLIP`` and has been answered.
+
+    """
+    followed = (
+        job_store.get_job(facts.followed_job_id) if facts.followed_job_id else None
+    )
+    job = (
+        followed if followed is not None else _current_or_recent_job(worker, job_store)
+    )
+    answer: FlipOutcome | None = None
+    if job is not None and job.state is JobState.AWAITING_FLIP:
+        if facts.claimed is not None and facts.claimed[0] == job.id:
+            answer = facts.claimed[1]
+        else:
+            answer = worker.flip_answer(job.id)
+    return {
+        "job": job,
+        "flip_answer": answer,
+        "refresh_checks": False,
+        "followed_job_id": followed.id if followed is not None else None,
+        "busy_line": _busy_line(worker, job_store, job),
+        "is_owner": job is not None and _is_owner(facts.owner_token, job.owner_token),
+        "scan_blocked": facts.scan_blocked,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class _ProfileOption:
+    """
+    One entry of the Profile select: what it submits and what it reads as.
+
+    Attributes:
+        name: The profile name, which is the ``value`` the option submits.
+            It is the wire contract ``POST /api/scan`` already takes, so only
+            the text a household member reads is new here.
+        label: The human name shown in the dropdown.
+        description: The sentence shown beneath the select for this profile.
+
+    """
+
+    name: str
+    label: str
+    description: str
+
+
+def _profile_options(worker: ScanWorker) -> tuple[_ProfileOption, ...]:
+    """
+    Build the ordered option list the Profile select renders.
+
+    Feeder profiles come first on a sheet-fed device, and this is
+    where ``has_flatbed`` is read: sheet-fed means the device reports no
+    flatbed source, and at render time the server's evidence for that is the
+    generated profile set, which mirrors the device's sources.  So the answer
+    is derived from the profiles already in hand -- no new device probe and no
+    new config key.
+
+    The classification comes from ``classify_source`` and from nowhere else:
+    its docstring states it is the only source-classification rule in the
+    codebase and forbids re-deriving the answer from the string.  That matters
+    most for the commonest real feeder name of all, whose first four letters
+    are the whole of the automatic rule -- an exact match is what keeps it out
+    of the single-page group, and this function inherits that answer rather
+    than asking again.
+
+    Args:
+        worker: The worker whose profile set is being rendered.
+
+    Returns:
+        One option per configured profile, feeder-first when the device is
+        sheet-fed and in configuration order otherwise.
+
+    """
+    entries: list[tuple[_ProfileOption, SourceKind]] = []
+    for name in worker.profile_names():
+        profile = worker.get_profile(name)
+        if profile is None:
+            # Listing and looking up are two locked calls, so a profile
+            # rewritten between them can be gone by the time it is read.  One
+            # option fewer for one render is honest; a placeholder would not
+            # be, and there is nothing to show under a name that no longer
+            # names anything.
+            continue
+        entries.append(
+            (
+                _ProfileOption(
+                    name=name,
+                    # A deployed config whose profiles predate the ``label``
+                    # key carries an empty human name: startup
+                    # generation only runs on a bare default config, so it is
+                    # skipped there, and a blank option is worse than a raw
+                    # profile name.  ``saneless auto-profiles --force`` is what
+                    # backfills the text, and the how-to says so.
+                    label=profile.label or name,
+                    description=profile.description,
+                ),
+                classify_source(profile.source),
+            )
+        )
+    sheet_fed = not any(kind is SourceKind.FLATBED for _, kind in entries)
+    if sheet_fed:
+        # A stable sort, so configuration order survives inside each group and
+        # the only thing this changes is which group comes first.
+        entries.sort(key=lambda entry: not entry[1].uses_feeder)
+    return tuple(option for option, _ in entries)
+
+
 @router.get("/")
-async def index(request: Request) -> Response:
+def index(request: Request) -> Response:
     """
     Render the main page with scan form, status, and job history.
 
-    Populates profile selector from settings, fetches tags and
-    correspondents from cache or paperless-ngx, and loads recent
-    job history from the database.
+    Populates profile selector from the worker's profile set (read under its
+    profile lock), fetches tags and correspondents from cache or
+    paperless-ngx, and loads recent job history from the database.
     """
     state = request.app.state
-    profiles = list(state.settings.profiles.keys())
-    tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
-    correspondents = _get_cached_or_fetch(
-        state.cache, state.paperless, "correspondents"
+    # The refresher only probes while a page says someone is looking, so
+    # every route that renders the strip has to stamp this.  Without it the
+    # lazy thread returns at its first guard for ever and the strip never
+    # leaves its cold-start rows.
+    state.refresher.note_watcher()
+    profiles = _profile_options(state.worker)
+    # A full page render is the unfiltered, nothing-ticked case of the same
+    # context the filter route builds, so it goes through the same function
+    # rather than a second shape the two could drift apart on.
+    tag_list = _tag_list_context(state, q="", selected=[])
+    # The correspondent half of the same saving.  ``show_correspondent``
+    # off means the select is left out of the markup, so this fetch would be a
+    # second cold-cache round trip for a list nobody can be shown.  The key
+    # stays in the context either way: the template reaches for it inside its
+    # own ``{% if %}``, and an absent key would be a different kind of bug from
+    # an empty one.
+    correspondents = (
+        _get_cached_or_fetch(state.cache, state.paperless, "correspondents")
+        if state.settings.web.show_correspondent
+        else []
     )
 
-    current_job = None
-    if state.worker.current_job_id:
-        current_job = state.job_store.get_job(state.worker.current_job_id)
-    if current_job is None:
-        recent = state.job_store.list_recent(limit=1)
-        current_job = recent[0] if recent else None
+    status = _status_context(state.worker, state.job_store, _status_facts(request))
 
-    jobs = state.job_store.list_recent(limit=50)
+    jobs = state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
 
     return state.templates.TemplateResponse(
         request,
         "index.html",
         {
             "profiles": profiles,
-            "tags": tags,
+            # Which option the page opens on, and the sentence that goes with
+            # it.  A browser selects the first option when none is marked, so
+            # naming the first one here is the only way the highlighted option
+            # and the description beneath it cannot disagree on first paint --
+            # and after the feeder-first regrouping the first option is no longer
+            # necessarily the first profile in the config file.
+            "selected": profiles[0].name if profiles else "",
+            "selected_description": profiles[0].description if profiles else "",
+            **tag_list,
             "correspondents": correspondents,
-            "job": current_job,
+            **status,
+            **_checks_context(state),
             "jobs": jobs,
+            # The title input's maxlength; templates own no vocabulary.
+            "title_max_length": TITLE_MAX_LENGTH,
+            # The reason line's copy, which only the full page renders: it is
+            # never an out-of-band swap target, so no status response needs it
+            # and it never has to exist as an empty placeholder.
+            # The template reads the string and decides nothing; the flag that
+            # says whether to render it comes from the status context.
+            "scan_blocked_reason": SCAN_BLOCKED_REASON,
+            # Which optional controls this appliance's form carries.  A
+            # configured key and not a per-browser toggle: one appliance, one
+            # form shape, and the template renders the controls or leaves them
+            # out of the markup entirely rather than hiding them with CSS.
+            # Turning one off changes the form and never the scan --
+            # ``start_scan`` falls back to the profile's defaults for exactly
+            # the control that is no longer on the page.
+            "show_tags": state.settings.web.show_tags,
+            "show_correspondent": state.settings.web.show_correspondent,
         },
     )
 
 
 @router.get("/health", response_model=None)
-async def health(request: Request) -> dict[str, str] | JSONResponse:
+def health(request: Request) -> dict[str, str] | JSONResponse:
     """
     Health check endpoint for container orchestration.
 
-    Returns 200 with ``{"status": "ok"}`` when the worker thread is
-    alive, or 503 with error detail when the worker is down.
+    Returns 200 with ``{"status": "ok"}`` when the worker is healthy.
+    Otherwise 503, whose detail distinguishes a failing job store ("job store
+    failing") from a dead worker thread ("worker thread is down").
+    Docker's HEALTHCHECK marks the container unhealthy on a 503 but does not
+    restart it, as ``docs/reference/docker.md`` explains.
     """
-    if request.app.state.worker.is_alive:
+    worker_health = request.app.state.worker.health
+    if worker_health is WorkerHealth.HEALTHY:
         return {"status": "ok"}
     return JSONResponse(
         status_code=503,
-        content={"status": "error", "detail": "worker thread is down"},
+        content={"status": "error", "detail": worker_health_detail(worker_health)},
     )
 
 
 @router.get("/api/paperless/test", response_model=None)
-async def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
+def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
     """
     Test paperless-ngx connection status.
 
@@ -128,100 +1011,609 @@ async def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
         status = request.app.state.paperless.test_connection()
         return {"status": status}
     except Exception as exc:
-        logger.warning("Paperless connection test failed: %s", exc)
+        # The class name and not the exception: a configured paperless.url may
+        # carry ``user:pass@`` and httpx puts the URL it could not reach in the
+        # exception's string form, which is why every handler in this module
+        # names the class instead (ASVS V7).
+        logger.warning("Paperless connection test failed: %s", type(exc).__name__)
         return JSONResponse(
             status_code=502,
             content={"status": "error", "detail": type(exc).__name__},
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ScanForm:
+    """The validated fields of one scan submission."""
+
+    profile: str
+    title: str
+    tags: list[int]
+    correspondent: int | None
+
+
+def _unhealthy_rejection(
+    worker_health: WorkerHealth,
+) -> tuple[RequestRejection, str] | None:
+    """
+    Map the worker's health to the rejection a scan submit gets, if any.
+
+    Args:
+        worker_health: The worker's health at the time of the request.
+
+    Returns:
+        ``None`` when the worker is healthy, otherwise the rejection to raise
+        and the job-row error text that records it.
+
+    """
+    match worker_health:
+        case WorkerHealth.HEALTHY:
+            outcome = None
+        case WorkerHealth.DEGRADED:
+            outcome = (RequestRejection.WORKER_DEGRADED, WORKER_DEGRADED_JOB_ERROR)
+        case WorkerHealth.DOWN:
+            outcome = (RequestRejection.WORKER_DOWN, WORKER_DOWN_JOB_ERROR)
+        case _:
+            assert_never(worker_health)
+    return outcome
+
+
+def _record_refused_submit(
+    job_store: JobStore, form: _ScanForm, *, error: str
+) -> str | None:
+    """
+    Record a submit refused before any job row existed, in one statement.
+
+    This departs from the older rule of creating a row only after enqueue,
+    because a refused attempt should be visible in history.  The row is written
+    already ``ERROR`` with ``ErrorCategory.REJECTED``, the marker that keeps it
+    out of the status area.
+
+    ``create_rejected_job`` is a single ``INSERT``.  Create-then-finish would be
+    two transactions, and a failure between them would leave a PENDING row with
+    no marker that nothing ever reconciles, disabling the Scan button for good.
+    With one statement a failure leaves no row at all.
+
+    Args:
+        job_store: The job store to write to.
+        form: The submitted scan fields the row records.
+        error: The job-row error text for the rejection.
+
+    Returns:
+        The id of the row written, or None when the store refused the write --
+        in which case the rendered error must neither reload Job History nor
+        name a row the user will not find there.
+
+    """
+    try:
+        job = job_store.create_rejected_job(
+            profile=form.profile,
+            title=form.title,
+            error=error,
+            tags=form.tags,
+            correspondent=form.correspondent,
+        )
+    except Exception:
+        logger.warning(
+            "Could not record the rejected scan in job history", exc_info=True
+        )
+        return None
+    return job.id
+
+
+def _reject_created_job(
+    worker: ScanWorker, job_store: JobStore, job_id: str, *, error: str
+) -> str | None:
+    """
+    Mark a job row the worker then refused as a REJECTED error.
+
+    The row had to exist before ``put_nowait``, or the worker could dequeue an
+    id with no row, so this refusal is recorded by finishing that row.  The
+    ``ErrorCategory.REJECTED`` marker is what keeps it out of the status area.
+
+    The row already exists, so a failed write cannot simply be dropped: the
+    row would stay PENDING with no marker, disabling the Scan button until a
+    restart.  It is owed to the worker instead, which records it on its next
+    idle tick.
+
+    Args:
+        worker: The worker a failed write is owed to.
+        job_store: The job store to write to.
+        job_id: The row already created for this submit.
+        error: The job-row error text for the rejection.
+
+    Returns:
+        The id of the row now recording the refusal, or None when the store
+        refused the write.  None means the row is still PENDING and owed to the
+        worker, so the rendered error must neither reload Job History yet nor
+        name a row that does not yet say it was rejected.
+
+    """
+    try:
+        job_store.finish_job(
+            job_id,
+            JobState.ERROR,
+            error=error,
+            error_category=ErrorCategory.REJECTED,
+        )
+    except Exception:
+        logger.warning(
+            "Could not record the rejected scan in job history; "
+            "the worker will record it",
+            exc_info=True,
+        )
+        worker.owe_rejection(job_id, error)
+        return None
+    return job_id
+
+
 @router.post("/api/scan")
-async def start_scan(
+def start_scan(
     request: Request,
-    profile: str = Form(...),
-    title: str = Form(default=""),
+    profile: Annotated[str, Form()],
+    title: Annotated[str, Form(max_length=TITLE_MAX_LENGTH)] = "",
     tags: list[int] = _TAGS_FORM_DEFAULT,
-    correspondent: int | None = Form(default=None),
+    correspondent: Annotated[int | None, Form()] = None,
 ) -> Response:
     """
     Start a new scan job from form submission.
 
-    Creates a job in the store and submits it to the worker queue.
-    Returns the status partial for HTMX swap.
+    Input is validated before any job row exists: a title over
+    ``TITLE_MAX_LENGTH`` or a profile that is not configured (checked under
+    the worker's profile lock) is a 422 and writes nothing.
+
+    A valid submit creates the job row and offers it to the worker, returning
+    the status partial once the job is queued.  That response re-renders the
+    Scan button out-of-band from server state and clears the
+    ``#status-message`` slot out-of-band, so an error left there by an earlier
+    rejected submit disappears.  A refused submit records a
+    REJECTED error row and raises: 429 with ``Retry-After`` when the queue is
+    full, 503 when the worker is down or degraded, and
+    503 with its own message when the paperless-ngx API token is a placeholder
+    nobody replaced, which is the one failure certain to waste paper because
+    the pages would be scanned and then have nowhere to go.
+    The rendered error reloads Job History only when that row was written.
 
     Args:
         request: The incoming HTTP request.
         profile: Scan profile name.
-        title: Document title (auto-generated if empty).
+        title: Document title; when blank, the profile's title, else
+            'Scan <time>'.
         tags: List of paperless-ngx tag IDs.
         correspondent: Optional paperless-ngx correspondent ID.
 
+    Raises:
+        RequestRejected: The profile is unknown, or the submit was refused.
+
     """
     state = request.app.state
-    if not title:
-        title = f"Scan {datetime.now(tz=UTC).strftime('%Y-%m-%d %H:%M')}"
+    # One locked lookup both validates the profile and yields its title, so
+    # there is no check-then-read gap for a profile rewrite to fall into.
+    found = state.worker.get_profile(profile)
+    if found is None:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    title = resolve_job_title(title, found, now=datetime.now(tz=UTC))
+    # Hiding a control changes the form, never the scan: with
+    # ``[web] show_tags`` or ``show_correspondent`` off, the submit carries
+    # nothing for that field and the profile's own default is what applies, exactly as a
+    # blank title already falls back to the profile's title on the line above.
+    # An operator who turns a control off gets the profile's answer rather than
+    # none at all, and the CLI, which has always applied these defaults, stops
+    # being the odd one out.
+    #
+    # The gate is the config key and never the submitted value, because the
+    # submitted value cannot carry the distinction this needs: an empty tag
+    # list and an absent correspondent arrive here identically whether the
+    # control was never rendered or was rendered and the user cleared it.  Only
+    # the setting that decided which page was served knows which happened.
+    # Reading the value instead took away an ability the appliance had -- the
+    # web path once applied no profile defaults at all, so
+    # ``tags or found.default_tags`` silently re-tagged a submit from somebody
+    # who had deliberately unticked every box.  With the control on the page
+    # the submit is now the whole answer, cleared list included; with it off
+    # the submit's value for that field is meaningless, which is why the
+    # assignment inside each gate is unconditional rather than a fallback.
+    if not state.settings.web.show_tags:
+        tags = found.default_tags
+    if not state.settings.web.show_correspondent:
+        correspondent = found.default_correspondent
+    form = _ScanForm(
+        profile=profile, title=title, tags=tags, correspondent=correspondent
+    )
 
+    # The route guard is the enforcement and the disabled Scan button is
+    # only a courtesy, so this refusal holds for curl, for a script, and for a
+    # browser whose ``disabled`` attribute was removed in devtools.  It is
+    # unconditional -- a configured consume directory does not buy an exception
+    # -- and it sits ahead of ``create_job`` so a scan that could never upload
+    # leaves exactly one row: the REJECTED one, which Job History shows so the
+    # attempt is visible rather than silently swallowed.
+    # The degraded-worker rejection is deliberately not reused here, and this
+    # comment names it in prose rather than as the symbol so a grep for that
+    # member still counts only the places that raise it: "the scan service was
+    # unavailable" is untrue when the service is fine and nobody set the token,
+    # and it would send a household member looking for a broken server.  The
+    # status is 503, matching the two existing refuse-to-start rejections, so
+    # htmx response handling and the history reload behave identically; a 4xx
+    # would imply the request was at fault, which it was not.
+    #
+    # This is the web layer's third place that unwraps the configured token,
+    # after the PaperlessClient build in ``web/app.py`` and the Paperless check
+    # in ``checks.py``.  The value goes to the predicate and nowhere else: it is
+    # never logged, rendered, echoed or put in the job row, whose text names the
+    # problem and the file to edit and never the secret (ASVS V7).
+    if is_placeholder_token(state.settings.paperless.token.get_secret_value()):
+        written = _record_refused_submit(
+            state.job_store, form, error=TOKEN_UNSET_JOB_ERROR
+        )
+        raise RequestRejected(RequestRejection.TOKEN_UNSET, job_id=written)
+
+    unhealthy = _unhealthy_rejection(state.worker.health)
+    if unhealthy is not None:
+        rejection, error = unhealthy
+        written = _record_refused_submit(state.job_store, form, error=error)
+        raise RequestRejected(rejection, job_id=written)
+
+    # The mint rule: a token is minted on the first submit from a browser
+    # and reused for every later job from it, so two tabs on one device do not
+    # disown each other.  It is recorded on the row either way; only a mint
+    # reaches the response as a cookie.
+    presented = _presented_owner(request)
+    owner = presented or secrets.token_urlsafe(32)
     job = state.job_store.create_job(
-        profile=profile,
-        title=title,
-        tags=tags,
-        correspondent=correspondent,
+        profile=form.profile,
+        title=form.title,
+        tags=form.tags,
+        correspondent=form.correspondent,
+        owner_token=owner,
     )
-    state.worker.submit(job)
-
-    return state.templates.TemplateResponse(
-        request,
-        "partials/status.html",
-        {"job": job},
-    )
+    # Annotated because app.state is untyped; assert_never needs the real type.
+    result: SubmitResult = state.worker.submit(job)
+    match result:
+        case SubmitResult.ACCEPTED:
+            # A job created by this request cannot have a flip answer yet.
+            # Only a successful scan clears the status-message slot, and only a
+            # successful scan carries the strip out-of-band: the scanner has
+            # just become busy, so the strip's paused note is due now rather than
+            # at the end of the cache's TTL.  The strip's own context rides
+            # along because the partial is rendered inside this response.
+            response = state.templates.TemplateResponse(
+                request,
+                "partials/status_response.html",
+                {
+                    # The created job is the followed job, so the poll URL this
+                    # browser is handed names it and the status area keeps
+                    # reporting the scan this person started.
+                    **_status_context(
+                        state.worker,
+                        state.job_store,
+                        replace(
+                            _status_facts(request, followed_job_id=job.id),
+                            # The token this submit is owned by, which is the
+                            # minted one when the browser presented none: the
+                            # cookie carrying it has not reached the browser
+                            # yet, so the request cannot present it.
+                            owner_token=owner,
+                        ),
+                    ),
+                    "clear_message": True,
+                    "refresh_checks": True,
+                    "terminal_reload": True,
+                    **_checks_context(state),
+                },
+            )
+            if presented is None:
+                response.set_cookie(
+                    OWNER_COOKIE,
+                    owner,
+                    httponly=True,
+                    samesite="lax",
+                    path="/",
+                )
+            return response
+        case SubmitResult.QUEUE_FULL:
+            rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
+        case SubmitResult.DOWN:
+            rejection, error = RequestRejection.WORKER_DOWN, WORKER_DOWN_JOB_ERROR
+        case SubmitResult.DEGRADED:
+            rejection, error = (
+                RequestRejection.WORKER_DEGRADED,
+                WORKER_DEGRADED_JOB_ERROR,
+            )
+        case _:
+            assert_never(result)
+    written = _reject_created_job(state.worker, state.job_store, job.id, error=error)
+    raise RequestRejected(rejection, job_id=written)
 
 
 @router.get("/api/jobs/current/status")
-async def current_job_status(request: Request) -> Response:
+def current_job_status(request: Request) -> Response:
     """
     Poll the current or most recent job status.
 
-    Returns the status partial template for HTMX polling swap.
+    Returns the status partial template for HTMX polling swap.  While an
+    answered job is still recorded ``AWAITING_FLIP``, the partial shows the
+    acknowledgment rather than the flip buttons.
+
+    The response re-renders the Scan button out-of-band from server state.
+    It never clears ``#status-message``: a poll carrying that clear would erase
+    a rejection shown mid-scan within a second.
     """
     state = request.app.state
-    job = None
-    if state.worker.current_job_id:
-        job = state.job_store.get_job(state.worker.current_job_id)
-    if job is None:
-        recent = state.job_store.list_recent(limit=1)
-        job = recent[0] if recent else None
-
     return state.templates.TemplateResponse(
         request,
-        "partials/status.html",
-        {"job": job},
+        "partials/status_response.html",
+        {
+            **_status_context(state.worker, state.job_store, _status_facts(request)),
+            "terminal_reload": True,
+        },
+    )
+
+
+@router.get("/api/jobs/{job_id}/status")
+def followed_job_status(request: Request, job_id: str) -> Response:
+    """
+    Poll the status of the job this browser submitted.
+
+    Declared after ``/api/jobs/current/status`` so that literal path keeps
+    winning: a browser that submitted nothing still gets today's route and
+    today's current-or-most-recent inference.
+
+    The path parameter is an opaque store lookup key and nothing else.  It
+    never builds a filesystem path, a URL or a template name, so there is no
+    traversal surface to guard, and an id naming no row is a
+    fallback rather than a 404 by design: a browser whose job has been pruned
+    degrades to the inferred rendering, and a 404 would additionally confirm to
+    a caller which ids exist.
+
+    Everything else matches ``current_job_status``: the Scan button rides along
+    out-of-band and ``#status-message`` is left alone.
+
+    Args:
+        request: The incoming HTTP request.
+        job_id: The job this browser is following.
+
+    Returns:
+        The status partial rendered for that job.
+
+    """
+    state = request.app.state
+    return state.templates.TemplateResponse(
+        request,
+        "partials/status_response.html",
+        {
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(request, followed_job_id=job_id),
+            ),
+            "terminal_reload": True,
+        },
+    )
+
+
+@router.get("/api/checks")
+def get_checks(
+    request: Request,
+    attempt: Annotated[int, Query()] = 0,
+) -> Response:
+    """
+    Render the status strip from the cache.
+
+    This is the target of the cold-start poll, and it is a cache read: it never
+    probes, so no number of open browser tabs can raise the probe rate above
+    the cache's TTL.  The poll ends itself -- the body this
+    returns once results exist carries no ``hx-trigger``, so the swap that
+    installs it is the last one.
+
+    ``attempt`` is how the poll ends when results never arrive.  Each
+    body names the number the next request should carry, so the count lives in
+    the URL rather than on the server: the strip is one shared cache read and
+    there is nothing per-tab to keep, and a browser that goes away takes its
+    count with it.
+
+    This route no longer hands its own ordinary failures to ``render_error``.
+    An error response is the one thing the polling element cannot
+    usefully receive, so both of the failures this handler can see end as a
+    trigger-free strip at 200 instead.  An out-of-range counter is clamped
+    rather than refused: the ``Query`` bound that used to make it a 422 is
+    gone, and the clamp into ``0..POLL_PROBE_ATTEMPT_CAP`` runs before anything
+    else reads the value.  The property that bound was defending is unchanged
+    -- a crafted number still never reaches ``_checks_context`` and is still
+    never rendered into the visible body, because only the clamped number is
+    used and only the clamped number goes into the next request's URL.  What
+    changed is the failure mode: past the cap the clamp lands on the cap, which
+    is the give-up body, so an out-of-range counter ends the chain quietly,
+    which is what the strip wanted all along.  A failure inside the watcher
+    stamp or the context build is caught and rendered as
+    ``_checks_fallback_context``.  The ``TemplateResponse`` call stays outside
+    the guard, so there is exactly one render path and one status code.
+
+    Args:
+        request: The incoming request.
+        attempt: Which attempt this is, counted from the zero a page render
+            starts at.  Clamped into ``0..POLL_PROBE_ATTEMPT_CAP`` here, so a
+            value below zero is read as the start of a fresh chain and a value
+            above the larger cap is read as that cap, where the response
+            carries no request attribute at all and the strip stops asking.
+            The bound is the *larger* of the two caps on purpose:
+            clamping at ``POLL_ATTEMPT_CAP`` would cut a legitimate chain that
+            is waiting on a live probe down to an ending it never reached.
+
+    Returns:
+        The strip body, for an ``outerHTML`` swap.
+
+    """
+    state = request.app.state
+    counted = min(max(attempt, 0), POLL_PROBE_ATTEMPT_CAP)
+    try:
+        state.refresher.note_watcher()
+        context = _checks_context(state, attempt=counted)
+    except Exception:
+        logger.exception("Failed to render the status strip")
+        context = _checks_fallback_context()
+    return state.templates.TemplateResponse(
+        request,
+        "partials/checks.html",
+        context,
+    )
+
+
+@router.post("/api/checks/refresh")
+def refresh_checks(request: Request) -> Response:
+    """
+    Re-probe every check now, bypassing the TTL, and render the result.
+
+    This is the one handler in this module allowed to probe, and the bypass is
+    the whole point of the button.  Routing the click through the refresher's
+    *policy* would do nothing for the first thirty seconds after a page load --
+    ``_tick`` returns early on a fresh cache -- which is precisely when
+    somebody who has just plugged the scanner back in presses it.  So it goes
+    through the refresher's *probe* instead: ``probe_now`` is the same
+    implementation the background thread runs, reached without the two guards,
+    which is what keeps the button and the thread from drifting into two
+    probes that disagree.
+
+    Concurrent clicks collapse.  ``probe_now`` admits one checker at a time and
+    a click landing while a probe is in flight re-renders the current strip
+    rather than probing again: the answer is seconds away, and a second probe
+    would cost a Paperless request and two filesystem writes to produce it
+    twice.
+
+    The collapse used to cost the clicker three things.
+    The strip rendered was the cache *as it stood* -- the pre-probe entry,
+    because the in-flight probe had not stored yet.  Because results already
+    existed the body carried no trigger, so nothing on the page was ever going
+    to pick up the result that probe landed a second later; the button could
+    visibly do nothing.  And the claim was stamped before the collapse was
+    discovered, so the next click inside two seconds was refused too: nothing,
+    twice in a row.  All three close here.  ``probe_now`` now reports whether
+    it probed, so a collapse is a fact rather than a guess; on a collapse the
+    claim goes back, because a collapse issued no Paperless request, no saned
+    dial and no filesystem write and so bought none of the traffic the floor
+    exists to bound; and ``_checks_context`` sees the same lock still held and
+    emits a trigger, so the page collects the answer on its own.
+
+    The grant given back is identified rather than assumed.  The claim reports
+    the stamp it wrote, this handler holds that stamp for the length of the
+    request, and ``release_manual_claim`` compares before it clears -- so a
+    release can only ever undo this request's own grant and never one a later
+    caller made.  The grant is tested with ``is not None`` and not
+    for truth: the stamp is a ``time.monotonic()`` reading, which counts from
+    boot, so the first click on a freshly booted appliance can hold a perfectly
+    valid grant of 0.0.
+
+    There is one render path and it is the last statement.  The context decides
+    the trigger from ``probe_in_flight``, which is still ``True`` on the
+    collapse branch -- the other checker has not released yet -- so the one
+    render covers both outcomes, and there is no second response and no
+    "poll once" flag for a later reader to keep in step with the template.
+
+    That render is guarded the way ``get_checks``'s is, and only the render.
+    ``_checks_context`` raising here used to be a 500, and because the button
+    aims at ``#checks-body`` that 500 arrived carrying the strip's own
+    ``HX-Target`` -- which, until the exemption was narrowed to a GET,
+    meant the error body was written over the strip, taking the five rows and
+    the only button that could bring them back.  Now a failure inside the
+    strip's rendering ends as ``_checks_fallback_context`` at 200 on this route
+    too, so the strip and the button stay on the page.  Everything before the
+    render -- the watcher stamp, the claim, the probe -- is the click's action
+    rather than the strip's drawing, and stays outside the guard on purpose: a
+    probe that raises is a failed click, and a failed click is reported like
+    every other one, as an error in the message slot with the strip left as it
+    was.
+
+    During a scan it re-runs only the checks that do not touch the scanner, and
+    that decision comes from the worker's own record of a job in flight rather
+    than from a failed attempt on a lock.  An explicit click does not get to
+    defeat the exclusive-scanner rule, because nothing in the SANE backend
+    mutually excludes two callers and a status probe landing mid-scan is a
+    second caller into the same C library.  Deriving it from the job state is
+    also what stops two checkers contending from being rendered to a household
+    member as a running scan.
+
+    ``CrossOriginGuard`` is app-wide middleware on every non-safe method
+    (``web/app.py``), so this POST inherits the cross-site check and must
+    **not** add a per-route dependency: a dependency is something a route added
+    later can forget, and the middleware is not.
+
+    A registry that raised is logged by the probe and stores nothing, leaving
+    the previous entry in place -- and a strip that blanked would be worse than
+    one still showing what was true a moment ago.
+
+    The bypass has a floor under it.  This is the one handler permitted to
+    probe and it is unauthenticated by design on a LAN -- ``CrossOriginGuard``
+    allows a request carrying neither ``Sec-Fetch-Site`` nor ``Origin``, which
+    is what a non-browser client sends -- so without a minimum interval a loop
+    turns one click into unbounded Paperless requests, saned dials and
+    filesystem writes.  Single flight does not cover it: that collapses
+    *concurrent* callers, and a serial loop is not concurrent.  The cost is
+    not only traffic; ``ScanWorker._scan_job`` blocks on a scanner gate that is
+    not a fair lock, so an unbounded loop can park a submitted job whose row
+    already reads ``SCANNING``.  A too-soon click re-renders the
+    current strip instead of erroring, because the click is not wrong, only
+    early: there is nothing to tell the person at the appliance, and the
+    response is the same partial from the same cache read either way.
+    """
+    state = request.app.state
+    state.refresher.note_watcher()
+    claim = state.checks.claim_manual_refresh()
+    if claim is not None and not state.refresher.probe_now():
+        state.checks.release_manual_claim(claim)
+    try:
+        context = _checks_context(state)
+    except Exception:
+        logger.exception("Failed to render the status strip")
+        context = _checks_fallback_context()
+    return state.templates.TemplateResponse(
+        request,
+        "partials/checks.html",
+        context,
     )
 
 
 @router.get("/api/tags")
-async def get_tags(request: Request) -> Response:
+def get_tags(
+    request: Request,
+    q: Annotated[str, Query(max_length=TAG_FILTER_MAX_LENGTH)] = "",
+    tags: list[int] = _TAGS_QUERY_DEFAULT,
+) -> Response:
     """
-    Fetch tag options for the dropdown selector.
+    Render the tag checkbox list, optionally narrowed by a filter.
 
-    Uses cached data when available, falling back to a fresh fetch
-    from paperless-ngx. Returns empty options on API errors.
+    Uses cached data when available, falling back to a fresh fetch from
+    paperless-ngx; an API error renders the last list fetched successfully, or
+    an empty list if there has never been one, rather than an error.
+
+    The response is the whole swap target, wrapper included, because the filter
+    swaps it ``outerHTML``.  Both parameters arrive from the same
+    ``hx-include`` and are what makes the swap lossless: see
+    ``_tag_list_context`` for why the selection has to ride along, and why
+    ``q`` reaches neither paperless-ngx nor the response body.
+
+    Args:
+        request: The incoming HTTP request.
+        q: Filter text; a value over ``TAG_FILTER_MAX_LENGTH`` is a 422 before
+            any work happens.
+        tags: The tag ids the browser reports as currently ticked.
+
     """
     state = request.app.state
-    tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
     return state.templates.TemplateResponse(
         request,
         "partials/tags.html",
-        {"tags": tags},
+        _tag_list_context(state, q=q, selected=tags),
     )
 
 
 @router.get("/api/correspondents")
-async def get_correspondents(request: Request) -> Response:
+def get_correspondents(request: Request) -> Response:
     """
     Fetch correspondent options for the dropdown selector.
 
     Uses cached data when available, falling back to a fresh fetch
-    from paperless-ngx. Returns empty options on API errors.
+    from paperless-ngx. On an API error it returns the last list fetched
+    successfully, or empty options if there has never been one.
     """
     state = request.app.state
     correspondents = _get_cached_or_fetch(
@@ -234,28 +1626,86 @@ async def get_correspondents(request: Request) -> Response:
     )
 
 
+@router.get("/api/profiles/description")
+def get_profile_description(request: Request, profile: str) -> Response:
+    """
+    Return the sentence that explains one profile, for the select's help slot.
+
+    The text is read from the loaded ``ProfileConfig`` rather than re-derived
+    from the source name, so an operator who took a profile over -- by removing
+    ``auto_generated`` and writing their own wording -- sees their sentence and
+    not the generated one.
+
+    ``profile`` is a query parameter and not a path segment, precisely so there
+    is no traversal surface to reason about: the name never builds a path, a
+    URL or a template name.  It is validated against the known profile set
+    before any work, by one locked lookup that both checks the name and yields
+    the profile, leaving no check-then-read gap -- the same shape ``start_scan``
+    uses.  An unknown name is a 422.
+
+    Args:
+        request: The incoming HTTP request.
+        profile: The profile name whose description is wanted.
+
+    Returns:
+        The description text alone, with no wrapper element.
+
+    Raises:
+        RequestRejected: The profile is not configured.
+
+    """
+    state = request.app.state
+    found = state.worker.get_profile(profile)
+    if found is None:
+        raise RequestRejected(RequestRejection.UNKNOWN_PROFILE)
+    return state.templates.TemplateResponse(
+        request,
+        "partials/profile_description.html",
+        {"description": found.description},
+    )
+
+
 @router.post("/api/cache/invalidate")
-async def invalidate_cache(request: Request, resource: str) -> Response:
+def invalidate_cache(
+    request: Request,
+    resource: MetadataResource,
+    q: Annotated[str, Form(max_length=TAG_FILTER_MAX_LENGTH)] = "",
+    tags: list[int] = _TAGS_FORM_DEFAULT,
+) -> Response:
     """
     Invalidate a specific cache entry and return fresh data.
 
     After clearing the cached entry, fetches and returns the updated
-    partial for the specified resource.
+    partial for the specified resource.  Any other resource name is a 422
+    before the cache is touched.
+
+    Invalidating means "fetch again", not "forget": when the refetch fails,
+    the partial is rendered from the last list fetched successfully (empty
+    if there has never been one) and the failure is logged.  The response
+    itself does not say the list is stale; the checks strip is what reports
+    Paperless unreachable.
+
+    The tag refresh renders the same partial the filter does, from the same
+    context, so a refresh mid-filter comes back filtered and still ticked.  The
+    two extra values arrive in the body rather than the query string only
+    because htmx sends an ``hx-include``'s values that way on a POST; they are
+    ignored for the correspondent resource, which includes nothing.
 
     Args:
         request: The incoming HTTP request.
         resource: Resource name to invalidate ('tags' or 'correspondents').
+        q: The tag filter currently in the box, if any.
+        tags: The tag ids currently ticked, if any.
 
     """
     state = request.app.state
     state.cache.invalidate(resource)
 
     if resource == "tags":
-        tags = _get_cached_or_fetch(state.cache, state.paperless, "tags")
         return state.templates.TemplateResponse(
             request,
             "partials/tags.html",
-            {"tags": tags},
+            _tag_list_context(state, q=q, selected=tags),
         )
 
     correspondents = _get_cached_or_fetch(
@@ -269,7 +1719,7 @@ async def invalidate_cache(request: Request, resource: str) -> Response:
 
 
 @router.get("/api/jobs/history")
-async def job_history(request: Request) -> Response:
+def job_history(request: Request) -> Response:
     """
     Fetch the job history table body.
 
@@ -277,7 +1727,7 @@ async def job_history(request: Request) -> Response:
     HTMX swap into the history table.
     """
     state = request.app.state
-    jobs = state.job_store.list_recent(limit=50)
+    jobs = state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
     return state.templates.TemplateResponse(
         request,
         "partials/history.html",
@@ -286,39 +1736,92 @@ async def job_history(request: Request) -> Response:
 
 
 @router.post("/api/flip/continue")
-async def continue_flip(request: Request) -> Response:
+def continue_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
-    Signal the worker to continue with pass B of manual duplex.
+    Answer the named job's flip prompt with Continue, starting its pass B.
 
-    Returns the updated status partial.
+    The posted ``job_id`` scopes the answer.  A Continue for any other
+    job, one sent before that job reached the flip prompt, or one arriving
+    after the prompt was already answered is dropped -- and the route still
+    returns the current status rather than an error.  Nothing is
+    waited for: the route renders whatever the store has recorded and the
+    one-second poll picks up pass B from there.
+
+    While the store still reads ``AWAITING_FLIP`` for an answered job, the
+    partial acknowledges the answer in place of the Continue and Abort
+    buttons, so a claimed or repeated click never re-renders a prompt that
+    looks unanswered.
+
+    A Continue from a browser that does not hold the job's owner token is
+    dropped in exactly the same way, and for the same reason: the
+    household member who did not load the paper must not be able to start
+    pass B, and must not be shown a failure for trying either.  A job whose
+    ``owner_token`` is NULL is unowned and anyone may answer it.
+
+    The response re-renders the Scan button out-of-band from server state
+    and leaves ``#status-message`` alone.
     """
     state = request.app.state
-    state.worker.continue_flip()
-    state.worker.wait_transition(timeout=2.0)
-    job = None
-    if state.worker.current_job_id:
-        job = state.job_store.get_job(state.worker.current_job_id)
+    presented = _presented_owner(request)
+    claimed = False
+    if _owner_answers(presented, state.job_store.get_job(job_id)):
+        claimed = state.worker.continue_flip(job_id)
     return state.templates.TemplateResponse(
         request,
-        "partials/status.html",
-        {"job": job},
+        "partials/status_response.html",
+        {
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(
+                    request,
+                    claimed=(job_id, FlipOutcome.CONTINUED) if claimed else None,
+                ),
+            ),
+            "terminal_reload": True,
+        },
     )
 
 
 @router.post("/api/flip/abort")
-async def abort_flip(request: Request) -> Response:
+def abort_flip(request: Request, job_id: str = Form(...)) -> Response:
     """
-    Signal the worker to abort the current manual duplex scan.
+    Answer the named job's flip prompt with Abort, failing it before pass B.
 
-    Returns the updated status partial.
+    The posted ``job_id`` scopes the answer: a double-clicked Abort
+    cannot land on the next queued job.  An Abort for any other job, one sent
+    before that job reached the flip prompt, or one arriving after Continue
+    already answered is dropped rather than reported as an error: the
+    route returns the current status either way.
+
+    While the store still reads ``AWAITING_FLIP`` for an answered job, the
+    partial shows "Aborting scan..." (or the answer that won) in place of the
+    buttons, so the response never invites a second click.
+
+    An Abort from a browser that does not hold the job's owner token is
+    dropped the same way: someone else's scan is not theirs to stop.
+    A job whose ``owner_token`` is NULL is unowned and anyone may answer it.
+
+    The response re-renders the Scan button out-of-band from server state
+    and leaves ``#status-message`` alone.
     """
     state = request.app.state
-    state.worker.abort_flip()
-    job = None
-    if state.worker.current_job_id:
-        job = state.job_store.get_job(state.worker.current_job_id)
+    presented = _presented_owner(request)
+    claimed = False
+    if _owner_answers(presented, state.job_store.get_job(job_id)):
+        claimed = state.worker.abort_flip(job_id)
     return state.templates.TemplateResponse(
         request,
-        "partials/status.html",
-        {"job": job},
+        "partials/status_response.html",
+        {
+            **_status_context(
+                state.worker,
+                state.job_store,
+                _status_facts(
+                    request,
+                    claimed=(job_id, FlipOutcome.ABORTED) if claimed else None,
+                ),
+            ),
+            "terminal_reload": True,
+        },
     )
