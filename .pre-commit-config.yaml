@@ -97,7 +97,7 @@ repos:
       - id: check-json5
 
   - repo: https://github.com/tsvikas/sync-with-uv
-    rev: v0.5.0
+    rev: v0.6.0
     hooks:
       - id: sync-with-uv
 
