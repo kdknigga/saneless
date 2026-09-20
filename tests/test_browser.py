@@ -434,7 +434,9 @@ def _is_allowed(url: str, allowlist: list[str]) -> bool:
 # every one of them must be covered by a ``blocked`` assertion at teardown. One
 # list may be shared by several contexts, which is the point -- a single
 # assertion then speaks for all of them.
-def _make_gate(blocked: list[str], allowlist: list[str]) -> Callable[[Route], None]:
+def _make_gate(
+    blocked: list[str], allowlist: list[str], seen: list[str]
+) -> Callable[[Route], None]:
     """
     Build the no-egress route handler every context in this module installs.
 
@@ -445,6 +447,13 @@ def _make_gate(blocked: list[str], allowlist: list[str]) -> Callable[[Route], No
         allowlist: The base URLs a page may reach. Read when each request
             arrives rather than captured, so a base appended after the gate is
             installed still counts.
+        seen: The list every handled URL is appended to, allowed or refused
+            alike, so it answers "did this gate handle any traffic at all?".
+            An empty ``blocked`` list means nothing on its own; an empty
+            ``blocked`` beside a non-empty ``seen`` means the gate was
+            installed, saw requests, and refused none of them. Required rather
+            than defaulted, so a context added later cannot quietly opt out of
+            the very check this records.
 
     Returns:
         A handler suitable for ``context.route("**/*", ...)``.
@@ -453,6 +462,9 @@ def _make_gate(blocked: list[str], allowlist: list[str]) -> Callable[[Route], No
 
     def _gate(route: Route) -> None:
         url = route.request.url
+        # Recorded before the decision, so an allowed request counts as traffic
+        # just as a refused one does.
+        seen.append(url)
         if _is_allowed(url, allowlist):
             route.continue_()
         else:
@@ -479,10 +491,21 @@ def context(
 
     The gate itself comes from ``_make_gate`` rather than being written here, so
     a hand-made context can install the identical one; see that factory's note.
+
+    Teardown asserts the gate saw traffic before it asserts nothing was blocked,
+    because the second assertion alone would pass over a context that was never
+    routed at all -- an empty list is what a gate that does not exist produces.
     """
     blocked: list[str] = []
-    context.route("**/*", _make_gate(blocked, egress_allowlist))
+    seen: list[str] = []
+    context.route("**/*", _make_gate(blocked, egress_allowlist, seen))
     yield context
+    # Order matters: an ungated context must be reported as ungated, not handed
+    # the clean bill of health an empty ``blocked`` list would otherwise give it.
+    assert seen, (
+        "the gate handled no request at all, so the no-egress assertion below "
+        "would have passed for a context whose routing was never installed"
+    )
     assert blocked == [], f"the page tried to reach the network: {blocked}"
 
 
@@ -4170,11 +4193,14 @@ class TestTwoBrowsersOneStack:
         job_store: JobStore = server.app.state.job_store
 
         blocked: list[str] = []
+        # One ``seen`` list for the same reason as one ``blocked`` list: both
+        # pages are navigated below, so a single record speaks for both gates.
+        seen: list[str] = []
         owner_ctx = browser.new_context()
         viewer_ctx = browser.new_context()
         try:
-            owner_ctx.route("**/*", _make_gate(blocked, egress_allowlist))
-            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist))
+            owner_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
             owner_page = owner_ctx.new_page()
             viewer_page = viewer_ctx.new_page()
 
