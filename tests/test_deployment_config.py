@@ -2656,3 +2656,97 @@ def test_hook_interpreter_is_pinned_to_the_project_python() -> None:
         f"{name} pins the hook interpreter to {match.group(1)}, but ruff targets "
         f"{expected}. A hook older than ruff's target rejects syntax ruff writes"
     )
+
+
+# ---------------------------------------------------------------------------
+# The suppression ban, enforced instead of merely written down
+# ---------------------------------------------------------------------------
+
+# CLAUDE.md and CONTRIBUTING.md both forbid silencing a checker rather than
+# fixing what it found, but prose cannot fail a build. The guard below turns
+# the rule into something falsifiable: it reads every tracked Python file and
+# reports any line carrying one of the six comment forms that do the
+# silencing. Those are, in words: the bare linter-suppression comment; the
+# shared type-checker suppression comment; the named per-checker form for the
+# linter and for each of the two type checkers in turn; and the leading-colon
+# form, which is what the file-level spellings all end in -- those disable
+# every rule in a whole module at once and share no text with the other five.
+# Matching is plain substring containment, so each bracketed per-rule variant
+# is caught by the same entry that catches its bare form.
+#
+# Every marker is assembled at runtime from the fragments below rather than
+# spelled out, for the reason the owner guard gives further up: this file is
+# in scope of its own scan, so a literal marker anywhere here would make the
+# guard report itself and go red with no real regression behind it. A join
+# over an inline sequence is no good either, because ruff's FLY002 rewrites it
+# straight back into the literal and suppressing the rule is forbidden -- the
+# irony of which is the whole point of this guard. An f-string over named
+# constants is the form FLY002 leaves alone. Each fragment on its own is
+# harmless; only the concatenations are the banned text, and no line in this
+# file spells one of them out.
+_MARKER_LEAD = "# "
+_MARKER_SEP = ": "
+_SILENCE_LINT = "noqa"
+_SILENCE_RULE = "ignore"
+_CHECKER_TYPE = "type"
+_CHECKER_RUFF = "ruff"
+_CHECKER_PYREFLY = "pyrefly"
+_CHECKER_TY = "ty"
+
+SUPPRESSION_MARKERS = (
+    f"{_MARKER_LEAD}{_SILENCE_LINT}",
+    f"{_MARKER_LEAD}{_CHECKER_TYPE}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_LEAD}{_CHECKER_RUFF}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_LEAD}{_CHECKER_PYREFLY}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_LEAD}{_CHECKER_TY}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_SEP}{_SILENCE_LINT}",
+)
+
+
+def _shipped_python_files() -> list[str]:
+    """
+    Return every tracked ``.py`` file outside ``.planning/``.
+
+    The suffix filter is not an optimisation. ``_shipped_files`` also returns
+    Markdown and YAML, and the ban is stated in prose in CLAUDE.md, in
+    CONTRIBUTING.md and in the CI workflow; scanning those would make the
+    guard fail on the very documents that define the rule.
+
+    Returns:
+        Repo-relative names of the tracked Python files in scope.
+
+    """
+    return [name for name in _shipped_files() if Path(name).suffix == ".py"]
+
+
+def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
+    """
+    No tracked Python file silences a checker instead of fixing what it found.
+
+    Scope follows ``git ls-files``, so a Python file added in a later phase is
+    covered without anyone remembering to extend a list. This file is in scope
+    of its own scan, which is why the markers it looks for are assembled at
+    runtime rather than written out.
+    """
+    offenders: list[str] = []
+    for name in _shipped_python_files():
+        # Two clauses rather than one tuple, for the reason given in the
+        # owner guard above.
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if any(marker in line for marker in SUPPRESSION_MARKERS)
+        )
+    assert not offenders, (
+        "a tracked Python file silences a checker with a suppression comment, "
+        "which CLAUDE.md and CONTRIBUTING.md both forbid. Fix what the checker "
+        "reported, at source, or change the rule set deliberately in "
+        "pyproject.toml where the whole project can see it. Remove the comment "
+        "from each line below:\n" + "\n".join(offenders)
+    )
