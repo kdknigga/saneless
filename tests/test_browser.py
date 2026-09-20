@@ -602,6 +602,75 @@ def scan_harness(
         assert harness.created_job_ids() == [], "a test's job rows were not deleted"
 
 
+# The probe the test below aims at the gate. ``.invalid`` is reserved so that
+# it can never resolve, so even a gate that had stopped aborting would contact
+# nothing real: the test would fail on an empty ``blocked`` list rather than
+# putting a request on somebody's server.
+_OFF_ALLOWLIST_URL = "http://egress-probe.invalid/should-never-be-reached"
+_EGRESS_PROBE_BUDGET = 5.0
+
+
+@pytest.mark.browser
+class TestTheEgressGateRefuses:
+    """
+    The positive half of the no-egress proof (ROBU-09, ROBU-11).
+
+    Every other browser test asserts that nothing was blocked, which is a claim
+    about the page. This one asserts that something *was* blocked, which is a
+    claim about the gate: that its abort path still fires and still records
+    what it refused. Without it an empty ``blocked`` list could not distinguish
+    a page wanting no internet from a gate that had quietly stopped refusing.
+    """
+
+    def test_a_request_outside_the_allowlist_is_recorded_and_aborted(
+        self,
+        browser: Browser,
+        browser_server: _BrowserServer,
+        egress_allowlist: list[str],
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        A fetch aimed off the allowlist is recorded and never leaves (ROBU-09).
+
+        The page is served by the test server first, so the probe is issued by
+        a live document through the same gate every other browser test relies
+        on. The rejection is swallowed inside the page because an aborted fetch
+        rejects, and that rejection is a consequence of the block rather than
+        the thing being proved.
+        """
+        # Not the module ``context`` fixture: its teardown asserts ``blocked``
+        # is empty, and refusing something on purpose is this test's subject.
+        # The gate installed here is the identical one, which is the reason
+        # ``_make_gate`` is a factory rather than a closure in that fixture.
+        blocked: list[str] = []
+        seen: list[str] = []
+        ctx = browser.new_context()
+        try:
+            ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            page = ctx.new_page()
+            page.goto(browser_server.url)
+            page.evaluate(
+                "(url) => { fetch(url).catch(() => {}); }", _OFF_ALLOWLIST_URL
+            )
+
+            def refusal_recorded() -> bool:
+                # The round-trip is what makes the poll work at all: the sync
+                # API only dispatches route handlers while the caller is
+                # inside a Playwright call, so a predicate that merely read
+                # the list would hold this thread and never let the gate run.
+                page.evaluate("0")
+                return bool(blocked)
+
+            assert poll_until(refusal_recorded, budget=_EGRESS_PROBE_BUDGET), (
+                f"the gate recorded no refusal within the budget: {blocked}"
+            )
+            assert blocked == [_OFF_ALLOWLIST_URL], (
+                f"the probe, and only the probe, should have been refused: {blocked}"
+            )
+        finally:
+            ctx.close()
+
+
 @pytest.mark.browser
 class TestBrowserRendering:
     """PicoCSS and semantic HTML rendering tests."""
