@@ -54,8 +54,10 @@ YAML parser makes of it.
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from saneless.config import (
@@ -2749,4 +2751,77 @@ def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
         "reported, at source, or change the rule set deliberately in "
         "pyproject.toml where the whole project can see it. Remove the comment "
         "from each line below:\n" + "\n".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The runtime-evaluated route annotations, asked of ruff rather than read out
+# of the config file
+# ---------------------------------------------------------------------------
+
+_TC002_TARGET = "src/saneless/web/routes.py"
+# Generous, because the assertion is about the answer and not the latency. The
+# measured run is well under a second: it invokes the ruff executable in this
+# environment directly, so there is no dependency resolution step in front of
+# it.
+_TC002_SECONDS = 120
+
+
+def test_ruff_still_exempts_the_runtime_evaluated_route_annotations() -> None:
+    """
+    Ruff leaves the runtime ``Response`` import in routes.py where it is.
+
+    FastAPI resolves a route's return annotation when the decorator runs, so a
+    ``Response`` it cannot resolve becomes a response model that makes
+    ``app.openapi()`` raise. ``runtime-evaluated-decorators`` in pyproject.toml
+    is what stops ruff's TC002 moving that import into a typing-only block.
+
+    The guard asks ruff rather than reading the config, so it also catches the
+    failure mode a config-shape assertion is blind to: ruff resolves a
+    decorator's receiver only through an assignment in the same module, so
+    constructing the ``APIRouter`` somewhere else stops the exemption applying
+    while the config still looks exactly right.
+    """
+    env = {
+        **os.environ,
+        "SANELESS_TEST_RUFF": str(Path(sys.executable).with_name("ruff")),
+        "SANELESS_TEST_FILE": _TC002_TARGET,
+    }
+
+    # Every argv element is a literal and the per-run paths travel in the
+    # environment, double-quoted so the shell never re-splits them -- the
+    # shape the other child-process tests in this suite established. The two
+    # obvious alternatives are both rejected by this project's own lint rules:
+    # a bare command name relying on PATH trips ruff S607, and putting the
+    # resolved executable path in argv[0] trips S603, because argv[0] stops
+    # being a literal. Suppression is forbidden, so the shell indirection is
+    # what is left. The repository path travels in ``cwd``, never as a -C
+    # argument, for the reason the git helper above gives. The command string
+    # stays inline rather than moving to a named constant: S603 only accepts
+    # an argv whose elements are literals at the call site.
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$SANELESS_TEST_RUFF" check --no-fix --select TC002 "$SANELESS_TEST_FILE"',
+        ],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_TC002_SECONDS,
+    )
+
+    # The exit code is the whole contract. Nothing asserts on the child's
+    # output, because tooling around it can write chatter to either stream
+    # without that meaning ruff found anything.
+    assert result.returncode == 0, (
+        f"ruff now wants to move a runtime import out of {_TC002_TARGET}. "
+        "FastAPI resolves each route's return annotation when the decorator "
+        "runs, so a Response moved into a typing-only block becomes a "
+        "response model FastAPI cannot resolve, and app.openapi() raises. "
+        "Restore runtime-evaluated-decorators in pyproject.toml, and check "
+        "the APIRouter is still constructed in the module that decorates "
+        f"with it:\n{result.stdout}\n{result.stderr}"
     )
