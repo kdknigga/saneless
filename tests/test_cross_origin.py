@@ -42,7 +42,7 @@ from saneless.config import (
 from saneless.vocabulary import RequestRejection, rejection_message
 from saneless.web.app import create_app
 from saneless.web.cross_origin import CrossOriginGuard, is_cross_origin_request
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, leaf_routes
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -292,7 +292,7 @@ def _unsafe_routes(app: FastAPI) -> list[tuple[str, str]]:
     """Return every (method, path) pair the app serves outside the safe methods."""
     return sorted(
         (method, _PATH_PARAM.sub("x", route.path))
-        for route in app.routes
+        for route in leaf_routes(app)
         if isinstance(route, APIRoute)
         for method in route.methods or ()
         if method not in SAFE_METHODS

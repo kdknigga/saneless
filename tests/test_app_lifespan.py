@@ -1027,7 +1027,7 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
 
     uncovered = {
         route.path
-        for route in app.routes
+        for route in leaf_routes(app)
         if isinstance(route, Route | Mount)
         and route.path not in _ROUTE_CALLS
         and route.path not in _ROUTE_SKIPS
@@ -1036,7 +1036,9 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
         f"routes {sorted(uncovered)} are neither driven nor skipped with a "
         f"reason; add them to _ROUTE_CALLS or _ROUTE_SKIPS"
     )
-    served = {route.path for route in app.routes if isinstance(route, Route | Mount)}
+    served = {
+        route.path for route in leaf_routes(app) if isinstance(route, Route | Mount)
+    }
     stale = (_ROUTE_CALLS.keys() | _ROUTE_SKIPS.keys()) - served
     assert stale == set(), (
         f"the route map names {sorted(stale)}, which the app does not serve; "
@@ -1047,7 +1049,7 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
         assert fake.init_call_count == 1
         assert fake.exit_call_count == 0
 
-        for route in app.routes:
+        for route in leaf_routes(app):
             path = getattr(route, "path", "")
             call = _ROUTE_CALLS.get(path)
             if call is None:
@@ -1104,7 +1106,9 @@ def test_the_schema_builds_in_process_and_is_not_served(settings: Settings) -> N
     app = _build_app(settings)
     with TestClient(app) as client:
         schema = app.openapi()
-        served = {route.path for route in app.routes if isinstance(route, APIRoute)}
+        served = {
+            route.path for route in leaf_routes(app) if isinstance(route, APIRoute)
+        }
         assert set(schema["paths"]) == served
         assert client.get("/openapi.json").status_code == 404
         assert (app.openapi_url, app.docs_url, app.redoc_url) == (None, None, None)

@@ -70,7 +70,7 @@ from saneless.web.checks_cache import CheckCache
 from saneless.web.refresher import CheckRefresher
 from saneless.web.routes import _profile_options, _ProfileOption
 from saneless.worker import ScanWorker, WorkerFlipCoordinator
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, leaf_routes
 
 # Every app built in this module, fixture or helper, talks to a Paperless client
 # whose requests fail inside the process: nothing reaches localhost:8000.
@@ -156,7 +156,9 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
     onto its threadpool; an ``async def`` one would block the event loop.  The
     client fixture is used so the lifespan closes the job store afterwards.
     """
-    routes = [route for route in _app(client).routes if isinstance(route, APIRoute)]
+    routes = [
+        route for route in leaf_routes(_app(client)) if isinstance(route, APIRoute)
+    ]
     assert routes
     for route in routes:
         assert not inspect.iscoroutinefunction(route.endpoint), route.path
@@ -1672,7 +1674,7 @@ class TestProfileDescriptionRoute:
         """Every handler runs on the threadpool, this one included (ROBU-05)."""
         routes = [
             route
-            for route in _app(client).routes
+            for route in leaf_routes(_app(client))
             if isinstance(route, APIRoute) and route.path == "/api/profiles/description"
         ]
 
