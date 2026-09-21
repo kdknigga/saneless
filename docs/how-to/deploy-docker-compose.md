@@ -343,8 +343,8 @@ release and there is nothing of that kind at the old path.
     exist, so the container finds a directory where the PEM file should be,
     and saneless refuses to start with `Paperless error: Could not build the
     TLS trust store for Paperless at <url>: <OS error text>;
-    check SSL_CERT_FILE and SSL_CERT_DIR`. Create the file on the host and
-    recreate the container. Note also that `SSL_CERT_FILE` replaces the
+    check SSL_CERT_FILE and SSL_CERT_DIR`. If you hit that, put the file in
+    place and recreate the container. Note also that `SSL_CERT_FILE` replaces the
     operating system's trust store rather than adding to it, so the file you
     name must carry every CA saneless needs -- if `paperless.url` is signed by
     a public CA, install the private CA into the OS trust store instead.
