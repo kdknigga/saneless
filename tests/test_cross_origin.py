@@ -304,6 +304,15 @@ def test_every_unsafe_route_rejects_a_cross_site_request(
 ) -> None:
     """Every state-changing route is behind the guard, not a per-route check (D-23)."""
     routes = _unsafe_routes(app)
+    # The exact enumerated count, first: the >= check below is satisfied by
+    # any superset, so on its own it would not notice the set shrinking to
+    # the four known paths, and neither check notices an empty enumeration
+    # except by failing loudly, which is the point.
+    assert len(routes) == 5, (
+        f"the app serves {len(routes)} unsafe (method, path) pairs, not the 5 "
+        f"this test pins; a state-changing route was added or removed, so "
+        f"update this literal"
+    )
     assert len(routes) >= len(KNOWN_UNSAFE_PATHS)
     assert {path for _, path in routes} >= KNOWN_UNSAFE_PATHS
     for method, path in routes:

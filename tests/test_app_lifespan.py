@@ -1025,6 +1025,19 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     app.state.paperless.poll_task = lambda *_a, **_k: {"status": "SUCCESS"}
     store: JobStore = app.state.job_store
 
+    # Size first, contents second: an empty enumeration satisfies every set
+    # comparison below, so the count is what makes them mean anything.  The
+    # literal is measured against the running app, deliberately not derived
+    # from _ROUTE_CALLS | _ROUTE_SKIPS, which the two checks below already
+    # compare the app against in both directions.
+    enumerated = [
+        route for route in leaf_routes(app) if isinstance(route, Route | Mount)
+    ]
+    assert len(enumerated) == 16, (
+        f"the app serves {len(enumerated)} Route/Mount leaves, not the 16 this "
+        f"test pins; a route was added or removed, so update this literal"
+    )
+
     uncovered = {
         route.path
         for route in leaf_routes(app)
@@ -1048,6 +1061,24 @@ def test_sane_lifecycle_across_startup_every_route_and_shutdown(
     with TestClient(app) as client:
         assert fake.init_call_count == 1
         assert fake.exit_call_count == 0
+
+        # What the loop below will actually drive, asserted before it runs:
+        # the existing `assert submitted` fires only afterwards, and a loop
+        # over an empty enumeration would reach it having proven nothing.
+        drivable = [
+            route
+            for route in leaf_routes(app)
+            if getattr(route, "path", "") in _ROUTE_CALLS
+        ]
+        assert len(leaf_routes(app)) == 16, (
+            f"the app serves {len(leaf_routes(app))} leaves, not the 16 this "
+            f"test pins; a route was added or removed, so update this literal"
+        )
+        assert len(drivable) == 15, (
+            f"{len(drivable)} of the leaves are named in _ROUTE_CALLS, not the "
+            f"15 this test pins; a route was added or removed, so update this "
+            f"literal"
+        )
 
         for route in leaf_routes(app):
             path = getattr(route, "path", "")
@@ -1109,6 +1140,12 @@ def test_the_schema_builds_in_process_and_is_not_served(settings: Settings) -> N
         served = {
             route.path for route in leaf_routes(app) if isinstance(route, APIRoute)
         }
+        # Both sides of the comparison below would be empty if the app served
+        # no API routes, so the size is asserted before the contents.
+        assert len(served) == 15, (
+            f"the app serves {len(served)} APIRoute paths, not the 15 this "
+            f"test pins; a route was added or removed, so update this literal"
+        )
         assert set(schema["paths"]) == served
         assert client.get("/openapi.json").status_code == 404
         assert (app.openapi_url, app.docs_url, app.redoc_url) == (None, None, None)

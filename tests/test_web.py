@@ -159,7 +159,13 @@ def test_no_route_handler_is_a_coroutine(client: TestClient) -> None:
     routes = [
         route for route in leaf_routes(_app(client)) if isinstance(route, APIRoute)
     ]
-    assert routes
+    # The exact count, not just a non-empty one: a filter that found a single
+    # route would satisfy `assert routes` while leaving the other fourteen
+    # handlers unchecked.
+    assert len(routes) == 15, (
+        f"the app serves {len(routes)} API routes, not the 15 this test pins; "
+        f"a route was added or removed, so update this literal"
+    )
     for route in routes:
         assert not inspect.iscoroutinefunction(route.endpoint), route.path
 
