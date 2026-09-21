@@ -4719,8 +4719,7 @@ class TestScanTokenRefusal:
             monkeypatch, settings=_token_settings(tmp_path, "changeme")
         )
 
-        with runner.isolated_filesystem():
-            result = runner.invoke(cli, ["auto-profiles"])
+        result = runner.invoke(cli, ["auto-profiles"])
 
         assert result.exit_code == 0, result.output
 

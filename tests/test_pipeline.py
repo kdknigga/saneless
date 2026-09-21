@@ -443,7 +443,7 @@ def _embedded_streams(pdf_path: Path) -> list[bytes]:
     streams: list[bytes] = []
     with pikepdf.open(pdf_path) as pdf:
         for page in pdf.pages:
-            (image,) = pikepdf.Page(page).images.values()
+            (image,) = pikepdf.Page(page).get_images().values()
             streams.append(image.read_raw_bytes())
     return streams
 
