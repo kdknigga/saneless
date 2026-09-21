@@ -612,6 +612,36 @@ _ENV_DELIMITER: Final = "__"
 """The nested delimiter in environment variable names."""
 
 
+class _ByteExactTomlSource(TomlConfigSettingsSource):
+    """A TOML source whose top-level section and key matching is byte-exact."""
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        toml_file: Path | None = None,
+    ) -> None:
+        """
+        Load the file, then restore byte-exact top-level key matching.
+
+        Args:
+            settings_cls: The settings class this source feeds.
+            toml_file: The TOML file to read.
+
+        """
+        # toml_file is passed by keyword, always: upstream has a third
+        # positional parameter of its own, so a positional argument here would
+        # land in the wrong slot the next time that signature moves.
+        super().__init__(settings_cls, toml_file=toml_file)
+        # pydantic-settings folds the case of top-level keys before matching
+        # them to fields, so a miscased [Scanner] binds into scanner instead of
+        # being reported and a config file naming a section that does not exist
+        # is silently accepted. The parsed table is handed on unchanged so the
+        # spelling in the file is the spelling that is matched. Reassigning
+        # after the base __init__ keeps its nested-default merging intact,
+        # which overriding __call__ would bypass.
+        self.init_kwargs = dict(self.toml_data)
+
+
 class Settings(BaseSettings):
     """
     Application settings with TOML + env var loading.
@@ -675,7 +705,7 @@ class Settings(BaseSettings):
         Configure settings sources with optional TOML file support.
 
         The _toml_file init kwarg is extracted and used to create a
-        TomlConfigSettingsSource if the file exists. pydantic-settings calls
+        _ByteExactTomlSource if the file exists. pydantic-settings calls
         this by keyword, so the two unused sources keep their names.
         """
         # saneless reads no .env file and no secrets directory.
@@ -685,7 +715,7 @@ class Settings(BaseSettings):
         toml_file = init_src.init_kwargs.pop("_toml_file", None)
 
         if toml_file is not None:
-            toml_source = TomlConfigSettingsSource(
+            toml_source = _ByteExactTomlSource(
                 settings_cls,
                 toml_file=toml_file,
             )
@@ -1089,15 +1119,47 @@ def _render_error(
     return f"[{label}] {key_path}: {message}" if key_path else f"[{label}]: {message}"
 
 
+_MIN_REDACTED_INPUT: Final = 2
+"""The shortest input string worth redacting from a rendered error line."""
+
+
+def _redact_input(line: str, value: object) -> str:
+    """
+    Remove an error's input text from an already-rendered line.
+
+    ``_render_error`` reads only ``loc``, ``type`` and ``msg``, and pydantic's
+    ``msg`` carries no input today -- but that wording belongs to pydantic, not
+    to this project, and for ``tokne = "..."`` the input is the Paperless
+    token. Redacting here means no wording upstream can put a config value in a
+    line a user pastes into a bug report. Strings shorter than two characters
+    are left alone: they cannot be a credential and replacing them would mangle
+    ordinary words inside an upstream message.
+
+    Args:
+        line: The rendered error line.
+        value: The error's ``input`` member.
+
+    Returns:
+        The line with every occurrence of the input's text replaced.
+
+    """
+    if not isinstance(value, str) or len(value) < _MIN_REDACTED_INPUT:
+        return line
+    return line.replace(value, "<value omitted>")
+
+
 def _render_error_lines(
     errors: Sequence[ErrorDetails], env_data: Mapping[str, object]
 ) -> list[str]:
     """
     Render every validation error as one line, sorted for stable output.
 
-    Only ``loc``, ``type`` and ``msg`` are read. ``input`` and ``ctx`` are
-    never touched: for ``tokne = "..."`` the input is the Paperless token, and
-    ``str(ValidationError)`` embeds it.
+    Only ``loc``, ``type`` and ``msg`` are rendered; ``ctx`` is never touched.
+    ``input`` is read for one purpose only -- to strike its own text back out
+    of the finished line -- so a rendered line cannot carry a config value
+    whatever wording pydantic's ``msg`` arrives with. Redaction happens before
+    the sort, so the order stays a property of the text that is actually
+    returned.
 
     Args:
         errors: ``ValidationError.errors()``.
@@ -1108,7 +1170,11 @@ def _render_error_lines(
 
     """
     return sorted(
-        _render_error(err["loc"], err["type"], err["msg"], env_data) for err in errors
+        _redact_input(
+            _render_error(err["loc"], err["type"], err["msg"], env_data),
+            err["input"],
+        )
+        for err in errors
     )
 
 
