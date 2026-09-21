@@ -47,6 +47,23 @@ Issues = "https://github.com/kdknigga/saneless/issues"
 requires = ["uv_build>=0.10.3,<0.11.0"]
 build-backend = "uv_build"
 
+# anyio 4.15.0 turned `anyio.abc.BlockingPortal` into a deprecated alias, and
+# starlette's `testclient` module evaluates that name at module scope.  This
+# project runs pytest under `filterwarnings = ["error"]`, so the deprecation
+# is raised instead of printed, and every module importing `TestClient` fails
+# to collect -- seven of them here.  Nothing in this repository can fix that:
+# the deprecated name is starlette's own, reached before any saneless code
+# runs.  Declaring the ceiling makes resolution refuse the broken combination
+# outright, rather than leaving it to be discovered as collection errors once
+# a lock has already been written.  `constraint-dependencies` is its right
+# home because it bounds what resolution may select without installing anyio
+# and without entering `[project].dependencies`, so a ceiling on a package
+# saneless never imports stays out of the built wheel's metadata and out of
+# every downstream installer.  Remove it once starlette stops using the
+# deprecated alias.
+[tool.uv]
+constraint-dependencies = ["anyio<4.15"]
+
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
 exclude = [
@@ -228,4 +245,5 @@ dev = [
     "pytest-timeout>=2.4.0",
     "zizmor>=1.30.1",
     "pytest-cov>=7.1.0",
+    "httpx2>=2.13.0",
 ]
