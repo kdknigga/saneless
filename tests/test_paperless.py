@@ -508,6 +508,58 @@ class TestPaperlessUrlValidation:
         assert "tok-SECRET-5d1" not in str(exc_info.value)
 
 
+class TestTrustStoreConfigErrors:
+    """
+    A broken ``SSL_CERT_FILE`` is a PaperlessError at construction.
+
+    The TLS trust anchors are read while the client is being built, so both
+    ways a deployer following the documented ``SSL_CERT_FILE`` remedy can get
+    it wrong arrive at this boundary.  A typo in the path is the missing-file
+    case.  The documented docker-compose bind mount
+    ``./my-ca.crt:/etc/ssl/certs/my-ca.crt:ro`` is the directory case: when the
+    host file is absent Docker silently creates a *directory* at the container
+    path.  Neither may leave the boundary as a raw ``OSError`` traceback.
+    """
+
+    def test_missing_ssl_cert_file_raises_a_paperless_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """An unreadable SSL_CERT_FILE names both variables and not the token."""
+        monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "absent-ca.crt"))
+        # An SSL_CERT_DIR inherited from the developer's environment would
+        # change which OpenSSL branch is taken, so the test sets the whole
+        # pair rather than only the half it is about.
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+        # No transport= argument, deliberately: httpx2.Client skips
+        # create_ssl_context entirely when a transport is supplied, so this
+        # test would pass against an unguarded client if it reached for the
+        # module's usual MockTransport seam.  Only the real transport reads
+        # the trust store.  Do not add a transport here.
+        with pytest.raises(PaperlessError) as exc_info:
+            PaperlessClient("https://paperless.example.com", "tok-SECRET-5d1")
+        message = str(exc_info.value)
+        assert "SSL_CERT_FILE" in message
+        assert "SSL_CERT_DIR" in message
+        assert isinstance(exc_info.value.__cause__, FileNotFoundError)
+        assert "tok-SECRET-5d1" not in message
+
+    def test_ssl_cert_file_naming_a_directory_raises_a_paperless_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """An SSL_CERT_FILE that is a directory chains its IsADirectoryError."""
+        monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path))
+        monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+        # No transport= argument, for the reason given in the test above.
+        with pytest.raises(PaperlessError) as exc_info:
+            PaperlessClient("https://paperless.example.com", "tok-SECRET-5d1")
+        assert "SSL_CERT_FILE" in str(exc_info.value)
+        assert isinstance(exc_info.value.__cause__, IsADirectoryError)
+
+
 _URL_SECRET = "pr0xy-S3CRET"
 
 
