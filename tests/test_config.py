@@ -15,6 +15,7 @@ from typing import IO, TYPE_CHECKING, Any, TypedDict, Unpack
 
 import pytest
 from pydantic import ValidationError
+from pydantic_settings.exceptions import SettingsError
 
 import saneless.config as config_mod
 from saneless.config import (
@@ -1193,6 +1194,93 @@ log_level = "TRACE"
         assert len(lines) == 1
         assert _HOSTILE_SECRET not in lines[0]
         assert lines[0] == expected
+
+    def test_a_short_value_inside_upstream_prose_leaves_the_prose_intact(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        Striking the input out must not shred pydantic's own words (CR-01).
+
+        ``web_port = "in"`` is a two-character typo, and ``in`` occurs inside
+        ``integer`` and ``string`` in pydantic's message. An unanchored
+        replacement turns the explanation into ``a valid <value omitted>teger``
+        -- the operator loses the one sentence that says what was wanted. The
+        input is not a word here, so nothing needs striking at all.
+        """
+        err = _load_error(
+            tmp_config_dir / "short_value.toml",
+            '[output]\nweb_port = "in"\n',
+        )
+        [line] = [ln for ln in _error_lines(err) if "web_port" in ln]
+        assert "<value omitted>" not in line
+        assert line.strip() == (
+            "[output] web_port: Input should be a valid integer, "
+            "unable to parse string as an integer"
+        )
+
+    def test_a_value_that_cannot_be_struck_cleanly_withholds_the_message(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        When the input sits mid-word, the whole message is withheld (CR-01).
+
+        ``eger`` occurs only inside ``integer``, so no word-anchored
+        replacement can remove it. Splicing would corrupt the prose and
+        leaving it would echo the input, so the message is dropped entirely:
+        the guarantee that no input reaches the line outranks the explanation.
+        """
+        err = _load_error(
+            tmp_config_dir / "midword_value.toml",
+            '[output]\nweb_port = "eger"\n',
+        )
+        [line] = [ln for ln in _error_lines(err) if "web_port" in ln]
+        assert "eger" not in line
+        assert line.strip() == "[output] web_port: <value omitted>"
+
+    def test_a_nested_input_value_is_struck_from_the_message(self) -> None:
+        """
+        A secret inside a non-string input is struck out too (WR-01).
+
+        ``SANELESS_PAPERLESS__TOKEN__X=<token>`` makes pydantic's ``input`` a
+        mapping, not a string. D-07 promises the line is incapable of carrying
+        the input "whatever upstream wording arrives", so a bare
+        ``isinstance(value, str)`` test leaves that promise unkept.
+        """
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": _HOSTILE_MESSAGE,
+            "input": {"x": _HOSTILE_SECRET},
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+
+    def test_the_environment_branch_strikes_values_from_upstream_wording(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The SettingsError branch redacts too, whatever wording arrives (WR-02).
+
+        ``_env_contribution`` raises ``SettingsError`` when a complex-typed
+        variable will not parse, and its text goes straight into the rendered
+        body. pydantic-settings names only the field and source today, but
+        that wording is upstream-owned -- which is the exact dependency D-07
+        exists to remove. The raise is forced here so the guard tests this
+        module's behaviour rather than upstream's current phrasing.
+        """
+        monkeypatch.setenv("SANELESS_PAPERLESS", f'{{"token": "{_HOSTILE_SECRET}"')
+
+        def hostile_env_contribution() -> dict[str, object]:
+            msg = f"error parsing value {_HOSTILE_SECRET} for field 'paperless'"
+            raise SettingsError(msg)
+
+        monkeypatch.setattr(config_mod, "_env_contribution", hostile_env_contribution)
+        err = _load_error(
+            tmp_config_dir / "env_settings_error.toml",
+            '[paperless]\nurl = "http://example.invalid"\n',
+        )
+        assert _HOSTILE_SECRET not in str(err)
 
     def test_env_branch_redacts_a_hostile_upstream_message(
         self, monkeypatch: pytest.MonkeyPatch
