@@ -1074,6 +1074,45 @@ def _env_variable_for(
     return None
 
 
+_MIN_REDACTED_INPUT: Final = 2
+"""The shortest input string worth redacting from an upstream message."""
+
+
+def _redact_input(text: str, value: object) -> str:
+    """
+    Remove an error's input text from an upstream message fragment.
+
+    pydantic's ``msg`` carries no input today -- but that wording belongs to
+    pydantic, not to this project, and for ``tokne = "..."`` the input is the
+    Paperless token. Redacting it means no wording upstream can put a config
+    value in a line a user pastes into a bug report.
+
+    The scope is deliberately the message alone, not the finished line.
+    pydantic's ``msg`` is the only part of a rendered line that comes from
+    outside this module: the section label, the key name, the did-you-mean
+    hint and the valid-keys list are all built from this module's own field
+    names. Replacing text across the whole line strikes the hint out whenever
+    a config value happens to equal a field name -- ``hst = "host"`` would
+    lose both the suggestion and the first valid key -- which destroys the
+    very part of the message the operator needs.
+
+    Strings shorter than two characters are left alone: they cannot be a
+    credential and replacing them would mangle ordinary words inside an
+    upstream message.
+
+    Args:
+        text: The upstream message fragment.
+        value: The error's ``input`` member.
+
+    Returns:
+        The text with every occurrence of the input's own text replaced.
+
+    """
+    if not isinstance(value, str) or len(value) < _MIN_REDACTED_INPUT:
+        return text
+    return text.replace(value, "<value omitted>")
+
+
 def _render_error(
     loc: tuple[str | int, ...],
     error_type: str,
@@ -1126,45 +1165,6 @@ def _render_error(
         where = f"{key_path} in [{label}]" if key_path else f"[{label}]"
         return f"environment variable {variable!r}: {where}: {message}"
     return f"[{label}] {key_path}: {message}" if key_path else f"[{label}]: {message}"
-
-
-_MIN_REDACTED_INPUT: Final = 2
-"""The shortest input string worth redacting from an upstream message."""
-
-
-def _redact_input(text: str, value: object) -> str:
-    """
-    Remove an error's input text from an upstream message fragment.
-
-    pydantic's ``msg`` carries no input today -- but that wording belongs to
-    pydantic, not to this project, and for ``tokne = "..."`` the input is the
-    Paperless token. Redacting it means no wording upstream can put a config
-    value in a line a user pastes into a bug report.
-
-    The scope is deliberately the message alone, not the finished line.
-    pydantic's ``msg`` is the only part of a rendered line that comes from
-    outside this module: the section label, the key name, the did-you-mean
-    hint and the valid-keys list are all built from this module's own field
-    names. Replacing text across the whole line strikes the hint out whenever
-    a config value happens to equal a field name -- ``hst = "host"`` would
-    lose both the suggestion and the first valid key -- which destroys the
-    very part of the message the operator needs.
-
-    Strings shorter than two characters are left alone: they cannot be a
-    credential and replacing them would mangle ordinary words inside an
-    upstream message.
-
-    Args:
-        text: The upstream message fragment.
-        value: The error's ``input`` member.
-
-    Returns:
-        The text with every occurrence of the input's own text replaced.
-
-    """
-    if not isinstance(value, str) or len(value) < _MIN_REDACTED_INPUT:
-        return text
-    return text.replace(value, "<value omitted>")
 
 
 def _render_error_lines(
