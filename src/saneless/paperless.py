@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-import httpx
+import httpx2
 
 from .exceptions import PaperlessError, PaperlessTimeoutError, describe
 from .vocabulary import ConnectionStatus
@@ -236,7 +236,7 @@ def _one_line_reason(exc: BaseException) -> str:
     """
     Describe a failure cause as one line for a ``PaperlessError`` message.
 
-    A CLI or web message must be a single line, but httpx's own text
+    A CLI or web message must be a single line, but httpx2's own text
     for an ``HTTPStatusError`` is two: ``Server error '503 ...' for url
     '...'`` followed by ``For more information check: <mdn url>``.  A status
     error is therefore rendered as its status, reason phrase and the body
@@ -250,7 +250,7 @@ def _one_line_reason(exc: BaseException) -> str:
         A non-empty single line.
 
     """
-    if isinstance(exc, httpx.HTTPStatusError):
+    if isinstance(exc, httpx2.HTTPStatusError):
         response = exc.response
         return (
             f"{response.status_code} {response.reason_phrase}: "
@@ -314,7 +314,7 @@ def _json_error_text(payload: object) -> str | None:
     return text
 
 
-def _render_error_body(response: httpx.Response) -> str:
+def _render_error_body(response: httpx2.Response) -> str:
     """
     Reduce a Paperless error response body to one bounded line.
 
@@ -355,7 +355,7 @@ def _without_userinfo(url: str) -> str:
     """
     Remove any ``user:password@`` from a URL before it is shown anywhere.
 
-    Deliberately textual rather than parsed, so it also covers a URL httpx
+    Deliberately textual rather than parsed, so it also covers a URL httpx2
     rejects or reads differently (no scheme, a bad port), and deliberately
     greedy: it cuts through the *last* ``@``, so a password holding a raw
     ``@`` or ``/`` cannot leave a fragment behind.  The cost is that a base
@@ -394,7 +394,7 @@ def _bounded_line(text: str) -> str:
     return line
 
 
-def _not_accepted_message(response: httpx.Response) -> str:
+def _not_accepted_message(response: httpx2.Response) -> str:
     """
     Say why a non-2xx upload response that is not a server error is final.
 
@@ -482,14 +482,14 @@ class PaperlessClient:
     Upload failures fall into two groups:
 
     * **Retried** with exponential backoff, for ``max_retries`` attempts in
-      total: every transient ``httpx.TransportError`` -- ConnectError, the
+      total: every transient ``httpx2.TransportError`` -- ConnectError, the
       timeouts, ReadError, WriteError, RemoteProtocolError (a reverse proxy
       closing the connection), ProxyError -- and any 5xx response.
     * **Fail fast**, with no further attempt: a 4xx rejection, any other
       non-2xx that is not a server error (a redirect, which names its target
       so ``paperless.url`` can be corrected), a URL with no
-      usable scheme (``httpx.UnsupportedProtocol``, which is a TransportError
-      but will never succeed on a retry), any other ``httpx.HTTPError``, and
+      usable scheme (``httpx2.UnsupportedProtocol``, which is a TransportError
+      but will never succeed on a retry), any other ``httpx2.HTTPError``, and
       a 200 whose body is not JSON.
 
     When a consume directory is configured it is the fallback both for
@@ -507,18 +507,18 @@ class PaperlessClient:
         token: API authentication token.  It is sent only in the
             ``Authorization`` header and never interpolated into a message.
             Any ``user:password@`` in ``url`` is sent as Basic auth, exactly
-            as httpx would send it, and is stripped from every message and
+            as httpx2 would send it, and is stripped from every message and
             log line.
         consume_dir: Optional fallback directory for PDF upload failures;
             None disables the fallback copy.
         max_retries: Maximum number of upload attempts, including the first.
-        transport: The httpx transport requests go through, handed straight
-            to ``httpx.Client(transport=...)``. None uses httpx's default
+        transport: The httpx2 transport requests go through, handed straight
+            to ``httpx2.Client(transport=...)``. None uses httpx2's default
             network transport. This is the injection seam for tests (an
-            ``httpx.MockTransport``) and for custom transports.
+            ``httpx2.MockTransport``) and for custom transports.
 
     Raises:
-        PaperlessError: If ``url`` is not a valid URL (``httpx.InvalidURL``).
+        PaperlessError: If ``url`` is not a valid URL (``httpx2.InvalidURL``).
 
     """
 
@@ -529,7 +529,7 @@ class PaperlessClient:
         consume_dir: Path | None = None,
         max_retries: int = 3,
         *,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx2.BaseTransport | None = None,
     ) -> None:
         """Initialize the paperless-ngx API client."""
         base_url = url.rstrip("/")
@@ -538,17 +538,17 @@ class PaperlessClient:
         # proxy) must not put that password in job.error, on the terminal or
         # in the log.
         self._display_url = _without_userinfo(base_url)
-        auth: httpx.BasicAuth | None = None
+        auth: httpx2.BasicAuth | None = None
         try:
-            parsed = httpx.URL(base_url)
+            parsed = httpx2.URL(base_url)
             if parsed.userinfo:
-                # The credentials travel as the Basic auth httpx would derive
+                # The credentials travel as the Basic auth httpx2 would derive
                 # from the URL anyway, so the request is unchanged, while the
-                # base URL itself -- which httpx names in its own request log
+                # base URL itself -- which httpx2 names in its own request log
                 # line and exception text -- no longer carries them.
-                auth = httpx.BasicAuth(parsed.username, parsed.password)
+                auth = httpx2.BasicAuth(parsed.username, parsed.password)
                 base_url = str(parsed.copy_with(userinfo=b"")).rstrip("/")
-            self._client = httpx.Client(
+            self._client = httpx2.Client(
                 base_url=base_url,
                 auth=auth,
                 headers={
@@ -558,7 +558,7 @@ class PaperlessClient:
                 timeout=30.0,
                 transport=transport,
             )
-        except httpx.InvalidURL as exc:
+        except httpx2.InvalidURL as exc:
             msg = f"Paperless URL {self._display_url} is not valid: {describe(exc)}"
             raise PaperlessError(msg) from exc
         self._consume_dir = consume_dir
@@ -580,9 +580,9 @@ class PaperlessClient:
         transport failure and every 5xx is retried with exponential backoff
         for ``max_retries`` attempts; a 4xx, a redirect or any other non-2xx
         that is not a 5xx, an unusable URL scheme, any
-        other httpx error and a non-JSON 200 end the attempts at once.  When
+        other httpx2 error and a non-JSON 200 end the attempts at once.  When
         the attempts end without delivery -- exhausted,
-        or cut short by ``httpx.UnsupportedProtocol`` -- and a consume
+        or cut short by ``httpx2.UnsupportedProtocol`` -- and a consume
         directory is configured, the PDF is copied there instead.  See the
         class docstring for the accepted duplicate-document risk of retrying.
 
@@ -608,14 +608,14 @@ class PaperlessClient:
                 if the attempts end without delivery and no consume directory
                 is configured (``failed after N attempts``, or ``Could not
                 reach Paperless`` for an unusable URL scheme); if any other
-                httpx error occurs; if the PDF cannot be opened; if a 200 body
+                httpx2 error occurs; if the PDF cannot be opened; if a 200 body
                 is not JSON or carries no task id; or if copying into the
                 consume directory fails.
                 Every one is chained to its cause.
 
         """
         data = self._form_fields(title, tags, correspondent, created)
-        last_error: httpx.HTTPError | None = None
+        last_error: httpx2.HTTPError | None = None
         fast_fail = False
 
         # Clause order is load-bearing: HTTPStatusError and UnsupportedProtocol
@@ -624,7 +624,7 @@ class PaperlessClient:
         for attempt in range(self._max_retries):
             try:
                 task_id = self._post_document(pdf_path, data)
-            except httpx.HTTPStatusError as exc:
+            except httpx2.HTTPStatusError as exc:
                 # Only a server error is transient.  A 4xx rejection and a
                 # redirect (1xx and 3xx too: raise_for_status refuses every
                 # non-2xx) would only be answered the same way again, so they
@@ -634,7 +634,7 @@ class PaperlessClient:
                     raise PaperlessError(msg) from exc
                 last_error = exc
                 self._back_off(attempt, exc)
-            except httpx.UnsupportedProtocol as exc:
+            except httpx2.UnsupportedProtocol as exc:
                 # Logged here because no _back_off runs for it: with a consume
                 # directory the scan still ends FALLBACK, and this line is then
                 # the only place the operator learns the URL is the problem.
@@ -646,10 +646,10 @@ class PaperlessClient:
                 last_error = exc
                 fast_fail = True
                 break
-            except httpx.TransportError as exc:
+            except httpx2.TransportError as exc:
                 last_error = exc
                 self._back_off(attempt, exc)
-            except httpx.HTTPError as exc:
+            except httpx2.HTTPError as exc:
                 msg = (
                     f"Could not upload to Paperless at {self._display_url}: "
                     f"{describe(exc)}"
@@ -720,12 +720,12 @@ class PaperlessClient:
             PaperlessError: If the PDF cannot be opened, or a 200 body is not
                 JSON or is a JSON null.
 
-        Any ``httpx.HTTPError`` from the request or from ``raise_for_status``
+        Any ``httpx2.HTTPError`` from the request or from ``raise_for_status``
         propagates: ``upload_document`` decides which of those to retry.
 
         """
         # Only the open is guarded: an OSError here is the PDF itself, while
-        # the request below raises httpx's own types, which upload_document
+        # the request below raises httpx2's own types, which upload_document
         # sorts into retries.
         try:
             pdf_file = pdf_path.open("rb")
@@ -757,7 +757,7 @@ class PaperlessClient:
             raise PaperlessError(msg)
         return str(task_id)
 
-    def _back_off(self, attempt: int, exc: httpx.HTTPError) -> None:
+    def _back_off(self, attempt: int, exc: httpx2.HTTPError) -> None:
         """
         Log a failed retryable attempt and sleep before the next one.
 
@@ -768,7 +768,7 @@ class PaperlessClient:
             exc: What it failed with.
 
         """
-        # _one_line_reason, not describe: httpx's text for a status error spans
+        # _one_line_reason, not describe: httpx2's text for a status error spans
         # lines and names the full request URL.
         logger.warning(
             "Upload attempt %d/%d failed: %s",
@@ -922,9 +922,9 @@ class PaperlessClient:
         delay = 0.5
         # RequestError rather than TransportError: DecodingError (a corrupt
         # compressed body) is a request-level failure that is not a transport
-        # one, and it must neither escape this boundary as a raw httpx type nor
+        # one, and it must neither escape this boundary as a raw httpx2 type nor
         # fail an upload Paperless already accepted.
-        last_transport_error: httpx.RequestError | None = None
+        last_transport_error: httpx2.RequestError | None = None
 
         while True:
             try:
@@ -932,7 +932,7 @@ class PaperlessClient:
                     "/api/tasks/",
                     params={"task_id": task_id},
                 )
-            except httpx.RequestError as exc:
+            except httpx2.RequestError as exc:
                 last_transport_error = exc
                 logger.warning(
                     "Polling task %s failed, retrying until the deadline: %s",
@@ -966,7 +966,7 @@ class PaperlessClient:
             delay = min(delay * 2, 30.0)
 
     def _finished_task(
-        self, task_id: str, response: httpx.Response
+        self, task_id: str, response: httpx2.Response
     ) -> dict[str, object] | None:
         """
         Read one task poll response.
@@ -1023,7 +1023,7 @@ class PaperlessClient:
         return None
 
     def test_connection(
-        self, *, timeout: httpx.Timeout | None = None
+        self, *, timeout: httpx2.Timeout | None = None
     ) -> ConnectionStatus:
         """
         Probe paperless-ngx and report which of five outcomes occurred.
@@ -1047,14 +1047,14 @@ class PaperlessClient:
         ``SaneBackend.get_devices()`` has no timeout at any layer -- not in
         python-sane, not in ``sane_get_devices(3)``, and not settable from
         Python -- so the SANE side of the status strip needs a socket
-        pre-probe to get any bound at all; httpx, by contrast, takes one per
+        pre-probe to get any bound at all; httpx2, by contrast, takes one per
         request.  The status strip and ``saneless doctor`` pass a short budget
         so an unplugged host is discovered in about two seconds instead of
         thirty, while ``GET /api/paperless/test`` deliberately keeps today's
         client default and therefore calls this with no argument at all.
 
         Bounding the probe needs no new exception handling.  The
-        ``except httpx.TransportError`` arm below is the base class of
+        ``except httpx2.TransportError`` arm below is the base class of
         ``ConnectTimeout`` and ``ReadTimeout`` as well as ``ConnectError``, so
         a budget that expires already lands on UNREACHABLE.
 
@@ -1074,9 +1074,9 @@ class PaperlessClient:
             response = self._client.get(
                 "/api/tags/",
                 params={"page_size": 1},
-                timeout=timeout if timeout is not None else httpx.USE_CLIENT_DEFAULT,
+                timeout=timeout if timeout is not None else httpx2.USE_CLIENT_DEFAULT,
             )
-        except httpx.TransportError:
+        except httpx2.TransportError:
             # The base class of ConnectError, ConnectTimeout and ReadTimeout.
             # Catching only ConnectError let the timeout siblings escape to
             # routes.py's blanket handler, which answers HTTP 502
@@ -1102,7 +1102,7 @@ class PaperlessClient:
 
         Raises:
             PaperlessError: If any page request fails for any
-                ``httpx.HTTPError`` (a non-2xx included) or a body is not JSON,
+                ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
                 naming the endpoint and base URL and chained to the cause.
 
         """
@@ -1117,7 +1117,7 @@ class PaperlessClient:
 
         Raises:
             PaperlessError: If any page request fails for any
-                ``httpx.HTTPError`` (a non-2xx included) or a body is not JSON,
+                ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
                 naming the endpoint and base URL and chained to the cause.
 
         """
@@ -1146,7 +1146,7 @@ class PaperlessClient:
         more than ``count`` over the size of the first page), or, with no
         usable ``count``, more than ``_METADATA_MAX_PAGES``.
 
-        This is a module boundary: no httpx type and no raw ValueError leaves
+        This is a module boundary: no httpx2 type and no raw ValueError leaves
         it.  A status error is rendered by ``_one_line_reason`` as status,
         reason and body, so the message stays one line.
 
@@ -1159,7 +1159,7 @@ class PaperlessClient:
 
         Raises:
             PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
-                <reason>``, chained to the httpx error or the ValueError, or
+                <reason>``, chained to the httpx2 error or the ValueError, or
                 unchained when a body or its items have the wrong shape, the
                 server repeats a page, or it needs more pages than its
                 ``count`` allows.
@@ -1220,7 +1220,7 @@ class PaperlessClient:
             The decoded body, whatever its shape.
 
         Raises:
-            PaperlessError: ``<prefix>: <reason>``, chained to the httpx error
+            PaperlessError: ``<prefix>: <reason>``, chained to the httpx2 error
                 or the ValueError.
 
         """
@@ -1229,7 +1229,7 @@ class PaperlessClient:
                 path, params={"page": page, "page_size": _METADATA_PAGE_SIZE}
             )
             response.raise_for_status()
-        except httpx.HTTPError as exc:
+        except httpx2.HTTPError as exc:
             msg = f"{prefix}: {_one_line_reason(exc)}"
             raise PaperlessError(msg) from exc
         try:

@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from saneless.job import Job, JobStore
     from saneless.scanner.base import PageSink, ScanSettings
 
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from PIL import Image
@@ -316,10 +316,10 @@ def _start_uvicorn(app: ASGIApp, host: str) -> _RunningUvicorn:
     thread.start()
     running = _RunningUvicorn(server=server, thread=thread, sock=sock, port=port)
     try:
-        httpx.get(
+        httpx2.get(
             f"http://127.0.0.1:{port}/static/app.css", timeout=10
         ).raise_for_status()
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         _stop_uvicorn(running)
         msg = f"Uvicorn server failed to start: {exc}"
         raise RuntimeError(msg) from exc
@@ -1045,7 +1045,9 @@ class TestServerOwnedScanButton:
         server = scan_harness.server
         server.scanner.gate.clear()
         try:
-            response = httpx.post(server.url + "/api/scan", data={"profile": "default"})
+            response = httpx2.post(
+                server.url + "/api/scan", data={"profile": "default"}
+            )
             assert response.status_code == 200, response.text
             created = scan_harness.created_job_ids()
             assert len(created) == 1, created
@@ -1885,7 +1887,7 @@ def _fill_queue_until_rejected(url: str) -> None:
     """
     statuses: list[int] = []
     for _ in range(_FILL_ATTEMPTS):
-        response = httpx.post(url + "/api/scan", data={"profile": "default"})
+        response = httpx2.post(url + "/api/scan", data={"profile": "default"})
         statuses.append(response.status_code)
         if response.status_code == _TOO_MANY_REQUESTS:
             return
@@ -2932,7 +2934,7 @@ def _probe_now(server: _BrowserServer) -> None:
         server: The private server to probe.
 
     """
-    response = httpx.post(f"{server.url}/api/checks/refresh", timeout=30.0)
+    response = httpx2.post(f"{server.url}/api/checks/refresh", timeout=30.0)
     assert response.status_code == 200, response.status_code
 
 

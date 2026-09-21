@@ -36,7 +36,7 @@ from string import ascii_letters, digits, hexdigits
 from time import monotonic
 from typing import TYPE_CHECKING, Final, assert_never
 
-import httpx
+import httpx2
 
 from saneless.config import is_placeholder_token
 from saneless.vocabulary import (
@@ -369,7 +369,7 @@ class CheckContext:
     machine where the diagnostic would otherwise not run.
 
     ``paperless=None`` means no usable client could be built at all, which
-    ``PaperlessClient.__init__`` only refuses for a URL httpx will not parse.
+    ``PaperlessClient.__init__`` only refuses for a URL httpx2 will not parse.
 
     ``profile_storage`` is the outcome the worker recorded when it wrote the
     generated profiles, not something re-derived here.  ``doctor`` derives its
@@ -1509,7 +1509,7 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     four agree on whether the appliance can upload.
 
     A ``None`` client means one could not be constructed, and the only way
-    ``PaperlessClient.__init__`` refuses is a URL httpx will not parse -- which
+    ``PaperlessClient.__init__`` refuses is a URL httpx2 will not parse -- which
     is the "not found at that URL" row, not a sixth sentence.
 
     Args:
@@ -1534,7 +1534,7 @@ def _check_paperless(context: CheckContext) -> CheckResult:
         status = ConnectionStatus.NOT_FOUND
     else:
         status = client.test_connection(
-            timeout=httpx.Timeout(PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS)
+            timeout=httpx2.Timeout(PROBE_READ_SECONDS, connect=PROBE_CONNECT_SECONDS)
         )
     state = CheckState.OK if status is ConnectionStatus.CONNECTED else CheckState.FAIL
     return CheckResult(

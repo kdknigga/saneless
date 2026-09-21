@@ -35,7 +35,7 @@ from html import unescape
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import httpx
+import httpx2
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -387,7 +387,7 @@ class _PaperlessRequestCounter:
         """Start with nothing recorded."""
         self.count = 0
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """
         Record the request and answer it successfully.
 
@@ -399,7 +399,7 @@ class _PaperlessRequestCounter:
 
         """
         self.count += 1
-        return httpx.Response(200, json={"count": 0, "results": []})
+        return httpx2.Response(200, json={"count": 0, "results": []})
 
 
 # What the two fixtures below hand a test.  Named because the alternative is
@@ -455,7 +455,7 @@ def counting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Count
             url=url,
             token=token,
             consume_dir=consume_dir,
-            transport=httpx.MockTransport(counter),
+            transport=httpx2.MockTransport(counter),
         )
 
     monkeypatch.setattr(app_module, "PaperlessClient", build_client)
@@ -1966,7 +1966,7 @@ class TestRouteShape:
         """
         Both handlers block, so both must run on FastAPI's threadpool.
 
-        An ``async def`` here would run a socket probe and an httpx call on the
+        An ``async def`` here would run a socket probe and an httpx2 call on the
         event loop and stall ``/health`` and the status poll with it (ROBU-05).
         """
         handler = getattr(routes_module, name)

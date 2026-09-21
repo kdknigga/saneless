@@ -9,7 +9,7 @@ import shutil
 import time
 from typing import TYPE_CHECKING
 
-import httpx
+import httpx2
 import pytest
 
 from saneless.exceptions import PaperlessError, PaperlessTimeoutError, describe
@@ -38,10 +38,10 @@ def sample_pdf(tmp_path: Path) -> Path:
 
 
 def _make_transport(
-    handler: Callable[[httpx.Request], httpx.Response],
-) -> httpx.MockTransport:
-    """Create an httpx.MockTransport from a handler function."""
-    return httpx.MockTransport(handler)
+    handler: Callable[[httpx2.Request], httpx2.Response],
+) -> httpx2.MockTransport:
+    """Create an httpx2.MockTransport from a handler function."""
+    return httpx2.MockTransport(handler)
 
 
 def _v9_payload(status: str, message: str | None) -> object:
@@ -94,7 +94,7 @@ _API_NO_TASK_SHAPES = [
 
 
 def _poll_client(
-    handler: Callable[[httpx.Request], httpx.Response],
+    handler: Callable[[httpx2.Request], httpx2.Response],
 ) -> PaperlessClient:
     """Build a client wired to the given mock handler."""
     return PaperlessClient(
@@ -107,8 +107,8 @@ def _poll_client(
 def _connection_result_for_status(status_code: int) -> ConnectionStatus:
     """Run test_connection against a server that answers with one status code."""
 
-    def handler(_request: httpx.Request) -> httpx.Response:
-        return httpx.Response(status_code, text="")
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(status_code, text="")
 
     client = _poll_client(handler)
     try:
@@ -118,11 +118,11 @@ def _connection_result_for_status(status_code: int) -> ConnectionStatus:
 
 
 def _connection_result_for_exception(
-    exc_type: type[httpx.TransportError],
+    exc_type: type[httpx2.TransportError],
 ) -> ConnectionStatus:
     """Run test_connection against a transport that raises."""
 
-    def handler(_request: httpx.Request) -> httpx.Response:
+    def handler(_request: httpx2.Request) -> httpx2.Response:
         msg = "transport failed"
         raise exc_type(msg)
 
@@ -146,9 +146,9 @@ _CONNECTION_STATUS_CASES = [
 ]
 
 _CONNECTION_EXCEPTION_CASES = [
-    pytest.param(httpx.ConnectError, id="connect-error"),
-    pytest.param(httpx.ConnectTimeout, id="connect-timeout"),
-    pytest.param(httpx.ReadTimeout, id="read-timeout"),
+    pytest.param(httpx2.ConnectError, id="connect-error"),
+    pytest.param(httpx2.ConnectTimeout, id="connect-timeout"),
+    pytest.param(httpx2.ReadTimeout, id="read-timeout"),
 ]
 
 
@@ -168,10 +168,10 @@ def _assert_no_staging_files(consume_dir: Path) -> None:
     )
 
 
-def _always_refused(_request: httpx.Request) -> httpx.Response:
+def _always_refused(_request: httpx2.Request) -> httpx2.Response:
     """Refuse every connection, forcing the consume-directory fallback."""
     msg = "connection refused"
-    raise httpx.ConnectError(msg)
+    raise httpx2.ConnectError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ class TestClientSignature:
     """The client's injection seam and its timeout are part of its API shape."""
 
     def test_transport_is_a_keyword_only_parameter_defaulting_to_none(self) -> None:
-        """``transport`` mirrors ``httpx.Client(transport=...)``, keyword-only."""
+        """``transport`` mirrors ``httpx2.Client(transport=...)``, keyword-only."""
         parameter = inspect.signature(PaperlessClient.__init__).parameters["transport"]
         assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
         assert parameter.default is None
@@ -208,8 +208,8 @@ class TestUploadDocument:
         """Upload returns task UUID on success."""
         task_uuid = "abc-123-def"
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=task_uuid)
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=task_uuid)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -227,10 +227,10 @@ class TestUploadDocument:
         """Upload includes repeated tag form fields."""
         captured_data: dict[str, str] = {}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             content = _request.content.decode("utf-8", errors="replace")
             captured_data["content"] = content
-            return httpx.Response(200, json="task-id")
+            return httpx2.Response(200, json="task-id")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -248,10 +248,10 @@ class TestUploadDocument:
         """Upload includes correspondent field."""
         captured_data: dict[str, str] = {}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             content = _request.content.decode("utf-8", errors="replace")
             captured_data["content"] = content
-            return httpx.Response(200, json="task-id")
+            return httpx2.Response(200, json="task-id")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -268,10 +268,10 @@ class TestUploadDocument:
         """Upload includes created date field."""
         captured_data: dict[str, str] = {}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             content = _request.content.decode("utf-8", errors="replace")
             captured_data["content"] = content
-            return httpx.Response(200, json="task-id")
+            return httpx2.Response(200, json="task-id")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -291,9 +291,9 @@ class TestUploadDocument:
         """Form fields (title, created) use data= parameter, PDF uses files= parameter."""
         captured_data: dict[str, bytes] = {}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             captured_data["body"] = _request.content
-            return httpx.Response(200, json="task-id")
+            return httpx2.Response(200, json="task-id")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -319,12 +319,12 @@ class TestUploadDocument:
         """Upload retries on ConnectError and eventually succeeds."""
         call_count = {"n": 0}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             call_count["n"] += 1
             if call_count["n"] <= 2:
                 msg = "connection refused"
-                raise httpx.ConnectError(msg)
-            return httpx.Response(200, json="task-id-ok")
+                raise httpx2.ConnectError(msg)
+            return httpx2.Response(200, json="task-id-ok")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -344,9 +344,9 @@ class TestUploadDocument:
         """Upload does not retry on 4xx errors."""
         call_count = {"n": 0}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             call_count["n"] += 1
-            return httpx.Response(400, text="Bad Request")
+            return httpx2.Response(400, text="Bad Request")
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -364,9 +364,9 @@ class TestUploadDocument:
     ) -> None:
         """Upload raises PaperlessError when retries are exhausted without fallback."""
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             msg = "connection refused"
-            raise httpx.ConnectError(msg)
+            raise httpx2.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -387,9 +387,9 @@ class TestUploadDocument:
         consume_dir = tmp_path / "consume"
         consume_dir.mkdir()
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             msg = "connection refused"
-            raise httpx.ConnectError(msg)
+            raise httpx2.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -421,12 +421,12 @@ class TestUploadDocument:
 
 
 _TRANSIENT_TRANSPORT_CASES = [
-    pytest.param(httpx.ReadError, id="read-error"),
-    pytest.param(httpx.WriteError, id="write-error"),
-    pytest.param(httpx.RemoteProtocolError, id="remote-protocol-error"),
-    pytest.param(httpx.ConnectError, id="connect-error"),
-    pytest.param(httpx.ConnectTimeout, id="connect-timeout"),
-    pytest.param(httpx.ReadTimeout, id="read-timeout"),
+    pytest.param(httpx2.ReadError, id="read-error"),
+    pytest.param(httpx2.WriteError, id="write-error"),
+    pytest.param(httpx2.RemoteProtocolError, id="remote-protocol-error"),
+    pytest.param(httpx2.ConnectError, id="connect-error"),
+    pytest.param(httpx2.ConnectTimeout, id="connect-timeout"),
+    pytest.param(httpx2.ReadTimeout, id="read-timeout"),
 ]
 
 _UNSUPPORTED_PROTOCOL_TEXT = (
@@ -437,30 +437,30 @@ _UNSUPPORTED_PROTOCOL_TEXT = (
 class _CountingHandler:
     """A mock transport handler that counts calls and replays a script."""
 
-    def __init__(self, respond: Callable[[int], httpx.Response]) -> None:
+    def __init__(self, respond: Callable[[int], httpx2.Response]) -> None:
         """Build a handler whose n-th call (1-based) is answered by ``respond``."""
         self.calls = 0
         self._respond = respond
 
-    def __call__(self, _request: httpx.Request) -> httpx.Response:
+    def __call__(self, _request: httpx2.Request) -> httpx2.Response:
         """Count the call and answer it."""
         self.calls += 1
         return self._respond(self.calls)
 
 
-def _raising(exc: Exception) -> Callable[[int], httpx.Response]:
+def _raising(exc: Exception) -> Callable[[int], httpx2.Response]:
     """Build a script that raises ``exc`` on every call."""
 
-    def respond(_call: int) -> httpx.Response:
+    def respond(_call: int) -> httpx2.Response:
         raise exc
 
     return respond
 
 
-def _answering(response: httpx.Response) -> Callable[[int], httpx.Response]:
+def _answering(response: httpx2.Response) -> Callable[[int], httpx2.Response]:
     """Build a script that answers every call with ``response``."""
 
-    def respond(_call: int) -> httpx.Response:
+    def respond(_call: int) -> httpx2.Response:
         return response
 
     return respond
@@ -492,10 +492,10 @@ class TestPaperlessUrlValidation:
 
     def test_invalid_url_raises_a_paperless_error(self) -> None:
         """
-        ``http://host:abc`` names the URL and httpx's own text.
+        ``http://host:abc`` names the URL and httpx2's own text.
 
         The token must never reach the message (T-28-20, Pitfall 1): only the
-        configured URL and the httpx text are interpolated.
+        configured URL and the httpx2 text are interpolated.
         """
         with pytest.raises(
             PaperlessError,
@@ -504,7 +504,7 @@ class TestPaperlessUrlValidation:
             ),
         ) as exc_info:
             PaperlessClient("http://host:abc", "tok-SECRET-5d1")
-        assert isinstance(exc_info.value.__cause__, httpx.InvalidURL)
+        assert isinstance(exc_info.value.__cause__, httpx2.InvalidURL)
         assert "tok-SECRET-5d1" not in str(exc_info.value)
 
 
@@ -523,7 +523,7 @@ class TestUrlCredentialsNeverShown:
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
         """The exhausted-retry message shows the host, not the credentials."""
-        handler = _CountingHandler(_raising(httpx.ConnectError("refused")))
+        handler = _CountingHandler(_raising(httpx2.ConnectError("refused")))
         client = PaperlessClient(
             url=f"https://scanner:{_URL_SECRET}@paperless.example",
             token=_MOCK_AUTH,
@@ -543,11 +543,11 @@ class TestUrlCredentialsNeverShown:
 
     def test_credentials_are_still_sent_as_basic_auth(self) -> None:
         """Stripping the userinfo from the URL does not change the request."""
-        seen: list[httpx.Request] = []
+        seen: list[httpx2.Request] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             seen.append(request)
-            return httpx.Response(200, json={"results": []})
+            return httpx2.Response(200, json={"results": []})
 
         client = PaperlessClient(
             url=f"https://scanner:{_URL_SECRET}@paperless.example/sub/",
@@ -558,8 +558,8 @@ class TestUrlCredentialsNeverShown:
             client.get_tags()
         finally:
             client.close()
-        expected = httpx.BasicAuth("scanner", _URL_SECRET)
-        probe = next(expected.auth_flow(httpx.Request("GET", "https://x/")))
+        expected = httpx2.BasicAuth("scanner", _URL_SECRET)
+        probe = next(expected.auth_flow(httpx2.Request("GET", "https://x/")))
         assert seen[0].headers["authorization"] == probe.headers["authorization"]
         assert str(seen[0].url).startswith("https://paperless.example/sub/api/tags/")
         assert _URL_SECRET not in str(seen[0].url)
@@ -567,13 +567,13 @@ class TestUrlCredentialsNeverShown:
     def test_no_log_record_carries_the_password(
         self, sample_pdf: Path, sleeps: list[float], caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Neither saneless's log lines nor httpx's request log name it."""
+        """Neither saneless's log lines nor httpx2's request log name it."""
         caplog.set_level(logging.DEBUG)
 
-        def respond(call: int) -> httpx.Response:
+        def respond(call: int) -> httpx2.Response:
             if call == 1:
-                return httpx.Response(503, text="down")
-            return httpx.Response(200, json="task-id")
+                return httpx2.Response(503, text="down")
+            return httpx2.Response(200, json="task-id")
 
         client = PaperlessClient(
             url=f"https://scanner:{_URL_SECRET}@paperless.example",
@@ -589,7 +589,7 @@ class TestUrlCredentialsNeverShown:
         assert sleeps == [1]
 
     def test_invalid_url_message_strips_the_password(self) -> None:
-        """A URL httpx rejects is shown without its userinfo too."""
+        """A URL httpx2 rejects is shown without its userinfo too."""
         with pytest.raises(PaperlessError) as exc_info:
             PaperlessClient(f"http://scanner:{_URL_SECRET}@host:abc", _MOCK_AUTH)
         assert str(exc_info.value) == (
@@ -599,7 +599,7 @@ class TestUrlCredentialsNeverShown:
     def test_scheme_less_url_message_strips_the_password(
         self, sample_pdf: Path, sleeps: list[float], caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A URL with no scheme, which httpx cannot parse as userinfo, is cut too."""
+        """A URL with no scheme, which httpx2 cannot parse as userinfo, is cut too."""
         caplog.set_level(logging.WARNING, logger="saneless.paperless")
         client = PaperlessClient(
             url=f"scanner:{_URL_SECRET}@paperless:8000", token=_MOCK_AUTH
@@ -636,7 +636,7 @@ class TestUrlCredentialsNeverShown:
         """A redirect target carrying userinfo is redacted like the base URL."""
         target = f"https://scanner:{_URL_SECRET}@paperless.example/api/"
         handler = _CountingHandler(
-            _answering(httpx.Response(302, headers={"location": target}))
+            _answering(httpx2.Response(302, headers={"location": target}))
         )
         client = _upload_client(handler)
         try:
@@ -657,7 +657,7 @@ class TestUploadFailureTranslation:
     @pytest.mark.parametrize("exc_type", _TRANSIENT_TRANSPORT_CASES)
     def test_transient_transport_failure_is_retried_then_raises(
         self,
-        exc_type: type[httpx.TransportError],
+        exc_type: type[httpx2.TransportError],
         sample_pdf: Path,
         sleeps: list[float],
     ) -> None:
@@ -688,7 +688,7 @@ class TestUploadFailureTranslation:
     @pytest.mark.parametrize("exc_type", _TRANSIENT_TRANSPORT_CASES)
     def test_transient_transport_failure_falls_back_after_retries(
         self,
-        exc_type: type[httpx.TransportError],
+        exc_type: type[httpx2.TransportError],
         sample_pdf: Path,
         tmp_path: Path,
         sleeps: list[float],
@@ -713,11 +713,11 @@ class TestUploadFailureTranslation:
     ) -> None:
         """Two dropped connections then a 200 deliver to the API on attempt 3."""
 
-        def respond(call: int) -> httpx.Response:
+        def respond(call: int) -> httpx2.Response:
             if call <= 2:
                 msg = "Server disconnected without sending a response."
-                raise httpx.RemoteProtocolError(msg)
-            return httpx.Response(200, json="task-id")
+                raise httpx2.RemoteProtocolError(msg)
+            return httpx2.Response(200, json="task-id")
 
         handler = _CountingHandler(respond)
         client = _upload_client(handler)
@@ -734,7 +734,7 @@ class TestUploadFailureTranslation:
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
         """An empty ``ReadTimeout("")`` still says what happened (describe rule)."""
-        handler = _CountingHandler(_raising(httpx.ReadTimeout("")))
+        handler = _CountingHandler(_raising(httpx2.ReadTimeout("")))
         client = _upload_client(handler)
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -753,7 +753,7 @@ class TestUploadFailureTranslation:
         UnsupportedProtocol is a TransportError, so it must be caught before
         the retrying clause.
         """
-        failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
+        failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
         client = _upload_client(handler)
         try:
@@ -772,7 +772,7 @@ class TestUploadFailureTranslation:
     ) -> None:
         """D-10: no retry is not no fallback -- the scan is never lost."""
         consume_dir = tmp_path / "consume"
-        failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
+        failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:
@@ -799,7 +799,7 @@ class TestUploadFailureTranslation:
         """
         caplog.set_level(logging.WARNING, logger="saneless.paperless")
         consume_dir = tmp_path / "consume"
-        failure = httpx.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
+        failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:
@@ -815,14 +815,14 @@ class TestUploadFailureTranslation:
     def test_empty_url_fails_fast_through_the_real_transport(
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
-        """An empty paperless.url raises httpx's own text on the first request."""
+        """An empty paperless.url raises httpx2's own text on the first request."""
         client = PaperlessClient(url="", token=_MOCK_AUTH, max_retries=3)
         try:
             with pytest.raises(PaperlessError, match="protocol") as exc_info:
                 client.upload_document(sample_pdf, title="Empty URL")
         finally:
             client.close()
-        assert isinstance(exc_info.value.__cause__, httpx.UnsupportedProtocol)
+        assert isinstance(exc_info.value.__cause__, httpx2.UnsupportedProtocol)
         assert sleeps == []
 
     @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
@@ -842,7 +842,7 @@ class TestUploadFailureTranslation:
         consume_dir = tmp_path / "consume"
         handler = _CountingHandler(
             _answering(
-                httpx.Response(400, json={"title": ["This field may not be blank."]})
+                httpx2.Response(400, json={"title": ["This field may not be blank."]})
             )
         )
         client = _upload_client(
@@ -857,7 +857,7 @@ class TestUploadFailureTranslation:
             "Paperless rejected the upload (400 Bad Request): "
             "title: This field may not be blank."
         )
-        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+        assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
         assert handler.calls == 1
         assert sleeps == []
         assert not consume_dir.exists()
@@ -880,7 +880,7 @@ class TestUploadFailureTranslation:
         consume_dir = tmp_path / "consume"
         target = "https://paperless:8443/api/documents/post_document/"
         handler = _CountingHandler(
-            _answering(httpx.Response(301, headers={"location": target}))
+            _answering(httpx2.Response(301, headers={"location": target}))
         )
         client = _upload_client(
             handler, consume_dir=tmp_path / consume_name if consume_name else None
@@ -894,7 +894,7 @@ class TestUploadFailureTranslation:
             f"Paperless redirected the upload (301 Moved Permanently) to {target}; "
             "check paperless.url"
         )
-        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+        assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
         assert handler.calls == 1
         assert sleeps == []
         assert not consume_dir.exists()
@@ -903,7 +903,7 @@ class TestUploadFailureTranslation:
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
         """A 3xx with no target is final too, reported by status and body."""
-        handler = _CountingHandler(_answering(httpx.Response(304)))
+        handler = _CountingHandler(_answering(httpx2.Response(304)))
         client = _upload_client(handler)
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -926,11 +926,11 @@ class TestUploadFailureTranslation:
         """
         WR-03: the attempt log renders a 5xx as status and body, on one line.
 
-        httpx's own text for a status error spans three lines and names the
+        httpx2's own text for a status error spans three lines and names the
         full request URL.
         """
         caplog.set_level(logging.WARNING, logger="saneless.paperless")
-        handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
+        handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
         client = _upload_client(handler)
         try:
             with pytest.raises(PaperlessError):
@@ -952,7 +952,7 @@ class TestUploadFailureTranslation:
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
         """A 503 on every attempt exhausts the retries and names the status."""
-        handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
+        handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
         client = _upload_client(handler)
         try:
             with pytest.raises(
@@ -963,19 +963,19 @@ class TestUploadFailureTranslation:
             client.close()
         assert handler.calls == 3
         assert sleeps == [1, 2]
-        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+        assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
 
     def test_5xx_exhausted_message_is_one_line(
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
         """
-        EXC-02: httpx's two-line 5xx text never reaches the message.
+        EXC-02: httpx2's two-line 5xx text never reaches the message.
 
         ``str(HTTPStatusError)`` is ``Server error '503 ...' for url '...'``
         followed by a second ``For more information check:`` line, so the
         cause is rendered as status, reason and the one-line body instead.
         """
-        handler = _CountingHandler(_answering(httpx.Response(503, text="down\n")))
+        handler = _CountingHandler(_answering(httpx2.Response(503, text="down\n")))
         client = _upload_client(handler)
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -993,7 +993,7 @@ class TestUploadFailureTranslation:
     ) -> None:
         """A 503 on every attempt takes the fallback when one is configured."""
         consume_dir = tmp_path / "consume"
-        handler = _CountingHandler(_answering(httpx.Response(503, text="down")))
+        handler = _CountingHandler(_answering(httpx2.Response(503, text="down")))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:
             result = client.upload_document(sample_pdf, title="Down")
@@ -1008,7 +1008,7 @@ class TestUploadFailureTranslation:
     ) -> None:
         """A login page served with 200 is a PaperlessError, not a raw ValueError."""
         handler = _CountingHandler(
-            _answering(httpx.Response(200, text="<html>login</html>"))
+            _answering(httpx2.Response(200, text="<html>login</html>"))
         )
         client = _upload_client(handler)
         try:
@@ -1037,7 +1037,7 @@ class TestUploadFailureTranslation:
         raw ``FileNotFoundError``, which the CLI reports as a saneless bug.
         """
         missing = tmp_path / "gone.pdf"
-        handler = _CountingHandler(_answering(httpx.Response(200, json="task-id")))
+        handler = _CountingHandler(_answering(httpx2.Response(200, json="task-id")))
         client = _upload_client(handler, consume_dir=tmp_path / "consume")
         try:
             with pytest.raises(PaperlessError) as exc_info:
@@ -1054,8 +1054,8 @@ class TestUploadFailureTranslation:
     def test_other_http_error_raises_at_once(
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
-        """Any remaining httpx.HTTPError (TooManyRedirects) is wrapped and chained."""
-        failure = httpx.TooManyRedirects("Exceeded maximum allowed redirects.")
+        """Any remaining httpx2.HTTPError (TooManyRedirects) is wrapped and chained."""
+        failure = httpx2.TooManyRedirects("Exceeded maximum allowed redirects.")
         handler = _CountingHandler(_raising(failure))
         client = _upload_client(handler)
         try:
@@ -1116,7 +1116,7 @@ class TestRenderErrorBody:
         ``detail`` wins, then the first field error as ``field: message``,
         then the first entry of a top-level list.
         """
-        response = httpx.Response(400, json=payload)
+        response = httpx2.Response(400, json=payload)
         assert _render_error_body(response) == expected
 
     def test_html_body_is_one_bounded_line(self) -> None:
@@ -1128,7 +1128,7 @@ class TestRenderErrorBody:
         """
         line = "<p>502 Bad Gateway from the reverse proxy</p>\n"
         html = (line * (5000 // len(line) + 1))[:5000]
-        response = httpx.Response(502, text=html)
+        response = httpx2.Response(502, text=html)
         result = _render_error_body(response)
         assert "\n" not in result
         assert len(result) <= 201
@@ -1136,12 +1136,12 @@ class TestRenderErrorBody:
 
     def test_empty_body_says_so(self) -> None:
         """An empty body renders as an explicit marker, never an empty string."""
-        response = httpx.Response(500, text="")
+        response = httpx2.Response(500, text="")
         assert _render_error_body(response) == "(empty response body)"
 
     def test_multiline_json_detail_body_is_collapsed(self) -> None:
         """No path yields a newline, including JSON-derived text (T-28-24)."""
-        response = httpx.Response(400, json={"detail": "line one\nline two"})
+        response = httpx2.Response(400, json={"detail": "line one\nline two"})
         assert _render_error_body(response) == "line one line two"
 
     def test_full_body_is_logged_at_debug(
@@ -1149,7 +1149,7 @@ class TestRenderErrorBody:
     ) -> None:
         """The whole body stays diagnosable, but only at DEBUG (T-28-21)."""
         body = "<html>" + ("x" * 900) + "</html>"
-        response = httpx.Response(502, text=body)
+        response = httpx2.Response(502, text=body)
         with caplog.at_level(logging.DEBUG, logger="saneless.paperless"):
             _render_error_body(response)
         debug_messages = [
@@ -1175,8 +1175,8 @@ class TestPollTask:
     ) -> None:
         """A completed task is reached on both the v9 and the v10 wire shape."""
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=build_payload("SUCCESS", None))
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=build_payload("SUCCESS", None))
 
         client = _poll_client(handler)
         try:
@@ -1192,8 +1192,8 @@ class TestPollTask:
     ) -> None:
         """A failed task raises, carrying the message Paperless supplied."""
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=build_payload("FAILURE", "disk on fire"))
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=build_payload("FAILURE", "disk on fire"))
 
         client = _poll_client(handler)
         try:
@@ -1215,8 +1215,8 @@ class TestPollTask:
         timeout that also blocks the worker for the whole budget.
         """
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=build_payload("REVOKED", "cancelled"))
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=build_payload("REVOKED", "cancelled"))
 
         client = _poll_client(handler)
         try:
@@ -1234,11 +1234,11 @@ class TestPollTask:
         """Pitfall #8: a 200 with no task keeps polling rather than raising."""
         call_count = {"n": 0}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return httpx.Response(200, json=build_no_task())
-            return httpx.Response(200, json=build_payload("SUCCESS", None))
+                return httpx2.Response(200, json=build_no_task())
+            return httpx2.Response(200, json=build_payload("SUCCESS", None))
 
         client = _poll_client(handler)
         try:
@@ -1251,8 +1251,8 @@ class TestPollTask:
     def test_failure_without_a_message_still_raises(self) -> None:
         """A failure carrying neither field raises with a stand-in message."""
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=[{"status": "FAILURE", "task_id": "t1"}])
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=[{"status": "FAILURE", "task_id": "t1"}])
 
         client = _poll_client(handler)
         try:
@@ -1271,9 +1271,9 @@ class TestPollTask:
         """
         call_count = {"n": 0}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             call_count["n"] += 1
-            return httpx.Response(401, text="Invalid token")
+            return httpx2.Response(401, text="Invalid token")
 
         client = _poll_client(handler)
         try:
@@ -1292,8 +1292,8 @@ class TestPollTask:
         than a raw JSON blob.
         """
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(401, json={"detail": "Invalid token."})
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(401, json={"detail": "Invalid token."})
 
         client = _poll_client(handler)
         try:
@@ -1315,8 +1315,8 @@ class TestPollTask:
         """
         page = "<html>\n<body>\n" + ("<p>Bad Gateway</p>\n" * 260) + "</body></html>"
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(502, text=page)
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(502, text=page)
 
         client = _poll_client(handler)
         try:
@@ -1331,8 +1331,8 @@ class TestPollTask:
     def test_timeout_raises_naming_the_task(self) -> None:
         """A deadline-expired poll raises and names the task id."""
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
 
         client = _poll_client(handler)
         try:
@@ -1345,8 +1345,8 @@ class TestPollTask:
         """D-11: `except PaperlessError` catches the timeout subclass too."""
         assert issubclass(PaperlessTimeoutError, PaperlessError)
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
 
         client = _poll_client(handler)
         try:
@@ -1363,8 +1363,8 @@ class TestPollTask:
         unconditionally, so that threshold is the regression this asserts.
         """
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(200, json=[{"status": "PENDING", "task_id": "t1"}])
 
         client = _poll_client(handler)
         try:
@@ -1377,16 +1377,16 @@ class TestPollTask:
 
 
 _POLL_TRANSPORT_CASES = [
-    pytest.param(httpx.ConnectError("connection refused"), id="connect-error"),
-    pytest.param(httpx.ReadTimeout(""), id="read-timeout-empty"),
+    pytest.param(httpx2.ConnectError("connection refused"), id="connect-error"),
+    pytest.param(httpx2.ReadTimeout(""), id="read-timeout-empty"),
     pytest.param(
-        httpx.RemoteProtocolError("Server disconnected without sending a response."),
+        httpx2.RemoteProtocolError("Server disconnected without sending a response."),
         id="remote-protocol-error",
     ),
     # A RequestError but not a TransportError: a proxy sending a corrupt gzip
     # body.  It must not escape poll_task raw or fail the accepted upload (WR-05).
     pytest.param(
-        httpx.DecodingError("Error -3 while decompressing data"),
+        httpx2.DecodingError("Error -3 while decompressing data"),
         id="decoding-error",
     ),
 ]
@@ -1396,12 +1396,12 @@ _DUPLICATE_SENTENCE = (
 )
 
 
-def _task_answer(task: dict[str, object]) -> Callable[[int], httpx.Response]:
+def _task_answer(task: dict[str, object]) -> Callable[[int], httpx2.Response]:
     """Build a script that answers every poll with a v9 list holding ``task``."""
-    return _answering(httpx.Response(200, json=[task]))
+    return _answering(httpx2.Response(200, json=[task]))
 
 
-def _failed_poll_message(respond: Callable[[int], httpx.Response]) -> str:
+def _failed_poll_message(respond: Callable[[int], httpx2.Response]) -> str:
     """Poll ``t1`` against ``respond`` and return the PaperlessError text."""
     client = _poll_client(_CountingHandler(respond))
     try:
@@ -1426,11 +1426,11 @@ class TestPollTaskFailureTranslation:
         poll backs off between them exactly as it does for a pending task.
         """
 
-        def respond(call: int) -> httpx.Response:
+        def respond(call: int) -> httpx2.Response:
             if call <= 2:
                 msg = "reset"
-                raise httpx.ReadError(msg)
-            return httpx.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
+                raise httpx2.ReadError(msg)
+            return httpx2.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
 
         handler = _CountingHandler(respond)
         client = _poll_client(handler)
@@ -1444,7 +1444,7 @@ class TestPollTaskFailureTranslation:
 
     @pytest.mark.parametrize("failure", _POLL_TRANSPORT_CASES)
     def test_poll_deadline_after_transport_errors_names_the_last_error(
-        self, failure: httpx.RequestError, sleeps: list[float]
+        self, failure: httpx2.RequestError, sleeps: list[float]
     ) -> None:
         """
         D-11 / OUTC-07 / T-28-38: transport errors still end at the deadline.
@@ -1477,18 +1477,18 @@ class TestPollTaskFailureTranslation:
         self, sleeps: list[float]
     ) -> None:
         """
-        WR-05: an undecodable poll response is a blip, not a raw httpx escape.
+        WR-05: an undecodable poll response is a blip, not a raw httpx2 escape.
 
-        ``httpx.DecodingError`` is a ``RequestError`` but not a
+        ``httpx2.DecodingError`` is a ``RequestError`` but not a
         ``TransportError``; the upload was already accepted, so the poll keeps
         asking within its deadline (D-11).
         """
 
-        def respond(call: int) -> httpx.Response:
+        def respond(call: int) -> httpx2.Response:
             if call == 1:
                 msg = "Error -3 while decompressing data"
-                raise httpx.DecodingError(msg)
-            return httpx.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
+                raise httpx2.DecodingError(msg)
+            return httpx2.Response(200, json=[{"task_id": "t1", "status": "SUCCESS"}])
 
         handler = _CountingHandler(respond)
         client = _poll_client(handler)
@@ -1526,11 +1526,11 @@ class TestPollTaskFailureTranslation:
         not end with "last error: ...", which would blame the network.
         """
 
-        def respond(call: int) -> httpx.Response:
+        def respond(call: int) -> httpx2.Response:
             if call == 1:
                 msg = "connection refused"
-                raise httpx.ConnectError(msg)
-            return httpx.Response(200, json=[{"task_id": "t1", "status": "PENDING"}])
+                raise httpx2.ConnectError(msg)
+            return httpx2.Response(200, json=[{"task_id": "t1", "status": "PENDING"}])
 
         handler = _CountingHandler(respond)
         client = _poll_client(handler)
@@ -1546,7 +1546,7 @@ class TestPollTaskFailureTranslation:
 
     def test_poll_401_still_fails_at_once(self, sleeps: list[float]) -> None:
         """OUTC-07: a non-200 is not a transport blip and ends the poll at once."""
-        handler = _CountingHandler(_answering(httpx.Response(401, text="Invalid")))
+        handler = _CountingHandler(_answering(httpx2.Response(401, text="Invalid")))
         client = _poll_client(handler)
         try:
             with pytest.raises(PaperlessError, match="401 Unauthorized"):
@@ -1558,7 +1558,7 @@ class TestPollTaskFailureTranslation:
 
     def test_poll_non_json_200_is_a_paperless_error(self, sleeps: list[float]) -> None:
         """EXC-01: a login page served with 200 is not a raw ValueError."""
-        handler = _CountingHandler(_answering(httpx.Response(200, text="<html>")))
+        handler = _CountingHandler(_answering(httpx2.Response(200, text="<html>")))
         client = _poll_client(handler)
         try:
             with pytest.raises(
@@ -1608,7 +1608,7 @@ class TestPollTaskFailureTranslation:
                 }
             ],
         }
-        message = _failed_poll_message(_answering(httpx.Response(200, json=payload)))
+        message = _failed_poll_message(_answering(httpx2.Response(200, json=payload)))
         assert message == (
             "Paperless task t1 ended FAILURE: Paperless reported a failure but "
             f"supplied no message; {_DUPLICATE_SENTENCE}"
@@ -1677,31 +1677,33 @@ _METADATA_METHODS = [
 # (script, expected message suffix or None for ``describe(cause)``, cause type)
 _METADATA_FAILURES = [
     pytest.param(
-        _raising(httpx.ConnectError("connection refused")),
+        _raising(httpx2.ConnectError("connection refused")),
         "connection refused",
-        httpx.ConnectError,
+        httpx2.ConnectError,
         id="connect-error",
     ),
     pytest.param(
-        _raising(httpx.ReadTimeout("")),
+        _raising(httpx2.ReadTimeout("")),
         "ReadTimeout",
-        httpx.ReadTimeout,
+        httpx2.ReadTimeout,
         id="read-timeout-empty",
     ),
     pytest.param(
-        _answering(httpx.Response(500, text="boom")),
+        _answering(httpx2.Response(500, text="boom")),
         "500 Internal Server Error: boom",
-        httpx.HTTPStatusError,
+        httpx2.HTTPStatusError,
         id="500",
     ),
     pytest.param(
-        _answering(httpx.Response(403, json={"detail": "You do not have permission."})),
+        _answering(
+            httpx2.Response(403, json={"detail": "You do not have permission."})
+        ),
         "403 Forbidden: You do not have permission.",
-        httpx.HTTPStatusError,
+        httpx2.HTTPStatusError,
         id="403",
     ),
     pytest.param(
-        _answering(httpx.Response(200, text="<html>login</html>")),
+        _answering(httpx2.Response(200, text="<html>login</html>")),
         None,
         ValueError,
         id="non-json-200",
@@ -1727,7 +1729,7 @@ class TestMetadataFetchTranslation:
         self,
         method: str,
         noun: str,
-        respond: Callable[[int], httpx.Response],
+        respond: Callable[[int], httpx2.Response],
         suffix: str | None,
         cause_type: type[Exception],
     ) -> None:
@@ -1735,7 +1737,7 @@ class TestMetadataFetchTranslation:
         Every failure names the endpoint and base URL and keeps the cause.
 
         A status error is rendered as status, reason and the one-line body
-        rather than httpx's two-line text, so the message stays one line
+        rather than httpx2's two-line text, so the message stays one line
         (EXC-02); a non-JSON body ends with ``describe`` of the ValueError.
         """
         handler = _CountingHandler(respond)
@@ -1748,7 +1750,7 @@ class TestMetadataFetchTranslation:
         error = exc_info.value
         cause = error.__cause__
         assert isinstance(cause, cause_type)
-        assert not isinstance(error, httpx.HTTPError)
+        assert not isinstance(error, httpx2.HTTPError)
         expected_suffix = describe(cause) if suffix is None else suffix
         assert str(error) == (
             f"Could not fetch {noun} from Paperless at http://paperless.test:8000: "
@@ -1761,7 +1763,7 @@ class TestMetadataFetchTranslation:
     def test_metadata_list_response_is_returned(self, method: str, noun: str) -> None:
         """A bare-list response is returned unchanged."""
         items = [{"id": 1, "name": f"first {noun}"}]
-        handler = _CountingHandler(_answering(httpx.Response(200, json=items)))
+        handler = _CountingHandler(_answering(httpx2.Response(200, json=items)))
         client = _metadata_client(handler)
         try:
             assert getattr(client, method)() == items
@@ -1776,7 +1778,7 @@ class TestMetadataFetchTranslation:
         """A paginated dict response yields its ``results``."""
         items = [{"id": 2, "name": f"second {noun}"}]
         payload = {"count": 1, "next": None, "previous": None, "results": items}
-        handler = _CountingHandler(_answering(httpx.Response(200, json=payload)))
+        handler = _CountingHandler(_answering(httpx2.Response(200, json=payload)))
         client = _metadata_client(handler)
         try:
             assert getattr(client, method)() == items
@@ -1810,18 +1812,18 @@ class _PagedHandler:
     "Invalid page".
     """
 
-    def __init__(self, pages: dict[int, httpx.Response]) -> None:
+    def __init__(self, pages: dict[int, httpx2.Response]) -> None:
         """Build a handler that answers page N with ``pages[N]``."""
-        self.requests: list[httpx.Request] = []
+        self.requests: list[httpx2.Request] = []
         self._pages = pages
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """Record the request and answer the page it asks for."""
         self.requests.append(request)
         page = int(request.url.params.get("page", "1"))
         response = self._pages.get(page)
         if response is None:
-            return httpx.Response(404, json={"detail": "Invalid page."})
+            return httpx2.Response(404, json={"detail": "Invalid page."})
         return response
 
     @property
@@ -1866,9 +1868,11 @@ class TestMetadataPagination:
         )
         handler = _PagedHandler(
             {
-                1: httpx.Response(200, json=_page_payload(first, _next_link(noun, 2))),
-                2: httpx.Response(200, json=_page_payload(second, _next_link(noun, 3))),
-                3: httpx.Response(200, json=_page_payload(third, None)),
+                1: httpx2.Response(200, json=_page_payload(first, _next_link(noun, 2))),
+                2: httpx2.Response(
+                    200, json=_page_payload(second, _next_link(noun, 3))
+                ),
+                3: httpx2.Response(200, json=_page_payload(third, None)),
             }
         )
         assert _fetch(handler, method) == first + second + third
@@ -1890,8 +1894,8 @@ class TestMetadataPagination:
         foreign_next = f"http://{_FOREIGN_HOST}/api/{noun}/?page=2"
         handler = _PagedHandler(
             {
-                1: httpx.Response(200, json=_page_payload(first, foreign_next)),
-                2: httpx.Response(200, json=_page_payload(second, None)),
+                1: httpx2.Response(200, json=_page_payload(first, foreign_next)),
+                2: httpx2.Response(200, json=_page_payload(second, None)),
             }
         )
         assert _fetch(handler, method) == first + second
@@ -1912,7 +1916,7 @@ class TestMetadataPagination:
     ) -> None:
         """A bare JSON list is the whole collection: nothing more is asked for."""
         items = _items(noun, 1, 2)
-        handler = _PagedHandler({1: httpx.Response(200, json=items)})
+        handler = _PagedHandler({1: httpx2.Response(200, json=items)})
         assert _fetch(handler, method) == items
         assert len(handler.requests) == 1
 
@@ -1927,9 +1931,9 @@ class TestMetadataPagination:
         first = _items(noun, 1, 2)
         handler = _PagedHandler(
             {
-                1: httpx.Response(200, json=_page_payload(first, _next_link(noun, 2))),
-                2: httpx.Response(200, json=_page_payload([], _next_link(noun, 3))),
-                3: httpx.Response(200, json=_page_payload(_items(noun, 9, 1), None)),
+                1: httpx2.Response(200, json=_page_payload(first, _next_link(noun, 2))),
+                2: httpx2.Response(200, json=_page_payload([], _next_link(noun, 3))),
+                3: httpx2.Response(200, json=_page_payload(_items(noun, 9, 1), None)),
             }
         )
         assert _fetch(handler, method) == first
@@ -1942,10 +1946,10 @@ class TestMetadataPagination:
         """A 302 on page 2 is not followed; it fails the whole fetch."""
         handler = _PagedHandler(
             {
-                1: httpx.Response(
+                1: httpx2.Response(
                     200, json=_page_payload(_items(noun, 1, 1), _next_link(noun, 2))
                 ),
-                2: httpx.Response(
+                2: httpx2.Response(
                     302,
                     headers={"Location": f"http://{_FOREIGN_HOST}/api/{noun}/?page=2"},
                 ),
@@ -1954,7 +1958,7 @@ class TestMetadataPagination:
         with pytest.raises(PaperlessError) as exc_info:
             _fetch(handler, method)
         assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
-        assert isinstance(exc_info.value.__cause__, httpx.HTTPStatusError)
+        assert isinstance(exc_info.value.__cause__, httpx2.HTTPStatusError)
         assert handler.pages_requested == ["1", "2"]
         assert {request.url.host for request in handler.requests} == {_CONFIGURED_HOST}
 
@@ -1969,10 +1973,10 @@ class TestMetadataPagination:
         """
         handler = _PagedHandler(
             {
-                1: httpx.Response(
+                1: httpx2.Response(
                     200, json=_page_payload(_items(noun, 1, 1), _next_link(noun, 2))
                 ),
-                2: httpx.Response(200, json=_page_payload(_items(noun, 2, 1), None)),
+                2: httpx2.Response(200, json=_page_payload(_items(noun, 2, 1), None)),
             }
         )
         _fetch(handler, method)
@@ -2002,7 +2006,7 @@ class TestMetadataResponseShape:
         """
         handler = _PagedHandler(
             {
-                1: httpx.Response(
+                1: httpx2.Response(
                     200, json={"count": 1, "next": None, "results": results}
                 )
             }
@@ -2018,7 +2022,7 @@ class TestMetadataResponseShape:
     def test_a_page_without_results_fails(self, method: str, noun: str) -> None:
         """A paginated page with no ``results`` key is malformed, not empty."""
         handler = _PagedHandler(
-            {1: httpx.Response(200, json={"count": 0, "next": None})}
+            {1: httpx2.Response(200, json={"count": 0, "next": None})}
         )
         with pytest.raises(PaperlessError, match="page 1 did not hold a list"):
             _fetch(handler, method)
@@ -2026,7 +2030,7 @@ class TestMetadataResponseShape:
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     def test_a_bare_list_of_non_objects_fails(self, method: str, noun: str) -> None:
         """A bare list must hold objects too."""
-        handler = _PagedHandler({1: httpx.Response(200, json=["one", "two"])})
+        handler = _PagedHandler({1: httpx2.Response(200, json=["one", "two"])})
         with pytest.raises(PaperlessError, match="page 1 did not hold a list"):
             _fetch(handler, method)
 
@@ -2040,10 +2044,10 @@ class TestMetadataResponseShape:
         """
         handler = _PagedHandler(
             {
-                1: httpx.Response(
+                1: httpx2.Response(
                     200, json=_page_payload(_items(noun, 1, 2), _next_link(noun, 2))
                 ),
-                2: httpx.Response(200, json=_items(noun, 3, 2)),
+                2: httpx2.Response(200, json=_items(noun, 3, 2)),
             }
         )
         with pytest.raises(PaperlessError) as exc_info:
@@ -2058,7 +2062,7 @@ class TestMetadataResponseShape:
         self, method: str, noun: str, body: object
     ) -> None:
         """A scalar body is a PaperlessError naming the collection."""
-        handler = _PagedHandler({1: httpx.Response(200, json=body)})
+        handler = _PagedHandler({1: httpx2.Response(200, json=body)})
         with pytest.raises(PaperlessError) as exc_info:
             _fetch(handler, method)
         assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
@@ -2076,16 +2080,16 @@ class _EndlessHandler:
 
     def __init__(self, page_for: Callable[[int], object], limit: int = 50) -> None:
         """Build a handler that answers page N with ``page_for(N)``."""
-        self.requests: list[httpx.Request] = []
+        self.requests: list[httpx2.Request] = []
         self._page_for = page_for
         self._limit = limit
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """Record the request and answer it, refusing to go on forever."""
         self.requests.append(request)
         assert len(self.requests) <= self._limit, "the client never stopped"
         page = int(request.url.params.get("page", "1"))
-        return httpx.Response(200, json=self._page_for(page))
+        return httpx2.Response(200, json=self._page_for(page))
 
 
 def _fetch_endless(handler: _EndlessHandler, method: str) -> list[dict[str, object]]:
@@ -2236,13 +2240,13 @@ class TestConnectionTest:
 
     @pytest.mark.parametrize("exc_type", _CONNECTION_EXCEPTION_CASES)
     def test_transport_failures_are_unreachable(
-        self, exc_type: type[httpx.TransportError]
+        self, exc_type: type[httpx2.TransportError]
     ) -> None:
         """
         Every transport-level failure is UNREACHABLE, not an escaped exception.
 
         ConnectTimeout and ReadTimeout used to propagate past the narrow
-        `except httpx.ConnectError` and hit routes.py's blanket handler,
+        `except httpx2.ConnectError` and hit routes.py's blanket handler,
         surfacing as HTTP 502 {"status": "error"} -- which is none of the
         five outcomes OUTC-08 names.
         """
@@ -2261,7 +2265,7 @@ class TestConnectionTest:
         produced = {
             _connection_result_for_status(code) for code in (200, 401, 404, 500)
         }
-        produced.add(_connection_result_for_exception(httpx.ConnectError))
+        produced.add(_connection_result_for_exception(httpx2.ConnectError))
         assert member in produced, f"{member.name} is not produced by any input"
 
     def test_legacy_wire_strings_are_byte_identical(self) -> None:
@@ -2274,15 +2278,15 @@ class TestConnectionTest:
         """
         assert _connection_result_for_status(200) == "connected"
         assert _connection_result_for_status(401) == "token_rejected"
-        assert _connection_result_for_exception(httpx.ConnectError) == "unreachable"
+        assert _connection_result_for_exception(httpx2.ConnectError) == "unreachable"
 
     def test_connection_test_hits_the_tags_endpoint(self) -> None:
         """The probe is a one-row GET against /api/tags/."""
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             assert "/api/tags/" in str(request.url)
             assert "page_size=1" in str(request.url)
-            return httpx.Response(200, json={"count": 0, "results": []})
+            return httpx2.Response(200, json={"count": 0, "results": []})
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -2306,7 +2310,7 @@ class TestConnectionTimeout:
     """
     The probe can be bounded per request without changing any caller (APPL-02).
 
-    ``PaperlessClient`` sets one flat 30 s on its ``httpx.Client``, which is
+    ``PaperlessClient`` sets one flat 30 s on its ``httpx2.Client``, which is
     thirty seconds of a household member staring at a spinner when the
     paperless-ngx host is unplugged.  The status strip and ``saneless doctor``
     need a two-second answer, while ``GET /api/paperless/test`` deliberately
@@ -2314,7 +2318,7 @@ class TestConnectionTimeout:
     not a new constructor argument.
 
     Every assertion here reads ``request.extensions["timeout"]``, the dict
-    httpx hands the transport, rather than measuring wall-clock.  The suite
+    httpx2 hands the transport, rather than measuring wall-clock.  The suite
     forbids ``sleep`` and a timing assertion against a real socket would be
     flaky on a loaded machine; what actually needs proving is *which budget was
     sent*, and that is a value, not a duration.
@@ -2322,7 +2326,7 @@ class TestConnectionTimeout:
 
     @staticmethod
     def _recorded_timeout(
-        timeout: httpx.Timeout | None,
+        timeout: httpx2.Timeout | None,
     ) -> dict[str, float | None]:
         """
         Run ``test_connection`` and return the timeout the transport was given.
@@ -2333,14 +2337,14 @@ class TestConnectionTimeout:
                 untouched.
 
         Returns:
-            The ``timeout`` extension dict httpx handed the mock transport.
+            The ``timeout`` extension dict httpx2 handed the mock transport.
 
         """
         seen: list[dict[str, float | None]] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             seen.append(request.extensions["timeout"])
-            return httpx.Response(200, json={"count": 0, "results": []})
+            return httpx2.Response(200, json={"count": 0, "results": []})
 
         client = PaperlessClient(
             url="http://paperless:8000",
@@ -2384,7 +2388,7 @@ class TestConnectionTimeout:
 
     def test_explicit_timeout_is_sent_to_the_transport(self) -> None:
         """A passed bound reaches the request, connect and read separately."""
-        recorded = self._recorded_timeout(httpx.Timeout(5.0, connect=2.0))
+        recorded = self._recorded_timeout(httpx2.Timeout(5.0, connect=2.0))
         assert recorded["connect"] == 2.0
         assert recorded["read"] == 5.0
 
@@ -2396,12 +2400,12 @@ class TestConnectionTimeout:
         already covers it -- asserted here so bounding the probe rests on a
         tested claim rather than on reading the class hierarchy.
         """
-        result = _connection_result_for_exception(httpx.ConnectTimeout)
+        result = _connection_result_for_exception(httpx2.ConnectTimeout)
         assert result is ConnectionStatus.UNREACHABLE
 
     def test_read_timeout_is_unreachable(self) -> None:
         """A host that accepts and then says nothing is UNREACHABLE too."""
-        result = _connection_result_for_exception(httpx.ReadTimeout)
+        result = _connection_result_for_exception(httpx2.ReadTimeout)
         assert result is ConnectionStatus.UNREACHABLE
 
 
@@ -2420,9 +2424,9 @@ class TestConsumeDir:
         consume_dir = tmp_path / "nonexistent" / "consume"
         assert not consume_dir.exists()
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             msg = "connection refused"
-            raise httpx.ConnectError(msg)
+            raise httpx2.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -2448,9 +2452,9 @@ class TestConsumeDir:
         consume_dir = tmp_path / "existing-consume"
         consume_dir.mkdir()
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             msg = "connection refused"
-            raise httpx.ConnectError(msg)
+            raise httpx2.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -2577,9 +2581,9 @@ class TestConsumeDir:
         consume_dir = tmp_path / "warn-consume"
         assert not consume_dir.exists()
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             msg = "connection refused"
-            raise httpx.ConnectError(msg)
+            raise httpx2.ConnectError(msg)
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -2602,9 +2606,9 @@ class TestAuthHeader:
         """Authorization header contains Token prefix and credential."""
         captured_headers: dict[str, str | None] = {}
 
-        def handler(_request: httpx.Request) -> httpx.Response:
+        def handler(_request: httpx2.Request) -> httpx2.Response:
             captured_headers["auth"] = _request.headers.get("authorization")
-            return httpx.Response(200, json={"status": "ok"})
+            return httpx2.Response(200, json={"status": "ok"})
 
         transport = _make_transport(handler)
         auth = "my-secret-token"
@@ -2626,9 +2630,9 @@ class TestAuthHeader:
         """
         captured_headers: dict[str, str | None] = {}
 
-        def handler(request: httpx.Request) -> httpx.Response:
+        def handler(request: httpx2.Request) -> httpx2.Response:
             captured_headers["accept"] = request.headers.get("accept")
-            return httpx.Response(200, json={"count": 0, "results": []})
+            return httpx2.Response(200, json={"count": 0, "results": []})
 
         transport = _make_transport(handler)
         client = PaperlessClient(
@@ -2698,14 +2702,14 @@ class TestUploadResultContract:
         not None -- which then reaches poll_task as if it were a real task id.
         """
 
-        def handler(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
+        def handler(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(
                 200,
                 content=b"null",
                 headers={"content-type": "application/json"},
             )
 
-        transport = httpx.MockTransport(handler)
+        transport = httpx2.MockTransport(handler)
         client = PaperlessClient(
             "http://localhost:8000",
             "token",

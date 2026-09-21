@@ -72,7 +72,7 @@ from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
-    import httpx
+    import httpx2
 
 # Every ExitCode member, written out rather than derived, so that adding a
 # member to the enum fails here as well as in the two doc-truth tests.  D-01
@@ -120,7 +120,7 @@ class _ConnectedPaperless:
         """Accept and ignore every constructor argument."""
 
     def test_connection(
-        self, *, timeout: httpx.Timeout | None = None
+        self, *, timeout: httpx2.Timeout | None = None
     ) -> ConnectionStatus:
         """
         Report a healthy paperless-ngx.
@@ -710,7 +710,7 @@ class TestDoctorKeepsItsDocumentedExitCodes:
         """
         A malformed URL is the Paperless row, not exit 3.
 
-        ``PaperlessClient.__init__`` raises ``PaperlessError`` for a URL httpx
+        ``PaperlessClient.__init__`` raises ``PaperlessError`` for a URL httpx2
         will not parse, which the group guard would turn into exit 3 -- a code
         ``doctor``'s documented table does not list, and a refusal that would
         cost the operator the other four rows.

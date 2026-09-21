@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pytest
 from fastapi.routing import _IncludedRouter
 from PIL import Image, ImageDraw
@@ -315,7 +315,7 @@ def default_settings(tmp_path: Path) -> Settings:
     return build_settings(tmp_path)
 
 
-def _refuse_every_request(request: httpx.Request) -> httpx.Response:
+def _refuse_every_request(request: httpx2.Request) -> httpx2.Response:
     """
     Fail a Paperless request the way an unreachable server does.
 
@@ -323,11 +323,11 @@ def _refuse_every_request(request: httpx.Request) -> httpx.Response:
         request: The request the client tried to send.
 
     Raises:
-        httpx.ConnectError: Always, as a refused connection would.
+        httpx2.ConnectError: Always, as a refused connection would.
 
     """
     msg = "paperless unreachable in tests"
-    raise httpx.ConnectError(msg, request=request)
+    raise httpx2.ConnectError(msg, request=request)
 
 
 @pytest.fixture
@@ -368,7 +368,7 @@ def offline_paperless(monkeypatch: pytest.MonkeyPatch) -> list[float]:
             url=url,
             token=token,
             consume_dir=consume_dir,
-            transport=httpx.MockTransport(_refuse_every_request),
+            transport=httpx2.MockTransport(_refuse_every_request),
         )
 
     monkeypatch.setattr("saneless.web.app.PaperlessClient", build_client)

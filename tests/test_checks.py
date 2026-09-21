@@ -33,7 +33,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-import httpx
+import httpx2
 import pytest
 
 from saneless import checks
@@ -1462,7 +1462,7 @@ def _device(vendor: str = "Brother", model: str = "ADS-2700W") -> DeviceInfo:
 class _RequestCounter:
     """Counts the HTTP requests a Paperless check issues, and their timeouts."""
 
-    def __init__(self, responder: Callable[[httpx.Request], httpx.Response]) -> None:
+    def __init__(self, responder: Callable[[httpx2.Request], httpx2.Response]) -> None:
         """
         Wrap a responder so every call through it is recorded.
 
@@ -1474,7 +1474,7 @@ class _RequestCounter:
         self.count = 0
         self.timeouts: list[dict[str, float | None]] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """
         Record the request and delegate to the responder.
 
@@ -1490,7 +1490,7 @@ class _RequestCounter:
         return self.responder(request)
 
 
-def _ok_response(_request: httpx.Request) -> httpx.Response:
+def _ok_response(_request: httpx2.Request) -> httpx2.Response:
     """
     Answer every request with an empty, successful tag page.
 
@@ -1501,7 +1501,7 @@ def _ok_response(_request: httpx.Request) -> httpx.Response:
         A 200 with an empty result list.
 
     """
-    return httpx.Response(200, json={"count": 0, "results": []})
+    return httpx2.Response(200, json={"count": 0, "results": []})
 
 
 def _paperless(
@@ -1519,7 +1519,7 @@ def _paperless(
 
     """
     return PaperlessClient(
-        url=url, token=_REAL_TOKEN, transport=httpx.MockTransport(counter)
+        url=url, token=_REAL_TOKEN, transport=httpx2.MockTransport(counter)
     )
 
 
@@ -2172,8 +2172,8 @@ class TestPaperlessCheck:
 
         """
 
-        def responder(_request: httpx.Request) -> httpx.Response:
-            return httpx.Response(status_code, text="")
+        def responder(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(status_code, text="")
 
         counter = _RequestCounter(responder)
         client = _paperless(counter)
@@ -2196,9 +2196,9 @@ class TestPaperlessCheck:
 
         """
 
-        def responder(_request: httpx.Request) -> httpx.Response:
+        def responder(_request: httpx2.Request) -> httpx2.Response:
             msg = "no route"
-            raise httpx.ConnectError(msg)
+            raise httpx2.ConnectError(msg)
 
         counter = _RequestCounter(responder)
         client = _paperless(counter)
@@ -2862,7 +2862,7 @@ def _gate_sampling_context(
 
     monkeypatch.setattr(checks, "_directory_accepts_a_write", sampling_write)
 
-    def sampling_response(request: httpx.Request) -> httpx.Response:
+    def sampling_response(request: httpx2.Request) -> httpx2.Response:
         probe.sample("paperless")
         return _ok_response(request)
 

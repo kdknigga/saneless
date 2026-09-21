@@ -23,11 +23,9 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from httpx2 import Response
-
     from saneless.job import Job
 
-import httpx
+import httpx2
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
@@ -1050,13 +1048,13 @@ _OWNER_COOKIE = "saneless_owner"
 _MINIMUM_OWNER_COOKIE_LENGTH = 43
 
 
-def _owner_set_cookie(response: Response) -> str | None:
+def _owner_set_cookie(response: httpx2.Response) -> str | None:
     """
     Return the raw ``Set-Cookie`` header carrying the owner token, if any.
 
     The raw header is parsed instead of the client's cookie jar because the jar
     normalises away exactly what D-23 pins: an absent ``Max-Age`` and an absent
-    ``Secure`` are both invisible once httpx has turned the header into a jar
+    ``Secure`` are both invisible once httpx2 has turned the header into a jar
     entry, so a jar assertion could not tell a session cookie from a persistent
     one.
 
@@ -2004,13 +2002,13 @@ _SCRIPT_FILTER = "<script>alert(1)</script>"
 
 
 class _RecordingTransport:
-    """An httpx handler that records every request and answers with no tags."""
+    """An httpx2 handler that records every request and answers with no tags."""
 
     def __init__(self) -> None:
         """Start with an empty record."""
-        self.requests: list[httpx.Request] = []
+        self.requests: list[httpx2.Request] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """
         Record the request and answer with an empty paperless-ngx page.
 
@@ -2023,7 +2021,7 @@ class _RecordingTransport:
 
         """
         self.requests.append(request)
-        return httpx.Response(200, json={"count": 0, "results": []})
+        return httpx2.Response(200, json={"count": 0, "results": []})
 
 
 def _serve_tag_rows(client: TestClient) -> FastAPI:
@@ -2058,7 +2056,7 @@ def _count_upstream(app: FastAPI) -> _RecordingTransport:
     app.state.paperless = PaperlessClient(
         url="http://paperless.invalid:8000",
         token="a-real-looking-token",
-        transport=httpx.MockTransport(handler),
+        transport=httpx2.MockTransport(handler),
     )
     return handler
 
@@ -2652,7 +2650,7 @@ class _MetadataRequestCounter:
         """Start with nothing recorded."""
         self.paths: list[str] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """
         Record the request's path and answer with an empty collection.
 
@@ -2665,7 +2663,7 @@ class _MetadataRequestCounter:
 
         """
         self.paths.append(request.url.path)
-        return httpx.Response(200, json={"count": 0, "results": []})
+        return httpx2.Response(200, json={"count": 0, "results": []})
 
     def count(self, path: str) -> int:
         """
@@ -2713,7 +2711,7 @@ def _counted_app(
     app.state.paperless = PaperlessClient(
         url="http://localhost:8000",
         token=credential,
-        transport=httpx.MockTransport(counter),
+        transport=httpx2.MockTransport(counter),
     )
     return app, counter
 
@@ -2798,7 +2796,7 @@ class TestHiddenControlsCostNoMetadataFetch:
 
 
 # A Paperless URL configured behind a reverse proxy may carry Basic-auth
-# userinfo, and httpx puts the URL it could not reach into the exception's
+# userinfo, and httpx2 puts the URL it could not reach into the exception's
 # string form.  Both halves are asserted absent from the log.
 _CREDENTIALLED_URL = "https://user:pass@paperless.example/api/tags/"
 
@@ -2820,7 +2818,7 @@ class TestRouteLogsNameExceptionsOnly:
         """The userinfo and the host both stay out of the record (ASVS V7)."""
 
         def _raise_with_the_url() -> str:
-            raise httpx.ConnectError(_CREDENTIALLED_URL)
+            raise httpx2.ConnectError(_CREDENTIALLED_URL)
 
         app = _simple_form_app(tmp_path)
         app.state.paperless.test_connection = _raise_with_the_url
