@@ -46,6 +46,8 @@ from saneless.vocabulary import TITLE_MAX_LENGTH, ProfileStorage, local_time
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
+    from pydantic_core import ErrorDetails
+
 
 class TestLoadSettingsFromToml:
     """Settings load correctly from a TOML file."""
@@ -888,6 +890,92 @@ log_level = "TRACE"
         assert len(lines) == 2
 
 
+class TestTomlKeyCaseContract:
+    """
+    TOML section and key names are matched byte-exactly (DEP-02, DEP-03, D-06).
+
+    pydantic-settings 2.15.0 made its file sources honour ``case_sensitive``,
+    which defaults to False, so a miscased top-level ``[Scanner]`` would bind
+    into ``scanner`` instead of being reported and the Phase 27 strictness
+    contract would weaken without a word. Nested keys were never folded; they
+    are pinned here so a later flip upstream cannot pass unnoticed.
+    """
+
+    def test_miscased_section_is_reported_not_bound(self, tmp_config_dir: Path) -> None:
+        """``[Scanner]`` is an unknown section, never a bound ``scanner`` (D-06)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_section.toml",
+            '[Scanner]\nhost = "x"\n\n[profiles.default]\n',
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith("  unknown section 'Scanner'")
+        ]
+        assert len(matching) == 1
+
+    def test_miscased_nested_key_stays_unknown(self, tmp_config_dir: Path) -> None:
+        """``[paperless] Token`` is still matched case-sensitively (DEP-03)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_token.toml",
+            '[paperless]\nToken = "x"\n\n[profiles.default]\n',
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith("  [paperless] unknown key 'Token'")
+        ]
+        assert len(matching) == 1
+
+    def test_miscased_nested_key_with_underscore_stays_unknown(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``[output] Web_Port`` is still matched case-sensitively (DEP-03)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_web_port.toml",
+            "[output]\nWeb_Port = 9\n\n[profiles.default]\n",
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith("  [output] unknown key 'Web_Port'")
+        ]
+        assert len(matching) == 1
+
+    def test_miscased_section_still_suggests_the_real_section(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """The ``[Paperless]`` close-match hint survives the upgrade (D-05)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_hint.toml",
+            '[Paperless]\nurl = "x"\n\n[profiles.default]\n',
+        )
+        message = str(err)
+        assert "did you mean [paperless]" in message
+        assert "profiles.Paperless" not in message
+
+    def test_correctly_cased_section_still_loads(self, tmp_config_dir: Path) -> None:
+        """
+        Positive control: the correct spelling still binds (D-06).
+
+        Without it this class could pass because every section errors.
+        """
+        config_file = tmp_config_dir / "correctly_cased.toml"
+        config_file.write_text('[scanner]\nhost = "x"\n\n[profiles.default]\n')
+        settings = load_settings(config_path=str(config_file))
+        assert settings.scanner.host == "x"
+
+    def test_capitalised_profile_name_is_a_distinct_profile(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``[profiles.Default]`` is not the default profile (D-08)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_profile.toml",
+            '[profiles.Default]\nsource = "ADF"\n',
+        )
+        assert "A 'default' profile must be defined in config" in str(err)
+
+
 class TestConfigErrorsNeverEchoValues:
     """
     A config error never contains an input value (D-14, CFG-05).
@@ -952,6 +1040,64 @@ class TestConfigErrorsNeverEchoValues:
             load_settings()
         assert "paperless" in str(exc_info.value)
         self._assert_value_absent(exc_info.value, value)
+
+    def test_never_echoes_token_whatever_wording_upstream_carries(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A token reaching the render boundary as an error's input is redacted.
+
+        pydantic's ``msg`` carries no input today, so the load is the standing
+        case and the direct render call is the guard: an upstream wording
+        change that started interpolating the input must still not put the
+        Paperless token in a user-visible line (D-07, CFG-05).
+        """
+        secret = "tok-SECRET-4f1c9ba27e5d8031-DISTINCTIVE"
+        err = _load_error(
+            tmp_config_dir / "long_token.toml",
+            f'[paperless]\ntokne = "{secret}"\n\n[profiles.default]\n',
+        )
+        self._assert_value_absent(err, secret)
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": f"Input should be a valid string (got {secret})",
+            "input": secret,
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert secret not in lines[0]
+
+    def test_redaction_leaves_the_product_contract_lines_alone(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """Redacting inputs keeps the one-line-per-error shape (D-07, D-10)."""
+        err = _load_error(
+            tmp_config_dir / "several_redacted.toml",
+            """\
+[paperless]
+tokne = "x"
+
+[output]
+web_port = "abc"
+log_level = "TRACE"
+
+[profiles.default]
+""",
+        )
+        body = _error_lines(err)[1:]
+        assert len(body) == 3
+        assert any(
+            line.startswith("  [paperless] unknown key 'tokne'") for line in body
+        )
+        assert any(
+            line.startswith("  [output] web_port: Input should be a valid integer")
+            for line in body
+        )
+        assert any(
+            line.startswith("  [output] log_level: Input should be 'DEBUG', ")
+            for line in body
+        )
 
 
 @pytest.fixture
