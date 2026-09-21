@@ -1079,20 +1079,29 @@ def _render_error(
     error_type: str,
     message: str,
     env_data: Mapping[str, object],
+    value: object,
 ) -> str:
     """
     Render one pydantic error as a ``[section] key`` line.
 
+    The input's text is struck out of ``message`` here, before any branch
+    composes a line, rather than at the call site: that makes this function
+    structurally unable to return a line built from an unredacted upstream
+    message, whatever a future caller does with the result.
+
     Args:
         loc: The error's location.
         error_type: The error's pydantic type, e.g. ``extra_forbidden``.
-        message: pydantic's short ``msg``, which never contains the input.
+        message: pydantic's short ``msg``, whose wording is upstream-owned.
         env_data: The environment's contribution, for attribution.
+        value: The error's ``input`` member -- the text that must not reach
+            the rendered line.
 
     Returns:
         The error line, without indentation.
 
     """
+    message = _redact_input(message, value)
     head = loc[0] if loc else None
     if not isinstance(head, str) or head not in Settings.model_fields:
         if error_type == "extra_forbidden" and len(loc) == 1:
@@ -1120,32 +1129,42 @@ def _render_error(
 
 
 _MIN_REDACTED_INPUT: Final = 2
-"""The shortest input string worth redacting from a rendered error line."""
+"""The shortest input string worth redacting from an upstream message."""
 
 
-def _redact_input(line: str, value: object) -> str:
+def _redact_input(text: str, value: object) -> str:
     """
-    Remove an error's input text from an already-rendered line.
+    Remove an error's input text from an upstream message fragment.
 
-    ``_render_error`` reads only ``loc``, ``type`` and ``msg``, and pydantic's
-    ``msg`` carries no input today -- but that wording belongs to pydantic, not
-    to this project, and for ``tokne = "..."`` the input is the Paperless
-    token. Redacting here means no wording upstream can put a config value in a
-    line a user pastes into a bug report. Strings shorter than two characters
-    are left alone: they cannot be a credential and replacing them would mangle
-    ordinary words inside an upstream message.
+    pydantic's ``msg`` carries no input today -- but that wording belongs to
+    pydantic, not to this project, and for ``tokne = "..."`` the input is the
+    Paperless token. Redacting it means no wording upstream can put a config
+    value in a line a user pastes into a bug report.
+
+    The scope is deliberately the message alone, not the finished line.
+    pydantic's ``msg`` is the only part of a rendered line that comes from
+    outside this module: the section label, the key name, the did-you-mean
+    hint and the valid-keys list are all built from this module's own field
+    names. Replacing text across the whole line strikes the hint out whenever
+    a config value happens to equal a field name -- ``hst = "host"`` would
+    lose both the suggestion and the first valid key -- which destroys the
+    very part of the message the operator needs.
+
+    Strings shorter than two characters are left alone: they cannot be a
+    credential and replacing them would mangle ordinary words inside an
+    upstream message.
 
     Args:
-        line: The rendered error line.
+        text: The upstream message fragment.
         value: The error's ``input`` member.
 
     Returns:
-        The line with every occurrence of the input's text replaced.
+        The text with every occurrence of the input's own text replaced.
 
     """
     if not isinstance(value, str) or len(value) < _MIN_REDACTED_INPUT:
-        return line
-    return line.replace(value, "<value omitted>")
+        return text
+    return text.replace(value, "<value omitted>")
 
 
 def _render_error_lines(
@@ -1155,11 +1174,12 @@ def _render_error_lines(
     Render every validation error as one line, sorted for stable output.
 
     Only ``loc``, ``type`` and ``msg`` are rendered; ``ctx`` is never touched.
-    ``input`` is read for one purpose only -- to strike its own text back out
-    of the finished line -- so a rendered line cannot carry a config value
-    whatever wording pydantic's ``msg`` arrives with. Redaction happens before
-    the sort, so the order stays a property of the text that is actually
-    returned.
+    ``input`` is read for one purpose only -- to strike its own text out of
+    pydantic's ``msg`` before that wording is composed into a line -- so a
+    rendered line cannot carry a config value whatever wording pydantic's
+    ``msg`` arrives with, and this project's own vocabulary in the same line
+    is never touched. Redaction happens before the sort, so the order stays a
+    property of the text that is actually returned.
 
     Args:
         errors: ``ValidationError.errors()``.
@@ -1170,10 +1190,7 @@ def _render_error_lines(
 
     """
     return sorted(
-        _redact_input(
-            _render_error(err["loc"], err["type"], err["msg"], env_data),
-            err["input"],
-        )
+        _render_error(err["loc"], err["type"], err["msg"], env_data, err["input"])
         for err in errors
     )
 
