@@ -17,7 +17,6 @@ import sys
 import threading
 import time
 import tomllib
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
@@ -2553,6 +2552,11 @@ def _invoke_on_a_worker_thread(runner: CliRunner, args: list[str]) -> Result:
     Handing the invocation to a worker thread restores the production
     precondition without stubbing uvicorn or weakening what is asserted.
 
+    The thread is a daemon joined with a timeout below pytest's own, so a
+    worker that wedges inside uvicorn fails this test with the message below
+    instead of hanging the run: a pool's ``shutdown(wait=True)`` would rejoin
+    the stuck worker and a non-daemon thread would hold interpreter exit open.
+
     Args:
         runner: The CliRunner to invoke with.
         args: The command line to pass to ``cli``.
@@ -2561,8 +2565,15 @@ def _invoke_on_a_worker_thread(runner: CliRunner, args: list[str]) -> Result:
         The Result the runner produced on the worker thread.
 
     """
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(runner.invoke, cli, args).result(timeout=60)
+    outcome: list[Result] = []
+    thread = threading.Thread(
+        target=lambda: outcome.append(runner.invoke(cli, args)), daemon=True
+    )
+    thread.start()
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "the CLI invocation did not finish"
+    assert outcome, "the CLI invocation produced no result"
+    return outcome[0]
 
 
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
