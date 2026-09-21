@@ -48,8 +48,18 @@ The citation guard holds every source, template, style and script file under
 ``src/`` to comments that give their own reasons, because the planning records
 they might otherwise point at do not ship with the product.
 
-Plain-text assertions only: the contract is what an operator copies, not what a
-YAML parser makes of it.
+The Phase 35 tests hold the declared ``>=`` floors to the versions ``uv.lock``
+resolves, and hold the ``anyio`` ceiling to its declaration. The container
+installs the built wheel with pip, which resolves from the floors and never
+reads the lock, so until the pins land the floors are the only thing a
+non-lock install obeys (DEP-12, DEP-13, D-09, D-10, D-11, D-17).
+
+Plain-text assertions, with one stated exception: the contract is what an
+operator copies, not what a YAML parser makes of it. The exception is the
+floor-to-lock guard at the foot of this file, which parses ``uv.lock`` with
+``tomllib`` because that file is machine-generated, is copied by nobody, and
+hides the one failure a line scanner cannot see -- two ``[[package]]`` entries
+for a single declared name.
 """
 
 from __future__ import annotations
