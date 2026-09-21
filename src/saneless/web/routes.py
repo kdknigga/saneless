@@ -65,7 +65,7 @@ __all__ = ["router"]
 logger = logging.getLogger(__name__)
 
 # Every handler below is a plain ``def`` on purpose.  Each one calls blocking
-# code -- sync httpx to Paperless, sqlite through the job store, the worker --
+# code -- sync httpx2 to Paperless, sqlite through the job store, the worker --
 # and FastAPI runs ``def`` handlers on its threadpool, so a slow Paperless call
 # cannot stall ``/health`` or the status poll.  The shared state
 # they touch is locked: the JobStore's RLock, the worker's profile lock and the
@@ -1012,7 +1012,7 @@ def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
         return {"status": status}
     except Exception as exc:
         # The class name and not the exception: a configured paperless.url may
-        # carry ``user:pass@`` and httpx puts the URL it could not reach in the
+        # carry ``user:pass@`` and httpx2 puts the URL it could not reach in the
         # exception's string form, which is why every handler in this module
         # names the class instead (ASVS V7).
         logger.warning("Paperless connection test failed: %s", type(exc).__name__)

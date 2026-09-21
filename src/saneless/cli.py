@@ -1219,7 +1219,7 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
         click.echo(f"Serving on {url}", err=True)
 
     # uvicorn follows the configured log_level, not -v: -v is saneless's own
-    # detail and must not turn on uvicorn's or httpx's debug output. The
+    # detail and must not turn on uvicorn's or httpx2's debug output. The
     # validated log level lower-cases to a name uvicorn accepts.
     #
     # The config needs nothing extra for the streaming mode, and adding
@@ -1483,7 +1483,7 @@ def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
     """
     Build a Paperless client for one ``doctor`` run, or report that there is none.
 
-    ``PaperlessClient.__init__`` refuses exactly one thing -- a URL httpx will
+    ``PaperlessClient.__init__`` refuses exactly one thing -- a URL httpx2 will
     not parse -- and it refuses it with ``PaperlessError``, which the group
     guard would turn into exit 3. That would cost the operator the other four
     rows to report a fact the Paperless row already has a sentence for, and it

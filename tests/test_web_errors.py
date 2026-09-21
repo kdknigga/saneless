@@ -749,7 +749,7 @@ def _control_character_request() -> Request:
     """
     Build a request whose method and path carry control characters.
 
-    httpx strips control characters from a URL, so the scope is built directly
+    httpx2 strips control characters from a URL, so the scope is built directly
     rather than sent through ``TestClient``, as the cross-origin guard's test
     does.
 

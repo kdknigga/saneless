@@ -2926,7 +2926,7 @@ class TestServeCommand:
         With ``-v`` uvicorn still gets the configured level, not ``debug``.
 
         ``-v`` is saneless's own detail; turning uvicorn up with it would drag
-        its and httpx's debug output into the log.
+        its and httpx2's debug output into the log.
         """
         runs = _fake_server_run(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)

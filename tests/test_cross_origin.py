@@ -439,7 +439,7 @@ def test_rejection_log_escapes_control_characters_in_the_path(
     Control characters in the decoded path reach the log line escaped.
 
     uvicorn percent-decodes ``%0A`` and ``%1B`` into ``scope["path"]``, but
-    httpx strips control characters from a URL, so the scope is driven into
+    httpx2 strips control characters from a URL, so the scope is driven into
     the guard directly rather than through ``TestClient``.  The standard
     library's URL parser drops the newline; ``%r`` escapes the rest, so a
     terminal escape sequence cannot rewrite what an operator reads.

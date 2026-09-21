@@ -201,9 +201,11 @@ def configure_logging(
         root_logger.addHandler(mirror_handler)
 
     # -v is saneless's own detail. The root logger keeps the configured level so
-    # httpx, multipart and uvicorn do not flood the log -- httpx's DEBUG output
-    # can include the Paperless Authorization header, and that token must not
-    # reach a log. NOTSET on the non-verbose path makes repeated calls
-    # idempotent instead of leaking an earlier call's DEBUG.
+    # httpx2, multipart and uvicorn do not flood the log. Library DEBUG output
+    # is also not saneless's to audit: httpcore2 logs full response headers
+    # today and nothing stops it logging request headers tomorrow, and the
+    # Paperless Authorization header must not reach a log. NOTSET on the
+    # non-verbose path makes repeated calls idempotent instead of leaking an
+    # earlier call's DEBUG.
     logging.getLogger("saneless").setLevel(logging.DEBUG if verbose else logging.NOTSET)
     return attached
