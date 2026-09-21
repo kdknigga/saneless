@@ -71,7 +71,7 @@ from saneless.vocabulary import (
 from tests.conftest import StubScannerBackend, build_settings, scan_batch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import AsyncIterator, Callable, Generator
 
     from click.testing import Result
 
@@ -2515,6 +2515,27 @@ def _record_sockets(monkeypatch: pytest.MonkeyPatch) -> list[socket.socket]:
     return made
 
 
+@contextlib.asynccontextmanager
+async def _refusing_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """
+    Refuse to start, the way a lifespan with a failed pre-flight would.
+
+    The ``yield`` below the raise is unreachable on purpose: it is what makes
+    this function an async generator, which is what ``asynccontextmanager``
+    needs to accept it at all.
+
+    Args:
+        _app: The app FastAPI hands to its lifespan; this one ignores it.
+
+    Yields:
+        Nothing -- the raise happens before the yield is ever reached.
+
+    """
+    msg = "the lifespan refuses to start"
+    raise RuntimeError(msg)
+    yield
+
+
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeCommand:
     """
@@ -2541,6 +2562,15 @@ class TestServeCommand:
             return object()
 
         monkeypatch.setattr("saneless.cli.create_app", fake_create_app)
+
+    @staticmethod
+    def _refusing_create_app(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace create_app with a real app whose lifespan refuses to start."""
+
+        def failing_create_app(*_args: object, **_kwargs: object) -> FastAPI:
+            return FastAPI(lifespan=_refusing_lifespan)
+
+        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
 
     def test_serve_binds_the_configured_defaults(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2981,6 +3011,45 @@ class TestServeCommand:
         assert _failure_lines(result) == [
             f"Serving on http://127.0.0.1:{run.port}",
             f"The web server could not start on http://127.0.0.1:{run.port}; "
+            "the cause is in the preceding log lines",
+        ]
+        assert "Traceback" not in result.output
+
+    def test_serve_exits_two_when_the_lifespan_refuses(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Uvicorn's own start-up exit code never becomes this CLI's (DEP-09, D-13).
+
+        Nothing about uvicorn is stubbed here (D-14): ``serve`` binds a real
+        ephemeral loopback socket and hands it to the real
+        ``uvicorn.Server.run(sockets=...)``, so the production pre-bound-socket
+        path executes end to end. Newer uvicorn exits the process itself when
+        start-up fails, with a code that happens to be this project's Paperless
+        code, so a caller reading exit codes would be told the wrong cause.
+
+        The lifespan is made to refuse by patching ``saneless.cli.create_app``
+        rather than by pointing a configured directory somewhere unwritable
+        (the corrected D-15): the CLI's own settings pre-flight calls
+        ``validate_settings_dirs`` and exits 2 from there, before
+        ``_run_server`` is ever reached, so the configuration route would pass
+        on an unfixed tree and prove nothing.
+        """
+        self._refusing_create_app(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
+
+        result = runner.invoke(cli, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        lines = _failure_lines(result)
+        # The port is the OS's, so it is read back from the announcement and
+        # then required to be the same one the failure line names.
+        announced = re.fullmatch(r"Serving on http://127\.0\.0\.1:(\d+)", lines[0])
+        assert announced is not None, result.output
+        port = announced[1]
+        assert lines == [
+            f"Serving on http://127.0.0.1:{port}",
+            f"The web server could not start on http://127.0.0.1:{port}; "
             "the cause is in the preceding log lines",
         ]
         assert "Traceback" not in result.output
