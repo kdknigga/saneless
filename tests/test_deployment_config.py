@@ -58,6 +58,13 @@ import os
 import re
 import subprocess
 import sys
+
+# The single exception to this module's plain-text rule, and the only import
+# here that parses anything. It serves the floor-to-lock guard at the foot of
+# the file, where the reason is set out in full: `uv.lock` is
+# machine-generated TOML that no operator copies, and a line scanner cannot
+# see two `[[package]]` entries for one name.
+import tomllib
 from pathlib import Path
 
 from saneless.config import (
@@ -79,6 +86,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
 README = REPO_ROOT / "README.md"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+UV_LOCK = REPO_ROOT / "uv.lock"
 DOCS_DIR = REPO_ROOT / "docs"
 
 DIRECTORY_MOUNT = "./config:/etc/saneless"
@@ -2824,4 +2832,258 @@ def test_ruff_still_exempts_the_runtime_evaluated_route_annotations() -> None:
         "Restore runtime-evaluated-decorators in pyproject.toml, and check "
         "the APIRouter is still constructed in the module that decorates "
         f"with it:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The declared floors against the versions uv.lock resolves (D-09, D-10, D-11)
+# ---------------------------------------------------------------------------
+
+# This is the one guard in this file that parses rather than matching plain
+# text, and the departure is deliberate. Everywhere else the contract is what
+# an operator copies, so a parser would assert something no reader ever sees.
+# ``uv.lock`` is the opposite: machine-generated TOML that nobody copies, and
+# the failure that most needs catching here -- one declared name resolved into
+# two ``[[package]]`` entries split by an environment marker -- is invisible to
+# a line scanner, because both entries are well formed and neither is wrong on
+# its own. ``tomllib`` is stdlib, so the parse costs no dependency and no
+# subprocess.
+
+# A declared requirement: a name, optional bracketed extras, then a single
+# ``>=`` floor. The floor stops at a comma, a semicolon or whitespace, so a
+# spec carrying an environment marker or a second bound does not match -- and a
+# spec that does not match is a reported offender, never a silent skip.
+_REQUIREMENT = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"(?:\[(?P<extras>[^\]]*)\])?"
+    r">=(?P<floor>[^,;\s]+)$"
+)
+
+# The leading distribution name of a ``[tool.uv]`` constraint string, which
+# carries an upper bound rather than a floor and so cannot use the pattern
+# above.
+_CONSTRAINT_NAME = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)")
+
+# The anyio ceiling, written once and spelled from the same pair, so loosening
+# the declaration and loosening the comparison cannot drift apart.
+_ANYIO_CEILING = (4, 15)
+_ANYIO_CEILING_SPEC = f"<{_ANYIO_CEILING[0]}.{_ANYIO_CEILING[1]}"
+
+
+def _canonical_name(name: str) -> str:
+    """
+    Return ``name`` in the canonical form both files can be compared on.
+
+    ``pyproject.toml`` and ``uv.lock`` are each free to spell a distribution
+    with either separator and either case, so neither side is authoritative
+    about punctuation.
+
+    Args:
+        name: A distribution name as either file happens to spell it.
+
+    Returns:
+        The name lower-cased, with every run of ``-``, ``_`` and ``.``
+        collapsed to a single ``-``.
+
+    """
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _locked_versions() -> dict[str, list[str]]:
+    """
+    Return every ``[[package]]`` version in ``uv.lock``, keyed by canonical name.
+
+    The value is a list and not a scalar on purpose: detecting a name that
+    resolved to more than one entry is half of what the guard below is for,
+    and a dict of scalars would silently keep whichever entry came last.
+
+    Returns:
+        Canonical distribution name -> every version the lock holds for it.
+
+    """
+    lock = tomllib.loads(UV_LOCK.read_text(encoding="utf-8"))
+    versions: dict[str, list[str]] = {}
+    for package in lock["package"]:
+        versions.setdefault(_canonical_name(package["name"]), []).append(
+            package["version"]
+        )
+    return versions
+
+
+def _declared_requirements() -> list[tuple[str, str]]:
+    """
+    Return every declared requirement paired with the table it was declared in.
+
+    Returns:
+        ``(where, spec)`` pairs covering ``[project].dependencies`` and then
+        ``[dependency-groups].dev``, each in its declared order.
+
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    project = [
+        ("[project].dependencies", spec)
+        for spec in pyproject["project"]["dependencies"]
+    ]
+    dev = [
+        ("[dependency-groups].dev", spec)
+        for spec in pyproject["dependency-groups"]["dev"]
+    ]
+    return project + dev
+
+
+def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
+    """
+    Every declared ``>=`` floor equals the version ``uv.lock`` resolves for it.
+
+    The Dockerfile installs the built wheel with pip, which resolves from
+    these floors and never reads the lock. A floor left below the locked
+    version therefore admits into the shipped image the very tree this project
+    upgraded away from, and nothing else in the repository would notice. The
+    rule is equality, not satisfaction, so the comparison is plain string
+    equality over the lock's ``version`` field and needs no PEP 440 parsing: a
+    post-release floor compares like any other string.
+
+    The check runs in both directions: every declared name is resolved by the
+    lock, and every floor equals what the lock resolved. One further
+    requirement makes the second half meaningful -- a declared name must have
+    exactly one ``[[package]]`` entry. A name absent from the lock fails, and a
+    name split across two entries by an environment marker fails with both
+    versions named, because which one a wheel install would land on is a
+    decision and not something a guard may guess.
+
+    Scope is ``[project].dependencies`` and ``[dependency-groups].dev``.
+    ``[tool.uv].constraint-dependencies`` is deliberately outside that scope:
+    it holds ceilings rather than floors, so there is no floor in it to compare
+    for equality, and the pattern above would reject its one entry as
+    uncomparable. That entry is covered instead by
+    ``test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it`` below. The
+    exclusion is stated here so no reader has to infer it from a regex that
+    happens not to match.
+    """
+    locked = _locked_versions()
+    offenders: list[str] = []
+    corrections: list[str] = []
+
+    for where, spec in _declared_requirements():
+        match = _REQUIREMENT.match(spec)
+        if match is None:
+            offenders.append(
+                f'"{spec}" in {where} is not a simple ">=" floor; this guard '
+                "cannot compare it"
+            )
+            continue
+
+        name = match.group("name")
+        extras = match.group("extras")
+        floor = match.group("floor")
+        entries = locked.get(_canonical_name(name), [])
+
+        if not entries:
+            offenders.append(
+                f"{name} is declared in {where} but has no [[package]] entry "
+                f"in {UV_LOCK.name}"
+            )
+            continue
+
+        if len(entries) > 1:
+            found = ", ".join(sorted(entries))
+            offenders.append(
+                f"{UV_LOCK.name} has {len(entries)} [[package]] entries for "
+                f"{name} ({found}); a marker-split resolution needs a "
+                "decision, not a guessed winner"
+            )
+            continue
+
+        resolved = entries[0]
+        if floor != resolved:
+            offenders.append(
+                f"{name} floors at {floor} in {where}, but {UV_LOCK.name} "
+                f"resolves {resolved}"
+            )
+            spelled = f"{name}[{extras}]" if extras else name
+            corrections.append(f"{spelled}>={resolved}")
+
+    remedy = ""
+    if corrections:
+        remedy = (
+            f"\n\nReplace these lines in {PYPROJECT.name}, extras included, in "
+            "the same commit as the lock move that caused this:\n"
+        ) + "\n".join(corrections)
+
+    assert not offenders, (
+        f"a declared floor and {UV_LOCK.name} disagree. The container installs "
+        "the built wheel with pip, which resolves from the floors and never "
+        "reads the lock, so a floor below the locked version is the only thing "
+        "standing between a fresh install and the tree this project already "
+        "upgraded away from:\n" + "\n".join(offenders) + remedy
+    )
+
+
+def test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it() -> None:
+    """
+    The ``anyio`` ceiling is still declared, and the locked anyio obeys it.
+
+    anyio 4.15.0 turned ``anyio.abc.BlockingPortal`` into a deprecated alias,
+    and starlette's ``testclient`` module evaluates that name at module scope.
+    This project runs pytest under ``filterwarnings = ["error"]``, so the
+    deprecation is raised rather than printed and every module that imports
+    ``TestClient`` fails during collection -- seven of them here. Nothing in
+    this repository can fix that, because the deprecated name is starlette's
+    own and is reached before any saneless code runs. The ceiling should be
+    removed only once starlette stops using the alias.
+
+    anyio is a transitive this project never imports, so it is declared in
+    neither dependency list and the floor guard above cannot see it: a ceiling
+    is not a floor, and putting it in either list would export a workaround for
+    an upstream bug into the published wheel's metadata. This guard is what
+    covers it, and it fails if the declaration is deleted, if its bound is
+    loosened, or if the lock stops obeying it.
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    uv_table = pyproject.get("tool", {}).get("uv", {})
+    constraints: list[str] = uv_table.get("constraint-dependencies", [])
+    declared = [
+        constraint
+        for constraint in constraints
+        if (match := _CONSTRAINT_NAME.match(constraint)) is not None
+        and _canonical_name(match.group("name")) == "anyio"
+    ]
+
+    assert len(declared) == 1, (
+        f"{PYPROJECT.name} declares {len(declared)} anyio entries in "
+        "[tool.uv].constraint-dependencies; exactly one is expected. Without "
+        "the ceiling, resolution is free to select anyio 4.15 or later, where "
+        "anyio.abc.BlockingPortal became a deprecated alias that starlette's "
+        "testclient module evaluates at module scope. Under "
+        'filterwarnings = ["error"] that deprecation is an error, so every '
+        "module importing TestClient fails to collect. Restore "
+        f'"anyio{_ANYIO_CEILING_SPEC}" there, and remove it only once '
+        "starlette stops using the alias"
+    )
+    ceiling = declared[0]
+    assert _ANYIO_CEILING_SPEC in ceiling, (
+        f"{PYPROJECT.name} constrains anyio as {ceiling!r}, which no longer "
+        f"carries the {_ANYIO_CEILING_SPEC} upper bound. anyio 4.15.0 turned "
+        "anyio.abc.BlockingPortal into a deprecated alias that starlette's "
+        "testclient module evaluates at module scope, and this project raises "
+        "deprecations as errors, so loosening the bound reopens seven "
+        "collection failures. Loosen it only once starlette migrates"
+    )
+
+    versions = _locked_versions().get("anyio", [])
+    assert len(versions) == 1, (
+        f"{UV_LOCK.name} holds {len(versions)} [[package]] entries for anyio "
+        f"({', '.join(sorted(versions))}); exactly one is expected, and the "
+        "ceiling cannot be checked against a split resolution"
+    )
+    parts = versions[0].split(".")
+    resolved = (int(parts[0]), int(parts[1]))
+    assert resolved < _ANYIO_CEILING, (
+        f"{UV_LOCK.name} resolves anyio {versions[0]}, which does not obey the "
+        f"declared {_ANYIO_CEILING_SPEC} ceiling. anyio 4.15.0 turned "
+        "anyio.abc.BlockingPortal into a deprecated alias, starlette's "
+        "testclient module evaluates it at module scope, and this project "
+        'runs under filterwarnings = ["error"], so every module importing '
+        "TestClient fails during collection. Re-lock with the constraint in "
+        "place; lift the ceiling only once starlette stops using the alias"
     )
