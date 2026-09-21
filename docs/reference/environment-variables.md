@@ -77,6 +77,17 @@ Both default to `true`. Setting one to `false` hides that control on the scan fo
 
 A container's clock reports UTC unless `TZ` is set, so **without it every one of those timestamps is UTC**, including the document title that ends up in paperless-ngx. Set it in your compose file's `environment:` block. A bare-metal install normally inherits the host's zone and needs nothing.
 
+### Not a saneless variable: `SSL_CERT_FILE` and `SSL_CERT_DIR`
+
+| Variable | Type | Example |
+|----------|------|---------|
+| `SSL_CERT_FILE` | path | `/etc/ssl/certs/my-ca.crt` |
+| `SSL_CERT_DIR` | path | `/etc/ssl/my-ca-dir` |
+
+These are OpenSSL's own variables, not `SANELESS_` settings, and saneless never reads them -- the TLS layer beneath its HTTP client does. They name the certificate authorities to trust when saneless connects to paperless-ngx over `https://`, and they are honoured **first**, ahead of the operating system's trust store. Their behaviour is unchanged: the previous HTTP client honoured them too. What changed is the default, which is now the operating system's trust store rather than a certificate bundle shipped inside a Python package. Set one of these only when your paperless-ngx certificate is signed by a private or corporate CA that is not installed on this machine; installing that CA into the OS trust store is the better fix wherever you can do it. [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#paperless-errors-exit-3) describes the failure they resolve, under **TLS certificate not trusted**.
+
+Prefer `SSL_CERT_FILE`. It takes a single PEM file and needs nothing else. `SSL_CERT_DIR` takes a directory and carries a trap: OpenSSL reads only files named `<8-hex-hash>.<n>` in it, so dropping a bare `.pem` into the directory fails exactly as if you had set nothing at all, with no diagnostic anywhere to tell you why. Run `c_rehash` over the directory, or make the link yourself with `ln -s my-ca.pem "$(openssl x509 -hash -noout -in my-ca.pem).0"`.
+
 ## Notes
 
 - **Profile fields** use `SANELESS_PROFILES__<NAME>__<FIELD>`, for example `SANELESS_PROFILES__RECEIPT__TITLE=Receipt` for `title` in `[profiles.receipt]`. Variable names are case-insensitive, and profile names are lower-cased. A `default` profile must still exist: with no config file, set at least one `SANELESS_PROFILES__DEFAULT__<FIELD>` too, or loading fails.

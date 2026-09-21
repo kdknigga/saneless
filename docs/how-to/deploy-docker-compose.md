@@ -321,3 +321,28 @@ release and there is nothing of that kind at the old path.
 - `GET /api/paperless/test` gained two outcomes: a 404 from the paperless-ngx API
   is now `not_found` and a 5xx is `server_error`, where both were previously
   reported as `connected`. The three original values are unchanged.
+- TLS verification now uses the operating system's trust store instead of a
+  certificate bundle shipped inside a Python package. The stock image is
+  unaffected, because it ships `ca-certificates`, and plain-`http://`
+  deployments are unaffected either way. A private or corporate CA installed in
+  the OS trust store now works where it previously did not. A private CA
+  installed only by editing the Python bundle, or through `REQUESTS_CA_BUNDLE`,
+  now fails with a certificate error: mount the CA file and point
+  `SSL_CERT_FILE` at it.
+
+    ```yaml
+    services:
+      saneless:
+        environment:
+          SSL_CERT_FILE: /etc/ssl/certs/my-ca.crt
+        volumes:
+          - ./my-ca.crt:/etc/ssl/certs/my-ca.crt:ro
+    ```
+
+    Both variables are described in
+    [Environment Variables](../reference/environment-variables.md#not-a-saneless-variable-ssl_cert_file-and-ssl_cert_dir),
+    and [Troubleshoot a Failed Scan](troubleshoot-a-failed-scan.md#paperless-errors-exit-3)
+    shows what the failure looks like from the CLI and from the web UI -- they
+    do not look alike.
+- The outgoing `User-Agent` is now `python-httpx2/<version>`. This matters only
+  to a reverse proxy or WAF in front of paperless-ngx that filters on it.

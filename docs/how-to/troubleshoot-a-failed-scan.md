@@ -145,7 +145,29 @@ The line starts with `Paperless error:`.
   when the connection is refused or reset, times out, is closed by a reverse proxy, or
   paperless-ngx answers with a server error. If every attempt fails and a consume directory is
   configured, the PDF is saved there instead. Without one, the scan fails. Check that
-  `paperless.url` is reachable from where saneless runs.
+  `paperless.url` is reachable from where saneless runs. A `https://` certificate that this
+  machine does not trust also arrives here, reported as unreachable in both the log and the web
+  UI -- see **TLS certificate not trusted** below before you go looking at the network.
+- **TLS certificate not trusted.** The line names an SSL failure, for example
+  `Paperless error: Could not fetch tags from Paperless at https://paperless.example.com/: [SSL:
+  CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1081)`,
+  and the scan exits 3. **The same failure looks different in the web UI.** The status strip and
+  `GET /api/paperless/test` report a bare `unreachable` with no TLS text anywhere, because a
+  certificate that cannot be verified means the connection never established, and saneless
+  classifies that as unreachable -- it is reported as the **Unreachable.** case above, with the
+  SSL detail dropped. If your web UI says Unreachable, this bullet may be why. The message on the
+  scan path is OpenSSL's own and has not changed; what
+  changed is which certificate authorities are trusted. saneless now verifies against the
+  operating system's trust store instead of a certificate bundle shipped inside a Python package.
+  So a private or corporate CA installed on the machine now works where it used to fail, and one
+  installed only by editing that Python bundle now gives you this error, which you may not have
+  been getting before. There are two fixes. Install the CA into the operating system's trust
+  store, which is the better option wherever it is available -- in the container, copy the
+  certificate to `/usr/local/share/ca-certificates/my-ca.crt` and run `update-ca-certificates`.
+  Or point OpenSSL at the certificate file directly with `SSL_CERT_FILE`, described in
+  [Environment Variables](../reference/environment-variables.md#not-a-saneless-variable-ssl_cert_file-and-ssl_cert_dir).
+  Do not turn certificate verification off to make this go away: saneless sends the Paperless API
+  token on every request, and an unverified connection hands that token to anyone in the path.
 - **Malformed URL.** A `paperless.url` without a usable `http://` or `https://` scheme is not
   retried, because retrying cannot help. With a consume directory configured the scan is still
   saved there, so it does not fail, but every scan goes to the folder and the log says the URL
