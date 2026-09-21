@@ -976,6 +976,16 @@ class TestTomlKeyCaseContract:
         assert "A 'default' profile must be defined in config" in str(err)
 
 
+_HOSTILE_SECRET = "tok-SECRET-4f1c9ba27e5d8031-DISTINCTIVE"
+"""A distinctive token stand-in for the hostile-upstream-message guards."""
+
+_HOSTILE_MESSAGE = f"Input should be a valid string (got {_HOSTILE_SECRET})"
+"""An upstream ``msg`` that interpolates the input, which pydantic's does not."""
+
+_REDACTED_MESSAGE = "Input should be a valid string (got <value omitted>)"
+"""``_HOSTILE_MESSAGE`` as it must appear once the input has been struck out."""
+
+
 class TestConfigErrorsNeverEchoValues:
     """
     A config error never contains an input value (D-14, CFG-05).
@@ -1071,12 +1081,21 @@ class TestConfigErrorsNeverEchoValues:
     def test_redaction_leaves_the_product_contract_lines_alone(
         self, tmp_config_dir: Path
     ) -> None:
-        """Redacting inputs keeps the one-line-per-error shape (D-07, D-10)."""
+        """
+        Redacting inputs keeps the one-line-per-error shape (D-07, D-10).
+
+        The mistyped key now carries ``"url"``, a real ``PaperlessConfig``
+        field name, so the fixture exercises the case where redaction can
+        reach this project's own vocabulary. The body must therefore be free
+        of the redaction marker: none of these three errors involves an
+        upstream message that quotes its input, so any marker in the body is
+        redaction eating a field name rather than a value.
+        """
         err = _load_error(
             tmp_config_dir / "several_redacted.toml",
             """\
 [paperless]
-tokne = "x"
+tokne = "url"
 
 [output]
 web_port = "abc"
@@ -1097,6 +1116,108 @@ log_level = "TRACE"
         assert any(
             line.startswith("  [output] log_level: Input should be 'DEBUG', ")
             for line in body
+        )
+        assert [line for line in body if "<value omitted>" in line] == []
+        assert (
+            "  [paperless] unknown key 'tokne' (did you mean 'token'?); "
+            "valid keys: url, token, consume_dir"
+        ) in body
+
+    def test_redaction_leaves_a_hint_that_collides_with_an_input_alone(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A value equal to a field name is not struck out of the hint.
+
+        ``hst = "host"`` misspells a key whose value happens to be another of
+        the section's field names. The did-you-mean hint and the valid-keys
+        list are built from this project's own field names, so neither may
+        lose a word to redaction; the whole line is pinned because the damage
+        lands in its tail.
+        """
+        err = _load_error(
+            tmp_config_dir / "collision.toml",
+            '[scanner]\nhst = "host"\n\n[profiles.default]\n',
+        )
+        assert _error_lines(err)[1:] == [
+            "  [scanner] unknown key 'hst' (did you mean 'host'?); "
+            "valid keys: host, device"
+        ]
+
+    @pytest.mark.parametrize(
+        ("loc", "error_type", "expected"),
+        [
+            pytest.param(
+                ("paperless", "token"),
+                "string_type",
+                f"[paperless] token: {_REDACTED_MESSAGE}",
+                id="section-key",
+            ),
+            pytest.param(
+                ("paperless",),
+                "model_type",
+                f"[paperless]: {_REDACTED_MESSAGE}",
+                id="whole-section",
+            ),
+            pytest.param(
+                ("nosuchsection", "x"),
+                "string_type",
+                f"nosuchsection.x: {_REDACTED_MESSAGE}",
+                id="unknown-loc-path",
+            ),
+            pytest.param(
+                ("profiles", "default", "source"),
+                "string_type",
+                f"[profiles.default] source: {_REDACTED_MESSAGE}",
+                id="profile-key",
+            ),
+        ],
+    )
+    def test_every_rendered_branch_redacts_a_hostile_upstream_message(
+        self, loc: tuple[str | int, ...], error_type: str, expected: str
+    ) -> None:
+        """
+        Every branch that carries pydantic's wording strikes the input out.
+
+        The narrowed redaction boundary must not weaken the guarantee: each
+        line that interpolates an upstream ``msg`` still loses the input's
+        text, whatever wording upstream arrives with (D-07, CFG-05).
+        """
+        hostile: ErrorDetails = {
+            "type": error_type,
+            "loc": loc,
+            "msg": _HOSTILE_MESSAGE,
+            "input": _HOSTILE_SECRET,
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+        assert lines[0] == expected
+
+    def test_env_branch_redacts_a_hostile_upstream_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The environment-attributed branch strikes the input out too.
+
+        This is the fifth render branch: it names the variable that supplied
+        the value, so the value itself must still be gone (D-07, CFG-05).
+        """
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", _HOSTILE_SECRET)
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": _HOSTILE_MESSAGE,
+            "input": _HOSTILE_SECRET,
+        }
+        lines = config_mod._render_error_lines(
+            [hostile], {"paperless": {"token": _HOSTILE_SECRET}}
+        )
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+        assert lines[0] == (
+            "environment variable 'SANELESS_PAPERLESS__TOKEN': "
+            f"token in [paperless]: {_REDACTED_MESSAGE}"
         )
 
 
