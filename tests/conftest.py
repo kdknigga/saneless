@@ -12,6 +12,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import pytest
+from fastapi.routing import _IncludedRouter
 from PIL import Image, ImageDraw
 
 from saneless import paperless as paperless_module
@@ -30,6 +31,9 @@ from saneless.vocabulary import FlipOutcome
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
+
+    from fastapi import FastAPI
+    from starlette.routing import BaseRoute
 
     from saneless.job import Job, JobStore
     from saneless.scanner.base import DeviceInfo, PageRecord, PageSink, ScanSettings
@@ -832,3 +836,72 @@ def quiet_window(seconds: float) -> None:
     """
     never_set = threading.Event()
     never_set.wait(seconds)
+
+
+def leaf_routes(app: FastAPI) -> list[BaseRoute]:
+    """
+    Every leaf route the app serves, flattening FastAPI's included routers.
+
+    FastAPI represents an included router as one opaque wrapper object in
+    ``app.routes`` rather than splicing its routes in, so a plain filter over
+    ``app.routes`` finds none of them.  Raising on an empty result makes a
+    further change to that shape fail here, once, instead of quietly emptying
+    every caller's filter -- and an emptied filter is what would leave the
+    cross-origin coverage guard green while proving nothing.
+
+    ``Mount`` objects are yielded alongside ``APIRoute`` ones, so a caller
+    enumerating ``Route | Mount`` still sees ``/static``.  Each caller keeps
+    its own ``isinstance`` narrowing, which is also what lets it reach
+    ``.path``.
+
+    Import it as ``from tests.conftest import leaf_routes``.  There is
+    deliberately no fixture wrapper: the call sites need this for three
+    different app objects -- one built by a helper, one extracted from a
+    ``TestClient``, one from a fixture -- so a fixture would need factory
+    machinery for no added safety.
+
+    Args:
+        app: The application whose routes to enumerate.
+
+    Returns:
+        Every leaf route, in the order the app declares them.
+
+    Raises:
+        AssertionError: If the app appears to serve no routes at all.
+
+    """
+    found = _flatten_routes(app.routes)
+    if not found:
+        msg = (
+            "enumerating the app's routes found none, so every caller's filter "
+            "would be empty; FastAPI's included-router wrapper has changed shape"
+        )
+        raise AssertionError(msg)
+    return found
+
+
+def _flatten_routes(routes: Sequence[BaseRoute]) -> list[BaseRoute]:
+    """
+    Replace each included-router wrapper with the routes it stands for.
+
+    Selection is by ``isinstance``, never by probing for the attribute: a
+    ``getattr`` defaulting to ``None`` when ``original_router`` is missing
+    would silently return nothing the moment that attribute were renamed while
+    the wrapper survived, which is exactly the hole the raise in
+    ``leaf_routes`` exists to close.  Importing the private class fails loudly
+    at import time instead.
+
+    Args:
+        routes: The routes to walk, at any depth.
+
+    Returns:
+        The leaves, with every wrapper expanded in place.
+
+    """
+    found: list[BaseRoute] = []
+    for route in routes:
+        if isinstance(route, _IncludedRouter):
+            found.extend(_flatten_routes(route.original_router.routes))
+        else:
+            found.append(route)
+    return found
