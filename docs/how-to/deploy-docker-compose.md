@@ -326,9 +326,8 @@ release and there is nothing of that kind at the old path.
   unaffected, because it ships `ca-certificates`, and plain-`http://`
   deployments are unaffected either way. A private or corporate CA installed in
   the OS trust store now works where it previously did not. A private CA
-  installed only by editing the Python bundle, or through `REQUESTS_CA_BUNDLE`,
-  now fails with a certificate error: mount the CA file and point
-  `SSL_CERT_FILE` at it.
+  installed only by editing the Python bundle now fails with a certificate
+  error: mount the CA file and point `SSL_CERT_FILE` at it.
 
     ```yaml
     services:
@@ -338,6 +337,17 @@ release and there is nothing of that kind at the old path.
         volumes:
           - ./my-ca.crt:/etc/ssl/certs/my-ca.crt:ro
     ```
+
+    Create `./my-ca.crt` on the host **before** the stack comes up. Docker
+    silently creates a *directory* at a bind-mount source that does not
+    exist, so the container finds a directory where the PEM file should be,
+    and saneless refuses to start with `Paperless error: Could not build the
+    TLS trust store for Paperless at <url>: <OS error text>;
+    check SSL_CERT_FILE and SSL_CERT_DIR`. Create the file on the host and
+    recreate the container. Note also that `SSL_CERT_FILE` replaces the
+    operating system's trust store rather than adding to it, so the file you
+    name must carry every CA saneless needs -- if `paperless.url` is signed by
+    a public CA, install the private CA into the OS trust store instead.
 
     Both variables are described in
     [Environment Variables](../reference/environment-variables.md#not-a-saneless-variable-ssl_cert_file-and-ssl_cert_dir),
