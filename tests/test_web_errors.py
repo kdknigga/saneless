@@ -61,7 +61,7 @@ from tests.conftest import StubScannerBackend, poll_until
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    import httpx
+    import httpx2
     from starlette.responses import Response
 
     from saneless.job import Job, JobStore
@@ -258,7 +258,7 @@ def _error_body(
 
 
 def _assert_htmx_error(
-    response: httpx.Response, rejection: RequestRejection, status: int
+    response: httpx2.Response, rejection: RequestRejection, status: int
 ) -> None:
     """Assert an htmx error response is retargeted and carries only the slot body."""
     assert response.status_code == status
@@ -268,7 +268,7 @@ def _assert_htmx_error(
 
 
 def _assert_json_error(
-    response: httpx.Response, rejection: RequestRejection, status: int
+    response: httpx2.Response, rejection: RequestRejection, status: int
 ) -> None:
     """Assert a non-htmx error response is the JSON shape, not retargeted."""
     assert response.status_code == status
@@ -523,7 +523,7 @@ class TestRequestErrorDisclosure:
     """
 
     @staticmethod
-    def _details(response: httpx.Response) -> re.Match[str]:
+    def _details(response: httpx2.Response) -> re.Match[str]:
         """
         Return the disclosure in `response`, failing if there is none.
 

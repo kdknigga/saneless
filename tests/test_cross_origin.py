@@ -294,7 +294,7 @@ def _unsafe_routes(app: FastAPI) -> list[tuple[str, str]]:
         (method, _PATH_PARAM.sub("x", route.path))
         for route in app.routes
         if isinstance(route, APIRoute)
-        for method in route.methods
+        for method in route.methods or ()
         if method not in SAFE_METHODS
     )
 

@@ -23,7 +23,7 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from httpx import Response
+    from httpx2 import Response
 
     from saneless.job import Job
 
