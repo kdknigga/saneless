@@ -518,7 +518,9 @@ class PaperlessClient:
             ``httpx2.MockTransport``) and for custom transports.
 
     Raises:
-        PaperlessError: If ``url`` is not a valid URL (``httpx2.InvalidURL``).
+        PaperlessError: If ``url`` is not a valid URL (``httpx2.InvalidURL``),
+            or if the TLS trust store named by ``SSL_CERT_FILE`` or
+            ``SSL_CERT_DIR`` cannot be read.
 
     """
 
@@ -560,6 +562,22 @@ class PaperlessClient:
             )
         except httpx2.InvalidURL as exc:
             msg = f"Paperless URL {self._display_url} is not valid: {describe(exc)}"
+            raise PaperlessError(msg) from exc
+        except OSError as exc:
+            # The TLS trust anchors are read while the client is being built,
+            # so a SSL_CERT_FILE naming a path that does not exist arrives
+            # here as FileNotFoundError, and one naming a directory -- which
+            # is what a docker-compose bind mount leaves behind when the host
+            # file is absent -- arrives as IsADirectoryError.  Neither may
+            # leave this boundary as a raw traceback.  The offending path is
+            # not recoverable from the exception, whose filename attribute is
+            # None, so the message names the two variables that steer the
+            # trust store and can be corrected.
+            msg = (
+                "Could not build the TLS trust store for Paperless at "
+                f"{self._display_url}: {describe(exc)}; "
+                "check SSL_CERT_FILE and SSL_CERT_DIR"
+            )
             raise PaperlessError(msg) from exc
         self._consume_dir = consume_dir
         self._max_retries = max_retries
