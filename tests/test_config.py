@@ -1219,23 +1219,48 @@ log_level = "TRACE"
         )
 
     def test_a_value_that_cannot_be_struck_cleanly_withholds_the_message(
-        self, tmp_config_dir: Path
+        self,
     ) -> None:
         """
-        When the input sits mid-word, the whole message is withheld (CR-01).
+        A credential glued into upstream prose withholds it whole (CR-01).
 
-        ``eger`` occurs only inside ``integer``, so no word-anchored
-        replacement can remove it. Splicing would corrupt the prose and
-        leaving it would echo the input, so the message is dropped entirely:
-        the guarantee that no input reaches the line outranks the explanation.
+        Word-anchored striking cannot reach a value upstream joined to its
+        own words with no separator, and a value this long cannot be there by
+        coincidence -- pydantic's longest word is ``integer``. Splicing would
+        corrupt the prose and leaving it would echo the input, so the message
+        is dropped entirely: not echoing outranks explaining. The section and
+        the key are this module's own words and survive.
+        """
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": f"Input should be valid{_HOSTILE_SECRET}string",
+            "input": _HOSTILE_SECRET,
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+        assert lines[0] == "[paperless] token: <value omitted>"
+
+    def test_a_short_midword_value_is_left_alone(self, tmp_config_dir: Path) -> None:
+        """
+        A short value buried in a word is coincidence, not an echo (CR-01).
+
+        ``eger`` occurs only inside ``integer``. No reader recovers the input
+        from that, so withholding the message would cost the explanation and
+        hide nothing -- the boundary between this and the case above is
+        length, not position.
         """
         err = _load_error(
             tmp_config_dir / "midword_value.toml",
             '[output]\nweb_port = "eger"\n',
         )
         [line] = [ln for ln in _error_lines(err) if "web_port" in ln]
-        assert "eger" not in line
-        assert line.strip() == "[output] web_port: <value omitted>"
+        assert "<value omitted>" not in line
+        assert line.strip() == (
+            "[output] web_port: Input should be a valid integer, "
+            "unable to parse string as an integer"
+        )
 
     def test_a_nested_input_value_is_struck_from_the_message(self) -> None:
         """
@@ -1269,10 +1294,11 @@ log_level = "TRACE"
         exists to remove. The raise is forced here so the guard tests this
         module's behaviour rather than upstream's current phrasing.
         """
-        monkeypatch.setenv("SANELESS_PAPERLESS", f'{{"token": "{_HOSTILE_SECRET}"')
+        malformed = f'{{"token": "{_HOSTILE_SECRET}"'
+        monkeypatch.setenv("SANELESS_PAPERLESS", malformed)
 
         def hostile_env_contribution() -> dict[str, object]:
-            msg = f"error parsing value {_HOSTILE_SECRET} for field 'paperless'"
+            msg = f"error parsing value {malformed} for field 'paperless'"
             raise SettingsError(msg)
 
         monkeypatch.setattr(config_mod, "_env_contribution", hostile_env_contribution)

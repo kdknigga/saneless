@@ -11,8 +11,10 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+import re
 import tempfile
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
@@ -44,7 +46,7 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Iterator, Sequence
     from datetime import datetime
 
     from pydantic_core import ErrorDetails
@@ -1077,6 +1079,47 @@ def _env_variable_for(
 _MIN_REDACTED_INPUT: Final = 2
 """The shortest input string worth redacting from an upstream message."""
 
+_REDACTED: Final = "<value omitted>"
+"""What stands in for an input value that must not reach a rendered line."""
+
+_MIN_WITHHELD_INPUT: Final = 8
+"""The length at which an input buried inside a word means upstream put it there.
+
+The longest word pydantic builds its messages from is ``integer``, at seven
+characters, so a value this long cannot be a coincidental fragment of its
+prose: something upstream joined the value to its own words without a
+separator, and the message has to be withheld whole. Shorter values collide
+with ordinary English by chance -- ``in`` lives inside ``integer`` and
+``string`` -- and striking those would cost the operator the explanation
+while hiding nothing a reader could recover.
+"""
+
+
+def _input_texts(value: object) -> Iterator[str]:
+    """
+    Yield every string an error's ``input`` carries, however it is nested.
+
+    ``input`` is not always a string. ``SANELESS_PAPERLESS__TOKEN__X=<token>``
+    makes pydantic build a mapping for ``token``, so the credential arrives as
+    ``{"x": "<token>"}``; a bare ``isinstance(value, str)`` test would walk
+    past it and leave the guarantee below unkept.
+
+    Args:
+        value: The error's ``input`` member, of any shape.
+
+    Yields:
+        Each string found in it, outermost first.
+
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _input_texts(item)
+    elif isinstance(value, list | tuple | set | frozenset):
+        for item in value:
+            yield from _input_texts(item)
+
 
 def _redact_input(text: str, value: object) -> str:
     """
@@ -1100,17 +1143,60 @@ def _redact_input(text: str, value: object) -> str:
     credential and replacing them would mangle ordinary words inside an
     upstream message.
 
+    Occurrences are struck at word boundaries, not anywhere they appear. An
+    unanchored replacement corrupts pydantic's own prose whenever a short
+    value happens to sit inside one of its words: ``web_port = "in"`` turned
+    "a valid integer" into "a valid <value omitted>teger", losing the one
+    sentence that says what was wanted, for the most ordinary kind of typo.
+
+    A long value can still survive that, if upstream joined it to its own
+    words with no separator for a boundary to find. Splicing there would
+    corrupt the prose and leaving it would echo the input, so the whole
+    message is withheld instead -- see ``_MIN_WITHHELD_INPUT`` for why length
+    is what separates that case from ordinary coincidence. Between explaining
+    and not echoing, not echoing wins; the section, the key, the did-you-mean
+    hint and the valid keys are this module's own words and survive either
+    way.
+
     Args:
         text: The upstream message fragment.
         value: The error's ``input`` member.
 
     Returns:
-        The text with every occurrence of the input's own text replaced.
+        The text with the input struck out, or the marker alone when it
+        could not be struck without corrupting the text.
 
     """
-    if not isinstance(value, str) or len(value) < _MIN_REDACTED_INPUT:
-        return text
-    return text.replace(value, "<value omitted>")
+    for secret in _input_texts(value):
+        if len(secret) < _MIN_REDACTED_INPUT:
+            continue
+        text = re.sub(rf"\b{re.escape(secret)}\b", _REDACTED, text)
+        if secret in text and len(secret) >= _MIN_WITHHELD_INPUT:
+            return _REDACTED
+    return text
+
+
+def _redact_environment(text: str) -> str:
+    """
+    Strike every ``SANELESS_*`` value out of an upstream message.
+
+    The environment branch has no pydantic ``input`` to work from: the error
+    arrives from ``_env_contribution`` before any field is built. What it can
+    carry is a configured value, and the JSON-valued variables are exactly
+    the ones a token travels in, so the environment's own values are what is
+    struck out.
+
+    Args:
+        text: The upstream message fragment.
+
+    Returns:
+        The text with every configured ``SANELESS_*`` value struck out.
+
+    """
+    values = [
+        value for name, value in os.environ.items() if name.startswith(_ENV_PREFIX)
+    ]
+    return _redact_input(text, values)
 
 
 def _render_error(
@@ -1308,9 +1394,12 @@ def _build_settings(
     try:
         env_data = _env_contribution()
     except SettingsError as exc:
-        # The message names the field and source, never the value; the
+        # pydantic-settings names the field and source, not the value, but
+        # that wording is upstream-owned -- the same dependency the render
+        # boundary exists to remove. The SANELESS_* values are struck out of
+        # it here so no upstream phrasing can put one in this line. The
         # exception (and its JSON-decoding cause) is not chained.
-        lines.append(f"environment: {_escape_name(str(exc))}")
+        lines.append(f"environment: {_escape_name(_redact_environment(str(exc)))}")
     else:
         try:
             if toml_file is not None:
