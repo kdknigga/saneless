@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
@@ -2536,6 +2537,34 @@ async def _refusing_lifespan(_app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
+def _invoke_on_a_worker_thread(runner: CliRunner, args: list[str]) -> Result:
+    """
+    Invoke the CLI on a worker thread, the way a fresh process would run it.
+
+    ``uvicorn.Server.run`` calls ``asyncio.run``, which refuses to start on a
+    thread that already has a running event loop. A real ``saneless serve``
+    process never does. The suite's main thread does: ``tests/test_browser.py``
+    holds Playwright's sync dispatcher loop open on it for the rest of the
+    session, so any test reaching real uvicorn on the main thread after the
+    browser module has run reports the CLI's unexpected-error code instead of
+    the code under test. That is an ordering artefact, not CLI behaviour, and
+    it makes the exit-code assertion pass alone and fail in a full run.
+
+    Handing the invocation to a worker thread restores the production
+    precondition without stubbing uvicorn or weakening what is asserted.
+
+    Args:
+        runner: The CliRunner to invoke with.
+        args: The command line to pass to ``cli``.
+
+    Returns:
+        The Result the runner produced on the worker thread.
+
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(runner.invoke, cli, args).result(timeout=60)
+
+
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeCommand:
     """
@@ -3034,11 +3063,15 @@ class TestServeCommand:
         ``validate_settings_dirs`` and exits 2 from there, before
         ``_run_server`` is ever reached, so the configuration route would pass
         on an unfixed tree and prove nothing.
+
+        This is the one serve test that reaches real uvicorn, so it is the one
+        that needs ``_invoke_on_a_worker_thread``; see that helper for why the
+        main thread cannot be used once the browser module has run.
         """
         self._refusing_create_app(monkeypatch)
         runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
 
-        result = runner.invoke(cli, ["serve"])
+        result = _invoke_on_a_worker_thread(runner, ["serve"])
 
         assert result.exit_code == 2, result.output
         lines = _failure_lines(result)
