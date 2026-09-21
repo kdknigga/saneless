@@ -1241,8 +1241,16 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
     # stopped is a normal stop, exit 0, so it is swallowed here; a Ctrl-C
     # before this point -- while settings load or the app is built -- is not
     # uvicorn's to handle and reaches the group guard, exit 130.
-    with contextlib.suppress(KeyboardInterrupt):
-        server.run(sockets=sockets)
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            server.run(sockets=sockets)
+    except SystemExit:
+        # uvicorn exits the process itself when start-up fails, with a code of
+        # its own choosing that collides with this CLI's table. A server that
+        # never started is this project's "could not start", handled below; a
+        # started server exiting is uvicorn's own decision and is left alone.
+        if server.started:
+            raise
     # Server.run returns quietly when start-up fails, such as the app's
     # lifespan raising; uvicorn has already logged why. Every command shares
     # one exit table, so that is a failure to start: one line, exit 2.
