@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from starlette.routing import Mount, Route
@@ -46,13 +47,11 @@ from saneless.web import app as app_module
 from saneless.web import refresher as refresher_module
 from saneless.web.app import create_app
 from saneless.worker import STOP_JOIN_SECONDS
-from tests.conftest import StubScannerBackend, wait_for_state
+from tests.conftest import StubScannerBackend, leaf_routes, wait_for_state
 from tests.fake_sane import FakeSaneModule
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    from fastapi import FastAPI
 
 _APP_LOGGER = "saneless.web.app"
 
@@ -906,6 +905,84 @@ _ROUTE_SKIPS: dict[str, str] = {
         "through Starlette and runs no saneless code at all"
     ),
 }
+
+# Every path the real app serves, measured rather than predicted.  Held here as
+# the phase's canonical set so the helper's own test compares against something
+# independent of the route map above, which the lifecycle proof already checks
+# the app against in both directions.
+_LEAF_PATHS = frozenset(
+    {
+        "/",
+        "/api/cache/invalidate",
+        "/api/checks",
+        "/api/checks/refresh",
+        "/api/correspondents",
+        "/api/flip/abort",
+        "/api/flip/continue",
+        "/api/jobs/current/status",
+        "/api/jobs/history",
+        "/api/jobs/{job_id}/status",
+        "/api/paperless/test",
+        "/api/profiles/description",
+        "/api/scan",
+        "/api/tags",
+        "/health",
+        "/static",
+    }
+)
+
+
+def test_leaf_routes_flattens_the_included_router(settings: Settings) -> None:
+    """
+    leaf_routes yields every leaf, the /static Mount included (DEP-05, D-03).
+
+    fastapi 0.141 represents an included router as one opaque wrapper object in
+    ``app.routes`` rather than splicing its routes in, so a plain
+    ``isinstance(route, APIRoute)`` filter over ``app.routes`` finds none of
+    them.  D-03 requires the helper to yield ``Mount`` objects as well as
+    ``APIRoute`` ones, because the served-against-map check below enumerates
+    ``Route | Mount`` and would otherwise report ``/static`` as stale.
+
+    The app is driven inside the lifespan so the job store it opened is closed
+    afterwards; ``create_app`` opens that store eagerly and only the lifespan
+    shutdown closes it.
+    """
+    app = _build_app(settings)
+    with TestClient(app):
+        leaves = leaf_routes(app)
+
+        assert len(leaves) == 16, (
+            f"the app serves {len(leaves)} leaf routes, not the 16 this test "
+            f"pins; a route was added or removed, so update this literal"
+        )
+        api_routes = [route for route in leaves if isinstance(route, APIRoute)]
+        assert len(api_routes) == 15, (
+            f"{len(api_routes)} of the leaves are APIRoute, not the 15 this "
+            f"test pins; a route was added or removed, so update this literal"
+        )
+        # D-03's whole point: the Mount survives the flattening.
+        mounts = [route for route in leaves if isinstance(route, Mount)]
+        assert [mount.path for mount in mounts] == ["/static"]
+
+        paths = {route.path for route in leaves if isinstance(route, Route | Mount)}
+        assert paths == _LEAF_PATHS
+
+
+def test_leaf_routes_refuses_to_report_no_routes() -> None:
+    """
+    An empty enumeration raises rather than silently emptying every caller.
+
+    D-02's choke point, tested directly rather than only through the five call
+    sites.  A helper that returned ``[]`` here would leave the cross-origin
+    coverage guard green while proving nothing about which routes the guard
+    actually covers, so the empty result has to be loud.
+    """
+    empty = FastAPI(openapi_url=None, docs_url=None, redoc_url=None)
+
+    with pytest.raises(
+        AssertionError, match="included-router wrapper has changed shape"
+    ):
+        leaf_routes(empty)
 
 
 def test_sane_lifecycle_across_startup_every_route_and_shutdown(
