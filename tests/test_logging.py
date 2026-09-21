@@ -21,6 +21,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
+# A fabricated token-shaped literal, not a credential. Its only job is to be
+# distinctive enough that a substring search for it cannot collide with
+# ordinary log text, so "the sentinel is absent" means the record really was
+# discarded rather than merely reformatted.
+_LIBRARY_DEBUG_SENTINEL = "Token 4f2b9ac81de7350649fc2e0bd85a71c3"
+
+
 def _raise_runtime_error(message: str) -> None:
     """
     Raise a RuntimeError carrying ``message``, so a test can log a real traceback.
@@ -131,12 +138,22 @@ class TestConfigureLogging:
         finally:
             self._cleanup_handlers()
 
-    def test_verbose_sets_saneless_loggers_to_debug_only(self, tmp_path: Path) -> None:
+    def test_verbose_sets_saneless_loggers_to_debug_only(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
         """
         -v is DEBUG for saneless's own loggers, not for the root or libraries.
 
-        httpx logs request headers at DEBUG, and those can carry the Paperless
-        Authorization header (T-27-23), so the root keeps the configured level.
+        The root logger keeps the configured level, so a DEBUG record emitted on
+        a library's own logger is discarded before it reaches any handler. That
+        mechanism, and nothing about the logger's name, is what keeps library
+        request detail -- which may carry the Paperless Authorization header --
+        out of the log. Raising the root to DEBUG lets the sentinel below
+        through, which is what makes this a check capable of failing.
+
+        Both surfaces are asserted on: under -v the mirror handler sits on the
+        root logger and writes to stderr as well as the file, so a file-only
+        assertion would let a leak through the mirror pass unnoticed.
         """
         log_file = tmp_path / "test.log"
         try:
@@ -147,11 +164,15 @@ class TestConfigureLogging:
                 backup_count=1,
                 verbose=True,
             )
+            logging.getLogger("httpx2").debug(_LIBRARY_DEBUG_SENTINEL)
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            assert _LIBRARY_DEBUG_SENTINEL not in log_file.read_text()
+            assert _LIBRARY_DEBUG_SENTINEL not in capsys.readouterr().err
             assert (
                 logging.getLogger("saneless.pipeline").getEffectiveLevel()
                 == logging.DEBUG
             )
-            assert logging.getLogger("httpx").getEffectiveLevel() == logging.INFO
             assert logging.getLogger().level == logging.INFO
         finally:
             self._cleanup_handlers()
@@ -518,18 +539,26 @@ class TestConfigureLoggingStreamMode:
             self._cleanup_handlers()
 
     def test_stream_mode_leaves_non_saneless_loggers_at_the_configured_level(
-        self,
+        self, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """
-        ``-v`` in stream mode raises only saneless's own loggers (D-38, T-27-23).
+        ``-v`` in stream mode raises only saneless's own loggers.
 
-        httpx at DEBUG prints the Paperless ``Authorization`` header, so the
-        root logger must keep the configured level in this mode too.
+        The root logger keeps the configured level in this mode too, so a DEBUG
+        record emitted on a library's own logger is discarded before it reaches
+        the one stderr handler. There is no file here, so that stream is the
+        only surface a leak could reach, and the Paperless ``Authorization``
+        header must not reach it. Raising the root to DEBUG puts the sentinel
+        below on stderr, which is what makes this check falsifiable.
         """
         try:
             configure_logging(
                 None, "INFO", max_bytes=1024, backup_count=1, verbose=True
             )
+            logging.getLogger("httpx2").debug(_LIBRARY_DEBUG_SENTINEL)
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            assert _LIBRARY_DEBUG_SENTINEL not in capsys.readouterr().err
             assert logging.getLogger("saneless").level == logging.DEBUG
             assert logging.getLogger().level == logging.INFO
             assert len(_stderr_stream_handlers()) == 1
