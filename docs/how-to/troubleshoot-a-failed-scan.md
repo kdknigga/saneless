@@ -151,7 +151,14 @@ The line starts with `Paperless error:`.
 - **TLS certificate not trusted.** The line names an SSL failure, for example
   `Paperless error: Could not fetch tags from Paperless at https://paperless.example.com/: [SSL:
   CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1081)`,
-  and the scan exits 3. **The same failure looks different in the web UI.** The status strip and
+  and the scan exits 3 -- but only without a consume directory. A certificate that cannot be
+  verified is classified as unreachable, so the upload is retried, the retries are exhausted, and
+  with a consume directory configured the PDF is saved there instead: the scan then ends
+  `FALLBACK`, shown as **Saved to folder**, and the command exits 0. That is the dangerous case
+  rather than the benign one -- scans appear to keep succeeding into a folder nobody is watching,
+  so a TLS misconfiguration can run unnoticed indefinitely. Watch for `FALLBACK` /
+  **Saved to folder** in `saneless jobs`.
+  **The same failure looks different in the web UI.** The status strip and
   `GET /api/paperless/test` report a bare `unreachable` with no TLS text anywhere, because a
   certificate that cannot be verified means the connection never established, and saneless
   classifies that as unreachable -- it is reported as the **Unreachable.** case above, with the
@@ -166,6 +173,12 @@ The line starts with `Paperless error:`.
   certificate to `/usr/local/share/ca-certificates/my-ca.crt` and run `update-ca-certificates`.
   Or point OpenSSL at the certificate file directly with `SSL_CERT_FILE`, described in
   [Environment Variables](../reference/environment-variables.md#not-a-saneless-variable-ssl_cert_file-and-ssl_cert_dir).
+  If the path you give does not exist, or is a directory rather than a PEM file, saneless refuses
+  at startup with `Paperless error: Could not build the TLS trust store for Paperless at <url>:
+  <OS error text>; check SSL_CERT_FILE and SSL_CERT_DIR` -- a different error from the
+  certificate-verify failure above, and one that means the remedy itself is misconfigured rather
+  than the certificate being untrusted. Under Docker the usual cause is a bind mount whose host
+  file is missing, which gives the container a directory.
   Do not turn certificate verification off to make this go away: saneless sends the Paperless API
   token on every request, and an unverified connection hands that token to anyone in the path.
 - **Malformed URL.** A `paperless.url` without a usable `http://` or `https://` scheme is not
