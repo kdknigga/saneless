@@ -23,7 +23,14 @@ from saneless.auto_profiles import (
     is_bare_default,
 )
 from saneless.checks import CheckContext, CheckKey, CheckState, run_checks
-from saneless.config import ProfileConfig, Settings, config_search_paths
+from saneless.config import (
+    CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
+    ProfileConfig,
+    Settings,
+    config_search_paths,
+    discover_config,
+)
 from saneless.exceptions import (
     ConfigError,
     FeederEmptyError,
@@ -4442,6 +4449,129 @@ class TestStartupProfileGeneration:
         names, profile = seen[0]
         assert set(names) == set(expected)
         assert profile == expected["default"]
+
+
+class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
+    """
+    The worker's "no config file was loaded" line is a fifth description of one fact.
+
+    The startup log, the Configuration row, ``doctor``'s table and the
+    one-shot warning all read ``config_file_state``.  This message was written
+    before any of them and says "create one of <three paths>" whatever the
+    search found -- so on the machine that started this phase it would have
+    told an operator to create a file while a ``config.toml`` sat in the very
+    directory it was naming, and never mentioned it.
+
+    It is exercised through ``_persist_generated_profiles`` directly rather
+    than through a started worker, because the branch is reached before
+    anything is written and starting a worker would only add timing.
+    """
+
+    @staticmethod
+    def _persist(
+        settings: Settings, scanner: MagicMock, paperless: MagicMock
+    ) -> ProfileWriteResult | None:
+        """
+        Run the persist step over settings that loaded no file.
+
+        Args:
+            settings: The settings the worker runs on.
+            scanner: The scanner the worker is built over.
+            paperless: The Paperless client the worker is built over.
+
+        Returns:
+            Whatever the persist step reported, which should be None.
+
+        """
+        store = JobStore()
+        worker = ScanWorker(scanner, paperless, settings, store)
+        try:
+            return worker._persist_generated_profiles({"default": ProfileConfig()})
+        finally:
+            store.close()
+
+    def test_a_stale_only_search_names_the_ignored_file_and_the_new_name(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The reason nothing loaded is the file the message used to leave out."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        directory = tmp_path / "etc"
+        directory.mkdir()
+        stale = directory / LEGACY_CONFIG_FILENAME
+        stale.write_text("# left behind\n")
+        default_settings._config_discovery = discover_config(
+            (directory / CONFIG_FILENAME,)
+        )
+
+        assert self._persist(default_settings, mock_scanner, mock_paperless) is None
+
+        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert str(stale.absolute()) in message
+        assert CONFIG_FILENAME in message
+
+    def test_a_search_that_found_nothing_lists_what_it_looked_at(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """With nothing stale there is nothing to rename, so the advice is unchanged."""
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+        candidates = tuple(
+            tmp_path / name / CONFIG_FILENAME for name in ("cwd", "xdg", "etc")
+        )
+        for candidate in candidates:
+            candidate.parent.mkdir()
+        default_settings._config_discovery = discover_config(candidates)
+
+        assert self._persist(default_settings, mock_scanner, mock_paperless) is None
+
+        records = _worker_records(caplog, logging.INFO, "no config file was loaded")
+        assert len(records) == 1
+        message = records[0].getMessage()
+        for candidate in candidates:
+            assert str(candidate.absolute()) in message
+        assert LEGACY_CONFIG_FILENAME not in message
+
+    def test_neither_message_writes_a_file(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Naming the stale file is reporting, not repairing.
+
+        The working directory is ``tmp_path``, so a write to any re-derived
+        location would show up here -- and the stale file's own bytes are
+        compared, because a helpful rename is exactly the repair this message
+        must not attempt.
+        """
+        monkeypatch.chdir(tmp_path)
+        directory = tmp_path / "etc"
+        directory.mkdir()
+        stale = directory / LEGACY_CONFIG_FILENAME
+        stale.write_text("# left behind\n")
+        default_settings._config_discovery = discover_config(
+            (directory / CONFIG_FILENAME,)
+        )
+
+        assert self._persist(default_settings, mock_scanner, mock_paperless) is None
+
+        assert stale.read_text() == "# left behind\n"
+        assert not (directory / CONFIG_FILENAME).exists()
+        assert not (tmp_path / CONFIG_FILENAME).exists()
 
 
 class TestWorkerEnumDispatch:

@@ -47,6 +47,7 @@ from saneless.checks import (
     CheckResult,
     CheckState,
     check_name,
+    configuration_check,
     run_checks,
 )
 from saneless.cli import (
@@ -57,6 +58,8 @@ from saneless.cli import (
     cli,
 )
 from saneless.config import (
+    CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
     ConfigDiscovery,
     OutputConfig,
     PaperlessConfig,
@@ -205,22 +208,31 @@ def _patch_doctor(
 
     def _fake_load_settings(config_path: str | None = None) -> Settings:
         """Return the test settings, recording ``--config`` as the real one does."""
-        explicit = None if config_path is None else Path(config_path)
-        settings._config_path = explicit
-        # The real loader records the search alongside the path, and the
-        # Configuration row reads the recording.  A fake that set only the
-        # path would leave every doctor run reporting a search it never ran.
-        settings._config_discovery = (
-            discover_config(())
-            if explicit is None
-            else ConfigDiscovery(
+        if config_path is not None:
+            # The real loader records the search alongside the path, and the
+            # Configuration row and the resolution table both read the
+            # recording.  A fake that set only the path would leave every
+            # doctor run reporting a search it never ran.
+            explicit = Path(config_path)
+            settings._config_path = explicit
+            settings._config_discovery = ConfigDiscovery(
                 explicit=explicit,
                 searched=(),
                 found=(explicit,),
                 loaded=explicit,
                 stale=(),
             )
-        )
+            return settings
+        # No --config: a recording a test attached to these settings stands,
+        # and the path follows it, which is the direction the real loader
+        # derives them in.  Without one there is nothing to record but an
+        # empty search.
+        injected = settings.config_discovery
+        if injected is None:
+            settings._config_discovery = discover_config(())
+            settings._config_path = None
+        else:
+            settings._config_path = injected.loaded
         return settings
 
     monkeypatch.setattr("saneless.cli.load_settings", _fake_load_settings)
@@ -351,6 +363,93 @@ def _lines(output: str) -> list[str]:
     return [line for line in output.splitlines() if line.strip()]
 
 
+# The caption that separates the check rows from the config resolution table
+# (D-12).  Written out rather than imported so that respelling it in ``cli.py``
+# is a visible change here, the way the row wording is pinned in
+# ``tests/test_checks.py``.
+_TABLE_CAPTION = "Config files searched, in order:"
+
+
+def _rows(output: str) -> list[str]:
+    """
+    Split off the check rows: everything printed before the resolution table.
+
+    The rows used to be the whole of ``doctor``'s output, so the assertions
+    that count them were written against every printed line.  They are scoped
+    here instead of loosened, because "one line per check and nothing else" is
+    still the contract for *that* section and the table is what follows it.
+
+    Args:
+        output: The captured command output.
+
+    Returns:
+        The non-empty lines above the caption.
+
+    """
+    lines = _lines(output)
+    assert _TABLE_CAPTION in lines, output
+    return lines[: lines.index(_TABLE_CAPTION)]
+
+
+def _table(output: str) -> list[str]:
+    """
+    Return the resolution table's entries, caption excluded.
+
+    Args:
+        output: The captured command output.
+
+    Returns:
+        The non-empty lines below the caption.
+
+    """
+    lines = _lines(output)
+    assert _TABLE_CAPTION in lines, output
+    return [line.strip() for line in lines[lines.index(_TABLE_CAPTION) + 1 :]]
+
+
+def _candidates(tmp_path: Path) -> tuple[Path, ...]:
+    """
+    Build three search candidates, in the shape ``config_search_paths`` returns.
+
+    Three separate directories, because the superseded-name file is looked for
+    beside each candidate and a shared directory would make "which candidate is
+    this file beside" unanswerable.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+
+    Returns:
+        The candidate paths, in search order.
+
+    """
+    directories = (tmp_path / "cwd", tmp_path / "xdg", tmp_path / "etc")
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+    return tuple(directory / CONFIG_FILENAME for directory in directories)
+
+
+def _all_ok_but_real_configuration(settings: Settings) -> tuple[CheckResult, ...]:
+    """
+    Build green rows for every check but Configuration, which is derived.
+
+    Lets an exit-code test say something about one row without the other five
+    being able to decide the answer for it.
+
+    Args:
+        settings: The settings whose recorded search the row reports.
+
+    Returns:
+        One result per check, in member order.
+
+    """
+    return tuple(
+        configuration_check(settings, absolute_paths=True)
+        if key is CheckKey.CONFIGURATION
+        else _row(key, CheckState.OK)
+        for key in CheckKey
+    )
+
+
 class TestDoctorHelp:
     """``doctor --help`` is reachable with nothing else working."""
 
@@ -395,7 +494,10 @@ class TestDoctorExitCodes:
     ) -> None:
         """A WARN is a true statement about a deployment that still works (D-01)."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
+        # Six rows, Configuration included, so the stub mirrors what a real
+        # run hands the printer rather than a registry one member short.
         results = (
+            _row(CheckKey.CONFIGURATION, CheckState.OK),
             _row(CheckKey.SCANNER, CheckState.OK),
             _row(CheckKey.PAPERLESS, CheckState.OK),
             _row(CheckKey.PROFILES, CheckState.OK),
@@ -412,6 +514,7 @@ class TestDoctorExitCodes:
         """Any FAIL is "can't scan, fix your setup" -- the existing exit 2."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         results = (
+            _row(CheckKey.CONFIGURATION, CheckState.OK),
             _row(CheckKey.SCANNER, CheckState.OK),
             _row(CheckKey.PAPERLESS, CheckState.FAIL, next_step="Fix the token."),
             _row(CheckKey.PROFILES, CheckState.WARN, next_step="Name them."),
@@ -439,15 +542,23 @@ class TestDoctorExitCodes:
 class TestDoctorOutput:
     """The printed table: six rows, in order, each with its marker."""
 
-    def test_all_ok_prints_exactly_five_lines(
+    def test_all_ok_prints_one_line_per_check(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """One line per check and nothing else -- no header, no summary."""
+        """
+        One line per check and nothing else above the table -- no header, no summary.
+
+        The rows section is still exactly the checks; the config resolution
+        table follows it, which is asserted here rather than left to the
+        table's own tests, so this cannot go on passing after the table stops
+        being printed at all.
+        """
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
         assert result.exit_code == 0
-        assert len(_lines(result.output)) == len(CheckKey)
+        assert len(_rows(result.output)) == len(CheckKey)
+        assert _TABLE_CAPTION in result.output
 
     def test_rows_are_printed_in_check_key_order(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -456,7 +567,7 @@ class TestDoctorOutput:
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
-        printed = [line.split("]", 1)[1].split()[0] for line in _lines(result.output)]
+        printed = [line.split("]", 1)[1].split()[0] for line in _rows(result.output)]
         assert printed == [check_name(key).split()[0] for key in CheckKey]
 
     @pytest.mark.parametrize(
@@ -482,7 +593,7 @@ class TestDoctorOutput:
             tuple(_row(key, state, next_step=next_step) for key in CheckKey),
         )
         result = runner.invoke(cli, ["doctor"])
-        rows = [line for line in _lines(result.output) if line.startswith("[")]
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
         assert len(rows) == len(CheckKey)
         assert all(row.startswith(marker) for row in rows)
 
@@ -495,7 +606,7 @@ class TestDoctorOutput:
         result = runner.invoke(cli, ["doctor"])
         starts = {
             line.index(f"{check_name(key)} message.")
-            for key, line in zip(CheckKey, _lines(result.output), strict=True)
+            for key, line in zip(CheckKey, _rows(result.output), strict=True)
         }
         assert len(starts) == 1
 
@@ -510,7 +621,7 @@ class TestDoctorOutput:
         results = _all_ok_except(CheckKey.FALLBACK, CheckState.WARN, step)
         _stub_registry(monkeypatch, results)
         result = runner.invoke(cli, ["doctor"])
-        lines = _lines(result.output)
+        lines = _rows(result.output)
         assert len(lines) == len(CheckKey) + 1
         warned = list(CheckKey).index(CheckKey.FALLBACK)
         row, step_line = lines[warned], lines[warned + 1]
@@ -526,7 +637,7 @@ class TestDoctorOutput:
         results = _all_ok_except(CheckKey.PAPERLESS, CheckState.FAIL, step)
         _stub_registry(monkeypatch, results)
         result = runner.invoke(cli, ["doctor"])
-        lines = _lines(result.output)
+        lines = _rows(result.output)
         failed = list(CheckKey).index(CheckKey.PAPERLESS)
         assert lines[failed + 1].strip() == step
 
@@ -537,7 +648,229 @@ class TestDoctorOutput:
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
-        assert all(line.startswith("[") for line in _lines(result.output))
+        assert all(line.startswith("[") for line in _rows(result.output))
+
+
+class TestDoctorConfigResolutionTable:
+    """
+    D-12: after the rows, where every config file the search looked at ended up.
+
+    The Configuration row says *which situation* the appliance is in, in the
+    same words the status strip uses.  This table says *which files*, by
+    absolute path, which the row may not carry: the strip is reachable by
+    anyone on the LAN and ``doctor`` is not, and the resolved path is the half
+    an operator needs to act (D-14).
+
+    ``doctor`` is what gets run on a machine where the log is not to hand, so
+    the table is printed on every run and not only when something is wrong --
+    a resolution that appears only on failure cannot be compared against a
+    working machine's.
+    """
+
+    @staticmethod
+    def _run(
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        discovery: ConfigDiscovery,
+    ) -> list[str]:
+        """
+        Run ``doctor`` over a recorded search and hand back the table's lines.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            discovery: The recording to attach to the settings.
+
+        Returns:
+            The table entries, caption excluded and stripped.
+
+        """
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discovery
+        runner = _patch_doctor(monkeypatch, settings)
+        _stub_registry(monkeypatch, _all_ok())
+        return _table(runner.invoke(cli, ["doctor"]).output)
+
+    def test_the_table_is_separated_from_the_rows_by_a_blank_line(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Two sections read as two sections, not as a seventh and eighth row."""
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(_candidates(tmp_path))
+        runner = _patch_doctor(monkeypatch, settings)
+        _stub_registry(monkeypatch, _all_ok())
+        printed = runner.invoke(cli, ["doctor"]).output.splitlines()
+        caption = printed.index(_TABLE_CAPTION)
+        assert printed[caption - 1] == ""
+        assert printed[caption - 2].startswith("[")
+
+    def test_every_searched_candidate_is_listed_in_search_order(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Search order is the whole point: which file won is a question of order."""
+        candidates = _candidates(tmp_path)
+        lines = self._run(monkeypatch, tmp_path, discover_config(candidates))
+        assert [line.split(maxsplit=2)[-1] for line in lines] == [
+            str(candidate.absolute()) for candidate in candidates
+        ]
+
+    def test_a_candidate_that_does_not_exist_says_not_found(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A place that was looked at and held nothing is the fact that was missing."""
+        candidates = _candidates(tmp_path)
+        lines = self._run(monkeypatch, tmp_path, discover_config(candidates))
+        assert all(line.startswith("not found ") for line in lines)
+
+    def test_the_loaded_candidate_says_used_and_a_later_one_says_not_used(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Two files, one winner: the loser is present and says why it lost."""
+        candidates = _candidates(tmp_path)
+        candidates[0].write_text("# the winner\n")
+        candidates[2].write_text("# also here\n")
+        lines = self._run(monkeypatch, tmp_path, discover_config(candidates))
+        assert lines[0] == f"used {candidates[0].absolute()}"
+        assert lines[1] == f"not found {candidates[1].absolute()}"
+        assert lines[2] == (
+            f"not used {candidates[2].absolute()} (an earlier file won)"
+        )
+
+    def test_a_stale_only_search_lists_the_old_name_as_ignored(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The 2026-09-22 failure, named: the file is there and nothing read it."""
+        candidates = _candidates(tmp_path)
+        stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
+        stale.write_text("# left behind\n")
+        lines = self._run(monkeypatch, tmp_path, discover_config(candidates))
+        assert lines[-1] == (
+            f"ignored {stale.absolute()} (old name; rename it to {CONFIG_FILENAME})"
+        )
+        assert len(lines) == len(candidates) + 1
+
+    def test_a_leftover_beside_a_loaded_file_says_leftover(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        D-17's Docker shape: the new file loaded and the old one is still there.
+
+        It is a different sentence from the stale-only one because it is a
+        different situation -- nothing is broken, and the old file may still
+        hold the only copy of the URL and token.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[0].write_text("# in use\n")
+        stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
+        stale.write_text("# left behind\n")
+        lines = self._run(monkeypatch, tmp_path, discover_config(candidates))
+        assert lines[0] == f"used {candidates[0].absolute()}"
+        assert lines[-1] == f"leftover {stale.absolute()} (old name; ignored)"
+
+    def test_an_explicit_config_says_no_search_was_done(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``--config`` skips the search, so listing candidates would be a lie."""
+        given = tmp_path / "given" / CONFIG_FILENAME
+        given.parent.mkdir()
+        given.write_text("# handed over\n")
+        runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
+        _stub_registry(monkeypatch, _all_ok())
+        result = runner.invoke(cli, ["--config", str(given), "doctor"])
+        assert _table(result.output) == [
+            f"used {given.absolute()} (given with --config; no search)"
+        ]
+
+    def test_a_search_with_nothing_to_look_at_says_none_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A caption with no entries under it reads as a table that failed to print.
+
+        Settings built directly -- a test fixture, or the web app's own
+        construction -- carry no recording, and the same line covers them.
+        """
+        lines = self._run(monkeypatch, tmp_path, discover_config(()))
+        assert lines == ["none recorded"]
+
+    def test_the_paths_line_up_under_one_label_column(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Every path starts at the same column, whatever its label.
+
+        The widths are derived from the label strings in ``cli.py`` rather than
+        written down, so this is the assertion that keeps the derivation
+        honest; it is asserted on the unstripped lines because indentation is
+        what does the aligning.
+        """
+        candidates = _candidates(tmp_path)
+        candidates[0].write_text("# in use\n")
+        candidates[1].write_text("# also here\n")
+        stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
+        stale.write_text("# left behind\n")
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(candidates)
+        runner = _patch_doctor(monkeypatch, settings)
+        _stub_registry(monkeypatch, _all_ok())
+        output = runner.invoke(cli, ["doctor"]).output
+        printed = _lines(output)[_lines(output).index(_TABLE_CAPTION) + 1 :]
+        assert len(printed) == len(candidates) + 1
+        assert len({line.index(str(tmp_path)) for line in printed}) == 1
+
+
+class TestDoctorExitsOnTheConfigurationRow:
+    """
+    D-05/D-07: the config situation decides the gate, like every other row.
+
+    A lone superseded-name file is red because nothing the operator wrote was
+    read; no file at all is amber because configuring saneless entirely through
+    the environment is supported.  Both are asserted through the exit code
+    rather than the printed words, because the exit code is what a scripted
+    health gate sees.
+    """
+
+    def test_a_stale_only_config_exits_two_through_the_real_registry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Unstubbed, so the wiring from the recording to the gate is under test."""
+        candidates = _candidates(tmp_path)
+        stale = candidates[2].with_name(LEGACY_CONFIG_FILENAME)
+        stale.write_text("# left behind\n")
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(candidates)
+        runner = _patch_doctor(monkeypatch, settings)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == ExitCode.CONFIG
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        assert len(rows) == len(CheckKey)
+        configuration = rows[list(CheckKey).index(CheckKey.CONFIGURATION)]
+        assert configuration.startswith(_state_marker(CheckState.FAIL))
+        assert f"saneless now reads {CONFIG_FILENAME}" in configuration
+        assert str(stale.absolute()) in result.output
+
+    def test_no_config_file_at_all_still_exits_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An environment-only deployment is a working one, so the gate stays green.
+
+        Every other row is stubbed green so that only the Configuration row can
+        decide the answer.
+        """
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(_candidates(tmp_path))
+        runner = _patch_doctor(monkeypatch, settings)
+        _stub_registry(monkeypatch, _all_ok_but_real_configuration(settings))
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0
+        rows = [line for line in _rows(result.output) if line.startswith("[")]
+        configuration = rows[list(CheckKey).index(CheckKey.CONFIGURATION)]
+        assert configuration.startswith(_state_marker(CheckState.WARN))
 
 
 class TestASkippedRowIsNotAPassingRow:
@@ -600,7 +933,7 @@ class TestASkippedRowIsNotAPassingRow:
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _one_skipped_scanner())
         result = runner.invoke(cli, ["doctor"])
-        lines = _lines(result.output)
+        lines = _rows(result.output)
         assert len(lines) == len(CheckKey)
         # Found by key, not by position: the Scanner row stopped being the
         # first one the day Configuration was inserted above it.
@@ -637,7 +970,7 @@ class TestASkippedRowIsNotAPassingRow:
         result = runner.invoke(cli, ["doctor"])
         starts = {
             line.index(f"{check_name(key)} message.")
-            for key, line in zip(CheckKey, _lines(result.output), strict=True)
+            for key, line in zip(CheckKey, _rows(result.output), strict=True)
         }
         assert len(starts) == 1
 
