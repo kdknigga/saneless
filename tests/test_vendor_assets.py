@@ -29,18 +29,18 @@ VENDOR_DIR = STATIC_DIR / "vendor"
 BASE_HTML = TEMPLATE_DIR / "base.html"
 APP_CSS = STATIC_DIR / "app.css"
 
-HTMX_BYTES = 51250
+HTMX_BYTES = 51238
 PICO_BYTES = 83319
 
 # The SHA-384 SRI digests of the files as the npm registry publishes them:
-# ``dist/htmx.min.js`` in htmx.org 2.0.8 and ``css/pico.min.css`` in
+# ``dist/htmx.min.js`` in htmx.org 2.0.10 and ``css/pico.min.css`` in
 # @picocss/pico 2.1.1, computed from each tarball after checking the tarball
 # against the registry's own sha512 ``dist.integrity``.  Written here by hand,
 # never from the vendored files, so a wrong or tampered build fails even when
 # its integrity attribute was regenerated to match it (IN-04).
 UPSTREAM_SRI: dict[str, str] = {
-    "/static/vendor/htmx-2.0.8.min.js": (
-        "sha384-/TgkGk7p307TH7EXJDuUlgG3Ce1UVolAOFopFekQkkXihi5u/6OCvVKyz1W+idaz"
+    "/static/vendor/htmx-2.0.10.min.js": (
+        "sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V"
     ),
     "/static/vendor/pico-2.1.1.min.css": (
         "sha384-L1dWfspMTHU/ApYnFiMz2QID/PlP1xCW9visvBdbEkOLkSSWsP6ZJWhPw6apiXxU"
@@ -122,7 +122,7 @@ def test_vendored_files_and_integrity_match_the_upstream_builds() -> None:
 
 def test_vendored_file_sizes() -> None:
     """The vendored files have the byte lengths of the npm registry builds."""
-    assert (VENDOR_DIR / "htmx-2.0.8.min.js").stat().st_size == HTMX_BYTES
+    assert (VENDOR_DIR / "htmx-2.0.10.min.js").stat().st_size == HTMX_BYTES
     assert (VENDOR_DIR / "pico-2.1.1.min.css").stat().st_size == PICO_BYTES
 
 
