@@ -3380,3 +3380,113 @@ def test_the_dockerfile_comment_quotes_the_declared_build_specifier() -> None:
         "comment explains a deliberate coupling, so a stale specifier there "
         "misstates a design decision:\n" + "\n".join(offenders)
     )
+
+
+# The start of an `updates:` entry, and the settling period each must carry.
+DEPENDABOT_ENTRY = re.compile(r"^-\s+package-ecosystem:")
+COOLDOWN_KEY = "cooldown:"
+DEFAULT_DAYS = re.compile(r"^default-days:\s*(?P<days>\d+)$")
+MINIMUM_COOLDOWN_DAYS = 7
+
+
+def test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr() -> None:
+    """
+    Every ``updates:`` entry carries a cooldown of at least a week (D-15).
+
+    Measured against zizmor 1.30.1 on its default persona: the
+    ``dependabot-cooldown`` check is ecosystem-gated. A cooldown-less ``pip``
+    or ``github-actions`` entry is a finding, but a cooldown-less ``uv`` entry
+    produces none and the audit exits 0 -- so for the ecosystem carrying this
+    project's Python pins, the blocking CI step proves nothing. Without this
+    guard the settling period the file's own header demands would be policy
+    with nothing behind it, which is worse than an absent rule because it
+    reads like an enforced one. The window between one entry and the next is
+    what scopes the check, because ``_significant_lines`` has already stripped
+    the indentation that would otherwise delimit it.
+    """
+    name = DEPENDABOT_CONFIG.relative_to(REPO_ROOT)
+    lines = _significant_lines(DEPENDABOT_CONFIG)
+    starts = [
+        index
+        for index, (_number, line) in enumerate(lines)
+        if DEPENDABOT_ENTRY.match(line) is not None
+    ]
+    assert starts, (
+        f"{name} declares no updates: entry at all, so this guard has nothing "
+        "to check. Either the file stopped configuring Dependabot or the entry "
+        "spelling changed under it"
+    )
+
+    offenders: list[str] = []
+    for position, index in enumerate(starts):
+        number, line = lines[index]
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        window = [entry_line for _entry_number, entry_line in lines[index:end]]
+        days = [
+            match.group("days")
+            for entry_line in window
+            for match in [DEFAULT_DAYS.match(entry_line)]
+            if match is not None
+        ]
+        if COOLDOWN_KEY not in window or len(days) != 1:
+            offenders.append(f"{name}:{number}: {line}")
+        elif int(days[0]) < MINIMUM_COOLDOWN_DAYS:
+            offenders.append(
+                f"{name}:{number}: {line} -- settles for only {days[0]} days"
+            )
+    assert not offenders, (
+        "a Dependabot entry can open a pull request before the release it "
+        f"proposes has settled for {MINIMUM_COOLDOWN_DAYS} days. That window "
+        "is the only thing between an upstream account compromised today and "
+        "a merge-ready bump today, and zizmor does not enforce it for every "
+        "ecosystem, so nothing else here would catch this:\n" + "\n".join(offenders)
+    )
+
+
+# The seventh banned suppression spelling, assembled from the same fragments
+# as the six above for the same reason -- and kept apart from them because
+# their guard scans Python files, which is where this one cannot look.
+_FLAG_LEAD = "--"
+
+SUPPRESSION_FLAGS = (f"{_FLAG_LEAD}{_SILENCE_RULE}",)
+
+
+def test_no_workflow_or_hook_file_silences_a_checker_with_a_flag() -> None:
+    """
+    No workflow or hook step passes a checker a flag that drops findings (D-05).
+
+    The advisory gate in ``ci.yml`` brought with it a suppression surface the
+    existing ban never reached: that guard scans tracked Python files, and
+    does so deliberately, because the prose stating the rule lives in Markdown
+    and YAML. An advisory waved through by a flag is the same defect as a
+    silenced type error -- the report stops, the vulnerable version stays in
+    the lock, and the build goes green over it. The match is on the bare flag
+    rather than on the audit step, because a line continuation would evade a
+    narrower rule and because the flag would be a suppression on any other
+    tool in these files too. The scan runs over significant lines, so the
+    comment in ``ci.yml`` stating this ban is not read as the ban being
+    broken, and the banned text is built at runtime for the reason the owner
+    guard gives further up.
+    """
+    scanned = 0
+    offenders: list[str] = []
+    for path in [*_workflow_files(), PRE_COMMIT_CONFIG]:
+        name = path.relative_to(REPO_ROOT)
+        lines = _significant_lines(path)
+        scanned += len(lines)
+        offenders.extend(
+            f"{name}:{number}: {line}"
+            for number, line in lines
+            if any(flag in line for flag in SUPPRESSION_FLAGS)
+        )
+    assert scanned, (
+        "no workflow or hook file yielded a single significant line, so this "
+        "guard has nothing to scan. Either the workflows moved or the hook "
+        "config was renamed, and either way the ban is no longer enforced"
+    )
+    assert not offenders, (
+        "a workflow or hook step tells a checker to drop findings instead of "
+        "fixing what it reported. For the advisory gate that means shipping a "
+        "package whose vulnerability is known and recorded, with a green "
+        "build over it. Fix the finding, or upgrade past it:\n" + "\n".join(offenders)
+    )
