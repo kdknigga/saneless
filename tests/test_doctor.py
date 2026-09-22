@@ -399,12 +399,15 @@ def _table(output: str) -> list[str]:
         output: The captured command output.
 
     Returns:
-        The non-empty lines below the caption.
+        The non-empty lines below the caption, with their column padding
+        collapsed to single spaces so an assertion reads as "this verdict
+        about this file".  The padding itself is a separate assertion, on the
+        unstripped lines, because it is a separate claim.
 
     """
     lines = _lines(output)
     assert _TABLE_CAPTION in lines, output
-    return [line.strip() for line in lines[lines.index(_TABLE_CAPTION) + 1 :]]
+    return [" ".join(line.split()) for line in lines[lines.index(_TABLE_CAPTION) + 1 :]]
 
 
 def _candidates(tmp_path: Path) -> tuple[Path, ...]:
