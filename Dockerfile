@@ -30,7 +30,7 @@ WORKDIR /app
 # Named inputs, never the whole context. This is the second of TWO independent
 # gates on what can reach a build layer; the first is the .dockerignore
 # allow-list. Copying the whole context here would sweep in whatever the daemon
-# was sent -- which, before this was written, included a real config.toml
+# was sent -- which, before this was written, included a real config file
 # holding a live paperless-ngx API token, recoverable afterwards from the
 # discarded builder stage. With both gates in place, a mistake in either one
 # alone leaks nothing.
@@ -125,7 +125,7 @@ USER saneless
 # bare-metal installs, and in Docker you remap on the host with -p 8888:8080.
 # The healthcheck URL is written out rather than expanded from the environment
 # on purpose -- a shell-form expansion would track SANELESS_OUTPUT__WEB_PORT
-# but silently not a web_port set in config.toml, which replaces one false
+# but silently not a web_port set in saneless.toml, which replaces one false
 # claim with a half-true one. 8080 is above 1024 and curl to localhost needs no
 # privilege, so neither the bind nor the probe cares that this is UID 1000.
 EXPOSE 8080

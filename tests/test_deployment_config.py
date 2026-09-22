@@ -1,13 +1,13 @@
 """
 Static text tests for the documented Docker deployment (CFG-09, M-30, D-09).
 
-saneless rewrites ``config.toml`` atomically: it writes a temp file beside the
+saneless rewrites ``saneless.toml`` atomically: it writes a temp file beside the
 config and renames it over the original. That rename only works when the
 container sees the config *directory*. A single-file bind mount makes the kernel
 refuse the rename with EBUSY, so every profile write fails on the deployment the
 docs used to recommend. These tests hold the compose example and every doc page
 to the read-write directory mount ``./config:/etc/saneless``, and they keep out
-the old, false claim that the container fails to start without ``config.toml``.
+the old, false claim that the container fails to start without ``saneless.toml``.
 
 The later tests hold the configuration, environment-variable and CLI references,
 the scripting how-to, the empty-page explanation and ``saneless.toml.example``
@@ -24,7 +24,7 @@ subsection, and the absence of the two claims that phase falsified (D-20).
 
 The Phase 30 tests hold the shipped compose template to D-17 -- the paperless
 connection is commented out, because a live line there silently overrides
-``./config/config.toml`` -- and to APPL-11's consume-directory mount and
+``./config/saneless.toml`` -- and to APPL-11's consume-directory mount and
 APPL-12's ``TZ``. They derive the documentation's expectations from the
 source: the route decorators, the ``WebConfig`` fields and the
 ``RequestRejection`` members, so a future addition cannot ship undocumented
@@ -106,7 +106,27 @@ DIRECTORY_MOUNT = "./config:/etc/saneless"
 # where the host side has to be absolute and quoted (row 31).
 ABSOLUTE_DIRECTORY_MOUNT = '"$(pwd)/config:/etc/saneless"'
 DIRECTORY_MOUNT_FORMS = (DIRECTORY_MOUNT, ABSOLUTE_DIRECTORY_MOUNT)
-SINGLE_FILE_MOUNT = "config.toml:/etc/saneless/config.toml"
+
+# The one config filename saneless reads, and the one it used to read. The
+# legacy name is assembled from named parts in an f-string rather than written
+# as a single literal, because the repository sweep guard forbids that literal
+# in every shipped file -- this one included -- and a literal here would make
+# the guard report its own definition. It is the ``FORBIDDEN_OWNER_SLUG``
+# idiom, and for the same reason: ruff's FLY002 rewrites a ``"".join`` over an
+# inline sequence straight back into the literal, and suppression is forbidden.
+CONFIG_NAME = "saneless.toml"
+_LEGACY_STEM = "config"
+_TOML_EXT = "toml"
+LEGACY_CONFIG_NAME = f"{_LEGACY_STEM}.{_TOML_EXT}"
+
+# Both spellings of the single-file bind mount that breaks the atomic rename.
+# The legacy spelling stays: an operator upgrading from it copies the old line
+# out of an old guide, so dropping it would make this guard vacuous for exactly
+# the deployment it exists to catch.
+SINGLE_FILE_MOUNTS = (
+    f"{LEGACY_CONFIG_NAME}:/etc/saneless/{LEGACY_CONFIG_NAME}",
+    f"{CONFIG_NAME}:/etc/saneless/{CONFIG_NAME}",
+)
 
 DEPLOY_HOWTO = DOCS_DIR / "how-to" / "deploy-docker-compose.md"
 DOCKER_REFERENCE = DOCS_DIR / "reference" / "docker.md"
@@ -148,18 +168,44 @@ def test_compose_mounts_the_config_directory() -> None:
     )
 
 
+def _is_single_file_mount(line: str) -> bool:
+    """Say whether a line bind-mounts the config file itself, in either spelling."""
+    return any(mount in line for mount in SINGLE_FILE_MOUNTS)
+
+
 def test_no_single_file_config_mount_anywhere() -> None:
-    """No compose file or doc page bind-mounts ``config.toml`` as a single file."""
+    """No compose file or doc page bind-mounts the config file on its own."""
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
         for path in _deployment_files()
         for number, line in enumerate(
             path.read_text(encoding="utf-8").splitlines(), start=1
         )
-        if SINGLE_FILE_MOUNT in line
+        if _is_single_file_mount(line)
     ]
-    assert not offenders, "single-file config.toml mount found:\n" + "\n".join(
-        offenders
+    assert not offenders, "single-file config mount found:\n" + "\n".join(offenders)
+
+
+def test_the_single_file_mount_guard_fires_for_both_spellings() -> None:
+    """
+    The guard above can fail, for the old filename and for the new one.
+
+    The rename is what makes this worth asserting. A guard written around one
+    literal filename goes quietly vacuous the moment the file is renamed: it
+    keeps passing, on every page, forever, while the mount it was written to
+    catch sails through under the other name. Feeding one synthetic line per
+    spelling through the same predicate the guard uses is the cheapest proof
+    that neither spelling is a blind spot.
+    """
+    for mount in SINGLE_FILE_MOUNTS:
+        line = f"      - ./{mount}:ro"
+        assert _is_single_file_mount(line), (
+            f"the single-file mount guard does not fire for {line.strip()!r}, "
+            f"so a page could carry that mount unnoticed"
+        )
+    assert not _is_single_file_mount(f"      - {DIRECTORY_MOUNT}"), (
+        "the single-file mount guard fires for the directory mount the docs "
+        "are supposed to recommend, so it would fail on correct pages"
     )
 
 
@@ -208,14 +254,17 @@ def test_deploy_doc_explains_missing_config_and_migration() -> None:
     migration = [
         line
         for line in text.splitlines()
-        if "config.toml" in line and "config/" in line and "mv" in line
+        if f"config/{CONFIG_NAME}" in line and "mv" in line
     ]
-    assert migration, f"{name} has no migration step moving config.toml into ./config/"
+    assert migration, (
+        f"{name} has no migration step moving an old single-file config to "
+        f"./config/{CONFIG_NAME}"
+    )
 
 
-def test_deploy_doc_says_where_auto_profiles_writes_without_config_toml() -> None:
+def test_deploy_doc_says_where_auto_profiles_writes_without_a_config_file() -> None:
     """
-    With no ``config.toml``, the doc names the real write path (WR-06).
+    With no ``saneless.toml``, the doc names the real write path (WR-06).
 
     The CLI writes ``./saneless.toml`` when no config file was loaded. The
     image's runtime stage sets ``WORKDIR /var/lib/saneless``, so that resolves
@@ -228,10 +277,10 @@ def test_deploy_doc_says_where_auto_profiles_writes_without_config_toml() -> Non
     name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
     assert AUTO_PROFILES_CONTAINER_PATH in text, (
         f"{name} does not say auto-profiles writes "
-        f"{AUTO_PROFILES_CONTAINER_PATH} when config.toml is missing"
+        f"{AUTO_PROFILES_CONTAINER_PATH} when the config file is missing"
     )
-    assert "touch config/config.toml" in text, (
-        f"{name} does not tell container users to create config/config.toml first"
+    assert f"touch config/{CONFIG_NAME}" in text, (
+        f"{name} does not tell container users to create config/{CONFIG_NAME} first"
     )
 
 
@@ -848,7 +897,7 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
 # ---------------------------------------------------------------------------
 
 # Every environment variable that carries the paperless-ngx connection. A live
-# line here silently overrides ``./config/config.toml`` -- the U-01 finding.
+# line here silently overrides ``./config/saneless.toml`` -- the U-01 finding.
 OVERRIDING_ENV_KEYS = ("SANELESS_PAPERLESS__URL", "SANELESS_PAPERLESS__TOKEN")
 
 _TOKEN_ASSIGNMENT = re.compile(r"SANELESS_PAPERLESS__TOKEN=(\S*)")
@@ -887,21 +936,21 @@ def test_compose_ships_no_live_paperless_environment_line() -> None:
     assert not offenders, (
         "the shipped compose template still sets the paperless connection in "
         "its environment: block, which silently overrides "
-        "./config/config.toml (D-17, U-01):\n" + "\n".join(offenders)
+        "./config/saneless.toml (D-17, U-01):\n" + "\n".join(offenders)
     )
 
 
 def test_compose_says_the_environment_block_overrides_the_config_file() -> None:
     """The commented block explains the override and the upgrade action."""
     text = COMPOSE.read_text(encoding="utf-8").lower()
-    for needle in ("override", "config.toml"):
+    for needle in ("override", CONFIG_NAME):
         assert needle in text, (
-            f"{COMPOSE.name} does not say that an environment line "
-            f"{needle}s the config file (D-17)"
+            f"{COMPOSE.name} does not contain {needle!r}, so it does not "
+            f"say that an environment line overrides {CONFIG_NAME} (D-17)"
         )
     assert "delete" in text or "remove" in text, (
         f"{COMPOSE.name} does not tell an operator who copied an earlier "
-        "version to remove their own token line, so their real config.toml "
+        "version to remove their own token line, so their real saneless.toml "
         "stays overridden and the status strip stays red"
     )
 
@@ -985,10 +1034,10 @@ def test_deploy_howto_tells_existing_operators_to_remove_their_token_line() -> N
     assert "SANELESS_PAPERLESS__TOKEN" in text, (
         f"{name} no longer names the variable an existing operator has to remove"
     )
-    for needle in ("override", "config.toml"):
+    for needle in ("override", CONFIG_NAME):
         assert needle in lowered, (
-            f"{name} does not explain that an environment line {needle}s the "
-            "config file (D-17)"
+            f"{name} does not contain {needle!r}, so it does not explain that "
+            f"an environment line overrides {CONFIG_NAME} (D-17)"
         )
     assert "red" in lowered, (
         f"{name} does not state the consequence -- the status strip stays red "
@@ -1517,14 +1566,17 @@ GITIGNORE = REPO_ROOT / ".gitignore"
 # Path fragments that must never appear on a ``!`` re-include line. ``config``
 # and ``saneless.toml`` are where a live paperless-ngx token lives; ``tests``
 # and ``.planning`` are bulk the image has no use for, and ``.planning`` in
-# particular carries the phase audit artifacts.
+# particular carries the phase audit artifacts. The legacy filename stays on
+# this list although saneless no longer reads it: a file left behind under the
+# old name still holds whatever token its owner put there, so it must never
+# reach the daemon either.
 FORBIDDEN_CONTEXT_PATHS = (
     ".env",
     ".git",
     ".planning",
     "config",
-    "config.toml",
-    "saneless.toml",
+    LEGACY_CONFIG_NAME,
+    CONFIG_NAME,
     "tests",
 )
 
@@ -1564,7 +1616,7 @@ def test_dockerignore_starts_with_a_deny_everything_line() -> None:
     ``!`` line below re-includes one path the wheel build needs. That only
     holds while ``*`` comes first. Move it down, or drop it, and every ``!``
     line below it becomes decoration while the working tree -- including a real
-    ``config.toml`` with a live paperless-ngx token -- rides into a build layer
+    ``saneless.toml`` with a live paperless-ngx token -- rides into a build layer
     that is recoverable from the image.
     """
     lines = _significant_lines(DOCKERIGNORE)
@@ -1760,7 +1812,7 @@ def test_dockerfile_copies_only_the_wheel_build_inputs() -> None:
     This is the second of the two independent build-context gates, the first
     being the ``.dockerignore`` allow-list. Copying the entire context sweeps
     whatever the daemon was sent into a layer -- which, before this phase,
-    included a real ``config.toml`` holding a live paperless-ngx token. Naming
+    included a real ``saneless.toml`` holding a live paperless-ngx token. Naming
     the inputs means a mistake in the allow-list alone cannot leak anything.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
@@ -2005,7 +2057,7 @@ def test_the_example_config_does_not_ship_a_live_web_port() -> None:
 
     The example shipped ``web_port = 8081``, which is wrong for every Docker
     reader: the image's ``EXPOSE`` and healthcheck are both 8080, so copying
-    the example into a mounted ``config.toml`` moved the server off the port
+    the example into a mounted ``saneless.toml`` moved the server off the port
     the healthcheck probes and the container went unhealthy with nothing on
     screen to say why. The line joins the commented pair below it instead, so
     it still documents the key without configuring anything.
@@ -3660,4 +3712,67 @@ def test_the_workflow_reader_collects_both_extensions_github_loads() -> None:
     assert found == on_disk, (
         "the reader disagrees with the directory. Every workflow file GitHub "
         f"would load must reach the guards: {sorted(on_disk - found)} missing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: the config filename rename (CFG-05, D-01, D-03, D-13, D-17)
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_doc_tells_upgraders_to_rename_the_config_file() -> None:
+    """
+    The compose how-to gives the rename an upgrading operator has to perform.
+
+    Every container deployed from this guide holds the old
+    ``config/config.toml`` rather than ``config/saneless.toml``, because the
+    old name is what the guide told its reader to create. saneless no longer
+    reads it, so on the first pull after the rename the file goes
+    silently unread -- the exact failure this phase exists to remove. The
+    guide must therefore carry the rename as a command, on one line, naming
+    both filenames, and must say what the reader sees until they run it: the
+    status page's Configuration row.
+    """
+    text = DEPLOY_HOWTO.read_text(encoding="utf-8")
+    name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
+    renames = [
+        line
+        for line in text.splitlines()
+        if "mv" in line
+        if f"config/{LEGACY_CONFIG_NAME}" in line
+        if f"config/{CONFIG_NAME}" in line
+    ]
+    assert renames, (
+        f"{name} has no line telling an upgrading operator to rename "
+        f"config/{LEGACY_CONFIG_NAME} to config/{CONFIG_NAME}. Without it "
+        "every container deployed from this guide loads no config at all "
+        "after the upgrade, with nothing on the page to say why"
+    )
+    assert "Configuration" in text, (
+        f"{name} does not name the Configuration row, which is what an "
+        "operator who has not renamed the file sees turn red"
+    )
+
+
+def test_compose_tells_upgraders_to_rename_the_config_file() -> None:
+    """
+    The shipped compose template carries the rename in a comment.
+
+    The compose file is the artifact an operator actually has open when they
+    pull a new image, and their own copy of it still names the old path. One
+    comment line naming both paths is what turns a silent no-config start into
+    an instruction.
+    """
+    renames = [
+        f"{COMPOSE.name}:{number}: {line.strip()}"
+        for number, line in _numbered(COMPOSE)
+        if _is_comment(line)
+        if f"./config/{LEGACY_CONFIG_NAME}" in line
+        if f"./config/{CONFIG_NAME}" in line
+    ]
+    assert renames, (
+        f"{COMPOSE.name} has no comment line naming both ./config/"
+        f"{LEGACY_CONFIG_NAME} and ./config/{CONFIG_NAME}, so an operator "
+        "copying this template gets no notice that the old name stopped "
+        "being read"
     )
