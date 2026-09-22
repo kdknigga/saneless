@@ -49,10 +49,11 @@ The citation guard holds every source, template, style and script file under
 they might otherwise point at do not ship with the product.
 
 The Phase 35 tests hold the declared ``>=`` floors to the versions ``uv.lock``
-resolves, and hold the ``anyio`` ceiling to its declaration. The container
-installs the built wheel with pip, which resolves from the floors and never
-reads the lock, so until the pins land the floors are the only thing a
-non-lock install obeys (DEP-12, DEP-13, D-09, D-10, D-11, D-17).
+resolves, and hold the ``anyio`` ceiling to its declaration. Phase 36 made the
+container install a hash-checked export of the lock, so the floors no longer
+decide what ships; the published wheel's metadata still carries them, so they
+remain the only thing a downstream non-lock install obeys (DEP-12, DEP-13,
+D-09, D-10, D-11, D-17).
 
 Plain-text assertions, with one stated exception: the contract is what an
 operator copies, not what a YAML parser makes of it. The exception is the
@@ -2945,9 +2946,11 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
     """
     Every declared ``>=`` floor equals the version ``uv.lock`` resolves for it.
 
-    The Dockerfile installs the built wheel with pip, which resolves from
-    these floors and never reads the lock. A floor left below the locked
-    version therefore admits into the shipped image the very tree this project
+    The container is no longer the surface at risk here -- it installs a
+    hash-checked export of the lock -- but the published wheel's metadata
+    carries these floors verbatim, so they are what a downstream
+    ``pip install saneless`` resolves against. A floor left below the locked
+    version therefore admits into a fresh install the very tree this project
     upgraded away from, and nothing else in the repository would notice. The
     rule is equality, not satisfaction, so the comparison is plain string
     equality over the lock's ``version`` field and needs no PEP 440 parsing: a
@@ -3022,10 +3025,10 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
 
     assert not offenders, (
         f"a declared floor and {UV_LOCK.name} disagree. The container installs "
-        "the built wheel with pip, which resolves from the floors and never "
-        "reads the lock, so a floor below the locked version is the only thing "
-        "standing between a fresh install and the tree this project already "
-        "upgraded away from:\n" + "\n".join(offenders) + remedy
+        "a hash-checked export of the lock, but the published wheel's metadata "
+        "carries these floors, so a floor below the locked version is the only "
+        "thing standing between a downstream fresh install and the tree this "
+        "project already upgraded away from:\n" + "\n".join(offenders) + remedy
     )
 
 
