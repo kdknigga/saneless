@@ -3516,7 +3516,7 @@ def _stale_only_discovery(tmp_path: Path) -> ConfigDiscovery:
         tmp_path: pytest's per-test directory.
 
     Returns:
-        The recording, whose one stale entry is ``<tmp_path>/etc/config.toml``.
+        The recording: no ``saneless.toml``, one stale ``<tmp_path>/etc/config.toml``.
 
     """
     directory = tmp_path / "etc"
@@ -3548,11 +3548,12 @@ class TestAutoProfilesRefusesAStaleOnlyConfig:
     D-15: the one CLI write refuses while a superseded-name file is the only one.
 
     ``auto-profiles``'s target with nothing loaded is ``./saneless.toml``, and
-    that file is the *first* thing the next start looks at.  Writing it while
-    ``config.toml`` still holds the only copy of the Paperless URL and token
-    would not lose those values but would permanently shadow them: the search
-    would stop at the new file and the row saying to rename the old one would
-    go green, with the appliance still running on defaults.
+    that file is the *first* thing the next start looks at.  Writing a
+    ``saneless.toml`` while an unread ``config.toml`` still holds the only
+    copy of the Paperless URL and token would not lose those values but would
+    permanently shadow them: the search would stop at the new file and the row
+    saying to rename the old one would go green, with the appliance still
+    running on defaults.
 
     So the refusal is not tidiness -- it is the difference between a fixable
     situation and one whose evidence has been buried.

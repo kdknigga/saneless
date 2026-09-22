@@ -5,7 +5,7 @@ Scan profiles define how saneless scans documents -- the paper source, resolutio
 ## What you'll need
 
 - saneless installed and working ([Install on Bare Metal](install-bare-metal.md) or [Deploy with Docker Compose](deploy-docker-compose.md))
-- A text editor to modify `saneless.toml` or `config.toml`
+- A text editor to modify `saneless.toml`
 
 ## Profile basics
 
@@ -189,7 +189,7 @@ Where the generated profiles go depends on the config file saneless loaded:
 
 - **A config file was loaded** (the `--config` path, or the first file found in the [search path](../reference/configuration.md#config-file-search-path)): the profiles are added to that file, as `saneless auto-profiles` would add them, and used straight away.
 - **No config file was loaded:** the profiles are used for this run only and nothing is written. The log names the locations where a config file would be picked up.
-- **The config file cannot be written** -- for example, a read-only mount, or `config.toml` bind-mounted as a single file (the rename fails with EBUSY; mount its directory instead, see [Deploy with Docker Compose](deploy-docker-compose.md)): the profiles are used for this run only, and a warning is logged.
+- **The config file cannot be written** -- for example, a read-only mount, or `saneless.toml` bind-mounted as a single file (the rename fails with EBUSY; mount its directory instead, see [Deploy with Docker Compose](deploy-docker-compose.md)): the profiles are used for this run only, and a warning is logged.
 
 Generation is tried once per start. If the scanner was not reachable, saneless keeps the bare `default` profile and logs why; connect the scanner, then restart saneless or run `saneless auto-profiles` to try again.
 

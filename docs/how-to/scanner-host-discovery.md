@@ -18,7 +18,7 @@ Set the scanner host in saneless configuration. saneless injects the value into 
 
 ### Method 1: Configuration file
 
-Add the scanner host to your `config.toml`:
+Add the scanner host to your `saneless.toml`:
 
 ```toml
 [scanner]

@@ -111,7 +111,7 @@ saneless uses `pydantic-settings` to load configuration from a TOML file with en
 - **TOML file** (`saneless.toml`) for persistent settings on bare-metal installs.
 - **Environment variables** (prefixed `SANELESS_`, nested with `__`) for container deployments where secrets should not be baked into the image.
 
-Configuration search paths follow XDG conventions: the current directory, `$XDG_CONFIG_HOME/saneless/` (default `~/.config/saneless/`), and `/etc/saneless/`.
+Configuration search paths follow XDG conventions, and the file is named `saneless.toml` in every one of them: `./saneless.toml`, `$XDG_CONFIG_HOME/saneless/saneless.toml` (default `~/.config/saneless/saneless.toml`), and `/etc/saneless/saneless.toml`.
 
 The **profile system** stores named scanner presets (source, resolution, color mode, default metadata) so users can switch between common scan types without reconfiguring each time. Profiles are defined in the TOML file under `[profiles.<name>]` sections.
 

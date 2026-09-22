@@ -8,19 +8,78 @@ Settings are loaded from the first file found, in priority order:
 
 1. `--config PATH` -- explicit CLI flag (highest priority)
 2. `./saneless.toml` -- current working directory
-3. `$XDG_CONFIG_HOME/saneless/config.toml` -- XDG config directory (`~/.config/saneless/config.toml` when `XDG_CONFIG_HOME` is unset, empty or relative)
-4. `/etc/saneless/config.toml` -- system-wide (typical for Docker)
+3. `$XDG_CONFIG_HOME/saneless/saneless.toml` -- XDG config directory (`~/.config/saneless/saneless.toml` when `XDG_CONFIG_HOME` is unset, empty or relative)
+4. `/etc/saneless/saneless.toml` -- system-wide (typical for Docker)
+
+The file is called `saneless.toml` in every searched location. No other filename is a search candidate, in any of them.
 
 If no file is found, defaults and environment variables are used.
 
 A path that is not a regular file (for example a directory) is skipped. An explicit `--config PATH` that does not exist, or is not a regular file, is an error (exit code 2). A leading `~` in `--config` is expanded to your home directory.
+
+!!! warning "Upgrading from config.toml to saneless.toml"
+
+    Earlier versions looked for `config.toml` in the XDG and `/etc` locations. saneless now reads `saneless.toml` there too, and the old name is no longer a fallback: a file still called `config.toml` in a searched directory is recognised by its name, never opened, and never merged into your settings.
+
+    Rename it:
+
+    ```bash
+    mv ~/.config/saneless/config.toml ~/.config/saneless/saneless.toml
+    # or, for a system-wide install
+    sudo mv /etc/saneless/config.toml /etc/saneless/saneless.toml
+    ```
+
+    Until you do, saneless says so in four places rather than starting up quietly on defaults: the log names the file it ignored, the [Configuration check](#the-configuration-check) is red and names both the file and the rename, `saneless doctor` lists it in its resolution table and exits 2, and `saneless auto-profiles` refuses to run -- writing a fresh `./saneless.toml` would shadow the URL and token in the file you have not renamed yet.
+
+    If the old file sits beside a `saneless.toml` that did load, the check is amber instead: the right file is in use, but the leftover may still hold settings that are now being ignored. Move anything you still need out of it into the loaded file, and only then delete it. Do not delete it first -- in the documented Docker layout `auto-profiles` writes `/var/lib/saneless/saneless.toml`, so after an upgrade the leftover `/etc/saneless/config.toml` may hold the only copy of your paperless-ngx URL and token.
+
+    A `./config.toml` belonging to some other tool in your working directory is flagged in the same way, because saneless cannot tell the two apart and will not read either. Run saneless from another directory, or create the `saneless.toml` it is looking for.
+
+### When no config file loads
+
+Every start logs one line saying where the settings came from. When a file loaded, that line names the file. When none did, it names every place saneless looked instead, absolute and in search order:
+
+```text
+Configuration: no config file; defaults + environment; searched /home/you/saneless.toml, /home/you/.config/saneless/saneless.toml, /etc/saneless/saneless.toml
+```
+
+The searched list appears only in this case. A start that loaded a file logs that file's path and no list -- the location that matters is the one in use, and three extra lines on every healthy start are noise in a log you read when something is wrong.
+
+A file under the old name found during that search gets its own warning, one per file, in search order:
+
+```text
+Ignoring /etc/saneless/config.toml: saneless reads saneless.toml, not config.toml; rename it to /etc/saneless/saneless.toml, then restart saneless
+```
+
+If a `saneless.toml` did load and an old-named file was left beside it, the warning says to move before it says to delete:
+
+```text
+Ignoring leftover /etc/saneless/config.toml: /var/lib/saneless/saneless.toml is in use; move anything you still need from it into /var/lib/saneless/saneless.toml, then delete it
+```
+
+On a machine where the log is not to hand, `saneless doctor` prints the same facts as a table -- every candidate, whether it exists, which one was used and any file ignored under the old name. See [CLI Commands](cli-commands.md#doctor).
+
+### The Configuration check
+
+`Configuration` is the first of the six rows on the status page and in `saneless doctor`, and it is always present. It is the row that says which configuration file is in use:
+
+| Situation | State | Message | Next step |
+|-----------|-------|---------|-----------|
+| A file loaded, nothing left under the old name | OK | `Config file loaded.` | *(none)* |
+| A file loaded, an old-named file beside it | Warning | `Using saneless.toml; an old config.toml is being ignored.` | `Move anything you still need from FILE into the saneless.toml in use, then delete FILE and restart saneless.` |
+| No file loaded, nothing found under the old name | Warning | `No config file; running on defaults and environment variables.` | `The saneless log lists every place it looked for saneless.toml.` |
+| No file loaded, an old-named file found | Failed | `No config file loaded: saneless now reads saneless.toml, not config.toml.` | `Rename FILE to saneless.toml, then restart saneless.` |
+
+`FILE` is the file saneless found and did not read. On the status page it is named by its documented spelling -- `./config.toml`, `$XDG_CONFIG_HOME/saneless/config.toml` or `/etc/saneless/config.toml`, the same three positions the search uses for `saneless.toml` -- because that page is visible to everyone on your network and carries no filesystem paths. The log, `saneless doctor` and the one-line stderr warning give the absolute path instead.
+
+A missing config file is a warning and never a failure. Configuring saneless entirely through `SANELESS_*` variables is supported (see [Environment Variables](environment-variables.md)), and an unset paperless-ngx URL or token already reddens the Paperless row -- it is not this row's job to report it twice.
 
 ## Validation
 
 Every section rejects keys it does not know, and so does the top level. A misspelt key is an error when the config loads, not a setting that is silently ignored. The error names the file (or the environment variable that supplied the value), the section and the key, suggests a close match when there is one, and lists the valid keys (or names the section a misplaced key belongs in). Type and value errors use the same `[section] key` form. Each problem gets its own line, and values are never printed, so a token in a mistyped key does not end up in your terminal or log. saneless then exits with code 2.
 
 ```text
-Configuration error in /etc/saneless/config.toml:
+Configuration error in /etc/saneless/saneless.toml:
   [paperless] unknown key 'tokne' (did you mean 'token'?); valid keys: url, token, consume_dir
   [paperless] unknown key 'web_port'; it belongs in [output]
 ```

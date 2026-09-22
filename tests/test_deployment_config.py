@@ -3776,3 +3776,101 @@ def test_compose_tells_upgraders_to_rename_the_config_file() -> None:
         "copying this template gets no notice that the old name stopped "
         "being read"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: the repository-wide sweep guard (CFG-05, D-13)
+# ---------------------------------------------------------------------------
+
+# The lines allowed to name the superseded config filename without also naming
+# the current one. Each entry is an exact ``(repo-relative path, stripped
+# line)`` pair, so widening the exception to a neighbouring line, or letting it
+# drift to another file, fails the guard rather than passing quietly. Every
+# entry carries the reason it is here.
+#
+# The line texts are assembled from ``LEGACY_CONFIG_NAME`` for the reason given
+# where that constant is defined: the guard below scans this file too, and a
+# literal here would make it report its own allowlist.
+_LEGACY_NAME_ALLOWED_LINES: frozenset[tuple[str, str]] = frozenset(
+    {
+        # The one place the superseded name is spelled in shipped source.
+        # Detection needs the literal -- without it nothing could name a
+        # leftover file -- and the constant exists precisely so that this is
+        # the only line which has to carry it. Detecting the old name is not
+        # supporting it: the file is stat-ed and never opened.
+        (
+            "src/saneless/config.py",
+            f'LEGACY_CONFIG_FILENAME: Final = "{LEGACY_CONFIG_NAME}"',
+        ),
+    }
+)
+
+
+def test_no_shipped_file_names_the_legacy_config_file() -> None:
+    """
+    No tracked file outside ``.planning/`` names the old config file (D-13).
+
+    The sweep is total because a half-swept tree is worse than an unswept one:
+    a reader who meets the old name on one page and the new name on another
+    has no way to tell which is stale. A line may still carry the old name
+    when it also carries the new one, because such a line is a rename
+    instruction rather than a leftover -- which is how the upgrade sections
+    are written. Anything else is an offender unless it appears verbatim in
+    ``_LEGACY_NAME_ALLOWED_LINES``.
+    """
+    offenders: list[str] = []
+    for name in _shipped_files():
+        # Two clauses rather than one tuple, for the reason set out on the
+        # owner-slug guard above: ruff format rewrites a parenthesised tuple
+        # into PEP 758's bracketless form, which the pre-commit
+        # debug-statements hook cannot parse on its own older interpreter.
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if LEGACY_CONFIG_NAME in line
+            if CONFIG_NAME not in line
+            if (name, line.strip()) not in _LEGACY_NAME_ALLOWED_LINES
+        )
+    assert not offenders, (
+        f"a shipped file still names {LEGACY_CONFIG_NAME} as a saneless "
+        f"config path. saneless reads {CONFIG_NAME} in every searched "
+        "location and never reads the old name, so a page that still spells "
+        "it sends its reader to create a file that is detected and ignored. "
+        "Either rename the path, or name both files on the line so it reads "
+        "as the rename it is:\n" + "\n".join(offenders)
+    )
+
+
+def test_legacy_name_allowlist_entries_still_exist() -> None:
+    """
+    Every allowlisted line is still present, verbatim, in the file it names.
+
+    Without this the allowlist rots into a silent pass: the guard above only
+    ever *subtracts*, so an entry whose line was reworded, moved or deleted
+    goes on excusing something that is not there, and the next line to match
+    its text inherits the exemption without anyone deciding to grant it.
+    """
+    missing: list[str] = []
+    for name, expected in sorted(_LEGACY_NAME_ALLOWED_LINES):
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            missing.append(f"{name}: is not UTF-8, so the line cannot be found")
+            continue
+        except OSError:
+            missing.append(f"{name}: cannot be read")
+            continue
+        if expected not in [line.strip() for line in text.splitlines()]:
+            missing.append(f"{name}: {expected}")
+    assert not missing, (
+        "an entry in _LEGACY_NAME_ALLOWED_LINES no longer matches a line in "
+        "the file it exempts, so it excuses nothing while the next line to "
+        "match its text would be exempted by accident. Remove the entry, or "
+        "correct it to the line that is really there:\n" + "\n".join(missing)
+    )

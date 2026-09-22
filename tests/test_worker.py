@@ -4459,8 +4459,8 @@ class TestNoConfigFileMessageAgreesWithTheRestOfTheProduct:
     one-shot warning all read ``config_file_state``.  This message was written
     before any of them and says "create one of <three paths>" whatever the
     search found -- so on the machine that started this phase it would have
-    told an operator to create a file while a ``config.toml`` sat in the very
-    directory it was naming, and never mentioned it.
+    told an operator to create a ``saneless.toml`` while a ``config.toml``
+    sat in the very directory it was naming, and never mentioned it.
 
     It is exercised through ``_persist_generated_profiles`` directly rather
     than through a started worker, because the branch is reached before
