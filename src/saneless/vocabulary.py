@@ -39,6 +39,7 @@ __all__ = [
     "TOKEN_UNSET_JOB_ERROR",
     "WORKER_DEGRADED_JOB_ERROR",
     "WORKER_DOWN_JOB_ERROR",
+    "ConfigFileState",
     "ConnectionStatus",
     "ErrorAdvice",
     "ErrorCategory",
@@ -184,11 +185,47 @@ class ProfileStorage(StrEnum):
     ``PERSISTED`` means the profiles are in the config file and will survive a
     restart.  Both ``IN_MEMORY_`` members mean they are in memory for this run
     only.
+
+    "No config file was loaded" covers two situations, and this enum does not
+    separate them: the searched directories held nothing, or one of them held a
+    file under the old name that was detected and deliberately not read.
+    ``ConfigFileState`` is what tells those apart, and it is the Configuration
+    row, not the Profiles row, that reports the difference.
     """
 
     PERSISTED = "PERSISTED"
     IN_MEMORY_NO_CONFIG_FILE = "IN_MEMORY_NO_CONFIG_FILE"
     IN_MEMORY_UNWRITABLE = "IN_MEMORY_UNWRITABLE"
+
+
+class ConfigFileState(StrEnum):
+    """
+    What the search for a configuration file found at startup.
+
+    Recorded once, when the search runs, and never re-probed.  Which file was
+    loaded is a fact about this process's past: the settings in hand came from
+    that file, and a fresh stat cannot reproduce it -- a file created, renamed
+    or deleted since startup would make a re-probe describe a program that is
+    not running.  Mixing a recorded "loaded" with a freshly probed "stale"
+    would also produce combinations none of these four members describe.
+    Every surface that reports configuration -- the startup log, the status
+    strip, ``saneless doctor`` and the one-shot commands -- reads the one
+    recording, so they cannot disagree about the same appliance.
+
+    ``LOADED`` is the healthy case.  ``LOADED_WITH_LEFTOVER`` is a warning and
+    not a failure: the right file was read, and the file left beside it under
+    the old name is a trap only for the next person to edit it, so the advice
+    is to move anything still wanted out of it first.  ``NOT_FOUND`` is a
+    warning too, because configuring saneless entirely through the environment
+    is supported.  ``STALE_ONLY`` is a failure: a file under the old name is
+    the only thing in the searched directories, so nothing the operator wrote
+    was read, and saneless is running on defaults while appearing configured.
+    """
+
+    LOADED = "LOADED"
+    LOADED_WITH_LEFTOVER = "LOADED_WITH_LEFTOVER"
+    NOT_FOUND = "NOT_FOUND"
+    STALE_ONLY = "STALE_ONLY"
 
 
 class ExitCode(IntEnum):
