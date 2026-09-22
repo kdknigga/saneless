@@ -182,10 +182,11 @@ Check that saneless is ready to scan, printing one line per health check.
 saneless [--config PATH] [-v] doctor
 ```
 
-`doctor` takes no options of its own. It runs the same five checks the web UI's system status list shows, in the same order and with the same wording, so the command and the page cannot disagree about whether the appliance is healthy.
+`doctor` takes no options of its own. It runs the same six checks the web UI's system status list shows, in the same order and with the same wording, so the command and the page cannot disagree about whether the appliance is healthy.
 
 | Check | What it looks at |
 |-------|------------------|
+| Configuration | Whether a `saneless.toml` was loaded, and whether an old `config.toml` is sitting in a searched directory being ignored |
 | Scanner | Whether scanner support is installed and a device answers. A configured sane-net host has its saned port probed first, so an unplugged network scanner is reported in about two seconds rather than two minutes |
 | Paperless | Whether the API token has been set to something real, and whether paperless-ngx accepts it. A placeholder token is reported without sending a request |
 | Profiles | Whether any scan profiles are configured, whether they were saved to a config file, and whether the generated ones have names yet |
@@ -195,28 +196,46 @@ saneless [--config PATH] [-v] doctor
 **Example output:**
 
 ```text
-[ OK ] Scanner     Canon MF740C Series is ready.
-[ OK ] Paperless   Connected to paperless-ngx.
-[ OK ] Profiles    4 scan profiles configured.
-[WARN] Fallback    Not configured; scans cannot be kept if paperless-ngx is down.
-                   Set a fallback folder in the saneless config so scans are kept when paperless-ngx is down.
-[ OK ] Data folder The data folder is writable.
+[ OK ] Configuration Config file loaded.
+[ OK ] Scanner       Canon MF740C Series is ready.
+[ OK ] Paperless     Connected to paperless-ngx.
+[ OK ] Profiles      4 scan profiles configured.
+[WARN] Fallback      Not configured; scans cannot be kept if paperless-ngx is down.
+                     Set a fallback folder in the saneless config so scans are kept when paperless-ngx is down.
+[ OK ] Data folder   The data folder is writable.
+
+Config files searched, in order:
+  used       /home/you/saneless.toml
+  not found  /home/you/.config/saneless/saneless.toml
+  not found  /etc/saneless/saneless.toml
 ```
 
 Every `[WARN]` and `[FAIL]` row is followed by an indented next step. An `[ OK ]` row has nothing to do about it and prints no second line.
+
+**The config resolution table.** After the rows, `doctor` lists every location its search looked at, with absolute paths, whether the run was healthy or not. This is the section to read when the settings are not the ones you expected: it is the only place that says which of the candidate files won, and it is printed by `doctor` only -- the web page carries the `Configuration` row and no paths at all, because it is visible to everyone on your network.
+
+| Label | Meaning |
+|-------|---------|
+| `used` | The file the settings came from. An explicit path adds ` (given with --config; no search)`, because that path replaces the search rather than joining it |
+| `not used` | The file exists but a higher-priority one won; the line adds ` (an earlier file won)` |
+| `not found` | Nothing is there, or what is there is not a regular file |
+| `ignored` | An old `config.toml` beside a candidate, while nothing loaded; the line adds ` (old name; rename it to saneless.toml)` |
+| `leftover` | An old `config.toml` beside a candidate, while a `saneless.toml` did load; the line adds ` (old name; ignored)` |
+
+When the table would have no lines at all -- settings built with no search behind them -- it prints `none recorded` rather than an empty caption, so a truncated run cannot be mistaken for an empty search.
 
 **Exit codes:**
 
 | Code | Meaning |
 |------|---------|
 | 0 | Every check came out OK or a warning |
-| 2 | At least one check failed (scanner support not installed, no scanner reachable, an unset or rejected API token, no scan profiles, or a folder saneless cannot write to), or the configuration could not be loaded |
+| 2 | At least one check failed (scanner support not installed, no scanner reachable, an unset or rejected API token, no scan profiles, a folder saneless cannot write to, or an old `config.toml` found where a `saneless.toml` was expected), or the configuration could not be loaded |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 130 | Cancelled (Ctrl-C) |
 
 **A warning does not fail the command.** An appliance that scans and files correctly is not broken because it could be tidier, and a health gate that goes red for tidiness is one people learn to ignore. Only a failure exits non-zero, so `if saneless doctor; then ...` means "everything that stops scanning or filing is fine".
 
-Unlike `scan`, `devices`, `serve` and `auto-profiles`, `doctor` does **not** refuse to run when python-sane is missing. That machine is exactly the one whose owner needs a diagnosis, so the missing scanner support becomes one failed row among five and the other four checks still report.
+Unlike `scan`, `devices`, `serve` and `auto-profiles`, `doctor` does **not** refuse to run when python-sane is missing. That machine is exactly the one whose owner needs a diagnosis, so the missing scanner support becomes one failed row among six, and the other five still report.
 
 `doctor` has no `--json` mode: it prints a table for a person to read, and scripts should gate on the exit code.
 
@@ -271,11 +290,13 @@ saneless [--config PATH] [-v] auto-profiles [--force]
 |------|---------|
 | 0 | Profiles generated successfully |
 | 1 | Scan error (SANE failed while listing devices, or could not open or read the scanner's capabilities) |
-| 2 | Configuration or setup error: the config could not be loaded, no scanner found, python-sane is not installed, or the config file could not be rewritten (for example `config.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
+| 2 | Configuration or setup error: the config could not be loaded, no scanner found, python-sane is not installed, an old `config.toml` was the only config file the search found (see below), or the config file could not be rewritten (for example `saneless.toml` bind-mounted as a single file, which fails with EBUSY -- mount its directory instead) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
 | 130 | Cancelled (Ctrl-C) |
 
-Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, they are written to `./saneless.toml` in the current directory. In the Docker image, whose working directory is `/var/lib/saneless`, that is `/var/lib/saneless/saneless.toml` -- in the durable data volume rather than the mounted `./config` directory, where it outlives the container and keeps loading ahead of any `config.toml` you add later -- so create `config/config.toml` on the host first (see [Deploy with Docker Compose](../how-to/deploy-docker-compose.md)). A config file created from scratch gets mode `0600`; rewriting an existing file keeps its permission bits, owner and group, each when the process is permitted to set it and the filesystem supports it.
+Profiles are written to the config file that was loaded: the `--config` path, or else the first file found in the [config file search path](configuration.md#config-file-search-path). When no config file was loaded, they are written to `./saneless.toml` in the current directory. In the Docker image, whose working directory is `/var/lib/saneless`, that is `/var/lib/saneless/saneless.toml` -- in the durable data volume rather than the mounted `./config` directory, where it outlives the container and keeps loading ahead of any `saneless.toml` you add later -- so create `config/saneless.toml` on the host first (see [Deploy with Docker Compose](../how-to/deploy-docker-compose.md)). A config file created from scratch gets mode `0600`; rewriting an existing file keeps its permission bits, owner and group, each when the process is permitted to set it and the filesystem supports it.
+
+**`auto-profiles` refuses to write while an old `config.toml` is the only config file found.** It exits 2 with the same rename message the `Configuration` check gives, before it asks the scanner for anything. Writing a fresh `./saneless.toml` in that situation would not lose the old file's paperless-ngx URL and token, but it would bury them: the search would stop at the new file, the row telling you to rename the old one would go green, and the appliance would keep running on defaults. Rename the file first, then run the command again.
 
 Without `--force`, a profile that already exists is left alone. With `--force`, the command merges rather than replaces: in a profile marked `auto_generated = true`, the generated keys are refreshed in place, and every other key (`default_tags`, `title`, and so on) and your comments are kept. A profile without `auto_generated = true` is never changed; it is skipped and reported. The output names the absolute path written, then prints one line for each kind of change that happened:
 

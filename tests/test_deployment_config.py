@@ -79,6 +79,7 @@ import sys
 import tomllib
 from pathlib import Path
 
+from saneless.checks import CheckKey, check_name
 from saneless.config import (
     OutputConfig,
     ProfileConfig,
@@ -3873,4 +3874,59 @@ def test_legacy_name_allowlist_entries_still_exist() -> None:
         "the file it exempts, so it excuses nothing while the next line to "
         "match its text would be exempted by accident. Remove the entry, or "
         "correct it to the line that is really there:\n" + "\n".join(missing)
+    )
+
+
+# Every page that enumerates the health checks for a reader. A page that lists
+# some of them is worse than one that lists none: the check a reader cannot
+# find is the one they conclude does not exist.
+CHECK_LISTING_PAGES = (
+    DOCS_DIR / "reference" / "cli-commands.md",
+    DOCS_DIR / "reference" / "web-api.md",
+    DOCS_DIR / "getting-started" / "first-web-ui-scan.md",
+)
+
+# Phrases that count the rows in prose. Each was true of the five-row strip and
+# is now false, and none of them would be caught by the name check above --
+# a page can name all six checks and still tell its reader there are five.
+STALE_CHECK_COUNT_PHRASES = (
+    "five checks",
+    "five rows",
+    "among five",
+    "other four",
+)
+
+
+def test_docs_that_list_the_checks_name_every_check() -> None:
+    """
+    Every page listing the checks names all of them, and counts them right.
+
+    The lists are derived from ``CheckKey`` rather than written down here, so
+    a seventh check added in a later phase fails this test on every page that
+    has not been updated -- which is the only reason the lists agree today.
+    The prose count is asserted separately because naming a check and counting
+    the checks are two different claims, and this phase falsified the second
+    one on three pages while leaving the first one true on two of them.
+    """
+    expected = [check_name(key) for key in CheckKey]
+    offenders: list[str] = []
+    for page in CHECK_LISTING_PAGES:
+        name = page.relative_to(REPO_ROOT)
+        text = page.read_text(encoding="utf-8")
+        offenders.extend(
+            f"{name}: does not name the {label} check"
+            for label in expected
+            if label not in text
+        )
+        lowered = text.lower()
+        offenders.extend(
+            f"{name}: still says {phrase!r}"
+            for phrase in STALE_CHECK_COUNT_PHRASES
+            if phrase in lowered
+        )
+    assert not offenders, (
+        "a documentation page disagrees with CheckKey about which checks "
+        f"exist. There are {len(expected)} -- {', '.join(expected)} -- and "
+        "every page that lists them must list all of them and must not count "
+        "them as five:\n" + "\n".join(offenders)
     )
