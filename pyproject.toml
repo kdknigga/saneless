@@ -44,7 +44,7 @@ Repository = "https://github.com/kdknigga/saneless"
 Issues = "https://github.com/kdknigga/saneless/issues"
 
 [build-system]
-requires = ["uv_build>=0.10.3,<0.11.0"]
+requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
 
 # anyio 4.15.0 turned `anyio.abc.BlockingPortal` into a deprecated alias, and
@@ -240,6 +240,7 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.16.8",
     "ty>=0.0.82",
+    "uv>=0.12.17",
     "mkdocs-material>=9.7.7",
     "pytest-timeout>=2.4.0",
     "zizmor>=1.30.1",

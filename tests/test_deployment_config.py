@@ -1190,10 +1190,10 @@ def test_pyproject_has_no_legacy_license_classifier() -> None:
     """
     The deprecated ``License ::`` classifier is gone (D-05).
 
-    This needs its own assertion because nothing else catches it. Neither
-    ``uv_build`` 0.10.3 nor ``twine check`` errors when the classifier ships
-    beside a PEP 639 ``License-Expression`` -- both were measured doing exactly
-    that -- so no build or publish step would fail if it came back.
+    This needs its own assertion because nothing else catches it. Neither the
+    build backend nor ``twine check`` errors when the classifier ships beside a
+    PEP 639 ``License-Expression`` -- both were measured doing exactly that --
+    so no build or publish step would fail if it came back.
     """
     text, name = _read(PYPROJECT)
     assert LEGACY_LICENSE_CLASSIFIER not in text, (

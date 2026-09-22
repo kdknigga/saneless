@@ -1,4 +1,4 @@
-# Digests re-resolved 2026-09-18 against the Docker Hub and GHCR v2 APIs.
+# Digests re-resolved 2026-09-21 against the Docker Hub and GHCR v2 APIs.
 #
 # Every FROM reference below is `image:tag@sha256:...`. Both halves are
 # load-bearing. The digest is the immutable content pin; the tag has to stay in
@@ -18,13 +18,13 @@
 # the same source.
 #
 # Pinned to the uv series this project builds with. pyproject.toml declares
-# `requires = ["uv_build>=0.10.3,<0.11.0"]`, so a Dependabot bump across that
+# `requires = ["uv_build>=0.12.17,<0.13.0"]`, so a Dependabot bump across that
 # ceiling needs the constraint widened in the same pull request -- which is
 # the coupling surfacing where it can be reviewed, rather than breaking later.
-FROM ghcr.io/astral-sh/uv:0.10.3@sha256:7a88d4c4e6f44200575000638453a5a381db0ae31ad5c3a51b14f8687c9d93a3 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv
 
 # Stage 1: Build
-FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS builder
+FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS builder
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 # Named inputs, never the whole context. This is the second of TWO independent
@@ -44,7 +44,7 @@ RUN uv build --wheel --out-dir /dist
 RUN uv export --locked --no-dev --no-emit-project -o /dist/requirements.txt
 
 # Stage 2: Runtime
-FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
+FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsane1 curl \
     && rm -rf /var/lib/apt/lists/*
