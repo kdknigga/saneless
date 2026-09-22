@@ -73,12 +73,15 @@ from saneless.checks import (
     check_state_label,
 )
 from saneless.config import (
+    CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
     ScannerConfig,
     Settings,
     WebConfig,
+    discover_config,
 )
 from saneless.job import JobResult
 from saneless.paperless import UploadResult
@@ -2881,6 +2884,31 @@ _COUNT_CHECK_MESSAGE_LINES = """
 """
 
 
+# Every name column whose text does not fit the column the CSS declares for
+# it, as ``[text, text width, declared width, used width]``.
+#
+# The comparison is against ``flex-basis`` rather than against the element's
+# own box, and that is what makes this falsifiable.  ``.check-name`` is a flex
+# item with ``flex-shrink: 0``, so a name wider than the basis does not clip --
+# CSS's automatic minimum size grows the *item* instead, silently, and
+# ``scrollWidth <= clientWidth`` stays true while the column it was supposed to
+# be has stopped existing for that one row.  What the reader loses is the
+# alignment: one row's message starts further right than the other five.
+_NAME_COLUMNS_TOO_NARROW = """
+() => Array.from(document.querySelectorAll("#checks-body .check-name"), (el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const style = getComputedStyle(el);
+    return [
+        el.textContent.trim(),
+        range.getBoundingClientRect().width,
+        parseFloat(style.flexBasis),
+        el.getBoundingClientRect().width,
+    ];
+}).filter(([, text, basis]) => text > basis)
+"""
+
+
 def _check_row(page: Page, name: str) -> Locator:
     """
     Return the strip row whose name column reads exactly ``name``.
@@ -2917,6 +2945,36 @@ def cold_strip_server(
     and not a reimplementation of it.
     """
     with _serve(_browser_test_settings(tmp_path), _BrowserTestScanner()) as server:
+        assert server.app.state.refresher.stop(), "the refresher thread did not stop"
+        egress_allowlist.append(server.url)
+        yield server
+
+
+@pytest.fixture
+def stale_config_strip_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app that found only a file under the superseded config name.
+
+    The 2026-09-22 failure, rebuilt: a file sits in the third searched
+    directory under the old name, nothing loaded, and the appliance is running
+    on defaults.  The recording is made by the real ``discover_config`` over
+    three directories inside ``tmp_path``, so the search that the page reports
+    is a search that really ran and the host's own ``/etc`` is never touched.
+
+    The refresher is stopped for the reason ``cold_strip_server`` stops it: the
+    test asks for the probe itself, so nothing here is racing a tick.
+    """
+    candidates = tuple(
+        tmp_path / name / CONFIG_FILENAME for name in ("cfg-cwd", "cfg-xdg", "cfg-etc")
+    )
+    for candidate in candidates:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidates[2].with_name(LEGACY_CONFIG_FILENAME).write_text("", encoding="utf-8")
+    settings = _browser_test_settings(tmp_path)
+    settings._config_discovery = discover_config(candidates)
+    with _serve(settings, _BrowserTestScanner()) as server:
         assert server.app.state.refresher.stop(), "the refresher thread did not stop"
         egress_allowlist.append(server.url)
         yield server
@@ -3212,11 +3270,17 @@ class TestStatusStripInChromium:
             assert name_box is not None, index
             name_columns.append((name_box["x"], name_box["width"]))
 
-        # The fixed gutter and name column still hold at 320 px, so the five
+        # The fixed gutter and name column still hold at 320 px, so the six
         # messages still start at one x. A layout that "fitted" by letting the
         # name column collapse per row would clear the overflow check above and
         # be unreadable.
         assert len(set(name_columns)) == 1, name_columns
+
+        # And one x because the column is wide enough for the longest name,
+        # not because nothing has outgrown it yet. This is what the width in
+        # app.css is answerable to.
+        too_narrow = page.evaluate(_NAME_COLUMNS_TOO_NARROW)
+        assert too_narrow == [], too_narrow
 
         # And the fit is a wrap, not a squeeze: at least one message occupies
         # more than one line box. .check-next is excluded by the probe, because
@@ -3231,6 +3295,53 @@ class TestStatusStripInChromium:
         assert refresh is not None
         assert refresh["height"] >= 44, refresh
         assert refresh["x"] + refresh["width"] <= viewport["width"], refresh
+
+    def test_every_check_name_fits_its_column_at_the_desktop_width(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        The name column is sized for the longest name, at the default viewport.
+
+        The 320 px test asserts this too, but it asserts it about a layout
+        that is already under pressure; a column too narrow for one name is a
+        mis-sized constant, not a narrow-screen effect, and it should be
+        caught where the page is otherwise comfortable.
+        """
+        server = cold_strip_server
+        _probe_now(server)
+        page.goto(server.url)
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+
+        too_narrow = page.evaluate(_NAME_COLUMNS_TOO_NARROW)
+        assert too_narrow == [], too_narrow
+
+    def test_a_leftover_old_name_config_is_the_first_row_and_is_red(
+        self, page: Page, stale_config_strip_server: _BrowserServer, tmp_path: Path
+    ) -> None:
+        """
+        The 2026-09-22 evening, as a household member would now have read it.
+
+        The strip that night showed four red or amber rows and named no cause.
+        This asserts the row that names it: first on the page, red, carrying
+        the rename and the file's documented spelling -- and carrying no host
+        path, which is the one thing the exception to the no-path rule is not
+        allowed to become.
+        """
+        server = stale_config_strip_server
+        _probe_now(server)
+        page.goto(server.url)
+
+        row = _check_row(page, "Configuration")
+        expect(row).to_have_count(1)
+        expect(row.locator(".check-glyph")).to_have_class(
+            f"check-glyph {check_state_class(CheckState.FAIL)}"
+        )
+        expect(row).to_contain_text(f"saneless now reads {CONFIG_FILENAME}")
+        expect(row).to_contain_text(f"/etc/saneless/{LEGACY_CONFIG_FILENAME}")
+
+        first = page.locator("#checks-body .check-row").nth(0)
+        expect(first.locator(".check-name")).to_have_text("Configuration")
+        assert str(tmp_path) not in page.locator("#checks-body").inner_text()
 
 
 # How long the strip is watched after it has stopped, in milliseconds. Three of
