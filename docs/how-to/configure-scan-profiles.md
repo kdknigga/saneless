@@ -108,6 +108,29 @@ resolution = 300
 mode = "Color"
 ```
 
+### What `auto-profiles` guesses, and when to override it
+
+`saneless auto-profiles` has to pick one of the two values for you, and an `Auto`
+source does not say which it should be. It writes `"adf"` only when it can find no
+evidence that the scanner has a glass at all -- neither a source named `Flatbed`
+nor a device type that has one. Anything else gets the `"flatbed"` default.
+
+Some backends report a scanner less completely than others. HP's `hpaio`, for
+example, names only `Auto` and `ADF` for an all-in-one that does have a glass. If
+your generated `Auto` profile guessed wrong, set the field yourself:
+
+```toml
+[profiles.auto]
+source = "Auto"
+auto_source_mode = "flatbed"   # or "adf"
+```
+
+A scan that guessed `"adf"` on a flatbed reports a scanner error after the first
+page, because saneless asks the scanner for a second sheet the glass cannot
+supply. Some scanners also show a panel message such as "Memory is low" when this
+happens. Set `auto_source_mode = "flatbed"`, or re-run `saneless auto-profiles
+--force` to regenerate the value.
+
 See [Configuration reference](../reference/configuration.md) for all profile fields.
 
 ## Paper size

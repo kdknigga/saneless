@@ -27,6 +27,7 @@ import click
 import uvicorn
 
 from .auto_profiles import (
+    device_type_of,
     generate_profiles,
     write_profiles_to_config,
 )
@@ -1396,7 +1397,7 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     # Use configured device or first discovered device
     device_id = settings.scanner.device or device_list[0].name
     caps = scanner.get_capabilities(device_id)
-    profiles = generate_profiles(caps)
+    profiles = generate_profiles(caps, device_type_of(device_list, device_id))
 
     # The file that was loaded (including an explicit --config). With no loaded
     # file the target is the one config filename in the working directory, and

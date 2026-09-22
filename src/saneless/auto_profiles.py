@@ -27,14 +27,16 @@ from saneless.exceptions import ConfigError, describe
 from saneless.scanner.base import SourceKind, classify_source
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from tomlkit import TOMLDocument
 
-    from saneless.scanner.base import DeviceCapabilities
+    from saneless.scanner.base import DeviceCapabilities, DeviceInfo
 
 __all__ = [
     "ProfileWriteResult",
+    "device_type_of",
     "generate_profiles",
     "is_bare_default",
     "pick_closest_resolution",
@@ -52,6 +54,15 @@ logger = logging.getLogger(__name__)
 # collision tie-break free to turn a second degenerate name into "source-2"
 # rather than dropping it.
 _EMPTY_SLUG_FALLBACK = "source"
+
+
+# Substrings of the SANE device-type strings that imply a scanning glass.
+# Matched as substrings, case-insensitively, against DeviceInfo.device_type --
+# backends spell these with varying decoration ("flatbed scanner",
+# "multi-function peripheral", hpaio's "all-in-one"). Read only by
+# _declares_platen, which documents why a feeder-only MFP matching here is the
+# accepted trade.
+_PLATEN_DEVICE_TYPES: Final = ("flatbed", "all-in-one", "multi-function")
 
 
 def _slugify(source: str) -> str:
@@ -277,7 +288,72 @@ def _claim_slug(source: str, claimed: dict[str, str]) -> str:
     return candidate
 
 
-def _auto_source_mode(source: str, *, has_flatbed: bool) -> Literal["flatbed", "adf"]:
+def device_type_of(devices: Sequence[DeviceInfo], device_id: str) -> str:
+    """
+    Find the type a discovered device declared, by its SANE name.
+
+    Both callers of ``generate_profiles`` already hold the enumeration result
+    and pick their ``device_id`` out of it, so the type is free -- no second
+    ``get_devices()`` RPC, which on the net backend is a real round trip.
+
+    A miss returns the empty string rather than raising. ``device_id`` can come
+    from ``scanner.device`` in the config, which the operator may have spelled
+    in a form the enumeration does not return verbatim, and a scanner whose
+    name does not match is still a scanner worth generating profiles for. The
+    empty string is exactly what ``_declares_platen`` reads as "no evidence",
+    so a miss degrades to judging the device on its source names alone.
+
+    Args:
+        devices: The devices the backend enumerated.
+        device_id: The SANE device name profiles are being generated for.
+
+    Returns:
+        The matching device's declared type, or ``""`` if none matches.
+
+    """
+    return next((d.device_type for d in devices if d.name == device_id), "")
+
+
+def _declares_platen(device_type: str) -> bool:
+    """
+    Read the device's own declared type for evidence that it has a platen.
+
+    SANE hands back a type string beside every device name, and saneless has
+    always carried it verbatim as ``DeviceInfo.device_type``. Nothing used to
+    ask it anything. It is the device's own answer to the question
+    ``_auto_source_mode`` needs answered, and it is available without a second
+    round trip.
+
+    The tokens below are the platen-bearing halves of SANE's conventional
+    vocabulary. ``"sheetfed scanner"`` -- the one type that positively denies a
+    platen -- matches none of them, so a real sheet-fed document scanner is
+    untouched by this function. So is a device whose backend reports a type
+    saneless does not recognise, or no type at all: absence of evidence is
+    read as absence, never as denial, which is what keeps this a widening of
+    the platen test rather than a replacement for it.
+
+    ``"multi-function"`` and ``"all-in-one"`` are included knowingly. A few
+    MFPs really are feeder-only, and on one of those this returns True and an
+    ``Auto`` profile comes back single-page. That device still names its feeder
+    explicitly -- an MFP without a platen has an ADF and says so -- so the
+    operator has a feeder profile that works, and the residual failure is the
+    cheap, visible one this project already accepts (see ``classify_source``).
+    The failure it replaces is the expensive one: probing a platen for a
+    second sheet that cannot exist.
+
+    Args:
+        device_type: The type string SANE reported for the device, as carried
+            on ``DeviceInfo.device_type``. Empty when unknown.
+
+    Returns:
+        Whether the declared type is one that has a platen.
+
+    """
+    lower = device_type.strip().lower()
+    return any(token in lower for token in _PLATEN_DEVICE_TYPES)
+
+
+def _auto_source_mode(source: str, *, has_platen: bool) -> Literal["flatbed", "adf"]:
     """
     Decide how an ``Auto`` source should be routed on this device.
 
@@ -287,9 +363,22 @@ def _auto_source_mode(source: str, *, has_flatbed: bool) -> Literal["flatbed", "
     not is a sheet-fed machine, where treating ``Auto`` as single-page returns
     one page from a whole stack.
 
+    ``has_platen`` is that question, and it is deliberately no longer the same
+    question as "does the device report a source named Flatbed". It used to be,
+    and that proxy is false on the ``hpaio`` backend: an HP LaserJet 3030 has a
+    platen, is the only scan path on many such units once the feeder wears out,
+    and hpaio names its two sources ``Auto`` and ``ADF`` -- no ``Flatbed``
+    among them. Every generated profile for that device was handed
+    ``auto_source_mode = "adf"``, so ``scan_pages`` sent a platen scan down
+    ``_scan_adf_pages``, which probed ``multi_scan()`` for a second sheet the
+    glass could not supply; the device answered with a device I/O error and a
+    "Memory is low" panel message, and a clean one-page scan was reported as a
+    scanner fault.
+
     Args:
         source: The SANE source name the profile will carry.
-        has_flatbed: Whether the device reports any flatbed source. Keyword-only,
+        has_platen: Whether the device is known to have a platen, from either
+            the sources it reports or the type it declares. Keyword-only,
             because a positional boolean is not allowed by this project's lint
             rules.
 
@@ -297,7 +386,7 @@ def _auto_source_mode(source: str, *, has_flatbed: bool) -> Literal["flatbed", "
         The ``auto_source_mode`` the profile should carry.
 
     """
-    if classify_source(source) is SourceKind.AUTO and not has_flatbed:
+    if classify_source(source) is SourceKind.AUTO and not has_platen:
         return "adf"
     return "flatbed"
 
@@ -419,6 +508,7 @@ def _profile_description(source: str) -> str:
 
 def generate_profiles(
     capabilities: DeviceCapabilities,
+    device_type: str = "",
 ) -> dict[str, ProfileConfig]:
     """
     Generate scan profiles from scanner capabilities.
@@ -444,6 +534,12 @@ def generate_profiles(
     Args:
         capabilities: Scanner device capabilities with sources,
             resolutions, and modes.
+        device_type: The type string SANE reported for the device, from
+            ``DeviceInfo.device_type``. Read only as extra evidence of a
+            platen, for the ``Auto`` routing decision ``_auto_source_mode``
+            makes. Defaults to empty, which reproduces the behaviour of every
+            caller that predates it: a device declaring no type is judged on
+            its source names alone.
 
     Returns:
         Dictionary mapping profile slug names to ProfileConfig instances.
@@ -456,9 +552,15 @@ def generate_profiles(
         resolution_range=capabilities.resolution_range,
     )
     mode = pick_preferred_mode(capabilities.modes, preferred="Color")
-    has_flatbed = any(
+    # Two independent witnesses to one fact, OR-ed rather than ranked: a named
+    # Flatbed source, or a declared device type that has a glass. Either alone
+    # is enough, because each covers the other's blind spot -- a backend can
+    # name a Flatbed source while declaring a type saneless does not know, and
+    # hpaio declares "all-in-one" while naming no Flatbed source at all. Only a
+    # device that offers neither witness is treated as sheet-fed.
+    has_platen = any(
         classify_source(s) is SourceKind.FLATBED for s in capabilities.sources
-    )
+    ) or _declares_platen(device_type)
     # A flatbed backs the default when the device has one; otherwise its first
     # reported source does. The fallback is what keeps a sheet-fed scanner from
     # producing a config that Settings refuses to load (see the docstring).
@@ -488,7 +590,7 @@ def generate_profiles(
             resolution=resolution,
             mode=mode,
             auto_generated=True,
-            auto_source_mode=_auto_source_mode(source, has_flatbed=has_flatbed),
+            auto_source_mode=_auto_source_mode(source, has_platen=has_platen),
             duplex=_duplex(source),
             label=_profile_label(source),
             description=_profile_description(source),
@@ -504,7 +606,7 @@ def generate_profiles(
             # backed by an Auto source on a platen-less device would otherwise
             # route a whole stack as a single page, disagreeing with the very
             # profile it was copied from.
-            auto_source_mode=_auto_source_mode(default_source, has_flatbed=has_flatbed),
+            auto_source_mode=_auto_source_mode(default_source, has_platen=has_platen),
             # Mirrors the loop for the same reason: the default duplicates a
             # source profile and must not claim a different duplex strategy.
             duplex=_duplex(default_source),

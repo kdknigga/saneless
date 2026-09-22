@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
 from .auto_profiles import (
+    device_type_of,
     generate_profiles,
     is_bare_default,
     write_profiles_to_config,
@@ -953,7 +954,7 @@ class ScanWorker:
                     return None
                 device_id = self._settings.scanner.device or devices[0].name
                 caps = self._scanner.get_capabilities(device_id)
-            return generate_profiles(caps)
+            return generate_profiles(caps, device_type_of(devices, device_id))
         except Exception as exc:
             # The exception class is named, never interpreted.  The old
             # message blamed the network for every failure, a parse error
