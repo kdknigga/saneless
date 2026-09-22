@@ -1838,8 +1838,9 @@ class TestProfileOrdering:
 
 # The scan form element as it stood before plan 30-15, byte for byte.  The
 # profile select lives inside it and must add nothing to it: the form already
-# carries hx-disinherit="hx-disabled-elt", and on htmx 2.0.8 an inherited
-# hx-disabled-elt strips disabled from a server-disabled button (C-10).
+# carries hx-disinherit="hx-disabled-elt", because an inherited hx-disabled-elt
+# would put the form's own child requests in charge of the Scan button's
+# disabled attribute (C-10).
 _SCAN_FORM_ELEMENT = """    <form hx-post="/api/scan"
           hx-target="#status-area"
           hx-swap="outerHTML"

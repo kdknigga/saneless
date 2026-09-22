@@ -763,7 +763,7 @@ class TestOfflinePage:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        The vendored htmx 2.0.8 runs with all three response rules (B2, ROBU-09).
+        The vendored htmx 2.0.10 runs with all three response rules (B2, ROBU-09).
 
         htmx merges the meta config shallowly, so a config holding only the
         ``[45]..`` entry would replace the whole array and stop every 2xx swap;
@@ -772,7 +772,7 @@ class TestOfflinePage:
         coupling intact.
         """
         page.goto(browser_server_url)
-        assert page.evaluate("htmx.version") == "2.0.8"
+        assert page.evaluate("htmx.version") == "2.0.10"
         assert page.evaluate("htmx.config.responseHandling.length") == 3
         error_rule_swaps = page.evaluate(
             "htmx.config.responseHandling.find((rule) => rule.code === '[45]..').swap"
@@ -917,19 +917,20 @@ class TestFlipPromptUI:
 _COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').length"
 
 # Counts the swaps of the two in-form controls the refresh buttons re-fetch.
-# htmx 2.0.8 strips hx-disabled-elt's `disabled` inside the request's onload
+# htmx sets and clears hx-disabled-elt's `disabled` inside the request's onload
 # handler, after the swap and before htmx:afterSettle, so once both events have
-# fired the inheritance trap has either sprung or it has not. Registered as an
-# init script so the listener exists before anything on the page can ask.
+# fired an inherited disable has either reached the button or it has not.
+# Registered as an init script so the listener exists before anything on the
+# page can ask.
 #
 # afterSettle, not afterRequest: the tag list is swapped outerHTML, and htmx
 # fires afterRequest on the element it requested *after* that swap has already
 # detached it, so the event never reaches this document-level listener. The
 # settle pass runs on the elements that are now in the document, on htmx's
 # default 20 ms settle delay -- which is later still, so it remains a sound
-# "the trap has had its chance" signal. The correspondent select is swapped
-# innerHTML and settles as itself; the new tag list settles under the same id
-# the old one carried, because the partial renders its own wrapper.
+# "the inherited disable has had its chance" signal. The correspondent select
+# is swapped innerHTML and settles as itself; the new tag list settles under
+# the same id the old one carried, because the partial renders its own wrapper.
 _RECORD_CONTROL_SWAPS = """
 window.__controlSwapsFinished = 0;
 document.addEventListener("htmx:afterSettle", (event) => {
@@ -1037,10 +1038,13 @@ class TestServerOwnedScanButton:
 
         The form carries ``hx-disabled-elt="#scan-btn"``. Without
         ``hx-disinherit`` the tags and correspondents refresh buttons inherit
-        it, and on htmx 2.0.8 finishing their requests strips ``disabled`` from
-        the button the server rendered disabled -- C-10 again, on every refresh
-        during a scan (T-26-48).  The page itself no longer asks for either list
-        on load, so the two refresh clicks are what exercise the trap.
+        it, so each of their requests would take charge of the ``disabled``
+        attribute on a button the server already rendered disabled -- C-10
+        again, on every refresh during a scan (T-26-48).  What is asserted is
+        this project's behaviour and not htmx's: a button the server rendered
+        disabled is still disabled after both lists have refreshed.  The page
+        itself no longer asks for either list on load, so the two refresh
+        clicks are what exercise it.
         """
         server = scan_harness.server
         server.scanner.gate.clear()
@@ -2398,13 +2402,13 @@ class TestBlockedScanButtonInABrowser:
         """
         The requests inside the form do not re-enable it (C-10, T-30-66).
 
-        On htmx 2.0.8 an inherited ``hx-disabled-elt`` strips ``disabled`` from
-        a server-disabled button the moment a child request finishes. With no
-        job active there is no one-second status poll to put it back, so a
-        blocked button that lost the attribute here would stay clickable --
-        which is exactly why the flag lives in the one button partial.  The two
-        refresh buttons are the form's own requests now that the page asks for
-        neither list on load.
+        An inherited ``hx-disabled-elt`` puts a child request in charge of the
+        button's ``disabled`` attribute, which is why the form disinherits it.
+        With no job active there is no one-second status poll to put the
+        attribute back, so a blocked button that lost it here would stay
+        clickable -- which is exactly why the flag lives in the one button
+        partial.  The two refresh buttons are the form's own requests now that
+        the page asks for neither list on load.
         """
         egress_allowlist.append(blocked_server.url)
         page.add_init_script(_RECORD_CONTROL_SWAPS)
@@ -3504,7 +3508,7 @@ class TestPollEndsOnAnErrorResponse:
 
     There was a defect here, and the previous version of this class concluded
     there was not. ``render_error`` set ``HX-Retarget: #status-message`` on
-    every htmx error response, and htmx 2.0.8 applies ``HX-Retarget`` to the
+    every htmx error response, and htmx 2.0.10 applies ``HX-Retarget`` to the
     response's target *before* it decides what to swap. So a 4xx from
     ``GET /api/checks`` was written into ``#status-message``: ``#checks-body``
     was never replaced, kept its ``every 2s`` trigger, and went on polling and

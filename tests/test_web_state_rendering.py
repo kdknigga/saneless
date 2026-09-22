@@ -709,9 +709,9 @@ def test_scan_form_disables_the_button_without_inheritance(
     The form disables the button for its own round-trip only (ROBU-04, S4).
 
     ``hx-disabled-elt`` replaces the deleted app.js handler.  ``hx-disinherit``
-    is mandatory: on htmx 2.0.8 the selects and refresh buttons inside the form
-    would otherwise inherit it and strip ``disabled`` from a server-disabled
-    button when their own requests finish (C-10).
+    is mandatory: the selects and refresh buttons inside the form would
+    otherwise inherit it and disable the button for the length of their own
+    requests (C-10).
     """
     match = _SCAN_FORM.search(client.get("/").text)
     assert match is not None, "scan form markup not found"
@@ -1716,11 +1716,9 @@ class TestScanBlocked:
         """
         No status response can hand back an enabled button (C-10, T-30-66).
 
-        This is the regression guard for the new flag specifically: on htmx
-        2.0.8 an inherited `hx-disabled-elt` strips `disabled` from a
-        server-disabled button when a child request finishes, so the button is
-        re-rendered from server state every second. A flag expressed anywhere
-        but the one partial would be dropped by exactly these polls.
+        This is the regression guard for the new flag specifically: the button
+        is re-rendered from server state every second, so a flag expressed
+        anywhere but the one partial would be dropped by exactly these polls.
         """
         for _ in range(5):
             match = _only_scan_button(

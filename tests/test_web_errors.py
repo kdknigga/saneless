@@ -362,7 +362,7 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
 
     ``render_error`` sets ``HX-Retarget: #status-message`` so an error never
     lands in the element the request was aimed at (D-02, D-03).  For exactly
-    one element that rule kept a defect alive: htmx 2.0.8 applies
+    one element that rule kept a defect alive: htmx 2.0.10 applies
     ``HX-Retarget`` to the response's target *before* it decides what to swap,
     so a 4xx from ``GET /api/checks`` was written into ``#status-message`` and
     ``#checks-body`` was never replaced -- keeping its ``every 2s`` trigger for
@@ -1579,7 +1579,7 @@ def test_htmx_config_restates_all_three_response_handling_entries(
     """
     The htmx-config meta swaps error bodies without breaking 2xx swaps (D-01).
 
-    htmx 2.0.8 merges meta config shallowly, so a meta holding only the
+    htmx 2.0.10 merges meta config shallowly, so a meta holding only the
     ``[45]..`` entry would replace the whole array and stop every 2xx swap.
     All three entries have to be restated.
     """
