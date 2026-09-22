@@ -11,8 +11,11 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+import re
 import tempfile
 import tomllib
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
@@ -38,23 +41,27 @@ from pydantic_settings.exceptions import SettingsError
 from saneless.exceptions import ConfigError
 from saneless.vocabulary import (
     TITLE_MAX_LENGTH,
+    ConfigFileState,
     PaperSize,
     ProfileStorage,
     local_time,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Iterator, Sequence
     from datetime import datetime
 
     from pydantic_core import ErrorDetails
     from pydantic_settings.main import InitSettingsSource
 
 __all__ = [
+    "CONFIG_FILENAME",
     "DEFAULT_RESOLUTION",
+    "LEGACY_CONFIG_FILENAME",
     "PLACEHOLDER_TOKENS",
     "PROFILE_DESCRIPTION_MAX_LENGTH",
     "PROFILE_LABEL_MAX_LENGTH",
+    "ConfigDiscovery",
     "LogLevel",
     "OutputConfig",
     "PaperlessConfig",
@@ -62,7 +69,9 @@ __all__ = [
     "ScannerConfig",
     "Settings",
     "WebConfig",
+    "config_file_state",
     "config_search_paths",
+    "discover_config",
     "env_sourced_keys",
     "is_placeholder_token",
     "load_settings",
@@ -95,6 +104,126 @@ PROFILE_LABEL_MAX_LENGTH: Final = 64
 
 PROFILE_DESCRIPTION_MAX_LENGTH: Final = 200
 """The longest ``profiles.<name>.description`` a config may carry."""
+
+CONFIG_FILENAME: Final = "saneless.toml"
+"""The one name a configuration file may have, in every searched location."""
+
+# The only place this project spells the old name. It names a file that is
+# stat-ed so it can be reported, and is never opened, parsed or merged; build
+# every other mention of it from this constant so a search for the literal
+# finds one definition rather than a habit.
+LEGACY_CONFIG_FILENAME: Final = "config.toml"
+"""The superseded name, detected and reported in searched directories only."""
+
+# Positionally aligned with ``config_search_paths()``: index i is how the
+# documentation spells the directory of candidate i. The status strip is
+# visible to anyone on the LAN and carries no filesystem path, so it names a
+# file by its documented spelling; the log and ``doctor`` print absolute paths.
+_SEARCH_DIR_SPELLINGS: Final = ("./", "$XDG_CONFIG_HOME/saneless/", "/etc/saneless/")
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigDiscovery:
+    """
+    What the search for a configuration file found, as it found it.
+
+    Frozen for the reason ``CheckResult`` is frozen: this is a report of a
+    search that has already happened, and the settings in hand were built from
+    it.  Nothing downstream may edit it on its way to a log line, a status row
+    or a terminal, and nothing downstream may re-run the search instead: a file
+    created or renamed since startup would make a second look describe a
+    program that is not running.
+
+    A file under the superseded name sitting in a searched directory is
+    recorded in ``stale``.  It was stat-ed and nothing more -- never opened,
+    parsed, merged, or used to populate any setting -- because detecting a name
+    is not supporting it, and such a file may belong to another tool entirely.
+
+    ``stale`` keeps every such file, in search order, so the log can name them
+    all.  The status strip names ``stale[0]``: it is the highest-priority one,
+    and renaming that file is what makes it load next start.
+
+    An explicit ``--config`` path searches nothing, so it records ``explicit``
+    with empty ``searched`` and ``stale``.
+
+    Attributes:
+        explicit: The path given on the command line, or None when the search
+            list was used.
+        searched: Every candidate looked at, in search order.
+        found: The candidates that are regular files, in search order.
+        loaded: The candidate the settings came from, or None.
+        stale: Existing superseded-name files beside a candidate, in search
+            order.
+
+    """
+
+    explicit: Path | None
+    searched: tuple[Path, ...]
+    found: tuple[Path, ...]
+    loaded: Path | None
+    stale: tuple[Path, ...]
+
+    def documented_spelling(self, path: Path) -> str:
+        """
+        Name a searched file the way the documentation spells it.
+
+        By search position, never by resolved path: the caller is the status
+        strip, which is visible to anyone on the LAN and therefore carries no
+        filesystem path.  Position is also what makes the answer stable when
+        the search list is redirected under a test's temporary directory.
+
+        Args:
+            path: A file in one of the searched directories, under either the
+                current or the superseded name.
+
+        Returns:
+            One of the three documented directory spellings, with the file's
+            own name appended.
+
+        Raises:
+            ValueError: If ``path`` sits beside no searched candidate.
+
+        """
+        for index, candidate in enumerate(self.searched):
+            if candidate.parent == path.parent:
+                return _SEARCH_DIR_SPELLINGS[index] + path.name
+        msg = f"Not beside any searched config candidate: {path}"
+        raise ValueError(msg)
+
+
+def discover_config(candidates: tuple[Path, ...]) -> ConfigDiscovery:
+    """
+    Look for a configuration file, and for superseded-name files beside one.
+
+    The whole search, in one place, so what was found is recorded once rather
+    than re-derived by each surface that reports it.  Only ``is_file()`` is
+    called, on the candidates and on their superseded-name siblings alike: a
+    sibling that is invalid TOML must not break the load, and a live token in
+    one must not reach the settings.
+
+    Args:
+        candidates: The paths to search, in priority order.
+
+    Returns:
+        The recording, with the first existing candidate as ``loaded``.
+
+    """
+    found = tuple(candidate for candidate in candidates if candidate.is_file())
+    stale = tuple(
+        sibling
+        for sibling in (
+            candidate.with_name(LEGACY_CONFIG_FILENAME) for candidate in candidates
+        )
+        if sibling.is_file()
+    )
+    return ConfigDiscovery(
+        explicit=None,
+        searched=candidates,
+        found=found,
+        loaded=found[0] if found else None,
+        stale=stale,
+    )
+
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 """The logging level names ``output.log_level`` accepts.
@@ -612,6 +741,36 @@ _ENV_DELIMITER: Final = "__"
 """The nested delimiter in environment variable names."""
 
 
+class _ByteExactTomlSource(TomlConfigSettingsSource):
+    """A TOML source whose top-level section and key matching is byte-exact."""
+
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        toml_file: Path | None = None,
+    ) -> None:
+        """
+        Load the file, then restore byte-exact top-level key matching.
+
+        Args:
+            settings_cls: The settings class this source feeds.
+            toml_file: The TOML file to read.
+
+        """
+        # toml_file is passed by keyword, always: upstream has a third
+        # positional parameter of its own, so a positional argument here would
+        # land in the wrong slot the next time that signature moves.
+        super().__init__(settings_cls, toml_file=toml_file)
+        # pydantic-settings folds the case of top-level keys before matching
+        # them to fields, so a miscased [Scanner] binds into scanner instead of
+        # being reported and a config file naming a section that does not exist
+        # is silently accepted. The parsed table is handed on unchanged so the
+        # spelling in the file is the spelling that is matched. Reassigning
+        # after the base __init__ keeps its nested-default merging intact,
+        # which overriding __call__ would bypass.
+        self.init_kwargs = dict(self.toml_data)
+
+
 class Settings(BaseSettings):
     """
     Application settings with TOML + env var loading.
@@ -647,6 +806,10 @@ class Settings(BaseSettings):
     # redirect profile writes.
     _config_path: Path | None = PrivateAttr(default=None)
 
+    # A PrivateAttr for the same reason, and left None on a directly
+    # constructed Settings: no search ran, so there is nothing to report.
+    _config_discovery: ConfigDiscovery | None = PrivateAttr(default=None)
+
     @property
     def config_path(self) -> Path | None:
         """
@@ -662,6 +825,21 @@ class Settings(BaseSettings):
         """
         return self._config_path
 
+    @property
+    def config_discovery(self) -> ConfigDiscovery | None:
+        """
+        What the search that produced these settings found.
+
+        Only ``load_settings`` records it; nothing in the environment or a
+        config file can set it.
+
+        Returns:
+            The recording, or None for settings built directly rather than
+            loaded.
+
+        """
+        return self._config_discovery
+
     @classmethod
     def settings_customise_sources(
         cls,
@@ -675,7 +853,7 @@ class Settings(BaseSettings):
         Configure settings sources with optional TOML file support.
 
         The _toml_file init kwarg is extracted and used to create a
-        TomlConfigSettingsSource if the file exists. pydantic-settings calls
+        _ByteExactTomlSource if the file exists. pydantic-settings calls
         this by keyword, so the two unused sources keep their names.
         """
         # saneless reads no .env file and no secrets directory.
@@ -685,7 +863,7 @@ class Settings(BaseSettings):
         toml_file = init_src.init_kwargs.pop("_toml_file", None)
 
         if toml_file is not None:
-            toml_source = TomlConfigSettingsSource(
+            toml_source = _ByteExactTomlSource(
                 settings_cls,
                 toml_file=toml_file,
             )
@@ -743,6 +921,43 @@ def profile_storage_for_loaded(settings: Settings) -> ProfileStorage:
     if settings.config_path is not None:
         return ProfileStorage.PERSISTED
     return ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
+
+
+def config_file_state(settings: Settings) -> ConfigFileState:
+    """
+    Say what the search for a configuration file found.
+
+    The one derivation of that fact, for the same reason
+    ``profile_storage_for_loaded`` is: four surfaces report it -- the startup
+    log, the Configuration row on the status strip, the ``doctor`` resolution
+    table and the warning one-shot commands print on stderr -- and four copies
+    of this rule would be four chances for them to describe the same appliance
+    differently.
+
+    It reads the recording made when the settings were loaded and stats
+    nothing.  Settings built directly carry no recording and so loaded nothing
+    by search; they are reported by whether a path was recorded on them, which
+    is what test fixtures and the explicit-path branch set.
+
+    Args:
+        settings: The settings in hand.
+
+    Returns:
+        Which of the four situations this process started in.
+
+    """
+    discovery = settings.config_discovery
+    if discovery is None:
+        if settings.config_path is not None:
+            return ConfigFileState.LOADED
+        return ConfigFileState.NOT_FOUND
+    if discovery.loaded is not None:
+        if discovery.stale:
+            return ConfigFileState.LOADED_WITH_LEFTOVER
+        return ConfigFileState.LOADED
+    if discovery.stale:
+        return ConfigFileState.STALE_ONLY
+    return ConfigFileState.NOT_FOUND
 
 
 def warn_on_legacy_duplex_sources(settings: Settings) -> None:
@@ -1044,25 +1259,167 @@ def _env_variable_for(
     return None
 
 
+_MIN_REDACTED_INPUT: Final = 2
+"""The shortest input string worth redacting from an upstream message."""
+
+_REDACTED: Final = "<value omitted>"
+"""What stands in for an input value that must not reach a rendered line."""
+
+_MIN_WITHHELD_INPUT: Final = 8
+"""The length at which an input buried inside a word means upstream put it there.
+
+The longest word pydantic builds its messages from is ``integer``, at seven
+characters, so a value this long cannot be a coincidental fragment of its
+prose: something upstream joined the value to its own words without a
+separator, and the message has to be withheld whole. Shorter values collide
+with ordinary English by chance -- ``in`` lives inside ``integer`` and
+``string`` -- and striking those would cost the operator the explanation
+while hiding nothing a reader could recover.
+"""
+
+
+def _input_texts(value: object) -> Iterator[str]:
+    """
+    Yield every string an error's ``input`` carries, however it is nested.
+
+    ``input`` is not always a string. ``SANELESS_PAPERLESS__TOKEN__X=<token>``
+    makes pydantic build a mapping for ``token``, so the credential arrives as
+    ``{"x": "<token>"}``; a bare ``isinstance(value, str)`` test would walk
+    past it and leave the guarantee below unkept.
+
+    Args:
+        value: The error's ``input`` member, of any shape.
+
+    Yields:
+        Each string found in it, outermost first.
+
+    """
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for item in value.values():
+            yield from _input_texts(item)
+    elif isinstance(value, list | tuple | set | frozenset):
+        for item in value:
+            yield from _input_texts(item)
+
+
+def _redact_input(text: str, value: object) -> str:
+    """
+    Remove an error's input text from an upstream message fragment.
+
+    pydantic's ``msg`` carries no input today -- but that wording belongs to
+    pydantic, not to this project, and for ``tokne = "..."`` the input is the
+    Paperless token. Redacting it means no wording upstream can put a config
+    value in a line a user pastes into a bug report.
+
+    The scope is deliberately the message alone, not the finished line.
+    pydantic's ``msg`` is the only part of a rendered line that comes from
+    outside this module: the section label, the key name, the did-you-mean
+    hint and the valid-keys list are all built from this module's own field
+    names. Replacing text across the whole line strikes the hint out whenever
+    a config value happens to equal a field name -- ``hst = "host"`` would
+    lose both the suggestion and the first valid key -- which destroys the
+    very part of the message the operator needs.
+
+    Strings shorter than two characters are left alone: they cannot be a
+    credential and replacing them would mangle ordinary words inside an
+    upstream message.
+
+    Occurrences are struck at word boundaries, not anywhere they appear. An
+    unanchored replacement corrupts pydantic's own prose whenever a short
+    value happens to sit inside one of its words: ``web_port = "in"`` turned
+    "a valid integer" into "a valid <value omitted>teger", losing the one
+    sentence that says what was wanted, for the most ordinary kind of typo.
+
+    A long value can still survive that, if upstream joined it to its own
+    words with no separator for a boundary to find. Splicing there would
+    corrupt the prose and leaving it would echo the input, so the whole
+    message is withheld instead -- see ``_MIN_WITHHELD_INPUT`` for why length
+    is what separates that case from ordinary coincidence. Between explaining
+    and not echoing, not echoing wins; the section, the key, the did-you-mean
+    hint and the valid keys are this module's own words and survive either
+    way.
+
+    Args:
+        text: The upstream message fragment.
+        value: The error's ``input`` member.
+
+    Returns:
+        The text with the input struck out, or the marker alone when it
+        could not be struck without corrupting the text.
+
+    """
+    for secret in _input_texts(value):
+        if len(secret) < _MIN_REDACTED_INPUT:
+            continue
+        text = re.sub(rf"\b{re.escape(secret)}\b", _REDACTED, text)
+        if secret in text and len(secret) >= _MIN_WITHHELD_INPUT:
+            return _REDACTED
+    return text
+
+
+def _redact_environment(text: str) -> str:
+    """
+    Strike every ``SANELESS_*`` value out of an upstream message.
+
+    The environment branch has no pydantic ``input`` to work from: the error
+    arrives from ``_env_contribution`` before any field is built. What it can
+    carry is a configured value, and the JSON-valued variables are exactly
+    the ones a token travels in, so the environment's own values are what is
+    struck out.
+
+    The name is matched case-insensitively because that is how the value got
+    in. ``SettingsConfigDict`` leaves ``case_sensitive`` at its default, so
+    pydantic-settings reads ``saneless_paperless__token`` exactly as it reads
+    the shouted spelling -- and an uppercase-only filter here would hand that
+    token to ``_redact_input`` as a value it was never told about, leaving it
+    in the rendered line. Whatever pydantic is willing to read, this has to
+    be willing to strike.
+
+    Args:
+        text: The upstream message fragment.
+
+    Returns:
+        The text with every configured ``SANELESS_*`` value struck out.
+
+    """
+    values = [
+        value
+        for name, value in os.environ.items()
+        if name.upper().startswith(_ENV_PREFIX)
+    ]
+    return _redact_input(text, values)
+
+
 def _render_error(
     loc: tuple[str | int, ...],
     error_type: str,
     message: str,
     env_data: Mapping[str, object],
+    value: object,
 ) -> str:
     """
     Render one pydantic error as a ``[section] key`` line.
 
+    The input's text is struck out of ``message`` here, before any branch
+    composes a line, rather than at the call site: that makes this function
+    structurally unable to return a line built from an unredacted upstream
+    message, whatever a future caller does with the result.
+
     Args:
         loc: The error's location.
         error_type: The error's pydantic type, e.g. ``extra_forbidden``.
-        message: pydantic's short ``msg``, which never contains the input.
+        message: pydantic's short ``msg``, whose wording is upstream-owned.
         env_data: The environment's contribution, for attribution.
+        value: The error's ``input`` member -- the text that must not reach
+            the rendered line.
 
     Returns:
         The error line, without indentation.
 
     """
+    message = _redact_input(message, value)
     head = loc[0] if loc else None
     if not isinstance(head, str) or head not in Settings.model_fields:
         if error_type == "extra_forbidden" and len(loc) == 1:
@@ -1095,9 +1452,13 @@ def _render_error_lines(
     """
     Render every validation error as one line, sorted for stable output.
 
-    Only ``loc``, ``type`` and ``msg`` are read. ``input`` and ``ctx`` are
-    never touched: for ``tokne = "..."`` the input is the Paperless token, and
-    ``str(ValidationError)`` embeds it.
+    Only ``loc``, ``type`` and ``msg`` are rendered; ``ctx`` is never touched.
+    ``input`` is read for one purpose only -- to strike its own text out of
+    pydantic's ``msg`` before that wording is composed into a line -- so a
+    rendered line cannot carry a config value whatever wording pydantic's
+    ``msg`` arrives with, and this project's own vocabulary in the same line
+    is never touched. Redaction happens before the sort, so the order stays a
+    property of the text that is actually returned.
 
     Args:
         errors: ``ValidationError.errors()``.
@@ -1108,7 +1469,8 @@ def _render_error_lines(
 
     """
     return sorted(
-        _render_error(err["loc"], err["type"], err["msg"], env_data) for err in errors
+        _render_error(err["loc"], err["type"], err["msg"], env_data, err["input"])
+        for err in errors
     )
 
 
@@ -1225,9 +1587,12 @@ def _build_settings(
     try:
         env_data = _env_contribution()
     except SettingsError as exc:
-        # The message names the field and source, never the value; the
+        # pydantic-settings names the field and source, not the value, but
+        # that wording is upstream-owned -- the same dependency the render
+        # boundary exists to remove. The SANELESS_* values are struck out of
+        # it here so no upstream phrasing can put one in this line. The
         # exception (and its JSON-decoding cause) is not chained.
-        lines.append(f"environment: {_escape_name(str(exc))}")
+        lines.append(f"environment: {_escape_name(_redact_environment(str(exc)))}")
     else:
         try:
             if toml_file is not None:
@@ -1344,19 +1709,24 @@ def config_search_paths() -> tuple[Path, ...]:
     List the config file locations searched when no explicit path is given.
 
     The single search list for both loading and the CLI's write target:
-    ``./saneless.toml``, then ``$XDG_CONFIG_HOME/saneless/config.toml``
-    (``~/.config`` when unset), then ``/etc/saneless/config.toml``. A
+    ``./saneless.toml``, then ``$XDG_CONFIG_HOME/saneless/saneless.toml``
+    (``~/.config`` when unset), then ``/etc/saneless/saneless.toml``. A
     function rather than a module constant so HOME and ``$XDG_CONFIG_HOME``
     are read when called, not at import.
+
+    One name in all three locations, because two names was a trap: a container
+    mounting the app-named file into the system config directory loaded no
+    configuration at all, and nothing said why. A file under the superseded
+    name in one of these directories is detected and reported, never read.
 
     Returns:
         The candidate paths, in search order.
 
     """
     return (
-        Path("./saneless.toml"),
-        xdg_config_home() / "saneless" / "config.toml",
-        Path("/etc/saneless/config.toml"),
+        Path(CONFIG_FILENAME),
+        xdg_config_home() / "saneless" / CONFIG_FILENAME,
+        Path("/etc/saneless") / CONFIG_FILENAME,
     )
 
 
@@ -1403,11 +1773,24 @@ def load_settings(config_path: str | None = None) -> Settings:
             msg = f"Config file not found or not a regular file: {explicit}"
             raise ConfigError(msg)
         path = explicit
+        # An explicit path searches nothing, so it detects nothing: there is
+        # no search list for a superseded-name file to sit beside.
+        discovery = ConfigDiscovery(
+            explicit=explicit,
+            searched=(),
+            found=(explicit,),
+            loaded=explicit,
+            stale=(),
+        )
     else:
-        path = next((p for p in config_search_paths() if p.is_file()), None)
+        # Called through the module global so the search list stays one
+        # function, substitutable in one place.
+        discovery = discover_config(config_search_paths())
+        path = discovery.loaded
     # With no path, only defaults + env vars are used.
     settings = _build_settings(toml_file=path)
     settings._config_path = path
+    settings._config_discovery = discovery
     return settings
 
 
@@ -1461,14 +1844,54 @@ def log_config_sources(settings: Settings) -> None:
     during load would never reach ``log_file``. It runs only
     after a successful load, so the environment is known to parse.
 
+    When nothing loaded, the line also lists every path that was searched,
+    absolute and in search order, because "no config file" on its own leaves
+    an operator to guess which three places that means -- and the file they
+    wrote may be in one of them under the wrong name. When a file did load,
+    the list is omitted: the file that was used is the fact that matters, and
+    three extra paths on every healthy start are noise in a log that is read
+    when something is wrong.
+
+    Each superseded-name file found beside a candidate then gets its own
+    warning, naming it and the rename that makes it load. A leftover beside a
+    file that did load is told to have anything still wanted moved out of it
+    first: after an upgrade it can hold the only copy of the URL and token.
+
     Args:
         settings: The loaded settings.
 
     """
-    source = (
-        str(settings.config_path)
-        if settings.config_path is not None
-        else "no config file; defaults + environment"
-    )
+    state = config_file_state(settings)
+    discovery = settings.config_discovery
+    if settings.config_path is not None:
+        source = str(settings.config_path)
+    else:
+        searched = ", ".join(
+            str(candidate.absolute())
+            for candidate in (discovery.searched if discovery is not None else ())
+        )
+        source = "no config file; defaults + environment"
+        if searched:
+            source = f"{source}; searched {searched}"
     keys = ", ".join(env_sourced_keys()) or "(none)"
     logger.info("Configuration: %s; from environment: %s", source, keys)
+    if discovery is None:
+        return
+    for stale in discovery.stale:
+        if state is ConfigFileState.STALE_ONLY:
+            logger.warning(
+                "Ignoring %s: saneless reads %s, not %s; rename it to %s, "
+                "then restart saneless",
+                stale.absolute(),
+                CONFIG_FILENAME,
+                LEGACY_CONFIG_FILENAME,
+                stale.with_name(CONFIG_FILENAME).absolute(),
+            )
+        elif discovery.loaded is not None:
+            logger.warning(
+                "Ignoring leftover %s: %s is in use; move anything you still "
+                "need from it into %s, then delete it",
+                stale.absolute(),
+                discovery.loaded.absolute(),
+                discovery.loaded.absolute(),
+            )

@@ -1,4 +1,4 @@
-# Digests re-resolved 2026-09-18 against the Docker Hub and GHCR v2 APIs.
+# Digests re-resolved 2026-09-21 against the Docker Hub and GHCR v2 APIs.
 #
 # Every FROM reference below is `image:tag@sha256:...`. Both halves are
 # load-bearing. The digest is the immutable content pin; the tag has to stay in
@@ -18,19 +18,19 @@
 # the same source.
 #
 # Pinned to the uv series this project builds with. pyproject.toml declares
-# `requires = ["uv_build>=0.10.3,<0.11.0"]`, so a Dependabot bump across that
+# `requires = ["uv_build>=0.12.17,<0.13.0"]`, so a Dependabot bump across that
 # ceiling needs the constraint widened in the same pull request -- which is
 # the coupling surfacing where it can be reviewed, rather than breaking later.
-FROM ghcr.io/astral-sh/uv:0.10.3@sha256:7a88d4c4e6f44200575000638453a5a381db0ae31ad5c3a51b14f8687c9d93a3 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.17@sha256:10787c682e4184e4f290de1171fd4703dc63de99221f10fe1c99002ce7fa9acc AS uv
 
 # Stage 1: Build
-FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6 AS builder
+FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS builder
 COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 # Named inputs, never the whole context. This is the second of TWO independent
 # gates on what can reach a build layer; the first is the .dockerignore
 # allow-list. Copying the whole context here would sweep in whatever the daemon
-# was sent -- which, before this was written, included a real config.toml
+# was sent -- which, before this was written, included a real config file
 # holding a live paperless-ngx API token, recoverable afterwards from the
 # discarded builder stage. With both gates in place, a mistake in either one
 # alone leaks nothing.
@@ -41,16 +41,39 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv build --wheel --out-dir /dist
+RUN uv export --locked --no-dev --no-emit-project -o /dist/requirements.txt
 
 # Stage 2: Runtime
-FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
+FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsane1 curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /dist/*.whl /tmp/
+COPY --from=builder /dist/requirements.txt /tmp/requirements.txt
+# The dependency set installed below comes from uv.lock, not from the project
+# wheel's own metadata, and every byte of it is checked against a sha256 the
+# lock recorded. Two invocations, in this order, never merged into one: the
+# exported requirements file first -- each of its entries carrying its digest --
+# and then the locally built wheel alone, with --no-deps.
+#
+# Installing the wheel on its own, which is what this replaced, resolved the
+# dependency tree from the project's `>=` floors at build time and never read
+# uv.lock. A lock refreshed to escape an advisory therefore constrained CI and
+# constrained nothing that shipped, and the published image could carry the very
+# tree this project had already upgraded away from. The hash check refuses
+# anything not listed with a matching digest -- a substituted or republished
+# artifact fails the build instead of shipping -- and --no-deps stops those
+# floors re-entering through the wheel. The wheel is deliberately absent from
+# the hashed file: it is built in the preceding stage of this same build, so
+# hashing it would only compare it against itself.
+#
+# gcc and the headers are installed, used and purged inside this single RUN
+# because python-sane publishes an sdist and no wheel, so it compiles here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libc6-dev libsane-dev \
-    && pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl \
+    && pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
+    && pip install --no-cache-dir --no-deps /tmp/*.whl \
+    && rm /tmp/*.whl /tmp/requirements.txt \
     && apt-get purge -y gcc libc6-dev libsane-dev && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 # The application account. Everything above this line needs root -- apt and the
@@ -102,7 +125,7 @@ USER saneless
 # bare-metal installs, and in Docker you remap on the host with -p 8888:8080.
 # The healthcheck URL is written out rather than expanded from the environment
 # on purpose -- a shell-form expansion would track SANELESS_OUTPUT__WEB_PORT
-# but silently not a web_port set in config.toml, which replaces one false
+# but silently not a web_port set in saneless.toml, which replaces one false
 # claim with a half-true one. 8080 is above 1024 and curl to localhost needs no
 # privilege, so neither the bind nor the probe cares that this is UID 1000.
 EXPOSE 8080

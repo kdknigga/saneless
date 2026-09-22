@@ -52,18 +52,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.17"
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run ty check
       - run: uv run pyrefly check src tests
-      # The workflow audit, in the same bare shape as its four neighbours: a
-      # clean run exits 0 and any finding exits 14, so a plain `run:` already
-      # fails the build on the first finding. No severity or confidence floor,
-      # no persona flag (the default `regular` persona is the contract), no
-      # `continue-on-error`, no `|| true`. Findings are fixed, never suppressed
-      # -- an inline audit-ignore comment is as forbidden here as `# noqa`.
+      # The workflow audit, in the same bare shape as the five other checks in
+      # this job: a clean run exits 0 and any finding exits 14, so a plain
+      # `run:` already fails the build on the first finding. No severity or
+      # confidence floor, no persona flag (the default `regular` persona is the
+      # contract), no `continue-on-error`, no `|| true`. Findings are fixed,
+      # never suppressed -- an inline audit-ignore comment is as forbidden here
+      # as `# noqa`.
       - run: uv run zizmor .
+      # The advisory gate, bare and blocking for the same reason its neighbour
+      # above is: a lockfile with a known vulnerability in it should not pass
+      # review, so the run fails rather than reports. No severity floor, no
+      # `continue-on-error`, no flag that drops a finding -- a test in
+      # tests/test_deployment_config.py enforces that last one.
+      #
+      # `--preview-features audit-command` silences a stderr warning that the
+      # subcommand is experimental. It does not enable it: `uv audit` runs
+      # unflagged on the pinned uv, and the flag only keeps the CI log clean.
+      #
+      # The default scope already covers the dev group, so no `--no-dev`: a
+      # compromised dev tool runs on a developer's machine with their
+      # credentials, which is not the lesser risk.
+      #
+      # CI only, with no prek hook. Unlike the workflow audit this reaches the
+      # OSV API over the network, so it fails the criteria the hook config
+      # states for a commit-stage check -- it cannot be fast, offline or
+      # guaranteed to finish.
+      - run: uv audit --preview-features audit-command
 
   test:
     name: test
@@ -80,6 +102,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.17"
       - run: uv sync --locked
       # pytest runs with HOME at a fresh empty directory, so a test that reads
       # or writes the real home fails here instead of passing on whatever the
@@ -113,6 +137,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.17"
       - run: uv sync --locked
       # Installed under the real HOME, into ~/.cache/ms-playwright.
       - run: uv run playwright install --with-deps chromium

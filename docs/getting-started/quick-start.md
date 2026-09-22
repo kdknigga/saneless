@@ -27,7 +27,7 @@ The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyo
 
     Replace `192.168.1.50` with the IP address of the machine running `saned`.
 
-    The container reads its configuration from `config.toml` inside the mounted `./config` directory. Put the file in `./config`, and keep the directory writable so saneless can save generated profiles to it.
+    The container reads its configuration from `saneless.toml` inside the mounted `./config` directory. Put the file in `./config`, and keep the directory writable so saneless can save generated profiles to it.
 
     !!! tip "Network scanners"
         The `SANELESS_SCANNER__HOST` environment variable tells saneless where to find your scanner over the network. If your scanner is on the same machine as the container, you can omit this variable. For multi-host setups, see [Scanner Host Discovery](../how-to/scanner-host-discovery.md).
@@ -68,7 +68,7 @@ token = "abc123def456"
 
 Replace the URL and token with your actual paperless-ngx address and API token.
 
-saneless searches for configuration in this order: `--config PATH`, `./saneless.toml`, `$XDG_CONFIG_HOME/saneless/config.toml` (default `~/.config/saneless/config.toml`), `/etc/saneless/config.toml`. See the [Configuration reference](../reference/configuration.md) for all available options.
+saneless searches for configuration in this order: `--config PATH`, `./saneless.toml`, `$XDG_CONFIG_HOME/saneless/saneless.toml` (default `~/.config/saneless/saneless.toml`), `/etc/saneless/saneless.toml`. See the [Configuration reference](../reference/configuration.md) for all available options.
 
 ## Scan
 

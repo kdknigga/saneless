@@ -78,12 +78,12 @@ def describe(exc: BaseException) -> str:
     Return a one-line description of an exception that is never empty.
 
     Some third-party exceptions stringify to an empty string -- an
-    ``httpx.ReadTimeout`` raised without a message is one -- and a user-visible
+    ``httpx2.ReadTimeout`` raised without a message is one -- and a user-visible
     line reading "Upload failed: " says nothing.  Falling back to the class
     name keeps the line readable.
 
     Others stringify over several lines -- pydantic's ``ValidationError`` and
-    httpx's ``HTTPStatusError`` do -- so the whitespace is collapsed here, once,
+    httpx2's ``HTTPStatusError`` do -- so the whitespace is collapsed here, once,
     and every boundary that wraps a message through ``describe`` keeps the CLI
     line and ``job.error`` to one line.
 

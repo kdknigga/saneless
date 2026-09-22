@@ -5,7 +5,7 @@ Scan profiles define how saneless scans documents -- the paper source, resolutio
 ## What you'll need
 
 - saneless installed and working ([Install on Bare Metal](install-bare-metal.md) or [Deploy with Docker Compose](deploy-docker-compose.md))
-- A text editor to modify `saneless.toml` or `config.toml`
+- A text editor to modify `saneless.toml`
 
 ## Profile basics
 
@@ -108,6 +108,29 @@ resolution = 300
 mode = "Color"
 ```
 
+### What `auto-profiles` guesses, and when to override it
+
+`saneless auto-profiles` has to pick one of the two values for you, and an `Auto`
+source does not say which it should be. It writes `"adf"` only when it can find no
+evidence that the scanner has a glass at all -- neither a source named `Flatbed`
+nor a device type that has one. Anything else gets the `"flatbed"` default.
+
+Some backends report a scanner less completely than others. HP's `hpaio`, for
+example, names only `Auto` and `ADF` for an all-in-one that does have a glass. If
+your generated `Auto` profile guessed wrong, set the field yourself:
+
+```toml
+[profiles.auto]
+source = "Auto"
+auto_source_mode = "flatbed"   # or "adf"
+```
+
+A scan that guessed `"adf"` on a flatbed reports a scanner error after the first
+page, because saneless asks the scanner for a second sheet the glass cannot
+supply. Some scanners also show a panel message such as "Memory is low" when this
+happens. Set `auto_source_mode = "flatbed"`, or re-run `saneless auto-profiles
+--force` to regenerate the value.
+
 See [Configuration reference](../reference/configuration.md) for all profile fields.
 
 ## Paper size
@@ -189,7 +212,7 @@ Where the generated profiles go depends on the config file saneless loaded:
 
 - **A config file was loaded** (the `--config` path, or the first file found in the [search path](../reference/configuration.md#config-file-search-path)): the profiles are added to that file, as `saneless auto-profiles` would add them, and used straight away.
 - **No config file was loaded:** the profiles are used for this run only and nothing is written. The log names the locations where a config file would be picked up.
-- **The config file cannot be written** -- for example, a read-only mount, or `config.toml` bind-mounted as a single file (the rename fails with EBUSY; mount its directory instead, see [Deploy with Docker Compose](deploy-docker-compose.md)): the profiles are used for this run only, and a warning is logged.
+- **The config file cannot be written** -- for example, a read-only mount, or `saneless.toml` bind-mounted as a single file (the rename fails with EBUSY; mount its directory instead, see [Deploy with Docker Compose](deploy-docker-compose.md)): the profiles are used for this run only, and a warning is logged.
 
 Generation is tried once per start. If the scanner was not reachable, saneless keeps the bare `default` profile and logs why; connect the scanner, then restart saneless or run `saneless auto-profiles` to try again.
 

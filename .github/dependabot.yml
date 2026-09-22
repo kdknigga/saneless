@@ -1,13 +1,21 @@
-# Update schedule for the two ecosystems whose pins are written by hand in this
-# repository: the SHA-pinned actions in .github/workflows/, and the digest-pinned
-# base images in the Dockerfile. Pinning to an immutable SHA or digest is what
-# makes a supply-chain audit pass, and it is also what stops those pins moving on
-# their own -- so something has to move them deliberately, and this is it.
+# Update schedule for the three ecosystems this repository pins: the SHA-pinned
+# actions in .github/workflows/, the digest-pinned base images in the Dockerfile,
+# and the Python dependencies that pyproject.toml declares and uv.lock resolves.
+# Pinning to an immutable SHA, digest or locked version is what makes a
+# supply-chain audit pass, and it is also what stops those pins moving on their
+# own -- so something has to move them deliberately, and this is it.
 #
-# Both entries below carry the seven-day settling period. It is not decoration:
-# an `updates:` entry that omits it is a workflow-audit finding, and the audit
-# runs as a blocking CI step -- so any third entry added here needs its own
-# copy of that block or the build fails.
+# All three entries below carry the seven-day settling period. It is not
+# decoration: it is the gap between an upstream release and a pull request
+# proposing it, and so the only thing standing between an account compromised
+# today and a merge-ready bump today. What enforces it is a test --
+# test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr, in
+# tests/test_deployment_config.py -- and not the workflow audit. zizmor's own
+# cooldown check is ecosystem-gated: measured on 1.30.1, it reports a
+# `github-actions` entry that omits the block, and an explicit value below
+# seven days, but it passes a `uv` entry carrying no block at all. Any fourth
+# entry added here needs its own copy of the block, and the test is what will
+# say so.
 #
 # Watch item for the docker entry: the ecosystem also parses `image:` keys out
 # of YAML manifests, so it may open pull requests against docker-compose.yml's
@@ -29,6 +37,13 @@ updates:
       default-days: 7
 
   - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"

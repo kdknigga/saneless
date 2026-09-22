@@ -2,11 +2,11 @@
 #
 # Configuration options:
 #   - Volume mount: the ./config directory, mounted read-write at /etc/saneless,
-#     holds config.toml. That file is the one place for the paperless-ngx
+#     holds saneless.toml. That file is the one place for the paperless-ngx
 #     token; see the environment: block below for why.
 #   - Environment variables: use SANELESS_ prefix with __ nested delimiter
 #     (e.g., SANELESS_PAPERLESS__URL, SANELESS_PAPERLESS__TOKEN). Anything set
-#     here overrides config.toml, which is why this file sets none of them.
+#     here overrides saneless.toml, which is why this file sets none of them.
 #   - Consume directory: optionally mount a host directory for paperless-ngx
 #     file-based ingestion as a fallback to API upload
 
@@ -23,17 +23,17 @@ services:
     # action and stays commented. Uncomment and edit it only if your own UID
     # differs, or instead run `chown -R 1000:1000 ./config` once. Either way
     # the ./config mount below has to stay writable: saneless rewrites profiles
-    # by renaming a temp file over config.toml, and it cannot do that in a
+    # by renaming a temp file over saneless.toml, and it cannot do that in a
     # directory it cannot write. A literal, not "${UID}:${GID}" -- compose does
     # not populate UID unless your shell exports it, and the silent fallback is
     # a container that fails to start for no visible reason.
     # user: "1000:1000"
     volumes:
-      # ./config holds config.toml. Mount the directory, not the file, and keep
-      # it writable: saneless rewrites profiles by writing a temp file beside
-      # config.toml and renaming it over the original, and a single-file bind
-      # mount makes that rename fail with EBUSY.
-      # If config.toml is missing, saneless starts with defaults plus
+      # ./config holds saneless.toml. Mount the directory, not the file, and
+      # keep it writable: saneless rewrites profiles by writing a temp file
+      # beside saneless.toml and renaming it over the original, and a
+      # single-file bind mount makes that rename fail with EBUSY.
+      # If saneless.toml is missing, saneless starts with defaults plus
       # environment variables and does not create the file.
       # See: https://github.com/kdknigga/saneless#configuration
       - ./config:/etc/saneless
@@ -44,7 +44,7 @@ services:
       # be reached at all, saneless drops the assembled PDF here instead of
       # failing the scan, and paperless-ngx ingests it once it is back. Mount
       # the directory paperless-ngx consumes (its PAPERLESS_CONSUMPTION_DIR),
-      # and set paperless.consume_dir in config.toml to the container path on
+      # and set paperless.consume_dir in saneless.toml to the container path on
       # the right -- the mount on its own does nothing.
       # - /srv/paperless/consume:/consume
     environment:
@@ -53,15 +53,19 @@ services:
       # paperless-ngx document title -- is UTC. Set your own zone.
       - TZ=America/Chicago
       # The paperless-ngx connection is commented out ON PURPOSE.
-      # ./config/config.toml is the one place for the URL and the token. A
+      # ./config/saneless.toml is the one place for the URL and the token. A
       # variable set here OVERRIDES that file silently: saneless would use this
-      # value and ignore the token you edited into config.toml, and the status
-      # strip would stay red with nothing on screen to say why.
+      # value and ignore the token you edited into saneless.toml, and the
+      # status strip would stay red with nothing on screen to say why.
       #
       # UPGRADING: earlier versions of this file shipped these two lines live,
       # so your own compose file probably still has them. Delete your
-      # SANELESS_PAPERLESS__TOKEN line, or your real config.toml stays
+      # SANELESS_PAPERLESS__TOKEN line, or your real saneless.toml stays
       # overridden and the status strip stays red after you fix it.
+      #
+      # UPGRADING: rename ./config/config.toml to ./config/saneless.toml. The
+      # old name is no longer read at all, and until you rename it the status
+      # page's first row, Configuration, is red and names the file.
       # - SANELESS_PAPERLESS__URL=http://paperless:8000
       # - SANELESS_PAPERLESS__TOKEN=<your paperless-ngx API token>
       # Uncomment to discover scanners on a remote host via SANE net backend:

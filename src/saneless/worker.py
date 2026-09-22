@@ -16,11 +16,17 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Literal
 
 from .auto_profiles import (
+    device_type_of,
     generate_profiles,
     is_bare_default,
     write_profiles_to_config,
 )
-from .config import config_search_paths, profile_storage_for_loaded
+from .config import (
+    CONFIG_FILENAME,
+    config_file_state,
+    config_search_paths,
+    profile_storage_for_loaded,
+)
 from .exceptions import ConfigError, ScanCancelledError
 from .job import JobResult
 from .pipeline import (
@@ -34,6 +40,7 @@ from .pipeline import (
 from .vocabulary import (
     ACTIVE_STATES,
     RESTART_REASON,
+    ConfigFileState,
     ErrorCategory,
     FlipOutcome,
     JobState,
@@ -947,7 +954,7 @@ class ScanWorker:
                     return None
                 device_id = self._settings.scanner.device or devices[0].name
                 caps = self._scanner.get_capabilities(device_id)
-            return generate_profiles(caps)
+            return generate_profiles(caps, device_type_of(devices, device_id))
         except Exception as exc:
             # The exception class is named, never interpreted.  The old
             # message blamed the network for every failure, a parse error
@@ -960,6 +967,54 @@ class ScanWorker:
                 exc_info=True,
             )
             return None
+
+    def _log_no_config_file(self) -> None:
+        """
+        Say why the generated profiles were not written, naming the real reason.
+
+        Two situations end up here and they want different sentences.  Usually
+        nothing was found and the fix is to create a file, so the message
+        lists the places that were looked at.  But a file under the superseded
+        name sitting in one of those directories is also "nothing loaded", and
+        telling that operator to create a file -- while naming the very
+        directory the file they already wrote is in, without mentioning it --
+        is how one appliance came to report four symptoms and no cause.
+
+        The state comes from ``config_file_state``, the same derivation the
+        startup log, the Configuration row, ``doctor`` and the CLI read, so
+        this message cannot come to disagree with them.  Nothing is written
+        and the superseded-name file is only named: a rename is the operator's
+        to make, and doing it for them would be this process deciding which of
+        two files holds the configuration.
+        """
+        discovery = self._settings.config_discovery
+        if (
+            discovery is not None
+            and config_file_state(self._settings) is ConfigFileState.STALE_ONLY
+        ):
+            logger.info(
+                "Auto-profiles: no config file was loaded, so the generated "
+                "profiles are used for this run only and were not written; %s "
+                "was ignored because saneless reads %s, not the old name; "
+                "rename it to keep them",
+                discovery.stale[0].absolute(),
+                CONFIG_FILENAME,
+            )
+            return
+        # The recorded search when there is one, so the list is what this
+        # process actually looked at rather than what a fresh call would
+        # return; settings built directly carry no recording and fall back.
+        searched = (
+            tuple(path.absolute() for path in discovery.searched)
+            if discovery is not None
+            else config_search_paths()
+        )
+        logger.info(
+            "Auto-profiles: no config file was loaded, so the generated "
+            "profiles are used for this run only and were not written; pass "
+            "--config or create one of %s to keep them",
+            ", ".join(str(path) for path in searched),
+        )
 
     def _persist_generated_profiles(
         self, profiles: dict[str, ProfileConfig]
@@ -981,12 +1036,7 @@ class ScanWorker:
         """
         config_path = self._settings.config_path
         if config_path is None:
-            logger.info(
-                "Auto-profiles: no config file was loaded, so the generated "
-                "profiles are used for this run only and were not written; pass "
-                "--config or create one of %s to keep them",
-                ", ".join(str(path) for path in config_search_paths()),
-            )
+            self._log_no_config_file()
             self._profile_storage = ProfileStorage.IN_MEMORY_NO_CONFIG_FILE
             return None
         try:

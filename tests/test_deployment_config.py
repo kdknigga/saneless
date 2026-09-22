@@ -1,13 +1,13 @@
 """
 Static text tests for the documented Docker deployment (CFG-09, M-30, D-09).
 
-saneless rewrites ``config.toml`` atomically: it writes a temp file beside the
+saneless rewrites ``saneless.toml`` atomically: it writes a temp file beside the
 config and renames it over the original. That rename only works when the
 container sees the config *directory*. A single-file bind mount makes the kernel
 refuse the rename with EBUSY, so every profile write fails on the deployment the
 docs used to recommend. These tests hold the compose example and every doc page
 to the read-write directory mount ``./config:/etc/saneless``, and they keep out
-the old, false claim that the container fails to start without ``config.toml``.
+the old, false claim that the container fails to start without ``saneless.toml``.
 
 The later tests hold the configuration, environment-variable and CLI references,
 the scripting how-to, the empty-page explanation and ``saneless.toml.example``
@@ -24,7 +24,7 @@ subsection, and the absence of the two claims that phase falsified (D-20).
 
 The Phase 30 tests hold the shipped compose template to D-17 -- the paperless
 connection is commented out, because a live line there silently overrides
-``./config/config.toml`` -- and to APPL-11's consume-directory mount and
+``./config/saneless.toml`` -- and to APPL-11's consume-directory mount and
 APPL-12's ``TZ``. They derive the documentation's expectations from the
 source: the route decorators, the ``WebConfig`` fields and the
 ``RequestRejection`` members, so a future addition cannot ship undocumented
@@ -48,16 +48,38 @@ The citation guard holds every source, template, style and script file under
 ``src/`` to comments that give their own reasons, because the planning records
 they might otherwise point at do not ship with the product.
 
-Plain-text assertions only: the contract is what an operator copies, not what a
-YAML parser makes of it.
+The Phase 35 tests hold the declared ``>=`` floors to the versions ``uv.lock``
+resolves, and hold the ``anyio`` ceiling to its declaration. Phase 36 made the
+container install a hash-checked export of the lock, so the floors no longer
+decide what ships; the published wheel's metadata still carries them, so they
+remain the only thing a downstream non-lock install obeys (DEP-12, DEP-13,
+D-09, D-10, D-11, D-17).
+
+Plain-text assertions, with one stated exception: the contract is what an
+operator copies, not what a YAML parser makes of it. The exception is the
+floor-to-lock guard at the foot of this file, which parses ``uv.lock`` with
+``tomllib`` because that file is machine-generated, is copied by nobody, and
+hides the one failure a line scanner cannot see -- two ``[[package]]`` entries
+for a single declared name.
 """
 
 from __future__ import annotations
 
+import inspect
+import os
 import re
 import subprocess
+import sys
+
+# The single exception to this module's plain-text rule, and the only import
+# here that parses anything. It serves the floor-to-lock guard at the foot of
+# the file, where the reason is set out in full: `uv.lock` is
+# machine-generated TOML that no operator copies, and a line scanner cannot
+# see two `[[package]]` entries for one name.
+import tomllib
 from pathlib import Path
 
+from saneless.checks import CheckKey, check_name
 from saneless.config import (
     OutputConfig,
     ProfileConfig,
@@ -77,6 +99,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = REPO_ROOT / "docker-compose.yml"
 README = REPO_ROOT / "README.md"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+UV_LOCK = REPO_ROOT / "uv.lock"
 DOCS_DIR = REPO_ROOT / "docs"
 
 DIRECTORY_MOUNT = "./config:/etc/saneless"
@@ -84,7 +107,27 @@ DIRECTORY_MOUNT = "./config:/etc/saneless"
 # where the host side has to be absolute and quoted (row 31).
 ABSOLUTE_DIRECTORY_MOUNT = '"$(pwd)/config:/etc/saneless"'
 DIRECTORY_MOUNT_FORMS = (DIRECTORY_MOUNT, ABSOLUTE_DIRECTORY_MOUNT)
-SINGLE_FILE_MOUNT = "config.toml:/etc/saneless/config.toml"
+
+# The one config filename saneless reads, and the one it used to read. The
+# legacy name is assembled from named parts in an f-string rather than written
+# as a single literal, because the repository sweep guard forbids that literal
+# in every shipped file -- this one included -- and a literal here would make
+# the guard report its own definition. It is the ``FORBIDDEN_OWNER_SLUG``
+# idiom, and for the same reason: ruff's FLY002 rewrites a ``"".join`` over an
+# inline sequence straight back into the literal, and suppression is forbidden.
+CONFIG_NAME = "saneless.toml"
+_LEGACY_STEM = "config"
+_TOML_EXT = "toml"
+LEGACY_CONFIG_NAME = f"{_LEGACY_STEM}.{_TOML_EXT}"
+
+# Both spellings of the single-file bind mount that breaks the atomic rename.
+# The legacy spelling stays: an operator upgrading from it copies the old line
+# out of an old guide, so dropping it would make this guard vacuous for exactly
+# the deployment it exists to catch.
+SINGLE_FILE_MOUNTS = (
+    f"{LEGACY_CONFIG_NAME}:/etc/saneless/{LEGACY_CONFIG_NAME}",
+    f"{CONFIG_NAME}:/etc/saneless/{CONFIG_NAME}",
+)
 
 DEPLOY_HOWTO = DOCS_DIR / "how-to" / "deploy-docker-compose.md"
 DOCKER_REFERENCE = DOCS_DIR / "reference" / "docker.md"
@@ -126,18 +169,44 @@ def test_compose_mounts_the_config_directory() -> None:
     )
 
 
+def _is_single_file_mount(line: str) -> bool:
+    """Say whether a line bind-mounts the config file itself, in either spelling."""
+    return any(mount in line for mount in SINGLE_FILE_MOUNTS)
+
+
 def test_no_single_file_config_mount_anywhere() -> None:
-    """No compose file or doc page bind-mounts ``config.toml`` as a single file."""
+    """No compose file or doc page bind-mounts the config file on its own."""
     offenders = [
         f"{path.relative_to(REPO_ROOT)}:{number}: {line.strip()}"
         for path in _deployment_files()
         for number, line in enumerate(
             path.read_text(encoding="utf-8").splitlines(), start=1
         )
-        if SINGLE_FILE_MOUNT in line
+        if _is_single_file_mount(line)
     ]
-    assert not offenders, "single-file config.toml mount found:\n" + "\n".join(
-        offenders
+    assert not offenders, "single-file config mount found:\n" + "\n".join(offenders)
+
+
+def test_the_single_file_mount_guard_fires_for_both_spellings() -> None:
+    """
+    The guard above can fail, for the old filename and for the new one.
+
+    The rename is what makes this worth asserting. A guard written around one
+    literal filename goes quietly vacuous the moment the file is renamed: it
+    keeps passing, on every page, forever, while the mount it was written to
+    catch sails through under the other name. Feeding one synthetic line per
+    spelling through the same predicate the guard uses is the cheapest proof
+    that neither spelling is a blind spot.
+    """
+    for mount in SINGLE_FILE_MOUNTS:
+        line = f"      - ./{mount}:ro"
+        assert _is_single_file_mount(line), (
+            f"the single-file mount guard does not fire for {line.strip()!r}, "
+            f"so a page could carry that mount unnoticed"
+        )
+    assert not _is_single_file_mount(f"      - {DIRECTORY_MOUNT}"), (
+        "the single-file mount guard fires for the directory mount the docs "
+        "are supposed to recommend, so it would fail on correct pages"
     )
 
 
@@ -186,14 +255,17 @@ def test_deploy_doc_explains_missing_config_and_migration() -> None:
     migration = [
         line
         for line in text.splitlines()
-        if "config.toml" in line and "config/" in line and "mv" in line
+        if f"config/{CONFIG_NAME}" in line and "mv" in line
     ]
-    assert migration, f"{name} has no migration step moving config.toml into ./config/"
+    assert migration, (
+        f"{name} has no migration step moving an old single-file config to "
+        f"./config/{CONFIG_NAME}"
+    )
 
 
-def test_deploy_doc_says_where_auto_profiles_writes_without_config_toml() -> None:
+def test_deploy_doc_says_where_auto_profiles_writes_without_a_config_file() -> None:
     """
-    With no ``config.toml``, the doc names the real write path (WR-06).
+    With no ``saneless.toml``, the doc names the real write path (WR-06).
 
     The CLI writes ``./saneless.toml`` when no config file was loaded. The
     image's runtime stage sets ``WORKDIR /var/lib/saneless``, so that resolves
@@ -206,10 +278,10 @@ def test_deploy_doc_says_where_auto_profiles_writes_without_config_toml() -> Non
     name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
     assert AUTO_PROFILES_CONTAINER_PATH in text, (
         f"{name} does not say auto-profiles writes "
-        f"{AUTO_PROFILES_CONTAINER_PATH} when config.toml is missing"
+        f"{AUTO_PROFILES_CONTAINER_PATH} when the config file is missing"
     )
-    assert "touch config/config.toml" in text, (
-        f"{name} does not tell container users to create config/config.toml first"
+    assert f"touch config/{CONFIG_NAME}" in text, (
+        f"{name} does not tell container users to create config/{CONFIG_NAME} first"
     )
 
 
@@ -826,7 +898,7 @@ def test_architecture_page_states_the_memory_disk_and_timeout_rules() -> None:
 # ---------------------------------------------------------------------------
 
 # Every environment variable that carries the paperless-ngx connection. A live
-# line here silently overrides ``./config/config.toml`` -- the U-01 finding.
+# line here silently overrides ``./config/saneless.toml`` -- the U-01 finding.
 OVERRIDING_ENV_KEYS = ("SANELESS_PAPERLESS__URL", "SANELESS_PAPERLESS__TOKEN")
 
 _TOKEN_ASSIGNMENT = re.compile(r"SANELESS_PAPERLESS__TOKEN=(\S*)")
@@ -865,21 +937,21 @@ def test_compose_ships_no_live_paperless_environment_line() -> None:
     assert not offenders, (
         "the shipped compose template still sets the paperless connection in "
         "its environment: block, which silently overrides "
-        "./config/config.toml (D-17, U-01):\n" + "\n".join(offenders)
+        "./config/saneless.toml (D-17, U-01):\n" + "\n".join(offenders)
     )
 
 
 def test_compose_says_the_environment_block_overrides_the_config_file() -> None:
     """The commented block explains the override and the upgrade action."""
     text = COMPOSE.read_text(encoding="utf-8").lower()
-    for needle in ("override", "config.toml"):
+    for needle in ("override", CONFIG_NAME):
         assert needle in text, (
-            f"{COMPOSE.name} does not say that an environment line "
-            f"{needle}s the config file (D-17)"
+            f"{COMPOSE.name} does not contain {needle!r}, so it does not "
+            f"say that an environment line overrides {CONFIG_NAME} (D-17)"
         )
     assert "delete" in text or "remove" in text, (
         f"{COMPOSE.name} does not tell an operator who copied an earlier "
-        "version to remove their own token line, so their real config.toml "
+        "version to remove their own token line, so their real saneless.toml "
         "stays overridden and the status strip stays red"
     )
 
@@ -963,10 +1035,10 @@ def test_deploy_howto_tells_existing_operators_to_remove_their_token_line() -> N
     assert "SANELESS_PAPERLESS__TOKEN" in text, (
         f"{name} no longer names the variable an existing operator has to remove"
     )
-    for needle in ("override", "config.toml"):
+    for needle in ("override", CONFIG_NAME):
         assert needle in lowered, (
-            f"{name} does not explain that an environment line {needle}s the "
-            "config file (D-17)"
+            f"{name} does not contain {needle!r}, so it does not explain that "
+            f"an environment line overrides {CONFIG_NAME} (D-17)"
         )
     assert "red" in lowered, (
         f"{name} does not state the consequence -- the status strip stays red "
@@ -1169,10 +1241,10 @@ def test_pyproject_has_no_legacy_license_classifier() -> None:
     """
     The deprecated ``License ::`` classifier is gone (D-05).
 
-    This needs its own assertion because nothing else catches it. Neither
-    ``uv_build`` 0.10.3 nor ``twine check`` errors when the classifier ships
-    beside a PEP 639 ``License-Expression`` -- both were measured doing exactly
-    that -- so no build or publish step would fail if it came back.
+    This needs its own assertion because nothing else catches it. Neither the
+    build backend nor ``twine check`` errors when the classifier ships beside a
+    PEP 639 ``License-Expression`` -- both were measured doing exactly that --
+    so no build or publish step would fail if it came back.
     """
     text, name = _read(PYPROJECT)
     assert LEGACY_LICENSE_CLASSIFIER not in text, (
@@ -1495,14 +1567,17 @@ GITIGNORE = REPO_ROOT / ".gitignore"
 # Path fragments that must never appear on a ``!`` re-include line. ``config``
 # and ``saneless.toml`` are where a live paperless-ngx token lives; ``tests``
 # and ``.planning`` are bulk the image has no use for, and ``.planning`` in
-# particular carries the phase audit artifacts.
+# particular carries the phase audit artifacts. The legacy filename stays on
+# this list although saneless no longer reads it: a file left behind under the
+# old name still holds whatever token its owner put there, so it must never
+# reach the daemon either.
 FORBIDDEN_CONTEXT_PATHS = (
     ".env",
     ".git",
     ".planning",
     "config",
-    "config.toml",
-    "saneless.toml",
+    LEGACY_CONFIG_NAME,
+    CONFIG_NAME,
     "tests",
 )
 
@@ -1542,7 +1617,7 @@ def test_dockerignore_starts_with_a_deny_everything_line() -> None:
     ``!`` line below re-includes one path the wheel build needs. That only
     holds while ``*`` comes first. Move it down, or drop it, and every ``!``
     line below it becomes decoration while the working tree -- including a real
-    ``config.toml`` with a live paperless-ngx token -- rides into a build layer
+    ``saneless.toml`` with a live paperless-ngx token -- rides into a build layer
     that is recoverable from the image.
     """
     lines = _significant_lines(DOCKERIGNORE)
@@ -1738,7 +1813,7 @@ def test_dockerfile_copies_only_the_wheel_build_inputs() -> None:
     This is the second of the two independent build-context gates, the first
     being the ``.dockerignore`` allow-list. Copying the entire context sweeps
     whatever the daemon was sent into a layer -- which, before this phase,
-    included a real ``config.toml`` holding a live paperless-ngx token. Naming
+    included a real ``saneless.toml`` holding a live paperless-ngx token. Naming
     the inputs means a mistake in the allow-list alone cannot leak anything.
     """
     name = DOCKERFILE.relative_to(REPO_ROOT)
@@ -1983,7 +2058,7 @@ def test_the_example_config_does_not_ship_a_live_web_port() -> None:
 
     The example shipped ``web_port = 8081``, which is wrong for every Docker
     reader: the image's ``EXPOSE`` and healthcheck are both 8080, so copying
-    the example into a mounted ``config.toml`` moved the server off the port
+    the example into a mounted ``saneless.toml`` moved the server off the port
     the healthcheck probes and the container went unhealthy with nothing on
     screen to say why. The line joins the commented pair below it instead, so
     it still documents the key without configuring anything.
@@ -2655,4 +2730,1203 @@ def test_hook_interpreter_is_pinned_to_the_project_python() -> None:
     assert match.group(1) == expected, (
         f"{name} pins the hook interpreter to {match.group(1)}, but ruff targets "
         f"{expected}. A hook older than ruff's target rejects syntax ruff writes"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The suppression ban, enforced instead of merely written down
+# ---------------------------------------------------------------------------
+
+# CLAUDE.md and CONTRIBUTING.md both forbid silencing a checker rather than
+# fixing what it found, but prose cannot fail a build. The guard below turns
+# the rule into something falsifiable: it reads every tracked Python file and
+# reports any line carrying one of the six comment forms that do the
+# silencing. Those are, in words: the bare linter-suppression comment; the
+# shared type-checker suppression comment; the named per-checker form for the
+# linter and for each of the two type checkers in turn; and the leading-colon
+# form, which is what the file-level spellings all end in -- those disable
+# every rule in a whole module at once and share no text with the other five.
+# Matching is plain substring containment, so each bracketed per-rule variant
+# is caught by the same entry that catches its bare form.
+#
+# Every marker is assembled at runtime from the fragments below rather than
+# spelled out, for the reason the owner guard gives further up: this file is
+# in scope of its own scan, so a literal marker anywhere here would make the
+# guard report itself and go red with no real regression behind it. A join
+# over an inline sequence is no good either, because ruff's FLY002 rewrites it
+# straight back into the literal and suppressing the rule is forbidden -- the
+# irony of which is the whole point of this guard. An f-string over named
+# constants is the form FLY002 leaves alone. Each fragment on its own is
+# harmless; only the concatenations are the banned text, and no line in this
+# file spells one of them out.
+_MARKER_LEAD = "# "
+_MARKER_SEP = ": "
+_SILENCE_LINT = "noqa"
+_SILENCE_RULE = "ignore"
+_CHECKER_TYPE = "type"
+_CHECKER_RUFF = "ruff"
+_CHECKER_PYREFLY = "pyrefly"
+_CHECKER_TY = "ty"
+
+SUPPRESSION_MARKERS = (
+    f"{_MARKER_LEAD}{_SILENCE_LINT}",
+    f"{_MARKER_LEAD}{_CHECKER_TYPE}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_LEAD}{_CHECKER_RUFF}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_LEAD}{_CHECKER_PYREFLY}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_LEAD}{_CHECKER_TY}{_MARKER_SEP}{_SILENCE_RULE}",
+    f"{_MARKER_SEP}{_SILENCE_LINT}",
+)
+
+
+def _shipped_python_files() -> list[str]:
+    """
+    Return every tracked ``.py`` file outside ``.planning/``.
+
+    The suffix filter is not an optimisation. ``_shipped_files`` also returns
+    Markdown and YAML, and the ban is stated in prose in CLAUDE.md, in
+    CONTRIBUTING.md and in the CI workflow; scanning those would make the
+    guard fail on the very documents that define the rule.
+
+    Returns:
+        Repo-relative names of the tracked Python files in scope.
+
+    """
+    return [name for name in _shipped_files() if Path(name).suffix == ".py"]
+
+
+def test_no_shipped_python_file_carries_a_suppression_comment() -> None:
+    """
+    No tracked Python file silences a checker instead of fixing what it found.
+
+    Scope follows ``git ls-files``, so a Python file added in a later phase is
+    covered without anyone remembering to extend a list. This file is in scope
+    of its own scan, which is why the markers it looks for are assembled at
+    runtime rather than written out.
+    """
+    offenders: list[str] = []
+    for name in _shipped_python_files():
+        # Two clauses rather than one tuple, for the reason given in the
+        # owner guard above.
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if any(marker in line for marker in SUPPRESSION_MARKERS)
+        )
+    assert not offenders, (
+        "a tracked Python file silences a checker with a suppression comment, "
+        "which CLAUDE.md and CONTRIBUTING.md both forbid. Fix what the checker "
+        "reported, at source, or change the rule set deliberately in "
+        "pyproject.toml where the whole project can see it. Remove the comment "
+        "from each line below:\n" + "\n".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# The runtime-evaluated route annotations, asked of ruff rather than read out
+# of the config file
+# ---------------------------------------------------------------------------
+
+_TC002_TARGET = "src/saneless/web/routes.py"
+# Generous, because the assertion is about the answer and not the latency. The
+# measured run is well under a second: it invokes the ruff executable in this
+# environment directly, so there is no dependency resolution step in front of
+# it.
+_TC002_SECONDS = 120
+
+
+def test_ruff_still_exempts_the_runtime_evaluated_route_annotations() -> None:
+    """
+    Ruff leaves the runtime ``Response`` import in routes.py where it is.
+
+    FastAPI resolves a route's return annotation when the decorator runs, so a
+    ``Response`` it cannot resolve becomes a response model that makes
+    ``app.openapi()`` raise. ``runtime-evaluated-decorators`` in pyproject.toml
+    is what stops ruff's TC002 moving that import into a typing-only block.
+
+    The guard asks ruff rather than reading the config, so it also catches the
+    failure mode a config-shape assertion is blind to: ruff resolves a
+    decorator's receiver only through an assignment in the same module, so
+    constructing the ``APIRouter`` somewhere else stops the exemption applying
+    while the config still looks exactly right.
+    """
+    env = {
+        **os.environ,
+        "SANELESS_TEST_RUFF": str(Path(sys.executable).with_name("ruff")),
+        "SANELESS_TEST_FILE": _TC002_TARGET,
+    }
+
+    # Every argv element is a literal and the per-run paths travel in the
+    # environment, double-quoted so the shell never re-splits them -- the
+    # shape the other child-process tests in this suite established. The two
+    # obvious alternatives are both rejected by this project's own lint rules:
+    # a bare command name relying on PATH trips ruff S607, and putting the
+    # resolved executable path in argv[0] trips S603, because argv[0] stops
+    # being a literal. Suppression is forbidden, so the shell indirection is
+    # what is left. The repository path travels in ``cwd``, never as a -C
+    # argument, for the reason the git helper above gives. The command string
+    # stays inline rather than moving to a named constant: S603 only accepts
+    # an argv whose elements are literals at the call site.
+    result = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'exec "$SANELESS_TEST_RUFF" check --no-fix --select TC002 "$SANELESS_TEST_FILE"',
+        ],
+        env=env,
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=_TC002_SECONDS,
+    )
+
+    # The exit code is the whole contract. Nothing asserts on the child's
+    # output, because tooling around it can write chatter to either stream
+    # without that meaning ruff found anything.
+    assert result.returncode == 0, (
+        f"ruff now wants to move a runtime import out of {_TC002_TARGET}. "
+        "FastAPI resolves each route's return annotation when the decorator "
+        "runs, so a Response moved into a typing-only block becomes a "
+        "response model FastAPI cannot resolve, and app.openapi() raises. "
+        "Restore runtime-evaluated-decorators in pyproject.toml, and check "
+        "the APIRouter is still constructed in the module that decorates "
+        f"with it:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The declared floors against the versions uv.lock resolves (D-09, D-10, D-11)
+# ---------------------------------------------------------------------------
+
+# This is the one guard in this file that parses rather than matching plain
+# text, and the departure is deliberate. Everywhere else the contract is what
+# an operator copies, so a parser would assert something no reader ever sees.
+# ``uv.lock`` is the opposite: machine-generated TOML that nobody copies, and
+# the failure that most needs catching here -- one declared name resolved into
+# two ``[[package]]`` entries split by an environment marker -- is invisible to
+# a line scanner, because both entries are well formed and neither is wrong on
+# its own. ``tomllib`` is stdlib, so the parse costs no dependency and no
+# subprocess.
+
+# A declared requirement: a name, optional bracketed extras, then a single
+# ``>=`` floor. The floor stops at a comma, a semicolon or whitespace, so a
+# spec carrying an environment marker or a second bound does not match -- and a
+# spec that does not match is a reported offender, never a silent skip.
+_REQUIREMENT = re.compile(
+    r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)"
+    r"(?:\[(?P<extras>[^\]]*)\])?"
+    r">=(?P<floor>[^,;\s]+)$"
+)
+
+# The leading distribution name of a ``[tool.uv]`` constraint string, which
+# carries an upper bound rather than a floor and so cannot use the pattern
+# above.
+_CONSTRAINT_NAME = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)")
+
+# The anyio ceiling, written once and spelled from the same pair, so loosening
+# the declaration and loosening the comparison cannot drift apart.
+_ANYIO_CEILING = (4, 15)
+_ANYIO_CEILING_SPEC = f"<{_ANYIO_CEILING[0]}.{_ANYIO_CEILING[1]}"
+
+
+def _canonical_name(name: str) -> str:
+    """
+    Return ``name`` in the canonical form both files can be compared on.
+
+    ``pyproject.toml`` and ``uv.lock`` are each free to spell a distribution
+    with either separator and either case, so neither side is authoritative
+    about punctuation.
+
+    Args:
+        name: A distribution name as either file happens to spell it.
+
+    Returns:
+        The name lower-cased, with every run of ``-``, ``_`` and ``.``
+        collapsed to a single ``-``.
+
+    """
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _locked_versions() -> dict[str, list[str]]:
+    """
+    Return every ``[[package]]`` version in ``uv.lock``, keyed by canonical name.
+
+    The value is a list and not a scalar on purpose: detecting a name that
+    resolved to more than one entry is half of what the guard below is for,
+    and a dict of scalars would silently keep whichever entry came last.
+
+    Returns:
+        Canonical distribution name -> every version the lock holds for it.
+
+    """
+    lock = tomllib.loads(UV_LOCK.read_text(encoding="utf-8"))
+    versions: dict[str, list[str]] = {}
+    for package in lock["package"]:
+        versions.setdefault(_canonical_name(package["name"]), []).append(
+            package["version"]
+        )
+    return versions
+
+
+def _declared_requirements() -> list[tuple[str, str]]:
+    """
+    Return every declared requirement paired with the table it was declared in.
+
+    Returns:
+        ``(where, spec)`` pairs covering ``[project].dependencies`` and then
+        ``[dependency-groups].dev``, each in its declared order.
+
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    project = [
+        ("[project].dependencies", spec)
+        for spec in pyproject["project"]["dependencies"]
+    ]
+    dev = [
+        ("[dependency-groups].dev", spec)
+        for spec in pyproject["dependency-groups"]["dev"]
+    ]
+    return project + dev
+
+
+def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
+    """
+    Every declared ``>=`` floor equals the version ``uv.lock`` resolves for it.
+
+    The container is no longer the surface at risk here -- it installs a
+    hash-checked export of the lock -- but the published wheel's metadata
+    carries these floors verbatim, so they are what a downstream
+    ``pip install saneless`` resolves against. A floor left below the locked
+    version therefore admits into a fresh install the very tree this project
+    upgraded away from, and nothing else in the repository would notice. The
+    rule is equality, not satisfaction, so the comparison is plain string
+    equality over the lock's ``version`` field and needs no PEP 440 parsing: a
+    post-release floor compares like any other string.
+
+    The check runs in both directions: every declared name is resolved by the
+    lock, and every floor equals what the lock resolved. One further
+    requirement makes the second half meaningful -- a declared name must have
+    exactly one ``[[package]]`` entry. A name absent from the lock fails, and a
+    name split across two entries by an environment marker fails with both
+    versions named, because which one a wheel install would land on is a
+    decision and not something a guard may guess.
+
+    Scope is ``[project].dependencies`` and ``[dependency-groups].dev``.
+    ``[tool.uv].constraint-dependencies`` is deliberately outside that scope:
+    it holds ceilings rather than floors, so there is no floor in it to compare
+    for equality, and the pattern above would reject its one entry as
+    uncomparable. That entry is covered instead by
+    ``test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it`` below. The
+    exclusion is stated here so no reader has to infer it from a regex that
+    happens not to match.
+    """
+    locked = _locked_versions()
+    offenders: list[str] = []
+    corrections: list[str] = []
+
+    for where, spec in _declared_requirements():
+        match = _REQUIREMENT.match(spec)
+        if match is None:
+            offenders.append(
+                f'"{spec}" in {where} is not a simple ">=" floor; this guard '
+                "cannot compare it"
+            )
+            continue
+
+        name = match.group("name")
+        extras = match.group("extras")
+        floor = match.group("floor")
+        entries = locked.get(_canonical_name(name), [])
+
+        if not entries:
+            offenders.append(
+                f"{name} is declared in {where} but has no [[package]] entry "
+                f"in {UV_LOCK.name}"
+            )
+            continue
+
+        if len(entries) > 1:
+            found = ", ".join(sorted(entries))
+            offenders.append(
+                f"{UV_LOCK.name} has {len(entries)} [[package]] entries for "
+                f"{name} ({found}); a marker-split resolution needs a "
+                "decision, not a guessed winner"
+            )
+            continue
+
+        resolved = entries[0]
+        if floor != resolved:
+            offenders.append(
+                f"{name} floors at {floor} in {where}, but {UV_LOCK.name} "
+                f"resolves {resolved}"
+            )
+            spelled = f"{name}[{extras}]" if extras else name
+            corrections.append(f"{spelled}>={resolved}")
+
+    remedy = ""
+    if corrections:
+        remedy = (
+            f"\n\nReplace these lines in {PYPROJECT.name}, extras included, in "
+            "the same commit as the lock move that caused this:\n"
+        ) + "\n".join(corrections)
+
+    assert not offenders, (
+        f"a declared floor and {UV_LOCK.name} disagree. The container installs "
+        "a hash-checked export of the lock, but the published wheel's metadata "
+        "carries these floors, so a floor below the locked version is the only "
+        "thing standing between a downstream fresh install and the tree this "
+        "project already upgraded away from:\n" + "\n".join(offenders) + remedy
+    )
+
+
+def test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it() -> None:
+    """
+    The ``anyio`` ceiling is still declared, and the locked anyio obeys it.
+
+    anyio 4.15.0 turned ``anyio.abc.BlockingPortal`` into a deprecated alias,
+    and starlette's ``testclient`` module evaluates that name at module scope.
+    This project runs pytest under ``filterwarnings = ["error"]``, so the
+    deprecation is raised rather than printed and every module that imports
+    ``TestClient`` fails during collection -- seven of them here. Nothing in
+    this repository can fix that, because the deprecated name is starlette's
+    own and is reached before any saneless code runs. The ceiling should be
+    removed only once starlette stops using the alias.
+
+    anyio is a transitive this project never imports, so it is declared in
+    neither dependency list and the floor guard above cannot see it: a ceiling
+    is not a floor, and putting it in either list would export a workaround for
+    an upstream bug into the published wheel's metadata. This guard is what
+    covers it, and it fails if the declaration is deleted, if its bound is
+    loosened, or if the lock stops obeying it.
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    uv_table = pyproject.get("tool", {}).get("uv", {})
+    constraints: list[str] = uv_table.get("constraint-dependencies", [])
+    declared = [
+        constraint
+        for constraint in constraints
+        if (match := _CONSTRAINT_NAME.match(constraint)) is not None
+        and _canonical_name(match.group("name")) == "anyio"
+    ]
+
+    assert len(declared) == 1, (
+        f"{PYPROJECT.name} declares {len(declared)} anyio entries in "
+        "[tool.uv].constraint-dependencies; exactly one is expected. Without "
+        "the ceiling, resolution is free to select anyio 4.15 or later, where "
+        "anyio.abc.BlockingPortal became a deprecated alias that starlette's "
+        "testclient module evaluates at module scope. Under "
+        'filterwarnings = ["error"] that deprecation is an error, so every '
+        "module importing TestClient fails to collect. Restore "
+        f'"anyio{_ANYIO_CEILING_SPEC}" there, and remove it only once '
+        "starlette stops using the alias"
+    )
+    ceiling = declared[0]
+    assert _ANYIO_CEILING_SPEC in ceiling, (
+        f"{PYPROJECT.name} constrains anyio as {ceiling!r}, which no longer "
+        f"carries the {_ANYIO_CEILING_SPEC} upper bound. anyio 4.15.0 turned "
+        "anyio.abc.BlockingPortal into a deprecated alias that starlette's "
+        "testclient module evaluates at module scope, and this project raises "
+        "deprecations as errors, so loosening the bound reopens seven "
+        "collection failures. Loosen it only once starlette migrates"
+    )
+
+    versions = _locked_versions().get("anyio", [])
+    assert len(versions) == 1, (
+        f"{UV_LOCK.name} holds {len(versions)} [[package]] entries for anyio "
+        f"({', '.join(sorted(versions))}); exactly one is expected, and the "
+        "ceiling cannot be checked against a split resolution"
+    )
+    parts = versions[0].split(".")
+    resolved = (int(parts[0]), int(parts[1]))
+    assert resolved < _ANYIO_CEILING, (
+        f"{UV_LOCK.name} resolves anyio {versions[0]}, which does not obey the "
+        f"declared {_ANYIO_CEILING_SPEC} ceiling. anyio 4.15.0 turned "
+        "anyio.abc.BlockingPortal into a deprecated alias, starlette's "
+        "testclient module evaluates it at module scope, and this project "
+        'runs under filterwarnings = ["error"], so every module importing '
+        "TestClient fails during collection. Re-lock with the constraint in "
+        "place; lift the ceiling only once starlette stops using the alias"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 36: pinned artifacts and advisory coverage (PIN-02, PIN-05, SEC-01,
+# SEC-03)
+# ---------------------------------------------------------------------------
+
+WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
+DEPENDABOT_CONFIG = REPO_ROOT / ".github" / "dependabot.yml"
+
+# The build backend's name, as ``[build-system].requires`` spells it.
+UV_BUILD_NAME = "uv_build"
+
+# A step reference to the action that installs uv on a runner.
+SETUP_UV_USES = re.compile(r"^-\s+uses:\s+astral-sh/setup-uv@")
+# A ``version:`` key inside a step's ``with:`` block, quoted or bare.
+WITH_VERSION = re.compile(r"^version:\s*[\"']?(?P<version>[^\"'\s]+)[\"']?$")
+# The build-backend requirement as the Dockerfile's uv-stage comment quotes it.
+QUOTED_REQUIRES = re.compile(r'requires = \["(?P<spec>uv_build[^"]+)"\]')
+# The dev group's uv floor. Anchored so it cannot match ``uv-<something>``.
+DEV_UV_FLOOR = re.compile(r"^uv>=(?P<floor>\S+)$")
+# A build-backend requirement split into its floor and its ceiling.
+UV_BUILD_RANGE = re.compile(r"^uv_build>=(?P<floor>[^,]+),<(?P<ceiling>\S+)$")
+
+
+def _workflow_files() -> list[Path]:
+    """
+    Return every GitHub Actions workflow file, sorted by path.
+
+    This is the suite's first reader of ``.github/workflows``. Several guards
+    need the same input set, and sorting is what keeps their failure messages
+    in a stable order rather than whatever order the filesystem returns.
+
+    Both spellings are collected because GitHub loads both. Every workflow
+    here happens to be ``.yml`` today, so globbing one extension would pass
+    and keep passing -- right up until someone adds a ``.yaml`` file, which
+    would then carry an unpinned ``uses:`` or an ``--ignore`` flag past every
+    guard that reads this list. The guards are supply-chain gates, so their
+    input set has to be what GitHub runs, not what the repository happens to
+    contain.
+
+    Returns:
+        The workflow files under ``.github/workflows``, in path order.
+
+    """
+    return sorted(
+        path for suffix in ("*.yml", "*.yaml") for path in WORKFLOW_DIR.glob(suffix)
+    )
+
+
+def _next_minor(version: str) -> str:
+    """
+    Return the lowest version of the minor series above ``version``.
+
+    Args:
+        version: A three-part release version.
+
+    Returns:
+        The first release of the following minor series.
+
+    """
+    major, minor, _patch = version.split(".")
+    return f"{major}.{int(minor) + 1}.0"
+
+
+def _dockerfile_uv_version() -> str:
+    """
+    Return the uv version the Dockerfile's tool stage pins, read off its tag.
+
+    One side of every comparison below is derived rather than written down a
+    second time, so no guard here can end up agreeing with a copy of itself.
+
+    Returns:
+        The tag half of the ``ghcr.io/astral-sh/uv`` reference.
+
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    tags = [
+        match.group("ref").partition("@")[0].removeprefix(f"{UV_IMAGE}:")
+        for _number, line in _significant_lines(DOCKERFILE)
+        for match in [FROM_LINE.match(line)]
+        if match is not None and match.group("ref").startswith(f"{UV_IMAGE}:")
+    ]
+    assert len(tags) == 1, (
+        f"{name} names {UV_IMAGE} on {len(tags)} FROM lines; exactly one is "
+        "expected, and the canonical uv version cannot be derived from any "
+        "other number of them"
+    )
+    return tags[0]
+
+
+def _declared_uv_build_specifier() -> str:
+    """
+    Return ``pyproject.toml``'s build-backend requirement, verbatim.
+
+    Returns:
+        The single ``[build-system].requires`` entry naming the backend.
+
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    specifiers = [
+        spec
+        for spec in pyproject["build-system"]["requires"]
+        if spec.startswith(UV_BUILD_NAME)
+    ]
+    assert len(specifiers) == 1, (
+        f"{PYPROJECT.name} declares {len(specifiers)} [build-system].requires "
+        f"entries for {UV_BUILD_NAME}; exactly one is expected"
+    )
+    return specifiers[0]
+
+
+def test_every_repeated_image_tag_in_the_dockerfile_shares_one_digest() -> None:
+    """
+    A tag on more than one ``FROM`` line carries the same digest at each (D-07).
+
+    ``python:3.14-slim`` is the base of both the builder and the runtime stage.
+    The defect this catches is not a missing pin -- the shape guard further up
+    already refuses those -- but a re-resolution that updated one line and
+    missed the other. That builds the application against different bytes than
+    it ships on, and nothing about it looks wrong in review.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    references = [
+        (number, match.group("ref"))
+        for number, line in _significant_lines(DOCKERFILE)
+        for match in [FROM_LINE.match(line)]
+        if match is not None
+    ]
+    assert references, f"{name} has no FROM instructions at all"
+
+    by_tag: dict[str, list[tuple[int, str]]] = {}
+    for number, reference in references:
+        image, _, digest = reference.partition("@")
+        by_tag.setdefault(image, []).append((number, digest))
+
+    repeated = {image: seen for image, seen in by_tag.items() if len(seen) > 1}
+    assert repeated, (
+        f"{name} no longer uses any image tag on more than one FROM line, so "
+        "this guard has nothing left to compare. It was written for the two "
+        "python:3.14-slim stages; if the file really has collapsed to one "
+        "stage per tag, delete the guard as a decision rather than leaving it "
+        "passing over an empty comparison"
+    )
+
+    offenders = [
+        f"{name}:{number}: {image}@{digest}"
+        for image, seen in sorted(repeated.items())
+        if len({digest for _number, digest in seen}) > 1
+        for number, digest in seen
+    ]
+    assert not offenders, (
+        "one image tag is pinned to two different digests. A re-resolution "
+        "updated one FROM line and missed the other, so the stages below no "
+        "longer start from the same bytes:\n" + "\n".join(offenders)
+    )
+
+
+def test_one_uv_version_spans_the_dockerfile_pyproject_and_workflows() -> None:
+    """
+    Every surface that names a uv version names the same one (D-09).
+
+    Before this phase uv was pinned in one place. It is now pinned in four
+    kinds of file, three of which are read by machines that never see the
+    others: the build backend resolves ``uv_build``, the runners resolve
+    ``setup-uv``, and a developer resolves the dev group. A disagreement
+    between them fails nothing where it is introduced -- it surfaces later as
+    a build that works in CI and not locally, or the reverse. ``uv.lock`` is
+    held to the same value independently by the declared-floor guard further
+    up, so the version cannot drift in a fifth place either.
+    """
+    expected = _dockerfile_uv_version()
+    offenders: list[str] = []
+
+    specifier = _declared_uv_build_specifier()
+    match = UV_BUILD_RANGE.match(specifier)
+    assert match is not None, (
+        f"{PYPROJECT.name} declares the build backend as {specifier!r}, which "
+        "is not the floor-and-ceiling shape this guard compares. Both bounds "
+        "are load-bearing: the floor is what agrees with the pinned uv, the "
+        "ceiling is what makes a bump across a minor surface in review"
+    )
+    if match.group("floor") != expected:
+        offenders.append(
+            f"{PYPROJECT.name}: [build-system].requires floors "
+            f"{UV_BUILD_NAME} at {match.group('floor')}"
+        )
+    if match.group("ceiling") != _next_minor(expected):
+        offenders.append(
+            f"{PYPROJECT.name}: [build-system].requires caps {UV_BUILD_NAME} "
+            f"at {match.group('ceiling')}, not {_next_minor(expected)}"
+        )
+
+    floors = [
+        floor_match.group("floor")
+        for where, spec in _declared_requirements()
+        if where == "[dependency-groups].dev"
+        for floor_match in [DEV_UV_FLOOR.match(spec)]
+        if floor_match is not None
+    ]
+    if len(floors) != 1:
+        offenders.append(
+            f"{PYPROJECT.name}: [dependency-groups].dev declares {len(floors)} "
+            "uv floors; exactly one is expected"
+        )
+    elif floors[0] != expected:
+        offenders.append(
+            f"{PYPROJECT.name}: [dependency-groups].dev floors uv at {floors[0]}"
+        )
+
+    sites = 0
+    for path in _workflow_files():
+        name = path.relative_to(REPO_ROOT)
+        lines = _significant_lines(path)
+        for index, (number, line) in enumerate(lines):
+            if SETUP_UV_USES.match(line) is None:
+                continue
+            sites += 1
+            # The next list item ends the step. Indentation cannot be used as
+            # the terminator: ``_significant_lines`` has already stripped it.
+            window: list[tuple[int, str]] = []
+            for later_number, later_line in lines[index + 1 :]:
+                if later_line.startswith("- "):
+                    break
+                window.append((later_number, later_line))
+            declared = [
+                (later_number, version_match.group("version"))
+                for later_number, later_line in window
+                for version_match in [WITH_VERSION.match(later_line)]
+                if version_match is not None
+            ]
+            if len(declared) != 1:
+                offenders.append(
+                    f"{name}:{number}: {line} -- this step declares "
+                    f"{len(declared)} version: keys; exactly one is expected"
+                )
+                continue
+            version_number, version = declared[0]
+            if version != expected:
+                offenders.append(f"{name}:{version_number}: version: {version}")
+
+    assert sites, (
+        "no astral-sh/setup-uv step was found in any workflow file, so this "
+        "guard has nothing to check. Either the action was replaced, or "
+        f"{WORKFLOW_DIR.relative_to(REPO_ROOT)} is no longer where the "
+        "workflows live"
+    )
+    assert not offenders, (
+        f"a uv version disagrees with the {expected} the Dockerfile's tool "
+        "stage pins. The build backend, the runners and a developer's machine "
+        "each resolve uv separately, so a disagreement here is a toolchain "
+        "that differs between the image, CI and local work:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_dockerfile_comment_quotes_the_declared_build_specifier() -> None:
+    """
+    The uv-stage comment quotes the specifier ``pyproject.toml`` declares (D-22).
+
+    That comment explains why the uv tool image and the build backend are
+    pinned together, and it argues the case by quoting the specifier. Quoted
+    text goes stale silently: nothing about editing ``pyproject.toml`` touches
+    the Dockerfile, so the comment would go on explaining a real coupling in
+    terms of a range that no longer exists -- misstating a design decision
+    rather than merely reading untidily. The raw lines are needed here because
+    ``_significant_lines`` drops whole-line comments by design.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    quoted = [
+        (number, match.group("spec"))
+        for number, line in _numbered(DOCKERFILE)
+        for match in [QUOTED_REQUIRES.search(line)]
+        if match is not None
+    ]
+    assert quoted, (
+        f"{name} no longer quotes a {UV_BUILD_NAME} requirement anywhere, so "
+        "this guard has nothing to compare. That comment is what explains why "
+        "the tool image and the build backend move together; if it went away "
+        "deliberately, remove this guard in the same change"
+    )
+    declared = _declared_uv_build_specifier()
+    offenders = [
+        f"{name}:{number}: {spec}" for number, spec in quoted if spec != declared
+    ]
+    assert not offenders, (
+        f"a Dockerfile comment quotes a {UV_BUILD_NAME} requirement that "
+        f"{PYPROJECT.name} does not declare -- it now reads {declared!r}. The "
+        "comment explains a deliberate coupling, so a stale specifier there "
+        "misstates a design decision:\n" + "\n".join(offenders)
+    )
+
+
+# The start of an `updates:` entry, and the settling period each must carry.
+DEPENDABOT_ENTRY = re.compile(r"^-\s+package-ecosystem:")
+COOLDOWN_KEY = "cooldown:"
+DEFAULT_DAYS = re.compile(r"^default-days:\s*(?P<days>\d+)$")
+MINIMUM_COOLDOWN_DAYS = 7
+
+
+def test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr() -> None:
+    """
+    Every ``updates:`` entry carries a cooldown of at least a week (D-15).
+
+    Measured against zizmor 1.30.1 on its default persona: the
+    ``dependabot-cooldown`` check is ecosystem-gated. A cooldown-less ``pip``
+    or ``github-actions`` entry is a finding, but a cooldown-less ``uv`` entry
+    produces none and the audit exits 0 -- so for the ecosystem carrying this
+    project's Python pins, the blocking CI step proves nothing. Without this
+    guard the settling period the file's own header demands would be policy
+    with nothing behind it, which is worse than an absent rule because it
+    reads like an enforced one. The window between one entry and the next is
+    what scopes the check, because ``_significant_lines`` has already stripped
+    the indentation that would otherwise delimit it.
+    """
+    name = DEPENDABOT_CONFIG.relative_to(REPO_ROOT)
+    lines = _significant_lines(DEPENDABOT_CONFIG)
+    starts = [
+        index
+        for index, (_number, line) in enumerate(lines)
+        if DEPENDABOT_ENTRY.match(line) is not None
+    ]
+    assert starts, (
+        f"{name} declares no updates: entry at all, so this guard has nothing "
+        "to check. Either the file stopped configuring Dependabot or the entry "
+        "spelling changed under it"
+    )
+
+    offenders: list[str] = []
+    for position, index in enumerate(starts):
+        number, line = lines[index]
+        end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+        window = [entry_line for _entry_number, entry_line in lines[index:end]]
+        days = [
+            match.group("days")
+            for entry_line in window
+            for match in [DEFAULT_DAYS.match(entry_line)]
+            if match is not None
+        ]
+        if COOLDOWN_KEY not in window or len(days) != 1:
+            offenders.append(f"{name}:{number}: {line}")
+        elif int(days[0]) < MINIMUM_COOLDOWN_DAYS:
+            offenders.append(
+                f"{name}:{number}: {line} -- settles for only {days[0]} days"
+            )
+    assert not offenders, (
+        "a Dependabot entry can open a pull request before the release it "
+        f"proposes has settled for {MINIMUM_COOLDOWN_DAYS} days. That window "
+        "is the only thing between an upstream account compromised today and "
+        "a merge-ready bump today, and zizmor does not enforce it for every "
+        "ecosystem, so nothing else here would catch this:\n" + "\n".join(offenders)
+    )
+
+
+# The seventh banned suppression spelling, assembled from the same fragments
+# as the six above for the same reason -- and kept apart from them because
+# their guard scans Python files, which is where this one cannot look.
+_FLAG_LEAD = "--"
+
+SUPPRESSION_FLAGS = (f"{_FLAG_LEAD}{_SILENCE_RULE}",)
+
+
+def test_no_workflow_or_hook_file_silences_a_checker_with_a_flag() -> None:
+    """
+    No workflow or hook step passes a checker a flag that drops findings (D-05).
+
+    The advisory gate in ``ci.yml`` brought with it a suppression surface the
+    existing ban never reached: that guard scans tracked Python files, and
+    does so deliberately, because the prose stating the rule lives in Markdown
+    and YAML. An advisory waved through by a flag is the same defect as a
+    silenced type error -- the report stops, the vulnerable version stays in
+    the lock, and the build goes green over it. The match is on the bare flag
+    rather than on the audit step, because a line continuation would evade a
+    narrower rule and because the flag would be a suppression on any other
+    tool in these files too. The scan runs over significant lines, so the
+    comment in ``ci.yml`` stating this ban is not read as the ban being
+    broken, and the banned text is built at runtime for the reason the owner
+    guard gives further up.
+    """
+    scanned = 0
+    offenders: list[str] = []
+    for path in [*_workflow_files(), PRE_COMMIT_CONFIG]:
+        name = path.relative_to(REPO_ROOT)
+        lines = _significant_lines(path)
+        scanned += len(lines)
+        offenders.extend(
+            f"{name}:{number}: {line}"
+            for number, line in lines
+            if any(flag in line for flag in SUPPRESSION_FLAGS)
+        )
+    assert scanned, (
+        "no workflow or hook file yielded a single significant line, so this "
+        "guard has nothing to scan. Either the workflows moved or the hook "
+        "config was renamed, and either way the ban is no longer enforced"
+    )
+    assert not offenders, (
+        "a workflow or hook step tells a checker to drop findings instead of "
+        "fixing what it reported. For the advisory gate that means shipping a "
+        "package whose vulnerability is known and recorded, with a green "
+        "build over it. Fix the finding, or upgrade past it:\n" + "\n".join(offenders)
+    )
+
+
+# A step's ``uses:`` key as ``_significant_lines`` leaves it: the indentation
+# is gone and the list dash may be, but a trailing comment survives intact,
+# which is what makes the comment half of the guard below possible.
+USES_LINE = re.compile(r"^(?:-\s+)?uses:\s*(?P<ref>\S+)(?P<trailer>.*)$")
+# A pinned third-party reference: ``owner/repo`` at a full-length commit SHA.
+# Lowercase is load-bearing rather than cosmetic -- a mixed-case SHA names the
+# same commit but compares unequal, which would defeat the cross-file check.
+PINNED_USES = re.compile(r"^(?P<action>[^@\s]+)@(?P<sha>[0-9a-f]{40})$")
+# The trailing comment both workflow headers promise every pin carries.
+VERSION_COMMENT = re.compile(r"^#\s*(?P<version>v\d+\.\d+\.\d+)$")
+# A call to a workflow in this same repository. ``$/`` is GitHub's
+# self-repository reference and is the spelling these files actually use;
+# ``./`` is the workspace-relative one, accepted too so that a deliberate
+# switch would not be reported as a malformed pin. Neither can collide with
+# an ``owner/repo@sha`` form.
+LOCAL_WORKFLOW_PREFIXES = ("$/", "./")
+
+
+def test_every_workflow_uses_reference_is_a_commented_lowercase_sha() -> None:
+    """
+    Every ``uses:`` ref is a full lowercase SHA carrying its version (D-05).
+
+    A tag or branch ref is mutable: whoever controls the action can repoint it,
+    and different bytes then run with this workflow's permissions. The trailing
+    comment is the half a reviewer actually reads, and ``ci.yml:1`` and
+    ``release.yml:1`` already declare -- in identical words -- that comments
+    must carry the full version, while nothing until now parsed that claim.
+    The cross-file check catches the one-site-updated-one-missed case, which
+    has real duplication to work with: ``actions/checkout`` appears six times
+    and ``astral-sh/setup-uv`` five.
+
+    Classification is total on purpose. A ``uses:`` line matching neither the
+    exempt nor the pinned form is an offender rather than a silent skip, because
+    a guard that quietly passes over what it cannot parse is worse than none.
+
+    What this deliberately does not do: assert that a SHA is the commit its
+    comment names. That is a registry lookup, it would break the suite's
+    offline guarantee, and it would need a token for rate limits. Dependabot
+    rewrites a SHA and its comment together, so ongoing agreement is the bot's
+    job; the "wrong from day one" residual was closed once by hand under D-06.
+    """
+    exempt: list[str] = []
+    pinned: list[tuple[str, str, str, str]] = []
+    shape_offenders: list[str] = []
+    comment_offenders: list[str] = []
+
+    for path in _workflow_files():
+        name = path.relative_to(REPO_ROOT)
+        for number, line in _significant_lines(path):
+            if "uses:" not in line:
+                continue
+            site = f"{name}:{number}"
+            match = USES_LINE.match(line)
+            if match is None:
+                shape_offenders.append(
+                    f"{site}: {line} -- carries a uses: key in a shape this "
+                    "guard cannot read, so it was checked by nothing"
+                )
+                continue
+            reference = match.group("ref")
+            if reference.startswith(LOCAL_WORKFLOW_PREFIXES) and "@" not in reference:
+                exempt.append(site)
+                continue
+            pin = PINNED_USES.match(reference)
+            if pin is None:
+                shape_offenders.append(f"{site}: {reference}")
+                continue
+            comment = VERSION_COMMENT.match(match.group("trailer").strip())
+            if comment is None:
+                comment_offenders.append(f"{site}: {reference}")
+                continue
+            pinned.append(
+                (site, pin.group("action"), pin.group("sha"), comment.group("version"))
+            )
+
+    assert pinned, (
+        "no pinned uses: reference was collected from any workflow file, so "
+        "this guard would pass over nothing at all. Either "
+        f"{WORKFLOW_DIR.relative_to(REPO_ROOT)} is no longer where the "
+        "workflows live, or every step was rewritten into a form this guard "
+        "cannot read"
+    )
+    assert exempt, (
+        "no uses: reference was exempted as a local reusable-workflow call. "
+        "release.yml calls ci.yml through GitHub's self-repository reference, "
+        "spelled $/ -- see release.yml:24-31 for why that spelling and not the "
+        "workspace-relative ./ one. If the exemption in this guard was rewritten "
+        "to ./ then it no longer matches the tree and release.yml's call is "
+        "about to be reported as a malformed pin; if release.yml simply stopped "
+        "calling ci.yml, delete the exemption as a decision rather than leaving "
+        "it matching nothing"
+    )
+    assert not shape_offenders, (
+        "a workflow uses: reference is not pinned to a full 40-character "
+        "lowercase commit SHA. A tag, a branch or a short ref is mutable, so "
+        "the bytes that run in CI are whatever the action's owner -- or whoever "
+        "compromises them -- points it at:\n" + "\n".join(shape_offenders)
+    )
+    assert not comment_offenders, (
+        "a pinned uses: reference carries no trailing # vX.Y.Z comment. A bare "
+        "SHA tells a reviewer nothing about which version they are approving, "
+        "and both workflow headers state that the comment is there:\n"
+        + "\n".join(comment_offenders)
+    )
+
+    by_action: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for site, action, sha, version in pinned:
+        by_action.setdefault((action, version), []).append((site, sha))
+
+    inconsistent = [
+        f"{action} {version}: "
+        + ", ".join(f"{site} -> {sha}" for site, sha in sorted(seen))
+        for (action, version), seen in sorted(by_action.items())
+        if len({sha for _site, sha in seen}) > 1
+    ]
+    assert not inconsistent, (
+        "one action at one version is pinned to two different SHAs. An update "
+        "landed at some of its sites and missed others, so the same named "
+        "version now runs different bytes depending on which workflow invoked "
+        "it:\n" + "\n".join(inconsistent)
+    )
+
+
+def test_the_workflow_reader_collects_both_extensions_github_loads() -> None:
+    """
+    ``_workflow_files`` reads ``.yaml`` as well as ``.yml`` (PR #13 review).
+
+    GitHub loads both spellings out of ``.github/workflows``. Every workflow
+    in this repository happens to be ``.yml``, so a reader that globbed one
+    extension passed today and would have kept passing -- while a ``.yaml``
+    file added later carried its ``uses:`` refs and any ``--ignore`` flag
+    past every guard built on this list. That is the whole failure this
+    module exists to prevent, arriving through the guard's own input set.
+
+    The check is on the glob patterns rather than on a fixture file, because
+    the defect is what the reader *would* miss, and no ``.yaml`` file exists
+    to observe. Asserting the reader finds a file that is not there could
+    only be written as a tautology.
+    """
+    source = inspect.getsource(_workflow_files)
+    for suffix in ("*.yml", "*.yaml"):
+        assert suffix in source, (
+            f"_workflow_files does not glob {suffix!r}. GitHub loads both "
+            "spellings, so a workflow using the other one would bypass every "
+            "guard that reads this list -- the uses: pin check and the "
+            "suppression-flag check both take their input from here."
+        )
+
+    found = {path.name for path in _workflow_files()}
+    on_disk = {
+        path.name
+        for path in WORKFLOW_DIR.iterdir()
+        if path.suffix in {".yml", ".yaml"} and path.is_file()
+    }
+    assert found == on_disk, (
+        "the reader disagrees with the directory. Every workflow file GitHub "
+        f"would load must reach the guards: {sorted(on_disk - found)} missing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: the config filename rename (CFG-05, D-01, D-03, D-13, D-17)
+# ---------------------------------------------------------------------------
+
+
+def test_deploy_doc_tells_upgraders_to_rename_the_config_file() -> None:
+    """
+    The compose how-to gives the rename an upgrading operator has to perform.
+
+    Every container deployed from this guide holds the old
+    ``config/config.toml`` rather than ``config/saneless.toml``, because the
+    old name is what the guide told its reader to create. saneless no longer
+    reads it, so on the first pull after the rename the file goes
+    silently unread -- the exact failure this phase exists to remove. The
+    guide must therefore carry the rename as a command, on one line, naming
+    both filenames, and must say what the reader sees until they run it: the
+    status page's Configuration row.
+    """
+    text = DEPLOY_HOWTO.read_text(encoding="utf-8")
+    name = DEPLOY_HOWTO.relative_to(REPO_ROOT)
+    renames = [
+        line
+        for line in text.splitlines()
+        if "mv" in line
+        if f"config/{LEGACY_CONFIG_NAME}" in line
+        if f"config/{CONFIG_NAME}" in line
+    ]
+    assert renames, (
+        f"{name} has no line telling an upgrading operator to rename "
+        f"config/{LEGACY_CONFIG_NAME} to config/{CONFIG_NAME}. Without it "
+        "every container deployed from this guide loads no config at all "
+        "after the upgrade, with nothing on the page to say why"
+    )
+    assert "Configuration" in text, (
+        f"{name} does not name the Configuration row, which is what an "
+        "operator who has not renamed the file sees turn red"
+    )
+
+
+def test_compose_tells_upgraders_to_rename_the_config_file() -> None:
+    """
+    The shipped compose template carries the rename in a comment.
+
+    The compose file is the artifact an operator actually has open when they
+    pull a new image, and their own copy of it still names the old path. One
+    comment line naming both paths is what turns a silent no-config start into
+    an instruction.
+    """
+    renames = [
+        f"{COMPOSE.name}:{number}: {line.strip()}"
+        for number, line in _numbered(COMPOSE)
+        if _is_comment(line)
+        if f"./config/{LEGACY_CONFIG_NAME}" in line
+        if f"./config/{CONFIG_NAME}" in line
+    ]
+    assert renames, (
+        f"{COMPOSE.name} has no comment line naming both ./config/"
+        f"{LEGACY_CONFIG_NAME} and ./config/{CONFIG_NAME}, so an operator "
+        "copying this template gets no notice that the old name stopped "
+        "being read"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase 37: the repository-wide sweep guard (CFG-05, D-13)
+# ---------------------------------------------------------------------------
+
+# The lines allowed to name the superseded config filename without also naming
+# the current one. Each entry is an exact ``(repo-relative path, stripped
+# line)`` pair, so widening the exception to a neighbouring line, or letting it
+# drift to another file, fails the guard rather than passing quietly. Every
+# entry carries the reason it is here.
+#
+# The line texts are assembled from ``LEGACY_CONFIG_NAME`` for the reason given
+# where that constant is defined: the guard below scans this file too, and a
+# literal here would make it report its own allowlist.
+_LEGACY_NAME_ALLOWED_LINES: frozenset[tuple[str, str]] = frozenset(
+    {
+        # The one place the superseded name is spelled in shipped source.
+        # Detection needs the literal -- without it nothing could name a
+        # leftover file -- and the constant exists precisely so that this is
+        # the only line which has to carry it. Detecting the old name is not
+        # supporting it: the file is stat-ed and never opened.
+        (
+            "src/saneless/config.py",
+            f'LEGACY_CONFIG_FILENAME: Final = "{LEGACY_CONFIG_NAME}"',
+        ),
+    }
+)
+
+
+def test_no_shipped_file_names_the_legacy_config_file() -> None:
+    """
+    No tracked file outside ``.planning/`` names the old config file (D-13).
+
+    The sweep is total because a half-swept tree is worse than an unswept one:
+    a reader who meets the old name on one page and the new name on another
+    has no way to tell which is stale. A line may still carry the old name
+    when it also carries the new one, because such a line is a rename
+    instruction rather than a leftover -- which is how the upgrade sections
+    are written. Anything else is an offender unless it appears verbatim in
+    ``_LEGACY_NAME_ALLOWED_LINES``.
+    """
+    offenders: list[str] = []
+    for name in _shipped_files():
+        # Two clauses rather than one tuple, for the reason set out on the
+        # owner-slug guard above: ruff format rewrites a parenthesised tuple
+        # into PEP 758's bracketless form, which the pre-commit
+        # debug-statements hook cannot parse on its own older interpreter.
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        except OSError:
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if LEGACY_CONFIG_NAME in line
+            if CONFIG_NAME not in line
+            if (name, line.strip()) not in _LEGACY_NAME_ALLOWED_LINES
+        )
+    assert not offenders, (
+        f"a shipped file still names {LEGACY_CONFIG_NAME} as a saneless "
+        f"config path. saneless reads {CONFIG_NAME} in every searched "
+        "location and never reads the old name, so a page that still spells "
+        "it sends its reader to create a file that is detected and ignored. "
+        "Either rename the path, or name both files on the line so it reads "
+        "as the rename it is:\n" + "\n".join(offenders)
+    )
+
+
+def test_legacy_name_allowlist_entries_still_exist() -> None:
+    """
+    Every allowlisted line is still present, verbatim, in the file it names.
+
+    Without this the allowlist rots into a silent pass: the guard above only
+    ever *subtracts*, so an entry whose line was reworded, moved or deleted
+    goes on excusing something that is not there, and the next line to match
+    its text inherits the exemption without anyone deciding to grant it.
+    """
+    missing: list[str] = []
+    for name, expected in sorted(_LEGACY_NAME_ALLOWED_LINES):
+        try:
+            text = (REPO_ROOT / name).read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            missing.append(f"{name}: is not UTF-8, so the line cannot be found")
+            continue
+        except OSError:
+            missing.append(f"{name}: cannot be read")
+            continue
+        if expected not in [line.strip() for line in text.splitlines()]:
+            missing.append(f"{name}: {expected}")
+    assert not missing, (
+        "an entry in _LEGACY_NAME_ALLOWED_LINES no longer matches a line in "
+        "the file it exempts, so it excuses nothing while the next line to "
+        "match its text would be exempted by accident. Remove the entry, or "
+        "correct it to the line that is really there:\n" + "\n".join(missing)
+    )
+
+
+# Every page that enumerates the health checks for a reader. A page that lists
+# some of them is worse than one that lists none: the check a reader cannot
+# find is the one they conclude does not exist.
+CHECK_LISTING_PAGES = (
+    DOCS_DIR / "reference" / "cli-commands.md",
+    DOCS_DIR / "reference" / "web-api.md",
+    DOCS_DIR / "getting-started" / "first-web-ui-scan.md",
+)
+
+# Phrases that count the rows in prose. Each was true of the five-row strip and
+# is now false, and none of them would be caught by the name check above --
+# a page can name all six checks and still tell its reader there are five.
+STALE_CHECK_COUNT_PHRASES = (
+    "five checks",
+    "five rows",
+    "among five",
+    "other four",
+)
+
+
+def test_docs_that_list_the_checks_name_every_check() -> None:
+    """
+    Every page listing the checks names all of them, and counts them right.
+
+    The lists are derived from ``CheckKey`` rather than written down here, so
+    a seventh check added in a later phase fails this test on every page that
+    has not been updated -- which is the only reason the lists agree today.
+    The prose count is asserted separately because naming a check and counting
+    the checks are two different claims, and this phase falsified the second
+    one on three pages while leaving the first one true on two of them.
+    """
+    expected = [check_name(key) for key in CheckKey]
+    offenders: list[str] = []
+    for page in CHECK_LISTING_PAGES:
+        name = page.relative_to(REPO_ROOT)
+        text = page.read_text(encoding="utf-8")
+        offenders.extend(
+            f"{name}: does not name the {label} check"
+            for label in expected
+            if label not in text
+        )
+        lowered = text.lower()
+        offenders.extend(
+            f"{name}: still says {phrase!r}"
+            for phrase in STALE_CHECK_COUNT_PHRASES
+            if phrase in lowered
+        )
+    assert not offenders, (
+        "a documentation page disagrees with CheckKey about which checks "
+        f"exist. There are {len(expected)} -- {', '.join(expected)} -- and "
+        "every page that lists them must list all of them and must not count "
+        "them as five:\n" + "\n".join(offenders)
     )

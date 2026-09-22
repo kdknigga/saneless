@@ -11,12 +11,14 @@ import tomllib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypedDict, Unpack
+from typing import IO, TYPE_CHECKING, Any, NamedTuple, TypedDict, Unpack
 
 import pytest
 from pydantic import ValidationError
+from pydantic_settings.exceptions import SettingsError
 
 import saneless.config as config_mod
+import saneless.vocabulary as vocabulary_mod
 from saneless.config import (
     DEFAULT_RESOLUTION,
     PLACEHOLDER_TOKENS,
@@ -45,6 +47,8 @@ from saneless.vocabulary import TITLE_MAX_LENGTH, ProfileStorage, local_time
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
+
+    from pydantic_core import ErrorDetails
 
 
 class TestLoadSettingsFromToml:
@@ -178,7 +182,7 @@ class TestLoadedConfigPath:
         """
         Run in an empty CWD with HOME redirected into tmp_path.
 
-        A developer's real ``~/.config/saneless/config.toml`` must not leak in.
+        A developer's real ``~/.config/saneless/saneless.toml`` must not leak in.
         """
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -211,9 +215,10 @@ class TestLoadedConfigPath:
         monkeypatch.delenv("XDG_CONFIG_HOME")
         home_config = empty_cwd_and_home / "home" / ".config" / "saneless"
         home_config.mkdir(parents=True)
-        (home_config / "config.toml").write_text("[profiles.default]\n")
+        expected = home_config / config_mod.CONFIG_FILENAME
+        expected.write_text("[profiles.default]\n")
         settings = load_settings()
-        assert settings.config_path == home_config / "config.toml"
+        assert settings.config_path == expected
 
     def test_no_file_found_records_none(self, empty_cwd_and_home: Path) -> None:
         """With no config file anywhere, config_path is None (D-16)."""
@@ -235,9 +240,21 @@ class TestLoadedConfigPath:
         """The search list is cwd, then the XDG config home, then /etc (D-16)."""
         assert config_mod.config_search_paths() == (
             Path("./saneless.toml"),
-            config_mod.xdg_config_home() / "saneless" / "config.toml",
-            Path("/etc/saneless/config.toml"),
+            config_mod.xdg_config_home() / "saneless" / "saneless.toml",
+            Path("/etc/saneless/saneless.toml"),
         )
+
+    def test_every_search_path_uses_the_one_config_filename(self) -> None:
+        """
+        One blessed filename in all three locations (Phase 37 CFG-01, D-01).
+
+        The tuple test above would still pass if a later edit reintroduced a
+        second spelling somewhere; this one cannot.
+        """
+        assert config_mod.CONFIG_FILENAME == "saneless.toml"
+        assert {p.name for p in config_mod.config_search_paths()} == {
+            config_mod.CONFIG_FILENAME
+        }
 
     def test_config_search_paths_reads_home_at_call_time(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -245,7 +262,9 @@ class TestLoadedConfigPath:
         """A HOME change after import is honoured by the search list (D-16)."""
         monkeypatch.delenv("XDG_CONFIG_HOME")
         monkeypatch.setenv("HOME", str(tmp_path / "elsewhere"))
-        expected = tmp_path / "elsewhere" / ".config" / "saneless" / "config.toml"
+        expected = (
+            tmp_path / "elsewhere" / ".config" / "saneless" / config_mod.CONFIG_FILENAME
+        )
         assert config_mod.config_search_paths()[1] == expected
 
 
@@ -344,9 +363,9 @@ class TestXdgBaseDirectories:
     def test_xdg_config_home_is_the_second_search_path(
         self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``$XDG_CONFIG_HOME/saneless/config.toml`` is searched second."""
+        """``$XDG_CONFIG_HOME/saneless/saneless.toml`` is searched second."""
         monkeypatch.setenv("XDG_CONFIG_HOME", str(empty_cwd_and_home / "xdg"))
-        expected = empty_cwd_and_home / "xdg" / "saneless" / "config.toml"
+        expected = empty_cwd_and_home / "xdg" / "saneless" / config_mod.CONFIG_FILENAME
         assert config_mod.config_search_paths()[1] == expected
 
     def test_config_under_xdg_config_home_is_loaded(
@@ -357,12 +376,11 @@ class TestXdgBaseDirectories:
         monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_dir))
         config_dir = xdg_dir / "saneless"
         config_dir.mkdir(parents=True)
-        (config_dir / "config.toml").write_text(
-            '[scanner]\nhost = "from-xdg"\n\n[profiles.default]\n'
-        )
+        expected = config_dir / config_mod.CONFIG_FILENAME
+        expected.write_text('[scanner]\nhost = "from-xdg"\n\n[profiles.default]\n')
         settings = load_settings()
         assert settings.scanner.host == "from-xdg"
-        assert settings.config_path == config_dir / "config.toml"
+        assert settings.config_path == expected
 
     def test_xdg_state_home_set_after_import_moves_state_defaults(
         self, empty_cwd_and_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -888,6 +906,102 @@ log_level = "TRACE"
         assert len(lines) == 2
 
 
+class TestTomlKeyCaseContract:
+    """
+    TOML section and key names are matched byte-exactly (DEP-02, DEP-03, D-06).
+
+    pydantic-settings 2.15.0 made its file sources honour ``case_sensitive``,
+    which defaults to False, so a miscased top-level ``[Scanner]`` would bind
+    into ``scanner`` instead of being reported and the Phase 27 strictness
+    contract would weaken without a word. Nested keys were never folded; they
+    are pinned here so a later flip upstream cannot pass unnoticed.
+    """
+
+    def test_miscased_section_is_reported_not_bound(self, tmp_config_dir: Path) -> None:
+        """``[Scanner]`` is an unknown section, never a bound ``scanner`` (D-06)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_section.toml",
+            '[Scanner]\nhost = "x"\n\n[profiles.default]\n',
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith("  unknown section 'Scanner'")
+        ]
+        assert len(matching) == 1
+
+    def test_miscased_nested_key_stays_unknown(self, tmp_config_dir: Path) -> None:
+        """``[paperless] Token`` is still matched case-sensitively (DEP-03)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_token.toml",
+            '[paperless]\nToken = "x"\n\n[profiles.default]\n',
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith("  [paperless] unknown key 'Token'")
+        ]
+        assert len(matching) == 1
+
+    def test_miscased_nested_key_with_underscore_stays_unknown(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``[output] Web_Port`` is still matched case-sensitively (DEP-03)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_web_port.toml",
+            "[output]\nWeb_Port = 9\n\n[profiles.default]\n",
+        )
+        matching = [
+            line
+            for line in _error_lines(err)
+            if line.startswith("  [output] unknown key 'Web_Port'")
+        ]
+        assert len(matching) == 1
+
+    def test_miscased_section_still_suggests_the_real_section(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """The ``[Paperless]`` close-match hint survives the upgrade (D-05)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_hint.toml",
+            '[Paperless]\nurl = "x"\n\n[profiles.default]\n',
+        )
+        message = str(err)
+        assert "did you mean [paperless]" in message
+        assert "profiles.Paperless" not in message
+
+    def test_correctly_cased_section_still_loads(self, tmp_config_dir: Path) -> None:
+        """
+        Positive control: the correct spelling still binds (D-06).
+
+        Without it this class could pass because every section errors.
+        """
+        config_file = tmp_config_dir / "correctly_cased.toml"
+        config_file.write_text('[scanner]\nhost = "x"\n\n[profiles.default]\n')
+        settings = load_settings(config_path=str(config_file))
+        assert settings.scanner.host == "x"
+
+    def test_capitalised_profile_name_is_a_distinct_profile(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """``[profiles.Default]`` is not the default profile (D-08)."""
+        err = _load_error(
+            tmp_config_dir / "miscased_profile.toml",
+            '[profiles.Default]\nsource = "ADF"\n',
+        )
+        assert "A 'default' profile must be defined in config" in str(err)
+
+
+_HOSTILE_SECRET = "tok-SECRET-4f1c9ba27e5d8031-DISTINCTIVE"
+"""A distinctive token stand-in for the hostile-upstream-message guards."""
+
+_HOSTILE_MESSAGE = f"Input should be a valid string (got {_HOSTILE_SECRET})"
+"""An upstream ``msg`` that interpolates the input, which pydantic's does not."""
+
+_REDACTED_MESSAGE = "Input should be a valid string (got <value omitted>)"
+"""``_HOSTILE_MESSAGE`` as it must appear once the input has been struck out."""
+
+
 class TestConfigErrorsNeverEchoValues:
     """
     A config error never contains an input value (D-14, CFG-05).
@@ -953,6 +1067,315 @@ class TestConfigErrorsNeverEchoValues:
         assert "paperless" in str(exc_info.value)
         self._assert_value_absent(exc_info.value, value)
 
+    def test_never_echoes_token_whatever_wording_upstream_carries(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A token reaching the render boundary as an error's input is redacted.
+
+        pydantic's ``msg`` carries no input today, so the load is the standing
+        case and the direct render call is the guard: an upstream wording
+        change that started interpolating the input must still not put the
+        Paperless token in a user-visible line (D-07, CFG-05).
+        """
+        secret = "tok-SECRET-4f1c9ba27e5d8031-DISTINCTIVE"
+        err = _load_error(
+            tmp_config_dir / "long_token.toml",
+            f'[paperless]\ntokne = "{secret}"\n\n[profiles.default]\n',
+        )
+        self._assert_value_absent(err, secret)
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": f"Input should be a valid string (got {secret})",
+            "input": secret,
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert secret not in lines[0]
+
+    def test_redaction_leaves_the_product_contract_lines_alone(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        Redacting inputs keeps the one-line-per-error shape (D-07, D-10).
+
+        The mistyped key now carries ``"url"``, a real ``PaperlessConfig``
+        field name, so the fixture exercises the case where redaction can
+        reach this project's own vocabulary. The body must therefore be free
+        of the redaction marker: none of these three errors involves an
+        upstream message that quotes its input, so any marker in the body is
+        redaction eating a field name rather than a value.
+        """
+        err = _load_error(
+            tmp_config_dir / "several_redacted.toml",
+            """\
+[paperless]
+tokne = "url"
+
+[output]
+web_port = "abc"
+log_level = "TRACE"
+
+[profiles.default]
+""",
+        )
+        body = _error_lines(err)[1:]
+        assert len(body) == 3
+        assert any(
+            line.startswith("  [paperless] unknown key 'tokne'") for line in body
+        )
+        assert any(
+            line.startswith("  [output] web_port: Input should be a valid integer")
+            for line in body
+        )
+        assert any(
+            line.startswith("  [output] log_level: Input should be 'DEBUG', ")
+            for line in body
+        )
+        assert [line for line in body if "<value omitted>" in line] == []
+        assert (
+            "  [paperless] unknown key 'tokne' (did you mean 'token'?); "
+            "valid keys: url, token, consume_dir"
+        ) in body
+
+    def test_redaction_leaves_a_hint_that_collides_with_an_input_alone(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A value equal to a field name is not struck out of the hint.
+
+        ``hst = "host"`` misspells a key whose value happens to be another of
+        the section's field names. The did-you-mean hint and the valid-keys
+        list are built from this project's own field names, so neither may
+        lose a word to redaction; the whole line is pinned because the damage
+        lands in its tail.
+        """
+        err = _load_error(
+            tmp_config_dir / "collision.toml",
+            '[scanner]\nhst = "host"\n\n[profiles.default]\n',
+        )
+        assert _error_lines(err)[1:] == [
+            "  [scanner] unknown key 'hst' (did you mean 'host'?); "
+            "valid keys: host, device"
+        ]
+
+    @pytest.mark.parametrize(
+        ("loc", "error_type", "expected"),
+        [
+            pytest.param(
+                ("paperless", "token"),
+                "string_type",
+                f"[paperless] token: {_REDACTED_MESSAGE}",
+                id="section-key",
+            ),
+            pytest.param(
+                ("paperless",),
+                "model_type",
+                f"[paperless]: {_REDACTED_MESSAGE}",
+                id="whole-section",
+            ),
+            pytest.param(
+                ("nosuchsection", "x"),
+                "string_type",
+                f"nosuchsection.x: {_REDACTED_MESSAGE}",
+                id="unknown-loc-path",
+            ),
+            pytest.param(
+                ("profiles", "default", "source"),
+                "string_type",
+                f"[profiles.default] source: {_REDACTED_MESSAGE}",
+                id="profile-key",
+            ),
+        ],
+    )
+    def test_every_rendered_branch_redacts_a_hostile_upstream_message(
+        self, loc: tuple[str | int, ...], error_type: str, expected: str
+    ) -> None:
+        """
+        Every branch that carries pydantic's wording strikes the input out.
+
+        The narrowed redaction boundary must not weaken the guarantee: each
+        line that interpolates an upstream ``msg`` still loses the input's
+        text, whatever wording upstream arrives with (D-07, CFG-05).
+        """
+        hostile: ErrorDetails = {
+            "type": error_type,
+            "loc": loc,
+            "msg": _HOSTILE_MESSAGE,
+            "input": _HOSTILE_SECRET,
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+        assert lines[0] == expected
+
+    def test_a_short_value_inside_upstream_prose_leaves_the_prose_intact(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        Striking the input out must not shred pydantic's own words (CR-01).
+
+        ``web_port = "in"`` is a two-character typo, and ``in`` occurs inside
+        ``integer`` and ``string`` in pydantic's message. An unanchored
+        replacement turns the explanation into ``a valid <value omitted>teger``
+        -- the operator loses the one sentence that says what was wanted. The
+        input is not a word here, so nothing needs striking at all.
+        """
+        err = _load_error(
+            tmp_config_dir / "short_value.toml",
+            '[output]\nweb_port = "in"\n',
+        )
+        [line] = [ln for ln in _error_lines(err) if "web_port" in ln]
+        assert "<value omitted>" not in line
+        assert line.strip() == (
+            "[output] web_port: Input should be a valid integer, "
+            "unable to parse string as an integer"
+        )
+
+    def test_a_value_that_cannot_be_struck_cleanly_withholds_the_message(
+        self,
+    ) -> None:
+        """
+        A credential glued into upstream prose withholds it whole (CR-01).
+
+        Word-anchored striking cannot reach a value upstream joined to its
+        own words with no separator, and a value this long cannot be there by
+        coincidence -- pydantic's longest word is ``integer``. Splicing would
+        corrupt the prose and leaving it would echo the input, so the message
+        is dropped entirely: not echoing outranks explaining. The section and
+        the key are this module's own words and survive.
+        """
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": f"Input should be valid{_HOSTILE_SECRET}string",
+            "input": _HOSTILE_SECRET,
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+        assert lines[0] == "[paperless] token: <value omitted>"
+
+    def test_a_short_midword_value_is_left_alone(self, tmp_config_dir: Path) -> None:
+        """
+        A short value buried in a word is coincidence, not an echo (CR-01).
+
+        ``eger`` occurs only inside ``integer``. No reader recovers the input
+        from that, so withholding the message would cost the explanation and
+        hide nothing -- the boundary between this and the case above is
+        length, not position.
+        """
+        err = _load_error(
+            tmp_config_dir / "midword_value.toml",
+            '[output]\nweb_port = "eger"\n',
+        )
+        [line] = [ln for ln in _error_lines(err) if "web_port" in ln]
+        assert "<value omitted>" not in line
+        assert line.strip() == (
+            "[output] web_port: Input should be a valid integer, "
+            "unable to parse string as an integer"
+        )
+
+    def test_a_nested_input_value_is_struck_from_the_message(self) -> None:
+        """
+        A secret inside a non-string input is struck out too (WR-01).
+
+        ``SANELESS_PAPERLESS__TOKEN__X=<token>`` makes pydantic's ``input`` a
+        mapping, not a string. D-07 promises the line is incapable of carrying
+        the input "whatever upstream wording arrives", so a bare
+        ``isinstance(value, str)`` test leaves that promise unkept.
+        """
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": _HOSTILE_MESSAGE,
+            "input": {"x": _HOSTILE_SECRET},
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+
+    def test_the_environment_branch_strikes_values_from_upstream_wording(
+        self, tmp_config_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The SettingsError branch redacts too, whatever wording arrives (WR-02).
+
+        ``_env_contribution`` raises ``SettingsError`` when a complex-typed
+        variable will not parse, and its text goes straight into the rendered
+        body. pydantic-settings names only the field and source today, but
+        that wording is upstream-owned -- which is the exact dependency D-07
+        exists to remove. The raise is forced here so the guard tests this
+        module's behaviour rather than upstream's current phrasing.
+        """
+        malformed = f'{{"token": "{_HOSTILE_SECRET}"'
+        monkeypatch.setenv("SANELESS_PAPERLESS", malformed)
+
+        def hostile_env_contribution() -> dict[str, object]:
+            msg = f"error parsing value {malformed} for field 'paperless'"
+            raise SettingsError(msg)
+
+        monkeypatch.setattr(config_mod, "_env_contribution", hostile_env_contribution)
+        err = _load_error(
+            tmp_config_dir / "env_settings_error.toml",
+            '[paperless]\nurl = "http://example.invalid"\n',
+        )
+        assert _HOSTILE_SECRET not in str(err)
+
+    def test_env_branch_redacts_a_hostile_upstream_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The environment-attributed branch strikes the input out too.
+
+        This is the fifth render branch: it names the variable that supplied
+        the value, so the value itself must still be gone (D-07, CFG-05).
+        """
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", _HOSTILE_SECRET)
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": _HOSTILE_MESSAGE,
+            "input": _HOSTILE_SECRET,
+        }
+        lines = config_mod._render_error_lines(
+            [hostile], {"paperless": {"token": _HOSTILE_SECRET}}
+        )
+        assert len(lines) == 1
+        assert _HOSTILE_SECRET not in lines[0]
+        assert lines[0] == (
+            "environment variable 'SANELESS_PAPERLESS__TOKEN': "
+            f"token in [paperless]: {_REDACTED_MESSAGE}"
+        )
+
+    def test_a_lowercase_env_name_is_struck_out_like_the_shouted_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A lowercase ``saneless_*`` value is redacted too (PR #13 review).
+
+        ``SettingsConfigDict`` leaves ``case_sensitive`` at its default, so
+        pydantic-settings reads ``saneless_paperless__token`` exactly as it
+        reads the shouted spelling -- this test asserts that first, so it
+        fails if that default ever changes rather than quietly passing on a
+        premise that stopped being true.
+
+        The redaction filter used to collect only names beginning with the
+        uppercase prefix, so a token that pydantic *had* read arrived at
+        ``_redact_input`` as a value it was never told about and survived
+        into the rendered line.
+        """
+        monkeypatch.delenv("SANELESS_PAPERLESS__TOKEN", raising=False)
+        monkeypatch.setenv("saneless_paperless__token", _HOSTILE_SECRET)
+
+        # The premise: pydantic reads the lowercase spelling.
+        assert Settings().paperless.token.get_secret_value() == _HOSTILE_SECRET
+
+        assert _HOSTILE_SECRET not in config_mod._redact_environment(
+            f"upstream said {_HOSTILE_SECRET} here"
+        )
+
 
 @pytest.fixture
 def no_discovered_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -966,6 +1389,328 @@ def no_discovered_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     return tmp_path
+
+
+class _SearchDirs(NamedTuple):
+    """The three directories a patched config search looks in, in order."""
+
+    cwd: Path
+    xdg: Path
+    etc: Path
+
+
+@pytest.fixture
+def patched_search_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> _SearchDirs:
+    """
+    Redirect all three config search candidates into tmp_path (Phase 37 CFG-01).
+
+    The real third candidate is ``/etc/saneless``, which no test may create,
+    write or chmod; patching the search list keeps the whole search, including
+    the stale-file probe, inside ``tmp_path``. The first candidate stays
+    relative, exactly as the real one is, so an assertion that the log prints
+    absolute paths is able to fail.
+
+    Returns:
+        The three directories, in search order.
+
+    """
+    dirs = _SearchDirs(
+        cwd=tmp_path / "cwd",
+        xdg=tmp_path / "xdg" / "saneless",
+        etc=tmp_path / "etc" / "saneless",
+    )
+    for directory in dirs:
+        directory.mkdir(parents=True)
+    monkeypatch.chdir(dirs.cwd)
+    candidates = (
+        Path(config_mod.CONFIG_FILENAME),
+        dirs.xdg / config_mod.CONFIG_FILENAME,
+        dirs.etc / config_mod.CONFIG_FILENAME,
+    )
+    monkeypatch.setattr(config_mod, "config_search_paths", lambda: candidates)
+    return dirs
+
+
+_MINIMAL_TOML = "[profiles.default]\n"
+"""A config file with nothing in it that any assertion here looks at."""
+
+_STALE_TOML = (
+    "[paperless]\n"
+    'token = "real-token-from-stale"\n'
+    'url = "http://paperless.example:8000"\n'
+)
+"""A valid old-name file whose values must never reach the settings."""
+
+
+class TestConfigDiscovery:
+    """
+    What config discovery found is recorded once and derived once (Phase 37).
+
+    An operator who mounted ``/etc/saneless/saneless.toml`` got no config at
+    all, because that directory was searched for the other spelling, and no
+    surface named the cause. Discovery now records every candidate it searched,
+    the file it loaded, and any old-name file left beside a candidate -- which
+    it stats and never opens.
+    """
+
+    @staticmethod
+    def _stale_in(directory: Path) -> Path:
+        """
+        Return the old-name file path inside ``directory``.
+
+        Args:
+            directory: A searched directory.
+
+        Returns:
+            The old-name sibling path, which need not exist.
+
+        """
+        return directory / config_mod.LEGACY_CONFIG_FILENAME
+
+    def test_xdg_new_name_is_discovered(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """A correctly named file under XDG loads (Phase 37 CFG-01)."""
+        expected = patched_search_paths.xdg / config_mod.CONFIG_FILENAME
+        expected.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+        assert settings.config_path == expected
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED
+        )
+
+    def test_xdg_old_name_alone_is_not_loaded(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """An old-name file under XDG is recorded as stale, not loaded (D-08)."""
+        stale = self._stale_in(patched_search_paths.xdg)
+        stale.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+        assert settings.config_path is None
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.stale == (stale,)
+
+    def test_etc_candidate_loads_the_new_name(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """
+        The 2026-09-22 failure, inverted (Phase 37 CFG-01).
+
+        A container mounting the app-named file into the system config
+        directory got nothing, because that directory was searched for the
+        other spelling. It now loads.
+        """
+        mounted = patched_search_paths.etc / config_mod.CONFIG_FILENAME
+        mounted.write_text('[scanner]\nhost = "from-etc"\n\n[profiles.default]\n')
+        settings = load_settings()
+        assert settings.config_path == mounted
+        assert settings.scanner.host == "from-etc"
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED
+        )
+
+    def test_stale_file_is_never_parsed(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """
+        Invalid TOML under the old name does not break the load (D-08).
+
+        Proof that the file is stat-ed and not read: were it parsed, this would
+        raise.
+        """
+        stale = self._stale_in(patched_search_paths.etc)
+        stale.write_text("this is [not toml")
+        settings = load_settings()
+        assert settings.config_path is None
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.stale == (stale,)
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.STALE_ONLY
+        )
+
+    def test_stale_file_values_are_never_used(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """
+        A live token under the old name populates nothing (D-08, Phase 37 CFG-03).
+
+        The dangerous shape of "detection": stat-ing a file and then quietly
+        merging it. The settings must still be the unconfigured defaults, and
+        the file must be untouched.
+        """
+        stale = self._stale_in(patched_search_paths.xdg)
+        stale.write_text(_STALE_TOML)
+        before = stale.read_bytes()
+
+        settings = load_settings()
+
+        assert is_placeholder_token(settings.paperless.token.get_secret_value())
+        assert settings.paperless.url != "http://paperless.example:8000"
+        assert "real-token-from-stale" not in settings.model_dump_json()
+        assert stale.read_bytes() == before
+
+    def test_discover_config_lists_found_loaded_and_stale(self, tmp_path: Path) -> None:
+        """
+        ``found`` is every existing candidate and ``loaded`` is the first (D-05).
+
+        Driven with a plain tuple, so nothing here depends on the environment.
+        """
+        first, second, third = (tmp_path / name for name in ("a", "b", "c"))
+        for directory in (first, second, third):
+            directory.mkdir()
+        candidates = tuple(
+            directory / config_mod.CONFIG_FILENAME
+            for directory in (first, second, third)
+        )
+        candidates[1].write_text(_MINIMAL_TOML)
+        candidates[2].write_text(_MINIMAL_TOML)
+        self._stale_in(third).write_text(_MINIMAL_TOML)
+        self._stale_in(first).write_text(_MINIMAL_TOML)
+
+        discovery = config_mod.discover_config(candidates)
+
+        assert discovery.searched == candidates
+        assert discovery.found == (candidates[1], candidates[2])
+        assert discovery.loaded == candidates[1]
+        assert discovery.stale == (self._stale_in(first), self._stale_in(third))
+        assert discovery.explicit is None
+
+    def test_discover_config_with_nothing_present(self, tmp_path: Path) -> None:
+        """An empty directory yields no found, no loaded and no stale."""
+        candidates = (tmp_path / config_mod.CONFIG_FILENAME,)
+        discovery = config_mod.discover_config(candidates)
+        assert discovery.found == ()
+        assert discovery.loaded is None
+        assert discovery.stale == ()
+
+    def test_unreadable_stale_file_still_counts(self, tmp_path: Path) -> None:
+        """
+        A stale file with no permissions is present, not absent (Phase 37 D-09).
+
+        Present-but-unreadable is deliberately not a distinct state this phase:
+        a stat is all the detection needs.
+        """
+        stale = self._stale_in(tmp_path)
+        stale.write_text(_MINIMAL_TOML)
+        stale.chmod(0o000)
+        try:
+            discovery = config_mod.discover_config(
+                (tmp_path / config_mod.CONFIG_FILENAME,)
+            )
+            assert discovery.stale == (stale,)
+        finally:
+            stale.chmod(0o600)
+
+    def test_state_loaded_with_leftover(
+        self, patched_search_paths: _SearchDirs
+    ) -> None:
+        """A leftover beside a loaded file is its own state (D-10)."""
+        (patched_search_paths.cwd / config_mod.CONFIG_FILENAME).write_text(
+            _MINIMAL_TOML
+        )
+        self._stale_in(patched_search_paths.etc).write_text(_MINIMAL_TOML)
+        settings = load_settings()
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED_WITH_LEFTOVER
+        )
+
+    def test_state_not_found(self, patched_search_paths: _SearchDirs) -> None:
+        """Nothing anywhere is NOT_FOUND, which is a supported deployment (D-07)."""
+        assert patched_search_paths.cwd.is_dir()
+        settings = load_settings()
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.NOT_FOUND
+        )
+
+    def test_explicit_path_bypasses_stale_detection(self, tmp_path: Path) -> None:
+        """
+        ``--config`` searches nothing, so it detects nothing (Phase 37, deferred).
+
+        Current behaviour, pinned so a later change to it is deliberate.
+        """
+        explicit = tmp_path / "elsewhere.toml"
+        explicit.write_text(_MINIMAL_TOML)
+        self._stale_in(tmp_path).write_text(_MINIMAL_TOML)
+
+        settings = load_settings(str(explicit))
+
+        discovery = settings.config_discovery
+        assert discovery is not None
+        assert discovery.explicit == explicit
+        assert discovery.searched == ()
+        assert discovery.stale == ()
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED
+        )
+
+    def test_directly_constructed_settings_are_not_found(self) -> None:
+        """``Settings()`` recorded no discovery, so it loaded no file (D-05)."""
+        settings = Settings()
+        assert settings.config_discovery is None
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.NOT_FOUND
+        )
+
+    def test_settings_with_only_a_path_are_loaded(self, tmp_path: Path) -> None:
+        """A recorded path without a discovery still reads as LOADED (D-05)."""
+        settings = Settings()
+        settings._config_path = tmp_path / config_mod.CONFIG_FILENAME
+        assert (
+            config_mod.config_file_state(settings)
+            is vocabulary_mod.ConfigFileState.LOADED
+        )
+
+    def test_documented_spelling_is_positional_not_path_derived(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The three spellings come from search position (Phase 37 D-14).
+
+        The status strip carries no filesystem path, so the stale file is named
+        by the spelling the documentation uses. Driving it with tmp_path
+        candidates proves the mapping is positional: a path-derived
+        implementation would echo tmp_path back.
+        """
+        dirs = tuple(tmp_path / name for name in ("a", "b", "c"))
+        candidates = tuple(directory / config_mod.CONFIG_FILENAME for directory in dirs)
+        discovery = config_mod.discover_config(candidates)
+
+        stale_spellings = [
+            discovery.documented_spelling(self._stale_in(directory))
+            for directory in dirs
+        ]
+        assert stale_spellings == [
+            f"./{config_mod.LEGACY_CONFIG_FILENAME}",
+            f"$XDG_CONFIG_HOME/saneless/{config_mod.LEGACY_CONFIG_FILENAME}",
+            f"/etc/saneless/{config_mod.LEGACY_CONFIG_FILENAME}",
+        ]
+        assert [discovery.documented_spelling(p) for p in candidates] == [
+            f"./{config_mod.CONFIG_FILENAME}",
+            f"$XDG_CONFIG_HOME/saneless/{config_mod.CONFIG_FILENAME}",
+            f"/etc/saneless/{config_mod.CONFIG_FILENAME}",
+        ]
+        assert all(str(tmp_path) not in text for text in stale_spellings)
+
+    def test_documented_spelling_rejects_an_unsearched_path(
+        self, tmp_path: Path
+    ) -> None:
+        """A path beside no candidate has no documented spelling (D-14)."""
+        discovery = config_mod.discover_config(
+            (tmp_path / "a" / config_mod.CONFIG_FILENAME,)
+        )
+        with pytest.raises(ValueError, match="searched"):
+            discovery.documented_spelling(tmp_path / "z" / config_mod.CONFIG_FILENAME)
 
 
 def _env_line(err: ConfigError, variable: str) -> str:
@@ -1324,6 +2069,158 @@ class TestConfigSources:
         assert "paperless.token" in messages[0]
         assert secret not in messages[0]
 
+    @staticmethod
+    def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        """Return the WARNING messages saneless.config emitted."""
+        return [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING and record.name == "saneless.config"
+        ]
+
+    @staticmethod
+    def _emit(settings: Settings, caplog: pytest.LogCaptureFixture) -> None:
+        """
+        Run the startup config log with both levels captured.
+
+        Args:
+            settings: The loaded settings to report on.
+            caplog: The capture fixture to record into.
+
+        """
+        with caplog.at_level(logging.INFO, logger="saneless.config"):
+            config_mod.log_config_sources(settings)
+
+    @pytest.mark.usefixtures("patched_search_paths")
+    def test_no_config_logs_every_searched_path_absolute(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        With nothing found, the one INFO line says where it looked (D-11, CFG-02).
+
+        The 2026-09-22 log said only "no config file" and the operator had to
+        guess which three paths that meant. The relative first candidate is
+        printed absolute, because a relative path in a log is worth nothing
+        without the working directory.
+        """
+        secret = "tok-SECRET-51ab"
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", secret)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        messages = self._info(caplog)
+        assert len(messages) == 1
+        assert "no config file; defaults + environment" in messages[0]
+        positions = [
+            messages[0].find(str(path.absolute()))
+            for path in config_mod.config_search_paths()
+        ]
+        assert all(position >= 0 for position in positions)
+        assert positions == sorted(positions)
+        assert self._warnings(caplog) == []
+        assert secret not in messages[0]
+
+    def test_loaded_config_does_not_log_the_search_list(
+        self,
+        patched_search_paths: _SearchDirs,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A successful load names one file and no others (D-11)."""
+        loaded = patched_search_paths.xdg / config_mod.CONFIG_FILENAME
+        loaded.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        messages = self._info(caplog)
+        assert len(messages) == 1
+        assert str(loaded) in messages[0]
+        assert str(patched_search_paths.etc) not in messages[0]
+        assert str(patched_search_paths.cwd) not in messages[0]
+        assert self._warnings(caplog) == []
+
+    def test_stale_only_warns_once_per_file_with_its_rename(
+        self,
+        patched_search_paths: _SearchDirs,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        Every old-name file is named with the rename to perform (Phase 37 CFG-03).
+
+        This is the line that would have ended the 2026-09-22 evening.
+        """
+        stale = [
+            directory / config_mod.LEGACY_CONFIG_FILENAME
+            for directory in (patched_search_paths.xdg, patched_search_paths.etc)
+        ]
+        for path in stale:
+            path.write_text(_MINIMAL_TOML)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        assert len(self._info(caplog)) == 1
+        warnings = self._warnings(caplog)
+        assert len(warnings) == len(stale)
+        for path, text in zip(stale, warnings, strict=True):
+            assert str(path.absolute()) in text
+            assert str(path.with_name(config_mod.CONFIG_FILENAME).absolute()) in text
+            assert "rename" in text
+
+    def test_leftover_beside_a_loaded_file_says_move_then_delete(
+        self,
+        patched_search_paths: _SearchDirs,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        A leftover may hold the only copy of the token (Phase 37 D-17).
+
+        In the documented container layout the generated profiles are written
+        to a different directory than the mounted config, so the old-name file
+        left behind after an upgrade can be the only place the URL and token
+        survive. The next step must never be a bare "delete it".
+        """
+        loaded = patched_search_paths.cwd / config_mod.CONFIG_FILENAME
+        loaded.write_text(_MINIMAL_TOML)
+        leftover = patched_search_paths.etc / config_mod.LEGACY_CONFIG_FILENAME
+        leftover.write_text(_STALE_TOML)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        assert len(self._info(caplog)) == 1
+        warnings = self._warnings(caplog)
+        assert len(warnings) == 1
+        assert str(leftover.absolute()) in warnings[0]
+        assert settings.config_path is not None
+        assert str(settings.config_path.absolute()) in warnings[0]
+        assert "move anything" in warnings[0]
+        assert "then delete" in warnings[0]
+
+    def test_stale_warnings_never_carry_a_secret(
+        self,
+        patched_search_paths: _SearchDirs,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Paths and key names reach the log; values never do (T-37-02)."""
+        secret = "tok-SECRET-51ab"
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", secret)
+        stale = patched_search_paths.etc / config_mod.LEGACY_CONFIG_FILENAME
+        stale.write_text(_STALE_TOML)
+        settings = load_settings()
+
+        self._emit(settings, caplog)
+
+        records = self._info(caplog) + self._warnings(caplog)
+        assert records
+        for text in records:
+            assert secret not in text
+            assert "real-token-from-stale" not in text
+
 
 class TestExplicitConfigPath:
     """
@@ -1360,7 +2257,7 @@ class TestExplicitConfigPath:
 
     def test_not_a_file_directory_is_rejected(self, tmp_path: Path) -> None:
         """A directory passed as the config path is a ConfigError naming it."""
-        directory = tmp_path / "config.toml"
+        directory = tmp_path / config_mod.CONFIG_FILENAME
         directory.mkdir()
         with pytest.raises(ConfigError) as exc_info:
             load_settings(str(directory))

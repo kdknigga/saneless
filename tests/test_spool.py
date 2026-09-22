@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from PIL import Image, ImageDraw
@@ -13,6 +14,9 @@ from PIL.ImageStat import Stat
 from saneless.exceptions import ScanError
 from saneless.scanner.base import PageRecord, PageSink
 from saneless.spool import SpooledPageSink
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Larger than any disk this suite will ever run on, so the per-page check is
 # guaranteed to report a shortfall without monkeypatching shutil.
@@ -81,10 +85,12 @@ class TestPageSinkContract:
 
     def test_is_abstract(self) -> None:
         """PageSink cannot be instantiated: it declares a contract only."""
-        # Through a ``type[PageSink]`` binding for the same reason as above:
-        # pyrefly reports the direct call statically, and this test is about
-        # what the interpreter does.
-        sink_type: type[PageSink] = PageSink
+        # Bound as a zero-argument callable, because both type checkers
+        # correctly refuse a direct call on an abstract class. Being refused is
+        # exactly what this test asserts the interpreter does at runtime, so
+        # the cast states the shape the call site claims and the raises block
+        # below is the proof of what actually happens.
+        sink_type = cast("Callable[[], object]", PageSink)
         with pytest.raises(TypeError):
             sink_type()
 

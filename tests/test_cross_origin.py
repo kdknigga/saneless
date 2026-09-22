@@ -42,7 +42,7 @@ from saneless.config import (
 from saneless.vocabulary import RequestRejection, rejection_message
 from saneless.web.app import create_app
 from saneless.web.cross_origin import CrossOriginGuard, is_cross_origin_request
-from tests.conftest import StubScannerBackend
+from tests.conftest import StubScannerBackend, leaf_routes
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -292,9 +292,9 @@ def _unsafe_routes(app: FastAPI) -> list[tuple[str, str]]:
     """Return every (method, path) pair the app serves outside the safe methods."""
     return sorted(
         (method, _PATH_PARAM.sub("x", route.path))
-        for route in app.routes
+        for route in leaf_routes(app)
         if isinstance(route, APIRoute)
-        for method in route.methods
+        for method in route.methods or ()
         if method not in SAFE_METHODS
     )
 
@@ -304,6 +304,15 @@ def test_every_unsafe_route_rejects_a_cross_site_request(
 ) -> None:
     """Every state-changing route is behind the guard, not a per-route check (D-23)."""
     routes = _unsafe_routes(app)
+    # The exact enumerated count, first: the >= check below is satisfied by
+    # any superset, so on its own it would not notice the set shrinking to
+    # the four known paths, and neither check notices an empty enumeration
+    # except by failing loudly, which is the point.
+    assert len(routes) == 5, (
+        f"the app serves {len(routes)} unsafe (method, path) pairs, not the 5 "
+        f"this test pins; a state-changing route was added or removed, so "
+        f"update this literal"
+    )
     assert len(routes) >= len(KNOWN_UNSAFE_PATHS)
     assert {path for _, path in routes} >= KNOWN_UNSAFE_PATHS
     for method, path in routes:
@@ -430,7 +439,7 @@ def test_rejection_log_escapes_control_characters_in_the_path(
     Control characters in the decoded path reach the log line escaped.
 
     uvicorn percent-decodes ``%0A`` and ``%1B`` into ``scope["path"]``, but
-    httpx strips control characters from a URL, so the scope is driven into
+    httpx2 strips control characters from a URL, so the scope is driven into
     the guard directly rather than through ``TestClient``.  The standard
     library's URL parser drops the newline; ``%r`` escapes the rest, so a
     terminal escape sequence cannot rewrite what an operator reads.

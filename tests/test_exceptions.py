@@ -8,7 +8,7 @@ own), N-08 (a deliberate cancel at the flip prompt is not a failure) and D-08
 
 from __future__ import annotations
 
-import httpx
+import httpx2
 import pytest
 
 from saneless.exceptions import (
@@ -64,8 +64,8 @@ class TestDescribe:
         assert describe(ValueError("boom")) == "boom"
 
     def test_describe_falls_back_to_the_class_name_for_empty_text(self) -> None:
-        """An httpx timeout that stringifies empty is named by its class (D-08)."""
-        assert describe(httpx.ReadTimeout("")) == "ReadTimeout"
+        """An httpx2 timeout that stringifies empty is named by its class (D-08)."""
+        assert describe(httpx2.ReadTimeout("")) == "ReadTimeout"
 
     def test_describe_falls_back_to_the_class_name_with_no_args(self) -> None:
         """An exception raised with no arguments is named by its class (D-08)."""

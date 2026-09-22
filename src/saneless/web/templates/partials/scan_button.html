@@ -9,12 +9,11 @@
    The blocked flag below is the second, independent source of disabled: a
    paperless-ngx token nobody set means an upload is impossible before any paper
    moves, so the button says no.  It lives HERE for the same reason the partial
-   itself exists -- on htmx 2.0.8 an inherited hx-disabled-elt strips disabled
-   from a server-disabled button the moment a child request finishes (fixed only
-   in 2.0.9, and htmx 4 is out of scope), so this button is re-rendered from
-   server state on every status response.  If the blocked state were expressed
-   anywhere else, the first tag or profile-description request to complete would
-   re-enable it.
+   itself exists -- this is the one place the button is rendered from, and every
+   status response re-renders it from server state, so the blocked flag and the
+   markup that expresses it cannot drift apart.  If the blocked state were
+   expressed anywhere else, it would have to be recomputed at each of those
+   sites and kept in step with this one.
 
    The flag adds a disabled source and nothing more: the label and aria-busy
    still come from the job's state alone, and the label stays Scan when there

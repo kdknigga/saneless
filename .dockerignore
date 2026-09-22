@@ -3,9 +3,9 @@
 # The `*` below must stay the first line. It excludes the entire working tree;
 # each `!` line under it re-includes exactly one path the wheel build reads.
 # Move `*` down, or drop it, and every `!` line becomes decoration while the
-# whole working tree is sent to the daemon -- including a real config.toml with
-# a live paperless-ngx token, which is then recoverable from the build cache and
-# from the discarded builder stage.
+# whole working tree is sent to the daemon -- including a real saneless config
+# file with a live paperless-ngx token, which is then recoverable from the
+# build cache and from the discarded builder stage.
 #
 # This is one of TWO independent gates. The other is the explicit `COPY` lines
 # in the builder stage of the Dockerfile, which replaced `COPY . .`. A mistake

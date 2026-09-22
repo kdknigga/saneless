@@ -1,6 +1,6 @@
 [project]
 name = "saneless"
-version = "0.2.0-rc.3"
+version = "0.2.0-rc.6"
 description = "SANE scanner to paperless-ngx bridge"
 readme = "README.md"
 license = "MIT"
@@ -21,18 +21,18 @@ classifiers = [
     "Topic :: Multimedia :: Graphics :: Capture :: Scanners",
 ]
 dependencies = [
-    "click>=8.3.1",
-    "fastapi>=0.135.1",
-    "httpx>=0.28.1",
+    "click>=8.5.0",
+    "fastapi>=0.141.1",
+    "httpx2>=2.13.0",
     "img2pdf>=0.6.3",
     "jinja2>=3.1.6",
-    "pikepdf>=10.5.1",
-    "pillow>=12.1.1",
-    "pydantic-settings[toml]>=2.13.1",
-    "python-multipart>=0.0.22",
-    "python-sane>=2.9.1",
-    "tomlkit>=0.14.0",
-    "uvicorn>=0.42.0",
+    "pikepdf>=10.13.0.post1",
+    "pillow>=12.3.0",
+    "pydantic-settings[toml]>=2.15.0",
+    "python-multipart>=0.0.32",
+    "python-sane>=2.9.2",
+    "tomlkit>=0.15.1",
+    "uvicorn>=0.53.0",
 ]
 
 [project.scripts]
@@ -44,8 +44,25 @@ Repository = "https://github.com/kdknigga/saneless"
 Issues = "https://github.com/kdknigga/saneless/issues"
 
 [build-system]
-requires = ["uv_build>=0.10.3,<0.11.0"]
+requires = ["uv_build>=0.12.17,<0.13.0"]
 build-backend = "uv_build"
+
+# anyio 4.15.0 turned `anyio.abc.BlockingPortal` into a deprecated alias, and
+# starlette's `testclient` module evaluates that name at module scope.  This
+# project runs pytest under `filterwarnings = ["error"]`, so the deprecation
+# is raised instead of printed, and every module importing `TestClient` fails
+# to collect -- seven of them here.  Nothing in this repository can fix that:
+# the deprecated name is starlette's own, reached before any saneless code
+# runs.  Declaring the ceiling makes resolution refuse the broken combination
+# outright, rather than leaving it to be discovered as collection errors once
+# a lock has already been written.  `constraint-dependencies` is its right
+# home because it bounds what resolution may select without installing anyio
+# and without entering `[project].dependencies`, so a ceiling on a package
+# saneless never imports stays out of the built wheel's metadata and out of
+# every downstream installer.  Remove it once starlette stops using the
+# deprecated alias.
+[tool.uv]
+constraint-dependencies = ["anyio<4.15"]
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
@@ -157,6 +174,19 @@ docstring-code-format = false
 # enabled.
 docstring-code-line-length = "dynamic"
 
+# Keep the formatter out of the planning archive.  That directory is a
+# historical record of decisions already made, not source this formatter
+# owns, and ruff formats fenced Python blocks inside Markdown, so leaving it
+# in scope would rewrite a finished audit trail.  The scope is deliberately
+# Markdown under that one directory: `docs/` and `README.md` keep being
+# formatted, and so does the one Python file that lives under `.planning/`.
+# The glob has to reach the files themselves -- this is the formatter's own
+# `exclude`, which matches files rather than directories, so a bare
+# directory name here would exclude nothing.  Linting is unaffected: the
+# top-level `[tool.ruff] exclude` is not touched, so `.planning/` stays
+# linted.
+exclude = [".planning/**/*.md"]
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = [
     "S101",   # assert is the test mechanism
@@ -203,16 +233,17 @@ junit_family = "legacy"
 
 [dependency-groups]
 dev = [
-    "httpx>=0.28.1",
-    "playwright>=1.58.0",
-    "pytest-playwright>=0.7.0",
-    "prek>=0.3.5",
-    "pyrefly>=1.2.0",
-    "pytest>=9.0.2",
-    "ruff>=0.15.5",
-    "ty>=0.0.80",
-    "mkdocs-material>=9.7.6",
+    "playwright>=1.63.0",
+    "pytest-playwright>=0.9.0",
+    "prek>=0.5.3",
+    "pyrefly>=1.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.8",
+    "ty>=0.0.82",
+    "uv>=0.12.17",
+    "mkdocs-material>=9.7.7",
     "pytest-timeout>=2.4.0",
     "zizmor>=1.30.1",
     "pytest-cov>=7.1.0",
+    "httpx2>=2.13.0",
 ]

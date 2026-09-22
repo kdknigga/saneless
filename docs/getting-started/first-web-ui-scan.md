@@ -14,8 +14,9 @@ Navigate to `http://<host>:8080` in your browser, replacing `<host>` with the IP
 
 ## Check the System status panel first
 
-The panel at the top answers "can this thing scan right now?" before you feed any paper. It has one row per check, each with a tick, a warning triangle or a cross, a short sentence, and -- when something is wrong -- the next step to take:
+The panel at the top answers "can this thing scan right now?" before you feed any paper. It has one row per check -- six of them -- each with a tick, a warning triangle or a cross, a short sentence, and -- when something is wrong -- the next step to take:
 
+- **Configuration** -- whether a configuration file was loaded, and whether one is being ignored.
 - **Scanner** -- whether a scanner is reachable, and which one.
 - **Paperless** -- whether saneless can reach paperless-ngx and whether the API token works.
 - **Profiles** -- how many scan profiles are configured.
@@ -23,6 +24,8 @@ The panel at the top answers "can this thing scan right now?" before you feed an
 - **Data folder** -- whether saneless can write its durable state.
 
 Under the rows, a line says when the checks last ran, in your server's local time. The **Check again** button re-runs them all immediately: press it after plugging the scanner back in rather than reloading the page. While a scan is running the scanner check is paused -- saneless will not interrupt a scan to probe the device -- and the panel says so.
+
+A red **Configuration** row naming a `config.toml` means saneless found a file under the name it used to read: rename that file to `saneless.toml` and restart saneless, and the row goes green with your settings loaded.
 
 These are the same checks `saneless doctor` prints from a terminal. If the Paperless row is red because the API token has not been set, the **Scan** button is greyed out with the reason beneath it, and no scan can start until the token is fixed in the config file.
 

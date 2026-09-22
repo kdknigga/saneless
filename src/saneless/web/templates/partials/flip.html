@@ -43,10 +43,10 @@
      there is no modal partial, no extra route and no script.
 
      The attribute sits on the BUTTON, which lives outside
-     <form hx-post="/api/scan">.  On the form it would make every child request
-     confirm and would need the form's inheritance list extended, which is the
-     exact htmx 2.0.8 inheritance landmine a regression test already guards;
-     that list must not be touched.
+     <form hx-post="/api/scan">.  It is inherited, so on the form it would make
+     every child request confirm, and it would need the form's inheritance list
+     extended; that list must not be touched.  (The attribute is not spelled in
+     prose here, so a count of it still counts only the place that sets it.)
 
      The wording is one question and one consequence.  It deliberately does not
      claim the pages already scanned are kept: that is a promise this contract

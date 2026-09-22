@@ -106,8 +106,8 @@ machine that has the scanner.
 ## Notes on the container lines above
 
 - **Mount the config *directory*, never the file inside it.** saneless saves
-  generated profiles by renaming a temporary file over `config.toml`, and a
-  single-file bind mount makes that rename fail. Put your `config.toml` inside
+  generated profiles by renaming a temporary file over `saneless.toml`, and a
+  single-file bind mount makes that rename fail. Put your `saneless.toml` inside
   `./config` and keep the directory writable.
 - **The container's port is fixed at 8080.** Change the left-hand half of the
   mapping to serve it elsewhere, for example `-p 8888:8080`.

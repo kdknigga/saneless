@@ -27,6 +27,7 @@ import click
 import uvicorn
 
 from .auto_profiles import (
+    device_type_of,
     generate_profiles,
     write_profiles_to_config,
 )
@@ -36,11 +37,14 @@ from .checks import (
     CheckResult,
     CheckState,
     check_name,
+    configuration_check,
     run_checks,
     worst_state,
 )
 from .config import (
+    CONFIG_FILENAME,
     Settings,
+    config_file_state,
     is_placeholder_token,
     load_settings,
     log_config_sources,
@@ -70,6 +74,7 @@ from .pipeline import (
 )
 from .scanner.sane_backend import SaneBackend, require_sane
 from .vocabulary import (
+    ConfigFileState,
     ErrorCategory,
     ExitCode,
     FlipOutcome,
@@ -528,7 +533,43 @@ def cli(ctx: click.Context, config_path: str | None, *, verbose: bool) -> None:
     ctx.obj["verbose"] = verbose
 
 
-def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Settings:
+# The two situations in which a file under the superseded name is sitting in a
+# searched directory doing nothing.  Named once, because three places ask.
+_SUPERSEDED_NAME_STATES: Final = (
+    ConfigFileState.STALE_ONLY,
+    ConfigFileState.LOADED_WITH_LEFTOVER,
+)
+
+
+def _warn_stale_config(settings: Settings) -> None:
+    """
+    Say on stderr that a file under the old name is being ignored, if one is.
+
+    The startup log already says it, and on a service that is enough, because
+    the records stream to the same terminal the operator is watching.  A
+    one-shot command writes its log to ``log_file`` and is read afterwards if
+    at all, so the person who just ran ``saneless scan`` and got the defaults
+    sees nothing at all -- which is the failure this phase exists to remove,
+    in miniature.
+
+    The words are not written here.  ``configuration_check`` holds the one
+    copy of them, and the terminal spelling is the same sentence with the file
+    named by its resolved path, which a terminal may carry and the LAN-visible
+    status strip may not.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+
+    """
+    if config_file_state(settings) not in _SUPERSEDED_NAME_STATES:
+        return
+    row = configuration_check(settings, absolute_paths=True)
+    click.echo(f"Warning: {row.message} {row.next_step}", err=True)
+
+
+def _load_cli_settings(
+    ctx: click.Context, *, stream_logs: bool = False, warn_stale: bool = True
+) -> Settings:
     """
     Load and validate settings and configure logging, once per process.
 
@@ -556,6 +597,10 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
             stream to stderr and no log file is written, so ``docker logs`` or
             journald sees them and owns retention. Only ``serve`` passes it;
             every one-shot command keeps the rotating file handler unchanged.
+        warn_stale: If False, do not print the superseded-name warning here.
+            Only ``auto-profiles`` passes it: that command refuses outright in
+            one of the two states, and the refusal and the warning are the
+            same sentence, so it decides for itself which one is printed.
 
     Returns:
         The loaded settings, the same object on every call.
@@ -589,6 +634,12 @@ def _load_cli_settings(ctx: click.Context, *, stream_logs: bool = False) -> Sett
     warn_on_legacy_duplex_sources(settings)
     # Which file and which environment keys, names only, once.
     log_config_sources(settings)
+    # A service's log is already on stderr, so the line above has reached the
+    # terminal and repeating it would be the same sentence twice per start.  A
+    # one-shot command's log is a file nobody is watching, so for it this is
+    # the only thing said in front of the person who ran it.
+    if warn_stale and not stream_logs:
+        _warn_stale_config(settings)
 
     ctx.obj["settings"] = settings
     return settings
@@ -1219,7 +1270,7 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
         click.echo(f"Serving on {url}", err=True)
 
     # uvicorn follows the configured log_level, not -v: -v is saneless's own
-    # detail and must not turn on uvicorn's or httpx's debug output. The
+    # detail and must not turn on uvicorn's or httpx2's debug output. The
     # validated log level lower-cases to a name uvicorn accepts.
     #
     # The config needs nothing extra for the streaming mode, and adding
@@ -1241,8 +1292,16 @@ def _run_server(app: FastAPI, sockets: list[socket.socket], log_level: str) -> N
     # stopped is a normal stop, exit 0, so it is swallowed here; a Ctrl-C
     # before this point -- while settings load or the app is built -- is not
     # uvicorn's to handle and reaches the group guard, exit 130.
-    with contextlib.suppress(KeyboardInterrupt):
-        server.run(sockets=sockets)
+    try:
+        with contextlib.suppress(KeyboardInterrupt):
+            server.run(sockets=sockets)
+    except SystemExit:
+        # uvicorn exits the process itself when start-up fails, with a code of
+        # its own choosing that collides with this CLI's table. A server that
+        # never started is this project's "could not start", handled below; a
+        # started server exiting is uvicorn's own decision and is left alone.
+        if server.started:
+            raise
     # Server.run returns quietly when start-up fails, such as the app's
     # lifespan raising; uvicorn has already logged why. Every command shares
     # one exit table, so that is a failure to start: one line, exit 2.
@@ -1300,7 +1359,26 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     # config or touching the device, exit 2 through the guard. --help never
     # reaches this body, so it needs no python-sane.
     require_sane()
-    settings = _load_cli_settings(ctx)
+    # The warning is suppressed so that the refusal below can be the only
+    # thing said: both are the same sentence, and printing it twice teaches a
+    # reader that this output repeats itself.
+    settings = _load_cli_settings(ctx, warn_stale=False)
+    if config_file_state(settings) is ConfigFileState.STALE_ONLY:
+        # This command is the only thing in saneless that creates a config
+        # file, and with nothing loaded its target is ./saneless.toml -- the
+        # first path the next start looks at.  Writing it now would not lose
+        # the old file's URL and token but would permanently shadow them: the
+        # search would stop at the new file, the row telling the operator to
+        # rename the old one would go green, and the appliance would keep
+        # running on defaults with nothing left saying why.  Refusing costs a
+        # rename; writing costs the evidence.  Exit 2 through the group guard,
+        # exactly as the no-scanner refusal below does.
+        row = configuration_check(settings, absolute_paths=True)
+        msg = f"{row.message} {row.next_step}"
+        raise ConfigError(msg)
+    # Not stale-only, so nothing is refused; an old file sitting beside the
+    # loaded one still gets said once, here rather than at load.
+    _warn_stale_config(settings)
 
     scanner = SaneBackend(host=settings.scanner.host)
     # This command ends through ctx.exit() as well as by returning and by
@@ -1319,12 +1397,14 @@ def auto_profiles(ctx: click.Context, *, force: bool) -> None:
     # Use configured device or first discovered device
     device_id = settings.scanner.device or device_list[0].name
     caps = scanner.get_capabilities(device_id)
-    profiles = generate_profiles(caps)
+    profiles = generate_profiles(caps, device_type_of(device_list, device_id))
 
     # The file that was loaded (including an explicit --config). With no loaded
-    # file the target stays ./saneless.toml, and the output names the resolved
-    # absolute path so the operator sees where it went.
-    config_path = settings.config_path or Path("./saneless.toml")
+    # file the target is the one config filename in the working directory, and
+    # the output names the resolved absolute path so the operator sees where it
+    # went. Built from the constant, so the target followed the rename without
+    # anyone having to remember this line.
+    config_path = settings.config_path or Path(CONFIG_FILENAME)
     # A ConfigError here (a single-file bind mount, a non-UTF-8 file, or
     # merged text that would not parse) names the file and the fix; the group
     # guard prints it as-is and exits 2, with no traceback.
@@ -1434,6 +1514,104 @@ _MARKER_WIDTH = max(
 _NAME_COL_WIDTH = max(len(check_name(key)) for key in CheckKey)
 _NEXT_STEP_INDENT = " " * (_MARKER_WIDTH + 1 + _NAME_COL_WIDTH + 1)
 
+# The config resolution table's caption and its five verdicts, one per line.
+# "used" and "not used" are about the search; "ignored" and "leftover" are
+# about a file under the superseded name, and they differ because the two
+# situations differ -- in one nothing was loaded and the file is the reason, in
+# the other something was loaded and the file is merely still there.
+_RESOLUTION_CAPTION: Final = "Config files searched, in order:"
+_RESOLUTION_LABELS: Final = ("used", "not used", "not found", "ignored", "leftover")
+# Derived, like the row widths above and for the same reason: respelling a
+# verdict must not be able to break the column silently.
+_RESOLUTION_LABEL_WIDTH: Final = max(len(label) for label in _RESOLUTION_LABELS)
+# Printed instead of an empty table. A caption with nothing under it reads as
+# output that failed halfway, rather than as "this process ran no search" --
+# which is what settings built directly, without a load, actually did.
+_RESOLUTION_NONE: Final = "  none recorded"
+
+
+def _resolution_line(label: str, path: Path, note: str = "") -> str:
+    """
+    Render one entry of the config resolution table.
+
+    Args:
+        label: One of ``_RESOLUTION_LABELS``.
+        path: The file this entry is about.
+        note: A parenthesised aside, or "" for none.
+
+    Returns:
+        The line, with the path at the same column whatever the label.
+
+    """
+    return f"  {label:<{_RESOLUTION_LABEL_WIDTH}}  {path.absolute()}{note}"
+
+
+def _config_resolution_lines(settings: Settings) -> list[str]:
+    """
+    Say where every configuration file the search looked at ended up.
+
+    Absolute paths, which the status strip's rows may not carry: that page is
+    reachable by anyone on the LAN, and this is a terminal on the machine,
+    where the resolved path is the half an operator can act on.
+
+    The recording is read and nothing is stat-ed again.  A file created,
+    renamed or deleted since startup would make a fresh look describe a
+    program that is not running -- and the whole point of the table is to
+    explain the settings the process is holding.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+
+    Returns:
+        One line per entry, or empty when no search was recorded.
+
+    """
+    discovery = settings.config_discovery
+    if discovery is None:
+        if settings.config_path is None:
+            return []
+        return [_resolution_line("used", settings.config_path)]
+    if discovery.explicit is not None:
+        return [
+            _resolution_line(
+                "used", discovery.explicit, " (given with --config; no search)"
+            )
+        ]
+    lines = []
+    for candidate in discovery.searched:
+        if candidate == discovery.loaded:
+            lines.append(_resolution_line("used", candidate))
+        elif candidate in discovery.found:
+            lines.append(
+                _resolution_line("not used", candidate, " (an earlier file won)")
+            )
+        else:
+            lines.append(_resolution_line("not found", candidate))
+    # A superseded-name file beside a candidate. Which verdict it gets is the
+    # same distinction the Configuration row draws: with nothing loaded it is
+    # the reason there is no configuration, and with something loaded it is
+    # only still there.
+    if discovery.loaded is None:
+        label, note = "ignored", f" (old name; rename it to {CONFIG_FILENAME})"
+    else:
+        label, note = "leftover", " (old name; ignored)"
+    lines.extend(_resolution_line(label, stale, note) for stale in discovery.stale)
+    return lines
+
+
+def _echo_config_resolution(settings: Settings) -> None:
+    """
+    Print the config resolution table under the check rows.
+
+    Args:
+        settings: The settings in hand.
+
+    """
+    click.echo("")
+    click.echo(_RESOLUTION_CAPTION)
+    for line in _config_resolution_lines(settings) or [_RESOLUTION_NONE]:
+        click.echo(line)
+
 
 def _doctor_scanner(settings: Settings) -> ScannerBackend | None:
     """
@@ -1475,7 +1653,7 @@ def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
     """
     Build a Paperless client for one ``doctor`` run, or report that there is none.
 
-    ``PaperlessClient.__init__`` refuses exactly one thing -- a URL httpx will
+    ``PaperlessClient.__init__`` refuses exactly one thing -- a URL httpx2 will
     not parse -- and it refuses it with ``PaperlessError``, which the group
     guard would turn into exit 3. That would cost the operator the other four
     rows to report a fact the Paperless row already has a sentence for, and it
@@ -1507,16 +1685,25 @@ def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
 # to say what is wrong, and a machine with no python-sane is precisely the
 # machine whose owner needs that said: it still has a token, profiles, a
 # fallback folder and a data directory to be told about. The import failure is
-# caught in _doctor_scanner and rendered as one FAIL row among five instead of a
+# caught in _doctor_scanner and rendered as one FAIL row among six instead of a
 # refusal to run at all.
+#
+# The output is two sections: the check rows, then a table of where every
+# configuration file the search looked at ended up. The rows say which
+# situation the appliance is in, in the words the status strip uses; the table
+# says which files, by absolute path, which the rows may not carry -- the strip
+# is a page anyone on the LAN can load and this is a terminal on the machine.
+# It is printed on every run and not only when something is wrong, because a
+# resolution that appears only on failure cannot be compared against a working
+# machine's, and comparing the two is how a configuration problem gets found.
 #
 # There is no --json, and this is a decision rather than an omission. Nothing in
 # the docs, the tests, the Dockerfile or the compose file would consume it, and
 # a container HEALTHCHECK that calls `doctor` -- the one caller that would have
 # wanted a machine shape -- is deliberately not offered. A JSON mode would be a
 # wire contract with no reader, and a wire contract is only free until the first
-# person parses it. The human-readable table plus the exit code is the whole
-# contract.
+# person parses it. The human-readable rows, the resolution table and the exit
+# code are the whole contract.
 @cli.command()
 @click.pass_context
 def doctor(ctx: click.Context) -> None:
@@ -1553,6 +1740,8 @@ def doctor(ctx: click.Context) -> None:
         )
         if result.next_step:
             click.echo(f"{_NEXT_STEP_INDENT}{result.next_step}")
+
+    _echo_config_resolution(settings)
 
     # Any failing check exits 2, and no new ExitCode member expresses it. Three
     # reasons, in order: tests/test_deployment_config.py:393,403 assert the

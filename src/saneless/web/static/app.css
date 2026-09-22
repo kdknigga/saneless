@@ -93,8 +93,8 @@
     color: var(--pico-muted-color);
 }
 
-/* The five rows are a list semantically -- a screen reader should hear "list
-   of 5 items" -- but Pico's default bullet and indent would fight the glyph
+/* The six rows are a list semantically -- a screen reader should hear "list
+   of 6 items" -- but Pico's default bullet and indent would fight the glyph
    gutter, so the marker is dropped and the inset with it. */
 .check-list {
     list-style: none;
@@ -121,11 +121,20 @@
     text-align: center;
 }
 
-/* 112px is the measured width of the longest name ("Data folder") at 16px/700
-   plus breathing room, so all five messages start at the same x. It is the one
-   700-weight body text on the page. */
+/* 8.5rem is the measured width of the longest name ("Configuration") at
+   16px/700 -- 7.69rem -- plus the same breathing room the old 7rem carried,
+   so all six messages start at the same x. It is the one 700-weight body text
+   on the page. In rem rather than px because Pico scales the root font with
+   the viewport, and the name grows with it: measured at 123px against a 16px
+   root and 154px against a 20px one, both 7.69rem.
+
+   Too narrow does not clip, which is why this is stated in a comment and
+   asserted in a test: flex-shrink is 0, so a name wider than this basis grows
+   its own item instead, and that row's message alone starts further right.
+   tests/test_browser.py measures the text against this basis at 320px and at
+   the desktop width. */
 .check-name {
-    flex: 0 0 7rem;
+    flex: 0 0 8.5rem;
     font-weight: 700;
 }
 

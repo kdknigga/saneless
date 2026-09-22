@@ -145,7 +145,42 @@ The line starts with `Paperless error:`.
   when the connection is refused or reset, times out, is closed by a reverse proxy, or
   paperless-ngx answers with a server error. If every attempt fails and a consume directory is
   configured, the PDF is saved there instead. Without one, the scan fails. Check that
-  `paperless.url` is reachable from where saneless runs.
+  `paperless.url` is reachable from where saneless runs. A `https://` certificate that this
+  machine does not trust also arrives here, reported as unreachable in both the log and the web
+  UI -- see **TLS certificate not trusted** below before you go looking at the network.
+- **TLS certificate not trusted.** The line names an SSL failure, for example
+  `Paperless error: Could not fetch tags from Paperless at https://paperless.example.com/: [SSL:
+  CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1081)`,
+  and the scan exits 3 -- but only without a consume directory. A certificate that cannot be
+  verified is classified as unreachable, so the upload is retried, the retries are exhausted, and
+  with a consume directory configured the PDF is saved there instead: the scan then ends
+  `FALLBACK`, shown as **Saved to folder**, and the command exits 0. That is the dangerous case
+  rather than the benign one -- scans appear to keep succeeding into a folder nobody is watching,
+  so a TLS misconfiguration can run unnoticed indefinitely. Watch for `FALLBACK` /
+  **Saved to folder** in `saneless jobs`.
+  **The same failure looks different in the web UI.** The status strip and
+  `GET /api/paperless/test` report a bare `unreachable` with no TLS text anywhere, because a
+  certificate that cannot be verified means the connection never established, and saneless
+  classifies that as unreachable -- it is reported as the **Unreachable.** case above, with the
+  SSL detail dropped. If your web UI says Unreachable, this bullet may be why. The message on the
+  scan path is OpenSSL's own and has not changed; what
+  changed is which certificate authorities are trusted. saneless now verifies against the
+  operating system's trust store instead of a certificate bundle shipped inside a Python package.
+  So a private or corporate CA installed on the machine now works where it used to fail, and one
+  installed only by editing that Python bundle now gives you this error, which you may not have
+  been getting before. There are two fixes. Install the CA into the operating system's trust
+  store, which is the better option wherever it is available -- in the container, copy the
+  certificate to `/usr/local/share/ca-certificates/my-ca.crt` and run `update-ca-certificates`.
+  Or point OpenSSL at the certificate file directly with `SSL_CERT_FILE`, described in
+  [Environment Variables](../reference/environment-variables.md#not-a-saneless-variable-ssl_cert_file-and-ssl_cert_dir).
+  If the path you give does not exist, or is a directory rather than a PEM file, saneless refuses
+  at startup with `Paperless error: Could not build the TLS trust store for Paperless at <url>:
+  <OS error text>; check SSL_CERT_FILE and SSL_CERT_DIR` -- a different error from the
+  certificate-verify failure above, and one that means the remedy itself is misconfigured rather
+  than the certificate being untrusted. Under Docker the usual cause is a bind mount whose host
+  file is missing, which gives the container a directory.
+  Do not turn certificate verification off to make this go away: saneless sends the Paperless API
+  token on every request, and an unverified connection hands that token to anyone in the path.
 - **Malformed URL.** A `paperless.url` without a usable `http://` or `https://` scheme is not
   retried, because retrying cannot help. With a consume directory configured the scan is still
   saved there, so it does not fail, but every scan goes to the folder and the log says the URL

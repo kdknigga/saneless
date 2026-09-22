@@ -61,7 +61,7 @@ from tests.conftest import StubScannerBackend, poll_until
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    import httpx
+    import httpx2
     from starlette.responses import Response
 
     from saneless.job import Job, JobStore
@@ -258,7 +258,7 @@ def _error_body(
 
 
 def _assert_htmx_error(
-    response: httpx.Response, rejection: RequestRejection, status: int
+    response: httpx2.Response, rejection: RequestRejection, status: int
 ) -> None:
     """Assert an htmx error response is retargeted and carries only the slot body."""
     assert response.status_code == status
@@ -268,7 +268,7 @@ def _assert_htmx_error(
 
 
 def _assert_json_error(
-    response: httpx.Response, rejection: RequestRejection, status: int
+    response: httpx2.Response, rejection: RequestRejection, status: int
 ) -> None:
     """Assert a non-htmx error response is the JSON shape, not retargeted."""
     assert response.status_code == status
@@ -362,7 +362,7 @@ class TestChecksPollTargetIsExemptFromTheRetarget:
 
     ``render_error`` sets ``HX-Retarget: #status-message`` so an error never
     lands in the element the request was aimed at (D-02, D-03).  For exactly
-    one element that rule kept a defect alive: htmx 2.0.8 applies
+    one element that rule kept a defect alive: htmx 2.0.10 applies
     ``HX-Retarget`` to the response's target *before* it decides what to swap,
     so a 4xx from ``GET /api/checks`` was written into ``#status-message`` and
     ``#checks-body`` was never replaced -- keeping its ``every 2s`` trigger for
@@ -523,7 +523,7 @@ class TestRequestErrorDisclosure:
     """
 
     @staticmethod
-    def _details(response: httpx.Response) -> re.Match[str]:
+    def _details(response: httpx2.Response) -> re.Match[str]:
         """
         Return the disclosure in `response`, failing if there is none.
 
@@ -749,7 +749,7 @@ def _control_character_request() -> Request:
     """
     Build a request whose method and path carry control characters.
 
-    httpx strips control characters from a URL, so the scope is built directly
+    httpx2 strips control characters from a URL, so the scope is built directly
     rather than sent through ``TestClient``, as the cross-origin guard's test
     does.
 
@@ -1579,7 +1579,7 @@ def test_htmx_config_restates_all_three_response_handling_entries(
     """
     The htmx-config meta swaps error bodies without breaking 2xx swaps (D-01).
 
-    htmx 2.0.8 merges meta config shallowly, so a meta holding only the
+    htmx 2.0.10 merges meta config shallowly, so a meta holding only the
     ``[45]..`` entry would replace the whole array and stop every 2xx swap.
     All three entries have to be restated.
     """

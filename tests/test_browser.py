@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from saneless.job import Job, JobStore
     from saneless.scanner.base import PageSink, ScanSettings
 
-import httpx
+import httpx2
 import pytest
 import uvicorn
 from PIL import Image
@@ -73,12 +73,15 @@ from saneless.checks import (
     check_state_label,
 )
 from saneless.config import (
+    CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
     ScannerConfig,
     Settings,
     WebConfig,
+    discover_config,
 )
 from saneless.job import JobResult
 from saneless.paperless import UploadResult
@@ -316,10 +319,10 @@ def _start_uvicorn(app: ASGIApp, host: str) -> _RunningUvicorn:
     thread.start()
     running = _RunningUvicorn(server=server, thread=thread, sock=sock, port=port)
     try:
-        httpx.get(
+        httpx2.get(
             f"http://127.0.0.1:{port}/static/app.css", timeout=10
         ).raise_for_status()
-    except httpx.HTTPError as exc:
+    except httpx2.HTTPError as exc:
         _stop_uvicorn(running)
         msg = f"Uvicorn server failed to start: {exc}"
         raise RuntimeError(msg) from exc
@@ -434,7 +437,9 @@ def _is_allowed(url: str, allowlist: list[str]) -> bool:
 # every one of them must be covered by a ``blocked`` assertion at teardown. One
 # list may be shared by several contexts, which is the point -- a single
 # assertion then speaks for all of them.
-def _make_gate(blocked: list[str], allowlist: list[str]) -> Callable[[Route], None]:
+def _make_gate(
+    blocked: list[str], allowlist: list[str], seen: list[str]
+) -> Callable[[Route], None]:
     """
     Build the no-egress route handler every context in this module installs.
 
@@ -445,6 +450,13 @@ def _make_gate(blocked: list[str], allowlist: list[str]) -> Callable[[Route], No
         allowlist: The base URLs a page may reach. Read when each request
             arrives rather than captured, so a base appended after the gate is
             installed still counts.
+        seen: The list every handled URL is appended to, allowed or refused
+            alike, so it answers "did this gate handle any traffic at all?".
+            An empty ``blocked`` list means nothing on its own; an empty
+            ``blocked`` beside a non-empty ``seen`` means the gate was
+            installed, saw requests, and refused none of them. Required rather
+            than defaulted, so a context added later cannot quietly opt out of
+            the very check this records.
 
     Returns:
         A handler suitable for ``context.route("**/*", ...)``.
@@ -453,6 +465,9 @@ def _make_gate(blocked: list[str], allowlist: list[str]) -> Callable[[Route], No
 
     def _gate(route: Route) -> None:
         url = route.request.url
+        # Recorded before the decision, so an allowed request counts as traffic
+        # just as a refused one does.
+        seen.append(url)
         if _is_allowed(url, allowlist):
             route.continue_()
         else:
@@ -479,10 +494,21 @@ def context(
 
     The gate itself comes from ``_make_gate`` rather than being written here, so
     a hand-made context can install the identical one; see that factory's note.
+
+    Teardown asserts the gate saw traffic before it asserts nothing was blocked,
+    because the second assertion alone would pass over a context that was never
+    routed at all -- an empty list is what a gate that does not exist produces.
     """
     blocked: list[str] = []
-    context.route("**/*", _make_gate(blocked, egress_allowlist))
+    seen: list[str] = []
+    context.route("**/*", _make_gate(blocked, egress_allowlist, seen))
     yield context
+    # Order matters: an ungated context must be reported as ungated, not handed
+    # the clean bill of health an empty ``blocked`` list would otherwise give it.
+    assert seen, (
+        "the gate handled no request at all, so the no-egress assertion below "
+        "would have passed for a context whose routing was never installed"
+    )
     assert blocked == [], f"the page tried to reach the network: {blocked}"
 
 
@@ -579,6 +605,75 @@ def scan_harness(
         assert harness.created_job_ids() == [], "a test's job rows were not deleted"
 
 
+# The probe the test below aims at the gate. ``.invalid`` is reserved so that
+# it can never resolve, so even a gate that had stopped aborting would contact
+# nothing real: the test would fail on an empty ``blocked`` list rather than
+# putting a request on somebody's server.
+_OFF_ALLOWLIST_URL = "http://egress-probe.invalid/should-never-be-reached"
+_EGRESS_PROBE_BUDGET = 5.0
+
+
+@pytest.mark.browser
+class TestTheEgressGateRefuses:
+    """
+    The positive half of the no-egress proof (ROBU-09, ROBU-11).
+
+    Every other browser test asserts that nothing was blocked, which is a claim
+    about the page. This one asserts that something *was* blocked, which is a
+    claim about the gate: that its abort path still fires and still records
+    what it refused. Without it an empty ``blocked`` list could not distinguish
+    a page wanting no internet from a gate that had quietly stopped refusing.
+    """
+
+    def test_a_request_outside_the_allowlist_is_recorded_and_aborted(
+        self,
+        browser: Browser,
+        browser_server: _BrowserServer,
+        egress_allowlist: list[str],
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        A fetch aimed off the allowlist is recorded and never leaves (ROBU-09).
+
+        The page is served by the test server first, so the probe is issued by
+        a live document through the same gate every other browser test relies
+        on. The rejection is swallowed inside the page because an aborted fetch
+        rejects, and that rejection is a consequence of the block rather than
+        the thing being proved.
+        """
+        # Not the module ``context`` fixture: its teardown asserts ``blocked``
+        # is empty, and refusing something on purpose is this test's subject.
+        # The gate installed here is the identical one, which is the reason
+        # ``_make_gate`` is a factory rather than a closure in that fixture.
+        blocked: list[str] = []
+        seen: list[str] = []
+        ctx = browser.new_context()
+        try:
+            ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            page = ctx.new_page()
+            page.goto(browser_server.url)
+            page.evaluate(
+                "(url) => { fetch(url).catch(() => {}); }", _OFF_ALLOWLIST_URL
+            )
+
+            def refusal_recorded() -> bool:
+                # The round-trip is what makes the poll work at all: the sync
+                # API only dispatches route handlers while the caller is
+                # inside a Playwright call, so a predicate that merely read
+                # the list would hold this thread and never let the gate run.
+                page.evaluate("0")
+                return bool(blocked)
+
+            assert poll_until(refusal_recorded, budget=_EGRESS_PROBE_BUDGET), (
+                f"the gate recorded no refusal within the budget: {blocked}"
+            )
+            assert blocked == [_OFF_ALLOWLIST_URL], (
+                f"the probe, and only the probe, should have been refused: {blocked}"
+            )
+        finally:
+            ctx.close()
+
+
 @pytest.mark.browser
 class TestBrowserRendering:
     """PicoCSS and semantic HTML rendering tests."""
@@ -671,7 +766,7 @@ class TestOfflinePage:
         self, page: Page, browser_server_url: str
     ) -> None:
         """
-        The vendored htmx 2.0.8 runs with all three response rules (B2, ROBU-09).
+        The vendored htmx 2.0.10 runs with all three response rules (B2, ROBU-09).
 
         htmx merges the meta config shallowly, so a config holding only the
         ``[45]..`` entry would replace the whole array and stop every 2xx swap;
@@ -680,7 +775,7 @@ class TestOfflinePage:
         coupling intact.
         """
         page.goto(browser_server_url)
-        assert page.evaluate("htmx.version") == "2.0.8"
+        assert page.evaluate("htmx.version") == "2.0.10"
         assert page.evaluate("htmx.config.responseHandling.length") == 3
         error_rule_swaps = page.evaluate(
             "htmx.config.responseHandling.find((rule) => rule.code === '[45]..').swap"
@@ -825,19 +920,20 @@ class TestFlipPromptUI:
 _COUNT_ARRAY_SCAN_BUTTONS = "document.querySelectorAll('[id=\"scan-btn\"]').length"
 
 # Counts the swaps of the two in-form controls the refresh buttons re-fetch.
-# htmx 2.0.8 strips hx-disabled-elt's `disabled` inside the request's onload
+# htmx sets and clears hx-disabled-elt's `disabled` inside the request's onload
 # handler, after the swap and before htmx:afterSettle, so once both events have
-# fired the inheritance trap has either sprung or it has not. Registered as an
-# init script so the listener exists before anything on the page can ask.
+# fired an inherited disable has either reached the button or it has not.
+# Registered as an init script so the listener exists before anything on the
+# page can ask.
 #
 # afterSettle, not afterRequest: the tag list is swapped outerHTML, and htmx
 # fires afterRequest on the element it requested *after* that swap has already
 # detached it, so the event never reaches this document-level listener. The
 # settle pass runs on the elements that are now in the document, on htmx's
 # default 20 ms settle delay -- which is later still, so it remains a sound
-# "the trap has had its chance" signal. The correspondent select is swapped
-# innerHTML and settles as itself; the new tag list settles under the same id
-# the old one carried, because the partial renders its own wrapper.
+# "the inherited disable has had its chance" signal. The correspondent select
+# is swapped innerHTML and settles as itself; the new tag list settles under
+# the same id the old one carried, because the partial renders its own wrapper.
 _RECORD_CONTROL_SWAPS = """
 window.__controlSwapsFinished = 0;
 document.addEventListener("htmx:afterSettle", (event) => {
@@ -945,15 +1041,20 @@ class TestServerOwnedScanButton:
 
         The form carries ``hx-disabled-elt="#scan-btn"``. Without
         ``hx-disinherit`` the tags and correspondents refresh buttons inherit
-        it, and on htmx 2.0.8 finishing their requests strips ``disabled`` from
-        the button the server rendered disabled -- C-10 again, on every refresh
-        during a scan (T-26-48).  The page itself no longer asks for either list
-        on load, so the two refresh clicks are what exercise the trap.
+        it, so each of their requests would take charge of the ``disabled``
+        attribute on a button the server already rendered disabled -- C-10
+        again, on every refresh during a scan (T-26-48).  What is asserted is
+        this project's behaviour and not htmx's: a button the server rendered
+        disabled is still disabled after both lists have refreshed.  The page
+        itself no longer asks for either list on load, so the two refresh
+        clicks are what exercise it.
         """
         server = scan_harness.server
         server.scanner.gate.clear()
         try:
-            response = httpx.post(server.url + "/api/scan", data={"profile": "default"})
+            response = httpx2.post(
+                server.url + "/api/scan", data={"profile": "default"}
+            )
             assert response.status_code == 200, response.text
             created = scan_harness.created_job_ids()
             assert len(created) == 1, created
@@ -1793,7 +1894,7 @@ def _fill_queue_until_rejected(url: str) -> None:
     """
     statuses: list[int] = []
     for _ in range(_FILL_ATTEMPTS):
-        response = httpx.post(url + "/api/scan", data={"profile": "default"})
+        response = httpx2.post(url + "/api/scan", data={"profile": "default"})
         statuses.append(response.status_code)
         if response.status_code == _TOO_MANY_REQUESTS:
             return
@@ -2304,13 +2405,13 @@ class TestBlockedScanButtonInABrowser:
         """
         The requests inside the form do not re-enable it (C-10, T-30-66).
 
-        On htmx 2.0.8 an inherited ``hx-disabled-elt`` strips ``disabled`` from
-        a server-disabled button the moment a child request finishes. With no
-        job active there is no one-second status poll to put it back, so a
-        blocked button that lost the attribute here would stay clickable --
-        which is exactly why the flag lives in the one button partial.  The two
-        refresh buttons are the form's own requests now that the page asks for
-        neither list on load.
+        An inherited ``hx-disabled-elt`` puts a child request in charge of the
+        button's ``disabled`` attribute, which is why the form disinherits it.
+        With no job active there is no one-second status poll to put the
+        attribute back, so a blocked button that lost it here would stay
+        clickable -- which is exactly why the flag lives in the one button
+        partial.  The two refresh buttons are the form's own requests now that
+        the page asks for neither list on load.
         """
         egress_allowlist.append(blocked_server.url)
         page.add_init_script(_RECORD_CONTROL_SWAPS)
@@ -2783,6 +2884,31 @@ _COUNT_CHECK_MESSAGE_LINES = """
 """
 
 
+# Every name column whose text does not fit the column the CSS declares for
+# it, as ``[text, text width, declared width, used width]``.
+#
+# The comparison is against ``flex-basis`` rather than against the element's
+# own box, and that is what makes this falsifiable.  ``.check-name`` is a flex
+# item with ``flex-shrink: 0``, so a name wider than the basis does not clip --
+# CSS's automatic minimum size grows the *item* instead, silently, and
+# ``scrollWidth <= clientWidth`` stays true while the column it was supposed to
+# be has stopped existing for that one row.  What the reader loses is the
+# alignment: one row's message starts further right than the other five.
+_NAME_COLUMNS_TOO_NARROW = """
+() => Array.from(document.querySelectorAll("#checks-body .check-name"), (el) => {
+    const range = document.createRange();
+    range.selectNodeContents(el);
+    const style = getComputedStyle(el);
+    return [
+        el.textContent.trim(),
+        range.getBoundingClientRect().width,
+        parseFloat(style.flexBasis),
+        el.getBoundingClientRect().width,
+    ];
+}).filter(([, text, basis]) => text > basis)
+"""
+
+
 def _check_row(page: Page, name: str) -> Locator:
     """
     Return the strip row whose name column reads exactly ``name``.
@@ -2824,6 +2950,36 @@ def cold_strip_server(
         yield server
 
 
+@pytest.fixture
+def stale_config_strip_server(
+    tmp_path: Path, egress_allowlist: list[str]
+) -> Iterator[_BrowserServer]:
+    """
+    Serve a private app that found only a file under the superseded config name.
+
+    The 2026-09-22 failure, rebuilt: a file sits in the third searched
+    directory under the old name, nothing loaded, and the appliance is running
+    on defaults.  The recording is made by the real ``discover_config`` over
+    three directories inside ``tmp_path``, so the search that the page reports
+    is a search that really ran and the host's own ``/etc`` is never touched.
+
+    The refresher is stopped for the reason ``cold_strip_server`` stops it: the
+    test asks for the probe itself, so nothing here is racing a tick.
+    """
+    candidates = tuple(
+        tmp_path / name / CONFIG_FILENAME for name in ("cfg-cwd", "cfg-xdg", "cfg-etc")
+    )
+    for candidate in candidates:
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+    candidates[2].with_name(LEGACY_CONFIG_FILENAME).write_text("", encoding="utf-8")
+    settings = _browser_test_settings(tmp_path)
+    settings._config_discovery = discover_config(candidates)
+    with _serve(settings, _BrowserTestScanner()) as server:
+        assert server.app.state.refresher.stop(), "the refresher thread did not stop"
+        egress_allowlist.append(server.url)
+        yield server
+
+
 def _probe_now(server: _BrowserServer) -> None:
     """
     Make the appliance probe and store its checks, from outside the browser.
@@ -2840,7 +2996,7 @@ def _probe_now(server: _BrowserServer) -> None:
         server: The private server to probe.
 
     """
-    response = httpx.post(f"{server.url}/api/checks/refresh", timeout=30.0)
+    response = httpx2.post(f"{server.url}/api/checks/refresh", timeout=30.0)
     assert response.status_code == 200, response.status_code
 
 
@@ -3114,11 +3270,17 @@ class TestStatusStripInChromium:
             assert name_box is not None, index
             name_columns.append((name_box["x"], name_box["width"]))
 
-        # The fixed gutter and name column still hold at 320 px, so the five
+        # The fixed gutter and name column still hold at 320 px, so the six
         # messages still start at one x. A layout that "fitted" by letting the
         # name column collapse per row would clear the overflow check above and
         # be unreadable.
         assert len(set(name_columns)) == 1, name_columns
+
+        # And one x because the column is wide enough for the longest name,
+        # not because nothing has outgrown it yet. This is what the width in
+        # app.css is answerable to.
+        too_narrow = page.evaluate(_NAME_COLUMNS_TOO_NARROW)
+        assert too_narrow == [], too_narrow
 
         # And the fit is a wrap, not a squeeze: at least one message occupies
         # more than one line box. .check-next is excluded by the probe, because
@@ -3133,6 +3295,53 @@ class TestStatusStripInChromium:
         assert refresh is not None
         assert refresh["height"] >= 44, refresh
         assert refresh["x"] + refresh["width"] <= viewport["width"], refresh
+
+    def test_every_check_name_fits_its_column_at_the_desktop_width(
+        self, page: Page, cold_strip_server: _BrowserServer
+    ) -> None:
+        """
+        The name column is sized for the longest name, at the default viewport.
+
+        The 320 px test asserts this too, but it asserts it about a layout
+        that is already under pressure; a column too narrow for one name is a
+        mis-sized constant, not a narrow-screen effect, and it should be
+        caught where the page is otherwise comfortable.
+        """
+        server = cold_strip_server
+        _probe_now(server)
+        page.goto(server.url)
+        expect(page.locator("#checks-body .check-row")).to_have_count(len(CheckKey))
+
+        too_narrow = page.evaluate(_NAME_COLUMNS_TOO_NARROW)
+        assert too_narrow == [], too_narrow
+
+    def test_a_leftover_old_name_config_is_the_first_row_and_is_red(
+        self, page: Page, stale_config_strip_server: _BrowserServer, tmp_path: Path
+    ) -> None:
+        """
+        The 2026-09-22 evening, as a household member would now have read it.
+
+        The strip that night showed four red or amber rows and named no cause.
+        This asserts the row that names it: first on the page, red, carrying
+        the rename and the file's documented spelling -- and carrying no host
+        path, which is the one thing the exception to the no-path rule is not
+        allowed to become.
+        """
+        server = stale_config_strip_server
+        _probe_now(server)
+        page.goto(server.url)
+
+        row = _check_row(page, "Configuration")
+        expect(row).to_have_count(1)
+        expect(row.locator(".check-glyph")).to_have_class(
+            f"check-glyph {check_state_class(CheckState.FAIL)}"
+        )
+        expect(row).to_contain_text(f"saneless now reads {CONFIG_FILENAME}")
+        expect(row).to_contain_text(f"/etc/saneless/{LEGACY_CONFIG_FILENAME}")
+
+        first = page.locator("#checks-body .check-row").nth(0)
+        expect(first.locator(".check-name")).to_have_text("Configuration")
+        assert str(tmp_path) not in page.locator("#checks-body").inner_text()
 
 
 # How long the strip is watched after it has stopped, in milliseconds. Three of
@@ -3410,7 +3619,7 @@ class TestPollEndsOnAnErrorResponse:
 
     There was a defect here, and the previous version of this class concluded
     there was not. ``render_error`` set ``HX-Retarget: #status-message`` on
-    every htmx error response, and htmx 2.0.8 applies ``HX-Retarget`` to the
+    every htmx error response, and htmx 2.0.10 applies ``HX-Retarget`` to the
     response's target *before* it decides what to swap. So a 4xx from
     ``GET /api/checks`` was written into ``#status-message``: ``#checks-body``
     was never replaced, kept its ``every 2s`` trigger, and went on polling and
@@ -4170,11 +4379,14 @@ class TestTwoBrowsersOneStack:
         job_store: JobStore = server.app.state.job_store
 
         blocked: list[str] = []
+        # One ``seen`` list for the same reason as one ``blocked`` list: both
+        # pages are navigated below, so a single record speaks for both gates.
+        seen: list[str] = []
         owner_ctx = browser.new_context()
         viewer_ctx = browser.new_context()
         try:
-            owner_ctx.route("**/*", _make_gate(blocked, egress_allowlist))
-            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist))
+            owner_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
             owner_page = owner_ctx.new_page()
             viewer_page = viewer_ctx.new_page()
 
@@ -4253,7 +4465,15 @@ class TestTwoBrowsersOneStack:
             owner_ctx.close()
             viewer_ctx.close()
             # One list, two contexts: this single assertion speaks for both,
-            # which is the contract _make_gate's note states.
+            # which is the contract _make_gate's note states. Order matters for
+            # the same reason it does in the context fixture -- these two are
+            # built by hand, so an assertion on ``blocked`` alone would give a
+            # clean bill of health to contexts whose routing was never
+            # installed, which is the hole the gate exists to close.
+            assert seen, (
+                "neither gate handled a request, so the no-egress assertion "
+                "below would have passed for two contexts that were never gated"
+            )
             assert blocked == [], f"a page tried to reach the network: {blocked}"
 
     def test_abort_asks_first_and_does_nothing_when_the_answer_is_no(

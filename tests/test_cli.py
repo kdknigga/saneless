@@ -33,10 +33,14 @@ import saneless.cli as cli_module
 import saneless.vocabulary as vocabulary_module
 from saneless.cli import ClickFlipCoordinator, _failure_line, _truncate, cli
 from saneless.config import (
+    CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
+    ConfigDiscovery,
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
     Settings,
+    discover_config,
 )
 from saneless.exceptions import (
     ConfigError,
@@ -71,7 +75,7 @@ from saneless.vocabulary import (
 from tests.conftest import StubScannerBackend, build_settings, scan_batch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator
+    from collections.abc import AsyncIterator, Callable, Generator
 
     from click.testing import Result
 
@@ -134,8 +138,26 @@ def _patch_cli(
         ``auto-profiles`` writes to ``settings.config_path`` (D-16); a stub that
         dropped the path would send its writes to ``./saneless.toml`` in the
         suite's working directory.
+
+        The search itself is recorded too, because the stale-file warning and
+        ``auto-profiles``'s refusal read the recording rather than the path.  A
+        recording a test attached to these settings stands, and the path is
+        derived from it, which is the direction the real loader derives them
+        in.
         """
-        settings._config_path = Path(config_path) if config_path else None
+        if config_path:
+            explicit = Path(config_path)
+            settings._config_path = explicit
+            settings._config_discovery = ConfigDiscovery(
+                explicit=explicit,
+                searched=(),
+                found=(explicit,),
+                loaded=explicit,
+                stale=(),
+            )
+            return settings
+        injected = settings.config_discovery
+        settings._config_path = None if injected is None else injected.loaded
         return settings
 
     def _no_sane_check() -> None:
@@ -1656,9 +1678,9 @@ class TestCliFlags:
 
         monkeypatch.setattr("saneless.cli.SaneBackend", MockSaneBackend)
 
-        result = runner.invoke(cli, ["--config", "/path/to/config.toml", "devices"])
+        result = runner.invoke(cli, ["--config", "/path/to/saneless.toml", "devices"])
         assert result.exit_code == 0
-        assert captured["config_path"] == "/path/to/config.toml"
+        assert captured["config_path"] == "/path/to/saneless.toml"
 
 
 class TestLegacyDuplexWarningReachesLogFile:
@@ -2515,6 +2537,67 @@ def _record_sockets(monkeypatch: pytest.MonkeyPatch) -> list[socket.socket]:
     return made
 
 
+@contextlib.asynccontextmanager
+async def _refusing_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """
+    Refuse to start, the way a lifespan with a failed pre-flight would.
+
+    The ``yield`` below the raise is unreachable on purpose: it is what makes
+    this function an async generator, which is what ``asynccontextmanager``
+    needs to accept it at all.
+
+    Args:
+        _app: The app FastAPI hands to its lifespan; this one ignores it.
+
+    Yields:
+        Nothing -- the raise happens before the yield is ever reached.
+
+    """
+    msg = "the lifespan refuses to start"
+    raise RuntimeError(msg)
+    yield
+
+
+def _invoke_on_a_worker_thread(runner: CliRunner, args: list[str]) -> Result:
+    """
+    Invoke the CLI on a worker thread, the way a fresh process would run it.
+
+    ``uvicorn.Server.run`` calls ``asyncio.run``, which refuses to start on a
+    thread that already has a running event loop. A real ``saneless serve``
+    process never does. The suite's main thread does: ``tests/test_browser.py``
+    holds Playwright's sync dispatcher loop open on it for the rest of the
+    session, so any test reaching real uvicorn on the main thread after the
+    browser module has run reports the CLI's unexpected-error code instead of
+    the code under test. That is an ordering artefact, not CLI behaviour, and
+    it makes the exit-code assertion pass alone and fail in a full run.
+
+    Handing the invocation to a worker thread restores the production
+    precondition without stubbing uvicorn or weakening what is asserted.
+
+    The thread is a daemon joined with a timeout below pytest's own, so a
+    worker that wedges inside uvicorn fails this test with the message below
+    instead of hanging the run: a pool's ``shutdown(wait=True)`` would rejoin
+    the stuck worker and a non-daemon thread would hold interpreter exit open.
+
+    Args:
+        runner: The CliRunner to invoke with.
+        args: The command line to pass to ``cli``.
+
+    Returns:
+        The Result the runner produced on the worker thread.
+
+    """
+    outcome: list[Result] = []
+    thread = threading.Thread(
+        target=lambda: outcome.append(runner.invoke(cli, args)), daemon=True
+    )
+    thread.start()
+    thread.join(timeout=30)
+    assert not thread.is_alive(), "the CLI invocation did not finish"
+    assert outcome, "the CLI invocation produced no result"
+    return outcome[0]
+
+
 @pytest.mark.usefixtures("uvicorn_loggers_restored")
 class TestServeCommand:
     """
@@ -2541,6 +2624,15 @@ class TestServeCommand:
             return object()
 
         monkeypatch.setattr("saneless.cli.create_app", fake_create_app)
+
+    @staticmethod
+    def _refusing_create_app(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace create_app with a real app whose lifespan refuses to start."""
+
+        def failing_create_app(*_args: object, **_kwargs: object) -> FastAPI:
+            return FastAPI(lifespan=_refusing_lifespan)
+
+        monkeypatch.setattr("saneless.cli.create_app", failing_create_app)
 
     def test_serve_binds_the_configured_defaults(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2856,7 +2948,7 @@ class TestServeCommand:
         With ``-v`` uvicorn still gets the configured level, not ``debug``.
 
         ``-v`` is saneless's own detail; turning uvicorn up with it would drag
-        its and httpx's debug output into the log.
+        its and httpx2's debug output into the log.
         """
         runs = _fake_server_run(monkeypatch)
         runner, _ = _patch_cli(monkeypatch)
@@ -2981,6 +3073,49 @@ class TestServeCommand:
         assert _failure_lines(result) == [
             f"Serving on http://127.0.0.1:{run.port}",
             f"The web server could not start on http://127.0.0.1:{run.port}; "
+            "the cause is in the preceding log lines",
+        ]
+        assert "Traceback" not in result.output
+
+    def test_serve_exits_two_when_the_lifespan_refuses(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Uvicorn's own start-up exit code never becomes this CLI's (DEP-09, D-13).
+
+        Nothing about uvicorn is stubbed here (D-14): ``serve`` binds a real
+        ephemeral loopback socket and hands it to the real
+        ``uvicorn.Server.run(sockets=...)``, so the production pre-bound-socket
+        path executes end to end. Newer uvicorn exits the process itself when
+        start-up fails, with a code that happens to be this project's Paperless
+        code, so a caller reading exit codes would be told the wrong cause.
+
+        The lifespan is made to refuse by patching ``saneless.cli.create_app``
+        rather than by pointing a configured directory somewhere unwritable
+        (the corrected D-15): the CLI's own settings pre-flight calls
+        ``validate_settings_dirs`` and exits 2 from there, before
+        ``_run_server`` is ever reached, so the configuration route would pass
+        on an unfixed tree and prove nothing.
+
+        This is the one serve test that reaches real uvicorn, so it is the one
+        that needs ``_invoke_on_a_worker_thread``; see that helper for why the
+        main thread cannot be used once the browser module has run.
+        """
+        self._refusing_create_app(monkeypatch)
+        runner, _ = _patch_cli(monkeypatch, settings=self._loopback_settings(tmp_path))
+
+        result = _invoke_on_a_worker_thread(runner, ["serve"])
+
+        assert result.exit_code == 2, result.output
+        lines = _failure_lines(result)
+        # The port is the OS's, so it is read back from the announcement and
+        # then required to be the same one the failure line names.
+        announced = re.fullmatch(r"Serving on http://127\.0\.0\.1:(\d+)", lines[0])
+        assert announced is not None, result.output
+        port = announced[1]
+        assert lines == [
+            f"Serving on http://127.0.0.1:{port}",
+            f"The web server could not start on http://127.0.0.1:{port}; "
             "the cause is in the preceding log lines",
         ]
         assert "Traceback" not in result.output
@@ -3195,7 +3330,7 @@ class TestAutoProfiles:
     ) -> None:
         """auto-profiles writes to the file settings were loaded from (D-16)."""
         monkeypatch.chdir(tmp_path)
-        config_file = tmp_path / "elsewhere" / "config.toml"
+        config_file = tmp_path / "elsewhere" / CONFIG_FILENAME
         config_file.parent.mkdir()
         runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
 
@@ -3321,7 +3456,7 @@ class TestAutoProfiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """SC3: --force refreshes a config held in a mounted directory."""
-        config_file = tmp_path / "config" / "config.toml"
+        config_file = tmp_path / "config" / CONFIG_FILENAME
         config_file.parent.mkdir()
         self._flatbed_config(config_file, flagged=True)
         runner, _ = _patch_cli(monkeypatch, scanner_cls=self._make_auto_scanner())
@@ -3334,7 +3469,7 @@ class TestAutoProfiles:
         assert "Refreshed: " in result.output
         flatbed = tomllib.loads(config_file.read_text())["profiles"]["flatbed"]
         assert flatbed["default_tags"] == [4]
-        assert [path.name for path in config_file.parent.iterdir()] == ["config.toml"]
+        assert [path.name for path in config_file.parent.iterdir()] == [CONFIG_FILENAME]
 
     def test_auto_profiles_no_force_skips_existing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -3366,6 +3501,409 @@ class TestAutoProfiles:
         for name in ("default", "flatbed", "adf"):
             assert repr(name) in line
         assert "Added: " not in result.output
+
+
+# What the superseded-name file holds in these tests.  Byte-for-byte
+# comparable, so "auto-profiles left it alone" is an assertion and not a hope.
+_STALE_TEXT = "# left behind\n[paperless]\nurl = 'http://nas:8000'\n"
+
+
+def _stale_only_discovery(tmp_path: Path) -> ConfigDiscovery:
+    """
+    Record a search that found nothing but a file under the superseded name.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+
+    Returns:
+        The recording: no ``saneless.toml``, one stale ``<tmp_path>/etc/config.toml``.
+
+    """
+    directory = tmp_path / "etc"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / LEGACY_CONFIG_FILENAME).write_text(_STALE_TEXT)
+    return discover_config((directory / CONFIG_FILENAME,))
+
+
+def _leftover_discovery(tmp_path: Path) -> ConfigDiscovery:
+    """
+    Record a search that loaded a file and found an old one beside it.
+
+    Args:
+        tmp_path: pytest's per-test directory.
+
+    Returns:
+        The recording, in the ``LOADED_WITH_LEFTOVER`` shape.
+
+    """
+    directory = tmp_path / "etc"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / CONFIG_FILENAME).write_text("# in use\n")
+    (directory / LEGACY_CONFIG_FILENAME).write_text(_STALE_TEXT)
+    return discover_config((directory / CONFIG_FILENAME,))
+
+
+class TestAutoProfilesRefusesAStaleOnlyConfig:
+    """
+    D-15: the one CLI write refuses while a superseded-name file is the only one.
+
+    ``auto-profiles``'s target with nothing loaded is ``./saneless.toml``, and
+    that file is the *first* thing the next start looks at.  Writing a
+    ``saneless.toml`` while an unread ``config.toml`` still holds the only
+    copy of the Paperless URL and token would not lose those values but would
+    permanently shadow them: the search would stop at the new file and the row
+    saying to rename the old one would go green, with the appliance still
+    running on defaults.
+
+    So the refusal is not tidiness -- it is the difference between a fixable
+    situation and one whose evidence has been buried.
+    """
+
+    @staticmethod
+    def _counting_scanner(calls: list[str]) -> type:
+        """
+        Build a scanner class that records every device enumeration.
+
+        Args:
+            calls: The list each ``get_devices`` call appends to.
+
+        Returns:
+            A backend class for ``_patch_cli``.
+
+        """
+
+        class _CountingScanner(StubScannerBackend):
+            """A backend that records being asked for devices."""
+
+            def __init__(self, host: str = "") -> None:
+                """Accept the host argument ``SaneBackend`` takes."""
+
+            def get_devices(self) -> list[DeviceInfo]:
+                """
+                Record the call and report one device.
+
+                Returns:
+                    A single flatbed.
+
+                """
+                calls.append("get_devices")
+                return [DeviceInfo("test:device", "Test", "Scanner", "scanner")]
+
+            def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+                """
+                Report capabilities the generator can work from.
+
+                Args:
+                    device_id: Ignored.
+
+                Returns:
+                    Two sources, three resolutions, two modes.
+
+                """
+                return DeviceCapabilities(
+                    sources=["Flatbed", "ADF"],
+                    resolutions=[150, 300, 600],
+                    modes=["Color", "Gray"],
+                )
+
+        return _CountingScanner
+
+    def _refuse(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, calls: list[str]
+    ) -> Result:
+        """
+        Run ``auto-profiles`` over a stale-only search.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            calls: Where the scanner records its device enumerations.
+
+        Returns:
+            The runner's result.
+
+        """
+        monkeypatch.chdir(tmp_path)
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = _stale_only_discovery(tmp_path)
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=self._counting_scanner(calls),
+        )
+        return runner.invoke(cli, ["auto-profiles"])
+
+    def test_it_exits_two_and_says_to_rename_the_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Exit 2 through the group guard, exactly as the no-scanner refusal does."""
+        result = self._refuse(monkeypatch, tmp_path, [])
+        stale = tmp_path / "etc" / LEGACY_CONFIG_FILENAME
+
+        assert result.exit_code == 2
+        lines = _failure_lines(result)
+        assert len(lines) == 1
+        assert f"saneless now reads {CONFIG_FILENAME}" in lines[0]
+        assert f"Rename {stale.absolute()} to {CONFIG_FILENAME}" in lines[0]
+
+    def test_the_sentence_is_printed_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The refusal replaces the stderr warning; it does not follow it.
+
+        Two copies of one sentence is how a reader learns the output repeats
+        itself and stops reading it.
+        """
+        result = self._refuse(monkeypatch, tmp_path, [])
+
+        assert result.output.count(f"saneless now reads {CONFIG_FILENAME}") == 1
+        assert "Warning: " not in result.output
+
+    def test_it_creates_no_shadowing_config_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The refusal is about a file that must not appear, so look for it."""
+        self._refuse(monkeypatch, tmp_path, [])
+
+        assert not (tmp_path / CONFIG_FILENAME).exists()
+        assert not (tmp_path / "etc" / CONFIG_FILENAME).exists()
+
+    def test_it_leaves_the_stale_files_bytes_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Detecting a name is not supporting it: the file is stat-ed, never touched."""
+        self._refuse(monkeypatch, tmp_path, [])
+
+        stale = tmp_path / "etc" / LEGACY_CONFIG_FILENAME
+        assert stale.read_text() == _STALE_TEXT
+
+    def test_it_refuses_before_asking_the_scanner_for_devices(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        A configuration refusal must not need a scanner to be reached.
+
+        Placing it after the device call would mean an operator with the file
+        in the wrong place *and* no scanner attached is told about the scanner
+        -- the one of the two they cannot fix from the keyboard.
+        """
+        calls: list[str] = []
+        result = self._refuse(monkeypatch, tmp_path, calls)
+
+        assert result.exit_code == 2
+        assert calls == []
+
+
+class TestAutoProfilesWriteTargetFollowsTheSearch:
+    """
+    CFG-05/D-13: the write goes to the file the search loaded, under its new name.
+
+    ``--config`` was already covered; these are the two paths where no explicit
+    path was given and the recording is the only thing that says where the
+    configuration lives.
+    """
+
+    def test_it_writes_to_the_file_the_search_loaded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A loaded XDG file is written in place, not shadowed by a new cwd file."""
+        monkeypatch.chdir(tmp_path)
+        loaded = tmp_path / "xdg" / CONFIG_FILENAME
+        loaded.parent.mkdir()
+        loaded.write_text("# loaded by the search\n")
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config((loaded,))
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+
+        result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert "flatbed" in tomllib.loads(loaded.read_text())["profiles"]
+        assert not (tmp_path / CONFIG_FILENAME).exists()
+
+    def test_a_search_that_found_nothing_writes_the_cwd_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With nothing loaded and nothing stale, the new name in the cwd is the target."""
+        monkeypatch.chdir(tmp_path)
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = discover_config(
+            (tmp_path / "etc" / CONFIG_FILENAME,)
+        )
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=settings,
+            scanner_cls=TestAutoProfiles._make_auto_scanner(),
+        )
+
+        result = runner.invoke(cli, ["auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        written = tmp_path / CONFIG_FILENAME
+        assert "flatbed" in tomllib.loads(written.read_text())["profiles"]
+
+
+class TestStaleConfigWarningReachesTheTerminal:
+    """
+    D-16: a one-shot command says on stderr what its log file says.
+
+    The startup log already names the ignored file, but a one-shot command's
+    log goes to ``log_file`` and is read afterwards, if at all.  The operator
+    watching the command run sees nothing -- which is the shape of the
+    2026-09-22 failure, where every surface that could have said it was one the
+    reader was not looking at.
+
+    ``serve`` is exempt because its records already stream to stderr: a service
+    printing the sentence twice per start is noise in the one stream an
+    operator does read.
+    """
+
+    @staticmethod
+    def _warnings(result: Result) -> list[str]:
+        """
+        Return the terminal warning lines of a command's stderr.
+
+        Args:
+            result: The runner's result.
+
+        Returns:
+            Every stderr line starting with the warning prefix.
+
+        """
+        return [
+            line for line in result.stderr.splitlines() if line.startswith("Warning: ")
+        ]
+
+    def _devices(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        discovery: ConfigDiscovery | None,
+    ) -> Result:
+        """
+        Run a one-shot command over a recorded search.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            discovery: The recording to attach, or None for settings with none.
+
+        Returns:
+            The runner's result.
+
+        """
+        settings = _make_settings(tmp_path)
+        if discovery is not None:
+            settings._config_discovery = discovery
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+        return runner.invoke(cli, ["devices"])
+
+    def test_a_stale_only_search_warns_once_with_the_rows_words(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """One line, carrying the Configuration row's message and its next step."""
+        result = self._devices(monkeypatch, tmp_path, _stale_only_discovery(tmp_path))
+        stale = tmp_path / "etc" / LEGACY_CONFIG_FILENAME
+
+        assert result.exit_code == 0
+        warnings = self._warnings(result)
+        assert len(warnings) == 1
+        assert f"saneless now reads {CONFIG_FILENAME}" in warnings[0]
+        assert f"Rename {stale.absolute()} to {CONFIG_FILENAME}" in warnings[0]
+
+    def test_a_leftover_beside_a_loaded_file_warns_too(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The amber state is warned about as well as the red one.
+
+        It is the state an upgraded Docker deployment lands in, and the old
+        file there can hold the only copy of the URL and token -- so the
+        terminal says to move before it says to delete (D-17).
+        """
+        result = self._devices(monkeypatch, tmp_path, _leftover_discovery(tmp_path))
+        stale = tmp_path / "etc" / LEGACY_CONFIG_FILENAME
+
+        warnings = self._warnings(result)
+        assert len(warnings) == 1
+        assert f"an old {LEGACY_CONFIG_FILENAME} is being ignored" in warnings[0]
+        assert f"Move anything you still need from {stale.absolute()}" in warnings[0]
+        assert warnings[0].index("Move") < warnings[0].index("then delete")
+
+    def test_a_loaded_file_with_nothing_beside_it_prints_no_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A healthy appliance gets a quiet terminal."""
+        loaded = tmp_path / "etc" / CONFIG_FILENAME
+        loaded.parent.mkdir()
+        loaded.write_text("# in use\n")
+        result = self._devices(monkeypatch, tmp_path, discover_config((loaded,)))
+
+        assert self._warnings(result) == []
+
+    def test_no_config_file_at_all_prints_no_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An environment-only deployment is not being warned at every command.
+
+        The amber Configuration row and the log's searched list already cover
+        it; a stderr line on every invocation would be a warning about a
+        supported setup.
+        """
+        result = self._devices(
+            monkeypatch,
+            tmp_path,
+            discover_config((tmp_path / "etc" / CONFIG_FILENAME,)),
+        )
+
+        assert self._warnings(result) == []
+
+    @pytest.mark.parametrize(("shape", "expected"), [("service", 0), ("one-shot", 1)])
+    def test_only_the_one_shot_shape_prints_the_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        shape: str,
+        expected: int,
+    ) -> None:
+        """
+        ``serve``'s own log already carries the sentence to stderr.
+
+        Asserted at ``_load_cli_settings`` rather than by starting a server,
+        because the split is a parameter of that function and starting uvicorn
+        would test a great deal else.  Both shapes are run in one test so that
+        the exemption cannot be satisfied by printing nowhere at all.
+
+        Args:
+            monkeypatch: pytest's patcher.
+            tmp_path: pytest's per-test directory.
+            capsys: Captures the echo, which goes to the real stderr here.
+            shape: "service" for the streaming shape ``serve`` asks for,
+                "one-shot" for every other command.
+            expected: How many warning lines that shape should print.
+
+        """
+        settings = _make_settings(tmp_path)
+        settings._config_discovery = _stale_only_discovery(tmp_path)
+        _patch_cli(monkeypatch, settings=settings)
+        context = click.Context(cli, obj={})
+
+        loaded = cli_module._load_cli_settings(context, stream_logs=shape == "service")
+
+        assert loaded is settings
+        printed = [
+            line
+            for line in capsys.readouterr().err.splitlines()
+            if line.startswith("Warning: ")
+        ]
+        assert len(printed) == expected
 
 
 class TestTruncation:
@@ -3599,7 +4137,7 @@ class TestExitCodes:
 
         def bad_load(*_args: object, **_kwargs: object) -> Settings:
             msg = (
-                "Configuration error in /etc/saneless/config.toml:\n"
+                "Configuration error in /etc/saneless/saneless.toml:\n"
                 "  line 12, column 5: Invalid value"
             )
             raise ConfigError(msg)
@@ -3610,7 +4148,7 @@ class TestExitCodes:
 
         assert result.exit_code == 2
         assert _failure_lines(result) == [
-            "Configuration error in /etc/saneless/config.toml:",
+            "Configuration error in /etc/saneless/saneless.toml:",
             "  line 12, column 5: Invalid value",
         ]
         assert "Traceback" not in result.output
@@ -4650,8 +5188,7 @@ class TestScanTokenRefusal:
             monkeypatch, settings=_token_settings(tmp_path, "changeme")
         )
 
-        with runner.isolated_filesystem():
-            result = runner.invoke(cli, ["auto-profiles"])
+        result = runner.invoke(cli, ["auto-profiles"])
 
         assert result.exit_code == 0, result.output
 

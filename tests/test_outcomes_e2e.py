@@ -16,9 +16,9 @@ Exactly two things are stubbed, and nothing else:
   into the pipeline's own sink, because there is no SANE device in CI.  It is
   the real ``SpooledPageSink`` that writes them and the real records that come
   back, so the pages this module's PDFs embed are real files;
-* **the HTTP layer** -- an ``httpx.MockTransport`` passed through
+* **the HTTP layer** -- an ``httpx2.MockTransport`` passed through
   ``PaperlessClient(..., transport=...)``, the seam ``tests/test_paperless.py``
-  uses throughout.  It sits *below* ``httpx.Client``, so the real
+  uses throughout.  It sits *below* ``httpx2.Client``, so the real
   ``upload_document`` and ``poll_task`` bodies execute, retries and all.
 
 Everything else is production code: real PDF assembly, real empty-page
@@ -58,7 +58,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 from unittest.mock import MagicMock
 
-import httpx
+import httpx2
 import pikepdf
 import pytest
 from PIL import Image, ImageDraw
@@ -158,7 +158,7 @@ _SCANNER_MESSAGE = "Scanner error on page 4: Document feeder jammed"
 _SCANNER_FAILURE = ScanError(_SCANNER_MESSAGE)
 
 
-def _unexpected(request: httpx.Request) -> httpx.Response:
+def _unexpected(request: httpx2.Request) -> httpx2.Response:
     """
     Answer a request no case expected, in a way that names itself.
 
@@ -174,7 +174,7 @@ def _unexpected(request: httpx.Request) -> httpx.Response:
         A 418 whose body names the offending method and path.
 
     """
-    return httpx.Response(
+    return httpx2.Response(
         418,
         text=(
             f"the end-to-end transport was not expecting "
@@ -194,7 +194,7 @@ def _v9_tasks(task_id: str, status: str) -> list[dict[str, object]]:
         status: The uppercase status to report.
 
     Returns:
-        The decoded body, ready to hand to ``httpx.Response(json=...)``.
+        The decoded body, ready to hand to ``httpx2.Response(json=...)``.
 
     """
     return [{"task_id": task_id, "status": status}]
@@ -216,7 +216,7 @@ def _v10_tasks(task_id: str, status: str, error_message: str) -> dict[str, objec
         error_message: The failure text, nested where v10 puts it.
 
     Returns:
-        The decoded body, ready to hand to ``httpx.Response(json=...)``.
+        The decoded body, ready to hand to ``httpx2.Response(json=...)``.
 
     """
     task: dict[str, object] = {
@@ -227,7 +227,7 @@ def _v10_tasks(task_id: str, status: str, error_message: str) -> dict[str, objec
     return {"count": 1, "next": None, "previous": None, "results": [task]}
 
 
-def _accepting_handler() -> Callable[[httpx.Request], httpx.Response]:
+def _accepting_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     """
     Accept every upload and report SUCCESS on the first poll, in the v9 shape.
 
@@ -243,22 +243,22 @@ def _accepting_handler() -> Callable[[httpx.Request], httpx.Response]:
     """
     issued: list[str] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == _DOCUMENTS_PATH:
             task_id = f"e2e-task-{len(issued) + 1}"
             issued.append(task_id)
-            return httpx.Response(200, json=task_id)
+            return httpx2.Response(200, json=task_id)
         if request.url.path == _TASKS_PATH:
             polled = str(request.url.params.get("task_id", ""))
             if polled not in issued:
                 return _unexpected(request)
-            return httpx.Response(200, json=_v9_tasks(polled, "SUCCESS"))
+            return httpx2.Response(200, json=_v9_tasks(polled, "SUCCESS"))
         return _unexpected(request)
 
     return handler
 
 
-def _paperless_failure_handler() -> Callable[[httpx.Request], httpx.Response]:
+def _paperless_failure_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     """
     Accept the upload, then report that paperless-ngx refused the document.
 
@@ -272,11 +272,11 @@ def _paperless_failure_handler() -> Callable[[httpx.Request], httpx.Response]:
 
     """
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == _DOCUMENTS_PATH:
-            return httpx.Response(200, json=_FAILURE_TASK)
+            return httpx2.Response(200, json=_FAILURE_TASK)
         if request.url.path == _TASKS_PATH:
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json=_v10_tasks(_FAILURE_TASK, "failure", _PAPERLESS_MESSAGE),
             )
@@ -285,7 +285,7 @@ def _paperless_failure_handler() -> Callable[[httpx.Request], httpx.Response]:
     return handler
 
 
-def _never_finishing_handler() -> Callable[[httpx.Request], httpx.Response]:
+def _never_finishing_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     """
     Accept the upload, then answer every poll with an empty v10 page.
 
@@ -299,11 +299,11 @@ def _never_finishing_handler() -> Callable[[httpx.Request], httpx.Response]:
 
     """
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == _DOCUMENTS_PATH:
-            return httpx.Response(200, json=_PENDING_TASK)
+            return httpx2.Response(200, json=_PENDING_TASK)
         if request.url.path == _TASKS_PATH:
-            return httpx.Response(
+            return httpx2.Response(
                 200,
                 json={"count": 0, "next": None, "previous": None, "results": []},
             )
@@ -312,7 +312,7 @@ def _never_finishing_handler() -> Callable[[httpx.Request], httpx.Response]:
     return handler
 
 
-def _server_error_handler() -> Callable[[httpx.Request], httpx.Response]:
+def _server_error_handler() -> Callable[[httpx2.Request], httpx2.Response]:
     """
     Refuse every upload with a 500, so the consume directory is the only route.
 
@@ -324,9 +324,9 @@ def _server_error_handler() -> Callable[[httpx.Request], httpx.Response]:
 
     """
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request: httpx2.Request) -> httpx2.Response:
         if request.url.path == _DOCUMENTS_PATH:
-            return httpx.Response(500, text="paperless-ngx is restarting")
+            return httpx2.Response(500, text="paperless-ngx is restarting")
         return _unexpected(request)
 
     return handler
@@ -374,7 +374,7 @@ class _Case:
     """
 
     label: str
-    handler_factory: Callable[[], Callable[[httpx.Request], httpx.Response]]
+    handler_factory: Callable[[], Callable[[httpx2.Request], httpx2.Response]]
     expected_state: JobState
     expected_outcome: ScanOutcome | None
     expected_pages: tuple[int | None, int | None, int | None]
@@ -728,7 +728,7 @@ class TestFiveOutcomesEndToEnd:
             # is identical at any retry count -- exhausting them is what
             # triggers it.
             max_retries=1,
-            transport=httpx.MockTransport(case.handler_factory()),
+            transport=httpx2.MockTransport(case.handler_factory()),
         )
         worker = ScanWorker(
             _build_scanner(case.scan_passes),
@@ -791,7 +791,7 @@ class TestAPartialScanSurvivesTheWorker:
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
             max_retries=1,
-            transport=httpx.MockTransport(_accepting_handler()),
+            transport=httpx2.MockTransport(_accepting_handler()),
         )
         worker = ScanWorker(
             _jamming_scanner(3, _SCANNER_FAILURE), paperless, settings, store
@@ -857,7 +857,7 @@ class TestFlipTimeoutReleasesTheWorker:
             token=settings.paperless.token.get_secret_value(),
             consume_dir=settings.paperless.consume_dir,
             max_retries=1,
-            transport=httpx.MockTransport(_accepting_handler()),
+            transport=httpx2.MockTransport(_accepting_handler()),
         )
         # Pass A of the timed-out job, then the single pass of the simplex job
         # that follows it.  No third batch: the timed-out job must never reach

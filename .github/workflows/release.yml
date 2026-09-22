@@ -63,6 +63,7 @@ jobs:
           # This workflow is tag-triggered and publishing, so a cache entry
           # written by a lower-privilege ref must never be restored into it.
           enable-cache: false
+          version: "0.12.17"
       # A hyphen in the tag means a pre-release, by semver's own rule. The URL
       # is computed here rather than inlined on the publish step so the action
       # always receives a non-empty value: whether it treats an empty

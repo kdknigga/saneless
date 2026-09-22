@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="light dark">
     {# htmx drops 4xx/5xx bodies by default; this makes it swap them, so a
-       rejected request shows its message. htmx 2.0.8 merges meta config
+       rejected request shows its message. htmx 2.0.10 merges meta config
        shallowly, so all three entries are restated: a meta holding only the
        [45].. entry would replace the array and stop every 2xx swap. #}
     <meta name="htmx-config"
@@ -14,8 +14,8 @@
     <link rel="stylesheet" href="/static/vendor/pico-2.1.1.min.css"
           integrity="sha384-L1dWfspMTHU/ApYnFiMz2QID/PlP1xCW9visvBdbEkOLkSSWsP6ZJWhPw6apiXxU">
     <link rel="stylesheet" href="/static/app.css">
-    <script src="/static/vendor/htmx-2.0.8.min.js"
-            integrity="sha384-/TgkGk7p307TH7EXJDuUlgG3Ce1UVolAOFopFekQkkXihi5u/6OCvVKyz1W+idaz"></script>
+    <script src="/static/vendor/htmx-2.0.10.min.js"
+            integrity="sha384-H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V"></script>
 </head>
 <body>
     <header class="container">

@@ -35,7 +35,7 @@ This applies to bind mounts only. A named or anonymous volume -- what
 `/var/lib/saneless` gets -- inherits `1000:1000` from the image the first time
 it is used, so durable state needs no fix-up. A bind mount keeps whatever
 ownership the host directory already has, and without write access there
-saneless cannot rewrite `config.toml` when it saves a generated profile. The
+saneless cannot rewrite `saneless.toml` when it saves a generated profile. The
 shipped `docker-compose.yml` also carries a commented `user:` line for running
 the container as your own UID instead.
 
@@ -56,7 +56,7 @@ Docker's restart policies act only when a container exits, so an unhealthy conta
 
 | Mount Point | Purpose | Required |
 |-------------|---------|----------|
-| `/etc/saneless` | Configuration directory holding `config.toml` (mount read-write; a missing `config.toml` means defaults plus environment variables) | Recommended |
+| `/etc/saneless` | Configuration directory holding `saneless.toml` (mount read-write; a missing `saneless.toml` means defaults plus environment variables). A `config.toml` left here from an earlier release is **not** read -- the Configuration row on the status page names it and gives the rename to `saneless.toml` | Recommended |
 | `/var/lib/saneless` | **Durable state:** the job database (`saneless.db`) and preserved scans (`failed/`) | **Yes -- do not treat as disposable** |
 | `/tmp/saneless` | Scratch space for the scan in progress; every file in it is deleted as the scan finishes | No (ephemeral OK) |
 | `/consume` | Consume directory fallback for file-based ingestion | No (only if using fallback) |
@@ -64,13 +64,13 @@ Docker's restart policies act only when a container exits, so an unhealthy conta
 `/consume` is the path the shipped `docker-compose.yml` uses, as a commented
 line you uncomment. Share it with paperless-ngx -- mount the same volume at
 paperless-ngx's `PAPERLESS_CONSUMPTION_DIR` -- and **set
-`paperless.consume_dir` to the same container path in `config.toml`.** The
+`paperless.consume_dir` to the same container path in `saneless.toml`.** The
 mount alone changes nothing: saneless falls back only when `consume_dir` names
 a directory. See [Consume directory
 fallback](../explanation/consume-directory-fallback.md) for when it activates
 and what it costs.
 
-Mount the configuration *directory* (`./config:/etc/saneless`), not `config.toml` itself. saneless rewrites `config.toml` by writing a temp file beside it and renaming it over the original; over a single-file bind mount that rename fails with EBUSY, and over a read-only mount the write is refused. See [Moving from a single-file config mount](../how-to/deploy-docker-compose.md#moving-from-a-single-file-config-mount).
+Mount the configuration *directory* (`./config:/etc/saneless`), not `saneless.toml` itself. saneless rewrites `saneless.toml` by writing a temp file beside it and renaming it over the original; over a single-file bind mount that rename fails with EBUSY, and over a read-only mount the write is refused. See [Moving from a single-file config mount](../how-to/deploy-docker-compose.md#moving-from-a-single-file-config-mount).
 
 `/var/lib/saneless` is not optional, and it is not the same kind of directory
 `/tmp/saneless` is. When a scan cannot be delivered to paperless-ngx at all --
@@ -135,7 +135,7 @@ All `SANELESS_*` environment variables are supported inside the container. Commo
 |----------|---------------|---------|
 | `SANELESS_SCANNER__HOST` | `192.168.1.50` | Network scanner IP address |
 | `SANELESS_PAPERLESS__URL` | `http://paperless:8000` | Paperless-ngx URL (Docker network) |
-| `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token. Prefer `config.toml` -- see below |
+| `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token. Prefer `saneless.toml` -- see below |
 | `SANELESS_OUTPUT__WEB_PORT` | `8080` | **The container's port is fixed at 8080.** `web_port` is a bare-metal setting: setting it here moves the server off the port the image exposes and the healthcheck probes, so the container reports unhealthy while the UI is in fact running somewhere else. Remap on the host instead -- `-p 8888:8080` |
 | `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. **Already set by the image** -- override it only if you mount the volume somewhere else |
 | `TZ` | `America/Chicago` | Standard container variable, **not** a saneless setting. A container's clock reports UTC without it, and saneless renders every timestamp in the server's local zone, so `TZ` is what makes the job history, `saneless jobs` and the fallback document title show your local time |
@@ -155,9 +155,9 @@ exact, never a substring match: `changeme7f3a91` is a real token.
 So do not copy a placeholder into a deployment expecting to fix it later --
 nothing will scan until it is replaced.
 
-**An environment variable overrides `config.toml`.** Setting
+**An environment variable overrides `saneless.toml`.** Setting
 `SANELESS_PAPERLESS__TOKEN` in a compose file wins over the token in the
-mounted config file, silently. Keep the secret in `config/config.toml` alone,
+mounted config file, silently. Keep the secret in `config/saneless.toml` alone,
 and leave the compose `environment:` block free of it -- which is what the
 shipped template now does.
 
@@ -217,12 +217,12 @@ services:
       - ./config:/etc/saneless
       - saneless-data:/var/lib/saneless
       # Optional consume-directory fallback; also set
-      # paperless.consume_dir = "/consume" in config.toml.
+      # paperless.consume_dir = "/consume" in saneless.toml.
       # - paperless-consume:/consume
     environment:
       - TZ=America/Chicago
       - SANELESS_SCANNER__HOST=192.168.1.50
-      # The paperless-ngx URL and token belong in config/config.toml. Setting
+      # The paperless-ngx URL and token belong in config/saneless.toml. Setting
       # them here overrides that file silently.
     restart: unless-stopped
 
@@ -230,7 +230,7 @@ volumes:
   saneless-data:
 ```
 
-`config/config.toml` alongside it carries the connection:
+`config/saneless.toml` alongside it carries the connection:
 
 ```toml
 [paperless]

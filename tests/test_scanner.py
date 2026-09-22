@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, cast
 
 import pytest
 from PIL import Image, ImageDraw
@@ -48,7 +48,7 @@ from tests.fake_sane import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
     from pathlib import Path
     from types import ModuleType
 
@@ -244,7 +244,12 @@ class TestScannerBackendABC:
 
     def test_scanner_backend_is_abstract(self) -> None:
         """ScannerBackend cannot be instantiated directly."""
-        cls: type = ScannerBackend
+        # Bound as a zero-argument callable, because both type checkers
+        # correctly refuse a direct call on an abstract class. Being refused is
+        # exactly what this test asserts the interpreter does at runtime, so
+        # the cast states the shape the call site claims and the raises block
+        # below is the proof of what actually happens.
+        cls = cast("Callable[[], object]", ScannerBackend)
         with pytest.raises(TypeError, match="abstract"):
             cls()
 
