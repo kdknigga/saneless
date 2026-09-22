@@ -3100,3 +3100,283 @@ def test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it() -> None:
         "TestClient fails during collection. Re-lock with the constraint in "
         "place; lift the ceiling only once starlette stops using the alias"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 36: pinned artifacts and advisory coverage (PIN-02, PIN-05, SEC-01,
+# SEC-03)
+# ---------------------------------------------------------------------------
+
+WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
+DEPENDABOT_CONFIG = REPO_ROOT / ".github" / "dependabot.yml"
+
+# The build backend's name, as ``[build-system].requires`` spells it.
+UV_BUILD_NAME = "uv_build"
+
+# A step reference to the action that installs uv on a runner.
+SETUP_UV_USES = re.compile(r"^-\s+uses:\s+astral-sh/setup-uv@")
+# A ``version:`` key inside a step's ``with:`` block, quoted or bare.
+WITH_VERSION = re.compile(r"^version:\s*[\"']?(?P<version>[^\"'\s]+)[\"']?$")
+# The build-backend requirement as the Dockerfile's uv-stage comment quotes it.
+QUOTED_REQUIRES = re.compile(r'requires = \["(?P<spec>uv_build[^"]+)"\]')
+# The dev group's uv floor. Anchored so it cannot match ``uv-<something>``.
+DEV_UV_FLOOR = re.compile(r"^uv>=(?P<floor>\S+)$")
+# A build-backend requirement split into its floor and its ceiling.
+UV_BUILD_RANGE = re.compile(r"^uv_build>=(?P<floor>[^,]+),<(?P<ceiling>\S+)$")
+
+
+def _workflow_files() -> list[Path]:
+    """
+    Return every GitHub Actions workflow file, sorted by path.
+
+    This is the suite's first reader of ``.github/workflows``. Several guards
+    need the same input set, and sorting is what keeps their failure messages
+    in a stable order rather than whatever order the filesystem returns.
+
+    Returns:
+        The workflow files under ``.github/workflows``, in path order.
+
+    """
+    return sorted(WORKFLOW_DIR.glob("*.yml"))
+
+
+def _next_minor(version: str) -> str:
+    """
+    Return the lowest version of the minor series above ``version``.
+
+    Args:
+        version: A three-part release version.
+
+    Returns:
+        The first release of the following minor series.
+
+    """
+    major, minor, _patch = version.split(".")
+    return f"{major}.{int(minor) + 1}.0"
+
+
+def _dockerfile_uv_version() -> str:
+    """
+    Return the uv version the Dockerfile's tool stage pins, read off its tag.
+
+    One side of every comparison below is derived rather than written down a
+    second time, so no guard here can end up agreeing with a copy of itself.
+
+    Returns:
+        The tag half of the ``ghcr.io/astral-sh/uv`` reference.
+
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    tags = [
+        match.group("ref").partition("@")[0].removeprefix(f"{UV_IMAGE}:")
+        for _number, line in _significant_lines(DOCKERFILE)
+        for match in [FROM_LINE.match(line)]
+        if match is not None and match.group("ref").startswith(f"{UV_IMAGE}:")
+    ]
+    assert len(tags) == 1, (
+        f"{name} names {UV_IMAGE} on {len(tags)} FROM lines; exactly one is "
+        "expected, and the canonical uv version cannot be derived from any "
+        "other number of them"
+    )
+    return tags[0]
+
+
+def _declared_uv_build_specifier() -> str:
+    """
+    Return ``pyproject.toml``'s build-backend requirement, verbatim.
+
+    Returns:
+        The single ``[build-system].requires`` entry naming the backend.
+
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    specifiers = [
+        spec
+        for spec in pyproject["build-system"]["requires"]
+        if spec.startswith(UV_BUILD_NAME)
+    ]
+    assert len(specifiers) == 1, (
+        f"{PYPROJECT.name} declares {len(specifiers)} [build-system].requires "
+        f"entries for {UV_BUILD_NAME}; exactly one is expected"
+    )
+    return specifiers[0]
+
+
+def test_every_repeated_image_tag_in_the_dockerfile_shares_one_digest() -> None:
+    """
+    A tag on more than one ``FROM`` line carries the same digest at each (D-07).
+
+    ``python:3.14-slim`` is the base of both the builder and the runtime stage.
+    The defect this catches is not a missing pin -- the shape guard further up
+    already refuses those -- but a re-resolution that updated one line and
+    missed the other. That builds the application against different bytes than
+    it ships on, and nothing about it looks wrong in review.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    references = [
+        (number, match.group("ref"))
+        for number, line in _significant_lines(DOCKERFILE)
+        for match in [FROM_LINE.match(line)]
+        if match is not None
+    ]
+    assert references, f"{name} has no FROM instructions at all"
+
+    by_tag: dict[str, list[tuple[int, str]]] = {}
+    for number, reference in references:
+        image, _, digest = reference.partition("@")
+        by_tag.setdefault(image, []).append((number, digest))
+
+    repeated = {image: seen for image, seen in by_tag.items() if len(seen) > 1}
+    assert repeated, (
+        f"{name} no longer uses any image tag on more than one FROM line, so "
+        "this guard has nothing left to compare. It was written for the two "
+        "python:3.14-slim stages; if the file really has collapsed to one "
+        "stage per tag, delete the guard as a decision rather than leaving it "
+        "passing over an empty comparison"
+    )
+
+    offenders = [
+        f"{name}:{number}: {image}@{digest}"
+        for image, seen in sorted(repeated.items())
+        if len({digest for _number, digest in seen}) > 1
+        for number, digest in seen
+    ]
+    assert not offenders, (
+        "one image tag is pinned to two different digests. A re-resolution "
+        "updated one FROM line and missed the other, so the stages below no "
+        "longer start from the same bytes:\n" + "\n".join(offenders)
+    )
+
+
+def test_one_uv_version_spans_the_dockerfile_pyproject_and_workflows() -> None:
+    """
+    Every surface that names a uv version names the same one (D-09).
+
+    Before this phase uv was pinned in one place. It is now pinned in four
+    kinds of file, three of which are read by machines that never see the
+    others: the build backend resolves ``uv_build``, the runners resolve
+    ``setup-uv``, and a developer resolves the dev group. A disagreement
+    between them fails nothing where it is introduced -- it surfaces later as
+    a build that works in CI and not locally, or the reverse. ``uv.lock`` is
+    held to the same value independently by the declared-floor guard further
+    up, so the version cannot drift in a fifth place either.
+    """
+    expected = _dockerfile_uv_version()
+    offenders: list[str] = []
+
+    specifier = _declared_uv_build_specifier()
+    match = UV_BUILD_RANGE.match(specifier)
+    assert match is not None, (
+        f"{PYPROJECT.name} declares the build backend as {specifier!r}, which "
+        "is not the floor-and-ceiling shape this guard compares. Both bounds "
+        "are load-bearing: the floor is what agrees with the pinned uv, the "
+        "ceiling is what makes a bump across a minor surface in review"
+    )
+    if match.group("floor") != expected:
+        offenders.append(
+            f"{PYPROJECT.name}: [build-system].requires floors "
+            f"{UV_BUILD_NAME} at {match.group('floor')}"
+        )
+    if match.group("ceiling") != _next_minor(expected):
+        offenders.append(
+            f"{PYPROJECT.name}: [build-system].requires caps {UV_BUILD_NAME} "
+            f"at {match.group('ceiling')}, not {_next_minor(expected)}"
+        )
+
+    floors = [
+        floor_match.group("floor")
+        for where, spec in _declared_requirements()
+        if where == "[dependency-groups].dev"
+        for floor_match in [DEV_UV_FLOOR.match(spec)]
+        if floor_match is not None
+    ]
+    if len(floors) != 1:
+        offenders.append(
+            f"{PYPROJECT.name}: [dependency-groups].dev declares {len(floors)} "
+            "uv floors; exactly one is expected"
+        )
+    elif floors[0] != expected:
+        offenders.append(
+            f"{PYPROJECT.name}: [dependency-groups].dev floors uv at {floors[0]}"
+        )
+
+    sites = 0
+    for path in _workflow_files():
+        name = path.relative_to(REPO_ROOT)
+        lines = _significant_lines(path)
+        for index, (number, line) in enumerate(lines):
+            if SETUP_UV_USES.match(line) is None:
+                continue
+            sites += 1
+            # The next list item ends the step. Indentation cannot be used as
+            # the terminator: ``_significant_lines`` has already stripped it.
+            window: list[tuple[int, str]] = []
+            for later_number, later_line in lines[index + 1 :]:
+                if later_line.startswith("- "):
+                    break
+                window.append((later_number, later_line))
+            declared = [
+                (later_number, version_match.group("version"))
+                for later_number, later_line in window
+                for version_match in [WITH_VERSION.match(later_line)]
+                if version_match is not None
+            ]
+            if len(declared) != 1:
+                offenders.append(
+                    f"{name}:{number}: {line} -- this step declares "
+                    f"{len(declared)} version: keys; exactly one is expected"
+                )
+                continue
+            version_number, version = declared[0]
+            if version != expected:
+                offenders.append(f"{name}:{version_number}: version: {version}")
+
+    assert sites, (
+        "no astral-sh/setup-uv step was found in any workflow file, so this "
+        "guard has nothing to check. Either the action was replaced, or "
+        f"{WORKFLOW_DIR.relative_to(REPO_ROOT)} is no longer where the "
+        "workflows live"
+    )
+    assert not offenders, (
+        f"a uv version disagrees with the {expected} the Dockerfile's tool "
+        "stage pins. The build backend, the runners and a developer's machine "
+        "each resolve uv separately, so a disagreement here is a toolchain "
+        "that differs between the image, CI and local work:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_dockerfile_comment_quotes_the_declared_build_specifier() -> None:
+    """
+    The uv-stage comment quotes the specifier ``pyproject.toml`` declares (D-22).
+
+    That comment explains why the uv tool image and the build backend are
+    pinned together, and it argues the case by quoting the specifier. Quoted
+    text goes stale silently: nothing about editing ``pyproject.toml`` touches
+    the Dockerfile, so the comment would go on explaining a real coupling in
+    terms of a range that no longer exists -- misstating a design decision
+    rather than merely reading untidily. The raw lines are needed here because
+    ``_significant_lines`` drops whole-line comments by design.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    quoted = [
+        (number, match.group("spec"))
+        for number, line in _numbered(DOCKERFILE)
+        for match in [QUOTED_REQUIRES.search(line)]
+        if match is not None
+    ]
+    assert quoted, (
+        f"{name} no longer quotes a {UV_BUILD_NAME} requirement anywhere, so "
+        "this guard has nothing to compare. That comment is what explains why "
+        "the tool image and the build backend move together; if it went away "
+        "deliberately, remove this guard in the same change"
+    )
+    declared = _declared_uv_build_specifier()
+    offenders = [
+        f"{name}:{number}: {spec}" for number, spec in quoted if spec != declared
+    ]
+    assert not offenders, (
+        f"a Dockerfile comment quotes a {UV_BUILD_NAME} requirement that "
+        f"{PYPROJECT.name} does not declare -- it now reads {declared!r}. The "
+        "comment explains a deliberate coupling, so a stale specifier there "
+        "misstates a design decision:\n" + "\n".join(offenders)
+    )
