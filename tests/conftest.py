@@ -228,8 +228,9 @@ def hermetic_env(
 
     Without this a test reaches the developer's real files: ``Path.home()``
     and the XDG variables decide config discovery and the state defaults, so a
-    ``Settings()`` would read ``~/.config/saneless/config.toml`` -- live URL and
-    token included -- and a ``JobStore`` would write under ``~/.local/state``.
+    ``Settings()`` would read ``~/.config/saneless/saneless.toml`` -- live URL
+    and token included -- and a ``JobStore`` would write under
+    ``~/.local/state``.
     The working directory matters the same way, because ``./saneless.toml`` is
     the first config search path and a developer's checkout usually has one.
 
