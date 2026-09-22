@@ -3490,3 +3490,126 @@ def test_no_workflow_or_hook_file_silences_a_checker_with_a_flag() -> None:
         "package whose vulnerability is known and recorded, with a green "
         "build over it. Fix the finding, or upgrade past it:\n" + "\n".join(offenders)
     )
+
+
+# A step's ``uses:`` key as ``_significant_lines`` leaves it: the indentation
+# is gone and the list dash may be, but a trailing comment survives intact,
+# which is what makes the comment half of the guard below possible.
+USES_LINE = re.compile(r"^(?:-\s+)?uses:\s*(?P<ref>\S+)(?P<trailer>.*)$")
+# A pinned third-party reference: ``owner/repo`` at a full-length commit SHA.
+# Lowercase is load-bearing rather than cosmetic -- a mixed-case SHA names the
+# same commit but compares unequal, which would defeat the cross-file check.
+PINNED_USES = re.compile(r"^(?P<action>[^@\s]+)@(?P<sha>[0-9a-f]{40})$")
+# The trailing comment both workflow headers promise every pin carries.
+VERSION_COMMENT = re.compile(r"^#\s*(?P<version>v\d+\.\d+\.\d+)$")
+# A call to a workflow in this same repository. ``$/`` is GitHub's
+# self-repository reference and is the spelling these files actually use;
+# ``./`` is the workspace-relative one, accepted too so that a deliberate
+# switch would not be reported as a malformed pin. Neither can collide with
+# an ``owner/repo@sha`` form.
+LOCAL_WORKFLOW_PREFIXES = ("$/", "./")
+
+
+def test_every_workflow_uses_reference_is_a_commented_lowercase_sha() -> None:
+    """
+    Every ``uses:`` ref is a full lowercase SHA carrying its version (D-05).
+
+    A tag or branch ref is mutable: whoever controls the action can repoint it,
+    and different bytes then run with this workflow's permissions. The trailing
+    comment is the half a reviewer actually reads, and ``ci.yml:1`` and
+    ``release.yml:1`` already declare -- in identical words -- that comments
+    must carry the full version, while nothing until now parsed that claim.
+    The cross-file check catches the one-site-updated-one-missed case, which
+    has real duplication to work with: ``actions/checkout`` appears six times
+    and ``astral-sh/setup-uv`` five.
+
+    Classification is total on purpose. A ``uses:`` line matching neither the
+    exempt nor the pinned form is an offender rather than a silent skip, because
+    a guard that quietly passes over what it cannot parse is worse than none.
+
+    What this deliberately does not do: assert that a SHA is the commit its
+    comment names. That is a registry lookup, it would break the suite's
+    offline guarantee, and it would need a token for rate limits. Dependabot
+    rewrites a SHA and its comment together, so ongoing agreement is the bot's
+    job; the "wrong from day one" residual was closed once by hand under D-06.
+    """
+    exempt: list[str] = []
+    pinned: list[tuple[str, str, str, str]] = []
+    shape_offenders: list[str] = []
+    comment_offenders: list[str] = []
+
+    for path in _workflow_files():
+        name = path.relative_to(REPO_ROOT)
+        for number, line in _significant_lines(path):
+            if "uses:" not in line:
+                continue
+            site = f"{name}:{number}"
+            match = USES_LINE.match(line)
+            if match is None:
+                shape_offenders.append(
+                    f"{site}: {line} -- carries a uses: key in a shape this "
+                    "guard cannot read, so it was checked by nothing"
+                )
+                continue
+            reference = match.group("ref")
+            if reference.startswith(LOCAL_WORKFLOW_PREFIXES) and "@" not in reference:
+                exempt.append(site)
+                continue
+            pin = PINNED_USES.match(reference)
+            if pin is None:
+                shape_offenders.append(f"{site}: {reference}")
+                continue
+            comment = VERSION_COMMENT.match(match.group("trailer").strip())
+            if comment is None:
+                comment_offenders.append(f"{site}: {reference}")
+                continue
+            pinned.append(
+                (site, pin.group("action"), pin.group("sha"), comment.group("version"))
+            )
+
+    assert pinned, (
+        "no pinned uses: reference was collected from any workflow file, so "
+        "this guard would pass over nothing at all. Either "
+        f"{WORKFLOW_DIR.relative_to(REPO_ROOT)} is no longer where the "
+        "workflows live, or every step was rewritten into a form this guard "
+        "cannot read"
+    )
+    assert exempt, (
+        "no uses: reference was exempted as a local reusable-workflow call. "
+        "release.yml calls ci.yml through GitHub's self-repository reference, "
+        "spelled $/ -- see release.yml:24-31 for why that spelling and not the "
+        "workspace-relative ./ one. If the exemption in this guard was rewritten "
+        "to ./ then it no longer matches the tree and release.yml's call is "
+        "about to be reported as a malformed pin; if release.yml simply stopped "
+        "calling ci.yml, delete the exemption as a decision rather than leaving "
+        "it matching nothing"
+    )
+    assert not shape_offenders, (
+        "a workflow uses: reference is not pinned to a full 40-character "
+        "lowercase commit SHA. A tag, a branch or a short ref is mutable, so "
+        "the bytes that run in CI are whatever the action's owner -- or whoever "
+        "compromises them -- points it at:\n" + "\n".join(shape_offenders)
+    )
+    assert not comment_offenders, (
+        "a pinned uses: reference carries no trailing # vX.Y.Z comment. A bare "
+        "SHA tells a reviewer nothing about which version they are approving, "
+        "and both workflow headers state that the comment is there:\n"
+        + "\n".join(comment_offenders)
+    )
+
+    by_action: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for site, action, sha, version in pinned:
+        by_action.setdefault((action, version), []).append((site, sha))
+
+    inconsistent = [
+        f"{action} {version}: "
+        + ", ".join(f"{site} -> {sha}" for site, sha in sorted(seen))
+        for (action, version), seen in sorted(by_action.items())
+        if len({sha for _site, sha in seen}) > 1
+    ]
+    assert not inconsistent, (
+        "one action at one version is pinned to two different SHAs. An update "
+        "landed at some of its sites and missed others, so the same named "
+        "version now runs different bytes depending on which workflow invoked "
+        "it:\n" + "\n".join(inconsistent)
+    )
