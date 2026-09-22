@@ -8,7 +8,7 @@ checks with the *same* words (D-02).  Nothing mechanical enforces that if each
 surface owns its own list, so ``checks.py`` owns one registry and both surfaces
 iterate ``CheckKey``.  These tests are what makes that a fact rather than a
 convention: every vocabulary case is parametrised over ``list(CheckKey)`` and
-``list(CheckState)``, so a sixth check or a fourth state cannot be added
+``list(CheckState)``, so a seventh check or a fourth state cannot be added
 without forcing a decision here -- the discipline
 ``tests/test_vocabulary.py`` already applies to the lookup functions and
 ``tests/test_web_state_rendering.py`` applies to the templates.
@@ -31,7 +31,7 @@ import threading
 from dataclasses import FrozenInstanceError
 from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 
 import httpx2
 import pytest
@@ -60,11 +60,14 @@ from saneless.checks import (
     worst_state,
 )
 from saneless.config import (
+    CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
     ScannerConfig,
     Settings,
+    discover_config,
 )
 from saneless.exceptions import ScanError
 from saneless.paperless import PaperlessClient
@@ -79,12 +82,26 @@ from tests.conftest import StubScannerBackend
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
+    from saneless.config import ConfigDiscovery
+
 # Loopback connects resolve or refuse immediately, so a short budget keeps a
 # hung test from burning the suite's 60 s timeout.
 _PROBE_BUDGET = 0.5
 
 # A token that is not a placeholder, so the Paperless check reaches its probe.
 _REAL_TOKEN = "a-real-looking-token"
+
+# The only three strings a check row is allowed to spell a filesystem path
+# with (Phase 37 D-14).  They are built from the config constants so this file
+# never holds the superseded name on its own, and they are the exception the
+# V7 guard below carves out -- one row, one field, two states, three constants.
+# Longest first, so stripping them from a string cannot leave a shorter one's
+# tail behind.
+_ALLOWED_PATH_SPELLINGS: Final = (
+    f"$XDG_CONFIG_HOME/saneless/{LEGACY_CONFIG_FILENAME}",
+    f"/etc/saneless/{LEGACY_CONFIG_FILENAME}",
+    f"./{LEGACY_CONFIG_FILENAME}",
+)
 
 
 def _refuse_temp_files_in(monkeypatch: pytest.MonkeyPatch, folder: Path) -> None:
@@ -192,22 +209,35 @@ class TestCheckVocabulary:
         assert len(list(CheckState)) == 3
         assert set(CheckState) == {CheckState.OK, CheckState.WARN, CheckState.FAIL}
 
-    def test_check_key_has_exactly_five_members(self) -> None:
+    def test_check_key_has_exactly_six_members(self) -> None:
         """
-        Five checks, and this enum is the contract that both surfaces see them.
+        Six checks, and this enum is the contract that both surfaces see them.
 
         D-02: neither ``saneless doctor`` nor the status strip may hold a check
         the other does not have.  Both iterate ``CheckKey``, so the only way to
-        add a sixth is here.
+        add a seventh is here.
         """
-        assert len(list(CheckKey)) == 5
+        assert len(list(CheckKey)) == 6
         assert set(CheckKey) == {
+            CheckKey.CONFIGURATION,
             CheckKey.SCANNER,
             CheckKey.PAPERLESS,
             CheckKey.PROFILES,
             CheckKey.FALLBACK,
             CheckKey.DATA_DIR,
         }
+
+    def test_configuration_is_the_first_member(self) -> None:
+        """
+        Phase 37 D-03: the cause is read above the symptoms.
+
+        Both surfaces render in member order, so first here is first on the
+        page and first in ``doctor``'s transcript.  On 2026-09-22 four rows
+        went red or amber for one missing config file and the reader had to
+        infer the cause from the symptoms; this row states it, and it states
+        it before they are read.
+        """
+        assert next(iter(CheckKey)) is CheckKey.CONFIGURATION
 
     @pytest.mark.parametrize("key", list(CheckKey))
     def test_check_name_is_complete(self, key: CheckKey) -> None:
@@ -1386,7 +1416,7 @@ class TestImportHygiene:
 
 
 # ---------------------------------------------------------------------------
-# The five checks
+# The six checks
 # ---------------------------------------------------------------------------
 
 
@@ -1523,6 +1553,82 @@ def _paperless(
     )
 
 
+def _candidates(root: Path) -> tuple[Path, Path, Path]:
+    """
+    Make three empty search directories and name the candidate in each.
+
+    The three stand for ``./``, ``$XDG_CONFIG_HOME/saneless/`` and
+    ``/etc/saneless/`` in that order, so a test can say "the file is in the
+    third searched place" without going anywhere near the real ``/etc``.
+
+    Args:
+        root: The directory the three search directories are made under.
+
+    Returns:
+        The three candidate paths, in search order; none of them exists yet.
+
+    """
+    directories = [root / name for name in ("cfg-cwd", "cfg-xdg", "cfg-etc")]
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+    return (
+        directories[0] / CONFIG_FILENAME,
+        directories[1] / CONFIG_FILENAME,
+        directories[2] / CONFIG_FILENAME,
+    )
+
+
+def _write_stale(candidate: Path) -> Path:
+    """
+    Put a superseded-name file beside one candidate.
+
+    Args:
+        candidate: The current-name candidate whose directory gets the file.
+
+    Returns:
+        The path written.
+
+    """
+    stale = candidate.with_name(LEGACY_CONFIG_FILENAME)
+    stale.write_text("", encoding="utf-8")
+    return stale
+
+
+def _discovery(
+    tmp_path: Path,
+    *,
+    loaded: int | None = None,
+    stale: tuple[int, ...] = (),
+) -> ConfigDiscovery:
+    """
+    Record a real search over three temporary candidates.
+
+    The files are written and then ``discover_config`` is run over them, rather
+    than a ``ConfigDiscovery`` being constructed by hand: a hand-built
+    recording can describe a filesystem that could not exist.
+
+    The search directories are separate from the ones ``_settings`` writes its
+    healthy default into, so attaching this recording afterwards cannot find
+    that file and quietly report a different state than the test asked for.
+
+    Args:
+        tmp_path: The test's own directory.
+        loaded: The index whose current-name file exists, or None for a search
+            that found nothing to load.
+        stale: The indexes whose directories also hold a superseded-name file.
+
+    Returns:
+        The recording that search produced.
+
+    """
+    candidates = _candidates(tmp_path / "search")
+    if loaded is not None:
+        candidates[loaded].write_text("", encoding="utf-8")
+    for index in stale:
+        _write_stale(candidates[index])
+    return discover_config(candidates)
+
+
 def _settings(
     tmp_path: Path,
     *,
@@ -1533,6 +1639,12 @@ def _settings(
 ) -> Settings:
     """
     Build a Settings object whose every path is inside the test's tmp_path.
+
+    A healthy discovery is attached: a file loaded from the first searched
+    place, and no superseded-name file anywhere.  Without it every test in
+    this file would carry an amber Configuration row it never asked for,
+    because a directly constructed ``Settings`` has run no search at all.
+    Tests about the other three states say so with ``_with_discovery``.
 
     Args:
         tmp_path: The test's own directory.
@@ -1549,7 +1661,7 @@ def _settings(
         resolved = tmp_path / "data"
         resolved.mkdir(exist_ok=True)
         data_dir = str(resolved)
-    return Settings(
+    settings = Settings(
         scanner=ScannerConfig(host=host, device="test:device:001"),
         paperless=PaperlessConfig(
             url="http://paperless:8000", token=token, consume_dir=consume_dir
@@ -1561,6 +1673,31 @@ def _settings(
         ),
         profiles={"default": ProfileConfig()},
     )
+    healthy = _candidates(tmp_path / "loaded")
+    healthy[0].write_text("", encoding="utf-8")
+    return _with_discovery(settings, discover_config(healthy))
+
+
+def _with_discovery(settings: Settings, discovery: ConfigDiscovery | None) -> Settings:
+    """
+    Attach a recording of the config search to settings already built.
+
+    The private attributes are written directly, the way ``load_settings``
+    writes them and the way the doctor fake in ``tests/test_doctor.py``
+    already does: they are deliberately not fields, so no public setter
+    exists and none should.
+
+    Args:
+        settings: The settings to record against, modified in place.
+        discovery: The recording, or None for settings that ran no search.
+
+    Returns:
+        The same settings, for use as an expression.
+
+    """
+    settings._config_discovery = discovery
+    settings._config_path = None if discovery is None else discovery.loaded
+    return settings
 
 
 def _with_profiles(settings: Settings, profiles: dict[str, ProfileConfig]) -> Settings:
@@ -1622,6 +1759,26 @@ def _row(results: tuple[CheckResult, ...], key: CheckKey) -> CheckResult:
 
     """
     return next(result for result in results if result.key is key)
+
+
+def _without_allowed_spellings(text: str) -> str:
+    """
+    Remove the three documented path spellings a row may legitimately carry.
+
+    What is left is what the no-path rule applies to unchanged, so the
+    exception cannot widen without this helper being changed too.
+
+    Args:
+        text: A rendered message or next step.
+
+    Returns:
+        The same text with every allowed spelling removed.
+
+    """
+    remainder = text
+    for spelling in _ALLOWED_PATH_SPELLINGS:
+        remainder = remainder.replace(spelling, "")
+    return remainder
 
 
 def _recording_dialler(
@@ -2530,11 +2687,16 @@ def _broken_context(tmp_path: Path) -> CheckContext:
     """
     Build a context in which every single check goes wrong.
 
+    The Configuration row is red rather than merely amber: a leftover
+    superseded-name file and nothing loaded is the one state in which a row is
+    allowed to print a path at all, so the V7 guard below is only falsifiable
+    against a context that actually reaches it.
+
     Args:
         tmp_path: The test's own directory.
 
     Returns:
-        A context whose five rows are all WARN or FAIL.
+        A context whose six rows are all WARN or FAIL.
 
     """
     settings = _with_profiles(
@@ -2547,6 +2709,7 @@ def _broken_context(tmp_path: Path) -> CheckContext:
         ),
         {},
     )
+    _with_discovery(settings, _discovery(tmp_path, stale=(2,)))
     return _context(
         settings,
         scanner=_RaisingBackend(),
@@ -2560,7 +2723,7 @@ class TestRunChecks:
 
     def test_every_key_appears_exactly_once(self, tmp_path: Path) -> None:
         """
-        A healthy context still produces all five rows.
+        A healthy context still produces all six rows.
 
         Args:
             tmp_path: The test's own directory.
@@ -2575,7 +2738,7 @@ class TestRunChecks:
 
     def test_every_key_appears_when_everything_is_broken(self, tmp_path: Path) -> None:
         """
-        A context where nothing works still produces all five rows.
+        A context where nothing works still produces all six rows.
 
         Args:
             tmp_path: The test's own directory.
@@ -2661,13 +2824,12 @@ class TestRunChecks:
         results = run_checks(
             _context(_settings(tmp_path), scanner=backend, skip_scanner=True)
         )
-        assert [result.skipped for result in results] == [
-            True,
-            False,
-            False,
-            False,
-            False,
-        ]
+        # Keyed by check, not by position: a member inserted above SCANNER
+        # would silently turn a positional list into an assertion about a
+        # different row, which is the failure mode ``_check_row`` in
+        # tests/test_browser.py documents for the same reason.
+        skipped = {result.key: result.skipped for result in results}
+        assert skipped == {key: key is CheckKey.SCANNER for key in CheckKey}
 
     @pytest.mark.parametrize("key", list(CheckKey))
     def test_no_row_leaks_a_path_url_token_or_traceback(
@@ -2676,17 +2838,47 @@ class TestRunChecks:
         """
         ASVS V7: nothing internal reaches a LAN-visible page through a row.
 
+        The one exception is narrow and is asserted as such (Phase 37 D-14):
+        the Configuration row's next step, in a superseded-name state, may
+        carry one of three fixed documented spellings.  Strip those and the
+        rule is unchanged -- no other slash, from any row, in either field.
+
         Args:
             tmp_path: The test's own directory.
             key: The row under inspection.
 
         """
         row = _row(run_checks(_broken_context(tmp_path)), key)
-        for text in (row.message, row.next_step):
-            assert "/" not in text
+        for field, text in (("message", row.message), ("next_step", row.next_step)):
+            allowed = key is CheckKey.CONFIGURATION and field == "next_step"
+            assert "/" not in (_without_allowed_spellings(text) if allowed else text)
             assert "http" not in text
             assert "changeme" not in text
             assert "Traceback" not in text
+            assert str(tmp_path) not in text
+
+    @pytest.mark.parametrize("key", list(CheckKey))
+    def test_no_row_leaks_a_path_when_a_leftover_sits_beside_a_loaded_file(
+        self, tmp_path: Path, key: CheckKey
+    ) -> None:
+        """
+        The amber leftover state names a file too, and the same narrow rule holds.
+
+        The companion to the case above: both superseded-name states print a
+        spelling, so both are checked, and neither may print anything else.
+
+        Args:
+            tmp_path: The test's own directory.
+            key: The row under inspection.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, loaded=0, stale=(2,))
+        )
+        row = _row(run_checks(_context(settings)), key)
+        for field, text in (("message", row.message), ("next_step", row.next_step)):
+            allowed = key is CheckKey.CONFIGURATION and field == "next_step"
+            assert "/" not in (_without_allowed_spellings(text) if allowed else text)
             assert str(tmp_path) not in text
 
     def test_a_warn_row_always_says_what_to_do(self, tmp_path: Path) -> None:
@@ -3319,3 +3511,235 @@ class TestRunChecksUnderTheScannerGate:
         finally:
             gate.lock.release()
         assert [result.key for result in results] == list(CheckKey)
+
+
+class TestConfigurationRow:
+    """
+    The row that names the cause the other five could only hint at (Phase 37).
+
+    Phase 37 D-03 gives the configuration file its own row rather than weaving
+    a sentence into three others.  D-05 is the contract: four states, one of
+    them green, and exactly two of them allowed to name a file.  Every message
+    and next step here is asserted in full, because 37-03's terminal surfaces
+    reuse these sentences verbatim and a paraphrase in one place would be a
+    second wording source.
+    """
+
+    def test_the_row_is_named_configuration(self) -> None:
+        """The name column a household member reads, and its column width."""
+        assert check_name(CheckKey.CONFIGURATION) == "Configuration"
+
+    def test_a_loaded_file_is_green_and_names_nothing(self, tmp_path: Path) -> None:
+        """
+        Phase 37 D-05, first case, and D-06: green shows no path.
+
+        A path in the healthy row is noise to the reader the strip is for, and
+        it is a host filesystem path on a page anyone on the LAN can load.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(_settings(tmp_path), _discovery(tmp_path, loaded=0))
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.OK
+        assert row.message == "Config file loaded."
+        assert row.next_step == ""
+
+    def test_a_leftover_beside_a_loaded_file_is_amber(self, tmp_path: Path) -> None:
+        """
+        Phase 37 D-05 second case and D-10: the right file loaded, so nothing failed.
+
+        It is still worth a row: the leftover is a trap for the next person to
+        edit, who has no way to tell from the filesystem which file is live.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, loaded=0, stale=(0,))
+        )
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.WARN
+        assert (
+            row.message == "Using saneless.toml; an old config.toml is being ignored."
+        )
+        assert row.next_step == (
+            f"Move anything you still need from ./{LEGACY_CONFIG_FILENAME} into the "
+            f"{CONFIG_FILENAME} in use, then delete ./{LEGACY_CONFIG_FILENAME} "
+            "and restart saneless."
+        )
+
+    def test_no_config_file_at_all_is_amber_and_points_at_the_log(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Phase 37 D-05 third case, D-06 and D-07: amber, and no path on the strip.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(_settings(tmp_path), _discovery(tmp_path))
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "No config file; running on defaults and environment variables."
+        )
+        assert row.next_step == (
+            f"The saneless log lists every place it looked for {CONFIG_FILENAME}."
+        )
+        assert "/" not in row.next_step
+
+    def test_a_lone_superseded_file_is_red_and_names_the_rename(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Phase 37 D-05 fourth case: nothing the operator wrote was read.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, stale=(0,))
+        )
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.FAIL
+        assert row.message == (
+            "No config file loaded: saneless now reads saneless.toml, not config.toml."
+        )
+        assert row.next_step == (
+            f"Rename ./{LEGACY_CONFIG_FILENAME} to {CONFIG_FILENAME}, "
+            "then restart saneless."
+        )
+
+    def test_the_2026_09_22_scenario_reads_the_cause_in_the_first_row(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        The failure this phase exists to remove, checked against its own wording.
+
+        A container mounted its configuration into the third searched place
+        under the superseded name.  Four rows went red or amber that evening
+        and not one named the cause.  This asserts the row that now does, and
+        that it is read before the Paperless row it explains.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path, token="changeme"), _discovery(tmp_path, stale=(2,))
+        )
+        results = run_checks(_context(settings))
+        row = _row(results, CheckKey.CONFIGURATION)
+        assert row.state is CheckState.FAIL
+        assert row.next_step == (
+            f"Rename /etc/saneless/{LEGACY_CONFIG_FILENAME} to {CONFIG_FILENAME}, "
+            "then restart saneless."
+        )
+        keys = [result.key for result in results]
+        assert keys.index(CheckKey.CONFIGURATION) < keys.index(CheckKey.PAPERLESS)
+
+    def test_the_docker_leftover_says_move_before_it_says_delete(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Phase 37 D-17: the leftover may hold the only copy of the URL and token.
+
+        In the documented Docker layout ``auto-profiles`` writes the working
+        directory's file, so after an upgrade the leftover in the third
+        searched place is the one the operator actually filled in.  A bare
+        "delete it" would be advice to destroy the configuration.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, loaded=0, stale=(2,))
+        )
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.WARN
+        assert f"/etc/saneless/{LEGACY_CONFIG_FILENAME}" in row.next_step
+        assert "Move anything you still need" in row.next_step
+        assert row.next_step.index("then delete") > row.next_step.index("Move")
+
+    def test_more_than_one_leftover_names_the_highest_priority_one(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        One file is named, and it is the one whose rename would load next start.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path), _discovery(tmp_path, stale=(1, 2))
+        )
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert f"$XDG_CONFIG_HOME/saneless/{LEGACY_CONFIG_FILENAME}" in row.next_step
+        assert f"/etc/saneless/{LEGACY_CONFIG_FILENAME}" not in row.next_step
+
+    def test_a_missing_file_is_amber_even_when_nothing_else_is_configured(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Phase 37 D-07: environment-only deployment is supported, so never red.
+
+        And the Paperless row keeps its own verdict: saying whether paperless
+        works is its job, and two rows reporting one fact is how a reader
+        learns to discount both.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(
+            _settings(tmp_path, token="changeme"), _discovery(tmp_path)
+        )
+        results = run_checks(_context(settings))
+        assert _row(results, CheckKey.CONFIGURATION).state is CheckState.WARN
+        assert _row(results, CheckKey.PAPERLESS).state is CheckState.FAIL
+
+    def test_settings_that_ran_no_search_read_as_no_config_file(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A directly constructed Settings has searched nothing, and says so.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        settings = _with_discovery(_settings(tmp_path), None)
+        assert settings.config_discovery is None
+        row = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        assert row.state is CheckState.WARN
+        assert row.message == (
+            "No config file; running on defaults and environment variables."
+        )
+
+    def test_the_terminal_form_names_the_absolute_path(self, tmp_path: Path) -> None:
+        """
+        Phase 37 D-14: the no-path rule binds the LAN page, not the terminal.
+
+        One function, one set of sentences, and the only difference is how the
+        file is spelled -- so the log, ``doctor`` and the strip cannot come to
+        describe the same appliance differently.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        discovery = _discovery(tmp_path, stale=(2,))
+        settings = _with_discovery(_settings(tmp_path), discovery)
+        strip = _row(run_checks(_context(settings)), CheckKey.CONFIGURATION)
+        terminal = checks.configuration_check(settings, absolute_paths=True)
+        assert terminal.state is strip.state
+        assert terminal.message == strip.message
+        assert str(discovery.stale[0].absolute()) in terminal.next_step
+        assert str(tmp_path) not in strip.next_step
