@@ -65,6 +65,7 @@ for a single declared name.
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import subprocess
@@ -3133,11 +3134,21 @@ def _workflow_files() -> list[Path]:
     need the same input set, and sorting is what keeps their failure messages
     in a stable order rather than whatever order the filesystem returns.
 
+    Both spellings are collected because GitHub loads both. Every workflow
+    here happens to be ``.yml`` today, so globbing one extension would pass
+    and keep passing -- right up until someone adds a ``.yaml`` file, which
+    would then carry an unpinned ``uses:`` or an ``--ignore`` flag past every
+    guard that reads this list. The guards are supply-chain gates, so their
+    input set has to be what GitHub runs, not what the repository happens to
+    contain.
+
     Returns:
         The workflow files under ``.github/workflows``, in path order.
 
     """
-    return sorted(WORKFLOW_DIR.glob("*.yml"))
+    return sorted(
+        path for suffix in ("*.yml", "*.yaml") for path in WORKFLOW_DIR.glob(suffix)
+    )
 
 
 def _next_minor(version: str) -> str:
@@ -3612,4 +3623,41 @@ def test_every_workflow_uses_reference_is_a_commented_lowercase_sha() -> None:
         "landed at some of its sites and missed others, so the same named "
         "version now runs different bytes depending on which workflow invoked "
         "it:\n" + "\n".join(inconsistent)
+    )
+
+
+def test_the_workflow_reader_collects_both_extensions_github_loads() -> None:
+    """
+    ``_workflow_files`` reads ``.yaml`` as well as ``.yml`` (PR #13 review).
+
+    GitHub loads both spellings out of ``.github/workflows``. Every workflow
+    in this repository happens to be ``.yml``, so a reader that globbed one
+    extension passed today and would have kept passing -- while a ``.yaml``
+    file added later carried its ``uses:`` refs and any ``--ignore`` flag
+    past every guard built on this list. That is the whole failure this
+    module exists to prevent, arriving through the guard's own input set.
+
+    The check is on the glob patterns rather than on a fixture file, because
+    the defect is what the reader *would* miss, and no ``.yaml`` file exists
+    to observe. Asserting the reader finds a file that is not there could
+    only be written as a tautology.
+    """
+    source = inspect.getsource(_workflow_files)
+    for suffix in ("*.yml", "*.yaml"):
+        assert suffix in source, (
+            f"_workflow_files does not glob {suffix!r}. GitHub loads both "
+            "spellings, so a workflow using the other one would bypass every "
+            "guard that reads this list -- the uses: pin check and the "
+            "suppression-flag check both take their input from here."
+        )
+
+    found = {path.name for path in _workflow_files()}
+    on_disk = {
+        path.name
+        for path in WORKFLOW_DIR.iterdir()
+        if path.suffix in {".yml", ".yaml"} and path.is_file()
+    }
+    assert found == on_disk, (
+        "the reader disagrees with the directory. Every workflow file GitHub "
+        f"would load must reach the guards: {sorted(on_disk - found)} missing."
     )

@@ -1334,6 +1334,33 @@ log_level = "TRACE"
             f"token in [paperless]: {_REDACTED_MESSAGE}"
         )
 
+    def test_a_lowercase_env_name_is_struck_out_like_the_shouted_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A lowercase ``saneless_*`` value is redacted too (PR #13 review).
+
+        ``SettingsConfigDict`` leaves ``case_sensitive`` at its default, so
+        pydantic-settings reads ``saneless_paperless__token`` exactly as it
+        reads the shouted spelling -- this test asserts that first, so it
+        fails if that default ever changes rather than quietly passing on a
+        premise that stopped being true.
+
+        The redaction filter used to collect only names beginning with the
+        uppercase prefix, so a token that pydantic *had* read arrived at
+        ``_redact_input`` as a value it was never told about and survived
+        into the rendered line.
+        """
+        monkeypatch.delenv("SANELESS_PAPERLESS__TOKEN", raising=False)
+        monkeypatch.setenv("saneless_paperless__token", _HOSTILE_SECRET)
+
+        # The premise: pydantic reads the lowercase spelling.
+        assert Settings().paperless.token.get_secret_value() == _HOSTILE_SECRET
+
+        assert _HOSTILE_SECRET not in config_mod._redact_environment(
+            f"upstream said {_HOSTILE_SECRET} here"
+        )
+
 
 @pytest.fixture
 def no_discovered_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

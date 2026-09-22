@@ -1186,6 +1186,14 @@ def _redact_environment(text: str) -> str:
     the ones a token travels in, so the environment's own values are what is
     struck out.
 
+    The name is matched case-insensitively because that is how the value got
+    in. ``SettingsConfigDict`` leaves ``case_sensitive`` at its default, so
+    pydantic-settings reads ``saneless_paperless__token`` exactly as it reads
+    the shouted spelling -- and an uppercase-only filter here would hand that
+    token to ``_redact_input`` as a value it was never told about, leaving it
+    in the rendered line. Whatever pydantic is willing to read, this has to
+    be willing to strike.
+
     Args:
         text: The upstream message fragment.
 
@@ -1194,7 +1202,9 @@ def _redact_environment(text: str) -> str:
 
     """
     values = [
-        value for name, value in os.environ.items() if name.startswith(_ENV_PREFIX)
+        value
+        for name, value in os.environ.items()
+        if name.upper().startswith(_ENV_PREFIX)
     ]
     return _redact_input(text, values)
 
