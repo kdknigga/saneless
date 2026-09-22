@@ -41,6 +41,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
 RUN uv build --wheel --out-dir /dist
+RUN uv export --locked --no-dev --no-emit-project -o /dist/requirements.txt
 
 # Stage 2: Runtime
 FROM python:3.14-slim@sha256:cad9a2c871761c413caa6fdd6441c783451e740a48aaeba60ae62a8b53525ef6
@@ -48,9 +49,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsane1 curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /dist/*.whl /tmp/
+COPY --from=builder /dist/requirements.txt /tmp/requirements.txt
+# The dependency set installed below comes from uv.lock, not from the project
+# wheel's own metadata, and every byte of it is checked against a sha256 the
+# lock recorded. Two invocations, in this order, never merged into one: the
+# exported requirements file first -- each of its entries carrying its digest --
+# and then the locally built wheel alone, with --no-deps.
+#
+# Installing the wheel on its own, which is what this replaced, resolved the
+# dependency tree from the project's `>=` floors at build time and never read
+# uv.lock. A lock refreshed to escape an advisory therefore constrained CI and
+# constrained nothing that shipped, and the published image could carry the very
+# tree this project had already upgraded away from. The hash check refuses
+# anything not listed with a matching digest -- a substituted or republished
+# artifact fails the build instead of shipping -- and --no-deps stops those
+# floors re-entering through the wheel. The wheel is deliberately absent from
+# the hashed file: it is built in the preceding stage of this same build, so
+# hashing it would only compare it against itself.
+#
+# gcc and the headers are installed, used and purged inside this single RUN
+# because python-sane publishes an sdist and no wheel, so it compiles here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libc6-dev libsane-dev \
-    && pip install --no-cache-dir /tmp/*.whl && rm /tmp/*.whl \
+    && pip install --no-cache-dir --require-hashes -r /tmp/requirements.txt \
+    && pip install --no-cache-dir --no-deps /tmp/*.whl \
+    && rm /tmp/*.whl /tmp/requirements.txt \
     && apt-get purge -y gcc libc6-dev libsane-dev && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 # The application account. Everything above this line needs root -- apt and the
