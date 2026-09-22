@@ -14,13 +14,23 @@ Every dependency is injected instead: the settings, the scanner backend, the
 Paperless client and the worker's profile-storage outcome all arrive as
 parameters on ``CheckContext``.  That is also what lets ``doctor`` run on a
 machine with no python-sane at all -- it passes ``scanner=None`` and still
-reports all five rows.
+reports all six rows.
 
 ASVS V7 applies to every string this module can render.  No message and no next
 step carries a filesystem path, a URL, a token value or exception text.  The
 Paperless URL may hold ``user:pass@`` (``paperless.py:461``) and the fallback
 folder is a host path on a LAN-visible page, so both are deliberately omitted,
 exactly as the log file's path is.
+
+There is exactly one exception, and it is this narrow: the Configuration row's
+*next step*, in the two states where a file under the superseded name was
+found, names that file -- as one of three fixed documented spellings (``./``,
+``$XDG_CONFIG_HOME/saneless/`` or ``/etc/saneless/`` followed by the old
+name), never as a resolved host path.  Renaming that exact file is the fix, so
+a row that would not name it could not be acted on; and because the spelling
+comes from the search *position* rather than from the path, what reaches the
+page is a constant this module could have hard-coded.  Every other row, every
+message, and every other state stays under the rule above.
 """
 
 from __future__ import annotations
@@ -38,8 +48,14 @@ from typing import TYPE_CHECKING, Final, assert_never
 
 import httpx2
 
-from saneless.config import is_placeholder_token
+from saneless.config import (
+    CONFIG_FILENAME,
+    LEGACY_CONFIG_FILENAME,
+    config_file_state,
+    is_placeholder_token,
+)
 from saneless.vocabulary import (
+    ConfigFileState,
     ConnectionStatus,
     ProfileStorage,
     connection_status_message,
@@ -78,6 +94,7 @@ __all__ = [
     "check_state_class",
     "check_state_glyph",
     "check_state_label",
+    "configuration_check",
     "run_checks",
     "worst_state",
 ]
@@ -290,7 +307,7 @@ class CheckState(StrEnum):
 
 class CheckKey(StrEnum):
     """
-    The five checks, and the contract that both surfaces show all five.
+    The six checks, and the contract that both surfaces show all six.
 
     This enum *is* the "neither surface may define a check the other does not
     have" rule.  ``run_checks`` iterates it and returns one result per member,
@@ -298,7 +315,15 @@ class CheckKey(StrEnum):
     renders them in member order, so there is no list of checks anywhere else
     to drift out of step with this one.
 
-    Adding a sixth member is therefore a deliberate act with a visible cost:
+    ``CONFIGURATION`` is first because member order is reading order, and it
+    is the row that can explain the others.  A missing or unreadable
+    configuration file turns the Paperless, Profiles and Fallback rows red or
+    amber at once, each of them reporting a symptom truthfully and none of
+    them naming the cause; a reader who meets the cause first has the other
+    rows explained before reaching them, and one who meets it last has already
+    drawn three wrong conclusions.
+
+    Adding a seventh member is therefore a deliberate act with a visible cost:
     ``check_name`` stops type-checking until the new key has a name, the
     dispatch in ``run_checks`` stops type-checking until it has a check
     function, and the completeness test in ``tests/test_checks.py`` fails until
@@ -309,6 +334,7 @@ class CheckKey(StrEnum):
     copy.
     """
 
+    CONFIGURATION = "CONFIGURATION"
     SCANNER = "SCANNER"
     PAPERLESS = "PAPERLESS"
     PROFILES = "PROFILES"
@@ -335,10 +361,14 @@ class CheckResult:
     probe, not a verdict about the appliance.
 
     Attributes:
-        key: Which of the five checks this is.
+        key: Which of the six checks this is.
         state: How it came out.
         message: A developer-authored sentence.  Never a path, a URL, a token
-            or exception text (ASVS V7).
+            or exception text (ASVS V7).  The module docstring states the one
+            exception: the Configuration row's ``next_step``, in its two
+            superseded-name states, carries one of three fixed documented
+            spellings of the file to rename -- never a resolved host path, and
+            never in ``message``.
         next_step: What to do about it, for ``WARN`` and ``FAIL`` rows.
         skipped: True when the probe was deliberately not run.
 
@@ -354,7 +384,7 @@ class CheckResult:
 @dataclass(frozen=True, slots=True)
 class CheckContext:
     """
-    Everything the five checks need, handed in rather than reached for.
+    Everything the six checks need, handed in rather than reached for.
 
     Every dependency is injected because the two surfaces build them
     differently, and neither may be the one this module knows about.
@@ -363,7 +393,7 @@ class CheckContext:
     builds what it needs for one command.
 
     ``scanner=None`` is how "python-sane is not installed on this machine" is
-    represented.  That is what lets ``doctor`` report all five rows on such a
+    represented.  That is what lets ``doctor`` report all six rows on such a
     machine instead of refusing at ``require_sane()`` and reporting none --
     the thing an operator most needs a diagnostic for is the
     machine where the diagnostic would otherwise not run.
@@ -414,6 +444,8 @@ def check_name(key: CheckKey) -> str:
 
     """
     match key:
+        case CheckKey.CONFIGURATION:
+            name = "Configuration"
         case CheckKey.SCANNER:
             name = "Scanner"
         case CheckKey.PAPERLESS:
@@ -1171,6 +1203,137 @@ def _device_label(device: DeviceInfo) -> str:
     return label
 
 
+def _stale_file_as_named(settings: Settings, *, absolute_paths: bool) -> str:
+    """
+    Spell the superseded-name file the row is about to tell someone to rename.
+
+    Two spellings of one file, one caller each.  The status strip gets the
+    documented spelling, because it is a page anyone on the LAN can load and
+    a search *position* maps to a constant string; ``saneless doctor`` and the
+    log get the absolute path, because they are read by the operator on the
+    machine, where the resolved path is the useful half and the disclosure
+    rule does not apply.
+
+    Args:
+        settings: The settings whose recorded search found the file.
+        absolute_paths: True for the terminal spelling.
+
+    Returns:
+        The file, spelled for the surface that asked.
+
+    Raises:
+        AssertionError: If the settings carry no recording.  Only a recorded
+            search can report a superseded-name state, so reaching this means
+            the state derivation and this function have come apart.
+
+    """
+    discovery = settings.config_discovery
+    if discovery is None:
+        msg = "A superseded-name state can only come from a recorded search"
+        raise AssertionError(msg)
+    stale = discovery.stale[0]
+    if absolute_paths:
+        return str(stale.absolute())
+    return discovery.documented_spelling(stale)
+
+
+def configuration_check(
+    settings: Settings, *, absolute_paths: bool = False
+) -> CheckResult:
+    """
+    Report which configuration file is in use, and whether an old one is not.
+
+    The row that exists because four rows once went red or amber for one
+    missing file and not one of them named it.  Its four outcomes come from
+    ``config_file_state``, which is the single derivation the startup log, the
+    status strip, ``saneless doctor`` and the one-shot commands all read, so
+    none of them can describe the same appliance differently.
+
+    Public, and with a spelling switch, for that same reason.  The terminal
+    surfaces call it with ``absolute_paths=True`` and get *these* sentences
+    with the file spelled as a resolved path; nothing there re-authors the
+    wording, so a change here changes every surface at once.
+
+    Why a missing file is amber and never red: configuring saneless entirely
+    through environment variables is supported and documented, so a deployment
+    with no file may be working exactly as designed.  Whether paperless-ngx is
+    reachable is the Paperless row's question, and it already goes red on an
+    unset URL or token -- two rows reporting one fact is how a reader learns
+    to discount both.
+
+    Why a lone file under the superseded name is red: nothing the operator
+    wrote was read.  Every value they set is absent, the appliance is running
+    on defaults, and the file sitting in the searched directory is the reason.
+
+    Why the leftover next step says move before it says delete: after an
+    upgrade the leftover can hold the only copy of the Paperless URL and
+    token, and a bare "delete it" would be advice to destroy the
+    configuration.
+
+    Why both next steps end in a restart: the search is run once, at load, and
+    the outcome is recorded.  Renaming the file changes nothing until the
+    process reads it.
+
+    Args:
+        settings: The settings in hand, carrying the search that built them.
+        absolute_paths: True to spell the file as a resolved path, for the
+            terminal and the log; False for the LAN-visible strip.
+
+    Returns:
+        Exactly one result for ``CheckKey.CONFIGURATION``.
+
+    Raises:
+        AssertionError: If the state is not a ConfigFileState member.
+
+    """
+    state = config_file_state(settings)
+    match state:
+        case ConfigFileState.LOADED:
+            return CheckResult(
+                key=CheckKey.CONFIGURATION,
+                state=CheckState.OK,
+                message="Config file loaded.",
+            )
+        case ConfigFileState.LOADED_WITH_LEFTOVER:
+            named = _stale_file_as_named(settings, absolute_paths=absolute_paths)
+            return CheckResult(
+                key=CheckKey.CONFIGURATION,
+                state=CheckState.WARN,
+                # One literal, deliberately over the 88-column guide (E501 is
+                # off in this project): the sentence is pinned word for word,
+                # and a grep for it has to find it on one line.
+                message=f"Using {CONFIG_FILENAME}; an old {LEGACY_CONFIG_FILENAME} is being ignored.",
+                next_step=(
+                    f"Move anything you still need from {named} into the "
+                    f"{CONFIG_FILENAME} in use, then delete {named} and "
+                    "restart saneless."
+                ),
+            )
+        case ConfigFileState.NOT_FOUND:
+            return CheckResult(
+                key=CheckKey.CONFIGURATION,
+                state=CheckState.WARN,
+                # One literal for the same reason as the row above.
+                message="No config file; running on defaults and environment variables.",
+                next_step=(
+                    f"The saneless log lists every place it looked for {CONFIG_FILENAME}."
+                ),
+            )
+        case ConfigFileState.STALE_ONLY:
+            named = _stale_file_as_named(settings, absolute_paths=absolute_paths)
+            return CheckResult(
+                key=CheckKey.CONFIGURATION,
+                state=CheckState.FAIL,
+                # One literal for the same reason as the rows above.
+                message=f"No config file loaded: saneless now reads {CONFIG_FILENAME}, not {LEGACY_CONFIG_FILENAME}.",
+                next_step=(
+                    f"Rename {named} to {CONFIG_FILENAME}, then restart saneless."
+                ),
+            )
+        case _:
+            assert_never(state)
+
+
 def _scanner_unreachable() -> CheckResult:
     """
     Build the "the scanner is not answering" row.
@@ -1705,7 +1868,7 @@ def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
     """
     Run the one check a key names.
 
-    A total ``match`` rather than a dict of functions: a sixth ``CheckKey``
+    A total ``match`` rather than a dict of functions: a seventh ``CheckKey``
     member stops this function type-checking until somebody decides what it
     does, which a dict lookup with a fallback would not.
 
@@ -1721,6 +1884,10 @@ def _dispatch(key: CheckKey, context: CheckContext) -> CheckResult:
 
     """
     match key:
+        case CheckKey.CONFIGURATION:
+            # Documented spellings, not absolute paths: this path renders on
+            # the status strip, which anyone on the LAN can load.
+            result = configuration_check(context.settings)
         case CheckKey.SCANNER:
             result = _check_scanner(context)
         case CheckKey.PAPERLESS:
@@ -1823,7 +1990,7 @@ def run_checks(
     call, and that is deliberate.  Only ``_check_scanner`` enters
     libsane.  ``_check_paperless`` carries a multi-second HTTP budget, and
     ``_check_fallback`` and ``_check_data_dir`` each create and delete a real
-    file.  A caller that wrapped all five made the lock that exists to keep two
+    file.  A caller that wrapped all six made the lock that exists to keep two
     callers out of libsane into the lock a scan start waits on: ``ScanWorker``
     would sit in ``with self._scanner_gate:`` with the job row already written
     ``SCANNING`` while a health probe waited on a Paperless timeout.  Passing

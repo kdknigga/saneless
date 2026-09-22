@@ -249,7 +249,7 @@ def _synthetic_results() -> tuple[CheckResult, ...]:
 
 def _results_with_a_skipped_scanner() -> tuple[CheckResult, ...]:
     """
-    Build the five rows a refresh during a scan produces.
+    Build the six rows a refresh during a scan produces.
 
     The Scanner row carries UI-SPEC S1's paused sentence and the ``skipped``
     flag; its state is ``OK`` for the reason ``_scanner_skipped``'s is, which is
@@ -807,12 +807,12 @@ class TestWatcherStamping:
 
 
 class TestColdStart:
-    """D-06: five ``Checking…`` rows and a poll that ends itself."""
+    """D-06: six ``Checking…`` rows and a poll that ends itself."""
 
     def test_cold_start_renders_one_checking_row_per_check(
         self, client: TestClient
     ) -> None:
-        """All five names are on the page before any probe has happened."""
+        """All six names are on the page before any probe has happened."""
         markup = client.get("/api/checks").text
         rows = _CHECK_ROW.findall(markup)
         assert len(rows) == len(CheckKey)
@@ -1153,7 +1153,7 @@ class TestTheStripSurvivesItsOwnFailure:
     overwriting the scan-progress line every two seconds.
 
     So this route catches its own failures and renders the cold-start body
-    instead: five named rows, the give-up line naming the button that is still
+    instead: six named rows, the give-up line naming the button that is still
     on the page, and no trigger.  The exception goes to the log and nowhere
     else -- this body is rendered on a page the whole LAN can read (ASVS V7,
     Phase 26 D-10, T-30-32-03).
@@ -1685,7 +1685,7 @@ class TestCollapsedRefreshStillDelivers:
         The give-up line stays cold-start-only: there are results, and they hold.
 
         ``POLL_GAVE_UP_LINE`` says the checks have not run yet.  Printing it
-        beside five rows that did run would be a lie the strip tells about
+        beside six rows that did run would be a lie the strip tells about
         itself, so ``gave_up`` still requires an empty cache.
         """
         _warm_the_cache(client)
@@ -1869,7 +1869,7 @@ class TestTheWindowFollowsTheProbe:
         Rows that did run keep their own sentence, whichever cap is in force.
 
         Neither the give-up line nor the still-checking line belongs beside
-        five results: one says nothing has been checked and the other says the
+        six results: one says nothing has been checked and the other says the
         *first* check is running, and both would be false here.
         """
         cap = checks_module.POLL_ATTEMPT_CAP
@@ -2281,7 +2281,7 @@ class TestASkippedRowIsNotAPassingRow:
 
     def test_the_cold_branch_still_says_checking(self, client: TestClient) -> None:
         """
-        D-06's five cold rows are untouched.
+        D-06's six cold rows are untouched.
 
         ``_CheckingRow`` is not a ``CheckResult`` and still hands its own trio
         to the macro, so the cold word stays "Checking" and does not become

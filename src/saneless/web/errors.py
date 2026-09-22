@@ -85,7 +85,7 @@ RETRY_AFTER_SECONDS: Final = 30
 # The id alone does not identify the poll.  ``Check again`` in the same partial
 # is ``hx-post="/api/checks/refresh" hx-target="#checks-body"``, so its click
 # arrives carrying the same header, and exempting it too meant a failing click
-# wrote the error body over the strip -- five rows and the only button that
+# wrote the error body over the strip -- six rows and the only button that
 # could bring them back, gone for the life of the tab.  So the
 # exemption also requires a GET (``_is_the_strip_fetching_itself``): the
 # strip's poll and its terminal-state reload are both ``GET /api/checks``, the

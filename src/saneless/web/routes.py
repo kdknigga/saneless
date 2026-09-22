@@ -216,7 +216,7 @@ class _CheckingRow:
     every one of them is a constant imported from ``saneless.checks``: the
     template still authors none of them.
 
-    Only ``key`` varies, so the five rows are built once at import.
+    Only ``key`` varies, so the six rows are built once at import.
 
     Attributes:
         key: Which check this row is standing in for.
@@ -235,7 +235,7 @@ class _CheckingRow:
 
 
 # One placeholder per CheckKey, in member order, so a cold strip still renders
-# five *named* rows rather than an empty list that reads as "nothing to report".
+# six *named* rows rather than an empty list that reads as "nothing to report".
 _CHECKING_ROWS: Final = tuple(_CheckingRow(key=key) for key in CheckKey)
 
 
@@ -368,7 +368,7 @@ def _checks_context(state: State, *, attempt: int = 0) -> dict[str, object]:
     ``gave_up`` means "this cold chain has stopped", and it is measured against
     the *applicable* cap rather than always against ``POLL_ATTEMPT_CAP``.  It
     still requires a cold cache, because its line says the checks have not run
-    yet and that would be a lie printed beside five rows that did run -- so a
+    yet and that would be a lie printed beside six rows that did run -- so a
     settling poll that runs out of attempts leaves the normal last-checked line
     alone.  What changed is that a cold chain at ``POLL_ATTEMPT_CAP`` with a
     probe in flight has *not* stopped: it keeps asking up to
@@ -435,13 +435,13 @@ def _checks_fallback_context() -> dict[str, object]:
     of the exception that produced it may reach the context (ASVS V7).  The
     exception goes to ``logger.exception`` instead.
 
-    ``checks`` is ``None`` and ``checking_rows`` is the cold-start five, so the
-    strip shows five *named* rows rather than an empty list that would read as
+    ``checks`` is ``None`` and ``checking_rows`` is the cold-start six, so the
+    strip shows six *named* rows rather than an empty list that would read as
     "nothing to report".  ``freshness_line`` is ``POLL_GAVE_UP_LINE``, and not
     because nothing has been checked: the guard around this body covers the
     whole render, so a raise from the worker's job lookup, the refresher's
     lock or the clock produces it on an appliance whose cache may well hold
-    five true rows.  It is chosen because the render that would have read the
+    six true rows.  It is chosen because the render that would have read the
     cache is the one that failed, so this body asserts nothing about the cache
     beyond the fact that it could not be shown -- and the line names the
     ``Check again`` button that is still on the page, which is the one way
@@ -1513,7 +1513,7 @@ def refresh_checks(request: Request) -> Response:
     ``_checks_context`` raising here used to be a 500, and because the button
     aims at ``#checks-body`` that 500 arrived carrying the strip's own
     ``HX-Target`` -- which, until the exemption was narrowed to a GET,
-    meant the error body was written over the strip, taking the five rows and
+    meant the error body was written over the strip, taking the six rows and
     the only button that could bring them back.  Now a failure inside the
     strip's rendering ends as ``_checks_fallback_context`` at 200 on this route
     too, so the strip and the button stay on the page.  Everything before the

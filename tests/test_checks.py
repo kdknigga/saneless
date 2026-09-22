@@ -253,8 +253,14 @@ class TestCheckVocabulary:
         assert name != key.value
 
     def test_check_names_are_the_ui_spec_column(self) -> None:
-        """The name column is UI-SPEC S1's, verbatim, in member order."""
+        """
+        The name column is UI-SPEC S1's, verbatim, in member order.
+
+        "Configuration" joins it at the head (Phase 37 D-03); the five the
+        spec named are unchanged and still in their order.
+        """
         assert [check_name(key) for key in CheckKey] == [
+            "Configuration",
             "Scanner",
             "Paperless",
             "Profiles",

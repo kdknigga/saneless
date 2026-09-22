@@ -94,7 +94,7 @@ class CheckCache:
        cached value is immutable all the way down and a renderer cannot mutate
        what the next renderer will read.
 
-    There is one entry rather than a keyed store: the five checks are run and
+    There is one entry rather than a keyed store: the six checks are run and
     shown together, so there is nothing to key on.
 
     Args:

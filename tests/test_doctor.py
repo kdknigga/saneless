@@ -2,8 +2,8 @@
 Tests for ``saneless doctor``, the CLI half of the shared check registry.
 
 This file exists because ``doctor`` is the command surface of
-``saneless.checks``.  The index page shows the five checks to a household
-member; ``doctor`` prints the same five, from the same registry and in the same
+``saneless.checks``.  The index page shows the six checks to a household
+member; ``doctor`` prints the same six, from the same registry and in the same
 words, to a shell that can gate on them (APPL-01, D-02).  What each check
 *decides* is ``tests/test_checks.py``'s subject.  What this file asserts is the
 rendering and the exit code -- the two things that belong to the command.
@@ -18,7 +18,7 @@ to notice afterwards:
   doc-truth tests and Phase 28's D-07 table at once.
 * **Amendment A-1** -- ``doctor`` never calls ``require_sane()``.  A machine
   with no python-sane is precisely the machine whose owner needs a diagnosis,
-  so the missing import is rendered as one ``FAIL`` row among five rather than
+  so the missing import is rendered as one ``FAIL`` row among six rather than
   as a refusal to run at all.  ``scan``, ``devices``, ``serve`` and
   ``auto-profiles`` all refuse; ``doctor`` is the one command that must not.
 * **APPL-01/D-14** -- a placeholder paperless-ngx token makes ``doctor`` exit
@@ -28,7 +28,7 @@ to notice afterwards:
 
 The state-permutation tests stub ``saneless.cli.run_checks`` with hand-built
 results, for the same reason ``tests/test_cli.py`` stubs the scanner backend:
-arranging five real checks into a chosen set of states would test the registry,
+arranging six real checks into a chosen set of states would test the registry,
 which already has 91 tests of its own.
 """
 
@@ -57,11 +57,13 @@ from saneless.cli import (
     cli,
 )
 from saneless.config import (
+    ConfigDiscovery,
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
     ScannerConfig,
     Settings,
+    discover_config,
     profile_storage_for_loaded,
 )
 from saneless.exceptions import ConfigError, PaperlessError
@@ -203,7 +205,22 @@ def _patch_doctor(
 
     def _fake_load_settings(config_path: str | None = None) -> Settings:
         """Return the test settings, recording ``--config`` as the real one does."""
-        settings._config_path = None if config_path is None else Path(config_path)
+        explicit = None if config_path is None else Path(config_path)
+        settings._config_path = explicit
+        # The real loader records the search alongside the path, and the
+        # Configuration row reads the recording.  A fake that set only the
+        # path would leave every doctor run reporting a search it never ran.
+        settings._config_discovery = (
+            discover_config(())
+            if explicit is None
+            else ConfigDiscovery(
+                explicit=explicit,
+                searched=(),
+                found=(explicit,),
+                loaded=explicit,
+                stale=(),
+            )
+        )
         return settings
 
     monkeypatch.setattr("saneless.cli.load_settings", _fake_load_settings)
@@ -245,15 +262,44 @@ def _all_ok() -> tuple[CheckResult, ...]:
     Build one OK result per check.
 
     Returns:
-        Five green rows in ``CheckKey`` order.
+        Six green rows in ``CheckKey`` order.
 
     """
     return tuple(_row(key, CheckState.OK) for key in CheckKey)
 
 
+def _all_ok_except(
+    key: CheckKey, state: CheckState, next_step: str
+) -> tuple[CheckResult, ...]:
+    """
+    Build one row per check, green but for the one named.
+
+    Generated from ``CheckKey`` rather than listed, so a member added to the
+    enum lands in these rows in its own position instead of turning a
+    hand-written tuple into an assertion about the wrong row.
+
+    Args:
+        key: The check that is not green.
+        state: What that check came out as.
+        next_step: What its row says to do about it.
+
+    Returns:
+        One result per check, in member order.
+
+    """
+    return tuple(
+        _row(
+            member,
+            state if member is key else CheckState.OK,
+            next_step=next_step if member is key else "",
+        )
+        for member in CheckKey
+    )
+
+
 def _one_skipped_scanner() -> tuple[CheckResult, ...]:
     """
-    Build five rows of which the Scanner one was never probed.
+    Build six rows of which the Scanner one was never probed.
 
     ``run_checks`` really can produce this -- ``_scanner_skipped`` and
     ``_scanner_busy`` both do -- but no ``doctor`` invocation reaches it today,
@@ -263,7 +309,7 @@ def _one_skipped_scanner() -> tuple[CheckResult, ...]:
     until something rendered it, nothing noticed it rendered wrong.
 
     Returns:
-        Five rows in ``CheckKey`` order, the Scanner one skipped.
+        Six rows in ``CheckKey`` order, the Scanner one skipped.
 
     """
     return tuple(
@@ -391,7 +437,7 @@ class TestDoctorExitCodes:
 
 
 class TestDoctorOutput:
-    """The printed table: five rows, in order, each with its marker."""
+    """The printed table: six rows, in order, each with its marker."""
 
     def test_all_ok_prints_exactly_five_lines(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -459,18 +505,15 @@ class TestDoctorOutput:
         """APPL-04: a row nobody can act on is a row that only gets escalated."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         step = "Set a fallback folder in the saneless config."
-        results = (
-            _row(CheckKey.SCANNER, CheckState.OK),
-            _row(CheckKey.PAPERLESS, CheckState.OK),
-            _row(CheckKey.PROFILES, CheckState.OK),
-            _row(CheckKey.FALLBACK, CheckState.WARN, next_step=step),
-            _row(CheckKey.DATA_DIR, CheckState.OK),
-        )
+        # Built from the enum rather than listed: a member added above
+        # FALLBACK moves the row and its step line together.
+        results = _all_ok_except(CheckKey.FALLBACK, CheckState.WARN, step)
         _stub_registry(monkeypatch, results)
         result = runner.invoke(cli, ["doctor"])
         lines = _lines(result.output)
         assert len(lines) == len(CheckKey) + 1
-        row, step_line = lines[3], lines[4]
+        warned = list(CheckKey).index(CheckKey.FALLBACK)
+        row, step_line = lines[warned], lines[warned + 1]
         assert step_line.strip() == step
         assert step_line.index(step) == row.index("Fallback message.")
 
@@ -480,22 +523,17 @@ class TestDoctorOutput:
         """Red rows carry a remedy for the same reason amber ones do."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         step = "Put a real API token in the saneless config file."
-        results = (
-            _row(CheckKey.SCANNER, CheckState.OK),
-            _row(CheckKey.PAPERLESS, CheckState.FAIL, next_step=step),
-            _row(CheckKey.PROFILES, CheckState.OK),
-            _row(CheckKey.FALLBACK, CheckState.OK),
-            _row(CheckKey.DATA_DIR, CheckState.OK),
-        )
+        results = _all_ok_except(CheckKey.PAPERLESS, CheckState.FAIL, step)
         _stub_registry(monkeypatch, results)
         result = runner.invoke(cli, ["doctor"])
         lines = _lines(result.output)
-        assert lines[2].strip() == step
+        failed = list(CheckKey).index(CheckKey.PAPERLESS)
+        assert lines[failed + 1].strip() == step
 
     def test_ok_rows_print_no_next_step_line(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Nothing to do means nothing printed; five green rows are five lines."""
+        """Nothing to do means nothing printed; six green rows are six lines."""
         runner = _patch_doctor(monkeypatch, _make_settings(tmp_path))
         _stub_registry(monkeypatch, _all_ok())
         result = runner.invoke(cli, ["doctor"])
@@ -564,10 +602,15 @@ class TestASkippedRowIsNotAPassingRow:
         result = runner.invoke(cli, ["doctor"])
         lines = _lines(result.output)
         assert len(lines) == len(CheckKey)
-        assert lines[0].startswith(f"{_SKIPPED_MARKER} ")
-        assert not lines[0].startswith(_state_marker(CheckState.OK))
+        # Found by key, not by position: the Scanner row stopped being the
+        # first one the day Configuration was inserted above it.
+        skipped = list(CheckKey).index(CheckKey.SCANNER)
+        assert lines[skipped].startswith(f"{_SKIPPED_MARKER} ")
+        assert not lines[skipped].startswith(_state_marker(CheckState.OK))
         assert all(
-            line.startswith(f"{_state_marker(CheckState.OK)} ") for line in lines[1:]
+            line.startswith(f"{_state_marker(CheckState.OK)} ")
+            for index, line in enumerate(lines)
+            if index != skipped
         )
 
     def test_a_skipped_row_does_not_fail_the_gate(
@@ -626,7 +669,7 @@ class TestDoctorUsesTheRealRegistry:
     def test_every_check_runs_against_the_real_registry(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Five rows come back from ``run_checks`` itself, not from a stub."""
+        """Six rows come back from ``run_checks`` itself, not from a stub."""
         settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
         runner = _patch_doctor(monkeypatch, settings)
         result = runner.invoke(cli, ["doctor"])
@@ -774,7 +817,7 @@ class TestProfilesRowAgreement:
 
         def _capture(context: CheckContext) -> tuple[CheckResult, ...]:
             """
-            Record the context and answer with five green rows.
+            Record the context and answer with six green rows.
 
             Args:
                 context: What ``doctor`` built.
