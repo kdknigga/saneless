@@ -113,7 +113,7 @@ class TestAtomicReplace:
         self, tmp_path: Path
     ) -> None:
         """CRLF endings and a non-ASCII comment reach disk unchanged, as UTF-8."""
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
 
         result = replace_file_atomically(target, _NEW)
@@ -128,7 +128,7 @@ class TestAtomicReplace:
         A freshly written config may hold the Paperless token, so mkstemp's
         0600 is kept rather than widened.
         """
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
 
         replace_file_atomically(target, _NEW)
 
@@ -137,13 +137,13 @@ class TestAtomicReplace:
 
     def test_atomic_replace_leaves_only_the_target(self, tmp_path: Path) -> None:
         """After success the directory holds the target and nothing else."""
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
 
         replace_file_atomically(target, _NEW)
 
         _leftovers(tmp_path)
-        assert sorted(entry.name for entry in tmp_path.iterdir()) == ["config.toml"]
+        assert sorted(entry.name for entry in tmp_path.iterdir()) == ["saneless.toml"]
 
     def test_atomic_temp_file_is_created_in_the_target_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -155,7 +155,7 @@ class TestAtomicReplace:
         /tmp would fail with EXDEV against a mounted config directory.
         """
         directories = _record_mkstemp(monkeypatch)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
 
         replace_file_atomically(target, _NEW)
@@ -186,7 +186,7 @@ class TestAtomicReplace:
 
         monkeypatch.setattr(os, "fsync", recording_fsync)
         monkeypatch.setattr(Path, "replace", recording_replace)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
 
         replace_file_atomically(target, _NEW)
@@ -209,7 +209,7 @@ class TestAtomicFailureCleanup:
             raise OSError(errno.EIO, os.strerror(errno.EIO))
 
         monkeypatch.setattr(os, "fsync", failing_fsync)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
 
         with pytest.raises(OSError, match=os.strerror(errno.EIO)) as excinfo:
@@ -229,7 +229,7 @@ class TestAtomicFailureCleanup:
             raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
 
         monkeypatch.setattr(Path, "replace", cross_device)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
 
         with pytest.raises(OSError, match=os.strerror(errno.EXDEV)) as excinfo:
@@ -259,7 +259,7 @@ class TestAtomicFailureCleanup:
             real_fsync(fd)
 
         monkeypatch.setattr(os, "fsync", no_directory_fsync)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
 
         replace_file_atomically(target, _NEW)
@@ -283,7 +283,7 @@ class TestSymlinkAndReadonly:
         """
         real_dir = tmp_path / "real"
         real_dir.mkdir()
-        real = real_dir / "config.toml"
+        real = real_dir / "saneless.toml"
         real.write_text(_ORIGINAL, encoding="utf-8")
         link = tmp_path / "link.toml"
         link.symlink_to(real)
@@ -309,7 +309,7 @@ class TestSymlinkAndReadonly:
         ``rename(2)`` checks only the directory, so without a pre-check the
         documented "config cannot be written" case would quietly succeed.
         """
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
         _deny_write_access(monkeypatch, target)
         directories = _record_mkstemp(monkeypatch)
@@ -351,7 +351,7 @@ class TestReadOnlyMount:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A read-only file in a writable directory is its own mount: D-08."""
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
         self._fake_read_only(monkeypatch, {target.resolve()})
         directories = _record_mkstemp(monkeypatch)
@@ -372,7 +372,7 @@ class TestReadOnlyMount:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A file and its directory on one read-only mount name that mount."""
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
         self._fake_read_only(monkeypatch, {target.resolve(), tmp_path.resolve()})
 
@@ -390,7 +390,7 @@ class TestReadOnlyMount:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An unwritable file on a writable mount is refused as read-only."""
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
         _deny_write_access(monkeypatch, target)
         self._fake_read_only(monkeypatch, set())
@@ -433,7 +433,7 @@ class TestModeAndOwner:
         mkstemp creates 0600; without copying the mode, a rewrite would lock
         out a group (for example a backup user) that could read it before.
         """
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
         target.chmod(0o640)
 
@@ -452,7 +452,7 @@ class TestModeAndOwner:
         rewrite (D-06), and chown(2) may clear set-id bits, so the mode has
         to be applied after it (Pitfall 5).
         """
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
         target.chmod(0o640)
         original = target.stat()
@@ -480,7 +480,7 @@ class TestModeAndOwner:
             raise PermissionError(errno.EPERM, os.strerror(errno.EPERM))
 
         monkeypatch.setattr(os, "fchown", refused_fchown)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
         target.chmod(0o640)
 
@@ -509,7 +509,7 @@ class TestModeAndOwner:
             raise OSError(code, os.strerror(code))
 
         monkeypatch.setattr(os, "fchown", unsupported_fchown)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
         target.chmod(0o640)
 
@@ -540,7 +540,7 @@ class TestModeAndOwner:
             real_fchown(fd, uid, gid)
 
         monkeypatch.setattr(os, "fchown", owner_refused)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
         original = target.stat()
 
@@ -562,7 +562,7 @@ class TestModeAndOwner:
             raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
 
         monkeypatch.setattr(os, "fchmod", unsupported_fchmod)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
 
         replace_file_atomically(target, _NEW)
@@ -580,7 +580,7 @@ class TestModeAndOwner:
             raise OSError(errno.EIO, os.strerror(errno.EIO))
 
         monkeypatch.setattr(os, "fchown", broken_fchown)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
 
         with pytest.raises(OSError, match=os.strerror(errno.EIO)):
@@ -594,7 +594,7 @@ class TestModeAndOwner:
     ) -> None:
         """With nothing to copy from, the new file keeps mkstemp's 0600."""
         calls = self._record_fchown_and_fchmod(monkeypatch)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
 
         replace_file_atomically(target, _NEW)
 
@@ -621,7 +621,7 @@ class TestBindMount:
             raise OSError(errno.EBUSY, os.strerror(errno.EBUSY))
 
         monkeypatch.setattr(Path, "replace", busy)
-        target = tmp_path / "config.toml"
+        target = tmp_path / "saneless.toml"
         target.write_bytes(_ORIGINAL.encode("utf-8"))
 
         with pytest.raises(ConfigError) as excinfo:
@@ -642,18 +642,18 @@ class TestBindMount:
         The documented ``./config:/etc/saneless`` layout is rewritten normally.
 
         The temp file is created inside the mounted directory, beside
-        ``config.toml``, and nothing else is left there afterwards (CFG-09).
+        ``saneless.toml``, and nothing else is left there afterwards (CFG-09).
         """
         config_dir = tmp_path / "config"
         config_dir.mkdir()
-        target = config_dir / "config.toml"
+        target = config_dir / "saneless.toml"
         target.write_text(_ORIGINAL, encoding="utf-8")
 
         result = replace_file_atomically(target, _NEW)
 
         assert result == target.resolve()
         assert target.read_bytes() == _NEW.encode("utf-8")
-        assert sorted(entry.name for entry in config_dir.iterdir()) == ["config.toml"]
+        assert sorted(entry.name for entry in config_dir.iterdir()) == ["saneless.toml"]
 
 
 # The real-kernel variant runs the helper inside an unprivileged user and mount
@@ -741,11 +741,11 @@ class TestRealBindMount:
         self, tmp_path: Path
     ) -> None:
         """Renaming over a real single-file bind mount is EBUSY -> ConfigError."""
-        host_file = tmp_path / "host-config.toml"
+        host_file = tmp_path / "host-saneless.toml"
         host_file.write_text(_ORIGINAL, encoding="utf-8")
         container_dir = tmp_path / "etc-saneless"
         container_dir.mkdir()
-        mounted = container_dir / "config.toml"
+        mounted = container_dir / "saneless.toml"
         mounted.write_text("", encoding="utf-8")
 
         completed = _run_in_mount_namespace(host_file, mounted, mounted)
@@ -765,11 +765,11 @@ class TestRealBindMount:
         without a mount check the operator was told "Permission denied" and
         went looking at file permissions.
         """
-        host_file = tmp_path / "host-config.toml"
+        host_file = tmp_path / "host-saneless.toml"
         host_file.write_text(_ORIGINAL, encoding="utf-8")
         container_dir = tmp_path / "etc-saneless"
         container_dir.mkdir()
-        mounted = container_dir / "config.toml"
+        mounted = container_dir / "saneless.toml"
         mounted.write_text("", encoding="utf-8")
 
         completed = _run_in_mount_namespace(host_file, mounted, mounted, read_only=True)
@@ -786,13 +786,13 @@ class TestRealBindMount:
         """A config in a ``:ro`` directory mount is reported as a read-only mount."""
         host_dir = tmp_path / "config"
         host_dir.mkdir()
-        host_file = host_dir / "config.toml"
+        host_file = host_dir / "saneless.toml"
         host_file.write_text(_ORIGINAL, encoding="utf-8")
         container_dir = tmp_path / "etc-saneless"
         container_dir.mkdir()
 
         completed = _run_in_mount_namespace(
-            host_dir, container_dir, container_dir / "config.toml", read_only=True
+            host_dir, container_dir, container_dir / "saneless.toml", read_only=True
         )
 
         assert completed.returncode == 3, completed.stderr
@@ -803,19 +803,19 @@ class TestRealBindMount:
     def test_real_directory_bind_mount_replaces_the_host_file(
         self, tmp_path: Path
     ) -> None:
-        """Through a real directory bind mount, the host's config.toml changes."""
+        """Through a real directory bind mount, the host's saneless.toml changes."""
         host_dir = tmp_path / "config"
         host_dir.mkdir()
-        host_file = host_dir / "config.toml"
+        host_file = host_dir / "saneless.toml"
         host_file.write_text(_ORIGINAL, encoding="utf-8")
         container_dir = tmp_path / "etc-saneless"
         container_dir.mkdir()
 
         completed = _run_in_mount_namespace(
-            host_dir, container_dir, container_dir / "config.toml"
+            host_dir, container_dir, container_dir / "saneless.toml"
         )
 
         assert completed.returncode == 0, completed.stderr
         assert "replaced" in completed.stdout
         assert host_file.read_text(encoding="utf-8") == "new = 1\n"
-        assert sorted(entry.name for entry in host_dir.iterdir()) == ["config.toml"]
+        assert sorted(entry.name for entry in host_dir.iterdir()) == ["saneless.toml"]

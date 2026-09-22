@@ -393,7 +393,7 @@ class TestIsBareDefault:
 
     def test_default_values_spelled_out_in_toml_are_bare(self, tmp_path: Path) -> None:
         """Writing the default values explicitly still counts as untouched."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(
             "[profiles.default]\n"
             'source = "Flatbed"\n'
@@ -692,7 +692,7 @@ class TestGenerateProfilesUsesClassifier:
             resolutions=[300],
             modes=["Color"],
         )
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         write_profiles_to_config(config_file, generate_profiles(caps))
 
         settings = load_settings(str(config_file))
@@ -726,7 +726,7 @@ class TestGenerateProfilesDuplex:
         profiles = generate_profiles(caps)
         assert profiles["adf-duplex"].duplex == "hardware"
 
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         write_profiles_to_config(config_file, profiles)
         assert self._written_profiles(config_file)["adf-duplex"]["duplex"] == (
             "hardware"
@@ -780,7 +780,7 @@ class TestGenerateProfilesDuplex:
             resolutions=[300],
             modes=["Color"],
         )
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         write_profiles_to_config(config_file, generate_profiles(caps))
 
         written = self._written_profiles(config_file)
@@ -797,7 +797,7 @@ class TestGenerateProfilesDuplex:
             resolutions=[300],
             modes=["Color"],
         )
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         write_profiles_to_config(config_file, generate_profiles(caps))
 
         assert "duplex" not in config_file.read_text()
@@ -835,7 +835,7 @@ class TestGenerateProfilesDuplex:
         profiles = generate_profiles(caps)
         assert all(profile.duplex != "manual" for profile in profiles.values())
 
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         write_profiles_to_config(config_file, profiles)
         settings = load_settings(str(config_file))
         assert all(profile.duplex != "manual" for profile in settings.profiles.values())
@@ -1089,7 +1089,7 @@ class TestMalformedProfilesSection:
 
     def test_a_scalar_profiles_key_raises_a_config_error(self, tmp_path: Path) -> None:
         """The domain's own error type, not AttributeError from tomlkit."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._MALFORMED)
 
         with pytest.raises(ConfigError, match="not a table"):
@@ -1097,7 +1097,7 @@ class TestMalformedProfilesSection:
 
     def test_the_malformed_file_is_left_untouched(self, tmp_path: Path) -> None:
         """Refusing to overwrite means the user's file is still theirs."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._MALFORMED)
 
         with pytest.raises(ConfigError):
@@ -1204,7 +1204,7 @@ auto_generated = false
 
     def _write(self, tmp_path: Path, *, force: bool) -> Path:
         """Write the generated set over the existing config and return the path."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._EXISTING)
         write_profiles_to_config(config_file, self._generated(), force=force)
         return config_file
@@ -1255,7 +1255,7 @@ auto_generated = false
         self, tmp_path: Path
     ) -> None:
         """The result reports what was added and what was pruned, separately."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._EXISTING)
         result = write_profiles_to_config(config_file, self._generated())
         assert set(result.added) == {"adf", "flatbed"}
@@ -1303,7 +1303,7 @@ auto_generated = true
 
     def _rerun(self, tmp_path: Path) -> Path:
         """Re-run the writer against a feeder-only device and return the path."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._PREVIOUS_RUN)
         write_profiles_to_config(config_file, self._feeder_only())
         return config_file
@@ -1315,7 +1315,7 @@ auto_generated = true
 
     def test_default_is_not_reported_removed(self, tmp_path: Path) -> None:
         """Only the ordinary orphan is named under Removed, never ``default``."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._PREVIOUS_RUN)
         result = write_profiles_to_config(config_file, self._feeder_only())
         assert result.removed == ("flatbed",)
@@ -1344,7 +1344,7 @@ class TestTomlWriting:
 
     def test_preserves_comments(self, tmp_path: Path) -> None:
         """Writing profiles preserves existing TOML comments."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(
             '[scanner]\nhost = ""  # SANE network host\n',
         )
@@ -1365,7 +1365,7 @@ class TestTomlWriting:
 
     def test_skip_existing_without_force(self, tmp_path: Path) -> None:
         """Existing profiles are not overwritten without force."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(
             '[profiles.default]\nsource = "ADF"\nresolution = 600\n'
             'mode = "Gray"\nauto_generated = false\n',
@@ -1395,7 +1395,7 @@ class TestTomlWriting:
         no flag that hands it to the tool: it is skipped, reported, and left
         byte for byte as the user wrote it.
         """
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = (
             b'[profiles.default]\nsource = "ADF"\nresolution = 600\n'
             b'mode = "Gray"\nauto_generated = false\n'
@@ -1418,7 +1418,7 @@ class TestTomlWriting:
 
     def test_writes_auto_source_mode_adf(self, tmp_path: Path) -> None:
         """Writes auto_source_mode when value is adf (non-default)."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         profiles = {
             "auto": ProfileConfig(
                 source="Auto",
@@ -1434,7 +1434,7 @@ class TestTomlWriting:
 
     def test_omits_auto_source_mode_flatbed(self, tmp_path: Path) -> None:
         """Does NOT write auto_source_mode when value is flatbed (default)."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         profiles = {
             "auto": ProfileConfig(
                 source="Auto",
@@ -1456,14 +1456,14 @@ class TestTomlWriting:
             modes=["Color"],
         )
         profiles = generate_profiles(caps)
-        config_file = tmp_path / "auto_config.toml"
+        config_file = tmp_path / "auto_saneless.toml"
         write_profiles_to_config(config_file, profiles)
         content = config_file.read_text()
         assert "paper_size" not in content
 
     def test_creates_new_file(self, tmp_path: Path) -> None:
         """Creates config file if it does not exist."""
-        config_file = tmp_path / "new_config.toml"
+        config_file = tmp_path / "new_saneless.toml"
 
         profiles = {
             "default": ProfileConfig(
@@ -1548,7 +1548,7 @@ auto_generated = true
         self, tmp_path: Path, *, force: bool, extra: bool = False
     ) -> tuple[Path, ProfileWriteResult]:
         """Write the regenerated set over the fixture and return path and result."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._EXISTING)
         result = write_profiles_to_config(
             config_file, self._generated(extra=extra), force=force
@@ -1642,7 +1642,7 @@ auto_generated = true
     def test_merge_result_describe_lists_groups_in_order(self, tmp_path: Path) -> None:
         """One line per non-empty group, in a fixed order, names shown with repr."""
         result = ProfileWriteResult(
-            path=tmp_path / "config.toml",
+            path=tmp_path / "saneless.toml",
             added=("a", "b"),
             refreshed=("c",),
             skipped_not_generated=("default",),
@@ -1661,7 +1661,7 @@ auto_generated = true
 
     def test_merge_result_describe_omits_empty_groups(self, tmp_path: Path) -> None:
         """Empty groups print nothing; an empty result describes nothing."""
-        path = tmp_path / "config.toml"
+        path = tmp_path / "saneless.toml"
         assert ProfileWriteResult(path=path, refreshed=("x",)).describe() == [
             "Refreshed: 'x'"
         ]
@@ -1730,7 +1730,7 @@ auto_generated = true
 
     def _write(self, tmp_path: Path, *, force: bool) -> Path:
         """Write the regenerated set over the fixture and return the path."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(self._EXISTING)
         write_profiles_to_config(config_file, self._generated(), force=force)
         return config_file
@@ -1885,7 +1885,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
     @staticmethod
     def _config(tmp_path: Path, name: str, flag: str) -> Path:
         """Write a hand-written ``name`` profile whose flag is the string ``flag``."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(
             '[profiles.default]\nsource = "Flatbed"\n\n'
             f'[profiles.{name}]\nsource = "mine"\nauto_generated = "{flag}"\n'
@@ -1957,7 +1957,7 @@ class TestOwnershipReadsTheFlagLikeTheLoader:
 
     def test_an_unparseable_flag_is_not_owned(self, tmp_path: Path) -> None:
         """A flag pydantic rejects is never read as the tool's (fail safe)."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(
             '[profiles.default]\nsource = "Flatbed"\n\n'
             '[profiles.zzz]\nsource = "mine"\nauto_generated = "maybe"\n'
@@ -1995,7 +1995,7 @@ class TestDurableConfigWrite:
 
     def test_crlf_utf8_config_keeps_crlf_and_comment(self, tmp_path: Path) -> None:
         """Every line ending stays CRLF, lines tomlkit adds included (D-05)."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_bytes(
             '# café\r\n[profiles.default]\r\nsource = "Flatbed"\r\n'.encode()
         )
@@ -2015,7 +2015,7 @@ class TestDurableConfigWrite:
         One CRLF anywhere used to turn every bare LF in the output into CRLF,
         rewriting lines the user wrote with LF.
         """
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = (
             b'[output]\r\nweb_port = 1\n\n[profiles.default]\nsource = "Flatbed"\n'
         )
@@ -2029,7 +2029,7 @@ class TestDurableConfigWrite:
 
     def test_bare_lf_in_a_multiline_string_is_kept(self, tmp_path: Path) -> None:
         """A CRLF file whose multi-line string holds a bare LF keeps that value."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_bytes(
             b'[profiles.default]\r\nsource = "Flatbed"\r\ntitle = """two\nlines"""\r\n'
         )
@@ -2042,7 +2042,7 @@ class TestDurableConfigWrite:
 
     def test_lf_utf8_config_stays_lf(self, tmp_path: Path) -> None:
         """An LF file gains no carriage returns."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_bytes(b'[profiles.default]\nsource = "Flatbed"\n')
 
         write_profiles_to_config(config_file, self._generated())
@@ -2051,7 +2051,7 @@ class TestDurableConfigWrite:
 
     def test_non_utf8_config_is_refused_utf8(self, tmp_path: Path) -> None:
         """Bytes that are not UTF-8 raise ConfigError and leave the file alone."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = b"# caf\xe9\n"
         config_file.write_bytes(original)
 
@@ -2069,7 +2069,7 @@ class TestDurableConfigWrite:
         (M-17, EXC-01); it now names the file, line and column and is chained,
         since tomlkit's message holds no document text.
         """
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = b"a = = 1\n"
         config_file.write_bytes(original)
 
@@ -2095,7 +2095,7 @@ class TestDurableConfigWrite:
         a ``TOMLKitError`` that is not a ``ParseError`` and carries no position,
         so the message claims none.
         """
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = b"[a]\nb = 1\n[a.b]\nc = 1\n"
         config_file.write_bytes(original)
 
@@ -2112,7 +2112,7 @@ class TestDurableConfigWrite:
 
     def test_inline_profiles_section_stays_valid_toml(self, tmp_path: Path) -> None:
         """A profile added to an inline ``profiles = {...}`` section re-parses."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text('profiles = { default = { source = "Flatbed" } }\n')
 
         result = write_profiles_to_config(config_file, self._generated())
@@ -2126,7 +2126,7 @@ class TestDurableConfigWrite:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Invalid dumped TOML raises ConfigError; file and directory unchanged."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = b'[profiles.default]\nsource = "Flatbed"\n'
         config_file.write_bytes(original)
         monkeypatch.setattr(auto_profiles.tomlkit, "dumps", lambda _doc: "profiles = {")
@@ -2150,7 +2150,7 @@ class TestDurableConfigWrite:
         nests ``profiles.default.auto_generated`` inside the new profile. The
         file must be left as it was, still loadable, with no temp file behind.
         """
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = (
             b'profiles.default.source = "Flatbed"\n'
             b"profiles.default.auto_generated = true\n"
@@ -2182,7 +2182,7 @@ class TestDurableConfigWrite:
         tomllib reads CRLF inside a multi-line string as LF while tomlkit keeps
         it, and NaN is unequal to itself; neither may block every rewrite.
         """
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_bytes(
             b'[profiles.default]\r\nsource = "Flatbed"\r\n'
             b'title = """two\r\nlines"""\r\nnote = nan\r\n'
@@ -2198,7 +2198,7 @@ class TestDurableConfigWrite:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Valid TOML whose data is not the merged document is never written."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         original = b'[profiles.default]\nsource = "Flatbed"\n'
         config_file.write_bytes(original)
         monkeypatch.setattr(
@@ -2216,7 +2216,7 @@ class TestDurableConfigWrite:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Only skipped names means no rewrite, so no EBUSY noise for a no-op."""
-        config_file = tmp_path / "config.toml"
+        config_file = tmp_path / "saneless.toml"
         config_file.write_text(
             '[profiles.flatbed]\nsource = "Flatbed"\nauto_generated = true\n'
         )
@@ -2238,10 +2238,10 @@ class TestDurableConfigWrite:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """D-07: the link survives, the real file changes, both are named."""
-        real = tmp_path / "dotfiles" / "config.toml"
+        real = tmp_path / "dotfiles" / "saneless.toml"
         real.parent.mkdir()
         real.write_text('[profiles.default]\nsource = "Flatbed"\n')
-        link = tmp_path / "config.toml"
+        link = tmp_path / "saneless.toml"
         link.symlink_to(real)
 
         with caplog.at_level(logging.INFO, logger="saneless.auto_profiles"):
