@@ -222,7 +222,7 @@ def render_error(
     own failure replaces the status strip.  The method is part of the key
     because the ``Check again`` button targets the same id, and a click's
     failure must not take the strip with it.  Two facts
-    make the exemption the fix.  htmx 2.0.8 applies
+    make the exemption the fix.  htmx 2.0.10 applies
     ``HX-Retarget`` to the response's target *before* it decides what to swap,
     so the header did not merely redirect the error -- it also spared
     ``#checks-body``, which kept its ``every 2s`` trigger and kept polling,

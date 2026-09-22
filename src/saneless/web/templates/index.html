@@ -5,8 +5,8 @@
 {# First in the block, for three reasons in this order:
    1. The strip exists so a household member can tell AT A GLANCE whether
       the appliance is healthy, and at a glance means first.
-   2. It is outside <form hx-post="/api/scan">, so the hx-disabled-elt /
-      hx-disinherit landmine cannot reach it.  No attribute is added to the
+   2. It is outside <form hx-post="/api/scan">, so the form's inherited
+      hx-disabled-elt cannot reach it.  No attribute is added to the
       form element; the inheritance fix below stays exactly as written.
    3. The error slot's invariant -- #status-message is the immediate sibling above
       #status-area -- is preserved untouched.
@@ -27,10 +27,10 @@
     <h2>Scan</h2>
     {# hx-disabled-elt replaces the deleted app script's beforeRequest handler:
        the button is disabled for the round-trip, so there is no double submit.
-       hx-disinherit is mandatory: the tags/correspondent selects and refresh
-       buttons inside this form issue their own requests and, on htmx 2.0.8, an
-       inherited hx-disabled-elt strips disabled from a server-disabled button
-       when they finish (an htmx bug, fixed only in 2.0.9). #}
+       hx-disinherit is mandatory: hx-disabled-elt is an inherited attribute, so
+       without it the tags/correspondent selects and refresh buttons inside this
+       form would each inherit it and disable the Scan button for the length of
+       their own round-trip -- greying it out every time a list refreshes. #}
     <form hx-post="/api/scan"
           hx-target="#status-area"
           hx-swap="outerHTML"
@@ -197,11 +197,12 @@
        This is also the decisive advantage over the alternative, which was to
        drop the filter field on the way out of the scan form with a parameter
        filter on the form element.  That would have meant adding an attribute
-       to the scan form, and every attribute added there has to be added to the
-       hx-disinherit list as well or the htmx 2.0.8 inheritance trap re-opens.
-       Nothing is added to the scan form element at all, so the fix above stays
-       exactly as written (the attribute names are in prose here so a grep for
-       the places that set them still counts only those).
+       to the scan form, and htmx attributes are inherited, so every attribute
+       added there has to be added to the hx-disinherit list as well or every
+       control inside the form picks it up.  Nothing is added to the scan form
+       element at all, so the fix above stays exactly as written (the attribute
+       names are in prose here so a grep for the places that set them still
+       counts only those).
 
        It goes with the fieldset above when the Tags block is off: a form whose
        only member is an input that is no longer rendered has nothing left to
