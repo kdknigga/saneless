@@ -18,7 +18,6 @@ from saneless.exceptions import (
     PaperlessTimeoutError,
     describe,
 )
-from saneless.logging_config import configure_logging
 from saneless.paperless import (
     PaperlessClient,
     UploadResult,
@@ -35,6 +34,7 @@ from tests.golden_support import (
     TASKS_PATH,
     LoopbackHit,
     loopback_paperless,
+    production_debug_logging,
 )
 
 if TYPE_CHECKING:
@@ -2056,32 +2056,20 @@ def _is_http_library_record(record: logging.LogRecord) -> bool:
 
 
 @pytest.fixture
-def production_debug_logging(caplog: pytest.LogCaptureFixture) -> Iterator[None]:
+def debug_capture(caplog: pytest.LogCaptureFixture) -> Iterator[None]:
     """
-    Configure logging as ``output.log_level = "DEBUG"`` does, and capture it all.
-
-    The production configuration, not only ``caplog.set_level``: a raised root
-    level with nothing capping the HTTP libraries would capture httpcore2's
-    header trace, and the test would be checking a setup nobody runs.  Root
-    handlers and levels are restored afterwards; the HTTP library loggers are
-    reset by the suite-wide fixture.
+    Log as ``output.log_level = "DEBUG"`` does, and capture every record.
 
     Yields:
-        Nothing; the restore runs after the test.
+        Nothing; the logging configuration is undone after the test.
 
     """
-    root = logging.getLogger()
-    before = root.handlers[:]
-    level = root.level
-    configure_logging(None, "DEBUG", max_bytes=1024, backup_count=1)
+    # caplog first: it restores the root level it found at teardown, which
+    # runs after this fixture's, so it must find the level from before the
+    # production configuration lowered it.
     caplog.set_level(logging.DEBUG)
-    yield
-    for handler in root.handlers[:]:
-        if handler not in before:
-            handler.close()
-            root.removeHandler(handler)
-    root.setLevel(level)
-    logging.getLogger("saneless").setLevel(logging.NOTSET)
+    with production_debug_logging():
+        yield
 
 
 class TestLoopbackClientSideProtocolErrors:
@@ -2096,7 +2084,7 @@ class TestLoopbackClientSideProtocolErrors:
     """
 
     @pytest.mark.parametrize("token", _UNSENDABLE_TOKENS)
-    @pytest.mark.usefixtures("production_debug_logging")
+    @pytest.mark.usefixtures("debug_capture")
     def test_upload_refuses_without_retry_copy_or_leak(
         self,
         token: str,
@@ -2131,7 +2119,7 @@ class TestLoopbackClientSideProtocolErrors:
 
     @pytest.mark.parametrize("token", _UNSENDABLE_TOKENS)
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
-    @pytest.mark.usefixtures("production_debug_logging")
+    @pytest.mark.usefixtures("debug_capture")
     def test_metadata_fetch_refuses_without_leak(
         self,
         method: str,
@@ -2158,7 +2146,7 @@ class TestLoopbackClientSideProtocolErrors:
         for text in (str(error), repr(error), caplog.text):
             _assert_token_absent(token, text)
 
-    @pytest.mark.usefixtures("production_debug_logging")
+    @pytest.mark.usefixtures("debug_capture")
     def test_valid_token_is_sent_once_and_no_library_debug_is_logged(
         self, sample_pdf: Path, caplog: pytest.LogCaptureFixture
     ) -> None:

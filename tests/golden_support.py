@@ -35,6 +35,7 @@ import email.parser
 import email.policy
 import io
 import json
+import logging
 import threading
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -46,6 +47,7 @@ import httpx2
 import pikepdf
 from PIL import Image, ImageDraw
 
+from saneless.logging_config import configure_logging
 from saneless.paperless import PaperlessClient
 from tests.conftest import StubScannerBackend, scan_batch
 
@@ -633,6 +635,38 @@ def _loopback_handler(hits: list[LoopbackHit]) -> type[BaseHTTPRequestHandler]:
             """Stay silent: the default writes every request to stderr."""
 
     return _Handler
+
+
+@contextlib.contextmanager
+def production_debug_logging() -> Generator[None]:
+    """
+    Configure logging as ``output.log_level = "DEBUG"`` does, then undo it.
+
+    A test that captures logs at DEBUG with only ``caplog.set_level`` checks a
+    setup nobody runs: nothing caps the HTTP libraries there, so httpcore2's
+    trace -- which quotes request headers, the token among them -- is captured
+    too.  This runs the real ``configure_logging`` instead, the worst case a
+    deployment can choose.  On exit the handlers it added are closed and
+    removed and the root and ``saneless`` levels are put back; the HTTP library
+    loggers are reset by the suite-wide fixture.
+
+    Yields:
+        Nothing; the restore runs on exit.
+
+    """
+    root = logging.getLogger()
+    before = root.handlers[:]
+    level = root.level
+    configure_logging(None, "DEBUG", max_bytes=1024, backup_count=1)
+    try:
+        yield
+    finally:
+        for handler in root.handlers[:]:
+            if handler not in before:
+                handler.close()
+                root.removeHandler(handler)
+        root.setLevel(level)
+        logging.getLogger("saneless").setLevel(logging.NOTSET)
 
 
 @contextlib.contextmanager

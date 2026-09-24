@@ -86,7 +86,7 @@ from saneless.vocabulary import (
 )
 from saneless.worker import ScanWorker
 from tests.conftest import spooling_in_turn
-from tests.golden_support import loopback_paperless
+from tests.golden_support import loopback_paperless, production_debug_logging
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -968,9 +968,11 @@ class TestClientSideMisconfigurationEndToEnd:
     ) -> None:
         """A token with a trailing space ends ERROR/CONFIG, token nowhere."""
         token = "abc "
-        caplog.set_level(logging.DEBUG, logger="saneless")
         settings = _build_settings(tmp_path, _MISCONFIGURED)
-        with loopback_paperless() as server:
+        # caplog before the production configuration, so the root level it
+        # restores at teardown is the one from before that lowered it.
+        caplog.set_level(logging.DEBUG)
+        with production_debug_logging(), loopback_paperless() as server:
             finished = _scan_once(
                 settings,
                 PaperlessClient(
@@ -1003,18 +1005,19 @@ class TestClientSideMisconfigurationEndToEnd:
         wait_for_state: Callable[..., Job],
     ) -> None:
         """``paperless.url = ""`` is not a consume-folder setup: ERROR/CONFIG."""
-        caplog.set_level(logging.DEBUG, logger="saneless")
         settings = _build_settings(tmp_path, _MISCONFIGURED, paperless_url="")
-        finished = _scan_once(
-            settings,
-            PaperlessClient(
-                url=settings.paperless.url,
-                token=settings.paperless.token.get_secret_value(),
-                consume_dir=settings.paperless.consume_dir,
-                max_retries=3,
-            ),
-            wait_for_state,
-        )
+        caplog.set_level(logging.DEBUG)
+        with production_debug_logging():
+            finished = _scan_once(
+                settings,
+                PaperlessClient(
+                    url=settings.paperless.url,
+                    token=settings.paperless.token.get_secret_value(),
+                    consume_dir=settings.paperless.consume_dir,
+                    max_retries=3,
+                ),
+                wait_for_state,
+            )
         assert finished.error_category is ErrorCategory.CONFIG
         assert finished.error is not None
         assert _TOKEN not in finished.error
