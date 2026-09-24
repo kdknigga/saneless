@@ -3540,6 +3540,27 @@ def test_no_requirement_is_declared_twice() -> None:
     )
 
 
+def test_pyproject_anchors_ty_to_this_tree() -> None:
+    """
+    ``pyproject.toml`` carries a ``[tool.ty]`` table, even an empty one.
+
+    ty ignores a ``pyproject.toml`` without that table and keeps searching
+    parent directories for one that has it. A git worktree nested inside
+    another checkout then anchors ty on the outer checkout, and ``ty check``
+    passes over the outer tree's source while never reading this one. The
+    table looks like dead configuration when empty, which is why it needs a
+    guard rather than only a comment.
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    assert "ty" in pyproject.get("tool", {}), (
+        f"{PYPROJECT.name} has no [tool.ty] table. ty skips such a file and "
+        "anchors on the nearest parent directory's pyproject.toml that has one, "
+        "so in a worktree nested inside another checkout it type-checks the "
+        "outer tree and passes. Restore the table, empty if nothing needs "
+        "configuring"
+    )
+
+
 PYTHON_VERSION_FILE = REPO_ROOT / ".python-version"
 
 

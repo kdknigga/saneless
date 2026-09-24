@@ -28,7 +28,7 @@ dependencies = [
     "jinja2>=3.1.6",
     "pikepdf>=10.13.0.post1",
     "pillow>=12.3.0",
-    "pydantic-settings[toml]>=2.15.0",
+    "pydantic-settings>=2.15.0",
     "python-multipart>=0.0.32",
     "python-sane>=2.9.2",
     "tomlkit>=0.15.1",
@@ -63,6 +63,16 @@ build-backend = "uv_build"
 # deprecated alias.
 [tool.uv]
 constraint-dependencies = ["anyio<4.15"]
+# The one place this project declares its uv version.  setup-uv reads it on
+# every runner, because no workflow step names a version of its own, and local
+# uv refuses to run `uv sync`, `uv run` or `uv lock` outside it, so the commit
+# hooks, CI and a developer's machine cannot drift apart.  It is a range and
+# not an exact pin by choice: a uv patch release reaches CI without review,
+# which is accepted in exchange for one declaration instead of eleven, and the
+# ceiling still stops a new minor series at review.  Two surfaces cannot read
+# it -- the Dockerfile's uv tool stage and the `uv_build` build-system
+# requirement -- so they stay pinned, and a test holds both inside this range.
+required-version = ">=0.12.18,<0.13"
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
@@ -106,7 +116,7 @@ target-version = "py314"
 # Enable Pyflakes (`F`) and a subset of the pycodestyle (`E`)  codes by default.
 # Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
 # McCabe complexity (`C901`) by default.
-select = ["E", "F", "B", "G", "W", "YTT", "ANN", "ASYNC", "S", "FBT", "A", "COM", "C4", "EM", "ICN", "LOG", "PIE", "Q", "RSE", "RET", "SIM", "TID", "TCH", "ARG", "PTH", "FLY", "PERF", "FURB", "RUF", "UP", "D", "I", "PL", "PT", "DTZ", "T20"]
+select = ["E", "F", "B", "G", "W", "YTT", "ANN", "ASYNC", "S", "FBT", "A", "COM", "C4", "EM", "ICN", "LOG", "PIE", "Q", "RSE", "RET", "SIM", "TID", "TC", "ARG", "PTH", "FLY", "PERF", "FURB", "RUF", "UP", "D", "I", "PL", "PT", "DTZ", "T20"]
 ignore = ["E501", "D203", "D212", "W505", "PLR2004", "COM812"]
 
 # Allow fix for all enabled rules (when `--fix`) is provided.
@@ -196,7 +206,12 @@ exclude = [".planning/**/*.md"]
 "src/saneless/__init__.py" = ["PLC0415"]
 "src/saneless/config.py" = ["S104"]
 
-[tool.ty.src]
+# Deliberately empty: its presence is the setting.  ty skips any
+# pyproject.toml without a `[tool.ty]` table and keeps searching parent
+# directories, so without it a git worktree nested inside another checkout
+# anchors ty on the outer checkout's pyproject.toml.  `ty check` then reports
+# on the outer tree's source and passes, whatever this tree contains.
+[tool.ty]
 
 [tool.pyrefly]
 # "src" must come first. Pyrefly infers a single import root from the project
@@ -223,7 +238,7 @@ markers = [
     "browser: Playwright browser tests (requires chromium)",
     "sane_hardware: tests that drive the real SANE test backend (requires libsane-dev)",
 ]
-addopts = ["-ra", "--strict-markers", "--strict-config"]
+addopts = ["-ra"]
 strict_markers = true
 strict_config = true
 xfail_strict = true
@@ -253,5 +268,9 @@ dev = [
     "pytest-timeout>=2.4.0",
     "zizmor>=1.30.1",
     "pytest-cov>=7.1.0",
-    "httpx2>=2.13.0",
+]
+# The release workflow installs only this group, hash-checked from the lock,
+# to run the version gate before anything is published.
+release = [
+    "packaging>=26.0",
 ]
