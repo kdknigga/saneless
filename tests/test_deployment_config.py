@@ -1592,12 +1592,21 @@ IMAGE_REFERENCE = re.compile(
     re.escape(PUBLISHED_IMAGE) + r"(?![\w-])(?::(?P<tag>[0-9A-Za-z._-]+))?"
 )
 
-# The release workflow names the image without a tag on purpose: its
-# ``images:`` key is the input the tagging action expands into every tag a
-# release publishes. That one line, in that one file, is the only reference
-# allowed to go untagged.
+# The release workflow names the image without a tag on purpose in two
+# places: its ``images:`` key is the input the tagging action expands into
+# every tag a release publishes, and its ``subject-name:`` keys name the
+# repository an attestation is stored against, with the digest supplied
+# beside it. Those lines, in that one file, are the only references allowed
+# to go untagged.
 _RELEASE_WORKFLOW_NAME = ".github/workflows/release.yml"
 _IMAGES_KEY = "images:"
+_SUBJECT_NAME_KEY = "subject-name:"
+_UNTAGGED_RELEASE_KEYS = (_IMAGES_KEY, _SUBJECT_NAME_KEY)
+
+# What follows the image name in a digest reference. A digest names one
+# immutable set of bytes, which is stricter than any tag, so a reference in
+# that form is never stale and never resolves to ``latest``.
+_DIGEST_SEPARATOR = "@"
 
 # The install-from-the-package-index command, assembled from fragments for the
 # same self-scan reason. It matches ``pip`` or ``pipx``, then ``install``, then
@@ -1680,8 +1689,10 @@ def _image_tag_offenders(names: list[str], root: Path, expected: str) -> list[st
     Return every image reference that does not carry the expected tag.
 
     An untagged reference is an offender like any other: the registry resolves
-    it to ``latest``, which a release candidate never receives. A file the
-    guard cannot read is an offender too, since it has not been checked.
+    it to ``latest``, which a release candidate never receives. A reference in
+    digest form is not, because it names exact bytes rather than a movable
+    tag. A file the guard cannot read is an offender too, since it has not been
+    checked.
 
     Args:
         names: Repo-relative file names to check.
@@ -1699,12 +1710,15 @@ def _image_tag_offenders(names: list[str], root: Path, expected: str) -> list[st
         if text is None:
             continue
         for number, line in enumerate(text.splitlines(), start=1):
-            if name == _RELEASE_WORKFLOW_NAME and line.strip().startswith(_IMAGES_KEY):
+            if name == _RELEASE_WORKFLOW_NAME and line.strip().startswith(
+                _UNTAGGED_RELEASE_KEYS
+            ):
                 continue
             offenders.extend(
                 f"{name}:{number}: {line.strip()}"
                 for match in IMAGE_REFERENCE.finditer(line)
                 if match.group("tag") != expected
+                and not line.startswith(_DIGEST_SEPARATOR, match.end())
             )
     return offenders
 
@@ -1781,13 +1795,22 @@ def test_every_shipped_image_reference_carries_the_published_image_tag() -> None
 def test_the_image_tag_guard_reports_wrong_missing_and_unread_tags(
     tmp_path: Path,
 ) -> None:
-    """Wrong and missing tags are reported, and so is a file that was not read."""
+    """
+    Wrong and missing tags are reported, and so is a file that was not read.
+
+    The release workflow's untagged ``images:`` and ``subject-name:`` lines
+    are exempt there and nowhere else, and a digest reference is exempt
+    everywhere; a ``latest`` pull in the release workflow is still reported.
+    """
     expected = "0.2.0-rc.6"
     workflows = tmp_path / ".github" / "workflows"
     workflows.mkdir(parents=True)
     (workflows / "release.yml").write_text(
         f"          {_IMAGES_KEY} {PUBLISHED_IMAGE}\n"
-        f"          run: docker pull {PUBLISHED_IMAGE}\n",
+        f"          run: docker pull {PUBLISHED_IMAGE}\n"
+        f"          {_SUBJECT_NAME_KEY} {PUBLISHED_IMAGE}\n"
+        f"          image: {PUBLISHED_IMAGE}{_DIGEST_SEPARATOR}sha256:0123abcd\n"
+        f"          run: docker pull {PUBLISHED_IMAGE}:latest\n",
         encoding="utf-8",
     )
     seeded = {
@@ -1797,6 +1820,10 @@ def test_the_image_tag_guard_reports_wrong_missing_and_unread_tags(
         "elsewhere.yml": f"{_IMAGES_KEY} {PUBLISHED_IMAGE}\n",
         "pinned.md": f"docker pull {PUBLISHED_IMAGE}:{expected}\n",
         "longer-name.md": f"docker pull {PUBLISHED_IMAGE}-other:latest\n",
+        "subject.yml": f"    {_SUBJECT_NAME_KEY} {PUBLISHED_IMAGE}\n",
+        "digest.md": (
+            f"docker pull {PUBLISHED_IMAGE}{_DIGEST_SEPARATOR}sha256:0123abcd\n"
+        ),
     }
     for name, text in seeded.items():
         (tmp_path / name).write_text(text, encoding="utf-8")
@@ -1810,10 +1837,12 @@ def test_the_image_tag_guard_reports_wrong_missing_and_unread_tags(
 
     assert [entry.split(": ", 1)[0] for entry in offenders] == [
         f"{_RELEASE_WORKFLOW_NAME}:2",
+        f"{_RELEASE_WORKFLOW_NAME}:5",
         "latest.yml:1",
         "untagged.md:1",
         "older.md:1",
         "elsewhere.yml:1",
+        "subject.yml:1",
         "latin1.md",
         "gone.md",
     ]
@@ -4650,6 +4679,611 @@ def test_the_workflow_reader_collects_both_extensions_github_loads() -> None:
     assert found == on_disk, (
         "the reader disagrees with the directory. Every workflow file GitHub "
         f"would load must reach the guards: {sorted(on_disk - found)} missing."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The release pipeline's order, approval and provenance
+# ---------------------------------------------------------------------------
+
+RELEASE_WORKFLOW = WORKFLOW_DIR / "release.yml"
+CI_WORKFLOW = WORKFLOW_DIR / "ci.yml"
+
+# The top-level key that opens the job table, and one job's key beneath it at
+# the two-space indent every workflow here uses. Same shape as the compose
+# service key above: a name alone on its line, ending in a colon.
+JOBS_KEY = "jobs:"
+JOB_KEY = re.compile(r"^  (?P<job>[a-z0-9_-]+):\s*$")
+# The start of one step in a job's ``steps:`` list, at the six-space indent
+# every job here uses.
+STEP_START = re.compile(r"^      -\s")
+# A ``run:`` key, bare or as a step's first key, with whatever follows it.
+RUN_KEY = re.compile(r"^(?P<indent>\s*)(?:-\s+)?run:\s*(?P<value>.*)$")
+# A block-scalar indicator: the script is on the lines below the key.
+BLOCK_SCALAR = re.compile(r"^[|>][+-]?$")
+# The word ``latest`` as a value rather than inside a longer name such as the
+# ``ubuntu-latest`` runner label.
+LATEST_WORD = re.compile(r"(?<![\w-])latest(?![\w-])")
+
+# The one output that routes a release, as every expression reading it spells
+# it. The gate derives it from the parsed version, not from the tag's text.
+GATE_ROUTING = "needs.gate.outputs.is_prerelease"
+# The gate's command, and the install it runs after.
+GATE_SCRIPT = "scripts/release_gate.py"
+GATE_INSTALL = "uv sync --locked --only-group release --no-install-project"
+# Ways a workflow has routed a release by reading the tag's text for a hyphen.
+# Each is a string test, which is exactly what the version gate replaced.
+HYPHEN_ROUTING = ("contains(github.ref_name", "*-*")
+# An expression opener. The tag name is attacker-chosen text, so a ``run:``
+# script reads it from the environment rather than having it pasted in.
+EXPRESSION_OPEN = "${{"
+
+# What each publishing job's token may do, and nothing more.
+PUBLISH_DOCKER_PERMISSIONS = {
+    "contents": "read",
+    "packages": "write",
+    "id-token": "write",
+    "attestations": "write",
+}
+PUBLISH_PYPI_PERMISSIONS = {"contents": "read", "id-token": "write"}
+
+# The published image's tag patterns: the exact version on every release,
+# and ``major.minor`` from final releases.
+SEMVER_VERSION_TAG = "type=semver,pattern={{version}}"
+SEMVER_MINOR_TAG = "type=semver,pattern={{major}}.{{minor}}"
+
+ATTEST_ACTION = "actions/attest@"
+SBOM_ACTION = "anchore/sbom-action@"
+BUILD_PUSH_ACTION = "docker/build-push-action@"
+METADATA_ACTION = "docker/metadata-action@"
+BUILD_DIGEST = "steps.build.outputs.digest"
+SMOKE_SCRIPT = "scripts/smoke_image.py"
+
+
+def _strip_trailing_comment(value: str) -> str:
+    """Return a YAML scalar without a trailing `` # comment``."""
+    return value.split(" #", 1)[0].strip()
+
+
+def _job_block(lines: list[tuple[int, str]], job: str) -> list[tuple[int, str]]:
+    """
+    Return the raw lines of one job, key line excluded.
+
+    The block runs from the line after ``  <job>:`` under the top-level
+    ``jobs:`` key to the line before the next job key, or the next top-level
+    key, or the end of the file. Lines are returned as read, indentation and
+    comments included, so a caller can tell nesting apart.
+
+    Args:
+        lines: ``(line number, line)`` pairs for the whole workflow.
+        job: The job id to find.
+
+    Returns:
+        The job's lines in file order, or an empty list when no such job is
+        declared under ``jobs:``.
+
+    """
+    in_jobs = False
+    block: list[tuple[int, str]] | None = None
+    for number, line in lines:
+        significant = line.strip() and not _is_comment(line)
+        if significant and not line[0].isspace():
+            if block is not None:
+                break
+            in_jobs = line.rstrip() == JOBS_KEY
+            continue
+        if not in_jobs:
+            continue
+        match = JOB_KEY.match(line)
+        if match is not None:
+            if block is not None:
+                break
+            if match.group("job") == job:
+                block = []
+            continue
+        if block is not None:
+            block.append((number, line))
+    return block or []
+
+
+def _indent(line: str) -> int:
+    """Return the number of leading spaces on a line."""
+    return len(line) - len(line.lstrip(" "))
+
+
+def _key_mapping(
+    lines: list[tuple[int, str]], key: str, indent: int
+) -> dict[str, str] | None:
+    """
+    Return the flat mapping held by ``key`` at exactly ``indent`` spaces.
+
+    Both spellings the workflows use are read: a flow mapping on the key's own
+    line (``key: {a: b, c: d}``) and a block of ``name: value`` lines nested
+    one level deeper. Comments are dropped. A scalar value comes back under
+    the empty-string key, so it can never compare equal to a real mapping.
+
+    Args:
+        lines: The lines to search, raw.
+        key: The key name, without its colon.
+        indent: The key's indentation in spaces.
+
+    Returns:
+        The mapping, or ``None`` when the key is absent.
+
+    """
+    opener = re.compile(rf"^ {{{indent}}}{re.escape(key)}:\s*(?P<value>.*)$")
+    for index, (_, line) in enumerate(lines):
+        match = opener.match(line)
+        if match is None:
+            continue
+        value = _strip_trailing_comment(match.group("value"))
+        if value.startswith("{") and value.endswith("}"):
+            pairs = [part.partition(":") for part in value[1:-1].split(",")]
+            return {name.strip(): rest.strip() for name, _, rest in pairs if rest}
+        if value:
+            return {"": value}
+        mapping: dict[str, str] = {}
+        for _, nested in lines[index + 1 :]:
+            if not nested.strip() or _is_comment(nested):
+                continue
+            if _indent(nested) <= indent:
+                break
+            name, _, rest = nested.strip().partition(":")
+            mapping[name] = _strip_trailing_comment(rest)
+        return mapping
+    return None
+
+
+def _job_needs(block: list[tuple[int, str]]) -> set[str]:
+    """
+    Return the job ids a job's ``needs:`` names.
+
+    Args:
+        block: The job's lines, as ``_job_block`` returns them.
+
+    Returns:
+        Every job named, whether as a scalar, a flow list or a block list.
+
+    """
+    for index, (_, line) in enumerate(block):
+        match = re.match(r"^    needs:\s*(?P<value>.*)$", line)
+        if match is None:
+            continue
+        value = _strip_trailing_comment(match.group("value"))
+        if value.startswith("["):
+            return {part.strip() for part in value.strip("[]").split(",") if part}
+        if value:
+            return {value}
+        needs: set[str] = set()
+        for _, nested in block[index + 1 :]:
+            if not nested.strip() or _is_comment(nested):
+                continue
+            if _indent(nested) <= _indent(line):
+                break
+            needs.add(_strip_trailing_comment(nested.strip().removeprefix("-")))
+        return needs
+    return set()
+
+
+def _job_steps(block: list[tuple[int, str]]) -> list[list[str]]:
+    """
+    Split a job into its steps, each as stripped significant lines.
+
+    Args:
+        block: The job's lines, as ``_job_block`` returns them.
+
+    Returns:
+        One list per step, in order. Lines before the first step are dropped.
+
+    """
+    steps: list[list[str]] = []
+    for _, line in block:
+        if STEP_START.match(line):
+            steps.append([])
+        if steps and line.strip() and not _is_comment(line):
+            steps[-1].append(line.strip())
+    return steps
+
+
+def _steps_using(block: list[tuple[int, str]], action: str) -> list[list[str]]:
+    """Return every step of a job whose ``uses:`` names ``action``."""
+    return [
+        step
+        for step in _job_steps(block)
+        if any(
+            re.match(r"^(?:-\s+)?uses:\s*", line) and action in line for line in step
+        )
+    ]
+
+
+def _step_value(step: list[str], key: str) -> str | None:
+    """Return a step key's value, comment stripped, or ``None`` when absent."""
+    for line in step:
+        name, separator, rest = line.removeprefix("- ").partition(":")
+        if separator and name.strip() == key:
+            return _strip_trailing_comment(rest)
+    return None
+
+
+def _run_scripts(lines: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """
+    Return every line of shell a workflow runs, block scalars included.
+
+    Args:
+        lines: ``(line number, line)`` pairs for the whole workflow.
+
+    Returns:
+        The ``run:`` line itself for an inline script, and every line of the
+        block for a ``run: |`` script.
+
+    """
+    scripts: list[tuple[int, str]] = []
+    block_indent: int | None = None
+    for number, line in lines:
+        if block_indent is not None:
+            if not line.strip():
+                continue
+            if _indent(line) > block_indent:
+                scripts.append((number, line.strip()))
+                continue
+            block_indent = None
+        match = RUN_KEY.match(line)
+        if match is None or _is_comment(line):
+            continue
+        value = match.group("value").strip()
+        if BLOCK_SCALAR.match(value):
+            block_indent = len(match.group("indent"))
+        else:
+            scripts.append((number, value))
+    return scripts
+
+
+def _release_job(job: str) -> list[tuple[int, str]]:
+    """Return one release job's block, asserting that the job exists."""
+    block = _job_block(_numbered(RELEASE_WORKFLOW), job)
+    assert block, (
+        f"release.yml declares no {job!r} job under jobs:, so none of the "
+        "guards on it can check anything"
+    )
+    return block
+
+
+_SEEDED_WORKFLOW = """\
+name: Seeded
+
+permissions:
+  contents: read
+
+jobs:
+  # a comment at the job indent is not a job key
+  first:
+    needs: [ci, gate]  # trailing reason
+    permissions:
+      contents: read  # reason
+      id-token: write
+    environment:
+      name: ${{ needs.gate.outputs.is_prerelease == 'true' && 'a' || 'b' }}
+    steps:
+      - uses: example/one@0000000000000000000000000000000000000000 # v1.0.0
+        with:
+          push: true
+      - run: |
+          echo "${GITHUB_REF_NAME}"
+          echo done
+  second:
+    needs:
+      - first
+    permissions: {contents: read, packages: write}
+    steps:
+      - run: echo ${{ github.ref_name }}
+
+concurrency:
+  group: release
+"""
+
+
+def test_the_job_reader_finds_one_release_job_and_stops_at_the_next(
+    tmp_path: Path,
+) -> None:
+    """
+    The job reader returns one job's lines and nothing from its neighbours.
+
+    The release guards below read ``needs:``, ``permissions:`` and steps out of
+    a named job without a YAML parser, so the reader has to be right about
+    where a job ends, or one job's keys would be credited to another.
+    """
+    seeded = tmp_path / "seeded.yml"
+    seeded.write_text(_SEEDED_WORKFLOW, encoding="utf-8")
+    lines = _numbered(seeded)
+
+    first = _job_block(lines, "first")
+    second = _job_block(lines, "second")
+
+    assert _job_needs(first) == {"ci", "gate"}
+    assert _job_needs(second) == {"first"}
+    assert _key_mapping(first, "permissions", 4) == {
+        "contents": "read",
+        "id-token": "write",
+    }
+    assert _key_mapping(second, "permissions", 4) == {
+        "contents": "read",
+        "packages": "write",
+    }
+    assert _key_mapping(lines, "concurrency", 0) == {"group": "release"}
+    assert _key_mapping(first, "environment", 4) == {
+        "name": "${{ needs.gate.outputs.is_prerelease == 'true' && 'a' || 'b' }}"
+    }
+    assert not any("second" in line or "- first" in line for _, line in first)
+    assert not any("group:" in line for _, line in second)
+    assert _job_block(lines, "absent") == []
+    assert len(_job_steps(first)) == 2
+    assert _step_value(_steps_using(first, "example/one@")[0], "push") == "true"
+    assert [line for _, line in _run_scripts(lines)] == [
+        'echo "${GITHUB_REF_NAME}"',
+        "echo done",
+        "echo ${{ github.ref_name }}",
+    ]
+
+
+def test_release_publishes_only_after_ci_and_the_version_gate() -> None:
+    """
+    Nothing publishes until CI and the version gate pass, and PyPI goes last.
+
+    A container registry tag can be deleted and pushed again; a package index
+    upload cannot. So the image publish needs CI (which builds and smoke-tests
+    the image) and the gate, and the index upload needs all three. A release
+    candidate once uploaded to the index in parallel with an image build that
+    then failed, which is the half-publish this order rules out.
+    """
+    docker_needs = _job_needs(_release_job("publish-docker"))
+    pypi_needs = _job_needs(_release_job("publish-pypi"))
+
+    assert {"ci", "gate"} <= docker_needs, (
+        f"publish-docker needs {sorted(docker_needs)}; it must wait for both "
+        "ci and gate"
+    )
+    assert {"ci", "gate", "publish-docker"} <= pypi_needs, (
+        f"publish-pypi needs {sorted(pypi_needs)}; the irreversible upload "
+        "must wait for ci, gate and the image publish"
+    )
+
+
+def test_release_gate_job_runs_the_gate_script_and_outputs_the_routing() -> None:
+    """
+    The gate job runs the version gate from the lock and exposes its answer.
+
+    The tag and ``pyproject.toml`` must name the same version or nothing
+    publishes, and the parsed version decides whether the release is a
+    pre-release. The gate's only dependency is installed hash-checked from the
+    lock, never fetched ad hoc into a publishing workflow.
+    """
+    block = _release_job("gate")
+    scripts = [line for _, line in _run_scripts(block)]
+
+    assert any(GATE_INSTALL in line for line in scripts), (
+        f"the gate job does not run {GATE_INSTALL!r}; its dependency must "
+        f"come from the lock. Run lines: {scripts}"
+    )
+    assert any(GATE_SCRIPT in line for line in scripts), (
+        f"the gate job does not run {GATE_SCRIPT}. Run lines: {scripts}"
+    )
+    outputs = _key_mapping(block, "outputs", 4) or {}
+    assert "steps.gate.outputs.is_prerelease" in outputs.get("is_prerelease", ""), (
+        "the gate job does not output is_prerelease from its gate step, so "
+        f"nothing downstream can route by it. Outputs: {outputs}"
+    )
+
+
+def test_both_publish_jobs_route_by_the_gate_not_by_a_hyphen_in_the_tag() -> None:
+    """
+    Environment and index both follow the gate's parsed-version answer.
+
+    A hyphen test on the tag's text sends ``v0.2.0rc7`` to the real index,
+    because PEP 440 needs no hyphen to spell a pre-release. Both publish jobs
+    select their environment with the same expression, so a final release is
+    approved before the image push as well as before the upload, and the
+    upload URL follows the same answer.
+    """
+    names = {
+        job: (_key_mapping(_release_job(job), "environment", 4) or {}).get("name", "")
+        for job in ("publish-docker", "publish-pypi")
+    }
+    assert GATE_ROUTING in names["publish-pypi"], (
+        f"publish-pypi's environment is {names['publish-pypi']!r}; it must be "
+        f"selected by {GATE_ROUTING}"
+    )
+    assert names["publish-docker"] == names["publish-pypi"], (
+        "the two publish jobs select their environment differently, so one of "
+        f"them can run without the approval the other waits for: {names}"
+    )
+
+    pypi_steps = _steps_using(
+        _release_job("publish-pypi"), "pypa/gh-action-pypi-publish@"
+    )
+    assert len(pypi_steps) == 1, "publish-pypi has no single upload step"
+    url = _step_value(pypi_steps[0], "repository-url") or ""
+    assert GATE_ROUTING in url, (
+        f"the upload's repository-url is {url!r}; it must be chosen by {GATE_ROUTING}"
+    )
+
+    offenders = [
+        f"release.yml:{number}: {line}"
+        for number, line in _significant_lines(RELEASE_WORKFLOW)
+        if any(needle in line for needle in HYPHEN_ROUTING)
+    ]
+    assert not offenders, (
+        "release.yml still routes a release by testing the tag's text for a "
+        "hyphen:\n" + "\n".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    ("job", "expected"),
+    [
+        ("publish-docker", PUBLISH_DOCKER_PERMISSIONS),
+        ("publish-pypi", PUBLISH_PYPI_PERMISSIONS),
+    ],
+)
+def test_publish_jobs_hold_exactly_the_permissions_they_use(
+    job: str, expected: dict[str, str]
+) -> None:
+    """
+    Each publish job's token can do what that job publishes with, no more.
+
+    The image job pushes to the registry and signs and stores attestations;
+    the upload job only needs its OIDC identity. A scope beyond that is a
+    scope a compromised step could use.
+    """
+    permissions = _key_mapping(_release_job(job), "permissions", 4)
+    assert permissions == expected, (
+        f"{job} holds {permissions}, expected exactly {expected}"
+    )
+
+
+def test_release_runs_do_not_overlap_in_the_release_concurrency_group() -> None:
+    """
+    Two tags pushed close together publish one after the other.
+
+    Out of order, the older release could finish last and leave ``latest`` on
+    it. An in-flight publish is never cancelled either, since cancelling one
+    between the image push and the upload would be a half-publish.
+    """
+    lines = _numbered(RELEASE_WORKFLOW)
+    concurrency = _key_mapping(lines, "concurrency", 0)
+    assert concurrency is not None, "release.yml has no workflow-level concurrency"
+    assert concurrency.get("group") == "release", (
+        f"release.yml's concurrency group is {concurrency.get('group')!r}, "
+        "expected 'release'"
+    )
+    assert concurrency.get("cancel-in-progress") == "false", (
+        f"release.yml's concurrency must not cancel an in-flight release: {concurrency}"
+    )
+
+
+def test_publish_docker_attests_signed_provenance_and_an_sbom() -> None:
+    """
+    The pushed image gets a signed provenance and a signed SBOM attestation.
+
+    Both are made for the digest the build step pushed and are pushed to the
+    registry beside it. BuildKit's own provenance is switched off explicitly:
+    left at its default on a public repository it attaches an unsigned
+    manifest, which the signed attestations replace.
+    """
+    block = _release_job("publish-docker")
+    builds = _steps_using(block, BUILD_PUSH_ACTION)
+    assert len(builds) == 1, "publish-docker has no single build-push step"
+    build = builds[0]
+    assert _step_value(build, "id") == "build", (
+        "the build step is not `id: build`, so its digest is not the one the "
+        "attestation steps name"
+    )
+    assert _step_value(build, "push") == "true"
+    assert _step_value(build, "provenance") == "false", (
+        "the build step does not set provenance: false, so BuildKit attaches "
+        "an unsigned provenance manifest by default"
+    )
+
+    attests = _steps_using(block, ATTEST_ACTION)
+    assert len(attests) == 2, (
+        f"publish-docker has {len(attests)} {ATTEST_ACTION} steps, expected "
+        "two: provenance and SBOM"
+    )
+    for step in attests:
+        assert _step_value(step, "push-to-registry") == "true", step
+        assert BUILD_DIGEST in (_step_value(step, "subject-digest") or ""), step
+        assert _step_value(step, "create-storage-record") == "false", step
+    with_sbom = [step for step in attests if _step_value(step, "sbom-path")]
+    assert len(with_sbom) == 1, (
+        "exactly one attest step must carry sbom-path (the SBOM); the other "
+        "is the provenance attestation"
+    )
+
+    sboms = _steps_using(block, SBOM_ACTION)
+    assert len(sboms) == 1, f"publish-docker has no single {SBOM_ACTION} step"
+    assert BUILD_DIGEST in (_step_value(sboms[0], "image") or ""), (
+        "the SBOM is not generated from the pushed digest"
+    )
+    steps = _job_steps(block)
+    assert steps.index(sboms[0]) < steps.index(with_sbom[0]), (
+        "the SBOM is attested before it is generated"
+    )
+
+
+def test_release_image_tags_follow_semver_and_leave_latest_to_the_default() -> None:
+    """
+    Every release gets its exact tag, finals also ``major.minor``, no raw latest.
+
+    The tagging action skips partial patterns for pre-releases and applies
+    ``latest`` to finals only by default, so writing ``latest`` anywhere in the
+    image job could only move it onto a release candidate.
+    """
+    block = _release_job("publish-docker")
+    metas = _steps_using(block, METADATA_ACTION)
+    assert len(metas) == 1, "publish-docker has no single metadata step"
+    meta = metas[0]
+    for pattern in (SEMVER_VERSION_TAG, SEMVER_MINOR_TAG):
+        assert pattern in meta, f"the metadata step's tags lack {pattern!r}"
+
+    offenders = [
+        f"release.yml:{number}: {line.strip()}"
+        for number, line in block
+        if not _is_comment(line) and LATEST_WORD.search(line)
+    ]
+    assert not offenders, (
+        "publish-docker names latest; leave it to the tagging action's "
+        "default, which withholds it from pre-releases:\n" + "\n".join(offenders)
+    )
+
+
+def test_release_run_scripts_never_paste_an_expression_into_the_shell() -> None:
+    """
+    No release ``run:`` script has an expression expanded into its text.
+
+    The tag name is chosen by whoever pushes it, and an expression is
+    substituted into the script before the shell parses it, so a crafted tag
+    would become shell. The gate reads the tag from the environment instead.
+    """
+    scripts = _run_scripts(_numbered(RELEASE_WORKFLOW))
+    assert scripts, "release.yml has no run: script, so this checked nothing"
+    offenders = [
+        f"release.yml:{number}: {line}"
+        for number, line in scripts
+        if EXPRESSION_OPEN in line
+    ]
+    assert not offenders, (
+        "a release run: script expands an expression into shell text:\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_ci_docker_job_builds_and_smoke_tests_the_image() -> None:
+    """
+    Every CI run builds the image locally and runs the smoke script on it.
+
+    The build is loaded into the runner and never pushed, and the checks live
+    in the script rather than in inline YAML, so every caller runs the same
+    ones. Because the release workflow calls CI, publishing waits for this.
+    """
+    block = _job_block(_numbered(CI_WORKFLOW), "docker")
+    assert block, "ci.yml declares no docker job"
+    builds = _steps_using(block, BUILD_PUSH_ACTION)
+    assert len(builds) == 1, "the docker job has no single build-push step"
+    build = builds[0]
+    assert _step_value(build, "push") == "false"
+    assert _step_value(build, "load") == "true"
+    tag = _step_value(build, "tags")
+    assert tag, "the docker job's build names no tag for the smoke run to use"
+
+    scripts = [line for _, line in _run_scripts(block)]
+    assert scripts, "the docker job runs nothing after the build"
+    inline = [line for line in scripts if SMOKE_SCRIPT not in line]
+    assert not inline, (
+        f"the docker job runs checks outside {SMOKE_SCRIPT}; keep them in the "
+        f"script so every caller runs the same ones: {inline}"
+    )
+    assert any(line.endswith(f"{SMOKE_SCRIPT} {tag}") for line in scripts), (
+        f"the smoke script is not run against the image the build tagged {tag}: "
+        f"{scripts}"
     )
 
 
