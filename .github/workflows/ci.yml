@@ -6,7 +6,7 @@ on:
     branches: [master]
   pull_request:
   # `release.yml` calls this workflow, so the release gate and the CI gate are
-  # one definition of green and can never drift apart (D-16). Three
+  # one definition of green and can never drift apart (D-16). Four
   # consequences worth knowing before you edit anything below:
   #
   #   * `concurrency.group` interpolates `github.workflow`, which under a

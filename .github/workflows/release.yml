@@ -187,7 +187,8 @@ jobs:
       # A Sigstore-signed SLSA build provenance attestation for the pushed
       # digest, stored in GitHub's attestation API and pushed to GHCR beside the
       # image. Verify with `gh attestation verify oci://<image>:<tag>
-      # -R kdknigga/saneless`, where <image> is the subject-name below. Storage records are for organisation-owned repositories only, so none
+      # -R kdknigga/saneless`, where <image> is the subject-name below.
+      # Storage records are for organisation-owned repositories only, so none
       # is requested, and the job holds no permission to write one.
       - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:

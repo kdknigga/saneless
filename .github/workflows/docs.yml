@@ -22,9 +22,10 @@ permissions:
 # Grouped per ref, so a new push to a pull request cancels that pull request's
 # stale docs build, and nothing else. A master run is never cancelled once it
 # has started; a newer master push can only replace one still waiting to start,
-# and the newer one publishes the newer site anyway. The Pages deploy has its own group on the deploy job: a workflow-level `pages`
-# group would put every pull request build in the deploy queue, where GitHub
-# keeps one pending run and cancels the older one -- which could be a deploy.
+# and the newer one publishes the newer site anyway. The Pages deploy has its
+# own group on the deploy job: a workflow-level `pages` group would put every
+# pull request build in the deploy queue, where GitHub keeps one pending run
+# and cancels the older one -- which could be a deploy.
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
