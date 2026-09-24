@@ -59,7 +59,7 @@ from saneless.worker import ScanWorker
 from tests.conftest import StubScannerBackend, poll_until
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator, Iterator
 
     import httpx2
     from starlette.responses import Response
@@ -1290,7 +1290,7 @@ def _appliance_with_credential(
     credential: str,
     *,
     consume_dir: str = "",
-) -> Iterator[TestClient]:
+) -> Generator[TestClient]:
     """
     Serve one app whose paperless-ngx credential is exactly ``credential``.
 

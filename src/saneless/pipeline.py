@@ -35,7 +35,7 @@ from saneless.spool import SpooledPageSink
 from saneless.vocabulary import FlipOutcome, JobState, ScanOutcome
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Generator, Sequence
 
     from saneless.config import ProfileConfig, Settings
     from saneless.paperless import PaperlessClient
@@ -654,7 +654,7 @@ def _preservation_failure_message(
 
 
 @contextlib.contextmanager
-def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Iterator[None]:
+def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
     """
     Move assembled PDFs out of harm's way when delivery fails, then re-raise.
 
@@ -881,7 +881,7 @@ def _preserving_partial_scan(
     tmp_path: Path,
     request: PipelineRequest,
     failed_dir: Path,
-) -> Iterator[None]:
+) -> Generator[None]:
     """
     Keep the pages an interrupted scan already spooled, then re-raise.
 
@@ -1083,7 +1083,7 @@ def _preserve_page_files_after_partial_failure(
 
 
 @contextlib.contextmanager
-def _preserving_page_files(spool_dir: Path, destination: Path) -> Iterator[None]:
+def _preserving_page_files(spool_dir: Path, destination: Path) -> Generator[None]:
     """
     Keep the spooled page files when the PDF they belong to cannot be built.
 

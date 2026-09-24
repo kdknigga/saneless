@@ -74,7 +74,7 @@ from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     import threading
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator, Iterator
 
     from starlette.datastructures import State
 
@@ -625,7 +625,7 @@ class _RecordingCache(CheckCache):
 @contextmanager
 def _a_recording_cache(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, start: float = 100.0
-) -> Iterator[tuple[TestClient, _RecordingCache]]:
+) -> Generator[tuple[TestClient, _RecordingCache]]:
     """
     Build a client whose check cache records the handler's claims and releases.
 
@@ -651,7 +651,7 @@ def _a_recording_cache(
 
 
 @contextmanager
-def _a_probe_in_flight(client: TestClient) -> Iterator[None]:
+def _a_probe_in_flight(client: TestClient) -> Generator[None]:
     """
     Hold the refresher's single-flight lock for the body of the ``with``.
 
