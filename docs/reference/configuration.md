@@ -103,9 +103,21 @@ Paperless-ngx API connection settings.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `url` | string | `""` | Paperless-ngx base URL (e.g., `http://paperless:8000`) |
-| `token` | string | `""` | API authentication token. Never written to logs or error messages. |
+| `url` | string | `""` | Paperless-ngx base URL (e.g., `http://paperless:8000`). It must be an `http://` or `https://` address that names a host, and it must not contain a user name or password: put the API token in `token`. Write an international host name in its `xn--` form. Spaces and line breaks around the value are ignored. `""` means not set: saneless still starts, but a scan fails as a configuration error when it comes to upload, and nothing is copied to `consume_dir`. Any other value that breaks these rules stops saneless when the config loads (exit 2), with an error naming the key and never the value |
+| `token` | string | `""` | API authentication token. Spaces and line breaks around it are ignored, so a trailing newline from a secret file or a CRLF `.env` file does no harm. What remains must be visible ASCII, with no spaces or control characters inside it. A value that breaks these rules stops saneless when the config loads (exit 2), with an error naming the key and never the value. The token is never written to logs or error messages |
 | `consume_dir` | string | unset (empty or omitted means disabled) | Fallback directory for PDF deposit when API is unavailable. An empty or whitespace-only value disables the fallback rather than naming the working directory. A leading `~` is expanded. |
+
+### Document date
+
+saneless sends no document date with an upload, so paperless-ngx dates the document itself. It
+uses the first date it finds in the document: in the file name, but only when
+`PAPERLESS_FILENAME_DATE_ORDER` is set in paperless-ngx, and then in the text of the document
+after OCR. It reads dates in the order `PAPERLESS_DATE_ORDER` gives, skips any listed in
+`PAPERLESS_IGNORE_DATES`, and takes only dates after 1900 that are not in the future. When it
+finds none, the document is dated with the date and time paperless-ngx received the upload, or,
+for a file saneless [saved to the consume directory](../explanation/consume-directory-fallback.md),
+the time saneless saved it there. Those are paperless-ngx settings, not saneless ones: set them
+on the paperless-ngx side.
 
 ## `[output]`
 
