@@ -873,7 +873,10 @@ def _assert_warned_done(text: str) -> None:
     assert "Done: Render Test" not in text
     assert '<p class="status-done">' not in text
     # A lost sheet is a degraded success, not a failure, as with a fallback.
-    assert 'role="alert"' not in text
+    # Only the status area and what follows it are searched: the index page
+    # carries an empty `#status-message` alert region above it for form errors.
+    status_area = text[text.index('<div id="status-area"') :]
+    assert 'role="alert"' not in status_area
 
 
 def test_warned_done_renders_the_warning_on_the_status_poll(

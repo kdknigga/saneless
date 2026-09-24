@@ -62,13 +62,25 @@
 
          Counts on every terminal job therefore means every terminal job that
          RECORDED counts: ERROR and CANCELLED rows have none to show, and that is
-         accepted, so a later reader need not chase a phantom. #}
-      <p class="status-done">&#10003; Done: {{ job.title }}</p>
+         accepted, so a later reader need not chase a phantom.
+
+         An upload that carries a warning -- a sheet the scanner could not read,
+         say -- is not headed with the green tick: it reads in the fallback amber
+         with the warning beneath, so nobody throws away a stack that is missing
+         a page.  It is a degraded success, not a failure, so like the fallback
+         branch it is not announced as an alert.  The words come from the
+         outcome_line filter in both arms, never from this template. #}
+      {% if job.warning %}
+      <p class="status-fallback">&#9888; {{ job.state | outcome_line(job.warning, job.title) }}</p>
+      <p class="status-fallback">{{ job.warning }}</p>
+      {% else %}
+      <p class="status-done">&#10003; {{ job.state | outcome_line(job.warning, job.title) }}</p>
+      {% endif %}
       {% set counts = job | page_counts %}
       {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
       {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% elif job.state == JobState.FALLBACK %}
-      <p class="status-fallback">&#8594; Saved to folder: {{ job.title }}</p>
+      <p class="status-fallback">&#8594; {{ job.state | outcome_line(job.warning, job.title) }}</p>
       {% if job.warning %}
       <p class="status-fallback">{{ job.warning }}</p>
       {% endif %}
