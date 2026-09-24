@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import IO, TYPE_CHECKING, Any, NamedTuple, TypedDict, Unpack
 
 import pytest
-from pydantic import SecretStr, ValidationError
+from pydantic import ValidationError
 from pydantic_settings.exceptions import SettingsError
 
 import saneless.config as config_mod
@@ -1424,7 +1424,7 @@ def no_discovered_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
 _TOKEN_RULE = "must contain only visible ASCII characters"
 """The start of the refusal every malformed token gets, whatever is wrong."""
 
-_URL_SHAPE_RULE = "and name a host"
+_URL_SHAPE_RULE = "address that names a host"
 """The tail of the refusal a scheme-less, non-HTTP or host-less URL gets."""
 
 _URL_USERINFO_RULE = "put the paperless-ngx API token in paperless.token"
@@ -1519,8 +1519,8 @@ class TestPaperlessTokenAndUrlAtLoad:
         assert settings.paperless.token.get_secret_value() == "tok"
 
     def test_a_directly_built_token_is_stripped_too(self) -> None:
-        """A ``SecretStr`` handed to the model is unwrapped, stripped and rewrapped."""
-        config = PaperlessConfig(token=SecretStr(" tok\n"))
+        """A token string handed straight to the model is stripped the same way."""
+        config = PaperlessConfig(token=" tok\n")
         assert config.token.get_secret_value() == "tok"
 
     @pytest.mark.parametrize(
@@ -1582,6 +1582,28 @@ class TestPaperlessTokenAndUrlAtLoad:
         assert line.startswith("  [paperless] url: ")
         assert rule in line
         TestConfigErrorsNeverEchoValues._assert_value_absent(err, raw_value)
+
+    @pytest.mark.parametrize(
+        "url", ["http://", "https://", "paperless:8000", "ftp://paperless"]
+    )
+    def test_a_misshapen_url_gets_the_whole_url_rule(
+        self, tmp_config_dir: Path, url: str
+    ) -> None:
+        """
+        A likely wrong URL gets the rule in full, not a rule with a hole in it.
+
+        The input is struck wherever it stands alone in the message, so a rule
+        that spelled out ``http://`` or an example address would lose those
+        very words for the operator who typed them.
+        """
+        err = _load_error(
+            tmp_config_dir / "host_less_url.toml",
+            f'[paperless]\nurl = "{url}"\n',
+        )
+        assert _only_body_line(err) == (
+            "  [paperless] url: Value error, must be an http or https address "
+            "that names a host"
+        )
 
     @pytest.mark.usefixtures("no_discovered_config")
     def test_a_malformed_url_from_the_environment_is_refused(
