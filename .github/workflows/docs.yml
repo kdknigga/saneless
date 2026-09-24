@@ -7,6 +7,11 @@ on:
     # branch that does not exist, which is why the documentation site has never
     # deployed once and why every deep link into it returns 404.
     branches: [master]
+  # Pull requests build the site with the same strict, anchor-validated command
+  # as master, so a broken nav entry or a dead `page.md#anchor` link is caught
+  # before merge instead of after. They never upload or deploy: the Pages
+  # upload step and the deploy job below both run on `push` only.
+  pull_request:
 
 # The site is published as a Pages artifact rather than by pushing a branch, so
 # nothing in this workflow needs a writable `contents` scope. Only the deploy
@@ -14,11 +19,15 @@ on:
 permissions:
   contents: read
 
-# One publish at a time, and never cancel one in flight: a half-applied
-# deployment is worse than a queued one.
+# Grouped per ref, so a new push to a pull request cancels that pull request's
+# stale docs build, and nothing else. A master run is never cancelled once it
+# has started; a newer master push can only replace one still waiting to start,
+# and the newer one publishes the newer site anyway. The Pages deploy has its own group on the deploy job: a workflow-level `pages`
+# group would put every pull request build in the deploy queue, where GitHub
+# keeps one pending run and cancels the older one -- which could be a deploy.
 concurrency:
-  group: pages
-  cancel-in-progress: false
+  group: docs-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -53,7 +62,10 @@ jobs:
       # packages including saneless and python-sane, and `uv run --no-sync`
       # installs none and still builds the site.
       - run: uv run --no-sync mkdocs build --strict
+      # A pull request build stops at the strict build above; only master
+      # produces a Pages artifact.
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name == 'push'
         with:
           path: site
 
@@ -63,9 +75,18 @@ jobs:
   # permanently empty. GitHub also auto-creates a `github-pages` environment
   # the first time this runs, alongside the two publish environments the
   # release workflow uses.
+  #
+  # Push only. The `github-pages` environment's branch policy would refuse a
+  # pull request deploy as well, but this job does not lean on that.
   deploy:
     name: deploy
+    if: github.event_name == 'push'
     needs: build
+    # One publish at a time, and never cancel one in flight: a half-applied
+    # deployment is worse than a queued one.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:
