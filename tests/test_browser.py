@@ -1498,6 +1498,81 @@ class TestFallbackStatusRendering:
         assert cell.inner_text().strip() == "Saved to folder"
 
 
+@pytest.mark.browser
+class TestWarnedDoneStatusRendering:
+    """
+    An upload that lost a sheet, proven amber in a browser rather than by grep.
+
+    The template tests prove the headline wears `status-fallback`; only a
+    resolved cascade proves that class reads as the fallback amber, and not as
+    the success green a green tick would have shown, in both colour schemes.
+    """
+
+    @pytest.fixture
+    def warned_done_page(
+        self, page: Page, browser_server: _BrowserServer
+    ) -> Iterator[Page]:
+        """Drive the live app's current job to a warned DONE, then clear it again."""
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        job = job_store.create_job(profile="default", title="Warned Doc")
+        job_store.finish_job(
+            job.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=(
+                    "1 page(s) could not be read by the scanner and were skipped. "
+                    "They were not removed for being blank; rescan those sheets."
+                ),
+                pages_scanned=1,
+                pages_removed=0,
+                pages_uploaded=1,
+            ),
+        )
+        app.state.worker._current_job_id = job.id
+        try:
+            yield page
+        finally:
+            # The server and its store are session-scoped: clearing the pointer
+            # alone leaves this row as the most recent job, which the idle page
+            # of every later test would then render. Deleting it restores idle.
+            app.state.worker._current_job_id = None
+            job_store.delete_job(job.id)
+
+    @pytest.mark.parametrize("scheme", ["light", "dark"])
+    def test_warned_done_colour_matches_the_fallback_amber(
+        self,
+        warned_done_page: Page,
+        browser_server: _BrowserServer,
+        scheme: Literal["light", "dark"],
+    ) -> None:
+        """
+        The warned headline resolves to the fallback amber, never the done green.
+
+        Run under both colour schemes, because an amber that turned green in
+        one of them would tell half the operators their stack was complete.
+        """
+        warned_done_page.emulate_media(color_scheme=scheme)
+        warned_done_page.goto(browser_server.url)
+        warned_done_page.wait_for_selector("#status-area .status-fallback")
+
+        status = warned_done_page.locator("#status-area")
+        text = status.inner_text()
+        assert "Uploaded with a warning: Warned Doc" in text
+        assert "rescan those sheets." in text
+        assert "Done: Warned Doc" not in text
+
+        colours = warned_done_page.evaluate(_PROBE_STATUS_COLOURS)
+        assert colours["status-fallback"] != colours["status-done"], colours
+        headline = warned_done_page.evaluate(
+            "() => getComputedStyle("
+            "document.querySelector('#status-area p.status-fallback')).color"
+        )
+        assert headline == colours["status-fallback"]
+        assert headline != colours["status-done"]
+
+
 _POLL_OBSERVATION_MS = 2500
 """How long a terminal page is watched for status polls: two and a half 1 s ticks."""
 

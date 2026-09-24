@@ -847,6 +847,98 @@ def test_fallback_warning_is_escaped_not_injected(client: TestClient) -> None:
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
 
 
+# The sentence the pipeline records when the scanner could not read a sheet: the
+# commonest way an upload succeeds while a page is lost.
+_SKIPPED_SHEET_WARNING = (
+    "1 page(s) could not be read by the scanner and were skipped. "
+    "They were not removed for being blank; rescan those sheets."
+)
+
+# The headline a warned upload wears, amber like a fallback and never "Done".
+_WARNED_HEADLINE = (
+    '<p class="status-fallback">&#9888; Uploaded with a warning: Render Test</p>'
+)
+
+
+def _assert_warned_done(text: str) -> None:
+    """
+    Assert that a page shows a warned upload as one, and never as a clean one.
+
+    Args:
+        text: The rendered status area or index page.
+
+    """
+    assert _WARNED_HEADLINE in text
+    assert f'<p class="status-fallback">{_SKIPPED_SHEET_WARNING}</p>' in text
+    assert "Done: Render Test" not in text
+    assert '<p class="status-done">' not in text
+    # A lost sheet is a degraded success, not a failure, as with a fallback.
+    # Only the status area and what follows it are searched: the index page
+    # carries an empty `#status-message` alert region above it for form errors.
+    status_area = text[text.index('<div id="status-area"') :]
+    assert 'role="alert"' not in status_area
+
+
+def test_warned_done_renders_the_warning_on_the_status_poll(
+    client: TestClient,
+) -> None:
+    """
+    An upload that lost a sheet is headed in amber with the reason beneath.
+
+    A green tick over a document missing a page tells the operator the stack
+    is safe to throw away, which is the one thing it is not.
+    """
+    _job_in_state(client, JobState.DONE, warning=_SKIPPED_SHEET_WARNING)
+    _assert_warned_done(client.get("/api/jobs/current/status").text)
+
+
+def test_warned_done_renders_the_warning_on_the_index_page(
+    client: TestClient,
+) -> None:
+    """A reload of the page says the same as the poll, not a stale green tick."""
+    _job_in_state(client, JobState.DONE, warning=_SKIPPED_SHEET_WARNING)
+    _assert_warned_done(client.get("/").text)
+
+
+def test_warned_done_warning_is_escaped_not_injected(client: TestClient) -> None:
+    """
+    The upload branch escapes its warning exactly as the fallback branch does.
+
+    The warning column is written by more than one path, so the second place
+    that renders it needs the same pin as the first.
+    """
+    _job_in_state(client, JobState.DONE, warning="<script>alert(1)</script>")
+    text = client.get("/api/jobs/current/status").text
+    assert "<script>alert(1)</script>" not in text
+    assert (
+        '<p class="status-fallback">&lt;script&gt;alert(1)&lt;/script&gt;</p>' in text
+    )
+
+
+def test_done_without_a_warning_is_unchanged_warned_guard(
+    client: TestClient,
+) -> None:
+    """
+    A clean upload keeps its green tick, byte for byte, and gains no amber line.
+
+    Named with the warned tests so the guard runs whenever they do: splitting
+    the branch must not change what a clean upload looks like.
+    """
+    _job_in_state(client, JobState.DONE)
+    text = client.get("/api/jobs/current/status").text
+    assert '<p class="status-done">&#10003; Done: Render Test</p>' in text
+    assert "status-fallback" not in text
+
+
+def test_warned_done_history_cell_label_and_class(client: TestClient) -> None:
+    """The history row names a warned upload and colours it amber, not green."""
+    _job_in_state(client, JobState.DONE, warning=_SKIPPED_SHEET_WARNING)
+    text = client.get("/api/jobs/history").text
+    assert '<td class="status-fallback">\n    Uploaded with a warning\n  </td>' in text
+    assert '<td class="status-done">' not in text
+    assert state_label(JobState.DONE) not in text
+
+
 # A scan that produced twelve pages, discarded two as blank and sent ten on.
 _COUNTS = JobResult(
     outcome=None,
