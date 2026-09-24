@@ -41,7 +41,7 @@ default_language_version:
   python: python3.14
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v6.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       - id: check-added-large-files
         stages: [pre-commit]
@@ -92,21 +92,38 @@ repos:
         stages: [pre-commit]
 
   - repo: https://gitlab.com/bmares/check-json5
-    rev: v1.0.1
+    rev: 82381b1133603e4ff6eb3d866ec4501d121b669b  # frozen: v1.0.1
     hooks:
       - id: check-json5
 
-  - repo: https://github.com/tsvikas/sync-with-uv
-    rev: v0.6.0
+  # The commit-stage lint fixer and formatter. They are local rather than
+  # fetched from a hook repository so that ruff comes from uv.lock, hash-checked
+  # and at the exact version the project resolves, the same binary the
+  # merge- and push-stage checks below run. A remote ruff hook would carry a
+  # second, separately pinned copy, and keeping that copy in step with the lock
+  # needs a syncing hook, which rewrites a frozen commit SHA back to its tag and
+  # so undoes the pin every remote repo above carries.
+  #
+  # They sit in their own block because they work the other way round from
+  # the whole-tree checkers in the next one: these are handed the changed
+  # files and filter them by type, so a commit touching no Python skips them.
+  # `require_serial` keeps prek from splitting the file list across parallel
+  # ruff processes that would race to rewrite the same files.
+  - repo: local
     hooks:
-      - id: sync-with-uv
+      - id: ruff-check
+        name: ruff check --fix
+        entry: uv run ruff check --fix
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
 
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.8
-    hooks:
-      - id: ruff
-        args: [--fix]
       - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format
+        language: system
+        types_or: [python, pyi]
+        require_serial: true
 
   - repo: local
     hooks:
@@ -170,10 +187,11 @@ repos:
         stages: [pre-merge-commit, pre-push]
 
       # Lint and format are checked, not applied, at merge and push. The
-      # ruff-pre-commit hooks above rewrite files, so they cannot run at either
-      # stage -- which left the two cheapest checks in the gate deferred to a CI
-      # round trip while the two slowest (the type checkers) ran locally.
-      # `--no-fix` and `--check` report instead of rewriting, so they can.
+      # commit-stage ruff fixer and formatter in the block above rewrite files,
+      # so they cannot run at either stage -- which would leave the two cheapest
+      # checks in the gate deferred to a CI round trip while the two slowest
+      # (the type checkers) ran locally. `--no-fix` and `--check` report
+      # instead of rewriting, so they can.
       - id: ruff-check-full
         name: ruff (no fix)
         entry: uv run ruff check --no-fix .
@@ -208,25 +226,28 @@ repos:
   # Comments in shipped source state their reasons in words. They never point
   # at the planning records (decision, finding and requirement IDs, phase and
   # plan numbers, the planning file names), because those records do not ship
-  # and a reader of src/ cannot look the reference up. pygrep fails the hook on
-  # any line under src/ that matches.
+  # and a reader of src/ cannot look the reference up. The release scripts
+  # under scripts/ ship with the repository too, and the workflows send a
+  # reader straight into them, so they are held to the same rule. pygrep fails
+  # the hook on any line under src/ or scripts/ that matches.
   #
   # This block is separate from the local block above because it works the
   # other way round: those hooks run whole-tree checkers with no filenames,
   # while this one is handed the files and filters them by path and type, so it
-  # only ever reads Python, templates, CSS and JavaScript under src/. The
-  # top-level exclude keeps the vendored assets out. Read-only, so it runs at
-  # all three stages. tests/test_deployment_config.py holds the same pattern,
-  # asserts the two stay identical, and runs it over src/ in CI. The test picks
-  # files by suffix where this hook picks them by type, so a Python script with
-  # no .py suffix would be checked here and not there.
+  # only ever reads Python, templates, CSS and JavaScript under src/ and
+  # scripts/. The top-level exclude keeps the vendored assets out. Read-only,
+  # so it runs at all three stages. tests/test_deployment_config.py holds the
+  # same pattern and the same two directories, asserts the two stay identical,
+  # and runs it over both in CI. The test picks files by suffix where this hook
+  # picks them by type, so a Python script with no .py suffix would be checked
+  # here and not there.
   - repo: local
     hooks:
       - id: no-planning-citations
-        name: no planning-artefact citations in src
+        name: no planning-artefact citations in src and scripts
         language: pygrep
         entry: '\b(R[0-9]+-)?(C|D|M|N|S|U|W|CR|IN|WR)-[0-9]{2,}\b|\b(A|API|APPL|CFG|CTR|DARK|DLVR|DOCS|DPLX|EXC|HARD|OUTC|ROBU|SCAN|SCNR|STOR|SWP|TEST)-[0-9]+\b|\bT-[0-9]+-[0-9]+\b|\b[Pp]hase [0-9]+|\b[Pp]lan [0-9]+(\.[0-9]+)?-[0-9]+\b|\bPitfall #?[0-9]+|UI-SPEC|\b(CONTEXT|RESEARCH)\b|\b(PLAN|SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|[Pp]er user decision|\.planning/'
-        files: ^src/
+        files: ^(src|scripts)/
         types_or: [python, html, css, javascript]
         stages: [pre-commit, pre-merge-commit, pre-push]
 
