@@ -5245,7 +5245,10 @@ def test_release_runs_do_not_overlap_in_the_release_concurrency_group() -> None:
 
     Out of order, the older release could finish last and leave ``latest`` on
     it. An in-flight publish is never cancelled either, since cancelling one
-    between the image push and the upload would be a half-publish.
+    between the image push and the upload would be a half-publish. A waiting
+    publish is not dropped: the default queue holds one pending run and
+    cancels it when a newer one enters the group, so a third tag pushed while
+    a final release waits for approval would lose the second release silently.
     """
     lines = _numbered(RELEASE_WORKFLOW)
     concurrency = _key_mapping(lines, "concurrency", 0)
@@ -5256,6 +5259,10 @@ def test_release_runs_do_not_overlap_in_the_release_concurrency_group() -> None:
     )
     assert concurrency.get("cancel-in-progress") == "false", (
         f"release.yml's concurrency must not cancel an in-flight release: {concurrency}"
+    )
+    assert concurrency.get("queue") == "max", (
+        "release.yml's concurrency keeps only one pending release, so a third "
+        f"tag cancels the second without a failure: {concurrency}"
     )
 
 

@@ -15,9 +15,16 @@ permissions:
 # last would leave `latest` on it. An in-flight release is never cancelled,
 # because stopping one between the image push and the package upload is a
 # half-publish.
+#
+# `queue: max` keeps every waiting release. The default queue holds one
+# pending run and cancels it when a newer one arrives, so a third tag pushed
+# while a final release sat waiting for approval would silently drop the
+# second release. With `max`, up to 100 runs wait in the group and start one
+# after another; only a 101st is cancelled.
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   # The release gate is the CI workflow itself, called as a reusable workflow,
