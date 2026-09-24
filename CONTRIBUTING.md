@@ -61,32 +61,52 @@ ls "$(git rev-parse --path-format=absolute --git-common-dir)/hooks"
 To add a dependency, use `uv add <package>` (or `uv add --dev <package>`) and commit
 the resulting `uv.lock` change alongside the `pyproject.toml` change.
 
-## The seven checks
+## The checks CI runs
 
-Every push to `master` and every pull request runs these seven commands, split across
-three parallel jobs in `.github/workflows/ci.yml`:
+Every push to `master` and every pull request runs `.github/workflows/ci.yml`, whose
+four parallel jobs run the commands below, and `.github/workflows/docs.yml`, which
+builds the documentation site:
 
-| Job | Command |
-|--------|---------|
-| `lint` | `uv run ruff check .` |
-| `lint` | `uv run ruff format --check .` |
-| `lint` | `uv run ty check` |
-| `lint` | `uv run pyrefly check src tests scripts` |
-| `test` | `uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"` |
-| `test` | `uv run env HOME="$(mktemp -d)" pytest -m sane_hardware` |
-| `browser` | `uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser` |
+| Workflow | Job | Command |
+|----------|-----|---------|
+| `ci.yml` | `lint` | `uv run prek run --all-files --show-diff-on-failure` |
+| `ci.yml` | `lint` | `uv run prek run --stage pre-push --all-files --show-diff-on-failure` |
+| `ci.yml` | `lint` | `uv audit --preview-features audit-command` |
+| `ci.yml` | `test` | `uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"` |
+| `ci.yml` | `test` | `uv run env HOME="$(mktemp -d)" pytest -m sane_hardware` |
+| `ci.yml` | `browser` | `uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser` |
+| `ci.yml` | `docker` | builds the image as `saneless:ci`, then `uv run --no-project python scripts/smoke_image.py saneless:ci` |
+| `docs.yml` | `build` | `uv run --no-sync mkdocs build --strict` |
 
-You can reproduce the gate exactly, in the same order, with:
+The `lint` job runs the hook file rather than a list of its own:
+`.pre-commit-config.yaml` is the one definition of the lint gate, so what the hooks
+check on your machine and what CI checks are the same thing. The first prek command
+runs the commit stage over the whole tree. That includes the file-modifying fixers
+(the ruff fixer and formatter, the end-of-file and trailing-whitespace fixers and the
+rest); on a clean tree they change nothing, and if any of them would change a file
+the job fails and prints the diff. The same stage runs ty and pyrefly over `src/`,
+the workflow audit (`zizmor`), the read-only file checks and the planning-citation
+check. The second command runs the push stage: ty over the whole project, pyrefly
+over `src tests scripts`, `ruff check --no-fix .`, `ruff format --check .` and
+`pytest tests/test_deployment_config.py`. One hook does nothing in CI:
+`check-added-large-files` looks only at files staged as new, and a CI checkout stages
+nothing, so it guards your local commits and not the pull request. `uv audit` is its
+own step because it queries an advisory database over the network, which no hook
+should need.
+
+You can reproduce the gate, in the same order, with:
 
 ```bash
-uv run ruff check .
-uv run ruff format --check .
-uv run ty check
-uv run pyrefly check src tests scripts
+uv run prek run --all-files --show-diff-on-failure
+uv run prek run --stage pre-push --all-files --show-diff-on-failure
+uv audit --preview-features audit-command
 uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"
 uv run env HOME="$(mktemp -d)" pytest -m sane_hardware
 uv run playwright install chromium   # once, to fetch the browser
 uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser
+docker build -t saneless:ci .
+uv run --no-project python scripts/smoke_image.py saneless:ci
+uv run --no-sync mkdocs build --strict
 ```
 
 The test commands point `HOME` at a fresh empty directory, which proves on every run
@@ -100,9 +120,20 @@ shell, before `env` changes it, so it is your real home, where `playwright insta
 put Chromium. If you set `PLAYWRIGHT_BROWSERS_PATH` or `XDG_CACHE_HOME` for the
 install, use that directory instead.
 
-All seven must exit 0. Fix what they report -- do not silence them. `# noqa`,
+The `docker` job builds the image from the `Dockerfile` and never pushes it, then
+starts containers from it and runs the smoke checks in `scripts/smoke_image.py`
+against them. The script drives the local `docker` CLI, and Podman's `docker` shim
+works too. The docs build is strict: a broken nav entry, a dead link or a link to an
+anchor that does not exist fails it. Never add `-q` to that command. Quiet mode hides
+the warnings that strict mode counts, so a quiet strict build exits 0 over a dead
+anchor.
+
+Every command must exit 0. Fix what they report -- do not silence them. `# noqa`,
 `# type: ignore` and rule-disabling are not accepted, and both type checkers must be
-clean because they do not always report the same issues for the same code.
+clean because they do not always report the same issues for the same code. The
+workflows skip nothing either: no hook is skipped with `SKIP=`, and no step carries
+`continue-on-error` or ends in `|| true`. A test in `tests/test_deployment_config.py`
+fails the build on any of them.
 
 Tests do not call `time.sleep`. A test that needs something to happen waits on a
 `threading.Event` that the code under test sets, polls with `poll_until` from
@@ -167,8 +198,9 @@ as inspecting what a commit is about to run.
 `uv run prek run`, never as `pre-commit run`. At its default stage it runs the
 formatter, the linter and both type checkers, but the type checkers only cover `src/`
 there. For the full type check over `src/` and `tests/`, run
-`uv run prek run --stage pre-push --all-files`. prek does not run the test suite at
-any stage, so run the seven commands above as well.
+`uv run prek run --stage pre-push --all-files`. That stage also runs
+`tests/test_deployment_config.py`, but no stage runs the rest of the test suite, so
+run the other commands above as well.
 
 ## Where the type checkers run
 
@@ -224,8 +256,8 @@ failure later and makes it slower to find.
 
 The same is true of merges and pushes. `git merge --no-verify` skips the
 `pre-merge-commit` hook, and `git push --no-verify` skips the `pre-push` hook. CI
-still runs all seven checks on the pull request, so skipping them locally only moves
-the failure later.
+still runs every check on the pull request, both hook stages included, so skipping
+them locally only moves the failure later.
 
 ## How `master` is protected
 
@@ -242,3 +274,10 @@ Dependabot is configured in `.github/dependabot.yml` to bump the SHA-pinned GitH
 Actions weekly. It watches all workflows in the repository, so it will also open pull
 requests touching `release.yml` and `docs.yml`. That is expected behaviour rather
 than scope creep, and those pull requests go through the same gate as any other.
+The same file has Dependabot move the Dockerfile's base-image digests, the locked
+Python dependencies and the hook repositories in `.pre-commit-config.yaml`. Those
+hook repositories are pinned to commit SHAs, each with a `# frozen: vX.Y.Z` comment
+naming its release, and Dependabot updates the SHA and the comment together. Every
+entry waits seven days after a release before proposing it. To move a hook pin by
+hand, run `uv run prek autoupdate --freeze`, never a plain `autoupdate`, which would
+write a tag back in place of the SHA.

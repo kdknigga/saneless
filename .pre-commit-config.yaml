@@ -162,7 +162,10 @@ repos:
       # reads five files, finishes in well under a second, and never rewrites
       # anything, so it cannot abort an operation by modifying the tree. Any
       # finding exits non-zero, which is the whole contract -- findings get
-      # fixed, not silenced with an inline audit-ignore comment.
+      # fixed, not silenced with an inline audit-ignore comment. The entry is
+      # bare on purpose: no severity or confidence floor and no persona flag,
+      # because the default `regular` persona is the contract. CI runs this
+      # hook through prek, so this entry is the only spelling of the audit.
       - id: zizmor
         name: zizmor (workflow audit)
         entry: uv run zizmor .
