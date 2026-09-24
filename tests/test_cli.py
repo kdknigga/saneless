@@ -52,10 +52,10 @@ from saneless.exceptions import (
     ScanError,
     StorageError,
 )
-from saneless.job import Job, JobStore
+from saneless.job import Job, JobResult, JobStore
 from saneless.logging_config import configure_logging
 from saneless.paperless import UploadResult
-from saneless.pipeline import PipelineEvent, PipelineRequest
+from saneless.pipeline import PipelineEvent, PipelineRequest, ScanResult
 from saneless.scanner import sane_backend
 from saneless.scanner.base import (
     DeviceCapabilities,
@@ -64,11 +64,14 @@ from saneless.scanner.base import (
     ScannerBackend,
 )
 from saneless.vocabulary import (
+    WARNED_UPLOAD_LABEL,
     ErrorCategory,
     FlipOutcome,
     JobState,
+    ScanOutcome,
     error_next_step,
     exit_code_for,
+    job_label,
     local_time,
     state_label,
 )
@@ -94,6 +97,34 @@ def _inked_page() -> Image.Image:
     page = Image.new("RGB", (100, 100), "white")
     ImageDraw.Draw(page).rectangle([10, 10, 90, 90], fill="black")
     return page
+
+
+# A warning sentence as the pipeline writes one for a skipped sheet: the row a
+# warned upload leaves behind carries it next to state DONE.
+_WARNED_SENTENCE = (
+    "1 page(s) could not be read by the scanner and were skipped. "
+    "They were not removed for being blank; rescan those sheets."
+)
+
+
+def _clean_scan_result() -> ScanResult:
+    """
+    Build the result of a clean one-page upload, as a faked pipeline returns.
+
+    ``saneless scan`` chooses its outcome line and exit code from what the
+    pipeline returns, so a fake that stands in for it has to return a result.
+
+    Returns:
+        A SUCCESS result with no warning.
+
+    """
+    return ScanResult(
+        outcome=ScanOutcome.SUCCESS,
+        pages_scanned=1,
+        pages_removed=0,
+        pages_uploaded=1,
+        warning=None,
+    )
 
 
 def _make_settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -434,10 +465,11 @@ class TestScanCommand:
             _paperless: object,
             _settings: object,
             request: PipelineRequest,
-        ) -> None:
+        ) -> ScanResult:
             captured.append(request)
             if request.status_callback is not None:
                 request.status_callback(PipelineEvent.DONE)
+            return _clean_scan_result()
 
         monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
         result = runner.invoke(cli, args)
@@ -613,10 +645,10 @@ class TestScanCommand:
         """Scan --profile photo -> pipeline called with profile_name='photo'."""
         captured: dict[str, object] = {}
 
-        def capturing_pipeline(*args: object, **_kwargs: object) -> dict[str, str]:
+        def capturing_pipeline(*args: object, **_kwargs: object) -> ScanResult:
             """Capture the PipelineRequest from the 4th positional arg."""
             captured["request"] = args[3]
-            return {"status": "SUCCESS"}
+            return _clean_scan_result()
 
         runner, _ = _patch_cli(monkeypatch)
         monkeypatch.setattr("saneless.cli.run_pipeline", capturing_pipeline)
@@ -2172,6 +2204,23 @@ class TestJobsCommand:
         store.update_state(job.id, state)
         store.close()
 
+    def _populate_warned(self, db_path: Path, title: str) -> None:
+        """Populate a JobStore at db_path with one DONE job that has a warning."""
+        store = JobStore(db_path=db_path)
+        job = store.create_job(profile="default", title=title)
+        store.finish_job(
+            job.id,
+            JobState.DONE,
+            JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=_WARNED_SENTENCE,
+                pages_scanned=4,
+                pages_removed=0,
+                pages_uploaded=3,
+            ),
+        )
+        store.close()
+
     def test_jobs_empty(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs with no jobs in DB shows empty output (exit 0)."""
         settings = self._settings_for(tmp_path)
@@ -2250,7 +2299,8 @@ class TestJobsCommand:
         The status column's reserve was sized for the raw enum values, the
         longest of which was `AWAITING_FLIP`. Humanised labels are longer, and
         "Saved to folder" is longer than `FALLBACK`, so the reserve is derived
-        from `state_label` rather than hardcoded.
+        from `state_label` -- and from the warned-upload label, the widest of
+        all -- rather than hardcoded.
         """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
@@ -2263,7 +2313,7 @@ class TestJobsCommand:
         assert len(lines) == 3
         row = lines[2]
         assert row.endswith("Saved to folder")
-        widest = max(len(state_label(s)) for s in JobState)
+        widest = max(*(len(state_label(s)) for s in JobState), len(WARNED_UPLOAD_LABEL))
         assert all(len(line) <= 80 for line in lines)
         # Every other label would fit too, not just this one.
         assert len(row) - len("Saved to folder") + widest <= 80
@@ -2289,6 +2339,66 @@ class TestJobsCommand:
         # No writer for either column until plan 23-07, so both read None today.
         assert data[0]["outcome"] is None
         assert data[0]["warning"] is None
+
+    def test_jobs_table_labels_a_warned_upload(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A DONE job with a warning reads "Uploaded with a warning", not Complete."""
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        self._populate_warned(settings.output.db_path, "Warned Doc")
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        assert len(lines) == 3
+        assert lines[2].endswith(WARNED_UPLOAD_LABEL)
+        assert "Complete" not in result.output
+        assert all(len(line) <= 80 for line in lines)
+
+    def test_jobs_table_width_fits_the_warned_label(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The warned label fits beside a title that fills its column.
+
+        The title column takes whatever the status reserve leaves, so a reserve
+        sized only for `state_label` would let a long title push the warned
+        label past column 80.
+        """
+        monkeypatch.setenv("COLUMNS", "80")
+        settings = self._settings_for(tmp_path)
+        self._populate_warned(settings.output.db_path, "W" * 120)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+        assert result.exit_code == 0
+        lines = [line for line in result.output.strip().split("\n") if line.strip()]
+        row = lines[2]
+        assert row.endswith(job_label(JobState.DONE, _WARNED_SENTENCE))
+        assert all(len(line) <= 80 for line in lines)
+
+    def test_jobs_json_keeps_done_and_the_warning_for_a_warned_upload(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        `--json` keeps the raw DONE state and the warning for a warned upload.
+
+        The warned label is derived from the state and the warning, so the
+        machine contract carries both unchanged and never the label.
+        """
+        settings = self._settings_for(tmp_path)
+        self._populate_warned(settings.output.db_path, "Warned Doc")
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data[0]["state"] == "DONE"
+        assert data[0]["outcome"] == "SUCCESS"
+        assert data[0]["warning"] == _WARNED_SENTENCE
+        assert WARNED_UPLOAD_LABEL not in result.output
 
     def test_jobs_limit(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Jobs --limit 1 with 2 jobs in DB shows only 1 job."""
