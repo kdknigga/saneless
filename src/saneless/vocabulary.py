@@ -444,7 +444,7 @@ TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
 #
 # Like every other string here it is a developer constant: it names the problem
 # and nothing else -- never the token value and never the paperless-ngx URL,
-# which may carry ``user:pass@`` credentials (ASVS V7).  The em dash is the
+# which says where paperless-ngx runs (ASVS V7).  The em dash is the
 # same one ``web/routes.py``'s paused-checks prefix already uses.
 SCAN_BLOCKED_REASON: Final = (
     "The paperless-ngx API token has not been set — see System status above."
@@ -1155,8 +1155,8 @@ def rejection_message(rejection: RequestRejection) -> str:
         case RequestRejection.TOKEN_UNSET:
             message = (
                 # Names the problem and the file to edit, never the token
-                # value and never the paperless-ngx URL, which may carry
-                # ``user:pass@`` credentials (ASVS V7).
+                # value and never the paperless-ngx URL, which says where
+                # paperless-ngx runs (ASVS V7).
                 "The paperless-ngx API token has not been set, so the scan was "
                 "not started. Put a real API token in the saneless config "
                 "file, then restart saneless."

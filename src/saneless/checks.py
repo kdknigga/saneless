@@ -18,9 +18,10 @@ reports all six rows.
 
 ASVS V7 applies to every string this module can render.  No message and no next
 step carries a filesystem path, a URL, a token value or exception text.  The
-Paperless URL may hold ``user:pass@`` (``paperless.py:461``) and the fallback
-folder is a host path on a LAN-visible page, so both are deliberately omitted,
-exactly as the log file's path is.
+Paperless URL says where paperless-ngx runs (a user name or password in it is
+refused when the config loads) and the fallback folder is a host path, both on
+a LAN-visible page, so both are deliberately omitted, exactly as the log
+file's path is.
 
 There is exactly one exception, and it is this narrow: the Configuration row's
 *next step*, in the two states where a file under the superseded name was
