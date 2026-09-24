@@ -198,9 +198,29 @@ jobs:
       # An SPDX SBOM of the pushed image, read by digest so it describes exactly
       # the bytes that were published. It is kept only as the input to the
       # attestation below: no workflow artifact, no release asset.
+      #
+      # Pinning the action's SHA does not by itself pin what it runs: the
+      # action downloads syft's install.sh from the syft repository at a tag,
+      # and the installer then fetches the binary and its checksum file from
+      # that tag's GitHub release. `syft-version` names the tag here rather
+      # than leaving it to the action's default, and v1.51.1 is an immutable
+      # release (checked 2026-09-24 with `gh api
+      # repos/anchore/syft/releases/tags/v1.51.1 --jq .immutable`): its tag
+      # cannot be moved and its assets cannot be replaced, so every byte this
+      # step fetches is fixed. Deleting the release frees nothing either, as
+      # an immutable release's tag name can never be reused. Moving to another
+      # syft version means checking that release is immutable the same way.
+      #
+      # `github-token` is emptied because syft inherits the action's
+      # environment, inputs included, and this step uploads nothing. What
+      # remains is the job's own reach: the pinned syft runs where the OIDC
+      # identity and the registry login are available, as every other pinned
+      # action in this job does.
       - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ghcr.io/kdknigga/saneless@${{ steps.build.outputs.digest }}
+          syft-version: v1.51.1
+          github-token: ""
           format: spdx-json
           output-file: sbom.spdx.json
           upload-artifact: false

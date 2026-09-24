@@ -4843,6 +4843,8 @@ SEMVER_MINOR_TAG = "type=semver,pattern={{major}}.{{minor}}"
 
 ATTEST_ACTION = "actions/attest@"
 SBOM_ACTION = "anchore/sbom-action@"
+# One exact syft release tag, the form the SBOM action installs from.
+SYFT_RELEASE_TAG = re.compile(r"v\d+\.\d+\.\d+")
 BUILD_PUSH_ACTION = "docker/build-push-action@"
 METADATA_ACTION = "docker/metadata-action@"
 BUILD_DIGEST = "steps.build.outputs.digest"
@@ -5339,6 +5341,32 @@ def test_publish_docker_attests_signed_provenance_and_an_sbom() -> None:
     steps = _job_steps(block)
     assert steps.index(sboms[0]) < steps.index(with_sbom[0]), (
         "the SBOM is attested before it is generated"
+    )
+
+
+def test_the_sbom_step_pins_the_syft_it_runs_and_withholds_the_token() -> None:
+    """
+    The SBOM step names the syft release it runs and passes it no token.
+
+    The action's SHA pin covers the action's own code, not the syft binary it
+    downloads at run time from a release tag. Naming an exact release tag
+    (one that was checked to be immutable when it was chosen) fixes those
+    bytes; leaving the input out hands the choice to whatever default the
+    action ships. syft inherits the action's environment, inputs included,
+    and this step uploads nothing, so it gets no GitHub token.
+    """
+    sboms = _steps_using(_release_job("publish-docker"), SBOM_ACTION)
+    assert len(sboms) == 1, f"publish-docker has no single {SBOM_ACTION} step"
+    version = _step_value(sboms[0], "syft-version") or ""
+    assert SYFT_RELEASE_TAG.fullmatch(version), (
+        f"the SBOM step's syft-version is {version!r}; it must name one exact "
+        "syft release tag such as v1.51.1, not a branch, a range or the "
+        "action's default"
+    )
+    token = _step_value(sboms[0], "github-token")
+    assert token in {'""', "''"}, (
+        f"the SBOM step's github-token is {token!r}; it must be set to an empty "
+        "string, or syft inherits the job's token through the action's inputs"
     )
 
 
