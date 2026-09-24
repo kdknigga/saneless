@@ -209,6 +209,14 @@ exclude = [".planning/**/*.md"]
 # leaves "." to resolve `tests` only.
 search-path = ["src", "."]
 
+# A deprecated API reported as a warning scrolls past unread: pyrefly hides
+# warnings by default, and the `@contextmanager -> Iterator[T]` annotations
+# sat there until someone went looking.  Making this kind an error fails the
+# hook and CI instead, so a new deprecation gets fixed when it lands rather
+# than accumulating.
+[tool.pyrefly.errors]
+deprecated = "error"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [

@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Generator, Iterator
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -345,7 +345,7 @@ def _stop_uvicorn(running: _RunningUvicorn) -> None:
 @contextmanager
 def _serve(
     settings: Settings, scanner: _BrowserTestScanner
-) -> Iterator[_BrowserServer]:
+) -> Generator[_BrowserServer]:
     """
     Run a private app on loopback for the length of one test, then shut it down.
 

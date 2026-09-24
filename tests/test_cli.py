@@ -75,7 +75,7 @@ from saneless.vocabulary import (
 from tests.conftest import StubScannerBackend, build_settings, scan_batch
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Generator
+    from collections.abc import AsyncGenerator, Callable, Generator
 
     from click.testing import Result
 
@@ -2538,7 +2538,7 @@ def _record_sockets(monkeypatch: pytest.MonkeyPatch) -> list[socket.socket]:
 
 
 @contextlib.asynccontextmanager
-async def _refusing_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+async def _refusing_lifespan(_app: FastAPI) -> AsyncGenerator[None]:
     """
     Refuse to start, the way a lifespan with a failed pre-flight would.
 
