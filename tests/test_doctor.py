@@ -82,7 +82,7 @@ if TYPE_CHECKING:
 # Every ExitCode member, written out rather than derived, so that adding a
 # member to the enum fails here as well as in the two doc-truth tests.  D-01
 # maps a red check onto the existing 2 and this is the assertion that says so.
-_EXPECTED_EXIT_CODES = {0, 1, 2, 3, 4, 5, 130}
+_EXPECTED_EXIT_CODES = {0, 1, 2, 3, 4, 5, 6, 7, 130}
 
 # Every call the CLI made to ``require_sane`` during one invocation.  Amendment
 # A-1 is an assertion about a call that must *not* happen, and a silent no-op
@@ -534,10 +534,10 @@ class TestDoctorExitCodes:
         ``doctor`` reuses 2 rather than growing the enum.
 
         The two doc-truth tests at ``tests/test_deployment_config.py`` compare
-        the documented global tables against every member, so a sixth code
-        would be a documentation change in three files and a Phase 28 D-07
-        revision, for a command that reports a list and can only carry one
-        code out of one process anyway.
+        the documented global tables against every member, so a code of
+        ``doctor``'s own would be a documentation change in three files, for a
+        command that reports a list and can only carry one code out of one
+        process anyway.
         """
         assert {int(code) for code in ExitCode} == _EXPECTED_EXIT_CODES
 

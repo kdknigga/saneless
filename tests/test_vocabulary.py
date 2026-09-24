@@ -31,12 +31,14 @@ from saneless.job import JobState as JobJobState
 from saneless.vocabulary import (
     ACTIVE_STATES,
     BUSY_STATES,
+    FALLBACK_NOT_UPLOADED_LINE,
     LOCAL_TIME_FORMAT,
     QUEUE_FULL_JOB_ERROR,
     RESTART_REASON,
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
+    WARNED_UPLOAD_LABEL,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ConnectionStatus,
@@ -57,9 +59,12 @@ from saneless.vocabulary import (
     error_message,
     error_next_step,
     exit_code_for,
+    exit_code_for_outcome,
     flip_answer_label,
+    job_label,
     job_state_for,
     local_time,
+    outcome_line,
     page_counts,
     progress_label,
     rejection_message,
@@ -1357,8 +1362,20 @@ class TestExitCode:
             ("PAPERLESS", 3),
             ("PDF", 4),
             ("UNEXPECTED", 5),
+            ("SAVED_TO_FOLDER", 6),
+            ("UPLOADED_WITH_WARNING", 7),
             ("CANCELLED", 130),
         }
+
+    def test_exit_code_cancelled_stays_last(self) -> None:
+        """
+        The delivered-but-degraded codes sit below 130, which stays last.
+
+        130 is the shell's SIGINT convention rather than a saneless choice, so
+        every code saneless picks for itself is a small integer that comes
+        before it, in the enum and in every table pinned to the enum.
+        """
+        assert list(ExitCode)[-1] is ExitCode.CANCELLED
 
     def test_exit_code_table_covers_every_category(self) -> None:
         """The pinned mapping table names every ErrorCategory member (D-07)."""
@@ -1383,6 +1400,148 @@ class TestExitCode:
         bad = cast("ErrorCategory", "UNRECOGNISED")
         with pytest.raises(AssertionError):
             exit_code_for(bad)
+
+
+_EXIT_CODES_FOR_OUTCOMES: list[tuple[ScanOutcome, str | None, ExitCode]] = [
+    (ScanOutcome.SUCCESS, None, ExitCode.SUCCESS),
+    (ScanOutcome.SUCCESS, "", ExitCode.SUCCESS),
+    (ScanOutcome.SUCCESS, "w", ExitCode.UPLOADED_WITH_WARNING),
+    (ScanOutcome.FALLBACK, None, ExitCode.SAVED_TO_FOLDER),
+    (ScanOutcome.FALLBACK, "", ExitCode.SAVED_TO_FOLDER),
+    (ScanOutcome.FALLBACK, "w", ExitCode.SAVED_TO_FOLDER),
+]
+
+
+class TestExitCodeForOutcome:
+    """exit_code_for_outcome delivered-outcome mapping tests."""
+
+    def test_exit_code_for_outcome_table_covers_every_outcome(self) -> None:
+        """The pinned mapping table names every ScanOutcome member."""
+        assert {outcome for outcome, _, _ in _EXIT_CODES_FOR_OUTCOMES} == set(
+            ScanOutcome
+        )
+
+    @pytest.mark.parametrize(
+        ("outcome", "warning", "expected"), _EXIT_CODES_FOR_OUTCOMES
+    )
+    def test_exit_code_for_outcome_mapping(
+        self, outcome: ScanOutcome, warning: str | None, expected: ExitCode
+    ) -> None:
+        """
+        A delivered document exits 0 only when nothing went wrong on the way.
+
+        An empty warning is no warning.  A FALLBACK exits 6 whether or not it
+        also carries a warning: the missing title, tags and correspondent are
+        the larger problem, and one process can only report one code.
+        """
+        assert exit_code_for_outcome(outcome, warning) is expected
+
+    @pytest.mark.parametrize("outcome", list(ScanOutcome))
+    @pytest.mark.parametrize("warning", [None, "", "w"])
+    def test_exit_code_for_outcome_is_never_a_failure_code(
+        self, outcome: ScanOutcome, warning: str | None
+    ) -> None:
+        """
+        A delivered outcome never borrows a failure code.
+
+        A script that retries on 3 would scan the stack a second time if a
+        document that reached paperless-ngx or its consume folder exited 3.
+        """
+        assert exit_code_for_outcome(outcome, warning) in {
+            ExitCode.SUCCESS,
+            ExitCode.SAVED_TO_FOLDER,
+            ExitCode.UPLOADED_WITH_WARNING,
+        }
+
+    def test_exit_code_for_outcome_raises_on_unrecognised_value(self) -> None:
+        """exit_code_for_outcome raises on a value outside ScanOutcome."""
+        bad = cast("ScanOutcome", "UNRECOGNISED")
+        with pytest.raises(AssertionError):
+            exit_code_for_outcome(bad, None)
+
+
+class TestJobLabel:
+    """job_label history-row label tests."""
+
+    def test_job_label_warned_done(self) -> None:
+        """A DONE job that carries a warning is not labelled "Complete"."""
+        assert job_label(JobState.DONE, "w") == "Uploaded with a warning"
+
+    def test_job_label_warned_done_reads_the_constant(self) -> None:
+        """The warned label is the one module constant, not a second spelling."""
+        assert job_label(JobState.DONE, "w") == WARNED_UPLOAD_LABEL
+        assert WARNED_UPLOAD_LABEL == "Uploaded with a warning"
+
+    @pytest.mark.parametrize("warning", [None, ""])
+    def test_job_label_clean_done(self, warning: str | None) -> None:
+        """A DONE job with no warning, or an empty one, is "Complete"."""
+        assert job_label(JobState.DONE, warning) == "Complete"
+
+    def test_job_label_warned_fallback(self) -> None:
+        """A FALLBACK keeps "Saved to folder" whether or not it has a warning."""
+        assert job_label(JobState.FALLBACK, "w") == "Saved to folder"
+
+    @pytest.mark.parametrize(
+        "state", [state for state in JobState if state is not JobState.DONE]
+    )
+    @pytest.mark.parametrize("warning", [None, "", "w"])
+    def test_job_label_delegates_to_state_label(
+        self, state: JobState, warning: str | None
+    ) -> None:
+        """Every state but a warned DONE is labelled exactly as state_label does."""
+        assert job_label(state, warning) == state_label(state)
+
+    def test_job_label_raises_on_unrecognised_value(self) -> None:
+        """job_label raises on a value outside JobState, as state_label does."""
+        bad = cast("JobState", "UNKNOWN")
+        with pytest.raises(AssertionError):
+            job_label(bad, None)
+
+
+_DELIVERED_OUTCOME_LINES: list[tuple[JobState, str | None, str]] = [
+    (JobState.DONE, None, "Done: T"),
+    (JobState.DONE, "", "Done: T"),
+    (JobState.DONE, "w", "Uploaded with a warning: T"),
+    (JobState.FALLBACK, None, "Saved to folder: T"),
+    (JobState.FALLBACK, "", "Saved to folder: T"),
+    (JobState.FALLBACK, "w", "Saved to folder: T"),
+]
+
+
+class TestOutcomeLine:
+    """outcome_line delivered-outcome headline tests."""
+
+    @pytest.mark.parametrize(("state", "warning", "expected"), _DELIVERED_OUTCOME_LINES)
+    def test_outcome_line_delivered(
+        self, state: JobState, warning: str | None, expected: str
+    ) -> None:
+        """
+        A delivered outcome's line names what happened, then the title.
+
+        Only a clean DONE says "Done".  A warned DONE and a FALLBACK each say
+        in their own words that something went wrong on the way.
+        """
+        assert outcome_line(state, warning, "T") == expected
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            state
+            for state in JobState
+            if state not in {JobState.DONE, JobState.FALLBACK}
+        ],
+    )
+    def test_outcome_line_refuses_undelivered_state(self, state: JobState) -> None:
+        """Only a delivered outcome has an outcome line; the error names the state."""
+        with pytest.raises(ValueError, match=state.value):
+            outcome_line(state, None, "T")
+
+    def test_outcome_line_fallback_not_uploaded_constant(self) -> None:
+        """The line a FALLBACK adds on stderr says what was lost, in fixed words."""
+        assert FALLBACK_NOT_UPLOADED_LINE == (
+            "Not uploaded: saved to the consume folder without its title, tags or "
+            "correspondent"
+        )
 
 
 class TestJobModuleReExports:

@@ -587,7 +587,11 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
     Ctrl-C once uvicorn is running is its graceful stop, exit 0 (D-03). No
     command but ``scan`` builds a PDF, so only ``scan`` has 4; only ``scan``
     and ``serve`` construct a Paperless client, so only they have 3; ``jobs``
-    never touches SANE, so it has no 1.
+    never touches SANE, so it has no 1.  Only ``scan`` delivers a document, so
+    only ``scan`` has 6 (saved to the consume folder) and 7 (uploaded with a
+    warning).  ``serve``'s 3 is a TLS trust store it cannot read when it
+    builds the Paperless client; a malformed Paperless URL never gets that
+    far, because the config load refuses it with a 2.
 
     ``doctor`` has the same four codes as ``jobs``, for three separate reasons.
     No 1: it never fails on SANE at all -- Amendment A-1 turns a missing
@@ -607,7 +611,7 @@ def test_cli_reference_command_exit_codes_are_real() -> None:
             f"{name}: `saneless {command}` documents unknown codes "
             f"{sorted(codes - EXIT_CODES)}"
         )
-    assert _documented_codes(tables["scan"]) == {0, 1, 2, 3, 4, 5, 130}
+    assert _documented_codes(tables["scan"]) == {0, 1, 2, 3, 4, 5, 6, 7, 130}
     assert _documented_codes(tables["devices"]) == {0, 1, 2, 5, 130}
     assert _documented_codes(tables["jobs"]) == {0, 2, 5, 130}
     assert _documented_codes(tables["serve"]) == {0, 2, 3, 5, 130}
