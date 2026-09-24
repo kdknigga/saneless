@@ -604,7 +604,9 @@ class OutputConfig(BaseModel):
     # under tmp_dir, which is disposable scratch space. The data_dir and
     # log_file defaults move together: both follow $XDG_STATE_HOME, computed
     # per instance rather than at import so a changed HOME is honoured.
-    # The Dockerfile's SANELESS_OUTPUT__DATA_DIR still overrides data_dir.
+    # The container image sets XDG_STATE_HOME, so these defaults land in its
+    # volume; an explicit SANELESS_OUTPUT__DATA_DIR or [output] data_dir
+    # still wins.
     data_dir: Path = Field(default_factory=_default_data_dir)
     # These three describe a rotating file, so they apply to one-shot CLI
     # commands only: `saneless serve` is a service, streams its records to

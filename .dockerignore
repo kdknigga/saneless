@@ -1,7 +1,7 @@
 # Docker build context -- an ALLOW-LIST, not a deny-list (D-29, DLVR-06).
 #
 # The `*` below must stay the first line. It excludes the entire working tree;
-# each `!` line under it re-includes exactly one path the wheel build reads.
+# each `!` line under it re-includes exactly one path the image build reads.
 # Move `*` down, or drop it, and every `!` line becomes decoration while the
 # whole working tree is sent to the daemon -- including a real saneless config
 # file with a live paperless-ngx token, which is then recoverable from the
@@ -12,11 +12,10 @@
 # in either one alone cannot leak a secret into a layer; both would have to be
 # wrong at once.
 #
-# README.md and LICENSE are NOT optional. pyproject.toml declares
-# `readme = "README.md"` and the PEP 639 `license-files = ["LICENSE"]`, and
-# `uv build --wheel` fails outright when either file is missing from the
-# context. uv.lock is not read by the wheel build, but it costs nothing and
-# keeps a future `uv sync --locked` in the builder stage possible.
+# None of these is optional. The builder stage runs `uv sync --locked`, which
+# fails outright without uv.lock. pyproject.toml declares
+# `readme = "README.md"` and the PEP 639 `license-files = ["LICENSE"]`, and the
+# project build fails outright when either file is missing from the context.
 #
 # `!src/` re-includes the directory and everything beneath it; `!src/**` is not
 # needed. Pinned by tests/test_deployment_config.py -- nothing else in CI would
