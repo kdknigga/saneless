@@ -123,7 +123,9 @@ install, use that directory instead.
 The `docker` job builds the image from the `Dockerfile` and never pushes it, then
 starts containers from it and runs the smoke checks in `scripts/smoke_image.py`
 against them. The script drives the local `docker` CLI, and Podman's `docker` shim
-works too. The docs build is strict: a broken nav entry, a dead link or a link to an
+works too, provided the image is built in Docker format: Podman's default OCI format
+drops the `HEALTHCHECK`, and the smoke test then refuses the image. Under Podman, build
+with `docker build --format docker -t saneless:ci .` instead. The docs build is strict: a broken nav entry, a dead link or a link to an
 anchor that does not exist fails it. Never add `-q` to that command. Quiet mode hides
 the warnings that strict mode counts, so a quiet strict build exits 0 over a dead
 anchor.

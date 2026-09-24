@@ -6,10 +6,12 @@ Usage::
     uv run --no-project python scripts/smoke_image.py IMAGE [--timeout SECONDS]
 
 Every check starts one or more containers from ``IMAGE`` through the local
-``docker`` CLI (Podman's ``docker`` shim works too) and either passes or raises
-``SmokeFailure`` with the reason. Every check runs whatever an earlier one did,
-so one run reports the whole picture: one line per check, ``ok   <name>`` or
-``FAIL <name>: <reason>``, then exit status 1 if any check failed.
+``docker`` CLI and either passes or raises ``SmokeFailure`` with the reason.
+Podman's ``docker`` shim works too, for an image built with ``--format
+docker``: Podman's default OCI build drops the HEALTHCHECK. Every check runs
+whatever an earlier one did, so one run reports the whole picture: one line
+per check, ``ok   <name>`` or ``FAIL <name>: <reason>``, then exit status 1 if
+any check failed.
 
 To extend the smoke test, write a function that takes an ``Engine`` and append
 a ``Check`` for it to ``CHECKS``. The tuple's order is the order the checks run
@@ -458,15 +460,22 @@ def _podman_health_cmd(engine: Engine) -> str | None:
     be passed to ``run`` verbatim. The probe is still the image's own command;
     nothing here writes one.
 
+    A Podman build in its default OCI format is the other case: Podman
+    discards the HEALTHCHECK at build time, so the config blob has none
+    either. That image cannot pass the check, and waiting out the health
+    deadline on it would only report the engine's banner, so it is refused at
+    once with the way to rebuild it.
+
     Args:
         engine: The Podman engine and the image under test.
 
     Returns:
         The image's HEALTHCHECK test as a JSON array, or ``None`` when Podman
-        already sees it or the image defines none.
+        already sees it.
 
     Raises:
-        SmokeFailure: The image could not be inspected or saved.
+        SmokeFailure: The image could not be inspected or saved, or it
+            carries no HEALTHCHECK at all.
 
     """
     seen = engine.sh(
@@ -485,7 +494,14 @@ def _podman_health_cmd(engine: Engine) -> str | None:
         )
         _require_success(saved, "saving the image to read its healthcheck")
         test = _archived_healthcheck(archive)
-    return json.dumps(test) if test else None
+    if not test:
+        msg = (
+            "the image carries no HEALTHCHECK. A Podman build drops it unless "
+            "the image is built in Docker format: rebuild with "
+            "`docker build --format docker` (or `podman build --format docker`)"
+        )
+        raise SmokeFailure(msg)
+    return json.dumps(test)
 
 
 @contextlib.contextmanager
