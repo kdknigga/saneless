@@ -1381,7 +1381,7 @@ class TestRenderErrorBody:
         then the first entry of a top-level list.
         """
         response = httpx2.Response(400, json=payload)
-        assert _render_error_body(response) == expected
+        assert _render_error_body(response, _MOCK_AUTH) == expected
 
     def test_html_body_is_one_bounded_line(self) -> None:
         """
@@ -1393,7 +1393,7 @@ class TestRenderErrorBody:
         line = "<p>502 Bad Gateway from the reverse proxy</p>\n"
         html = (line * (5000 // len(line) + 1))[:5000]
         response = httpx2.Response(502, text=html)
-        result = _render_error_body(response)
+        result = _render_error_body(response, _MOCK_AUTH)
         assert "\n" not in result
         assert len(result) <= 201
         assert result.endswith("…")
@@ -1401,12 +1401,12 @@ class TestRenderErrorBody:
     def test_empty_body_says_so(self) -> None:
         """An empty body renders as an explicit marker, never an empty string."""
         response = httpx2.Response(500, text="")
-        assert _render_error_body(response) == "(empty response body)"
+        assert _render_error_body(response, _MOCK_AUTH) == "(empty response body)"
 
     def test_multiline_json_detail_body_is_collapsed(self) -> None:
         """No path yields a newline, including JSON-derived text (T-28-24)."""
         response = httpx2.Response(400, json={"detail": "line one\nline two"})
-        assert _render_error_body(response) == "line one line two"
+        assert _render_error_body(response, _MOCK_AUTH) == "line one line two"
 
     def test_full_body_is_logged_at_debug(
         self, caplog: pytest.LogCaptureFixture
@@ -1415,7 +1415,7 @@ class TestRenderErrorBody:
         body = "<html>" + ("x" * 900) + "</html>"
         response = httpx2.Response(502, text=body)
         with caplog.at_level(logging.DEBUG, logger="saneless.paperless"):
-            _render_error_body(response)
+            _render_error_body(response, _MOCK_AUTH)
         debug_messages = [
             record.getMessage()
             for record in caplog.records
@@ -2265,6 +2265,154 @@ class TestThirdPartyTextIsRedacted:
         assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
         assert "refused: Token" in str(exc_info.value)
         _assert_token_absent(token, str(exc_info.value))
+
+
+def _auth_echo(request: httpx2.Request) -> str:
+    """
+    Build the line an auth gateway answers with: the header it refused.
+
+    Args:
+        request: The request the gateway received.
+
+    Returns:
+        A sentence quoting the request's ``Authorization`` header whole.
+
+    """
+    return f"Invalid token header: {request.headers['authorization']}"
+
+
+def _upload_401_json(request: httpx2.Request) -> httpx2.Response:
+    """Refuse an upload with a DRF-style 401 that quotes the header."""
+    return httpx2.Response(401, json={"detail": _auth_echo(request)})
+
+
+def _upload_403_text(request: httpx2.Request) -> httpx2.Response:
+    """Refuse an upload with a plain-text 403 that quotes the header."""
+    return httpx2.Response(403, text=_auth_echo(request))
+
+
+def _upload_redirect(request: httpx2.Request) -> httpx2.Response:
+    """Redirect an upload to a login page whose query carries the token."""
+    token = request.headers["authorization"].split()[-1]
+    return httpx2.Response(
+        302, headers={"location": f"https://sso.example/login?auth={token}"}
+    )
+
+
+def _upload_500_text(request: httpx2.Request) -> httpx2.Response:
+    """Fail an upload with a 5xx page that quotes the header."""
+    return httpx2.Response(500, text=_auth_echo(request))
+
+
+def _poll_401_json(request: httpx2.Request) -> httpx2.Response:
+    """Refuse a task poll with a DRF-style 401 that quotes the header."""
+    return httpx2.Response(401, json={"detail": _auth_echo(request)})
+
+
+def _poll_failure_text(request: httpx2.Request) -> httpx2.Response:
+    """Answer a task poll with a FAILURE whose result quotes the header."""
+    task = {"task_id": "t1", "status": "FAILURE", "result": _auth_echo(request)}
+    return httpx2.Response(200, json=[task])
+
+
+def _tags_403_text(request: httpx2.Request) -> httpx2.Response:
+    """Refuse a tag list with a plain-text 403 that quotes the header."""
+    return httpx2.Response(403, text=_auth_echo(request))
+
+
+# (what the client does, how the server answers it)
+_ECHOING_ANSWERS = [
+    pytest.param("upload", _upload_401_json, id="upload-401-json"),
+    pytest.param("upload", _upload_403_text, id="upload-403-text"),
+    pytest.param("upload", _upload_redirect, id="upload-redirect-location"),
+    pytest.param("upload", _upload_500_text, id="upload-500-text"),
+    pytest.param("poll", _poll_401_json, id="poll-401-json"),
+    pytest.param("poll", _poll_failure_text, id="poll-task-failure"),
+    pytest.param("tags", _tags_403_text, id="tags-403-text"),
+]
+
+
+def _run_operation(client: PaperlessClient, operation: str, pdf: Path) -> None:
+    """
+    Make the one client call a response-text case exercises.
+
+    Args:
+        client: The client under test.
+        operation: ``upload``, ``poll`` or ``tags``.
+        pdf: The PDF an upload sends.
+
+    """
+    match operation:
+        case "upload":
+            client.upload_document(pdf, title="Echo")
+        case "poll":
+            client.poll_task("t1", timeout=5)
+        case _:
+            client.get_tags()
+
+
+class TestResponseTextIsRedacted:
+    """
+    Text the server sends back has the token struck out wherever it is shown.
+
+    A reverse proxy or auth gateway in front of paperless-ngx may answer a
+    refused request by quoting the ``Authorization`` header it refused.  That
+    body becomes the error message -- the job's error, shown on the status
+    page to anyone on the LAN -- and is logged in full at DEBUG.
+    """
+
+    @pytest.mark.parametrize("token", _REDACTED_TOKENS)
+    @pytest.mark.parametrize(("operation", "answer"), _ECHOING_ANSWERS)
+    @pytest.mark.usefixtures("debug_capture")
+    def test_token_quoted_by_the_server_is_struck(
+        self,
+        operation: str,
+        answer: Callable[[httpx2.Request], httpx2.Response],
+        token: str,
+        sample_pdf: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Neither the message nor any log line carries the echoed token."""
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=token,
+            max_retries=1,
+            transport=_make_transport(answer),
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                _run_operation(client, operation, sample_pdf)
+        finally:
+            client.close()
+        message = str(exc_info.value)
+        # The server's text is still shown, with the token replaced.
+        assert "***" in message
+        for text in (message, repr(exc_info.value), caplog.text):
+            _assert_token_absent(token, text)
+
+    @pytest.mark.parametrize("token", _REDACTED_TOKENS)
+    @pytest.mark.usefixtures("debug_capture")
+    def test_full_body_logged_at_debug_is_struck(
+        self, token: str, sample_pdf: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The DEBUG copy of an error body keeps the text but not the token."""
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=token,
+            transport=_make_transport(_upload_403_text),
+        )
+        try:
+            with pytest.raises(PaperlessError):
+                client.upload_document(sample_pdf, title="Echo")
+        finally:
+            client.close()
+        bodies = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.DEBUG
+            and record.getMessage().startswith("Paperless error body")
+        ]
+        assert bodies == ["Paperless error body (403): Invalid token header: Token ***"]
 
 
 _CONFIGURED_HOST = "paperless.test"

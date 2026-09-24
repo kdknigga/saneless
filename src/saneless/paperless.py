@@ -234,7 +234,40 @@ def _is_duplicate_failure(task: dict[str, object], message: str) -> bool:
     return isinstance(data, dict) and "duplicate_of" in data
 
 
-def _one_line_reason(exc: BaseException) -> str:
+def _strike(text: str, token: str) -> str:
+    """
+    Strike the configured token out of text saneless did not write.
+
+    Library text and server text are not under saneless's control.  h11
+    refusing a header value quotes it whole, and a reverse proxy or auth
+    gateway may answer a refused request by quoting the ``Authorization``
+    header.  So every piece of such text the client shows or logs -- an
+    exception's text, a response body at any status, a task's failure text,
+    a redirect target -- goes through here first, before it is cut to length,
+    so no fragment of the token can survive the cut.
+
+    The token is struck both as configured and stripped, since a bytes repr
+    spells out edge whitespace and control characters and so no longer
+    contains the raw form.  The replacement is unanchored: a credential is
+    struck wherever it appears, and over-redacting a diagnostic line costs
+    nothing.  A token shorter than two characters is left alone, because
+    striking a single character would mangle the text and hide no secret.
+
+    Args:
+        text: Third-party text of any shape.
+        token: The configured ``paperless.token``.
+
+    Returns:
+        The text with every occurrence of the token replaced by ``***``.
+
+    """
+    for secret in (token, token.strip()):
+        if len(secret) >= 2:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _one_line_reason(exc: BaseException, token: str) -> str:
     """
     Describe a failure cause as one line for a ``PaperlessError`` message.
 
@@ -247,18 +280,19 @@ def _one_line_reason(exc: BaseException) -> str:
 
     Args:
         exc: The cause.
+        token: The configured token, struck out of the text by ``_strike``.
 
     Returns:
-        A non-empty single line.
+        A non-empty single line with the token struck out.
 
     """
     if isinstance(exc, httpx2.HTTPStatusError):
         response = exc.response
         return (
             f"{response.status_code} {response.reason_phrase}: "
-            f"{_render_error_body(response)}"
+            f"{_render_error_body(response, token)}"
         )
-    return describe(exc)
+    return _strike(describe(exc), token)
 
 
 class _RetryDecision(Enum):
@@ -407,37 +441,42 @@ def _json_error_text(payload: object) -> str | None:
     return text
 
 
-def _render_error_body(response: httpx2.Response) -> str:
+def _render_error_body(response: httpx2.Response, token: str) -> str:
     """
     Reduce a Paperless error response body to one bounded line.
 
-    This is the single body renderer for the client: the upload 4xx and the
-    task poll non-200 both use it.  A DRF JSON error is reduced to its
-    ``detail``, else its first field error, else the first entry of a
-    top-level list; anything else (an HTML proxy page, plain text) is used
-    as it stands.  In every case the whitespace is collapsed, so no newline,
-    tab or other whitespace control character from the upstream can forge an
-    extra CLI line, and the text is cut to ``_MAX_BODY_LINE_CHARS``
-    characters plus an ellipsis, so the job store and the web status area
-    cannot be flooded.  The full body is logged at DEBUG so it stays
-    diagnosable.
+    This is the single body renderer for the client: the upload 4xx and 5xx,
+    the task poll non-200 and the metadata fetch all use it.  A DRF JSON error
+    is reduced to its ``detail``, else its first field error, else the first
+    entry of a top-level list; anything else (an HTML proxy page, plain text)
+    is used as it stands.  In every case the token is struck out first, then
+    the whitespace is collapsed, so no newline, tab or other whitespace
+    control character from the upstream can forge an extra CLI line, and the
+    text is cut to ``_MAX_BODY_LINE_CHARS`` characters plus an ellipsis, so
+    the job store and the web status area cannot be flooded.  The full body,
+    with the token struck out too, is logged at DEBUG so it stays diagnosable.
 
     Args:
         response: The error response.
+        token: The configured token, struck out of the body by ``_strike``.
 
     Returns:
         A non-empty single line; ``(empty response body)`` when the body
         carried nothing.
 
     """
-    logger.debug("Paperless error body (%s): %s", response.status_code, response.text)
+    logger.debug(
+        "Paperless error body (%s): %s",
+        response.status_code,
+        _strike(response.text, token),
+    )
     try:
         text = _json_error_text(response.json())
     except ValueError:
         text = None
     if text is None:
         text = response.text
-    return _bounded_line(text) or _EMPTY_BODY
+    return _bounded_line(_strike(text, token)) or _EMPTY_BODY
 
 
 _USERINFO = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)?.*@", re.DOTALL)
@@ -487,7 +526,7 @@ def _bounded_line(text: str) -> str:
     return line
 
 
-def _not_accepted_message(response: httpx2.Response) -> str:
+def _not_accepted_message(response: httpx2.Response, token: str) -> str:
     """
     Say why a non-2xx upload response that is not a server error is final.
 
@@ -499,16 +538,21 @@ def _not_accepted_message(response: httpx2.Response) -> str:
 
     Args:
         response: The upload response ``raise_for_status`` refused.
+        token: The configured token, struck out of the body and the
+            redirect target by ``_strike``.
 
     Returns:
         A single line naming the status and what to check.
 
     """
     status = f"{response.status_code} {response.reason_phrase}"
-    location = _bounded_line(_without_userinfo(response.headers.get("location", "")))
+    location = _bounded_line(
+        _strike(_without_userinfo(response.headers.get("location", "")), token)
+    )
     if response.is_client_error:
         return (
-            f"Paperless rejected the upload ({status}): {_render_error_body(response)}"
+            f"Paperless rejected the upload ({status}): "
+            f"{_render_error_body(response, token)}"
         )
     if response.is_redirect and location:
         return (
@@ -517,7 +561,7 @@ def _not_accepted_message(response: httpx2.Response) -> str:
         )
     return (
         f"Paperless did not accept the upload ({status}): "
-        f"{_render_error_body(response)}"
+        f"{_render_error_body(response, token)}"
     )
 
 
@@ -701,7 +745,7 @@ class PaperlessClient:
             raise PaperlessError(msg) from exc
         self._consume_dir = consume_dir
         self._max_retries = max_retries
-        # Kept only to strike it out of third-party text; see _reason.
+        # Kept only to strike it out of third-party text; see _strike.
         self._token = token
 
     def upload_document(
@@ -773,7 +817,7 @@ class PaperlessClient:
                         # A 4xx rejection and a redirect (1xx and 3xx too:
                         # raise_for_status refuses every non-2xx) would only be
                         # answered the same way again: no retry, no fallback.
-                        msg = _not_accepted_message(exc.response)
+                        msg = _not_accepted_message(exc.response, self._token)
                         raise PaperlessError(msg) from exc
                     case _RetryDecision.RETRY:
                         last_error = exc
@@ -892,15 +936,8 @@ class PaperlessClient:
         """
         Describe a failure cause in one line, with the configured token struck.
 
-        Library text is not under saneless's control and can quote a request
-        header -- h11 refusing a header value quotes it whole -- so every place
-        the client interpolates an exception's text goes through here.  The
-        token is struck both as configured and stripped, since a bytes repr
-        spells out edge whitespace and control characters and so no longer
-        contains the raw form.  The replacement is unanchored: a credential is
-        struck wherever it appears, and over-redacting a diagnostic line costs
-        nothing.  A token shorter than two characters is left alone, because
-        striking a single character would mangle the line and hide no secret.
+        Every place the client interpolates an exception's text goes through
+        here, and so through ``_strike``.
 
         Args:
             exc: The cause.
@@ -909,11 +946,7 @@ class PaperlessClient:
             The one-line reason, with the token replaced by ``***``.
 
         """
-        reason = _one_line_reason(exc)
-        for secret in (self._token, self._token.strip()):
-            if len(secret) >= 2:
-                reason = reason.replace(secret, "***")
-        return reason
+        return _one_line_reason(exc, self._token)
 
     def _back_off(self, attempt: int, exc: httpx2.HTTPError) -> None:
         """
@@ -1147,7 +1180,8 @@ class PaperlessClient:
         if response.status_code != 200:
             msg = (
                 f"Paperless task poll failed ({response.status_code} "
-                f"{response.reason_phrase}): {_render_error_body(response)}"
+                f"{response.reason_phrase}): "
+                f"{_render_error_body(response, self._token)}"
             )
             raise PaperlessError(msg)
 
@@ -1168,7 +1202,9 @@ class PaperlessClient:
             logger.info("Task %s completed: %s", task_id, status)
             return task
         if status in _TERMINAL_STATUSES:
-            full_failure = " ".join(_failure_message(task).split())
+            full_failure = " ".join(
+                _strike(_failure_message(task), self._token).split()
+            )
             # Bounded like an error body: a failure result can embed a whole
             # OCR or consumer traceback, and this text becomes job.error and
             # the CLI line.  The duplicate check reads the
