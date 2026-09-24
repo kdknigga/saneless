@@ -4148,15 +4148,17 @@ DEPENDABOT_CONFIG = REPO_ROOT / ".github" / "dependabot.yml"
 # The build backend's name, as ``[build-system].requires`` spells it.
 UV_BUILD_NAME = "uv_build"
 
-# A step reference to the action that installs uv on a runner.
-SETUP_UV_USES = re.compile(r"^-\s+uses:\s+astral-sh/setup-uv@")
-# A ``version:`` or ``version-file:`` key inside a step's ``with:`` block --
-# either one overrides the uv version setup-uv would otherwise read from
-# ``pyproject.toml``.
-WITH_VERSION = re.compile(r"^(?P<key>version(?:-file)?):")
+# A step reference to the action that installs uv on a runner, as the step's
+# first key (``- uses:``) or as a later one (``uses:`` below ``- name:``).
+SETUP_UV_USES = re.compile(r"^\s*(?:-\s+)?uses:\s*astral-sh/setup-uv@")
+# The list item that opens a step, and the column its keys sit at.
+STEP_ITEM = re.compile(r"^(?P<dash>\s*)-\s+")
+# The ``with:`` inputs that override the uv version setup-uv would otherwise
+# read from ``pyproject.toml``.
+SETUP_UV_VERSION_INPUTS = frozenset({"version", "version-file"})
 # The setup-uv steps the workflows carry today. Fewer found means the step
 # scanner stopped recognising them, not that the pins went away.
-MINIMUM_SETUP_UV_STEPS = 5
+MINIMUM_SETUP_UV_STEPS = 7
 # The build-backend requirement as the Dockerfile's uv-stage comment quotes it.
 QUOTED_REQUIRES = re.compile(r'requires = \["(?P<spec>uv_build[^"]+)"\]')
 # A build-backend requirement split into its floor and its ceiling.
@@ -4339,34 +4341,85 @@ def _pinned_uv_offenders(required: SpecifierSet) -> list[str]:
     return offenders
 
 
-def _setup_uv_version_overrides() -> tuple[int, list[str]]:
+def _key_column(line: str) -> int:
+    """Return the column a line's key starts at, past any list-item dash."""
+    return len(line) - len(line.lstrip(" -"))
+
+
+def _enclosing_step(lines: list[tuple[int, str]], index: int) -> list[tuple[int, str]]:
+    """
+    Return the step holding ``lines[index]``, its list-item dash blanked.
+
+    The step opens at the nearest list item, at or above the line, whose keys
+    sit in the same column as the line's key, and runs until the next line at
+    or left of that item's dash. The dash is replaced by a space so every key
+    of the step, the first one included, sits at the same indent and can be
+    read with ``_key_mapping``.
+
+    Args:
+        lines: Significant raw lines of one workflow, indentation kept.
+        index: Position of a line inside a step.
+
+    Returns:
+        The step's lines, in order.
+
+    """
+    column = _key_column(lines[index][1])
+    start = index
+    while start > 0:
+        item = STEP_ITEM.match(lines[start][1])
+        if item is not None and _key_column(lines[start][1]) == column:
+            break
+        start -= 1
+    number, opener = lines[start]
+    dash = len(opener) - len(opener.lstrip(" "))
+    step = [(number, f"{opener[:dash]} {opener[dash + 1 :]}")]
+    for later_number, later_line in lines[start + 1 :]:
+        if _indent(later_line) <= dash:
+            break
+        step.append((later_number, later_line))
+    return step
+
+
+def _setup_uv_version_overrides(
+    paths: list[Path] | None = None,
+) -> tuple[int, list[str]]:
     """
     Scan every setup-uv step for an input that overrides ``required-version``.
 
+    A step is found whichever key comes first in it, and its ``with:`` inputs
+    are read in both spellings the workflows use: a block of lines, or a flow
+    mapping on the key's own line.
+
+    Args:
+        paths: Workflow files to scan; every workflow in the repository when
+            omitted.
+
     Returns:
         How many setup-uv steps were found, and one line per ``version:`` or
-        ``version-file:`` input, naming its file and line.
+        ``version-file:`` input, naming its file and the step's line.
 
     """
     sites = 0
     offenders: list[str] = []
-    for path in _workflow_files():
-        name = path.relative_to(REPO_ROOT)
-        lines = _significant_lines(path)
+    for path in _workflow_files() if paths is None else paths:
+        name = path.relative_to(REPO_ROOT) if path.is_relative_to(REPO_ROOT) else path
+        lines = [
+            (number, line)
+            for number, line in _numbered(path)
+            if line.strip() and not _is_comment(line)
+        ]
         for index, (number, line) in enumerate(lines):
             if SETUP_UV_USES.match(line) is None:
                 continue
             sites += 1
-            # The next list item ends the step. Indentation cannot be used as
-            # the terminator: ``_significant_lines`` has already stripped it.
-            for later_number, later_line in lines[index + 1 :]:
-                if later_line.startswith("- "):
-                    break
-                if WITH_VERSION.match(later_line) is not None:
-                    offenders.append(
-                        f"{name}:{later_number}: {later_line} -- the setup-uv "
-                        f"step at line {number} overrides required-version"
-                    )
+            step = _enclosing_step(lines, index)
+            inputs = _key_mapping(step, "with", _key_column(line)) or {}
+            offenders.extend(
+                f"{name}:{number}: the setup-uv step overrides required-version "
+                f"with {key}: {inputs[key]}"
+                for key in sorted(SETUP_UV_VERSION_INPUTS & inputs.keys())
+            )
     return sites, offenders
 
 
@@ -4416,6 +4469,61 @@ def test_every_uv_surface_sits_inside_the_required_version_range() -> None:
         "overrides it, is a toolchain that differs between the image, CI and "
         "local work:\n" + "\n".join(offenders)
     )
+
+
+_SEEDED_SETUP_UV = """\
+name: Seeded
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v1.0.0
+        with: {persist-credentials: false}
+      - name: Set up uv, name first
+        uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v1.0.0
+        with:
+          version: "0.13.0"
+      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v1.0.0
+        with: {enable-cache: false, version: "0.13.0"}
+      - uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v1.0.0
+        with:
+          version-file: uv.lock
+      - with: {version: "0.13.0"}
+        uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v1.0.0
+      - name: Set up uv, reading pyproject.toml
+        # version: "0.13.0" in a comment is not an input
+        uses: astral-sh/setup-uv@0000000000000000000000000000000000000000 # v1.0.0
+        with:
+          enable-cache: false
+      - run: echo version: 0.13.0
+"""
+
+
+def test_the_setup_uv_scanner_sees_every_step_and_input_spelling(
+    tmp_path: Path,
+) -> None:
+    """
+    A version override is found whichever way the step or its inputs are written.
+
+    A step may open with ``name:`` rather than ``uses:``, or even with
+    ``with:``, and ``with:`` may be a flow mapping on one line. Each of those
+    spellings already appears in these workflows, so a scanner that knew only
+    ``- uses:`` followed by a block ``with:`` would let a later step override
+    the one declared uv range without any guard noticing.
+    """
+    seeded = tmp_path / "seeded.yml"
+    seeded.write_text(_SEEDED_SETUP_UV, encoding="utf-8")
+
+    sites, offenders = _setup_uv_version_overrides([seeded])
+
+    assert sites == 5, f"expected five setup-uv steps, found {sites}"
+    assert [offender.split(": ", 1)[0] for offender in offenders] == [
+        f"{seeded}:9",
+        f"{seeded}:12",
+        f"{seeded}:14",
+        f"{seeded}:18",
+    ], offenders
+    assert "version-file: uv.lock" in offenders[2], offenders
 
 
 def test_the_dockerfile_comment_quotes_the_declared_build_specifier() -> None:
