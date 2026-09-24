@@ -1652,13 +1652,25 @@ _UNTAGGED_RELEASE_KEYS = (_IMAGES_KEY, _SUBJECT_NAME_KEY)
 _DIGEST_SEPARATOR = "@"
 
 # The install-from-the-package-index command, assembled from fragments for the
-# same self-scan reason. It matches ``pip`` or ``pipx``, then ``install``, then
-# the project name as a whole name -- not a longer name that starts with it --
-# and ignores case, because the package index does.
+# same self-scan reason. Every spelling that resolves the name on the index
+# counts: ``pip``, ``pip3``, ``pip3.14``, ``python -m pip`` and ``uv pip``
+# with ``install``; ``pipx`` and ``uv tool`` with ``install`` or ``run``; and
+# ``uvx``. Flags may sit between the command and the name (``-U``,
+# ``--upgrade``, ``--force``), the name may be quoted, and it must be the whole
+# name -- not a longer name that starts with it. Case is ignored, because the
+# package index ignores it. An install from the repository names ``git+...``
+# where the project name would be, so it never matches.
 _PIP = "pip"
+_UV = "uv"
 _INSTALL = "install"
 PYPI_INSTALL = re.compile(
-    rf"\b{_PIP}x?\s+{_INSTALL}\s+{_PROJECT_NAME}(?![\w-])", re.IGNORECASE
+    rf"(?<![\w.-])(?:"
+    rf"(?:{_PIP}(?:3(?:\.\d+)?)?|python3?\s+-m\s+{_PIP}|{_UV}\s+{_PIP})"
+    rf"\s+{_INSTALL}"
+    rf"|(?:{_PIP}x|{_UV}\s+tool)\s+(?:{_INSTALL}|run)"
+    rf"|{_UV}x"
+    rf")(?:\s+-{{1,2}}[\w-]+(?:=\S+)?)*\s+['\"]?{_PROJECT_NAME}(?![\w-])",
+    re.IGNORECASE,
 )
 _PYPI_INSTALL_LINE = f"{_PIP} {_INSTALL} {_PROJECT_NAME}"
 _PIPX_INSTALL_LINE = f"{_PIP}x {_INSTALL} {_PROJECT_NAME}"
@@ -1939,25 +1951,49 @@ def test_no_shipped_pip_install_line_uses_the_package_index_before_final() -> No
 def test_the_pip_install_guard_tells_the_index_from_the_repository(
     tmp_path: Path,
 ) -> None:
-    """Index installs and unread files are reported; repository installs are not."""
-    seeded = {
+    """
+    Index installs and unread files are reported; repository installs are not.
+
+    Every command that resolves the name on the index counts, however it is
+    spelled: another pip executable, flags before the name, a quoted name, or
+    one of the uv and pipx commands that run a package without installing it.
+    """
+    name = _PROJECT_NAME
+    repository = f"git+https://github.com/{_IMAGE_OWNER}/{name}"
+    index_installs = {
         "pip.md": f"    {_PYPI_INSTALL_LINE}\n",
         "pipx.md": f"    {_PIPX_INSTALL_LINE}\n",
         "prose.md": f"then retry `{_PYPI_INSTALL_LINE}`.\n",
-        "git-pipx.md": "pipx install git+https://github.com/kdknigga/saneless\n",
-        "git-pip.md": "pip install git+https://github.com/kdknigga/saneless\n",
-        "other.md": f"{_PIPX_INSTALL_LINE}-plugin\n",
+        "pip3.md": f"{_PIP}3 {_INSTALL} {name}\n",
+        "pip3-14.md": f"{_PIP}3.14 {_INSTALL} {name}\n",
+        "upgrade-short.md": f"{_PIP} {_INSTALL} -U {name}\n",
+        "upgrade-long.md": f"{_PIP} {_INSTALL} --upgrade '{name}'\n",
+        "pipx-force.md": f"{_PIP}x {_INSTALL} --force {name}\n",
+        "pipx-run.md": f"{_PIP}x run {name} serve\n",
+        "python-m.md": f"python3 -m {_PIP} {_INSTALL} {name}[web]\n",
+        "uv-pip.md": f"{_UV} {_PIP} {_INSTALL} {name}==0.2.0\n",
+        "uv-tool.md": f"{_UV} tool {_INSTALL} {name}\n",
+        "uv-tool-run.md": f"{_UV} tool run {name}\n",
+        "uvx.md": f"{_UV}x {name} --help\n",
     }
-    for name, text in seeded.items():
-        (tmp_path / name).write_text(text, encoding="utf-8")
+    repository_installs = {
+        "git-pipx.md": f"{_PIP}x {_INSTALL} {repository}\n",
+        "git-pip.md": f"{_PIP} {_INSTALL} {repository}\n",
+        "git-upgrade.md": f"{_PIP} {_INSTALL} --upgrade {repository}\n",
+        "git-uv-tool.md": f"{_UV} tool {_INSTALL} {repository}\n",
+        "git-uvx.md": f"{_UV}x --from {repository} {name}\n",
+        "other.md": f"{_PIPX_INSTALL_LINE}-plugin\n",
+        "longer-command.md": f"my{_PIP} {_INSTALL} {name}\n",
+    }
+    seeded = {**index_installs, **repository_installs}
+    for file_name, text in seeded.items():
+        (tmp_path / file_name).write_text(text, encoding="utf-8")
     (tmp_path / "latin1.md").write_bytes(b"caf\xe9\n")
 
     offenders = _pip_install_offenders([*seeded, "latin1.md", "gone.md"], tmp_path)
 
     assert [entry.split(":", 1)[0] for entry in offenders] == [
-        "pip.md",
-        "pipx.md",
-        "prose.md",
+        *index_installs,
         "latin1.md",
         "gone.md",
     ]
