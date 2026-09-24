@@ -53,7 +53,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          version: "0.12.17"
+          version: "0.12.18"
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -103,7 +103,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          version: "0.12.17"
+          version: "0.12.18"
       - run: uv sync --locked
       # pytest runs with HOME at a fresh empty directory, so a test that reads
       # or writes the real home fails here instead of passing on whatever the
@@ -138,7 +138,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends libsane-dev
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          version: "0.12.17"
+          version: "0.12.18"
       - run: uv sync --locked
       # Installed under the real HOME, into ~/.cache/ms-playwright.
       - run: uv run playwright install --with-deps chromium
