@@ -13,11 +13,17 @@ from __future__ import annotations
 
 import logging
 import threading
+from typing import TYPE_CHECKING, NoReturn
 
+import httpx2
 import pytest
 
 from saneless.exceptions import PaperlessError
+from saneless.paperless import PaperlessClient
 from saneless.web.cache import MetadataCache
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _WAIT_SECONDS = 5.0
 _CACHE_LOGGER = "saneless.web.cache"
@@ -334,10 +340,15 @@ def test_recovered_refresh_replaces_the_last_good_value() -> None:
     assert cache.get("tags") is recovered
 
 
-def test_unexpected_refresh_failure_serves_the_last_good_value_with_a_traceback(
+def test_unexpected_refresh_failure_serves_the_last_good_value_by_class_name(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A failure that is not a Paperless error is served stale and logged with exc_info."""
+    """
+    A failure that is not a Paperless error is served stale, named by class only.
+
+    Its text is not saneless's and may quote a URL or a token, so neither the
+    message nor a traceback is logged.
+    """
     clock = _FakeClock()
     cache = MetadataCache(ttl=60, clock=clock)
     good: _Rows = [{"id": 1, "name": "receipt"}]
@@ -350,8 +361,98 @@ def test_unexpected_refresh_failure_serves_the_last_good_value_with_a_traceback(
     assert served is good
     records = _warnings(caplog)
     assert len(records) == 1
-    assert "surprise" in records[0].getMessage()
-    assert records[0].exc_info is not None
+    assert records[0].getMessage().endswith(": RuntimeError")
+    assert "surprise" not in caplog.text
+    assert records[0].exc_info is None
+
+
+# Text no log record may carry: a stand-in for a configured token, and the
+# userinfo of a URL that third-party exception text might quote.
+_MARKER = "tok-MARKER-9b1e5c"
+_MARKED_TEXT = f"refused: Token {_MARKER} user:pass@paperless.invalid"
+
+
+def _marked_client_fetch() -> _Rows:
+    """
+    Fetch tags through a real client whose token is the marker, and fail.
+
+    The transport raises httpx2's error quoting the token, so what reaches the
+    cache is the ``PaperlessError`` the client itself builds.
+
+    Returns:
+        Never: the fetch always raises.
+
+    """
+
+    def refuse(request: httpx2.Request) -> NoReturn:
+        msg = f"refused: {_MARKER}"
+        raise httpx2.ConnectError(msg, request=request)
+
+    client = PaperlessClient(
+        url="http://paperless.invalid:8000",
+        token=_MARKER,
+        transport=httpx2.MockTransport(refuse),
+    )
+    return client.get_tags()
+
+
+def _foreign_fetch() -> _Rows:
+    """Fail the way no saneless code would, with text quoting the marker."""
+    raise RuntimeError(_MARKED_TEXT)
+
+
+@pytest.mark.parametrize(
+    ("fetch", "cause"),
+    [
+        pytest.param(
+            _marked_client_fetch,
+            "Could not fetch tags from Paperless at http://paperless.invalid:8000",
+            id="paperless-error",
+        ),
+        pytest.param(_foreign_fetch, "RuntimeError", id="other"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("invalidate_during_fetch", "wording"),
+    [
+        pytest.param(False, "for another 60s: ", id="re-armed"),
+        pytest.param(True, "the next request fetches again: ", id="not-re-armed"),
+    ],
+)
+def test_stale_warning_never_carries_marker_text(
+    caplog: pytest.LogCaptureFixture,
+    fetch: Callable[[], _Rows],
+    cause: str,
+    *,
+    invalidate_during_fetch: bool,
+    wording: str,
+) -> None:
+    """
+    Both stale-copy warnings name the cause without the marker or a traceback.
+
+    An invalidate made from inside the fetch runs while the fetch is in
+    flight, which is what stops the re-arm, without a second thread.
+    """
+    clock = _FakeClock()
+    cache = MetadataCache(ttl=60, clock=clock)
+    good: _Rows = [{"id": 1, "name": "receipt"}]
+    cache.set("tags", good)
+    clock.advance(61)
+
+    def failing_fetch() -> _Rows:
+        if invalidate_during_fetch:
+            cache.invalidate("tags")
+        return fetch()
+
+    caplog.set_level(logging.DEBUG)
+    served = cache.get_or_fetch("tags", failing_fetch)
+
+    assert served is good
+    assert _MARKER not in caplog.text
+    assert "user:pass" not in caplog.text
+    [record] = _warnings(caplog)
+    assert record.exc_info is None
+    assert wording + cause in record.getMessage()
 
 
 def test_failure_without_a_last_good_value_propagates_and_stores_nothing(
