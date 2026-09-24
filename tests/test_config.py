@@ -1277,6 +1277,36 @@ log_level = "TRACE"
             "unable to parse string as an integer"
         )
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("p@ss!", id="symbol-inside-and-trailing"),
+            pytest.param("ab-", id="trailing-dash"),
+            pytest.param("(tok)", id="parenthesised"),
+        ],
+    )
+    def test_redact_input_strikes_a_value_edged_with_punctuation(
+        self, value: str
+    ) -> None:
+        """
+        A short value that starts or ends with punctuation is still struck.
+
+        A word boundary needs a word character on one side of it, so a value
+        whose first or last character is punctuation has no boundary to find
+        where it meets a space or a bracket. Such a value used to survive in
+        the message whole: exactly the short, symbol-heavy kind a password is.
+        """
+        hostile: ErrorDetails = {
+            "type": "string_type",
+            "loc": ("paperless", "token"),
+            "msg": f"Input should be a valid string (got {value})",
+            "input": value,
+        }
+        lines = config_mod._render_error_lines([hostile], {})
+        assert len(lines) == 1
+        assert value not in lines[0]
+        assert lines[0] == f"[paperless] token: {_REDACTED_MESSAGE}"
+
     def test_a_nested_input_value_is_struck_from_the_message(self) -> None:
         """
         A secret inside a non-string input is struck out too (WR-01).
@@ -1389,6 +1419,285 @@ def no_discovered_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     return tmp_path
+
+
+_TOKEN_RULE = "must contain only visible ASCII characters"
+"""The start of the refusal every malformed token gets, whatever is wrong."""
+
+_URL_SHAPE_RULE = "address that names a host"
+"""The tail of the refusal a scheme-less, non-HTTP or host-less URL gets."""
+
+_URL_USERINFO_RULE = "put the paperless-ngx API token in paperless.token"
+"""The part of the userinfo refusal that says where a credential belongs."""
+
+
+def _only_body_line(err: ConfigError) -> str:
+    """
+    Return the one rendered line under the header, asserting there is one.
+
+    Args:
+        err: The load's ConfigError.
+
+    Returns:
+        The single body line, leading indentation included.
+
+    """
+    body = _error_lines(err)[1:]
+    assert len(body) == 1, str(err)
+    return body[0]
+
+
+class TestPaperlessTokenAndUrlAtLoad:
+    """
+    ``paperless.token`` and ``paperless.url`` are checked where they are loaded.
+
+    Both are typed by hand or pasted from a secret file, and both used to be
+    kept exactly as typed: a trailing newline from a secret file ended up in
+    every request's Authorization header, and ``paperless:8000`` failed only
+    when the first scan tried to upload. The load is the one place a bad value
+    can be refused before any request exists, so that is where it happens --
+    with a message that names the key and never the value.
+    """
+
+    @pytest.mark.parametrize(
+        ("toml_value", "raw_value"),
+        [
+            pytest.param('"ab c"', "ab c", id="inner-space"),
+            pytest.param('"ab\\u0001c"', "ab\x01c", id="control-character"),
+            pytest.param('"t\\u00f6k"', "tök", id="non-ascii"),
+        ],
+    )
+    def test_a_token_with_a_bad_character_inside_is_refused(
+        self, tmp_config_dir: Path, toml_value: str, raw_value: str
+    ) -> None:
+        """Stripping cannot fix a character inside the token, so it is refused."""
+        err = _load_error(
+            tmp_config_dir / "bad_token.toml",
+            f"[paperless]\ntoken = {toml_value}\n",
+        )
+        line = _only_body_line(err)
+        assert line.startswith("  [paperless] token: ")
+        assert _TOKEN_RULE in line
+        TestConfigErrorsNeverEchoValues._assert_value_absent(err, raw_value)
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_a_token_with_a_bad_character_from_the_environment_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same rule holds for ``SANELESS_PAPERLESS__TOKEN``."""
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", "ab c")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        line = _env_line(exc_info.value, "SANELESS_PAPERLESS__TOKEN")
+        assert _TOKEN_RULE in line
+        TestConfigErrorsNeverEchoValues._assert_value_absent(exc_info.value, "ab c")
+
+    @pytest.mark.parametrize(
+        ("toml_value", "expected"),
+        [
+            pytest.param('"tok\\r\\n"', "tok", id="crlf"),
+            pytest.param('" tok "', "tok", id="spaces"),
+            pytest.param('"\\ttok\\n"', "tok", id="tab-and-newline"),
+        ],
+    )
+    def test_whitespace_around_a_token_is_stripped(
+        self, tmp_config_dir: Path, toml_value: str, expected: str
+    ) -> None:
+        """A secret file's trailing newline is not part of the token."""
+        config_file = tmp_config_dir / "padded_token.toml"
+        config_file.write_text(f"[paperless]\ntoken = {toml_value}\n")
+        settings = load_settings(config_path=str(config_file))
+        assert settings.paperless.token.get_secret_value() == expected
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_whitespace_around_an_environment_token_is_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A CRLF ``.env`` line loads the same token as a clean one."""
+        monkeypatch.setenv("SANELESS_PAPERLESS__TOKEN", "tok\r\n")
+        settings = load_settings()
+        assert settings.paperless.token.get_secret_value() == "tok"
+
+    def test_a_directly_built_token_is_stripped_too(self) -> None:
+        """A token string handed straight to the model is stripped the same way."""
+        config = PaperlessConfig(token=" tok\n")
+        assert config.token.get_secret_value() == "tok"
+
+    @pytest.mark.parametrize(
+        "toml_value",
+        [
+            pytest.param('""', id="empty"),
+            pytest.param('"changeme"', id="placeholder"),
+            pytest.param('"  "', id="blank"),
+        ],
+    )
+    def test_an_unset_token_still_loads(
+        self, tmp_config_dir: Path, toml_value: str
+    ) -> None:
+        """
+        An unset or stand-in token is not a load error.
+
+        ``serve`` must still start so its status strip can say the token is
+        missing; refusing it here would turn that explanation into a crash.
+        """
+        config_file = tmp_config_dir / "unset_token.toml"
+        config_file.write_text(f"[paperless]\ntoken = {toml_value}\n")
+        settings = load_settings(config_path=str(config_file))
+        assert is_placeholder_token(settings.paperless.token.get_secret_value())
+
+    @pytest.mark.parametrize(
+        ("toml_value", "raw_value", "rule"),
+        [
+            pytest.param(
+                '"paperless:8000"', "paperless:8000", _URL_SHAPE_RULE, id="no-scheme"
+            ),
+            pytest.param('"ftp://h"', "ftp://h", _URL_SHAPE_RULE, id="ftp-scheme"),
+            pytest.param('"https://"', "https://", _URL_SHAPE_RULE, id="no-host"),
+            pytest.param(
+                '"http://h:abc"', "http://h:abc", "is not a valid URL", id="bad-port"
+            ),
+            pytest.param(
+                '"http://pa perless:8000"',
+                "http://pa perless:8000",
+                "must contain only visible ASCII characters",
+                id="inner-space",
+            ),
+            pytest.param(
+                '"http://b\\u00fccher.lan"',
+                "http://bücher.lan",
+                "xn--",
+                id="non-ascii-host",
+            ),
+        ],
+    )
+    def test_a_malformed_url_is_refused(
+        self, tmp_config_dir: Path, toml_value: str, raw_value: str, rule: str
+    ) -> None:
+        """A URL no request could use is refused at load, not at first upload."""
+        err = _load_error(
+            tmp_config_dir / "bad_url.toml",
+            f"[paperless]\nurl = {toml_value}\n",
+        )
+        line = _only_body_line(err)
+        assert line.startswith("  [paperless] url: ")
+        assert rule in line
+        TestConfigErrorsNeverEchoValues._assert_value_absent(err, raw_value)
+
+    @pytest.mark.parametrize(
+        "url", ["http://", "https://", "paperless:8000", "ftp://paperless"]
+    )
+    def test_a_misshapen_url_gets_the_whole_url_rule(
+        self, tmp_config_dir: Path, url: str
+    ) -> None:
+        """
+        A likely wrong URL gets the rule in full, not a rule with a hole in it.
+
+        The input is struck wherever it stands alone in the message, so a rule
+        that spelled out ``http://`` or an example address would lose those
+        very words for the operator who typed them.
+        """
+        err = _load_error(
+            tmp_config_dir / "host_less_url.toml",
+            f'[paperless]\nurl = "{url}"\n',
+        )
+        assert _only_body_line(err) == (
+            "  [paperless] url: Value error, must be an http or https address "
+            "that names a host"
+        )
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_a_malformed_url_from_the_environment_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same rule holds for ``SANELESS_PAPERLESS__URL``."""
+        monkeypatch.setenv("SANELESS_PAPERLESS__URL", "paperless:8000")
+        with pytest.raises(ConfigError) as exc_info:
+            load_settings()
+        line = _env_line(exc_info.value, "SANELESS_PAPERLESS__URL")
+        assert _URL_SHAPE_RULE in line
+        TestConfigErrorsNeverEchoValues._assert_value_absent(
+            exc_info.value, "paperless:8000"
+        )
+
+    def test_an_invalid_url_error_never_carries_the_parser_text(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        The URL parser's own complaint is never shown: it can quote a password.
+
+        With an ``@`` after a ``/`` the parser reads ``scanner:hunter`` as a
+        host and port and reports ``Invalid port: 'hunter'`` -- half of the
+        password, in the one message an operator pastes into a bug report.
+        """
+        err = _load_error(
+            tmp_config_dir / "invalid_url.toml",
+            '[paperless]\nurl = "http://scanner:hunter/2secret@host"\n',
+        )
+        line = _only_body_line(err)
+        assert line.startswith("  [paperless] url: ")
+        assert "is not a valid URL" in line
+        for fragment in ("hunter", "2secret"):
+            TestConfigErrorsNeverEchoValues._assert_value_absent(err, fragment)
+
+    def test_a_userinfo_url_is_refused_and_points_at_the_token(
+        self, tmp_config_dir: Path
+    ) -> None:
+        """
+        A ``user:password@`` in the URL is refused, never sent as credentials.
+
+        The client would otherwise send it as Basic auth in place of the
+        token, and the password would ride along wherever the URL is shown.
+        """
+        err = _load_error(
+            tmp_config_dir / "userinfo_url.toml",
+            '[paperless]\nurl = "http://u:pw-7f3a@paperless:8000"\n',
+        )
+        line = _only_body_line(err)
+        assert line.startswith("  [paperless] url: ")
+        assert _URL_USERINFO_RULE in line
+        TestConfigErrorsNeverEchoValues._assert_value_absent(err, "pw-7f3a")
+
+    def test_a_userinfo_url_never_reaches_repr_or_json(self) -> None:
+        """
+        No settings object can hold a URL with a password in it.
+
+        ``repr`` and ``model_dump_json`` show ``url`` in the clear -- only the
+        token is masked -- so the guarantee is that such a URL cannot load.
+        """
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(paperless=PaperlessConfig(url="http://u:pw-7f3a@paperless:8000"))
+        [error] = exc_info.value.errors()
+        assert error["loc"] == ("url",)
+        assert _URL_USERINFO_RULE in error["msg"]
+
+    @pytest.mark.parametrize(
+        ("toml_value", "expected"),
+        [
+            pytest.param('" http://h \\n"', "http://h", id="padded"),
+            pytest.param('""', "", id="unset"),
+            pytest.param('"   "', "", id="blank-is-unset"),
+            pytest.param(
+                '"HTTP://Host:8000/sub/"', "HTTP://Host:8000/sub/", id="upper-case"
+            ),
+        ],
+    )
+    def test_a_usable_url_loads_stripped(
+        self, tmp_config_dir: Path, toml_value: str, expected: str
+    ) -> None:
+        """Surrounding whitespace goes, the rest is kept as written."""
+        config_file = tmp_config_dir / "good_url.toml"
+        config_file.write_text(f"[paperless]\nurl = {toml_value}\n")
+        settings = load_settings(config_path=str(config_file))
+        assert settings.paperless.url == expected
+
+    @pytest.mark.usefixtures("no_discovered_config")
+    def test_whitespace_around_an_environment_url_is_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``SANELESS_PAPERLESS__URL`` is stripped like the file value."""
+        monkeypatch.setenv("SANELESS_PAPERLESS__URL", " http://h \n")
+        settings = load_settings()
+        assert settings.paperless.url == "http://h"
 
 
 class _SearchDirs(NamedTuple):

@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal, Protocol, cast
 
+import httpx2
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -430,8 +431,20 @@ def is_placeholder_token(value: str) -> bool:
     return not normalised or normalised in PLACEHOLDER_TOKENS
 
 
+# Visible ASCII: what an HTTP header value or a URL can carry without quoting.
+_VISIBLE_ASCII: Final = range(0x21, 0x7F)
+
+
 class PaperlessConfig(BaseModel):
-    """Paperless-ngx API connection settings."""
+    """
+    Paperless-ngx API connection settings.
+
+    Surrounding whitespace is stripped from ``url`` and ``token`` as they load.
+    A set token must then be visible ASCII only, and a set URL must be an
+    ``http``/``https`` address that names a host and carries no user name or
+    password; anything else is refused with a message naming the key, never
+    the value.
+    """
 
     # A mistyped ``tokne`` used to leave the token unset without a word.
     model_config = ConfigDict(extra="forbid")
@@ -443,6 +456,116 @@ class PaperlessConfig(BaseModel):
     token: SecretStr = SecretStr("")
     # None means the fallback copy is disabled.
     consume_dir: Path | None = None
+
+    @field_validator("token", mode="before")
+    @classmethod
+    def _normalise_token(cls, value: object) -> object:
+        """
+        Strip the token and refuse one no Authorization header can carry.
+
+        A secret file ends in a newline and a ``.env`` written on Windows ends
+        its lines in CRLF, so the edges are stripped: that is never part of
+        a paperless-ngx token. What is left must be visible ASCII. A space,
+        control character or non-ASCII character inside it cannot be a real
+        token, and a line break would split the request header, so it is
+        refused here, before any request exists.
+
+        An empty token and the placeholder literals pass through: they mean
+        "not configured yet", which ``serve`` starts with and explains.
+
+        The message names the rule, never the value: the renderer re-raises
+        a ``ValidationError`` unchained and redacts its input, and nothing
+        here may undo that.
+
+        A ``SecretStr`` is passed through as it is. A file or the environment
+        always supplies a ``str``; a ``SecretStr`` comes only from code that
+        built it, and unwrapping it here would add a secret-unwrapping site to
+        this module, which has none.
+
+        Args:
+            value: The raw ``token`` input.
+
+        Returns:
+            The stripped string for pydantic to wrap, else the input unchanged
+            -- a ``SecretStr`` as it is, anything else for pydantic's own type
+            check.
+
+        Raises:
+            ValueError: The stripped token holds a character outside visible
+                ASCII.
+
+        """
+        if isinstance(value, str):
+            value = value.strip()
+            if any(ord(char) not in _VISIBLE_ASCII for char in value):
+                msg = (
+                    "must contain only visible ASCII characters: no spaces, "
+                    "line breaks or control characters inside it"
+                )
+                raise ValueError(msg)
+        return value
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def _normalise_url(cls, value: object) -> object:
+        """
+        Strip the URL and refuse one no upload could use.
+
+        Parsed with ``httpx2.URL``, the client's own parser, so what loads is
+        exactly what the client will accept. A scheme-less ``paperless:8000``
+        parses with ``paperless`` as its scheme and no host, so it is caught
+        by the scheme-and-host rule rather than failing at the first upload.
+        A ``user:password@`` would be sent as credentials in place of the
+        token and shown wherever the URL is, so it is refused and the message
+        says where a credential belongs. An empty or blank value means
+        "unset" and loads.
+
+        The parser's own complaint is never used: for
+        ``http://user:pass/word@host`` it reads ``user:pass`` as host and
+        port and quotes the password back. Every message here is fixed text.
+
+        Args:
+            value: The raw ``url`` input.
+
+        Returns:
+            The stripped URL, ``""`` when unset, else the input unchanged for
+            pydantic's own type check.
+
+        Raises:
+            ValueError: The URL holds whitespace, a control or non-ASCII
+                character, does not parse, is not ``http``/``https`` with a
+                host, or carries a user name or password.
+
+        """
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        if not value:
+            return value
+        if any(ord(char) not in _VISIBLE_ASCII for char in value):
+            msg = (
+                "must contain only visible ASCII characters; write an "
+                "international host name in its xn-- form"
+            )
+            raise ValueError(msg)
+        try:
+            parsed = httpx2.URL(value)
+        except httpx2.InvalidURL:
+            msg = "is not a valid URL"
+            raise ValueError(msg) from None
+        if parsed.scheme not in {"http", "https"} or not parsed.host:
+            # No URL in the text: the renderer strikes the input wherever it
+            # stands alone, so "http://" or an example such as
+            # "paperless:8000" would lose words exactly when typed as the value.
+            msg = "must be an http or https address that names a host"
+            raise ValueError(msg)
+        if parsed.userinfo:
+            msg = (
+                "must not contain a user name or password; put the "
+                "paperless-ngx API token in paperless.token"
+            )
+            raise ValueError(msg)
+        return value
 
     @field_validator("consume_dir", mode="before")
     @classmethod
@@ -1328,16 +1451,20 @@ def _redact_input(text: str, value: object) -> str:
     credential and replacing them would mangle ordinary words inside an
     upstream message.
 
-    Occurrences are struck at word boundaries, not anywhere they appear. An
-    unanchored replacement corrupts pydantic's own prose whenever a short
-    value happens to sit inside one of its words: ``web_port = "in"`` turned
-    "a valid integer" into "a valid <value omitted>teger", losing the one
-    sentence that says what was wanted, for the most ordinary kind of typo.
+    An occurrence is struck when no word character touches either edge of
+    it, not anywhere it appears. An unanchored replacement corrupts
+    pydantic's own prose whenever a short value happens to sit inside one of
+    its words: ``web_port = "in"`` turned "a valid integer" into "a valid
+    <value omitted>teger", losing the one sentence that says what was
+    wanted, for the most ordinary kind of typo. Looking at the neighbouring
+    characters rather than for a word boundary also catches a value that
+    starts or ends with punctuation -- ``p@ss!``, ``(tok)`` -- which has no
+    boundary to find where it meets a space or a bracket.
 
     A long value can still survive that, if upstream joined it to its own
-    words with no separator for a boundary to find. Splicing there would
-    corrupt the prose and leaving it would echo the input, so the whole
-    message is withheld instead -- see ``_MIN_WITHHELD_INPUT`` for why length
+    words with no separator between them. Splicing there would corrupt the
+    prose and leaving it would echo the input, so the whole message is
+    withheld instead -- see ``_MIN_WITHHELD_INPUT`` for why length
     is what separates that case from ordinary coincidence. Between explaining
     and not echoing, not echoing wins; the section, the key, the did-you-mean
     hint and the valid keys are this module's own words and survive either
@@ -1355,7 +1482,7 @@ def _redact_input(text: str, value: object) -> str:
     for secret in _input_texts(value):
         if len(secret) < _MIN_REDACTED_INPUT:
             continue
-        text = re.sub(rf"\b{re.escape(secret)}\b", _REDACTED, text)
+        text = re.sub(rf"(?<!\w){re.escape(secret)}(?!\w)", _REDACTED, text)
         if secret in text and len(secret) >= _MIN_WITHHELD_INPUT:
             return _REDACTED
     return text
