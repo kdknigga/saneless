@@ -14,6 +14,14 @@ package name for each distro is listed in the [System Requirements table in
 The project uses `uv` for packaging and environments. Nothing here uses `pip`,
 `poetry` or `conda`.
 
+Your `uv` must be a 0.12.x release, 0.12.18 or newer. `pyproject.toml` declares that
+range as `required-version` under `[tool.uv]`, and uv refuses to run `uv sync`,
+`uv run` or `uv lock` outside it. The git hooks run through `uv run`, so an older uv
+blocks commits too. `uv --version` shows what you have. If it is outside the range,
+run `uv self update 0.12.18`, or upgrade through whatever installed uv. Name the
+version: a bare `uv self update` installs the newest uv, which can already be past
+the 0.12 series.
+
 ## Setting up
 
 ```bash
