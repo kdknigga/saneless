@@ -49,9 +49,9 @@ The citation guard holds every source, template, style and script file under
 they might otherwise point at do not ship with the product.
 
 The Phase 35 tests hold the declared ``>=`` floors to the versions ``uv.lock``
-resolves, and hold the ``anyio`` ceiling to its declaration. Phase 36 made the
-container install a hash-checked export of the lock, so the floors no longer
-decide what ships; the published wheel's metadata still carries them, so they
+resolves, and hold the ``anyio`` ceiling to its declaration. The container
+builds its environment with ``uv sync --locked`` in the builder stage, so the
+floors no longer decide what ships; the published wheel's metadata still carries them, so they
 remain the only thing a downstream non-lock install obeys (DEP-12, DEP-13,
 D-09, D-10, D-11, D-17).
 
@@ -84,6 +84,7 @@ import sys
 # name. It also reads `project.version` for the published-image guard.
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1914,10 +1915,16 @@ FORBIDDEN_CONTEXT_PATHS = (
     "tests",
 )
 
-# Every entry the wheel build reads. ``uv.lock`` is deliberately absent: the
-# build succeeds without it, so requiring it here would assert a convenience
-# rather than a contract.
-REQUIRED_CONTEXT_PATHS = ("!src/", "!pyproject.toml", "!README.md", "!LICENSE")
+# Every entry the image build reads. ``uv.lock`` is a contract, not a
+# convenience: the builder stage runs ``uv sync --locked``, which fails outright
+# when the lock is absent from the context.
+REQUIRED_CONTEXT_PATHS = (
+    "!src/",
+    "!pyproject.toml",
+    "!uv.lock",
+    "!README.md",
+    "!LICENSE",
+)
 
 
 def _significant_lines(path: Path) -> list[tuple[int, str]]:
@@ -1947,7 +1954,7 @@ def test_dockerignore_starts_with_a_deny_everything_line() -> None:
     ``.dockerignore``'s first meaningful line is exactly ``*`` (D-29, D-30).
 
     The file is an allow-list: ``*`` excludes the whole working tree and each
-    ``!`` line below re-includes one path the wheel build needs. That only
+    ``!`` line below re-includes one path the image build needs. That only
     holds while ``*`` comes first. Move it down, or drop it, and every ``!``
     line below it becomes decoration while the working tree -- including a real
     ``saneless.toml`` with a live paperless-ngx token -- rides into a build layer
@@ -1986,14 +1993,15 @@ def test_dockerignore_never_reincludes_a_secret_or_test_path() -> None:
     )
 
 
-def test_dockerignore_reincludes_everything_the_wheel_build_needs() -> None:
+def test_dockerignore_reincludes_everything_the_build_needs() -> None:
     """
-    The allow-list re-includes every input ``uv build --wheel`` actually reads.
+    The allow-list re-includes every input the image build actually reads.
 
-    Two of these are live traps rather than conveniences. ``pyproject.toml``
-    declares ``readme = "README.md"`` and the PEP 639
-    ``license-files = ["LICENSE"]``; excluding either file makes the wheel
-    build **fail**, not merely produce a thinner wheel. An over-tightened
+    None of these is a convenience. The builder stage runs
+    ``uv sync --locked``, which refuses to run without ``uv.lock``.
+    ``pyproject.toml`` declares ``readme = "README.md"`` and the PEP 639
+    ``license-files = ["LICENSE"]``; excluding either file makes the project
+    build **fail**, not merely produce a thinner package. An over-tightened
     allow-list therefore breaks the image build rather than degrading it
     quietly, which is the better failure -- but only if it is caught here
     first.
@@ -2002,10 +2010,10 @@ def test_dockerignore_reincludes_everything_the_wheel_build_needs() -> None:
     name = DOCKERIGNORE.relative_to(REPO_ROOT)
     missing = [entry for entry in REQUIRED_CONTEXT_PATHS if entry not in lines]
     assert not missing, (
-        f"{name} does not re-include {missing}. README.md and LICENSE are not "
-        "optional: pyproject.toml's readme and license-files keys each make "
-        "`uv build --wheel` fail when the named file is absent from the "
-        "context"
+        f"{name} does not re-include {missing}. None of them is optional: "
+        "`uv sync --locked` fails without uv.lock, and pyproject.toml's readme "
+        "and license-files keys each make the project build fail when the "
+        "named file is absent from the context"
     )
 
 
@@ -2070,7 +2078,7 @@ UV_IMAGE = "ghcr.io/astral-sh/uv"
 # Spellings of the superuser a ``USER`` instruction can carry.
 ROOT_USERS = frozenset({"root", "0", "0:0", "root:root"})
 
-WHEEL_BUILD_INPUTS = ("pyproject.toml", "uv.lock", "README.md", "LICENSE")
+BUILD_INPUTS = ("pyproject.toml", "uv.lock", "README.md", "LICENSE")
 
 
 def test_dockerfile_pins_every_base_image_by_digest() -> None:
@@ -2139,9 +2147,13 @@ def test_dockerfile_gets_uv_from_a_named_from_stage() -> None:
     )
 
 
-def test_dockerfile_copies_only_the_wheel_build_inputs() -> None:
+def test_dockerfile_copies_only_the_build_inputs() -> None:
     """
     The builder stage copies named paths, never the whole working tree (D-29).
+
+    ``uv sync --locked`` reads exactly these: the project metadata, the lock it
+    verifies every artifact against, the two files the metadata names, and the
+    package sources.
 
     This is the second of the two independent build-context gates, the first
     being the ``.dockerignore`` allow-list. Copying the entire context sweeps
@@ -2161,8 +2173,11 @@ def test_dockerfile_copies_only_the_wheel_build_inputs() -> None:
         + "\n".join(offenders)
     )
     copied = " ".join(line for _, line in lines if line.upper().startswith("COPY"))
-    missing = [entry for entry in WHEEL_BUILD_INPUTS if entry not in copied]
-    assert not missing, f"{name} has no COPY line naming {missing}"
+    missing = [entry for entry in BUILD_INPUTS if entry not in copied]
+    assert not missing, (
+        f"{name} has no COPY line naming {missing}; `uv sync --locked` in the "
+        "builder stage cannot build the project without them"
+    )
     assert "src" in copied.split(), (
         f"{name} has no COPY line naming the `src` package directory"
     )
@@ -2260,6 +2275,295 @@ def test_dockerfile_sets_a_workdir_in_the_runtime_stage() -> None:
         f"runtime stage begins at line {max(froms)}, so the runtime stage "
         "still starts in /"
     )
+
+
+# The stage that compiles, the finished environment it hands over, and the
+# one command that both hash-checks and installs every dependency.
+BUILDER_STAGE = "builder"
+VENV_DIR = "/opt/venv"
+LOCKED_SYNC = "uv sync --locked"
+
+# Build tooling the runtime stage must never carry. ``/uv`` is the binary's
+# path on a copy line; ``uv sync`` is the command itself.
+RUNTIME_BUILD_TOOLS = ("gcc", "libc6-dev", "libsane-dev", "/uv", "uv sync")
+
+# Tokens that must appear nowhere in the file's instructions. The HTTP client
+# existed only for the healthcheck, and the data-dir variable overrode an
+# operator's own ``[output] data_dir``.
+FORBIDDEN_DOCKERFILE_TOKENS = ("curl", "SANELESS_OUTPUT__DATA_DIR")
+
+# The SANE backends the image enables, in the order dll.conf lists them.
+IMAGE_SANE_BACKENDS = ["net", "escl"]
+DLL_CONF_WRITE = re.compile(r"printf\s+'(?P<body>[^']*)'\s*>\s*/etc/sane\.d/dll\.conf")
+
+# What the runtime stage must do, each paired with the words an offender
+# message uses when it does not.
+RUNTIME_REQUIREMENTS = (
+    (
+        re.compile(rf"^COPY\s+--from={BUILDER_STAGE}\s+{VENV_DIR}\s"),
+        f"copy the finished {VENV_DIR} from the {BUILDER_STAGE} stage",
+    ),
+    (
+        re.compile(r"^ENV\b.*\bXDG_STATE_HOME=/var/lib(?:\s|$)"),
+        "set `ENV XDG_STATE_HOME=/var/lib`",
+    ),
+    (re.compile(r"^RUN\b.*\bpip uninstall\b"), "uninstall pip"),
+    (
+        re.compile(r"^RUN\b.*\brm\b.*\s/etc/sane\.d/dll\.d/"),
+        "empty /etc/sane.d/dll.d/, where a package could re-add backends",
+    ),
+    (
+        re.compile(r'^HEALTHCHECK\b.*\s--start-period=\S+.*\sCMD\s+\["python",'),
+        "run an exec-form `python` HEALTHCHECK with --start-period",
+    ),
+)
+
+
+def _dockerfile_stages(
+    lines: list[tuple[int, str]],
+) -> list[tuple[str | None, list[tuple[int, str]]]]:
+    """
+    Split Dockerfile lines into stages of whole instructions.
+
+    Continuation lines are folded into the instruction they continue, so a
+    ``RUN`` or ``HEALTHCHECK`` wrapped with trailing backslashes is read as
+    one piece of text, numbered by its first line.
+
+    Args:
+        lines: ``(line number, stripped line)`` pairs with comments removed,
+            as ``_significant_lines`` returns them.
+
+    Returns:
+        One ``(stage name, instructions)`` pair per ``FROM``, in file order.
+        The name is ``None`` for a stage with no ``AS``.
+
+    """
+    instructions: list[tuple[int, str]] = []
+    for number, line in lines:
+        if instructions and instructions[-1][1].endswith("\\"):
+            start, text = instructions[-1]
+            instructions[-1] = (start, f"{text} {line}")
+        else:
+            instructions.append((number, line))
+
+    stages: list[tuple[str | None, list[tuple[int, str]]]] = []
+    for number, text in instructions:
+        if FROM_LINE.match(text) is not None:
+            named = FROM_STAGE.match(text)
+            stages.append((named.group("stage") if named else None, []))
+        if stages:
+            stages[-1][1].append((number, text))
+    return stages
+
+
+def _runtime_stage_offenders(runtime: list[tuple[int, str]]) -> list[str]:
+    """
+    Return every way the final stage falls short of a curated runtime.
+
+    Args:
+        runtime: The final stage's instructions, as ``_dockerfile_stages``
+            returns them.
+
+    Returns:
+        One message per missing requirement or leaked build tool.
+
+    """
+    offenders = [
+        f"the runtime stage does not {what}"
+        for pattern, what in RUNTIME_REQUIREMENTS
+        if not any(pattern.search(text) for _, text in runtime)
+    ]
+    offenders.extend(
+        f"line {number}: the runtime stage carries build tooling {tool!r}: {text}"
+        for number, text in runtime
+        for tool in RUNTIME_BUILD_TOOLS
+        if tool in text
+    )
+    writes = [
+        (number, match.group("body"))
+        for number, text in runtime
+        for match in [DLL_CONF_WRITE.search(text)]
+        if match is not None
+    ]
+    if not writes:
+        offenders.append("the runtime stage never writes /etc/sane.d/dll.conf")
+    for number, body in writes:
+        backends = [entry.strip() for entry in body.split("\\n") if entry.strip()]
+        if backends != IMAGE_SANE_BACKENDS:
+            offenders.append(
+                f"line {number}: dll.conf enables {backends}, not exactly "
+                f"{IMAGE_SANE_BACKENDS}"
+            )
+    return offenders
+
+
+def _builder_stage_offenders(builder: list[tuple[int, str]]) -> list[str]:
+    """
+    Return every way the builder stage falls short of a locked, finished venv.
+
+    Args:
+        builder: The builder stage's instructions.
+
+    Returns:
+        One message per missing or malformed ``uv sync --locked``.
+
+    """
+    syncs = [
+        (number, text)
+        for number, text in builder
+        if text.startswith("RUN") and LOCKED_SYNC in text
+    ]
+    offenders: list[str] = []
+    if len(syncs) < 2:
+        offenders.append(
+            f"the {BUILDER_STAGE} stage runs `{LOCKED_SYNC}` {len(syncs)} time(s), "
+            "not twice (build backend first, then the project)"
+        )
+    if not any("--group build" in text for _, text in syncs):
+        offenders.append(
+            f"no `{LOCKED_SYNC}` in the {BUILDER_STAGE} stage installs "
+            "`--group build`, so python-sane has no hash-checked backend to "
+            "build against"
+        )
+    offenders.extend(
+        f"line {number}: `{LOCKED_SYNC}` without --no-editable leaves the venv "
+        f"pointing back into the {BUILDER_STAGE} stage's source tree: {text}"
+        for number, text in syncs
+        if "--no-editable" not in text
+    )
+    return offenders
+
+
+def _dockerfile_runtime_offenders(lines: list[tuple[int, str]]) -> list[str]:
+    """
+    Return every departure from a builder-built venv and a curated runtime.
+
+    Args:
+        lines: ``(line number, stripped line)`` pairs with comments removed.
+
+    Returns:
+        One message per offence; empty when the file holds every invariant.
+
+    """
+    stages = _dockerfile_stages(lines)
+    offenders = [
+        f"line {number}: {token!r} is back in the image: {text}"
+        for _, stage in stages
+        for number, text in stage
+        for token in FORBIDDEN_DOCKERFILE_TOKENS
+        if token in text
+    ]
+    builders = [stage for name, stage in stages if name == BUILDER_STAGE]
+    if not builders:
+        offenders.append(f"there is no `FROM ... AS {BUILDER_STAGE}` stage")
+    if len(stages) < 2 or stages[-1][0] is not None:
+        offenders.append("there is no unnamed final runtime stage")
+        return offenders
+    for builder in builders:
+        offenders.extend(_builder_stage_offenders(builder))
+    offenders.extend(_runtime_stage_offenders(stages[-1][1]))
+    return offenders
+
+
+def test_dockerfile_runtime_stage_receives_a_finished_locked_venv() -> None:
+    """
+    The runtime image is a finished venv on a curated base, and nothing more.
+
+    Every dependency byte is hash-checked by ``uv sync --locked`` in the
+    builder stage, python-sane's build backend included, and compilation
+    happens only there. The runtime stage copies the finished ``/opt/venv``
+    and carries no compiler, headers, uv, pip or HTTP client that a
+    ``docker exec`` could turn into an installer. It enables exactly the
+    ``net`` and ``escl`` SANE backends, because the stock list probes about
+    eighty and the first device enumeration paid for every one of them. It
+    sets ``XDG_STATE_HOME`` rather than the data-dir variable, so a mounted
+    ``saneless.toml``'s ``[output] data_dir`` takes effect, and its
+    healthcheck is a Python probe with a start period.
+
+    This reads the file. That the built image holds these properties is
+    proven separately, by building and running it.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    lines = _significant_lines(DOCKERFILE)
+    assert lines, f"{name} has no meaningful lines at all"
+    offenders = _dockerfile_runtime_offenders(lines)
+    assert not offenders, (
+        f"{name} departs from the builder-built venv and curated runtime:\n"
+        + "\n".join(offenders)
+    )
+
+
+# The target shape in miniature, so each seeded break below is one edit away
+# from a file the guard accepts.
+_SEEDED_DOCKERFILE = """\
+FROM uv-image AS uv
+FROM base AS builder
+RUN apt-get update && apt-get install -y gcc libc6-dev libsane-dev
+COPY --from=uv /uv /usr/local/bin/uv
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-default-groups --group build --no-install-project --no-editable
+COPY src ./src
+RUN uv sync --locked --no-default-groups --no-editable
+FROM base
+RUN apt-get install -y libsane1 \\
+    && printf 'net\\nescl\\n' > /etc/sane.d/dll.conf \\
+    && rm -rf /etc/sane.d/dll.d/* \\
+    && python -m pip uninstall -y pip
+COPY --from=builder /opt/venv /opt/venv
+ENV XDG_STATE_HOME=/var/lib
+HEALTHCHECK --interval=30s --start-period=30s \\
+    CMD ["python", "-c", "probe"]
+"""
+
+
+def test_the_runtime_guard_accepts_the_target_shape(tmp_path: Path) -> None:
+    """The runtime-invariant guard passes a file holding every invariant."""
+    seeded = tmp_path / "Dockerfile"
+    seeded.write_text(_SEEDED_DOCKERFILE, encoding="utf-8")
+    assert _dockerfile_runtime_offenders(_significant_lines(seeded)) == []
+
+
+@pytest.mark.parametrize(
+    ("before", "after", "named"),
+    [
+        (
+            "ENV XDG_STATE_HOME=/var/lib",
+            "ENV SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless",
+            "XDG_STATE_HOME",
+        ),
+        (
+            "ENV XDG_STATE_HOME=/var/lib",
+            "ENV SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless",
+            "SANELESS_OUTPUT__DATA_DIR",
+        ),
+        (
+            'CMD ["python", "-c", "probe"]',
+            "CMD curl -f http://localhost:8080/health || exit 1",
+            "curl",
+        ),
+        ("--interval=30s --start-period=30s", "--interval=30s", "--start-period"),
+        ("'net\\nescl\\n'", "'net\\nescl\\nepson2\\n'", "dll.conf"),
+        ("install -y libsane1", "install -y libsane1 gcc", "gcc"),
+        ("&& rm -rf /etc/sane.d/dll.d/* ", "", "dll.d"),
+        ("&& python -m pip uninstall -y pip", "&& true", "pip"),
+        (
+            "--from=builder /opt/venv /opt/venv",
+            "--from=builder /dist /dist",
+            "/opt/venv",
+        ),
+        ("--group build --no-install-project", "--no-install-project", "--group build"),
+        ("--no-default-groups --no-editable", "--no-default-groups", "--no-editable"),
+    ],
+)
+def test_the_runtime_guard_reports_a_seeded_break(
+    tmp_path: Path, before: str, after: str, named: str
+) -> None:
+    """Each broken invariant yields an offender naming what broke."""
+    assert before in _SEEDED_DOCKERFILE, f"the seed no longer contains {before!r}"
+    seeded = tmp_path / "Dockerfile"
+    seeded.write_text(_SEEDED_DOCKERFILE.replace(before, after), encoding="utf-8")
+    offenders = _dockerfile_runtime_offenders(_significant_lines(seeded))
+    assert any(named in offender for offender in offenders), offenders
 
 
 # ---------------------------------------------------------------------------
@@ -2542,8 +2846,9 @@ def test_no_doc_page_documents_usb_passthrough_into_a_container() -> None:
 
     PROJECT.md constrains this project to need no ``--privileged`` flag,
     because USB device access is handled by the ``saned`` server rather than by
-    the saneless container. A container reaches a scanner over the SANE network
-    protocol, always -- including a ``saned`` running on its own host.
+    the saneless container. A container reaches a scanner over the network --
+    ``saned`` over SANE's own protocol, including a ``saned`` on its own host,
+    or an eSCL device directly -- and never over the USB bus.
 
     Documenting a device mapping as an "advanced" option would add a fourth
     deployment shape that contradicts that constraint, has never been tested
@@ -3340,8 +3645,8 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
     """
     Every declared ``>=`` floor equals the version ``uv.lock`` resolves for it.
 
-    The container is no longer the surface at risk here -- it installs a
-    hash-checked export of the lock -- but the published wheel's metadata
+    The container is no longer the surface at risk here -- its builder stage
+    runs ``uv sync --locked`` -- but the published wheel's metadata
     carries these floors verbatim, so they are what a downstream installer
     resolves against. A floor left below the locked
     version therefore admits into a fresh install the very tree this project
@@ -3418,11 +3723,172 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
         ) + "\n".join(corrections)
 
     assert not offenders, (
-        f"a declared floor and {UV_LOCK.name} disagree. The container installs "
-        "a hash-checked export of the lock, but the published wheel's metadata "
+        f"a declared floor and {UV_LOCK.name} disagree. The container runs "
+        "`uv sync --locked` in its builder stage, but the published wheel's metadata "
         "carries these floors, so a floor below the locked version is the only "
         "thing standing between a downstream fresh install and the tree this "
         "project already upgraded away from:\n" + "\n".join(offenders) + remedy
+    )
+
+
+# python-sane publishes an sdist and no wheel, so installing it runs a build
+# backend. These name the three links that make that backend come from the
+# lock: isolation off for the package, the group holding the backend, and the
+# backend itself.
+SDIST_ONLY_PACKAGE = "python-sane"
+BUILD_GROUP = "build"
+BUILD_BACKEND = "setuptools"
+
+
+def _build_backend_offenders(
+    pyproject: dict[str, Any], lock: dict[str, Any]
+) -> list[str]:
+    """
+    Return every broken link between python-sane and a hash-checked backend.
+
+    ``uv.lock`` does not lock build dependencies, and a build constraint pins
+    a version without checking a hash. The backend is therefore declared as a
+    dependency group, installed from the lock like any other package, and
+    python-sane is built against that installed copy with isolation off.
+
+    Args:
+        pyproject: ``pyproject.toml``, parsed.
+        lock: ``uv.lock``, parsed.
+
+    Returns:
+        One message per missing link; empty when the chain is whole.
+
+    """
+    uv_settings = pyproject.get("tool", {}).get("uv", {})
+    offenders: list[str] = []
+    if SDIST_ONLY_PACKAGE not in uv_settings.get("no-build-isolation-package", []):
+        offenders.append(
+            f"[tool.uv].no-build-isolation-package does not list "
+            f"{SDIST_ONLY_PACKAGE}, so uv builds it in an isolated environment "
+            f"whose {BUILD_BACKEND} is resolved at build time and never "
+            "hash-checked"
+        )
+    if BUILD_GROUP not in uv_settings.get("default-groups", []):
+        offenders.append(
+            f"[tool.uv].default-groups does not include {BUILD_GROUP!r}, so a "
+            f"plain `uv sync` has no {BUILD_BACKEND} to build "
+            f"{SDIST_ONLY_PACKAGE} against"
+        )
+    declared = pyproject.get("dependency-groups", {}).get(BUILD_GROUP, [])
+    names = {
+        _canonical_name(match.group("name"))
+        for spec in declared
+        if isinstance(spec, str)
+        for match in [_CONSTRAINT_NAME.match(spec)]
+        if match is not None
+    }
+    if BUILD_BACKEND not in names:
+        offenders.append(
+            f"[dependency-groups].{BUILD_GROUP} does not declare {BUILD_BACKEND}"
+        )
+    entries = [
+        package
+        for package in lock.get("package", [])
+        if _canonical_name(package.get("name", "")) == BUILD_BACKEND
+    ]
+    if len(entries) != 1:
+        offenders.append(
+            f"uv.lock has {len(entries)} [[package]] entries for {BUILD_BACKEND}, "
+            "not exactly one"
+        )
+    for entry in entries:
+        sdist_hash = entry.get("sdist", {}).get("hash", "")
+        wheel_hashes = [wheel.get("hash", "") for wheel in entry.get("wheels", [])]
+        if not sdist_hash.startswith("sha256:"):
+            offenders.append(f"uv.lock records no sdist sha256 for {BUILD_BACKEND}")
+        if not wheel_hashes or not all(
+            digest.startswith("sha256:") for digest in wheel_hashes
+        ):
+            offenders.append(
+                f"uv.lock records no sha256 for every {BUILD_BACKEND} wheel"
+            )
+    return offenders
+
+
+def test_python_sanes_build_backend_comes_from_the_lock_hash_checked() -> None:
+    """
+    python-sane's build backend comes from the lock, hash-checked.
+
+    python-sane ships only an sdist, so every install compiles it, and the
+    backend that compiles it is code run with the builder's privileges. Left
+    to build isolation, uv resolves that backend fresh at build time from an
+    open-ended requirement and checks no hash. The chain that closes the gap
+    has four links -- isolation off for python-sane, a ``build`` group in the
+    default groups, that group declaring setuptools, and a setuptools entry in
+    ``uv.lock`` with sha256 digests -- and removing any one reopens it.
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    lock = tomllib.loads(UV_LOCK.read_text(encoding="utf-8"))
+    offenders = _build_backend_offenders(pyproject, lock)
+    assert not offenders, (
+        f"{SDIST_ONLY_PACKAGE}'s build backend is not locked and hash-checked:\n"
+        + "\n".join(offenders)
+    )
+
+
+def _seeded_build_backend_chain() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a parsed pyproject and lock holding every link of the chain."""
+    pyproject: dict[str, Any] = {
+        "tool": {
+            "uv": {
+                "no-build-isolation-package": [SDIST_ONLY_PACKAGE],
+                "default-groups": ["dev", BUILD_GROUP],
+            }
+        },
+        "dependency-groups": {BUILD_GROUP: [f"{BUILD_BACKEND}>=84.0.0"]},
+    }
+    lock: dict[str, Any] = {
+        "package": [
+            {
+                "name": BUILD_BACKEND,
+                "version": "84.0.0",
+                "sdist": {"hash": "sha256:" + "0" * 64},
+                "wheels": [{"hash": "sha256:" + "1" * 64}],
+            }
+        ]
+    }
+    return pyproject, lock
+
+
+def test_the_build_backend_guard_accepts_the_whole_chain() -> None:
+    """The build-backend guard passes a chain with every link in place."""
+    pyproject, lock = _seeded_build_backend_chain()
+    assert _build_backend_offenders(pyproject, lock) == []
+
+
+def test_the_build_backend_guard_reports_isolation_left_on() -> None:
+    """Dropping python-sane from the no-isolation list is reported."""
+    pyproject, lock = _seeded_build_backend_chain()
+    pyproject["tool"]["uv"]["no-build-isolation-package"] = []
+    offenders = _build_backend_offenders(pyproject, lock)
+    assert any("no-build-isolation-package" in item for item in offenders), offenders
+
+
+def test_the_build_backend_guard_reports_a_backend_without_hashes() -> None:
+    """A setuptools lock entry stripped of its digests is reported twice."""
+    pyproject, lock = _seeded_build_backend_chain()
+    entry = lock["package"][0]
+    entry["sdist"] = {}
+    entry["wheels"] = [{"url": "https://example.invalid/setuptools.whl"}]
+    offenders = _build_backend_offenders(pyproject, lock)
+    assert any("sdist sha256" in item for item in offenders), offenders
+    assert any("wheel" in item for item in offenders), offenders
+
+
+def test_the_build_backend_guard_reports_a_missing_group() -> None:
+    """A build group left out of the defaults, and left empty, is reported."""
+    pyproject, lock = _seeded_build_backend_chain()
+    pyproject["tool"]["uv"]["default-groups"] = ["dev"]
+    pyproject["dependency-groups"][BUILD_GROUP] = []
+    offenders = _build_backend_offenders(pyproject, lock)
+    assert any("default-groups" in item for item in offenders), offenders
+    assert any(f"does not declare {BUILD_BACKEND}" in item for item in offenders), (
+        offenders
     )
 
 
