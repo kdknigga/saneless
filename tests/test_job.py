@@ -821,9 +821,10 @@ class TestMigrationLadder:
         """
         A file that is not SQLite raises StorageError naming the path (D-07).
 
-        sqlite3 raises ``DatabaseError: file is not a database`` at the WAL
-        pragma; the CLI guard maps StorageError to exit 2 by type, so the raw
-        sqlite3 error must not escape as an unexpected error.
+        sqlite3 raises ``DatabaseError: file is not a database`` at the first
+        statement that reads the file; the CLI guard maps StorageError to exit
+        2 by type, so the raw sqlite3 error must not escape as an unexpected
+        error.
         """
         db_file = tmp_path / "jobs.db"
         db_file.write_bytes(b"this is not a database\n" * 64)
