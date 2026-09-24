@@ -51,9 +51,11 @@ volumes:
 
 The fallback activates only when **all** of these conditions are true:
 
-1. The API upload fails in one of the ways listed above -- a connection refused or reset, a timeout, a reverse proxy closing the connection, or a server error -- or `paperless.url` is malformed, with no usable `http://` or `https://` scheme.
-2. All attempts are exhausted. A malformed URL is the exception: it is not retried, because retrying cannot help, but it still falls back so the scan is not lost.
+1. The API upload fails in one of the ways listed above -- a connection refused or reset, a timeout, a reverse proxy closing the connection, or a server error.
+2. All attempts are exhausted.
 3. A `consume_dir` is configured (non-empty string).
+
+**A configuration problem never falls back either.** A `paperless.url` without an `http://` or `https://` scheme and a host, or a `paperless.token` with a space, line break or control character inside it, is refused when the config loads, so saneless does not run at all (exit 2). An empty `paperless.url` loads, because it means "not set yet", but a scan that reaches the upload then fails at once as a configuration error: it is not retried, nothing is copied to the consume directory, and the PDF is kept in `failed/` as described below. The consume directory stands in for paperless-ngx while paperless-ngx is away; it is not a way to run saneless with no paperless-ngx address at all.
 
 **A rejected or redirected upload never falls back.** When paperless-ngx answers with a 4xx -- a bad token, or a field it refuses, such as an invalid title -- the upload is not retried and nothing is copied to the consume directory. The scan fails at once with Paperless's reason, because the same request would only be rejected again. A redirect (a 3xx) is treated the same way: it almost always means `paperless.url` points at the wrong address, such as an `http://` URL behind a proxy that redirects to `https://`, so the scan fails at once and the error names where the upload was redirected to.
 
@@ -87,7 +89,7 @@ This is a deliberate trade-off: saving the document without metadata is better t
 
 ## How the Job Reports It
 
-**The job status distinguishes the two paths.** A scan that fell back to the consume directory ends in the `FALLBACK` state -- terminal, and distinct from both `DONE` and `ERROR`. It is labelled **Saved to folder** everywhere a job state is rendered:
+**A web scan's job status distinguishes the two paths.** A scan that fell back to the consume directory ends in the `FALLBACK` state -- terminal, and distinct from both `DONE` and `ERROR`. It is labelled **Saved to folder** everywhere a job state is rendered:
 
 - The web UI status area shows `Saved to folder: <title>` in amber, visually distinct from the green Complete and the red Failed.
 - The job history table renders the same amber label in its status column.
@@ -95,6 +97,8 @@ This is a deliberate trade-off: saving the document without metadata is better t
 - `saneless jobs --json` reports `"state": "FALLBACK"` and `"outcome": "FALLBACK"`. The JSON output is deliberately not humanised: it stays the raw enum value, so scripts can compare against it.
 
 So the job history does mark which documents arrived without metadata. You no longer have to spot them from the paperless-ngx side.
+
+**A CLI scan reports it on the terminal instead.** `saneless scan` does not write to the job store, so its scans never appear in the job history or in `saneless jobs`. A CLI scan that fell back prints `Saved to folder: <title>` on stdout, then two lines on stderr -- `Not uploaded: saved to the consume folder without its title, tags or correspondent`, and `Warning: ` followed by the sentence quoted below -- and exits with code 6. A script should treat exit 6 as "delivered, but fix the connection": the document is in paperless-ngx's hands, so scanning the stack again would only file it twice. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md#saved-to-the-consume-folder-exit-6).
 
 A job also carries a `warning` field, which the status area prints beneath the status line when it is set and `saneless jobs --json` reports as `"warning"`. Two situations fill it in.
 
@@ -104,4 +108,4 @@ A consume-directory fallback records where the file went and what that route cos
 
 The `FALLBACK` state says the document took the other route; the warning says what that route cost. The metadata consequence described under Limitations above is therefore also stated per job, on the job itself, rather than only in this document.
 
-The second case is an ADF duplex scan whose front and back page counts did not match, which records the two counts and notes that partial PDFs were saved.
+The second case is a scan that was uploaded but with something missing or split: a sheet the scanner could not read and skipped, or a manual duplex scan whose front and back page counts did not match, uploaded as two documents. That job ends `DONE`, but it is not shown as a plain success: the status area, the job history and `saneless scan` all label it **Uploaded with a warning**, in amber, with the warning sentence beneath it (on stderr, for the CLI, which exits 7). `saneless jobs --json` keeps `"state": "DONE"` and carries the sentence in `"warning"`.

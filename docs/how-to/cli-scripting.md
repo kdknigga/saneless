@@ -82,6 +82,11 @@ fi
 
 ### Job history JSON
 
+`saneless jobs` lists the scans the web UI ran, from the job database the server keeps. A
+`saneless scan` run is not recorded there: it reports through its own output and exit code (see
+[Exit codes](#exit-codes)), so a script that runs `saneless scan` should check that, not
+`saneless jobs`.
+
 ```bash
 saneless jobs --json --limit 5
 ```
@@ -114,7 +119,10 @@ view prints ("Complete", "Failed", "Saved to folder", "Cancelled") never appear 
 about something odd that did not fail the scan, or `null`. A job whose `state`
 is `FALLBACK` was scanned and saved, but paperless-ngx did not accept it over
 the API, so the PDF went to the consume directory and its title, tags and
-correspondent were not applied.
+correspondent were not applied. A job whose `state` is `DONE` and whose
+`warning` is set was uploaded with a warning -- a sheet the scanner skipped, or
+a manual duplex scan uploaded as two documents -- and the table view labels it
+"Uploaded with a warning" rather than "Complete".
 
 ## Exit codes
 
@@ -178,21 +186,27 @@ paperless-ngx restart. Use the web server's `/health` endpoint for that.
 
 ```bash
 #!/bin/bash
-if saneless scan --profile default --title "Automated Scan"; then
-  echo "Scan uploaded successfully"
-else
-  exit_code=$?
-  case $exit_code in
-    1) echo "Scan failed -- check scanner connection" ;;
-    2) echo "Configuration error -- check profile name" ;;
-    3) echo "Upload failed -- check paperless-ngx connection" ;;
-    4) echo "PDF assembly failed -- check disk space and the output directory" ;;
-    5) echo "Unexpected error -- see the log file and report a bug" ;;
-    130) echo "Cancelled" ;;
-  esac
-  exit $exit_code
-fi
+saneless scan --profile default --title "Automated Scan"
+exit_code=$?
+case $exit_code in
+  0) echo "Scan uploaded successfully" ;;
+  1) echo "Scan failed -- check scanner connection" ;;
+  2) echo "Configuration error -- check the profile name and the config" ;;
+  3) echo "Upload failed -- check paperless-ngx connection" ;;
+  4) echo "PDF assembly failed -- check disk space and the output directory" ;;
+  5) echo "Unexpected error -- see the log file and report a bug" ;;
+  6) echo "Saved to the consume folder without its title, tags or correspondent -- do not rescan; fix the paperless-ngx connection" ;;
+  7) echo "Uploaded with a warning -- check the document in paperless-ngx (see stderr)" ;;
+  130) echo "Cancelled" ;;
+esac
+exit $exit_code
 ```
+
+Only exit 0 is a clean success. Exits 6 and 7 both mean the document was delivered, so the
+script must not scan the stack again on either, but neither is a success to ignore: 6 means
+every scan is going to the consume folder until the connection to paperless-ngx is fixed, and
+7 means a document needs checking. `saneless scan` is not recorded in the job history, so its
+exit code and stderr are the only report a script gets.
 
 ### Checking readiness before a scan
 

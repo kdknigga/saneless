@@ -14,7 +14,7 @@ In a shell, `echo $?` right after the command prints its exit code.
 |---|---|---|
 | 0 | The command succeeded | -- |
 | 1 | The scanner failed, or the scan produced no usable pages | [Scanner errors](#scanner-errors-exit-1) |
-| 2 | saneless could not start: configuration, profile or setup | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
+| 2 | saneless could not start: configuration, profile or setup; or `paperless.url` is not set when a scan uploads | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
 | 3 | paperless-ngx could not be reached or rejected the upload | [Paperless errors](#paperless-errors-exit-3) |
 | 4 | The scanned pages could not be written as a PDF | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
 | 5 | An error saneless did not anticipate: a bug | [Unexpected errors](#unexpected-errors-exit-5) |
@@ -125,6 +125,28 @@ Other causes of exit 2, each on one line:
   that saneless can read and write it and its directory, and that the file really is saneless's
   job database. If it is damaged, move it aside: saneless then starts with an empty job history,
   and the moved file is kept for inspection or restoring.
+- **`paperless.url` or `paperless.token` refused.** Spaces and line breaks around either value
+  are ignored. What is left of `paperless.url` must be empty, or an `http://` or `https://`
+  address that names a host and holds no user name or password. What is left of
+  `paperless.token` must be visible ASCII, with no spaces, line breaks or control characters
+  inside it. A value that breaks these rules is refused when the config loads, so every command
+  that reads the config exits 2 and `serve` does not start. The line names the key and the rule,
+  never the value, for example `[paperless] token: Value error, must contain only visible ASCII
+  characters: no spaces, line breaks or control characters inside it`. See
+  [`[paperless]`](../reference/configuration.md#paperless).
+- **`paperless.url` not set.** An empty `paperless.url` loads, so `serve` can start and show what
+  is missing, but a scan fails when it reaches the upload, with a line saying `paperless.url is
+  not set, or has no http or https scheme`. It is not retried, and nothing is copied to the
+  consume folder even when one is configured: the PDF is kept in `failed/` in the data directory
+  and the line ends with its path. Set the URL, then upload the kept PDF yourself or scan again.
+
+**If an earlier version of saneless ever showed your API token in an error, rotate the token.**
+Earlier versions sent a token with a trailing space or line break -- easy to get from a secret
+file or a `.env` file with Windows line endings -- exactly as written, and the request then failed
+with an error that quoted the token. That error could be printed, logged and stored on the job,
+where the job history shows it. saneless now ignores those characters and never quotes the token, but it
+does not rewrite job records or logs written before. Generate a new API token in paperless-ngx and
+put it in `paperless.token`, so the copy left behind no longer works.
 
 ## python-sane is not installed (exit 2)
 
@@ -146,7 +168,9 @@ The line starts with `Paperless error:`.
 - **Unreachable.** saneless tries the upload three times, with a growing pause between attempts,
   when the connection is refused or reset, times out, is closed by a reverse proxy, or
   paperless-ngx answers with a server error. If every attempt fails and a consume directory is
-  configured, the PDF is saved there instead. Without one, the scan fails. Check that
+  configured, the PDF is saved there instead and the scan exits 6, not 3 -- see
+  [Saved to the consume folder](#saved-to-the-consume-folder-exit-6). Without one, the scan
+  fails. Check that
   `paperless.url` is reachable from where saneless runs. A `https://` certificate that this
   machine does not trust also arrives here, reported as unreachable in both the log and the web
   UI -- see **TLS certificate not trusted** below before you go looking at the network.
@@ -156,10 +180,15 @@ The line starts with `Paperless error:`.
   and the scan exits 3 -- but only without a consume directory. A certificate that cannot be
   verified is classified as unreachable, so the upload is retried, the retries are exhausted, and
   with a consume directory configured the PDF is saved there instead: the scan then ends
-  `FALLBACK`, shown as **Saved to folder**, and the command exits 0. That is the dangerous case
-  rather than the benign one -- scans appear to keep succeeding into a folder nobody is watching,
-  so a TLS misconfiguration can run unnoticed indefinitely. Watch for `FALLBACK` /
-  **Saved to folder** in `saneless jobs`.
+  `FALLBACK`, shown as **Saved to folder**, and `saneless scan` prints `Saved to folder: <title>`
+  on stdout, the `Not uploaded: ...` line and the warning on stderr, and exits 6 (see
+  [Saved to the consume folder](#saved-to-the-consume-folder-exit-6)). That is the dangerous case
+  rather than the benign one -- every scan still delivers a document, but into a folder that
+  applies none of its title, tags or correspondent, so a TLS misconfiguration can run unnoticed
+  for a long time. Watch for it where each kind of scan reports: for `saneless scan`, exit 6 and
+  the stderr lines, which a script should treat as a problem to fix rather than a success; for a
+  web scan, **Saved to folder** in the status area and the job history (`saneless jobs` lists
+  web scans only, because a CLI scan is not recorded in the job store).
   **The same failure looks different in the web UI.** The status strip and
   `GET /api/paperless/test` report a bare `unreachable` with no TLS text anywhere, because a
   certificate that cannot be verified means the connection never established, and saneless
@@ -183,10 +212,10 @@ The line starts with `Paperless error:`.
   file is missing, which gives the container a directory.
   Do not turn certificate verification off to make this go away: saneless sends the Paperless API
   token on every request, and an unverified connection hands that token to anyone in the path.
-- **Malformed URL.** A `paperless.url` without a usable `http://` or `https://` scheme is not
-  retried, because retrying cannot help. With a consume directory configured the scan is still
-  saved there, so it does not fail, but every scan goes to the folder and the log says the URL
-  cannot be used. Fix the URL in the config.
+- **Malformed or unset URL.** This is a configuration error (exit 2), not a Paperless error,
+  and it is never retried and never saved to the consume folder. See
+  **`paperless.url` or `paperless.token` refused** and **`paperless.url` not set** under
+  [Configuration errors](#configuration-errors-exit-2).
 - **Upload rejected.** paperless-ngx answered with a 4xx, such as a bad API token or a field it
   refuses. The line gives Paperless's own reason. A rejected upload is never retried and never
   falls back to the consume directory; fix what the reason names and scan again.
@@ -253,7 +282,7 @@ again. The warning is one of these:
   those sheets.
 - **Page count mismatch.** A manual duplex scan got a different number of fronts from backs, so
   saneless could not interleave them. It uploaded the fronts and the backs as two separate
-  documents, the second with `(backs)` after the title. In paperless-ngx, check both documents
+  documents, with `(fronts)` and `(backs)` after the title. In paperless-ngx, check both documents
   and look for a sheet that fed twice or not at all.
 
 A run that was saved to the consume folder *and* carries a warning exits 6, not 7: the missing
@@ -290,6 +319,7 @@ stream, printed directly above the line, and no hint is offered. Collect it from
 or `journalctl` instead of restarting the service.
 
 Please report it as a bug and attach the log file. Attach the log only, never your config file,
-which holds your Paperless API token. If the log was recorded with `log_level = "DEBUG"`, search it
-for your token before sharing it: debug output from the HTTP client can include the authorization
-header.
+which holds your Paperless API token. saneless keeps the HTTP libraries' own debug output out of
+the log whatever `log_level` says, because it can include the authorization header. A log that an
+earlier version wrote with `log_level = "DEBUG"` may still hold it, so search such a log for your
+token before sharing it.
