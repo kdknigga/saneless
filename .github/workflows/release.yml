@@ -66,6 +66,11 @@ jobs:
   # `release` group, hash-checked, and never from an ad hoc `--with` fetch
   # inside a publishing workflow.
   #
+  # A semver-shaped tag must also spell the version exactly as pyproject.toml
+  # does. The image tag is the tag's own spelling and the docs pin the
+  # declared one, so `v0.2.0-rc6` against `0.2.0-rc.6` would publish an image
+  # tag no page names; the gate refuses it before anything is pushed.
+  #
   # A tag that is a valid version but not semver-shaped (`v0.2.0rc7`) still
   # passes, with a warning in the log: the image tagging action emits no tag
   # for it, so publish-docker fails -- before publish-pypi, which is the order

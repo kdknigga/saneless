@@ -6,7 +6,9 @@ A release is refused when the pushed tag and the version declared in
 PEP 440 versions, so ``v0.2.0-rc.6`` and ``v0.2.0rc6`` are the same release.
 Whether the release is a pre-release comes from the parsed version, never from
 how the tag happens to be spelled, and nothing is handed to later jobs when the
-gate refuses.
+gate refuses. A semver-shaped tag must also spell the version exactly as
+``pyproject.toml`` does, because that spelling becomes the published image tag
+the documentation pins.
 """
 
 from __future__ import annotations
@@ -52,6 +54,47 @@ def test_mismatched_or_unparseable_tag_is_refused(tag: str, declared: str) -> No
     """A tag that names another version, or no version at all, is refused."""
     with pytest.raises(GateError):
         check(tag, declared)
+
+
+@pytest.mark.parametrize(
+    ("tag", "declared"),
+    [
+        ("v0.2.0-rc6", "0.2.0-rc.6"),
+        ("v0.2.0-c6", "0.2.0-rc.6"),
+        ("v0.2.0-pre.6", "0.2.0-rc.6"),
+        ("v0.2.0-preview6", "0.2.0rc6"),
+        ("v0.2.0-rc.6", "0.2.0rc6"),
+    ],
+)
+def test_semver_tag_spelled_unlike_the_project_is_refused(
+    tag: str, declared: str
+) -> None:
+    """
+    A semver-shaped tag that names the right version in another spelling fails.
+
+    Each of these tags is the declared version under PEP 440, but the image
+    tagger would publish the tag's own spelling, not the one every
+    documented image reference pins, so the docs would name a missing tag.
+    """
+    with pytest.raises(GateError) as exc_info:
+        check(tag, declared)
+
+    text = str(exc_info.value)
+    assert repr(tag.removeprefix("v")) in text, text
+    assert repr(declared) in text, text
+
+
+def test_misspelled_tag_exits_nonzero_and_writes_no_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A spelling refusal fails the step before any routing value is written."""
+    code, output = _run(monkeypatch, tmp_path, "v0.2.0-rc6", "0.2.0-rc.6")
+
+    assert code == 1
+    assert "0.2.0-rc.6" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_refusal_names_both_versions() -> None:
