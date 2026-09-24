@@ -18,6 +18,8 @@ In a shell, `echo $?` right after the command prints its exit code.
 | 3 | paperless-ngx could not be reached or rejected the upload | [Paperless errors](#paperless-errors-exit-3) |
 | 4 | The scanned pages could not be written as a PDF | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
 | 5 | An error saneless did not anticipate: a bug | [Unexpected errors](#unexpected-errors-exit-5) |
+| 6 | The scan was saved to the consume folder, not uploaded: its title, tags and correspondent were not applied | [Saved to the consume folder](#saved-to-the-consume-folder-exit-6) |
+| 7 | The scan was uploaded, but with a warning | [Uploaded with a warning](#uploaded-with-a-warning-exit-7) |
 | 130 | You cancelled the scan | [Cancelled scans](#cancelled-scans-exit-130) |
 
 [Use the CLI for Scripting](cli-scripting.md#exit-codes) shows how to branch on these codes in a
@@ -223,6 +225,39 @@ between the passes, so the backs came back in reverse: the document is `a-0001`,
 `a-0002`, `b-000N-1`, and so on, with the *last* `b-` file behind the first `a-` file. Sorting the
 directory by name would put every front page first and every back page last, in the wrong order.
 A simplex scan has only `a-` files and sorts correctly.
+
+## Saved to the consume folder (exit 6)
+
+stdout reads `Saved to folder: <title>`, and stderr reads `Not uploaded: saved to the consume
+folder without its title, tags or correspondent`, followed by the warning, which names where the
+PDF was written.
+
+The document was delivered, so do not scan the stack again. saneless could not reach paperless-ngx
+through its API, even after retrying, and a consume directory is configured, so it wrote the PDF
+there instead. paperless-ngx picks the file up from that folder and applies its own matching rules
+to it, not the title, tags and correspondent chosen for this scan.
+
+- In paperless-ngx, find the new document and set its title, tags and correspondent by hand.
+- Then find out why the API upload failed: it is the **Unreachable.** or **TLS certificate not
+  trusted.** case under [Paperless errors](#paperless-errors-exit-3), and every scan will keep
+  going to the folder until it is fixed.
+
+## Uploaded with a warning (exit 7)
+
+stdout reads `Uploaded with a warning: <title>`, and the warning itself is on stderr. The document
+reached paperless-ngx with its title, tags and correspondent, so do not scan the whole stack
+again. The warning is one of these:
+
+- **Pages could not be read by the scanner and were skipped.** The warning gives the count. Those
+  sheets are missing from the document in paperless-ngx; open it, find the gaps, and scan just
+  those sheets.
+- **Page count mismatch.** A manual duplex scan got a different number of fronts from backs, so
+  saneless could not interleave them. It uploaded the fronts and the backs as two separate
+  documents, the second with `(backs)` after the title. In paperless-ngx, check both documents
+  and look for a sheet that fed twice or not at all.
+
+A run that was saved to the consume folder *and* carries a warning exits 6, not 7: the missing
+title, tags and correspondent are the larger problem.
 
 ## Cancelled scans (exit 130)
 

@@ -124,10 +124,12 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 |---|---|---|
 | 0 | Success | Scan completed and uploaded |
 | 1 | Scan error | Scanner disconnected mid-scan, empty feeder, no pages scanned, flip wait timed out |
-| 2 | Configuration, profile or setup error | Unknown profile name, a `--config` file that does not exist, a TOML syntax error, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, python-sane not installed, a job database saneless cannot use (unreadable, or an unsupported schema) |
-| 3 | Paperless upload error | paperless-ngx unreachable, invalid API token, a malformed `paperless.url` |
+| 2 | Configuration, profile or setup error | Unknown profile name, a `--config` file that does not exist, a TOML syntax error, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, python-sane not installed, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan uploads |
+| 3 | Paperless upload error | paperless-ngx unreachable, invalid API token |
 | 4 | PDF assembly error | Disk full while writing the PDF, unwritable output directory |
 | 5 | Unexpected error (a saneless bug) | Prints one line; the traceback is in the log file -- attach it to a bug report |
+| 6 | Saved to the consume folder | paperless-ngx could not be reached, so the PDF went to the consume folder without its title, tags or correspondent; stdout reads `Saved to folder: <title>`. The document was delivered: do not rescan |
+| 7 | Uploaded with a warning | A sheet the scanner skipped, or manual-duplex front and back counts that differed (uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr. The document was delivered: do not rescan the whole stack |
 | 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; Ctrl-C during a one-shot command |
 
 Every failure prints one line to stderr (a configuration error prints a header naming the file,
