@@ -57,7 +57,7 @@ If a `saneless.toml` did load and an old-named file was left beside it, the warn
 Ignoring leftover /etc/saneless/config.toml: /var/lib/saneless/saneless.toml is in use; move anything you still need from it into /var/lib/saneless/saneless.toml, then delete it
 ```
 
-On a machine where the log is not to hand, `saneless doctor` prints the same facts as a table -- every candidate, whether it exists, which one was used and any file ignored under the old name. See [CLI Commands](cli-commands.md#doctor).
+On a machine where the log is not to hand, `saneless doctor` prints the same facts as a table -- every candidate, whether it exists, which one was used and any file ignored under the old name. See [CLI Commands](cli-commands.md#saneless-doctor).
 
 ### The Configuration check
 
