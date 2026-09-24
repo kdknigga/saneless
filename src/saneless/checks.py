@@ -1672,6 +1672,13 @@ def _check_paperless(context: CheckContext) -> CheckResult:
     ``doctor``, this check, the scan route and ``saneless scan`` share, so all
     four agree on whether the appliance can upload.
 
+    An empty ``paperless.url`` is examined next and skips the probe too.  It
+    loads, so ``serve`` can start and show this row, but a request to it
+    fails inside httpx2 before anything is sent, and ``test_connection``
+    would report that as UNREACHABLE -- a network fault, when the fix is a
+    setting.  ``ConnectionStatus`` is a public JSON contract, so the unset URL
+    gets its own row here rather than a sixth status.
+
     A ``None`` client means one could not be constructed, and the only way
     ``PaperlessClient.__init__`` refuses is a URL httpx2 will not parse -- which
     is the "not found at that URL" row, not a sixth sentence.
@@ -1691,6 +1698,16 @@ def _check_paperless(context: CheckContext) -> CheckResult:
             next_step=(
                 "Put a real API token in the saneless config file, "
                 "then restart saneless."
+            ),
+        )
+    if not context.settings.paperless.url:
+        return CheckResult(
+            key=CheckKey.PAPERLESS,
+            state=CheckState.FAIL,
+            message="The paperless-ngx address has not been set.",
+            next_step=(
+                "Set paperless.url in the saneless config file to the "
+                "paperless-ngx address, then restart saneless."
             ),
         )
     client = context.paperless

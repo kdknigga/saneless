@@ -326,10 +326,17 @@ def _retry_decision(exc: httpx2.HTTPError) -> _RetryDecision:
     """
     Classify an httpx2 error: the one place the client decides what to do.
 
-    Every client error goes through here, so a change of policy is a change to
-    this function alone.  Separating a failure before the request was sent from
-    one after it -- where a retry may store a second copy -- would split RETRY
-    and leave the other decisions as they are.
+    Every upload and metadata-fetch error goes through here, so a change of
+    policy for those is a change to this function alone.  Separating a failure
+    before the request was sent from one after it -- where a retry may store a
+    second copy -- would split RETRY and leave the other decisions as they are.
+
+    Two paths decide without it, because neither retries, copies or raises
+    anything a policy could change.  ``test_connection`` reports every
+    transport error as UNREACHABLE; the Paperless check reports an unset
+    ``paperless.url`` before it probes.  ``poll_task`` runs only after an
+    upload was accepted, and keeps asking through any request error until its
+    deadline, since failing then would invite a rescan and a duplicate.
 
     A chain of ``isinstance`` tests on exception types, with a total fallback:
     a new httpx2 subclass lands in the nearest arm above it, and anything

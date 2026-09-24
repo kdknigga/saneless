@@ -192,7 +192,7 @@ saneless [--config PATH] [-v] doctor
 |-------|------------------|
 | Configuration | Whether a `saneless.toml` was loaded, and whether an old `config.toml` is sitting in a searched directory being ignored |
 | Scanner | Whether scanner support is installed and a device answers. A configured sane-net host has its saned port probed first, so an unplugged network scanner is reported in about two seconds rather than two minutes |
-| Paperless | Whether the API token has been set to something real, and whether paperless-ngx accepts it. A placeholder token is reported without sending a request |
+| Paperless | Whether the API token and the paperless-ngx address have been set, and whether paperless-ngx accepts the token. A placeholder token or an empty `paperless.url` is reported without sending a request |
 | Profiles | Whether any scan profiles are configured, whether they were saved to a config file, and whether the generated ones have names yet |
 | Fallback | Whether a fallback folder is configured for when paperless-ngx is down, and whether saneless can write to it |
 | Data folder | Whether the folder holding the job database will take a write |

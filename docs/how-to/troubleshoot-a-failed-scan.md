@@ -135,8 +135,9 @@ Other causes of exit 2, each on one line:
   characters: no spaces, line breaks or control characters inside it`. See
   [`[paperless]`](../reference/configuration.md#paperless).
 - **`paperless.url` not set.** An empty `paperless.url` loads, so `serve` can start and show what
-  is missing, but a scan fails when it reaches the upload, with a line saying `paperless.url is
-  not set, or has no http or https scheme`. It is not retried, and nothing is copied to the
+  is missing: the status strip's Paperless row and `saneless doctor` say `The paperless-ngx
+  address has not been set.` A scan that reaches the upload fails with a line saying
+  `paperless.url is not set, or has no http or https scheme`. It is not retried, and nothing is copied to the
   consume folder even when one is configured: the PDF is kept in `failed/` in the data directory
   and the line ends with its path. Set the URL, then upload the kept PDF yourself or scan again.
 

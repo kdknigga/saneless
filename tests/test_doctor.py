@@ -144,7 +144,10 @@ class _ConnectedPaperless:
 
 
 def _make_settings(
-    tmp_path: Path, token: str = _NOT_A_PLACEHOLDER, consume_dir: str = ""
+    tmp_path: Path,
+    token: str = _NOT_A_PLACEHOLDER,
+    consume_dir: str = "",
+    url: str = "http://localhost:8000",
 ) -> Settings:
     """
     Build settings whose directories exist and are writable.
@@ -157,6 +160,7 @@ def _make_settings(
         tmp_path: pytest's per-test directory.
         token: The paperless-ngx token to configure.
         consume_dir: The fallback folder, or "" for none.
+        url: The paperless-ngx address, or "" for unset.
 
     Returns:
         Settings ready for ``_patch_doctor``.
@@ -169,7 +173,7 @@ def _make_settings(
     return Settings(
         scanner=ScannerConfig(device="test:device:001"),
         paperless=PaperlessConfig(
-            url="http://localhost:8000",
+            url=url,
             token=token,
             consume_dir=consume_dir,
         ),
@@ -990,6 +994,17 @@ class TestDoctorUsesTheRealRegistry:
         result = runner.invoke(cli, ["doctor"])
         assert result.exit_code == ExitCode.CONFIG
         assert "The paperless-ngx API token has not been set." in result.output
+
+    def test_an_unset_url_is_named_not_reported_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An empty ``paperless.url`` is a setting to fill in, not a network fault."""
+        settings = _make_settings(tmp_path, url="")
+        runner = _patch_doctor(monkeypatch, settings)
+        result = runner.invoke(cli, ["doctor"])
+        assert result.exit_code == ExitCode.CONFIG
+        assert "The paperless-ngx address has not been set." in result.output
+        assert "Could not reach paperless-ngx" not in result.output
 
     def test_the_token_value_is_never_printed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

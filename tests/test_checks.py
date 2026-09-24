@@ -2273,6 +2273,21 @@ class TestScannerCheck:
         assert row.state is CheckState.OK
 
 
+def _without_url(settings: Settings) -> Settings:
+    """
+    Return ``settings`` with ``paperless.url`` left unset.
+
+    Args:
+        settings: Settings from ``_settings``.
+
+    Returns:
+        A copy whose paperless-ngx address is empty, everything else kept.
+
+    """
+    paperless = settings.paperless.model_copy(update={"url": ""})
+    return settings.model_copy(update={"paperless": paperless})
+
+
 _PROBE_OUTCOMES = [
     pytest.param(200, CheckState.OK, ConnectionStatus.CONNECTED, id="connected"),
     pytest.param(
@@ -2315,6 +2330,57 @@ class TestPaperlessCheck:
         assert row.next_step == (
             "Put a real API token in the saneless config file, then restart saneless."
         )
+
+    def test_an_unset_url_fails_as_configuration_without_a_request(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        An empty ``paperless.url`` is a setting to fill in, not a network fault.
+
+        Probing it would fail inside httpx2 before any request is sent, and
+        that failure used to be reported as "Could not reach paperless-ngx",
+        sending the operator to look for a server that was never named.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        counter = _RequestCounter(_ok_response)
+        client = _paperless(counter, url="")
+        try:
+            results = run_checks(
+                _context(_without_url(_settings(tmp_path)), paperless=client)
+            )
+        finally:
+            client.close()
+        row = _row(results, CheckKey.PAPERLESS)
+        assert counter.count == 0
+        assert row.state is CheckState.FAIL
+        assert row.message == "The paperless-ngx address has not been set."
+        assert row.next_step == (
+            "Set paperless.url in the saneless config file to the paperless-ngx "
+            "address, then restart saneless."
+        )
+
+    def test_an_unset_token_is_named_before_an_unset_url(self, tmp_path: Path) -> None:
+        """
+        A fresh install has neither; the row names the token first.
+
+        Args:
+            tmp_path: The test's own directory.
+
+        """
+        counter = _RequestCounter(_ok_response)
+        client = _paperless(counter, url="")
+        try:
+            results = run_checks(
+                _context(_without_url(_settings(tmp_path, token="")), paperless=client)
+            )
+        finally:
+            client.close()
+        row = _row(results, CheckKey.PAPERLESS)
+        assert counter.count == 0
+        assert row.message == "The paperless-ngx API token has not been set."
 
     @pytest.mark.parametrize(("status_code", "state", "status"), _PROBE_OUTCOMES)
     def test_each_outcome_reuses_the_existing_sentence(
