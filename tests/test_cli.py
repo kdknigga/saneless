@@ -5397,10 +5397,16 @@ class TestJobsTableWidth:
         assert len(local_time(datetime.now(tz=UTC))) <= cli_module._TIME_COL_WIDTH
         assert cli_module._TIME_COL_WIDTH == 22
 
-    def test_the_title_column_is_24_at_80_columns(
+    def test_the_title_column_is_17_at_80_columns(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Unchanged from before this plan: the zone token fits in the slack."""
+        """
+        At 80 columns the title keeps 17, above the floor of 15.
+
+        It was 24 until the Status column had to hold "Uploaded with a
+        warning", seven characters wider than "Saved to folder". The zone
+        token still fits in the timestamp column's own slack.
+        """
         monkeypatch.setenv("COLUMNS", "80")
         settings = self._settings_for(tmp_path)
         self._one_job(settings.output.db_path)
@@ -5410,7 +5416,7 @@ class TestJobsTableWidth:
 
         assert result.exit_code == 0, result.output
         lines = result.output.strip().split("\n")
-        assert _jobs_header_title_width(lines[0]) == 24
+        assert _jobs_header_title_width(lines[0]) == 17
         assert all(len(line) <= 80 for line in lines)
 
     def test_a_narrow_terminal_floors_the_title_column_at_15(

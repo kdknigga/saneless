@@ -74,15 +74,22 @@ from .pipeline import (
 )
 from .scanner.sane_backend import SaneBackend, require_sane
 from .vocabulary import (
+    FALLBACK_NOT_UPLOADED_LINE,
+    WARNED_UPLOAD_LABEL,
     ConfigFileState,
     ErrorCategory,
     ExitCode,
     FlipOutcome,
     JobState,
+    ScanOutcome,
     classify_error,
     error_next_step,
     exit_code_for,
+    exit_code_for_outcome,
+    job_label,
+    job_state_for,
     local_time,
+    outcome_line,
     progress_label,
     state_label,
 )
@@ -106,8 +113,12 @@ _LISTEN_BACKLOG: Final = 2048
 # Width of the Status column in `saneless jobs`, derived rather than written
 # down: the humanised labels are longer than the raw enum values they replaced,
 # and a ninth JobState member must not be able to overflow an 80-column
-# terminal without anyone noticing.
-_STATUS_COL_WIDTH = max(len(state_label(state)) for state in JobState)
+# terminal without anyone noticing. A DONE row that carries a warning is
+# labelled from the state and the warning together rather than by a state of
+# its own, so its label joins the max explicitly -- it is the widest of all.
+_STATUS_COL_WIDTH = max(
+    *(len(state_label(state)) for state in JobState), len(WARNED_UPLOAD_LABEL)
+)
 
 # The widest zone token ``%Z`` produces at a realistic offset: five characters,
 # the ``+0545`` shape the tz database falls back to where there is no
@@ -721,11 +732,11 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     )
 
     def status_callback(event: PipelineEvent) -> None:
-        state = event.job_state
-        if event is PipelineEvent.DONE:
-            click.echo(f"Done: {resolved_title}")
-        else:
-            click.echo(progress_label(state))
+        # DONE is announced for an upload and a consume-folder fallback alike,
+        # warning or not, so it cannot choose the closing line: the ScanResult
+        # does, once run_pipeline returns.
+        if event is not PipelineEvent.DONE:
+            click.echo(progress_label(event.job_state))
 
     try:
         request = PipelineRequest(
@@ -747,7 +758,7 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             # only the click.confirm read itself moves to the prompt thread.
             flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
         )
-        run_pipeline(
+        result = run_pipeline(
             scanner,
             paperless,
             settings,
@@ -757,6 +768,22 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
         # Failures reach the group guard, which prints one line and exits with
         # its ExitCode; the client is closed either way.
         paperless.close()
+
+    # The outcome line, the stderr lines and the exit code are the CLI's whole
+    # report of a scan: nothing is written to the job store. A document that was
+    # delivered but degraded -- saved to the consume folder, or uploaded with a
+    # warning -- exits 6 or 7, so a script can tell it from a clean success and
+    # from a paperless failure (3), which it might retry by scanning again.
+    click.echo(
+        outcome_line(job_state_for(result.outcome), result.warning, resolved_title)
+    )
+    if result.outcome is ScanOutcome.FALLBACK:
+        click.echo(FALLBACK_NOT_UPLOADED_LINE, err=True)
+    if result.warning:
+        click.echo(f"Warning: {result.warning}", err=True)
+    code = exit_code_for_outcome(result.outcome, result.warning)
+    if code is not ExitCode.SUCCESS:
+        ctx.exit(code)
 
 
 def _echo_capabilities(caps: DeviceCapabilities) -> None:
@@ -1063,7 +1090,7 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                     f"{local_time(j.created_at):<{ts_w}} "
                     f"{_truncate(j.profile, profile_w):<{profile_w}} "
                     f"{_truncate(j.title, title_w):<{title_w}} "
-                    f"{state_label(j.state)}"
+                    f"{job_label(j.state, j.warning)}"
                 )
     finally:
         store.close()
@@ -1674,7 +1701,10 @@ def _doctor_paperless(settings: Settings) -> PaperlessClient | None:
             settings.paperless.consume_dir,
         )
     except PaperlessError as exc:
-        # The message names the URL, which may carry user:pass@.
+        # Only the class name. A URL carrying credentials is refused when the
+        # config loads, so the message holds no secret; it is left out because
+        # the Paperless row already explains the failure to the operator, and
+        # this line only has to record which exception it was.
         logger.info("Paperless client unavailable: %s", type(exc).__name__)
         return None
 
