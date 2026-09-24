@@ -16,6 +16,7 @@ import pytest
 from fastapi.routing import _IncludedRouter
 from PIL import Image, ImageDraw
 
+from saneless import logging_config
 from saneless import paperless as paperless_module
 from saneless.config import (
     OutputConfig,
@@ -233,7 +234,7 @@ def library_logger_levels() -> Iterator[None]:
 
     """
     yield
-    for name in ("httpx2", "httpcore2", "hpack", "multipart", "python_multipart"):
+    for name in logging_config._LIBRARY_LOGGERS:
         logging.getLogger(name).setLevel(logging.NOTSET)
 
 

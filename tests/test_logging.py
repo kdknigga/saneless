@@ -166,12 +166,12 @@ class TestConfigureLogging:
         """
         -v is DEBUG for saneless's own loggers, not for the root or libraries.
 
-        The root logger keeps the configured level, so a DEBUG record emitted on
-        a library's own logger is discarded before it reaches any handler. That
-        mechanism, and nothing about the logger's name, is what keeps library
-        request detail -- which may carry the Paperless Authorization header --
-        out of the log. Raising the root to DEBUG lets the sentinel below
-        through, which is what makes this a check capable of failing.
+        The root logger keeps the configured level, and a DEBUG record emitted
+        on a library's own logger is discarded before it reaches any handler.
+        Two things now hold that record back: the root level, and the HTTP
+        library loggers' own capped level (``TestLibraryLoggerCap``). The cap
+        alone would still hide the sentinel if -v raised the root to DEBUG, so
+        the root-level assertion at the end is the one that fails then.
 
         Both surfaces are asserted on: under -v the mirror handler sits on the
         root logger and writes to stderr as well as the file, so a file-only

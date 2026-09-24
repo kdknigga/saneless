@@ -4,7 +4,8 @@ Logging setup for saneless's two operating shapes.
 One-shot CLI commands configure the root logger at the configured level with a
 rotating file handler. Verbose mode also mirrors records to stderr and logs
 saneless's own loggers at DEBUG, while the root logger and third-party
-libraries keep the configured level.
+libraries keep the configured level. The HTTP library loggers never go below
+INFO, whatever that level is, because their DEBUG output carries headers.
 
 ``saneless serve`` passes no log file at all instead: a service streams to
 stderr and writes nothing to disk, so the platform -- ``docker logs``,
@@ -16,7 +17,7 @@ from __future__ import annotations
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -24,6 +25,20 @@ if TYPE_CHECKING:
 __all__ = ["configure_logging"]
 
 _FORMAT = "%(asctime)s %(levelname)-8s %(name)s %(message)s"
+
+# The HTTP stack's loggers, held at INFO or above whatever the log level says.
+# httpcore2's DEBUG trace writes headers; httpx2 is its client front end and
+# hpack its HTTP/2 header codec (not installed today, and a name costs nothing
+# when absent). python_multipart is the multipart parser's real logger name, and
+# multipart the shim package that re-exports it. Children such as
+# httpcore2.http11 inherit the level from their parent.
+_LIBRARY_LOGGERS: Final = (
+    "httpx2",
+    "httpcore2",
+    "hpack",
+    "multipart",
+    "python_multipart",
+)
 
 
 class _TracebackFreeFormatter(logging.Formatter):
@@ -148,7 +163,8 @@ def configure_logging(
     _remove_own_handlers(root_logger)
     # The level-name mapping rather than an attribute lookup on the module,
     # which would also "resolve" non-level names such as BASIC_FORMAT.
-    root_logger.setLevel(logging.getLevelNamesMapping()[log_level.upper()])
+    level = logging.getLevelNamesMapping()[log_level.upper()]
+    root_logger.setLevel(level)
 
     if log_file is None:
         # The reader who knows the fallback branch below will expect
@@ -201,11 +217,22 @@ def configure_logging(
         root_logger.addHandler(mirror_handler)
 
     # -v is saneless's own detail. The root logger keeps the configured level so
-    # httpx2, multipart and uvicorn do not flood the log. Library DEBUG output
-    # is also not saneless's to audit: httpcore2 logs full response headers
-    # today and nothing stops it logging request headers tomorrow, and the
-    # Paperless Authorization header must not reach a log. NOTSET on the
+    # httpx2, multipart and uvicorn do not flood the log. NOTSET on the
     # non-verbose path makes repeated calls idempotent instead of leaking an
     # earlier call's DEBUG.
     logging.getLogger("saneless").setLevel(logging.DEBUG if verbose else logging.NOTSET)
+
+    # The root level alone does not keep library DEBUG output out: a configured
+    # log_level of DEBUG is the root's level, and a library logger without one
+    # of its own inherits it. That output is not saneless's to audit --
+    # httpcore2 logs full response headers today, nothing stops it logging
+    # request headers tomorrow, and the Paperless Authorization header must not
+    # reach a log. So each HTTP library logger gets its own level, the
+    # configured one but never below INFO. Not a flat INFO: a logger's own
+    # level, not the root's, gates emission, so INFO under a WARNING root would
+    # switch httpx2's per-request line on. Setting it on every call keeps
+    # repeated calls idempotent, as above.
+    library_level = max(level, logging.INFO)
+    for name in _LIBRARY_LOGGERS:
+        logging.getLogger(name).setLevel(library_level)
     return attached
