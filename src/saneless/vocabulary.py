@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = [
     "ACTIVE_STATES",
     "BUSY_STATES",
+    "FALLBACK_NOT_UPLOADED_LINE",
     "LOCAL_TIME_FORMAT",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
@@ -37,6 +38,7 @@ __all__ = [
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
     "TOKEN_UNSET_JOB_ERROR",
+    "WARNED_UPLOAD_LABEL",
     "WORKER_DEGRADED_JOB_ERROR",
     "WORKER_DOWN_JOB_ERROR",
     "ConfigFileState",
@@ -60,9 +62,12 @@ __all__ = [
     "error_message",
     "error_next_step",
     "exit_code_for",
+    "exit_code_for_outcome",
     "flip_answer_label",
+    "job_label",
     "job_state_for",
     "local_time",
+    "outcome_line",
     "page_counts",
     "progress_label",
     "rejection_message",
@@ -241,6 +246,16 @@ class ExitCode(IntEnum):
     ``CANCELLED`` is 130, the shell's convention for a process stopped by
     SIGINT, because a cancel -- Ctrl-C or the operator declining the flip -- is
     a deliberate stop and not a failure.
+
+    ``SAVED_TO_FOLDER`` (6) and ``UPLOADED_WITH_WARNING`` (7) are not failures
+    either: each means a document *was* delivered, to the consume folder
+    without its title, tags or correspondent, or to paperless-ngx with a
+    warning about a skipped sheet or unequal duplex counts.  They are kept
+    apart from ``PAPERLESS`` because a script that retries a paperless failure
+    would scan the stack a second time.  When a run is both, the fallback
+    wins, since the lost metadata is the larger problem.  They are chosen in
+    ``exit_code_for_outcome``, not in ``exit_code_for``, because no error
+    category leads to either.
     """
 
     SUCCESS = 0
@@ -249,6 +264,8 @@ class ExitCode(IntEnum):
     PAPERLESS = 3
     PDF = 4
     UNEXPECTED = 5
+    SAVED_TO_FOLDER = 6
+    UPLOADED_WITH_WARNING = 7
     CANCELLED = 130
 
 
@@ -438,6 +455,17 @@ SCAN_BLOCKED_REASON: Final = (
 # records.
 RESTART_REASON: Final = "The server restarted before this scan finished"
 
+# The words for a delivered scan that did not go cleanly.  A DONE job carrying
+# a warning is labelled WARNED_UPLOAD_LABEL rather than "Complete", and a
+# FALLBACK adds FALLBACK_NOT_UPLOADED_LINE on the CLI's stderr to say what was
+# lost.  They live here once, beside "Complete" and "Saved to folder" in
+# ``state_label``, so the CLI outcome line, the web status area and the
+# history row cannot drift apart.  Neither carries a configured value.
+WARNED_UPLOAD_LABEL: Final = "Uploaded with a warning"
+FALLBACK_NOT_UPLOADED_LINE: Final = (
+    "Not uploaded: saved to the consume folder without its title, tags or correspondent"
+)
+
 # How every user-facing timestamp is spelled, on the web page and in the CLI
 # table alike.  ``%Z`` is on the format rather than in a column caption so
 # the zone is named on every line and a copy-pasted timestamp is
@@ -530,6 +558,66 @@ def state_label(state: JobState) -> str:
         case _:
             assert_never(state)
     return label
+
+
+def job_label(state: JobState, warning: str | None) -> str:
+    """
+    Return the history-row label for a job, taking its warning into account.
+
+    A DONE job that carries a warning -- a sheet the scanner skipped, or
+    manual-duplex front and back counts that differed -- was uploaded, but
+    calling it "Complete" would hide the warning from anyone skimming the
+    history.  It gets ``WARNED_UPLOAD_LABEL`` instead.  Every other case,
+    including a FALLBACK with a warning, is exactly ``state_label``: there is no
+    ``JobState`` member for a warned upload, only a DONE plus a warning.
+
+    Args:
+        state: The job state to label.
+        warning: The job's warning, if any.  An empty string is no warning.
+
+    Returns:
+        The user-facing label, e.g. ``"Uploaded with a warning"``.
+
+    Raises:
+        AssertionError: If the value is not a JobState member.
+
+    """
+    if state is JobState.DONE and warning:
+        return WARNED_UPLOAD_LABEL
+    return state_label(state)
+
+
+def outcome_line(state: JobState, warning: str | None, title: str) -> str:
+    """
+    Return the one-line headline for a delivered scan.
+
+    This is the line the CLI prints on stdout when a scan finishes and the
+    headline of the web status area.  Only a clean DONE says ``Done:``; a
+    warned DONE and a FALLBACK each name what went wrong, so no surface can
+    report a degraded scan as a clean one.
+
+    Args:
+        state: The job's terminal state, DONE or FALLBACK.
+        warning: The job's warning, if any.  An empty string is no warning.
+        title: The document title, appended after the colon.
+
+    Returns:
+        The headline, e.g. ``"Uploaded with a warning: Invoice"``.
+
+    Raises:
+        ValueError: If ``state`` is not a delivered outcome.  A job that
+            failed, was cancelled or is still running has no outcome line.
+
+    """
+    match state:
+        case JobState.DONE:
+            prefix = WARNED_UPLOAD_LABEL if warning else "Done"
+        case JobState.FALLBACK:
+            prefix = state_label(JobState.FALLBACK)
+        case _:
+            msg = f"{state.value} is not a delivered outcome, so has no outcome line"
+            raise ValueError(msg)
+    return f"{prefix}: {title}"
 
 
 def progress_label(state: JobState) -> str:
@@ -1171,6 +1259,9 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
     not saneless types -- and for a bare ``SanelessError``, which is itself a
     bug.
 
+    A scan that delivered its document is not an error at all, even when it
+    was degraded on the way; ``exit_code_for_outcome`` gives those their codes.
+
     Args:
         category: The error category to map.
 
@@ -1194,6 +1285,41 @@ def exit_code_for(category: ErrorCategory) -> ExitCode:
             exit_code = ExitCode.UNEXPECTED
         case _:
             assert_never(category)
+    return exit_code
+
+
+def exit_code_for_outcome(outcome: ScanOutcome, warning: str | None) -> ExitCode:
+    """
+    Return the CLI exit code for a scan that delivered its document.
+
+    A clean upload exits ``SUCCESS``.  An upload that carries a warning exits
+    ``UPLOADED_WITH_WARNING``, and a document saved to the consume folder exits
+    ``SAVED_TO_FOLDER`` whether or not it also carries a warning: the lost
+    title, tags and correspondent are the larger problem, and one process can
+    report only one code.
+
+    This is a ``match`` with ``assert_never`` for the same reason
+    ``job_state_for`` is: a third ``ScanOutcome`` member then fails both type
+    checkers here until it is given a code.
+
+    Args:
+        outcome: The outcome the pipeline resolved to.
+        warning: The run's warning, if any.  An empty string is no warning.
+
+    Returns:
+        The exit code, e.g. ``ExitCode.UPLOADED_WITH_WARNING``.
+
+    Raises:
+        AssertionError: If the value is not a ScanOutcome member.
+
+    """
+    match outcome:
+        case ScanOutcome.SUCCESS:
+            exit_code = ExitCode.UPLOADED_WITH_WARNING if warning else ExitCode.SUCCESS
+        case ScanOutcome.FALLBACK:
+            exit_code = ExitCode.SAVED_TO_FOLDER
+        case _:
+            assert_never(outcome)
     return exit_code
 
 

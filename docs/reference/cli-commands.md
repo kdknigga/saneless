@@ -21,10 +21,12 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 |------|---------|
 | 0 | Success |
 | 1 | Scan error: the scanner failed, the feeder was empty, no pages were scanned, or the flip wait timed out |
-| 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, or a job database saneless cannot use (unreadable, or an unsupported schema) |
-| 3 | Paperless-ngx error: unreachable after retries, upload rejected, or a malformed Paperless URL |
+| 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan uploads |
+| 3 | Paperless-ngx error: unreachable after retries, or upload rejected |
 | 4 | PDF assembly error: the scanned pages could not be written as a PDF |
 | 5 | Unexpected error only: a saneless bug. The line names the exception type and the traceback is in the log file -- or, under `saneless serve`, in the stream, because a service writes no file |
+| 6 | Saved to the consume folder without its title, tags or correspondent. The document was delivered, so do not scan it again |
+| 7 | Uploaded, with a warning on stderr: a sheet the scanner skipped, or manual-duplex front and back counts that differed. The document was delivered, so do not rescan the whole stack |
 | 130 | Cancelled by the operator |
 
 Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
@@ -50,10 +52,12 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
 |------|---------|
 | 0 | Scan and upload completed successfully |
 | 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt) |
-| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, an unset or placeholder paperless-ngx API token, no scanner found, or python-sane not installed) |
-| 3 | Paperless-ngx upload error (unreachable after retries, upload rejected, malformed Paperless URL) |
+| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, an unset or placeholder paperless-ngx API token, no scanner found, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan uploads) |
+| 3 | Paperless-ngx upload error (unreachable after retries, or upload rejected) |
 | 4 | PDF assembly error (disk full, unwritable output directory) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
+| 6 | Saved to the consume folder, not uploaded: the document is there but its title, tags and correspondent were not applied; stdout reads `Saved to folder: <title>` |
+| 7 | Uploaded with a warning (a sheet the scanner skipped, or manual-duplex front and back counts that differed, uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |
 | 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt, or Ctrl-C during the scan) |
 
 With neither `--title` nor a profile `title`, the document title is the scan's start time rendered in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. Set `TZ` on the server (or in `docker-compose.yml`) if that zone is wrong; a container reports UTC unless you do.
@@ -266,7 +270,7 @@ Once the addresses are bound, `serve` prints one `Serving on http://<address>:<p
 |------|---------|
 | 0 | Clean shutdown, including Ctrl-C once the web server is running |
 | 2 | Cannot start (port already in use, a host that does not resolve or an address that cannot be bound, web server failed to start, SANE could not be initialised, python-sane not installed, invalid config, or the job database is unreadable or has an unsupported schema) |
-| 3 | Malformed Paperless URL |
+| 3 | The TLS trust store named by `SSL_CERT_FILE` or `SSL_CERT_DIR` cannot be read |
 | 5 | Unexpected error (a saneless bug; the traceback is in the stream, not a file -- `serve` writes none) |
 | 130 | Cancelled (Ctrl-C before the web server has started) |
 
