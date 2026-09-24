@@ -45,8 +45,9 @@ profile model defaults to, and every documentation deep link names a page
 that exists (DOCS-02, D-45).
 
 The citation guard holds every source, template, style and script file under
-``src/`` to comments that give their own reasons, because the planning records
-they might otherwise point at do not ship with the product.
+``src/``, and every release script under ``scripts/``, to comments that give
+their own reasons, because the planning records they might otherwise point at
+do not ship with the product.
 
 The Phase 35 tests hold the declared ``>=`` floors to the versions ``uv.lock``
 resolves, and hold the ``anyio`` ceiling to its declaration. The container
@@ -1394,7 +1395,12 @@ PLANNING_CITATION = re.compile(
     r"SUMMARY|VERIFICATION|REVIEW)\.md\b|Open Question|"
     r"[Pp]er user decision|\.planning/"
 )
-_SOURCE_PREFIX = "src/"
+# The directories whose files ship with the repository and are read by people
+# who have no copy of the planning records: the package itself, and the
+# release scripts the workflows run. The hook's ``files:`` pattern below says
+# the same thing in regex form, and a test keeps the two in step.
+_SOURCE_PREFIXES = ("src/", "scripts/")
+CITATION_HOOK_FILES = r"^(src|scripts)/"
 _SOURCE_SUFFIXES = frozenset({".py", ".html", ".css", ".js"})
 # The vendored htmx and Pico files are upstream bytes pinned by an integrity
 # hash, so they are neither ours to comment nor ours to edit.
@@ -1404,7 +1410,7 @@ PRE_COMMIT_CONFIG = REPO_ROOT / ".pre-commit-config.yaml"
 
 def _shipped_source_files() -> list[str]:
     """
-    Return the tracked source, template, style and script files under src/.
+    Return the tracked source and script files under src/ and scripts/.
 
     Returns:
         Repo-relative path names, vendored assets excluded.
@@ -1413,7 +1419,7 @@ def _shipped_source_files() -> list[str]:
     return [
         name
         for name in _shipped_files()
-        if name.startswith(_SOURCE_PREFIX)
+        if name.startswith(_SOURCE_PREFIXES)
         and Path(name).suffix in _SOURCE_SUFFIXES
         and not name.startswith(_VENDOR_PREFIX)
     ]
@@ -1458,11 +1464,13 @@ def _citation_offenders(names: list[str], root: Path) -> list[str]:
 
 def test_no_src_file_cites_a_planning_artefact() -> None:
     """
-    No shipped source file points at the planning records for its reasons.
+    No shipped source or script file points at the planning records.
 
     A comment that says only "see decision so-and-so" tells a reader of the
     product nothing, because the planning directory does not ship with it.
-    Each comment in src/ has to carry its own reason in plain words.
+    Each comment in src/ and scripts/ has to carry its own reason in plain
+    words: the release scripts ship with the repository just as the package
+    does, and a workflow reader lands in them first.
 
     This test and the no-planning-citations hook share one pattern, but not
     quite one file set: the test picks files by suffix (``.py``, ``.html``,
@@ -1474,7 +1482,8 @@ def test_no_src_file_cites_a_planning_artefact() -> None:
     """
     offenders = _citation_offenders(_shipped_source_files(), REPO_ROOT)
     assert not offenders, (
-        "a file under src/ cites a planning artefact or could not be read. "
+        "a file under src/ or scripts/ cites a planning artefact or could not "
+        "be read. "
         "Replace a reference with the reason it stood for, in words, or "
         "delete it where the sentence is complete without it:\n" + "\n".join(offenders)
     )
@@ -1504,6 +1513,40 @@ def test_the_citation_hook_uses_the_guard_pattern() -> None:
         "the guard test uses, so the two can disagree about what a citation "
         "is. Copy PLANNING_CITATION.pattern into the hook's entry verbatim"
     )
+
+
+def test_the_citation_hook_covers_src_and_scripts() -> None:
+    """
+    The commit hook reads the same directories the guard above reads.
+
+    The pattern is only half of what the two share. A hook scoped to src/
+    alone would let a citation into a release script at commit, merge and
+    push, and only CI would say so. The regex and the prefix list are written
+    once each, and this test holds them to the same directories.
+    """
+    lines = _significant_lines(PRE_COMMIT_CONFIG)
+    starts = [
+        index
+        for index, (_number, line) in enumerate(lines)
+        if line == "- id: no-planning-citations"
+    ]
+    assert len(starts) == 1, (
+        f"{PRE_COMMIT_CONFIG.name} does not declare exactly one "
+        "no-planning-citations hook, so there is no hook scope to check"
+    )
+    window: list[str] = []
+    for _number, line in lines[starts[0] + 1 :]:
+        if line.startswith("- "):
+            break
+        window.append(line)
+    assert f"files: {CITATION_HOOK_FILES}" in window, (
+        f"the no-planning-citations hook is not scoped to {CITATION_HOOK_FILES}, "
+        "so it checks a different set of directories from the guard test. "
+        f"Its lines read: {window}"
+    )
+    files = re.compile(CITATION_HOOK_FILES)
+    assert all(files.match(prefix) for prefix in _SOURCE_PREFIXES)
+    assert files.match("tests/test_deployment_config.py") is None
 
 
 # Only the documentation deep links: the site root has no path after
@@ -4478,12 +4521,68 @@ def test_every_dependabot_entry_settles_for_a_week_before_opening_a_pr() -> None
 # their guard scans Python files, which is where this one cannot look.
 _FLAG_LEAD = "--"
 
-SUPPRESSION_FLAGS = (f"{_FLAG_LEAD}{_SILENCE_RULE}",)
+# The rest are ways a workflow or hook step goes green over a failure without
+# a checker being told anything: an environment variable that makes prek skip
+# a hook by id, prek's own skip option, the step-level setting that marks a
+# failed step as passed, a shell fallback that swallows the exit status, and
+# ruff's option to report findings and exit 0. Plain literals are safe here,
+# because no guard in this file scans Python source for them.
+SUPPRESSION_FLAGS = (
+    f"{_FLAG_LEAD}{_SILENCE_RULE}",
+    "SKIP=",
+    "--skip",
+    "continue-on-error",
+    "|| true",
+    "--exit-zero",
+)
+
+
+def _suppression_flag_offenders(name: str, lines: list[tuple[int, str]]) -> list[str]:
+    """
+    Return every significant line that carries a banned suppression spelling.
+
+    Args:
+        name: The file name to report the lines under.
+        lines: ``(line number, line)`` pairs, comments already dropped.
+
+    Returns:
+        One ``name:line: text`` entry per offending line.
+
+    """
+    return [
+        f"{name}:{number}: {line}"
+        for number, line in lines
+        if any(flag in line for flag in SUPPRESSION_FLAGS)
+    ]
+
+
+def test_the_suppression_flag_scan_reports_each_banned_spelling() -> None:
+    """Each banned spelling is reported on a line, and a clean step is not."""
+    seeded = [
+        (1, "continue-on-error: true"),
+        (2, "- run: uv run prek run --all-files || true"),
+        (3, "- run: SKIP=zizmor uv run prek run --all-files"),
+        (4, "- run: uv run prek run --all-files --skip zizmor"),
+        (5, "entry: uv run ruff check --exit-zero ."),
+        (6, f"- run: uv audit {_FLAG_LEAD}{_SILENCE_RULE} GHSA-0000"),
+        (7, "- run: uv run prek run --all-files --show-diff-on-failure"),
+    ]
+
+    offenders = _suppression_flag_offenders("seeded.yml", seeded)
+
+    assert [entry.split(":")[1] for entry in offenders] == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+    ]
 
 
 def test_no_workflow_or_hook_file_silences_a_checker_with_a_flag() -> None:
     """
-    No workflow or hook step passes a checker a flag that drops findings (D-05).
+    No workflow or hook step passes a flag or setting that drops a failure (D-05).
 
     The advisory gate in ``ci.yml`` brought with it a suppression surface the
     existing ban never reached: that guard scans tracked Python files, and
@@ -4493,21 +4592,20 @@ def test_no_workflow_or_hook_file_silences_a_checker_with_a_flag() -> None:
     the lock, and the build goes green over it. The match is on the bare flag
     rather than on the audit step, because a line continuation would evade a
     narrower rule and because the flag would be a suppression on any other
-    tool in these files too. The scan runs over significant lines, so the
-    comment in ``ci.yml`` stating this ban is not read as the ban being
-    broken, and the banned text is built at runtime for the reason the owner
+    tool in these files too. Now that CI runs the hook file itself, a skipped
+    hook or a swallowed exit status is the same defect one level up, so those
+    spellings are banned alongside it. The scan runs over significant lines,
+    so the comment in ``ci.yml`` stating this ban is not read as the ban being
+    broken, and the audit flag is built at runtime for the reason the owner
     guard gives further up.
     """
     scanned = 0
     offenders: list[str] = []
     for path in [*_workflow_files(), PRE_COMMIT_CONFIG]:
-        name = path.relative_to(REPO_ROOT)
         lines = _significant_lines(path)
         scanned += len(lines)
         offenders.extend(
-            f"{name}:{number}: {line}"
-            for number, line in lines
-            if any(flag in line for flag in SUPPRESSION_FLAGS)
+            _suppression_flag_offenders(str(path.relative_to(REPO_ROOT)), lines)
         )
     assert scanned, (
         "no workflow or hook file yielded a single significant line, so this "
@@ -4515,10 +4613,11 @@ def test_no_workflow_or_hook_file_silences_a_checker_with_a_flag() -> None:
         "config was renamed, and either way the ban is no longer enforced"
     )
     assert not offenders, (
-        "a workflow or hook step tells a checker to drop findings instead of "
-        "fixing what it reported. For the advisory gate that means shipping a "
-        "package whose vulnerability is known and recorded, with a green "
-        "build over it. Fix the finding, or upgrade past it:\n" + "\n".join(offenders)
+        "a workflow or hook step tells a checker to drop findings, skips a "
+        "hook, or marks a failed step as passed, instead of fixing what was "
+        "reported. For the advisory gate that means shipping a package whose "
+        "vulnerability is known and recorded, with a green build over it. Fix "
+        "the finding, or upgrade past it:\n" + "\n".join(offenders)
     )
 
 
@@ -5285,6 +5384,524 @@ def test_the_ci_docker_job_builds_and_smoke_tests_the_image() -> None:
         f"the smoke script is not run against the image the build tagged {tag}: "
         f"{scripts}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The hook file as the one definition of the gate
+# ---------------------------------------------------------------------------
+
+DOCS_WORKFLOW = WORKFLOW_DIR / "docs.yml"
+
+# One entry in the hook file's ``repos:`` list as ``_significant_lines`` leaves
+# it, and the two repository names that are never fetched from anywhere.
+HOOK_REPO = re.compile(r"^-\s+repo:\s*(?P<repo>\S+)$")
+IN_TREE_HOOK_REPOS = frozenset({"local", "meta"})
+# A remote hook pin: a full-length lowercase commit SHA, then the release it
+# was resolved from, in the comment form ``prek autoupdate --freeze`` writes
+# and Dependabot updates together with the SHA. A tag is a name the upstream
+# owner can move to other code; a commit SHA is not.
+REV_LINE = re.compile(r"^rev:\s*(?P<value>.*)$")
+FROZEN_REV = re.compile(r"^[0-9a-f]{40}\s+#\s*frozen:\s*v\d+\.\d+\.\d+$")
+# The hook that rewrites a frozen remote rev back to the tag in its comment.
+SYNCING_HOOK_REPO = "sync-with-uv"
+
+# The commands the CI lint job runs, each as its own step: the hook file at
+# its commit stage and at its push stage, both over the whole tree, then the
+# advisory audit, which reaches the network and so is deliberately no hook.
+LINT_COMMANDS = (
+    "uv run prek run --all-files",
+    "uv run prek run --stage pre-push --all-files",
+    "uv audit --preview-features audit-command",
+)
+# A checker the hook file already runs, invoked by name from a workflow step.
+# A second spelling of a gate in the workflow is a second definition of it,
+# and the two drift.
+DIRECT_CHECKER = re.compile(r"(?<![\w-])(?:ruff|ty\s+check|pyrefly|zizmor)(?![\w-])")
+
+# The condition that keeps a docs step or job off pull requests.
+PUSH_ONLY = "github.event_name == 'push'"
+UPLOAD_PAGES_ACTION = "actions/upload-pages-artifact@"
+MKDOCS_BUILD = "mkdocs build"
+STRICT_FLAG = "--strict"
+QUIET_FLAG = "--quiet"
+# A job-level ``if:`` key, at the four-space indent every job key here uses.
+JOB_IF = re.compile(r"^    if:\s*(?P<value>.*)$")
+
+
+def _top_level_block(
+    lines: list[tuple[int, str]], key: str
+) -> tuple[str, list[tuple[int, str]]] | None:
+    """
+    Return a top-level key's inline value and the raw lines nested under it.
+
+    Args:
+        lines: ``(line number, line)`` pairs for the whole file, raw.
+        key: The top-level key, without its colon.
+
+    Returns:
+        The value written on the key's own line (empty for a block) and the
+        lines up to the next top-level key, or ``None`` when the key is absent.
+
+    """
+    value: str | None = None
+    block: list[tuple[int, str]] = []
+    for number, line in lines:
+        significant = line.strip() and not _is_comment(line)
+        if significant and not line[0].isspace():
+            if value is not None:
+                break
+            name, separator, rest = line.partition(":")
+            if separator and name == key:
+                value = _strip_trailing_comment(rest)
+            continue
+        if value is not None:
+            block.append((number, line))
+    return None if value is None else (value, block)
+
+
+def _workflow_triggers(lines: list[tuple[int, str]]) -> set[str]:
+    """Return the event names a workflow's ``on:`` key lists, in either form."""
+    found = _top_level_block(lines, "on")
+    if found is None:
+        return set()
+    value, block = found
+    if value:
+        return {part.strip() for part in value.strip("[]").split(",") if part.strip()}
+    return {
+        line.strip().partition(":")[0]
+        for _, line in block
+        if line.strip() and not _is_comment(line) and _indent(line) == 2
+    }
+
+
+def _job_ids(lines: list[tuple[int, str]]) -> list[str]:
+    """Return the ids of the jobs declared under the top-level ``jobs:`` key."""
+    found = _top_level_block(lines, "jobs")
+    if found is None:
+        return []
+    return [
+        match.group("job")
+        for _, line in found[1]
+        for match in [JOB_KEY.match(line)]
+        if match is not None
+    ]
+
+
+def _condition(value: str | None) -> str:
+    """Return an ``if:`` value without the optional ``${{ }}`` wrapper."""
+    text = (value or "").strip()
+    if text.startswith(EXPRESSION_OPEN) and text.endswith("}}"):
+        text = text.removeprefix(EXPRESSION_OPEN).removesuffix("}}")
+    return text.strip()
+
+
+def _hook_repos(lines: list[tuple[int, str]]) -> list[tuple[int, str, list[str]]]:
+    """
+    Split the hook file's significant lines into one window per repo entry.
+
+    Args:
+        lines: ``_significant_lines`` output for the hook file.
+
+    Returns:
+        ``(line number, repo, lines)`` per entry, where the lines run from the
+        one after ``- repo:`` to the one before the next entry.
+
+    """
+    starts = [
+        (index, match.group("repo"))
+        for index, (_number, line) in enumerate(lines)
+        for match in [HOOK_REPO.match(line)]
+        if match is not None
+    ]
+    repos: list[tuple[int, str, list[str]]] = []
+    for position, (index, repo) in enumerate(starts):
+        end = starts[position + 1][0] if position + 1 < len(starts) else len(lines)
+        window = [line for _number, line in lines[index + 1 : end]]
+        repos.append((lines[index][0], repo, window))
+    return repos
+
+
+def _unfrozen_hook_repos(lines: list[tuple[int, str]]) -> tuple[int, list[str]]:
+    """
+    Return how many remote hook repos there are, and each one not frozen.
+
+    Args:
+        lines: ``_significant_lines`` output for the hook file.
+
+    Returns:
+        The number of remote repo entries, and one ``line: repo -- reason``
+        entry per repo whose ``rev:`` is not a frozen commit SHA.
+
+    """
+    remote = 0
+    offenders: list[str] = []
+    for number, repo, window in _hook_repos(lines):
+        if repo in IN_TREE_HOOK_REPOS:
+            continue
+        remote += 1
+        revs = [
+            match.group("value")
+            for line in window
+            for match in [REV_LINE.match(line)]
+            if match is not None
+        ]
+        if len(revs) != 1:
+            offenders.append(f"{number}: {repo} -- {len(revs)} rev: lines")
+        elif FROZEN_REV.match(revs[0]) is None:
+            offenders.append(f"{number}: {repo} -- rev: {revs[0]}")
+    return remote, offenders
+
+
+def test_every_remote_hook_repo_is_pinned_to_a_frozen_commit() -> None:
+    """
+    Every hook fetched from elsewhere is pinned to a commit, with its version.
+
+    prek clones a remote hook repo at its ``rev:`` and runs the code there
+    with the developer's or the runner's privileges. A tag is a name its owner
+    can move, so a compromised upstream account could hand every checkout new
+    code under the old version. A full commit SHA cannot be moved, and the
+    ``# frozen: vX.Y.Z`` comment keeps the pin readable and is what Dependabot
+    rewrites together with the SHA.
+    """
+    remote, offenders = _unfrozen_hook_repos(_significant_lines(PRE_COMMIT_CONFIG))
+    assert remote, (
+        f"{PRE_COMMIT_CONFIG.name} declares no remote hook repo at all, so this "
+        "guard has nothing to check. Either every hook became local or the "
+        "repo entry spelling changed under the scan"
+    )
+    assert not offenders, (
+        "a remote hook repo is pinned to a movable name rather than a commit. "
+        "Run `uv run prek autoupdate --freeze` (or resolve the tag's commit by "
+        "hand) so each reads `rev: <40-hex sha>  # frozen: vX.Y.Z`:\n"
+        + "\n".join(f"{PRE_COMMIT_CONFIG.name}:{entry}" for entry in offenders)
+    )
+
+
+def test_the_frozen_rev_scan_reports_a_tag_a_bare_sha_and_a_missing_rev() -> None:
+    """A tag, an uncommented SHA, a mixed-case SHA and no rev are all reported."""
+    sha = "3e8a8703264a2f4a69428a0aa4dcb512790b2c8c"
+    seeded = list(
+        enumerate(
+            [
+                "repos:",
+                "- repo: https://example.invalid/frozen",
+                f"rev: {sha}  # frozen: v6.0.0",
+                "hooks:",
+                "- id: check-ast",
+                "- repo: https://example.invalid/tag",
+                "rev: v6.0.0",
+                "- repo: https://example.invalid/bare",
+                f"rev: {sha}",
+                "- repo: https://example.invalid/upper",
+                f"rev: {sha.upper()}  # frozen: v6.0.0",
+                "- repo: https://example.invalid/none",
+                "hooks:",
+                "- repo: local",
+                "hooks:",
+                "- id: ty-checker",
+                "- repo: meta",
+            ],
+            start=1,
+        )
+    )
+
+    remote, offenders = _unfrozen_hook_repos(seeded)
+
+    assert remote == 5
+    assert [entry.split(" -- ")[0] for entry in offenders] == [
+        "6: https://example.invalid/tag",
+        "8: https://example.invalid/bare",
+        "10: https://example.invalid/upper",
+        "12: https://example.invalid/none",
+    ]
+
+
+def test_the_hook_file_has_no_sync_with_uv_hook() -> None:
+    """
+    No hook rewrites a frozen remote rev back to a tag.
+
+    ``sync-with-uv`` sets each remote hook's rev to the version ``uv.lock``
+    holds. Run against a frozen pin it replaced the SHA with the tag and left
+    the ``# frozen:`` comment behind, so the file claimed a pin it no longer
+    had. ruff, the one tool it kept in step, now runs from the lock through
+    local hooks, so the syncing hook has nothing left to do.
+    """
+    repos = [
+        repo
+        for _number, repo, _window in _hook_repos(_significant_lines(PRE_COMMIT_CONFIG))
+    ]
+    assert repos, f"{PRE_COMMIT_CONFIG.name} declares no hook repo at all"
+    offenders = [repo for repo in repos if SYNCING_HOOK_REPO in repo]
+    assert not offenders, (
+        f"{PRE_COMMIT_CONFIG.name} still carries {SYNCING_HOOK_REPO}, which "
+        "rewrites a frozen commit SHA back to the tag in its comment and so "
+        f"silently undoes the pin: {offenders}"
+    )
+
+
+def _ci_lint_offenders(lines: list[tuple[int, str]]) -> list[str]:
+    """
+    Return every way a CI workflow departs from running the hook file as its gate.
+
+    Args:
+        lines: ``(line number, line)`` pairs for the whole workflow, raw.
+
+    Returns:
+        One entry per lint command the ``lint`` job does not run as a step of
+        its own, and one per ``run:`` line anywhere that calls a checker the
+        hook file already runs.
+
+    """
+    block = _job_block(lines, "lint")
+    if not block:
+        return ["no lint job is declared under jobs:"]
+    runs = [
+        value
+        for step in _job_steps(block)
+        for value in [_step_value(step, "run")]
+        if value is not None
+    ]
+    offenders = [
+        f"the lint job has no step running {command!r}"
+        for command in LINT_COMMANDS
+        if not any(run == command or run.startswith(f"{command} ") for run in runs)
+    ]
+    offenders.extend(
+        f"{number}: {line} -- calls a checker the hook file already runs"
+        for number, line in _run_scripts(lines)
+        if DIRECT_CHECKER.search(line)
+    )
+    return offenders
+
+
+def test_ci_lint_job_runs_the_hook_file_at_both_stages_and_the_audit() -> None:
+    """
+    CI's lint job runs the hook file, and no workflow step repeats a checker.
+
+    ``.pre-commit-config.yaml`` is the one definition of the gate. The lint job
+    runs it at the commit stage, where a fixer that would change a file fails
+    the job with the diff, and at the push stage, where the full type checks,
+    the no-fix lint and format checks and the deployment-config tests run.
+    The advisory audit stays its own step because it reaches the network. A
+    checker called by name from a step would be a second definition, free to
+    drift from the first.
+    """
+    offenders = _ci_lint_offenders(_numbered(CI_WORKFLOW))
+    assert not offenders, (
+        "ci.yml does not run the hook file as its lint gate. The lint job "
+        f"must run each of {list(LINT_COMMANDS)} as its own step, and no step "
+        "may call ruff, ty, pyrefly or zizmor directly:\n" + "\n".join(offenders)
+    )
+
+
+_SEEDED_CI = """\
+name: Seeded
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000 # v1.0.0
+      - run: uv sync --locked
+{lint_steps}
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: {test_run}
+"""
+# The lint job as it was before the hook file became the gate: each checker
+# its own step, the commit stage alone, and no push stage.
+_SEEDED_OLD_LINT_STEPS = """\
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run ty check
+      - run: uv run zizmor .
+      - run: uv run prek run --all-files
+      - run: uv audit --preview-features audit-command"""
+
+
+def test_the_ci_lint_scan_reports_direct_checkers_and_missing_stages(
+    tmp_path: Path,
+) -> None:
+    """The old separate-steps shape is reported; the hook-file shape is not."""
+    old = tmp_path / "old.yml"
+    old.write_text(
+        _SEEDED_CI.format(
+            lint_steps=_SEEDED_OLD_LINT_STEPS,
+            test_run="uv run pyrefly check src tests scripts",
+        ),
+        encoding="utf-8",
+    )
+    new = tmp_path / "new.yml"
+    new.write_text(
+        _SEEDED_CI.format(
+            lint_steps="\n".join(
+                f"      - run: {command} --show-diff-on-failure"
+                if "prek" in command
+                else f"      - run: {command}"
+                for command in LINT_COMMANDS
+            ),
+            test_run='uv run env HOME="$(mktemp -d)" pytest',
+        ),
+        encoding="utf-8",
+    )
+
+    offenders = _ci_lint_offenders(_numbered(old))
+
+    assert offenders[0] == (
+        "the lint job has no step running "
+        "'uv run prek run --stage pre-push --all-files'"
+    )
+    assert [entry.split(":")[0] for entry in offenders[1:]] == [
+        "9",
+        "10",
+        "11",
+        "12",
+        "18",
+    ]
+    assert _ci_lint_offenders(_numbered(new)) == []
+    assert _ci_lint_offenders([(1, "jobs:")]) == ["no lint job is declared under jobs:"]
+
+
+def _docs_workflow_offenders(lines: list[tuple[int, str]]) -> list[str]:
+    """
+    Return every way the docs workflow departs from build-on-PR, deploy-on-push.
+
+    Args:
+        lines: ``(line number, line)`` pairs for the whole workflow, raw.
+
+    Returns:
+        One entry per broken property: the pull-request trigger, the deploy
+        job's push gate, each upload step's push gate, and each ``mkdocs
+        build`` line that is not strict or that is quiet.
+
+    """
+    offenders: list[str] = []
+    if "pull_request" not in _workflow_triggers(lines):
+        offenders.append("on: has no pull_request trigger")
+    deploy_if = [
+        _condition(match.group("value"))
+        for _, line in _job_block(lines, "deploy")
+        for match in [JOB_IF.match(line)]
+        if match is not None
+    ]
+    if deploy_if != [PUSH_ONLY]:
+        offenders.append(f"the deploy job is not gated on push: {deploy_if}")
+    uploads = [
+        step
+        for job in _job_ids(lines)
+        for step in _steps_using(_job_block(lines, job), UPLOAD_PAGES_ACTION)
+    ]
+    if not uploads:
+        offenders.append("no step uploads a Pages artifact")
+    offenders.extend(
+        f"a Pages upload step is not gated on push: {step}"
+        for step in uploads
+        if _condition(_step_value(step, "if")) != PUSH_ONLY
+    )
+    builds = [
+        (number, line) for number, line in _run_scripts(lines) if MKDOCS_BUILD in line
+    ]
+    if not builds:
+        offenders.append(f"no step runs {MKDOCS_BUILD}")
+    for number, line in builds:
+        flags = line.split(MKDOCS_BUILD, 1)[1].split()
+        if STRICT_FLAG not in flags:
+            offenders.append(f"{number}: {line} -- not {STRICT_FLAG}")
+        quiet = [
+            flag
+            for flag in flags
+            if flag == QUIET_FLAG
+            or (flag.startswith("-") and not flag.startswith("--") and "q" in flag)
+        ]
+        if quiet:
+            offenders.append(f"{number}: {line} -- {quiet} hides what strict counts")
+    return offenders
+
+
+def test_docs_workflow_builds_prs_strictly_and_deploys_only_on_push() -> None:
+    """
+    Every pull request builds the site strictly; only a push to master publishes.
+
+    Strict mode fails the build on a warning, and quiet mode hides warnings,
+    so a quiet strict build exits 0 over a dead anchor. The Pages upload and
+    the deploy job run on push only, so a pull request can break the build but
+    never the published site.
+    """
+    offenders = _docs_workflow_offenders(_numbered(DOCS_WORKFLOW))
+    assert not offenders, (
+        "docs.yml no longer builds every pull request with a strict, "
+        "unquiet mkdocs build while publishing only on push:\n" + "\n".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "expected"),
+    [
+        ("  pull_request:\n", "", "no pull_request trigger"),
+        (
+            "    if: github.event_name == 'push'\n    needs: build",
+            "    needs: build",
+            "deploy job is not gated",
+        ),
+        (
+            "        if: github.event_name == 'push'\n        with:\n          path: site",
+            "        with:\n          path: site",
+            "upload step is not gated",
+        ),
+        ("mkdocs build --strict", "mkdocs build --strict -q", "hides what strict"),
+        ("mkdocs build --strict", "mkdocs build --quiet --strict", "hides what"),
+        ("mkdocs build --strict", "mkdocs build", "not --strict"),
+    ],
+)
+def test_the_docs_workflow_scan_reports_each_seeded_break(
+    old: str, new: str, expected: str
+) -> None:
+    """Each property of the real workflow, broken on its own, is reported."""
+    text = DOCS_WORKFLOW.read_text(encoding="utf-8")
+    assert text.count(old) == 1, f"the seed {old!r} no longer matches docs.yml once"
+    seeded = list(enumerate(text.replace(old, new).splitlines(), start=1))
+
+    offenders = _docs_workflow_offenders(seeded)
+
+    assert any(expected in entry for entry in offenders), offenders
+
+
+def _anchor_validation(lines: list[tuple[int, str]]) -> str | None:
+    """Return mkdocs.yml's ``validation.anchors`` level, or ``None`` if unset."""
+    mapping = _key_mapping(lines, "validation", 0)
+    return None if mapping is None else mapping.get("anchors")
+
+
+def test_docs_workflow_build_validates_anchors_through_mkdocs_yml() -> None:
+    """
+    The strict docs build fails on a link to an anchor that does not exist.
+
+    mkdocs ignores a dead ``page.md#anchor`` link unless ``validation.anchors``
+    raises it to a warning, and only then does ``--strict`` turn it into a
+    failed build.
+    """
+    level = _anchor_validation(_numbered(MKDOCS))
+    assert level == "warn", (
+        f"mkdocs.yml sets validation.anchors to {level!r}, so the strict build "
+        "passes a link to an anchor that does not exist. Set it to warn"
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "site_name: x\n",
+        "validation:\n  anchors: info\n",
+        "validation:\n  unrecognized_links: warn\n",
+        "nav:\n  anchors: warn\n",
+    ],
+)
+def test_the_anchor_validation_reader_reports_anything_but_warn(text: str) -> None:
+    """An absent, lower or misplaced anchors level does not read as warn."""
+    lines = list(enumerate(text.splitlines(), start=1))
+    assert _anchor_validation(lines) != "warn"
+    assert _anchor_validation([(1, "validation: {anchors: warn}")]) == "warn"
 
 
 # ---------------------------------------------------------------------------

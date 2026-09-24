@@ -1,11 +1,16 @@
-# Update schedule for the three ecosystems this repository pins: the SHA-pinned
+# Update schedule for the four ecosystems this repository pins: the SHA-pinned
 # actions in .github/workflows/, the digest-pinned base images in the Dockerfile,
-# and the Python dependencies that pyproject.toml declares and uv.lock resolves.
+# the Python dependencies that pyproject.toml declares and uv.lock resolves, and
+# the frozen hook repositories in .pre-commit-config.yaml. Each of those is a
+# commit SHA with a `# frozen: vX.Y.Z` comment naming the release it came from,
+# and Dependabot rewrites the comment together with the SHA, so the pin and the
+# version it claims move as one.
+#
 # Pinning to an immutable SHA, digest or locked version is what makes a
 # supply-chain audit pass, and it is also what stops those pins moving on their
 # own -- so something has to move them deliberately, and this is it.
 #
-# All three entries below carry the seven-day settling period. It is not
+# All four entries below carry the seven-day settling period. It is not
 # decoration: it is the gap between an upstream release and a pull request
 # proposing it, and so the only thing standing between an account compromised
 # today and a merge-ready bump today. What enforces it is a test --
@@ -13,7 +18,7 @@
 # tests/test_deployment_config.py -- and not the workflow audit. zizmor's own
 # cooldown check is ecosystem-gated: measured on 1.30.1, it reports a
 # `github-actions` entry that omits the block, and an explicit value below
-# seven days, but it passes a `uv` entry carrying no block at all. Any fourth
+# seven days, but it passes a `uv` entry carrying no block at all. Any fifth
 # entry added here needs its own copy of the block, and the test is what will
 # say so.
 #
@@ -44,6 +49,13 @@ updates:
       default-days: 7
 
   - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: "pre-commit"
     directory: "/"
     schedule:
       interval: "weekly"
