@@ -144,8 +144,9 @@ Other causes of exit 2, each on one line:
 Earlier versions sent a token with a trailing space or line break -- easy to get from a secret
 file or a `.env` file with Windows line endings -- exactly as written, and the request then failed
 with an error that quoted the token. That error could be printed, logged and stored on the job,
-where the job history shows it. saneless now ignores those characters and never quotes the token, but it
-does not rewrite job records or logs written before. Generate a new API token in paperless-ngx and
+where the job history shows it. saneless now ignores those characters, and when a reply from
+paperless-ngx or a proxy, or an HTTP library error, quotes the token, it is replaced by `***` in the
+message, the log and any traceback. saneless does not rewrite job records or logs written before. Generate a new API token in paperless-ngx and
 put it in `paperless.token`, so the copy left behind no longer works.
 
 ## python-sane is not installed (exit 2)

@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import time
+import traceback
 from collections import Counter
 from typing import TYPE_CHECKING
 
@@ -2413,6 +2414,146 @@ class TestResponseTextIsRedacted:
             and record.getMessage().startswith("Paperless error body")
         ]
         assert bodies == ["Paperless error body (403): Invalid token header: Token ***"]
+
+
+def _inner_token_failure(token: str) -> httpx2.ConnectError:
+    """
+    Build a transport error whose own text is clean but whose cause quotes the token.
+
+    httpx2 re-raises its transport's errors as its own types, chained to the
+    original, so the token can sit one link down the chain.
+
+    Args:
+        token: The configured token.
+
+    Returns:
+        A ConnectError chained to an error naming the token.
+
+    """
+    error = httpx2.ConnectError("connection failed")
+    error.__cause__ = OSError(f"header refused: Token {token}")
+    return error
+
+
+_TOKEN_BEARING_CAUSES = [
+    pytest.param(_token_bearing_failure, id="own-text"),
+    pytest.param(_inner_token_failure, id="inner-cause"),
+]
+
+
+def _formatted(error: BaseException) -> str:
+    """
+    Render an error the way a logged traceback shows it, causes included.
+
+    Args:
+        error: The error to render.
+
+    Returns:
+        The full traceback text, every chained cause and context included.
+
+    """
+    return "".join(traceback.format_exception(error))
+
+
+class TestChainedCausesCarryNoToken:
+    """
+    A traceback of any client error is as clean as its message.
+
+    The worker logs a failed job with ``logger.exception`` and the CLI logs a
+    failure with ``exc_info``, and both print the whole chain.  A message with
+    the token struck out is worth nothing if the cause it is chained to
+    prints the token a line further down.
+    """
+
+    @pytest.mark.parametrize("token", _REDACTED_TOKENS)
+    @pytest.mark.parametrize("build", _TOKEN_BEARING_CAUSES)
+    @pytest.mark.usefixtures("sleeps")
+    def test_upload_retries_exhausted(
+        self,
+        build: Callable[[str], httpx2.ConnectError],
+        token: str,
+        sample_pdf: Path,
+    ) -> None:
+        """The failed-after-N-attempts error formats without the token."""
+        handler = _CountingHandler(_raising(build(token)))
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=token,
+            max_retries=2,
+            transport=_make_transport(handler),
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Chain")
+        finally:
+            client.close()
+        assert handler.calls == 2
+        assert "failed after 2 attempts" in str(exc_info.value)
+        _assert_token_absent(token, _formatted(exc_info.value))
+
+    @pytest.mark.parametrize("token", _REDACTED_TOKENS)
+    @pytest.mark.parametrize("build", _TOKEN_BEARING_CAUSES)
+    def test_poll_timeout(
+        self, build: Callable[[str], httpx2.ConnectError], token: str
+    ) -> None:
+        """The poll timeout naming the last request error formats without it."""
+        handler = _CountingHandler(_raising(build(token)))
+        client = PaperlessClient(
+            url="http://paperless:8000", token=token, transport=_make_transport(handler)
+        )
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=0)
+        finally:
+            client.close()
+        assert "last error:" in str(exc_info.value)
+        _assert_token_absent(token, _formatted(exc_info.value))
+
+    @pytest.mark.parametrize("token", _REDACTED_TOKENS)
+    @pytest.mark.parametrize("build", _TOKEN_BEARING_CAUSES)
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_metadata_fetch(
+        self,
+        method: str,
+        noun: str,
+        build: Callable[[str], httpx2.ConnectError],
+        token: str,
+    ) -> None:
+        """A failed tag or correspondent fetch formats without the token."""
+        handler = _CountingHandler(_raising(build(token)))
+        client = PaperlessClient(
+            url="http://paperless:8000", token=token, transport=_make_transport(handler)
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                getattr(client, method)()
+        finally:
+            client.close()
+        assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
+        _assert_token_absent(token, _formatted(exc_info.value))
+
+    @pytest.mark.usefixtures("sleeps")
+    def test_a_clean_cause_is_still_chained(self, sample_pdf: Path) -> None:
+        """
+        The control: a cause that quotes nothing secret stays attached.
+
+        Dropping every cause would pass the tests above too, and lose the
+        diagnosis a traceback exists to give.
+        """
+        failure = httpx2.ConnectError("connection refused")
+        handler = _CountingHandler(_raising(failure))
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=_MOCK_AUTH,
+            max_retries=2,
+            transport=_make_transport(handler),
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Chain")
+        finally:
+            client.close()
+        assert exc_info.value.__cause__ is failure
 
 
 _CONFIGURED_HOST = "paperless.test"

@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import time
+import traceback
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Final, assert_never
@@ -614,7 +615,8 @@ class PaperlessClient:
     exponential backoff, and connection testing.  The construction and
     upload path is a module boundary: whatever goes wrong there leaves as a
     ``PaperlessError`` naming the configured base URL and the original text
-    with the token struck out, chained to its cause -- or, for a request that
+    with the token struck out, chained to its cause unless some link of that
+    cause's chain quotes the token (see ``_cause``) -- or, for a request that
     could not be sent at all, as a ``ConfigError`` with fixed text and no
     cause.  A URL or token the constructor refuses is a ``PaperlessError``
     with fixed text and no cause.
@@ -799,8 +801,9 @@ class PaperlessClient:
                 configured (``failed after N attempts``); if any other httpx2
                 error occurs; if the PDF cannot be opened; if a 200 body is
                 not JSON or carries no task id; or if copying into the consume
-                directory fails.  Every one is chained to its cause, and any
-                library text it quotes has the token struck out.
+                directory fails.  Any library or server text it quotes has the
+                token struck out, and it is chained to its cause only when no
+                link of the cause's chain quotes the token.
 
         """
         data = self._form_fields(title, tags, correspondent)
@@ -818,7 +821,7 @@ class PaperlessClient:
                         # raise_for_status refuses every non-2xx) would only be
                         # answered the same way again: no retry, no fallback.
                         msg = _not_accepted_message(exc.response, self._token)
-                        raise PaperlessError(msg) from exc
+                        raise PaperlessError(msg) from self._cause(exc)
                     case _RetryDecision.RETRY:
                         last_error = exc
                         self._back_off(attempt, exc)
@@ -836,7 +839,7 @@ class PaperlessClient:
                             f"Could not upload to Paperless at {self._display_url}: "
                             f"{self._reason(exc)}"
                         )
-                        raise PaperlessError(msg) from exc
+                        raise PaperlessError(msg) from self._cause(exc)
                     case unreachable:
                         assert_never(unreachable)
             else:
@@ -853,7 +856,8 @@ class PaperlessClient:
             f"Upload to Paperless at {self._display_url} failed after "
             f"{self._max_retries} attempts: {reason}"
         )
-        raise PaperlessError(msg) from last_error
+        cause = None if last_error is None else self._cause(last_error)
+        raise PaperlessError(msg) from cause
 
     @staticmethod
     def _form_fields(
@@ -924,7 +928,7 @@ class PaperlessClient:
                 f"Paperless at {self._display_url} returned a response that is "
                 f"not JSON: {self._reason(exc)}"
             )
-            raise PaperlessError(msg) from exc
+            raise PaperlessError(msg) from self._cause(exc)
         if task_id is None:
             # A JSON null body would otherwise become the string
             # "None" -- truthy, not None, and polled as a real task id.
@@ -947,6 +951,30 @@ class PaperlessClient:
 
         """
         return _one_line_reason(exc, self._token)
+
+    def _cause(self, exc: BaseException) -> BaseException | None:
+        """
+        Return ``exc`` as a cause to chain to, or None when it would leak the token.
+
+        A ``PaperlessError`` whose message has the token struck out would
+        still print it if it were chained to library text quoting it: the
+        worker logs a failed job with ``logger.exception`` and the CLI logs a
+        failure with ``exc_info``, and both print every chained cause and
+        context.  So the cause is kept only when its whole formatted
+        traceback -- exactly what a log would print, every link of its own
+        chain included -- is unchanged by ``_strike``.  Otherwise the error
+        is raised ``from None``: its message already carries the struck
+        reason, and no traceback can put the token back.
+
+        Args:
+            exc: The cause the caller would chain to.
+
+        Returns:
+            ``exc`` when no link of its chain quotes the token, else None.
+
+        """
+        rendered = "".join(traceback.format_exception(exc))
+        return exc if _strike(rendered, self._token) == rendered else None
 
     def _back_off(self, attempt: int, exc: httpx2.HTTPError) -> None:
         """
@@ -1101,12 +1129,15 @@ class PaperlessClient:
                 returns a non-200 response, carrying the status code, the
                 reason phrase and the body reduced to one bounded line by
                 ``_render_error_body``; or if a 200 body is not JSON,
-                chained to the ValueError.
+                chained to the ValueError.  The token is struck out of every
+                piece of server text in the message.
             PaperlessTimeoutError: If the deadline passes before the task
                 reaches a terminal status. The message names the task id so
                 the task can be looked up in paperless-ngx directly, and,
                 when the last poll failed with a request error rather than
-                being answered, ends by naming that error and is chained to it.
+                being answered, ends by naming that error and is chained to it
+                -- unless that error's chain quotes the token, when it carries
+                no cause.
 
         """
         deadline = time.monotonic() + timeout
@@ -1148,7 +1179,7 @@ class PaperlessClient:
                 if last_transport_error is None:
                     raise PaperlessTimeoutError(msg)
                 msg = f"{msg}; last error: {self._reason(last_transport_error)}"
-                raise PaperlessTimeoutError(msg) from last_transport_error
+                raise PaperlessTimeoutError(msg) from self._cause(last_transport_error)
 
             # Clamped so the poll never sleeps past its own deadline -- that
             # is what makes a sub-second timeout cost what it says it does
@@ -1192,7 +1223,7 @@ class PaperlessClient:
                 f"Paperless at {self._display_url} returned a task response that is "
                 f"not JSON: {self._reason(exc)}"
             )
-            raise PaperlessError(msg) from exc
+            raise PaperlessError(msg) from self._cause(exc)
 
         task = _extract_task(payload)
         if task is None:
@@ -1300,7 +1331,8 @@ class PaperlessClient:
                 no cause.
             PaperlessError: If any page request fails for any other
                 ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
-                naming the endpoint and base URL and chained to the cause.
+                naming the endpoint and base URL and chained to the cause
+                unless the cause's chain quotes the token.
 
         """
         return self._fetch_collection("/api/tags/", "tags")
@@ -1318,7 +1350,8 @@ class PaperlessClient:
                 no cause.
             PaperlessError: If any page request fails for any other
                 ``httpx2.HTTPError`` (a non-2xx included) or a body is not JSON,
-                naming the endpoint and base URL and chained to the cause.
+                naming the endpoint and base URL and chained to the cause
+                unless the cause's chain quotes the token.
 
         """
         return self._fetch_collection("/api/correspondents/", "correspondents")
@@ -1348,8 +1381,9 @@ class PaperlessClient:
 
         This is a module boundary: no httpx2 type and no raw ValueError leaves
         it.  A status error is rendered by ``_one_line_reason`` as status,
-        reason and body, so the message stays one line, and any library text
-        has the token struck out by ``_reason``.
+        reason and body, so the message stays one line, any library or server
+        text has the token struck out by ``_reason``, and a cause is chained
+        only through ``_cause``.
 
         Args:
             path: The collection endpoint, e.g. ``/api/tags/``.
@@ -1363,7 +1397,8 @@ class PaperlessClient:
                 <fixed problem>``, with no cause, when the request cannot be
                 sent from the configured URL and token.
             PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
-                <reason>``, chained to the httpx2 error or the ValueError, or
+                <reason>``, chained to the httpx2 error or the ValueError
+                unless its chain quotes the token, or
                 unchained when a body or its items have the wrong shape, the
                 server repeats a page, or it needs more pages than its
                 ``count`` allows.
@@ -1428,9 +1463,9 @@ class PaperlessClient:
                 ``_retry_decision`` finds the request could not be sent from
                 the configured URL and token; the library's text, which can
                 quote the token, is left out.
-            PaperlessError: ``<prefix>: <reason>``, chained to any other
-                httpx2 error or the ValueError, with the token struck out of
-                the reason.
+            PaperlessError: ``<prefix>: <reason>``, with the token struck out
+                of the reason, chained to any other httpx2 error or the
+                ValueError unless that cause's chain quotes the token.
 
         """
         try:
@@ -1445,12 +1480,12 @@ class PaperlessClient:
                 # h11 error would print the refused token in a traceback.
                 raise ConfigError(msg) from None
             msg = f"{prefix}: {self._reason(exc)}"
-            raise PaperlessError(msg) from exc
+            raise PaperlessError(msg) from self._cause(exc)
         try:
             return response.json()
         except ValueError as exc:
             msg = f"{prefix}: {self._reason(exc)}"
-            raise PaperlessError(msg) from exc
+            raise PaperlessError(msg) from self._cause(exc)
 
     def close(self) -> None:
         """Close the underlying HTTP client."""
