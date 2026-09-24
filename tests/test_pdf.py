@@ -12,7 +12,6 @@ survive assembly untouched.
 
 import os
 import re
-import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -33,6 +32,7 @@ from saneless.pdf import (
 )
 from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.spool import SpooledPageSink
+from tests.golden_support import embedded_streams, png_idat
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -62,11 +62,6 @@ JOB_B = "bbbbbbbb-1111-2222-3333-444444444444"
 # anywhere the suite can run, and it is still a real check rather than a
 # disabled one.
 _TEST_RESERVE_MB = 1
-
-# A PNG file opens with an 8-byte signature; chunks follow it, each one a
-# 4-byte length, a 4-byte type, that many payload bytes and a 4-byte CRC.
-_PNG_SIGNATURE_LENGTH = 8
-_PNG_CHUNK_OVERHEAD = 12
 
 # Every error class img2pdf 0.6.3 defines.  Each is a direct ``Exception``
 # subclass with no shared base, which is why the boundary cannot catch a tuple.
@@ -118,29 +113,6 @@ def _rounded_media_box(page: pikepdf.Page) -> list[int]:
     return [round(box.llx), round(box.lly), round(box.urx), round(box.ury)]
 
 
-def _embedded_streams(pdf_path: Path) -> list[bytes]:
-    """
-    Read each PDF page's single embedded image stream, in page order.
-
-    Raw rather than decoded: img2pdf passes a suitable PNG's compressed pixel
-    data straight through, so the raw stream is directly comparable with the
-    spooled PNG's own IDAT payload.
-
-    Args:
-        pdf_path: The assembled PDF to read.
-
-    Returns:
-        One raw stream per page, in the order the pages appear.
-
-    """
-    streams: list[bytes] = []
-    with pikepdf.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            (image,) = pikepdf.Page(page).get_images().values()
-            streams.append(image.read_raw_bytes())
-    return streams
-
-
 def _media_boxes(pdf_path: Path) -> list[tuple[float, float, float, float]]:
     """
     Read every page's MediaBox exactly, in page order.
@@ -159,35 +131,6 @@ def _media_boxes(pdf_path: Path) -> list[tuple[float, float, float, float]]:
     with pikepdf.open(pdf_path) as pdf:
         boxes = [pikepdf.Rectangle(page.mediabox) for page in pdf.pages]
     return [(box.llx, box.lly, box.urx, box.ury) for box in boxes]
-
-
-def _png_idat_payload(png_path: Path) -> bytes:
-    """
-    Concatenate a PNG's IDAT chunk payloads -- the compressed pixel data.
-
-    This is the strongest available statement of D-03's "the spooled PNG is
-    exactly what img2pdf embeds": for a non-interlaced, non-alpha PNG img2pdf
-    copies the IDAT payload into the PDF stream untouched, so this byte string
-    must come back out of the assembled PDF verbatim. Decoding either side
-    would only prove the two images look alike, which a re-encode would also
-    satisfy.
-
-    Args:
-        png_path: The spooled page to read.
-
-    Returns:
-        Every IDAT payload in the file, concatenated in file order.
-
-    """
-    raw = png_path.read_bytes()
-    payload = bytearray()
-    offset = _PNG_SIGNATURE_LENGTH
-    while offset < len(raw):
-        (length,) = struct.unpack(">I", raw[offset : offset + 4])
-        if raw[offset + 4 : offset + 8] == b"IDAT":
-            payload += raw[offset + 8 : offset + 8 + length]
-        offset += length + _PNG_CHUNK_OVERHEAD
-    return bytes(payload)
 
 
 def _recording_convert(calls: list[dict[str, object]]) -> Callable[..., object]:
@@ -434,7 +377,7 @@ class TestAssemblePdf:
             list(reversed(records)), output_dir, filename="rev.pdf", dpi=300
         )
 
-        assert _embedded_streams(forward) == list(reversed(_embedded_streams(backward)))
+        assert embedded_streams(forward) == list(reversed(embedded_streams(backward)))
 
 
 class TestBoundedAssembly:
@@ -468,8 +411,8 @@ class TestBoundedAssembly:
 
         with pikepdf.open(pdf_path) as pdf:
             assert len(pdf.pages) == 3
-        assert _embedded_streams(pdf_path) == [
-            _png_idat_payload(record.path) for record in records
+        assert embedded_streams(pdf_path) == [
+            png_idat(record.path.read_bytes()) for record in records
         ]
 
     def test_convert_runs_once_per_page_with_an_outputstream(
@@ -560,7 +503,7 @@ class TestBoundedAssembly:
         reference = tmp_path / "single-convert.pdf"
         reference.write_bytes(reference_bytes)
         assert _media_boxes(merged) == _media_boxes(reference)
-        assert _embedded_streams(merged) == _embedded_streams(reference)
+        assert embedded_streams(merged) == embedded_streams(reference)
 
     def test_merge_leaves_no_single_page_pdf_behind(
         self,
@@ -601,8 +544,8 @@ class TestBoundedAssembly:
 
         pdf_path = assemble_pdf(records, output_dir, filename="duplex.pdf", dpi=300)
 
-        assert _embedded_streams(pdf_path) == [
-            _png_idat_payload(record.path) for record in records
+        assert embedded_streams(pdf_path) == [
+            png_idat(record.path.read_bytes()) for record in records
         ]
 
     def test_a_failing_merge_becomes_pdf_error(
