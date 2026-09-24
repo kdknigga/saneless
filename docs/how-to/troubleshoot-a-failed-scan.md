@@ -136,10 +136,13 @@ Other causes of exit 2, each on one line:
   [`[paperless]`](../reference/configuration.md#paperless).
 - **`paperless.url` not set.** An empty `paperless.url` loads, so `serve` can start and show what
   is missing: the status strip's Paperless row and `saneless doctor` say `The paperless-ngx
-  address has not been set.` A scan that reaches the upload fails with a line saying
-  `paperless.url is not set, or has no http or https scheme`. It is not retried, and nothing is copied to the
-  consume folder even when one is configured: the PDF is kept in `failed/` in the data directory
-  and the line ends with its path. Set the URL, then upload the kept PDF yourself or scan again.
+  address has not been set.` No scan starts while it is empty: `saneless scan` exits 2 before the
+  scanner is opened, with a line ending `the paperless-ngx address in paperless.url has not been
+  set`, and the web UI greys out the Scan button and refuses the scan. Should a scan still reach
+  the upload with no address, it fails with a line saying `paperless.url is not set, or has no
+  http or https scheme`. It is not retried, and nothing is copied to the consume folder even when
+  one is configured: the PDF is kept in `failed/` in the data directory and the line ends with its
+  path. Set the URL, then upload the kept PDF yourself or scan again.
 
 **If an earlier version of saneless ever showed your API token in an error, rotate the token.**
 Earlier versions sent a token with a trailing space or line break -- easy to get from a secret

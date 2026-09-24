@@ -5127,7 +5127,12 @@ def _open_counting_scanner(opens: list[str]) -> type[ScannerBackend]:
     return _CountingScanner
 
 
-def _token_settings(tmp_path: Path, value: str, consume_dir: str = "") -> Settings:
+def _token_settings(
+    tmp_path: Path,
+    value: str,
+    consume_dir: str = "",
+    url: str = "http://localhost:8000",
+) -> Settings:
     """
     Build settings carrying ``value`` as the paperless-ngx token.
 
@@ -5135,6 +5140,7 @@ def _token_settings(tmp_path: Path, value: str, consume_dir: str = "") -> Settin
         tmp_path: The test's own temporary directory.
         value: The configured token, placeholder or not.
         consume_dir: A fallback consume directory, when the test needs one.
+        url: The configured paperless-ngx address; empty means unset.
 
     Returns:
         Settings otherwise identical to the suite's defaults.
@@ -5142,11 +5148,7 @@ def _token_settings(tmp_path: Path, value: str, consume_dir: str = "") -> Settin
     """
     return _make_settings(
         tmp_path,
-        paperless=PaperlessConfig(
-            url="http://localhost:8000",
-            token=value,
-            consume_dir=consume_dir,
-        ),
+        paperless=PaperlessConfig(url=url, token=value, consume_dir=consume_dir),
     )
 
 
@@ -5260,6 +5262,53 @@ class TestScanTokenRefusal:
         assert result.exit_code == 2
         assert secret not in result.output
         assert secret not in result.stderr
+
+    def test_an_unset_url_exits_2_before_the_scanner(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        An empty ``paperless.url`` refuses like a placeholder token.
+
+        The upload would fail for certain, so feeding the stack first would
+        only waste the paper and leave the PDF in ``failed/``.
+        """
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(tmp_path, "a-real-token", url=""),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
+        lines = result.stderr.splitlines()
+        assert lines[0] == (
+            "Scanning 'Tax return' with profile 'default': "
+            "the paperless-ngx address in paperless.url has not been set"
+        )
+        assert lines[1] == f"Try: {error_next_step(ErrorCategory.CONFIG)}"
+
+    def test_a_consume_dir_fallback_does_not_soften_the_unset_url_refusal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """No copy is made for an unset URL, so a scan must not start either."""
+        opens: list[str] = []
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_token_settings(
+                tmp_path, "a-real-token", consume_dir=str(tmp_path), url=""
+            ),
+            scanner_cls=_open_counting_scanner(opens),
+            paperless_cls=_refusing_paperless(),
+        )
+
+        result = runner.invoke(cli, ["scan", "--title", "Tax return"])
+
+        assert result.exit_code == 2, result.output
+        assert opens == []
 
     def test_devices_is_unaffected_by_a_placeholder_token(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

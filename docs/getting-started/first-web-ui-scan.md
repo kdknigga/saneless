@@ -27,7 +27,7 @@ Under the rows, a line says when the checks last ran, in your server's local tim
 
 A red **Configuration** row naming a `config.toml` means saneless found a file under the name it used to read: rename that file to `saneless.toml` and restart saneless, and the row goes green with your settings loaded.
 
-These are the same checks `saneless doctor` prints from a terminal. If the Paperless row is red because the API token has not been set, the **Scan** button is greyed out with the reason beneath it, and no scan can start until the token is fixed in the config file.
+These are the same checks `saneless doctor` prints from a terminal. If the Paperless row is red because the API token or the paperless-ngx address has not been set, the **Scan** button is greyed out with the reason beneath it, and no scan can start until the config file is fixed.
 
 ## Fill in scan details
 

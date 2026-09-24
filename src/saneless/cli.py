@@ -159,6 +159,8 @@ _FLIP_PROMPT = (
 # a hardcoded credential. This is vocabulary.py's `_REJECTED_WIRE_VALUE` idiom
 # rather than a suppression.
 _UNSET_CREDENTIAL_PROBLEM = "the paperless-ngx API token has not been set"
+# The same refusal for an empty paperless.url, which names the setting.
+_UNSET_ADDRESS_PROBLEM = "the paperless-ngx address in paperless.url has not been set"
 
 
 # Whether a human can answer a prompt here, behind a function of its own rather
@@ -699,11 +701,17 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # `<what saneless was doing>: <problem>` shape because ErrorCategory.CONFIG
     # prints the exception as-is (_failure_line), so the "what saneless was
     # doing" half has to be part of the message.
+    #
+    # An empty paperless.url is refused here for the same reason: the upload
+    # would fail for certain as a configuration error, and no consume-folder
+    # copy is made for it, so the stack would be fed for a PDF in failed/.
+    unset = None
     if is_placeholder_token(settings.paperless.token.get_secret_value()):
-        msg = (
-            f"Scanning '{resolved_title}' with profile '{profile}': "
-            f"{_UNSET_CREDENTIAL_PROBLEM}"
-        )
+        unset = _UNSET_CREDENTIAL_PROBLEM
+    elif not settings.paperless.url:
+        unset = _UNSET_ADDRESS_PROBLEM
+    if unset is not None:
+        msg = f"Scanning '{resolved_title}' with profile '{profile}': {unset}"
         raise ConfigError(msg)
 
     manual_duplex = settings.profiles[profile].duplex == "manual"

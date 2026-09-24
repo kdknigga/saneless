@@ -38,6 +38,7 @@ from saneless.vocabulary import (
     TERMINAL_STATES,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
+    URL_UNSET_JOB_ERROR,
     WARNED_UPLOAD_LABEL,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
@@ -930,6 +931,12 @@ _REJECTION_MESSAGES: list[tuple[RequestRejection, str]] = [
         "restart saneless.",
     ),
     (
+        RequestRejection.URL_UNSET,
+        "The paperless-ngx address has not been set, so the scan was not "
+        "started. Set paperless.url in the saneless config file, then restart "
+        "saneless.",
+    ),
+    (
         RequestRejection.UNKNOWN_PROFILE,
         "That scan profile does not exist. Reload the page to see the current "
         "profiles.",
@@ -972,6 +979,7 @@ _REJECTION_STATUS_CODES: list[tuple[RequestRejection, int]] = [
     (RequestRejection.WORKER_DOWN, 503),
     (RequestRejection.WORKER_DEGRADED, 503),
     (RequestRejection.TOKEN_UNSET, 503),
+    (RequestRejection.URL_UNSET, 503),
     (RequestRejection.UNKNOWN_PROFILE, 422),
     (RequestRejection.TITLE_TOO_LONG, 422),
     (RequestRejection.INVALID_REQUEST, 422),
@@ -987,6 +995,7 @@ _JOB_ROW_TEXTS: list[str] = [
     WORKER_DOWN_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     TOKEN_UNSET_JOB_ERROR,
+    URL_UNSET_JOB_ERROR,
     RESTART_REASON,
 ]
 
@@ -1001,6 +1010,7 @@ class TestRequestRejection:
             "WORKER_DOWN",
             "WORKER_DEGRADED",
             "TOKEN_UNSET",
+            "URL_UNSET",
             "UNKNOWN_PROFILE",
             "TITLE_TOO_LONG",
             "INVALID_REQUEST",

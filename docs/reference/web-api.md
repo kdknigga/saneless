@@ -299,6 +299,7 @@ One sentence per kind of refusal, and every sentence is a fixed developer consta
 | `WORKER_DOWN` | 503 | The scan service is not running, so the scan was not started. Restart saneless, then try again. |
 | `WORKER_DEGRADED` | 503 | Job history cannot be saved right now, so the scan was not started. Check the server's free disk space and log, then try again. |
 | `TOKEN_UNSET` | 503 | The paperless-ngx API token has not been set, so the scan was not started. Put a real API token in the saneless config file, then restart saneless. |
+| `URL_UNSET` | 503 | The paperless-ngx address has not been set, so the scan was not started. Set paperless.url in the saneless config file, then restart saneless. |
 | `UNKNOWN_PROFILE` | 422 | That scan profile does not exist. Reload the page to see the current profiles. |
 | `TITLE_TOO_LONG` | 422 | The title is too long. Shorten it to 256 characters or fewer. |
 | `INVALID_REQUEST` | 422 | The request was not valid. Reload the page, then try again. |
@@ -311,6 +312,8 @@ One sentence per kind of refusal, and every sentence is a fixed developer consta
 **`TOKEN_UNSET` is new, and it is deliberately not `WORKER_DEGRADED`.** The scan service is working perfectly well; nobody set the paperless-ngx API token. Saying "the scan service was unavailable" would send a household member looking for a broken server, so the refusal says what is actually wrong and which file fixes it. A placeholder token counts as unset: saneless keeps a small fixed list of literals such as `changeme` and `your-api-token-here`, and an empty or whitespace-only token is the same case. See [Docker: placeholder tokens are detected](docker.md#placeholder-tokens-are-detected).
 
 While the token is unset the Scan button also renders disabled with the reason beneath it, and the status strip's Paperless row is red. The button is a courtesy; the route guard is the enforcement, so a direct `POST /api/scan` is refused just the same. Like `QUEUE_FULL`, `WORKER_DOWN` and `WORKER_DEGRADED`, a `TOKEN_UNSET` refusal records the attempt in job history as a failed job -- `Not started: the paperless-ngx API token has not been set` -- so an attempt that never scanned is still visible.
+
+**`URL_UNSET` is the same refusal for an empty `paperless.url`.** An empty address loads, so `serve` can start and the status strip's Paperless row can say `The paperless-ngx address has not been set.`, but an upload to it is certain to fail, and no copy is made to the consume directory for it. So the Scan button renders disabled with its own reason, `POST /api/scan` is refused, and the attempt is recorded as `Not started: the paperless-ngx address has not been set`. When the token is unset as well, `TOKEN_UNSET` is the one reported.
 
 ---
 

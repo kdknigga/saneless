@@ -35,9 +35,11 @@ __all__ = [
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
     "SCAN_BLOCKED_REASON",
+    "SCAN_BLOCKED_URL_REASON",
     "TERMINAL_STATES",
     "TITLE_MAX_LENGTH",
     "TOKEN_UNSET_JOB_ERROR",
+    "URL_UNSET_JOB_ERROR",
     "WARNED_UPLOAD_LABEL",
     "WORKER_DEGRADED_JOB_ERROR",
     "WORKER_DOWN_JOB_ERROR",
@@ -404,6 +406,10 @@ class RequestRejection(StrEnum):
     # service is fine and nobody set the paperless-ngx API token.  Sharing the
     # member would send a household member looking for a broken server.
     TOKEN_UNSET = _UNSET_REJECTION_VALUE
+    # The same refusal for the other half of an unconfigured paperless-ngx: an
+    # empty ``paperless.url``.  Its own member so the sentence names the
+    # setting to fill in rather than the token.
+    URL_UNSET = "URL_UNSET"
     UNKNOWN_PROFILE = "UNKNOWN_PROFILE"
     TITLE_TOO_LONG = "TITLE_TOO_LONG"
     INVALID_REQUEST = "INVALID_REQUEST"
@@ -420,8 +426,8 @@ class RequestRejection(StrEnum):
 TITLE_MAX_LENGTH: Final = 256
 
 # Job-row error texts.  A submit refused because the queue was full, the
-# worker was down or degraded, or the paperless-ngx API token was never set
-# still writes a job row, so history shows the attempt; these are that row's
+# worker was down or degraded, or the paperless-ngx API token or address was
+# never set still writes a job row, so history shows the attempt; these are that row's
 # ``error``.  Like every other ``job.error`` they carry no trailing period.
 QUEUE_FULL_JOB_ERROR: Final = "Not started: the scan queue was full"
 WORKER_DOWN_JOB_ERROR: Final = "Not started: the scan service was not running"
@@ -435,6 +441,7 @@ _UNSET_CREDENTIAL_JOB_ERROR = (
     "Not started: the paperless-ngx API token has not been set"
 )
 TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
+URL_UNSET_JOB_ERROR: Final = "Not started: the paperless-ngx address has not been set"
 
 # Why the Scan button is greyed out, rendered as a line beneath it.  It
 # deliberately does not repeat the fix: the status strip's Paperless row, a few
@@ -448,6 +455,10 @@ TOKEN_UNSET_JOB_ERROR: Final = _UNSET_CREDENTIAL_JOB_ERROR
 # same one ``web/routes.py``'s paused-checks prefix already uses.
 SCAN_BLOCKED_REASON: Final = (
     "The paperless-ngx API token has not been set — see System status above."
+)
+# The same line when the token is set but ``paperless.url`` is empty.
+SCAN_BLOCKED_URL_REASON: Final = (
+    "The paperless-ngx address has not been set — see System status above."
 )
 
 # What startup recovery passes to ``JobStore.fail_active_jobs`` for a job the
@@ -1161,6 +1172,13 @@ def rejection_message(rejection: RequestRejection) -> str:
                 "not started. Put a real API token in the saneless config "
                 "file, then restart saneless."
             )
+        case RequestRejection.URL_UNSET:
+            message = (
+                # Names the setting, never its value (ASVS V7).
+                "The paperless-ngx address has not been set, so the scan was "
+                "not started. Set paperless.url in the saneless config file, "
+                "then restart saneless."
+            )
         case RequestRejection.UNKNOWN_PROFILE:
             message = (
                 "That scan profile does not exist. Reload the page to see the "
@@ -1215,6 +1233,7 @@ def rejection_status_code(rejection: RequestRejection) -> int:
             RequestRejection.WORKER_DOWN
             | RequestRejection.WORKER_DEGRADED
             | RequestRejection.TOKEN_UNSET
+            | RequestRejection.URL_UNSET
         ):
             status_code = 503
         case (

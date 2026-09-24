@@ -42,6 +42,7 @@ from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
+    URL_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ErrorCategory,
@@ -1290,6 +1291,7 @@ def _appliance_with_credential(
     credential: str,
     *,
     consume_dir: str = "",
+    url: str | None = None,
 ) -> Generator[TestClient]:
     """
     Serve one app whose paperless-ngx credential is exactly ``credential``.
@@ -1304,6 +1306,7 @@ def _appliance_with_credential(
         scanner: The stub backend the served worker drives.
         credential: The paperless-ngx token this appliance is configured with.
         consume_dir: A configured consume directory, when the test needs one.
+        url: The paperless-ngx address, or None to keep the module's own.
 
     Yields:
         A started TestClient over that app.
@@ -1312,7 +1315,7 @@ def _appliance_with_credential(
     configured = settings.model_copy(
         update={
             "paperless": PaperlessConfig(
-                url=settings.paperless.url,
+                url=settings.paperless.url if url is None else url,
                 token=credential,
                 consume_dir=consume_dir,
             )
@@ -1538,6 +1541,74 @@ class TestPlaceholderTokenRefusal:
             assert response.status_code == 200
             assert 'id="status-area"' in response.text
             assert OWNER_COOKIE in response.headers.get("set-cookie", "")
+
+
+class TestUnsetUrlRefusal:
+    """
+    ``POST /api/scan`` refuses a scan when ``paperless.url`` is empty.
+
+    An empty address loads, so ``serve`` can start and say what is missing,
+    but the upload is certain to fail as a configuration error.  Starting
+    the scan anyway would only pull the stack through the feeder for a PDF
+    that ends in ``failed/``.
+    """
+
+    def test_unset_url_submit_is_503_with_its_own_message(
+        self, web_settings: Settings, web_scanner: StubScannerBackend
+    ) -> None:
+        """The refusal names the address, not the token or the service."""
+        with _appliance_with_credential(
+            web_settings, web_scanner, _ACCEPTED_CREDENTIAL, url=""
+        ) as client:
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Unset Url"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+            body = _error_body(RequestRejection.URL_UNSET, 503, _newest_job_id(client))
+            assert response.text.strip() == f"{body}\n{HISTORY_LOADER}"
+            assert rejection_message(RequestRejection.TOKEN_UNSET) not in response.text
+            _assert_rejected_row(client, URL_UNSET_JOB_ERROR)
+
+    def test_unset_url_refuses_even_with_a_consume_dir_configured(
+        self, web_settings: Settings, web_scanner: StubScannerBackend, tmp_path: Path
+    ) -> None:
+        """No copy is made for an unset URL, so the folder buys no exception."""
+        with _appliance_with_credential(
+            web_settings,
+            web_scanner,
+            _ACCEPTED_CREDENTIAL,
+            consume_dir=str(tmp_path),
+            url="",
+        ) as client:
+            response = client.post(
+                "/api/scan", data={"profile": "default", "title": "Raw Post"}
+            )
+            _assert_json_error(response, RequestRejection.URL_UNSET, 503)
+            _assert_rejected_row(client, URL_UNSET_JOB_ERROR)
+
+    def test_unset_url_refuses_before_any_job_is_offered_to_the_worker(
+        self,
+        web_settings: Settings,
+        web_scanner: StubScannerBackend,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One row exists, and it is the refusal."""
+        with _appliance_with_credential(
+            web_settings, web_scanner, _ACCEPTED_CREDENTIAL, url=""
+        ) as client:
+            offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": "Never Offered"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+            assert offered == []
+            rows = _job_store(client).list_recent(limit=50)
+            assert len(rows) == 1
+            assert rows[0].error_category is ErrorCategory.REJECTED
 
 
 # --- The client half: htmx-config meta and the #status-message slot ----------

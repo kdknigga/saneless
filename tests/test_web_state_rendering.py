@@ -128,7 +128,12 @@ _REAL_CREDENTIAL = "test-token"
 _SHIPPED_PLACEHOLDER = "changeme"
 
 
-def _make_app(tmp_path: Path, *, credential: str = _REAL_CREDENTIAL) -> FastAPI:
+def _make_app(
+    tmp_path: Path,
+    *,
+    credential: str = _REAL_CREDENTIAL,
+    url: str = "http://localhost:8000",
+) -> FastAPI:
     """
     Build a real app with a stub scanner and no network calls, not yet started.
 
@@ -137,6 +142,8 @@ def _make_app(tmp_path: Path, *, credential: str = _REAL_CREDENTIAL) -> FastAPI:
         credential: The paperless-ngx token this appliance is configured with.
             The default is a real one; pass `_SHIPPED_PLACEHOLDER` for the
             blocked-Scan-button case (UI-SPEC S8).
+        url: The paperless-ngx address; empty means unset, which blocks the
+            Scan button too.
 
     Returns:
         The app, whose lifespan (and so its worker) starts with its TestClient.
@@ -144,7 +151,7 @@ def _make_app(tmp_path: Path, *, credential: str = _REAL_CREDENTIAL) -> FastAPI:
     """
     settings = Settings(
         scanner=ScannerConfig(device="test:device:001"),
-        paperless=PaperlessConfig(url="http://localhost:8000", token=credential),
+        paperless=PaperlessConfig(url=url, token=credential),
         output=OutputConfig(
             tmp_dir=str(tmp_path),
             data_dir=str(tmp_path),
@@ -185,6 +192,13 @@ def blocked_client(tmp_path: Path) -> Iterator[TestClient]:
     there is no runtime setter to reach for (UI-SPEC S8).
     """
     with TestClient(_make_app(tmp_path, credential=_SHIPPED_PLACEHOLDER)) as tc:
+        yield tc
+
+
+@pytest.fixture
+def url_unset_client(tmp_path: Path) -> Iterator[TestClient]:
+    """TestClient over an appliance with a real token and no paperless-ngx address."""
+    with TestClient(_make_app(tmp_path, url="")) as tc:
         yield tc
 
 
@@ -1790,6 +1804,21 @@ class TestScanBlocked:
 
         assert len(rendered) == 1
         assert rendered[0].strip() == _BLOCKED_REASON
+
+    def test_an_unset_url_blocks_the_button_and_names_the_address(
+        self, url_unset_client: TestClient
+    ) -> None:
+        """The second condition that blocks the button gets its own reason."""
+        page = url_unset_client.get("/").text
+        match = _only_scan_button(page)
+        rendered = _REASON_LINE.findall(page)
+
+        assert "disabled" in match.group("attrs")
+        assert _DESCRIBED_BY in match.group("attrs")
+        assert [text.strip() for text in rendered] == [
+            "The paperless-ngx address has not been set \N{EM DASH} "
+            "see System status above."
+        ]
 
     def test_blocked_reason_line_follows_the_button_inside_the_form(
         self, blocked_client: TestClient

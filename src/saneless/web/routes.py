@@ -35,8 +35,10 @@ from saneless.scanner.base import SourceKind, classify_source
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
+    SCAN_BLOCKED_URL_REASON,
     TITLE_MAX_LENGTH,
     TOKEN_UNSET_JOB_ERROR,
+    URL_UNSET_JOB_ERROR,
     WORKER_DEGRADED_JOB_ERROR,
     WORKER_DOWN_JOB_ERROR,
     ErrorCategory,
@@ -54,6 +56,7 @@ from saneless.web.errors import RequestRejected
 if TYPE_CHECKING:
     from starlette.datastructures import State
 
+    from saneless.config import Settings
     from saneless.job import Job, JobStore
     from saneless.paperless import PaperlessClient
     from saneless.web.cache import MetadataCache
@@ -738,7 +741,7 @@ def _status_facts(
         claimed=claimed,
         followed_job_id=followed_job_id,
         owner_token=_presented_owner(request),
-        scan_blocked=is_placeholder_token(settings.paperless.token.get_secret_value()),
+        scan_blocked=_scan_block(settings) is not None,
     )
 
 
@@ -944,6 +947,7 @@ def index(request: Request) -> Response:
     )
 
     status = _status_context(state.worker, state.job_store, _status_facts(request))
+    block = _scan_block(state.settings)
 
     jobs = state.job_store.list_recent(limit=WEB_HISTORY_LIMIT)
 
@@ -972,7 +976,7 @@ def index(request: Request) -> Response:
             # and it never has to exist as an empty placeholder.
             # The template reads the string and decides nothing; the flag that
             # says whether to render it comes from the status context.
-            "scan_blocked_reason": SCAN_BLOCKED_REASON,
+            "scan_blocked_reason": block.reason if block is not None else "",
             # Which optional controls this appliance's form carries.  A
             # configured key and not a per-browser toggle: one appliance, one
             # form shape, and the template renders the controls or leaves them
@@ -1060,6 +1064,60 @@ def _unhealthy_rejection(
         case _:
             assert_never(worker_health)
     return outcome
+
+
+@dataclass(frozen=True, slots=True)
+class _ScanBlock:
+    """
+    Why no scan can start on this appliance, in each form a surface shows it.
+
+    Attributes:
+        rejection: What ``POST /api/scan`` is refused with.
+        job_error: The refused attempt's job-row error.
+        reason: The line beneath the disabled Scan button.
+
+    """
+
+    rejection: RequestRejection
+    job_error: str
+    reason: str
+
+
+_TOKEN_UNSET_BLOCK: Final = _ScanBlock(
+    RequestRejection.TOKEN_UNSET, TOKEN_UNSET_JOB_ERROR, SCAN_BLOCKED_REASON
+)
+_URL_UNSET_BLOCK: Final = _ScanBlock(
+    RequestRejection.URL_UNSET, URL_UNSET_JOB_ERROR, SCAN_BLOCKED_URL_REASON
+)
+
+
+def _scan_block(settings: Settings) -> _ScanBlock | None:
+    """
+    Decide whether paperless-ngx is configured well enough for a scan to start.
+
+    The one place the web layer decides it, so the Scan button, its reason
+    line and the route guard cannot disagree.  A placeholder token is named
+    first, then an empty ``paperless.url``, matching the status strip's
+    Paperless row.
+
+    This is the web layer's third place that unwraps the configured token,
+    after the PaperlessClient build in ``web/app.py`` and the Paperless check
+    in ``checks.py``.  The value goes to the predicate and nowhere else: it is
+    never logged, rendered, echoed or put in the job row, whose text names the
+    problem and the file to edit and never the secret (ASVS V7).
+
+    Args:
+        settings: The settings the process started with.
+
+    Returns:
+        The block, or None when a scan may start.
+
+    """
+    if is_placeholder_token(settings.paperless.token.get_secret_value()):
+        return _TOKEN_UNSET_BLOCK
+    if not settings.paperless.url:
+        return _URL_UNSET_BLOCK
+    return None
 
 
 def _record_refused_submit(
@@ -1241,16 +1299,13 @@ def start_scan(
     # htmx response handling and the history reload behave identically; a 4xx
     # would imply the request was at fault, which it was not.
     #
-    # This is the web layer's third place that unwraps the configured token,
-    # after the PaperlessClient build in ``web/app.py`` and the Paperless check
-    # in ``checks.py``.  The value goes to the predicate and nowhere else: it is
-    # never logged, rendered, echoed or put in the job row, whose text names the
-    # problem and the file to edit and never the secret (ASVS V7).
-    if is_placeholder_token(state.settings.paperless.token.get_secret_value()):
-        written = _record_refused_submit(
-            state.job_store, form, error=TOKEN_UNSET_JOB_ERROR
-        )
-        raise RequestRejected(RequestRejection.TOKEN_UNSET, job_id=written)
+    # An empty ``paperless.url`` is refused the same way: the upload would
+    # fail for certain as a configuration error, and no consume-folder copy is
+    # made for it, so the stack would be fed for a PDF that ends in failed/.
+    block = _scan_block(state.settings)
+    if block is not None:
+        written = _record_refused_submit(state.job_store, form, error=block.job_error)
+        raise RequestRejected(block.rejection, job_id=written)
 
     unhealthy = _unhealthy_rejection(state.worker.health)
     if unhealthy is not None:
