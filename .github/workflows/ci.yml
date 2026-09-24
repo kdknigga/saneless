@@ -1,4 +1,4 @@
-# SHAs resolved 2026-09-18 via gh api; comments must carry the full version.
+# SHAs resolved 2026-09-24 via gh api; comments must carry the full version.
 name: CI
 
 on:
@@ -16,6 +16,9 @@ on:
   #     release run is never cancelled by this block.
   #   * The `browser` job becomes part of the release gate, costing one
   #     Chromium download per release. That is D-16's intent, not an accident.
+  #   * The `docker` job becomes part of the release gate too, so no image
+  #     or package is published until this commit's image has been built and
+  #     has passed the smoke checks.
   #   * This workflow reads no secrets, so no caller ever needs
   #     `secrets: inherit`. Keep it that way.
   workflow_call:
@@ -142,3 +145,36 @@ jobs:
       # the path is the one the install step above wrote Chromium to.
       - name: Browser tests with an empty HOME
         run: uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser
+
+  # Every pull request builds the image and runs it, so a Dockerfile that
+  # cannot build (one missing libsane-dev, say) or an image that misbehaves is
+  # red before merge. Because release.yml calls this workflow, publishing waits
+  # for this job as well. The checks live in scripts/smoke_image.py rather
+  # than in inline YAML, so every caller runs the same ones.
+  #
+  # The image is loaded into the runner's engine and never pushed. The GHA
+  # layer cache it writes is scoped to the ref that ran it; in a release run
+  # that is the tag, so publish-docker's rebuild of the same commit reuses
+  # these smoke-tested layers. setup-buildx provides the docker-container
+  # driver, which that cache needs.
+  docker:
+    name: docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions: {contents: read}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: {persist-credentials: false}
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          push: false
+          load: true
+          context: .
+          tags: saneless:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # uv supplies the project's Python for the script. The runner's system
+      # python3 is older than the syntax the formatter writes.
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - run: uv run --no-project python scripts/smoke_image.py saneless:ci
