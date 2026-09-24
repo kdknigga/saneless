@@ -15,6 +15,7 @@ import re
 from typing import TYPE_CHECKING
 
 import pytest
+
 from scripts.release_gate import GateError, check, main
 
 if TYPE_CHECKING:
