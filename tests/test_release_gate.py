@@ -228,6 +228,36 @@ def test_non_semver_tag_routes_by_version_and_warns(
     assert "semver" in err.lower()
 
 
+@pytest.mark.parametrize(
+    ("tag", "declared"),
+    [
+        ("v0.2.0-rc.06", "0.2.0-rc.6"),
+        ("vv0.2.0", "0.2.0"),
+        ("v0.2", "0.2.0"),
+        ("v0!0.2.0.0", "0.2.0"),
+    ],
+)
+def test_a_tag_the_image_tagger_rejects_passes_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    tag: str,
+    declared: str,
+) -> None:
+    """
+    A PEP 440 match that strict semver rejects is flagged in the log.
+
+    Each tag names the declared version, but none is a valid semver string (a
+    leading zero in a numeric pre-release identifier, a doubled ``v``, a
+    missing patch number, an epoch), so the image tagger publishes no tag for
+    it and the image publish fails before anything reaches the index.
+    """
+    code, _ = _run(monkeypatch, tmp_path, tag, declared)
+
+    assert code == 0
+    assert "semver" in capsys.readouterr().err.lower()
+
+
 def test_semver_tag_produces_no_warning(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

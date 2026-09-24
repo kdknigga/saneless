@@ -34,11 +34,16 @@ from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
+# One pre-release identifier as the semver grammar defines it: a number with
+# no leading zero, or an alphanumeric identifier. ``rc.06`` is not valid
+# semver, so the image tagging action emits no tag for it.
+_PRERELEASE_ID = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+
 # The tag shape docker/metadata-action's semver patterns accept:
 # MAJOR.MINOR.PATCH, an optional ``-prerelease`` and an optional ``+build``.
 _SEMVER = re.compile(
     r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
-    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    rf"(?:-{_PRERELEASE_ID}(?:\.{_PRERELEASE_ID})*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
 
