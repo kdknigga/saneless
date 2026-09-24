@@ -60,11 +60,13 @@ operator copies, not what a YAML parser makes of it. The first is the
 floor-to-lock guard at the foot of this file, which parses ``uv.lock`` with
 ``tomllib`` because that file is machine-generated, is copied by nobody, and
 hides the one failure a line scanner cannot see -- two ``[[package]]`` entries
-for a single declared name. The second is the published-image guard, which
-reads ``project.version`` from ``pyproject.toml`` and parses it with
-``packaging``: whether the version is a release candidate or a final release
-decides which image tag exists, and PEP 440 is not something to re-implement
-with a regular expression.
+for a single declared name. The second is ``packaging``, used wherever a guard
+has to decide what a version or a version range means: the published-image
+guard reads ``project.version`` to tell a release candidate from a final
+release, the uv guard asks whether each pinned uv lies inside the declared
+``required-version`` range, and the interpreter guard asks whether
+``.python-version`` satisfies ``requires-python``. PEP 440 ordering and range
+membership are not things to re-implement with a regular expression.
 """
 
 from __future__ import annotations
@@ -86,7 +88,9 @@ from pathlib import Path
 import pytest
 
 # The other parsing import: the published-image guard parses the project
-# version with it to tell a release candidate from a final release.
+# version with it to tell a release candidate from a final release, and the
+# uv and interpreter guards test version-range membership with it.
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
 from saneless.checks import CheckKey, check_name
@@ -3253,9 +3257,10 @@ _REQUIREMENT = re.compile(
     r">=(?P<floor>[^,;\s]+)$"
 )
 
-# The leading distribution name of a ``[tool.uv]`` constraint string, which
-# carries an upper bound rather than a floor and so cannot use the pattern
-# above.
+# The leading distribution name of any requirement string, whatever follows
+# it. A ``[tool.uv]`` constraint carries an upper bound rather than a floor and
+# so cannot use the pattern above, and the duplicate-declaration guard needs
+# the name of every requirement, floor or not.
 _CONSTRAINT_NAME = re.compile(r"^(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)")
 
 # The anyio ceiling, written once and spelled from the same pair, so loosening
@@ -3308,9 +3313,14 @@ def _declared_requirements() -> list[tuple[str, str]]:
     """
     Return every declared requirement paired with the table it was declared in.
 
+    Every dependency group is read, not a named one: a group added later
+    carries floors into the lock just as ``dev`` does, and a guard that listed
+    its groups by name would pass over a new one without a word.
+
     Returns:
         ``(where, spec)`` pairs covering ``[project].dependencies`` and then
-        ``[dependency-groups].dev``, each in its declared order.
+        each ``[dependency-groups]`` table in file order, each labelled
+        ``[dependency-groups].<group>`` and listed in its declared order.
 
     """
     pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
@@ -3318,11 +3328,12 @@ def _declared_requirements() -> list[tuple[str, str]]:
         ("[project].dependencies", spec)
         for spec in pyproject["project"]["dependencies"]
     ]
-    dev = [
-        ("[dependency-groups].dev", spec)
-        for spec in pyproject["dependency-groups"]["dev"]
+    groups = [
+        (f"[dependency-groups].{group}", spec)
+        for group, specs in pyproject["dependency-groups"].items()
+        for spec in specs
     ]
-    return project + dev
+    return project + groups
 
 
 def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
@@ -3347,8 +3358,8 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
     versions named, because which one a wheel install would land on is a
     decision and not something a guard may guess.
 
-    Scope is ``[project].dependencies`` and ``[dependency-groups].dev``.
-    ``[tool.uv].constraint-dependencies`` is deliberately outside that scope:
+    Scope is ``[project].dependencies`` and every ``[dependency-groups]``
+    table. ``[tool.uv].constraint-dependencies`` is deliberately outside that scope:
     it holds ceilings rather than floors, so there is no floor in it to compare
     for equality, and the pattern above would reject its one entry as
     uncomparable. That entry is covered instead by
@@ -3485,6 +3496,88 @@ def test_the_anyio_ceiling_is_declared_and_the_lock_obeys_it() -> None:
     )
 
 
+def test_no_requirement_is_declared_twice() -> None:
+    """
+    No distribution is declared in more than one dependency table.
+
+    A runtime dependency is already installed in every environment that
+    installs the project, so declaring it again in a group adds nothing but
+    a second floor. Two floors for one name drift independently: a bump that
+    moves one leaves the other behind, and which of them a reader believes
+    depends on which table they happened to open. Names are compared in
+    canonical form, so a second spelling with a different separator, case or
+    extras list is the same distribution and is caught.
+    """
+    requirements = _declared_requirements()
+    assert requirements, (
+        f"{PYPROJECT.name} declares no requirements in any table, so this "
+        "guard has nothing to compare"
+    )
+
+    tables: dict[str, list[str]] = {}
+    unnamed: list[str] = []
+    for where, spec in requirements:
+        match = _CONSTRAINT_NAME.match(spec)
+        if match is None:
+            unnamed.append(f'"{spec}" in {where}')
+            continue
+        tables.setdefault(_canonical_name(match.group("name")), []).append(where)
+
+    assert not unnamed, (
+        "these requirements do not start with a distribution name, so this "
+        "guard cannot tell whether they repeat another:\n" + "\n".join(unnamed)
+    )
+    offenders = [
+        f"{name}: {', '.join(where)}"
+        for name, where in sorted(tables.items())
+        if len(where) > 1
+    ]
+    assert not offenders, (
+        f"{PYPROJECT.name} declares a distribution in more than one table. "
+        "Each extra declaration is a second floor that moves independently of "
+        "the first; keep the one in the table that needs it and delete the "
+        "rest:\n" + "\n".join(offenders)
+    )
+
+
+PYTHON_VERSION_FILE = REPO_ROOT / ".python-version"
+
+
+def test_python_version_names_one_interpreter_the_project_supports() -> None:
+    """
+    ``.python-version`` names exactly one interpreter, and the project accepts it.
+
+    uv, setup-uv and pyenv all read this file to choose an interpreter. A
+    second line is not a fallback any of them agree on: uv takes the first,
+    while pyenv puts every listed version on ``PATH``, so the file stops
+    answering "which Python does this repository run on". A version outside
+    ``requires-python`` is worse, because the environment it selects cannot
+    install the project at all. The bound is read from ``requires-python``
+    rather than written here, so raising the project's floor without updating
+    this file fails the suite instead of passing against a stale copy.
+    """
+    name = PYTHON_VERSION_FILE.relative_to(REPO_ROOT)
+    lines = [
+        line.strip()
+        for line in PYTHON_VERSION_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == 1, (
+        f"{name} lists {len(lines)} interpreter versions ({', '.join(lines)}); "
+        "exactly one is expected. uv uses the first line and pyenv exposes "
+        "every line, so more than one leaves the tools disagreeing about "
+        "which Python this repository runs on"
+    )
+
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    supported = SpecifierSet(pyproject["project"]["requires-python"])
+    assert Version(lines[0]) in supported, (
+        f"{name} selects Python {lines[0]}, which {PYPROJECT.name}'s "
+        f'requires-python = "{supported}" rejects, so the interpreter it '
+        "picks cannot install the project"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Phase 36: pinned artifacts and advisory coverage (PIN-02, PIN-05, SEC-01,
 # SEC-03)
@@ -3498,12 +3591,15 @@ UV_BUILD_NAME = "uv_build"
 
 # A step reference to the action that installs uv on a runner.
 SETUP_UV_USES = re.compile(r"^-\s+uses:\s+astral-sh/setup-uv@")
-# A ``version:`` key inside a step's ``with:`` block, quoted or bare.
-WITH_VERSION = re.compile(r"^version:\s*[\"']?(?P<version>[^\"'\s]+)[\"']?$")
+# A ``version:`` or ``version-file:`` key inside a step's ``with:`` block --
+# either one overrides the uv version setup-uv would otherwise read from
+# ``pyproject.toml``.
+WITH_VERSION = re.compile(r"^(?P<key>version(?:-file)?):")
+# The setup-uv steps the workflows carry today. Fewer found means the step
+# scanner stopped recognising them, not that the pins went away.
+MINIMUM_SETUP_UV_STEPS = 5
 # The build-backend requirement as the Dockerfile's uv-stage comment quotes it.
 QUOTED_REQUIRES = re.compile(r'requires = \["(?P<spec>uv_build[^"]+)"\]')
-# The dev group's uv floor. Anchored so it cannot match ``uv-<something>``.
-DEV_UV_FLOOR = re.compile(r"^uv>=(?P<floor>\S+)$")
 # A build-backend requirement split into its floor and its ceiling.
 UV_BUILD_RANGE = re.compile(r"^uv_build>=(?P<floor>[^,]+),<(?P<ceiling>\S+)$")
 
@@ -3531,21 +3627,6 @@ def _workflow_files() -> list[Path]:
     return sorted(
         path for suffix in ("*.yml", "*.yaml") for path in WORKFLOW_DIR.glob(suffix)
     )
-
-
-def _next_minor(version: str) -> str:
-    """
-    Return the lowest version of the minor series above ``version``.
-
-    Args:
-        version: A three-part release version.
-
-    Returns:
-        The first release of the following minor series.
-
-    """
-    major, minor, _patch = version.split(".")
-    return f"{major}.{int(minor) + 1}.0"
 
 
 def _dockerfile_uv_version() -> str:
@@ -3641,59 +3722,75 @@ def test_every_repeated_image_tag_in_the_dockerfile_shares_one_digest() -> None:
     )
 
 
-def test_one_uv_version_spans_the_dockerfile_pyproject_and_workflows() -> None:
+def _pinned_uv_offenders(required: SpecifierSet) -> list[str]:
     """
-    Every surface that names a uv version names the same one (D-09).
+    Return every uv pin that cannot read ``required-version`` and escapes it.
 
-    Before this phase uv was pinned in one place. It is now pinned in four
-    kinds of file, three of which are read by machines that never see the
-    others: the build backend resolves ``uv_build``, the runners resolve
-    ``setup-uv``, and a developer resolves the dev group. A disagreement
-    between them fails nothing where it is introduced -- it surfaces later as
-    a build that works in CI and not locally, or the reverse. ``uv.lock`` is
-    held to the same value independently by the declared-floor guard further
-    up, so the version cannot drift in a fifth place either.
+    Args:
+        required: ``[tool.uv] required-version``, parsed.
+
+    Returns:
+        One line per pin outside the range, naming the file and the pin.
+
     """
-    expected = _dockerfile_uv_version()
+    ceilings = [spec.version for spec in required if spec.operator == "<"]
+    assert len(ceilings) == 1, (
+        f"{PYPROJECT.name} declares required-version = {str(required)!r}, "
+        "which does not carry exactly one '<' upper bound. The ceiling is what "
+        "keeps a new uv minor series from reaching the runners without review, "
+        "and the build backend's ceiling is compared to it"
+    )
+    ceiling = Version(ceilings[0])
     offenders: list[str] = []
+
+    tool_stage = _dockerfile_uv_version()
+    if Version(tool_stage) not in required:
+        offenders.append(
+            f"{DOCKERFILE.relative_to(REPO_ROOT)}: the {UV_IMAGE} tool stage "
+            f"pins {tool_stage}"
+        )
+
+    locked = _locked_versions().get("uv", [])
+    if len(locked) != 1:
+        offenders.append(
+            f"{UV_LOCK.name}: holds {len(locked)} [[package]] entries for uv; "
+            "exactly one is expected"
+        )
+    elif Version(locked[0]) not in required:
+        offenders.append(f"{UV_LOCK.name}: resolves uv {locked[0]}")
 
     specifier = _declared_uv_build_specifier()
     match = UV_BUILD_RANGE.match(specifier)
     assert match is not None, (
         f"{PYPROJECT.name} declares the build backend as {specifier!r}, which "
         "is not the floor-and-ceiling shape this guard compares. Both bounds "
-        "are load-bearing: the floor is what agrees with the pinned uv, the "
-        "ceiling is what makes a bump across a minor surface in review"
+        "are load-bearing: the floor must lie inside required-version and the "
+        "ceiling must equal its upper bound"
     )
-    if match.group("floor") != expected:
+    if Version(match.group("floor")) not in required:
         offenders.append(
-            f"{PYPROJECT.name}: [build-system].requires floors "
-            f"{UV_BUILD_NAME} at {match.group('floor')}"
+            f"{PYPROJECT.name}: [build-system].requires floors {UV_BUILD_NAME} "
+            f"at {match.group('floor')}"
         )
-    if match.group("ceiling") != _next_minor(expected):
+    if Version(match.group("ceiling")) != ceiling:
         offenders.append(
-            f"{PYPROJECT.name}: [build-system].requires caps {UV_BUILD_NAME} "
-            f"at {match.group('ceiling')}, not {_next_minor(expected)}"
+            f"{PYPROJECT.name}: [build-system].requires caps {UV_BUILD_NAME} at "
+            f"{match.group('ceiling')}, but required-version caps uv at {ceiling}"
         )
+    return offenders
 
-    floors = [
-        floor_match.group("floor")
-        for where, spec in _declared_requirements()
-        if where == "[dependency-groups].dev"
-        for floor_match in [DEV_UV_FLOOR.match(spec)]
-        if floor_match is not None
-    ]
-    if len(floors) != 1:
-        offenders.append(
-            f"{PYPROJECT.name}: [dependency-groups].dev declares {len(floors)} "
-            "uv floors; exactly one is expected"
-        )
-    elif floors[0] != expected:
-        offenders.append(
-            f"{PYPROJECT.name}: [dependency-groups].dev floors uv at {floors[0]}"
-        )
 
+def _setup_uv_version_overrides() -> tuple[int, list[str]]:
+    """
+    Scan every setup-uv step for an input that overrides ``required-version``.
+
+    Returns:
+        How many setup-uv steps were found, and one line per ``version:`` or
+        ``version-file:`` input, naming its file and line.
+
+    """
     sites = 0
+    offenders: list[str] = []
     for path in _workflow_files():
         name = path.relative_to(REPO_ROOT)
         lines = _significant_lines(path)
@@ -3703,38 +3800,62 @@ def test_one_uv_version_spans_the_dockerfile_pyproject_and_workflows() -> None:
             sites += 1
             # The next list item ends the step. Indentation cannot be used as
             # the terminator: ``_significant_lines`` has already stripped it.
-            window: list[tuple[int, str]] = []
             for later_number, later_line in lines[index + 1 :]:
                 if later_line.startswith("- "):
                     break
-                window.append((later_number, later_line))
-            declared = [
-                (later_number, version_match.group("version"))
-                for later_number, later_line in window
-                for version_match in [WITH_VERSION.match(later_line)]
-                if version_match is not None
-            ]
-            if len(declared) != 1:
-                offenders.append(
-                    f"{name}:{number}: {line} -- this step declares "
-                    f"{len(declared)} version: keys; exactly one is expected"
-                )
-                continue
-            version_number, version = declared[0]
-            if version != expected:
-                offenders.append(f"{name}:{version_number}: version: {version}")
+                if WITH_VERSION.match(later_line) is not None:
+                    offenders.append(
+                        f"{name}:{later_number}: {later_line} -- the setup-uv "
+                        f"step at line {number} overrides required-version"
+                    )
+    return sites, offenders
 
-    assert sites, (
-        "no astral-sh/setup-uv step was found in any workflow file, so this "
-        "guard has nothing to check. Either the action was replaced, or "
-        f"{WORKFLOW_DIR.relative_to(REPO_ROOT)} is no longer where the "
+
+def test_every_uv_surface_sits_inside_the_required_version_range() -> None:
+    """
+    Every surface that pins uv lies inside ``pyproject.toml``'s declared range.
+
+    ``[tool.uv] required-version`` is the one place the uv version is
+    declared. setup-uv reads it on every runner when a step names no version
+    of its own, and local uv refuses to run outside it, so a ``version:`` or
+    ``version-file:`` input on a setup-uv step is a second source that
+    silently wins on that runner. Those inputs are refused outright.
+
+    Two surfaces cannot read the range and stay pinned: the Dockerfile's uv
+    tool stage and the ``uv_build`` build-backend requirement. The lock pins a
+    third, the ``uv`` the dev environment installs. Each is held inside the
+    range, and the build backend's ceiling must equal the range's, so the
+    backend cannot admit a uv series the rest of the toolchain refuses. Pins
+    are compared to the range rather than to each other: two surfaces that
+    each move to a newer patch release inside it are both correct, even when
+    their updates land in separate commits.
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    declared_range = pyproject.get("tool", {}).get("uv", {}).get("required-version")
+    if declared_range is None:
+        offenders = [
+            f"{PYPROJECT.name}: [tool.uv] declares no required-version, so "
+            "setup-uv has no version to read and local uv enforces none"
+        ]
+    else:
+        offenders = _pinned_uv_offenders(SpecifierSet(declared_range))
+
+    sites, overrides = _setup_uv_version_overrides()
+    offenders.extend(overrides)
+
+    assert sites >= MINIMUM_SETUP_UV_STEPS, (
+        f"only {sites} astral-sh/setup-uv steps were found across the "
+        f"workflows, fewer than the {MINIMUM_SETUP_UV_STEPS} they carry. "
+        "Either the action was replaced, the step scanner stopped matching it, "
+        f"or {WORKFLOW_DIR.relative_to(REPO_ROOT)} is no longer where the "
         "workflows live"
     )
     assert not offenders, (
-        f"a uv version disagrees with the {expected} the Dockerfile's tool "
-        "stage pins. The build backend, the runners and a developer's machine "
-        "each resolve uv separately, so a disagreement here is a toolchain "
-        "that differs between the image, CI and local work:\n" + "\n".join(offenders)
+        f"a uv surface escapes {PYPROJECT.name}'s [tool.uv] required-version. "
+        "That range is the one declaration of the uv this project builds, "
+        "tests and ships with; a pin outside it, or a setup-uv step that "
+        "overrides it, is a toolchain that differs between the image, CI and "
+        "local work:\n" + "\n".join(offenders)
     )
 
 
