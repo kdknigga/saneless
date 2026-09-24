@@ -32,7 +32,7 @@ Set `SANELESS_SCANNER__HOST` in your `docker-compose.yml`:
 ```yaml
 services:
   saneless:
-    image: ghcr.io/kdknigga/saneless:latest
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
     environment:
       - SANELESS_SCANNER__HOST=192.168.1.50
 ```

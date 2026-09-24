@@ -34,7 +34,7 @@ pip install saneless
 The Docker image includes `libsane` and handles `python-sane` compilation automatically:
 
 ```bash
-docker run -p 8080:8080 ghcr.io/kdknigga/saneless
+docker run -p 8080:8080 ghcr.io/kdknigga/saneless:0.2.0-rc.6
 ```
 
 ## Usage

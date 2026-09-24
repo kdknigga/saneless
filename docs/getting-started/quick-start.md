@@ -22,7 +22,7 @@ The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyo
     docker run -p 8080:8080 \
       -v "$(pwd)/config:/etc/saneless" \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
-      ghcr.io/kdknigga/saneless:latest
+      ghcr.io/kdknigga/saneless:0.2.0-rc.6
     ```
 
     Replace `192.168.1.50` with the IP address of the machine running `saned`.

@@ -42,7 +42,7 @@ on that box, and `SANELESS_SCANNER__HOST` pointing at it -- either
     ```yaml
     services:
       saneless:
-        image: ghcr.io/kdknigga/saneless:latest
+        image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
         ports:
           - "8080:8080"
         volumes:
@@ -63,7 +63,7 @@ on that box, and `SANELESS_SCANNER__HOST` pointing at it -- either
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
       -e SANELESS_SCANNER__HOST=host.docker.internal \
-      ghcr.io/kdknigga/saneless:latest
+      ghcr.io/kdknigga/saneless:0.2.0-rc.6
     ```
 
 ## Shape 3 -- Container, scanner on another machine
@@ -79,7 +79,7 @@ machine that has the scanner.
     ```yaml
     services:
       saneless:
-        image: ghcr.io/kdknigga/saneless:latest
+        image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
         ports:
           - "8080:8080"
         volumes:
@@ -100,7 +100,7 @@ machine that has the scanner.
       -v "$(pwd)/config:/etc/saneless" \
       -v saneless-data:/var/lib/saneless \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
-      ghcr.io/kdknigga/saneless:latest
+      ghcr.io/kdknigga/saneless:0.2.0-rc.6
     ```
 
 ## Notes on the container lines above
