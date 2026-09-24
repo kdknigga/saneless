@@ -29,7 +29,7 @@ from saneless.checks import (
     CheckKey,
 )
 from saneless.config import is_placeholder_token, resolve_job_title
-from saneless.exceptions import PaperlessError, describe
+from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
 from saneless.scanner.base import SourceKind, classify_source
 from saneless.vocabulary import (
@@ -464,6 +464,14 @@ def _checks_fallback_context() -> dict[str, object]:
     }
 
 
+# How the web tier logs an exception from the Paperless client, here, in
+# paperless_test and in web/cache.py.  A PaperlessError or ConfigError is logged
+# by its message, which the client builds from fixed words, the credential-free
+# display URL and a token-redacted reason.  Anything else on those paths is
+# logged by class name only and without a traceback, because third-party
+# exception text can carry a URL, a header or a token.  Tracebacks remain only
+# for failures of saneless's own store and templates, which never receive a
+# client exception.
 def _get_cached_or_fetch(
     cache: MetadataCache,
     paperless: PaperlessClient,
@@ -491,7 +499,7 @@ def _get_cached_or_fetch(
     fetch = paperless.get_tags if resource == "tags" else paperless.get_correspondents
     try:
         data = cache.get_or_fetch(resource, fetch)
-    except PaperlessError as exc:
+    except (PaperlessError, ConfigError) as exc:
         logger.warning(
             "Failed to fetch %s from paperless-ngx, using empty list: %s",
             resource,
@@ -502,8 +510,7 @@ def _get_cached_or_fetch(
         logger.warning(
             "Failed to fetch %s from paperless-ngx, using empty list: %s",
             resource,
-            describe(exc),
-            exc_info=True,
+            type(exc).__name__,
         )
         data = []
     return data
@@ -1011,10 +1018,7 @@ def paperless_test(request: Request) -> dict[str, str] | JSONResponse:
         status = request.app.state.paperless.test_connection()
         return {"status": status}
     except Exception as exc:
-        # The class name and not the exception: a configured paperless.url may
-        # carry ``user:pass@`` and httpx2 puts the URL it could not reach in the
-        # exception's string form, which is why every handler in this module
-        # names the class instead (ASVS V7).
+        # Class name only, by the client-exception rule above _get_cached_or_fetch.
         logger.warning("Paperless connection test failed: %s", type(exc).__name__)
         return JSONResponse(
             status_code=502,

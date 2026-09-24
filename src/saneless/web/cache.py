@@ -7,7 +7,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Final
 
-from saneless.exceptions import PaperlessError, describe
+from saneless.exceptions import ConfigError, PaperlessError, describe
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -113,8 +113,8 @@ class MetadataCache:
 
         When ``fetch`` raises and the key has a last good copy, that copy is
         returned and kept for one more TTL, and one warning names the key and
-        the cause: an expected Paperless error without a traceback, anything
-        else with one.  The threads queued behind the failed fetch find the
+        the cause, without a traceback: the message of a Paperless client
+        error, or the class name of anything else.  The threads queued behind the failed fetch find the
         re-armed entry, so an outage costs one failed fetch and one log line
         per TTL rather than one per page load.  The re-arm obeys the same
         invalidate check as a successful fetch; when an invalidate stops it,
@@ -153,21 +153,17 @@ class MetadataCache:
                 stale, re_armed = self._re_arm(key, generation)
                 if stale is None:
                     raise
-                # An expected Paperless error is described by its message
-                # alone; anything else is a surprise and keeps its traceback.
-                traceback = None if isinstance(exc, PaperlessError) else exc
+                # The web tier's client-exception rule, stated above
+                # routes._get_cached_or_fetch.
+                reason = (
+                    describe(exc)
+                    if isinstance(exc, PaperlessError | ConfigError)
+                    else type(exc).__name__
+                )
                 if re_armed:
-                    logger.warning(
-                        _STALE_RE_ARMED,
-                        key,
-                        self._ttl,
-                        describe(exc),
-                        exc_info=traceback,
-                    )
+                    logger.warning(_STALE_RE_ARMED, key, self._ttl, reason)
                 else:
-                    logger.warning(
-                        _STALE_NOT_RE_ARMED, key, describe(exc), exc_info=traceback
-                    )
+                    logger.warning(_STALE_NOT_RE_ARMED, key, reason)
                 return stale
             with self._locks_guard:
                 if self._generations.get(key, 0) == generation:
