@@ -35,6 +35,13 @@ markdown_extensions:
   - def_list
   - tables
 
+# By default mkdocs only logs a dead `page.md#anchor` at INFO, so `--strict` lets
+# it through. At `warn`, `mkdocs build --strict` fails on one. Do not add `-q` to
+# that build: quiet mode drops the warnings and the build exits 0 anyway.
+validation:
+  anchors: warn
+  unrecognized_links: warn
+
 nav:
   - Home: index.md
   - Getting Started:
