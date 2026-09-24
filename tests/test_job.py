@@ -266,7 +266,7 @@ def _build_s2_schema(db_path: str) -> None:
         conn.close()
 
 
-def _build_newer_schema(db_path: str, version: int) -> None:
+def _build_stamped_schema(db_path: str, version: int) -> None:
     """Write a rollback-journal database stamped with the given schema version."""
     conn = sqlite3.connect(db_path)
     try:
@@ -785,7 +785,7 @@ class TestMigrationLadder:
         db_path = str(tmp_path / "newer.db")
         supported = len(job_module._MIGRATIONS)
         newer = supported + 1
-        _build_newer_schema(db_path, newer)
+        _build_stamped_schema(db_path, newer)
 
         with pytest.raises(StorageError, match="newer") as exc_info:
             JobStore(db_path=db_path)
@@ -807,7 +807,7 @@ class TestMigrationLadder:
         would rewrite, so the refusal must come before any statement that writes.
         """
         db_file = tmp_path / "newer.db"
-        _build_newer_schema(str(db_file), len(job_module._MIGRATIONS) + 1)
+        _build_stamped_schema(str(db_file), len(job_module._MIGRATIONS) + 1)
         before = hashlib.sha256(db_file.read_bytes()).hexdigest()
 
         with pytest.raises(StorageError):
@@ -816,6 +816,35 @@ class TestMigrationLadder:
         assert hashlib.sha256(db_file.read_bytes()).hexdigest() == before
         assert not (tmp_path / "newer.db-wal").exists()
         assert not (tmp_path / "newer.db-shm").exists()
+
+    @pytest.mark.parametrize("stamp", [-1, -2, -5, -(2**31)])
+    def test_negative_schema_version_is_refused_and_left_untouched(
+        self, tmp_path: Path, stamp: int
+    ) -> None:
+        """
+        A negative schema version is refused before anything writes to the file.
+
+        user_version is a signed 32-bit field. Unguarded, the ladder indexes
+        its migrations from the end for a negative value: -2 runs the last two
+        steps and commits each before failing, and -5 escapes as a bare
+        IndexError that neither the CLI nor the web lifespan maps.
+        """
+        db_file = tmp_path / "negative.db"
+        _build_stamped_schema(str(db_file), stamp)
+        before = hashlib.sha256(db_file.read_bytes()).hexdigest()
+
+        with pytest.raises(StorageError) as exc_info:
+            JobStore(db_path=str(db_file))
+
+        message = str(exc_info.value)
+        assert str(db_file) in message
+        assert f"schema version {stamp}" in message
+        assert "restore a backup" in message
+        assert "\n" not in message
+        assert exc_info.value.__cause__ is None
+        assert hashlib.sha256(db_file.read_bytes()).hexdigest() == before
+        assert not (tmp_path / "negative.db-wal").exists()
+        assert not (tmp_path / "negative.db-shm").exists()
 
     def test_unusable_non_sqlite_file_is_a_storage_error(self, tmp_path: Path) -> None:
         """

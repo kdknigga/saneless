@@ -442,10 +442,10 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
     A path that cannot be opened (a directory, a missing parent) fails at
     ``connect``; a file that is not SQLite fails at the ``user_version`` read,
     the first statement that reads it.  A database stamped with a schema
-    version newer than this release's migration ladder is refused before any
-    statement that could write to it.  Only this open path is translated: the
-    runtime store methods keep their raw sqlite3 errors, which the web
-    worker's degraded-health handling depends on.
+    version newer than this release's migration ladder, or negative, is
+    refused before any statement that could write to it.  Only this open
+    path is translated: the runtime store methods keep their raw sqlite3
+    errors, which the web worker's degraded-health handling depends on.
 
     Args:
         db_path: Path to the SQLite database file, or ":memory:".
@@ -455,9 +455,9 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
 
     Raises:
         StorageError: If the database cannot be opened or read as SQLite, or
-            if its schema version is newer than this release supports, in
-            which case the file is left exactly as it was found.  The
-            connection, when one was opened, is closed first.
+            if its schema version is newer than this release supports or
+            negative, in which case the file is left exactly as it was
+            found.  The connection, when one was opened, is closed first.
 
     """
     try:
@@ -472,11 +472,21 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
         # The except BaseException arm below closes the connection.
         version: int = conn.execute("PRAGMA user_version").fetchone()[0]
         supported = len(_MIGRATIONS)
+        # user_version is a signed 32-bit field, so a foreign tool can stamp a
+        # negative value. The ladder would index its migrations from the end
+        # for one, so it is refused here with the too-new case.
         if version > supported:
             msg = (
                 f"job database at {db_path} is at schema version {version}, "
                 f"newer than this release supports ({supported}); "
                 "restore a backup or run a newer saneless"
+            )
+            raise StorageError(msg)
+        if version < 0:
+            msg = (
+                f"job database at {db_path} is at schema version {version}, "
+                f"which no saneless release writes (0 to {supported}); "
+                "restore a backup"
             )
             raise StorageError(msg)
         # WAL has to be enabled before the connection switches to explicit
@@ -636,9 +646,9 @@ class JobStore:
 
         Raises:
             StorageError: If the database cannot be opened or read as SQLite,
-                its schema version is newer than this release supports (the
-                file is then left untouched), or its jobs table has an
-                unsupported shape.  Every message names ``db_path``.
+                its schema version is newer than this release supports or
+                negative (the file is then left untouched), or its jobs table
+                has an unsupported shape.  Every message names ``db_path``.
 
         """
         db_path = os.fspath(db_path)
