@@ -32,15 +32,17 @@ import argparse
 import contextlib
 import dataclasses
 import http.client
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, LiteralString
+from typing import TYPE_CHECKING, Any, LiteralString
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -380,8 +382,88 @@ def check_no_cannot_write(engine: Engine) -> None:
         raise SmokeFailure(msg)
 
 
+def _archived_healthcheck(archive: Path) -> list[str] | None:
+    """
+    Read the HEALTHCHECK test from an image saved as an OCI archive.
+
+    Args:
+        archive: The ``oci-archive`` file the engine wrote.
+
+    Returns:
+        The HEALTHCHECK ``Test`` array, or ``None`` when the image has none.
+
+    Raises:
+        SmokeFailure: The archive is not a single-image OCI layout.
+
+    """
+
+    def blob(tar: tarfile.TarFile, digest: str) -> dict[str, Any]:
+        member = tar.extractfile(f"blobs/sha256/{digest.removeprefix('sha256:')}")
+        if member is None:
+            msg = f"no blob {digest} in the saved image"
+            raise SmokeFailure(msg)
+        return json.load(member)
+
+    try:
+        with tarfile.open(archive) as tar:
+            member = tar.extractfile("index.json")
+            if member is None:
+                msg = "no index.json in the saved image"
+                raise SmokeFailure(msg)
+            index = json.load(member)
+            manifest = blob(tar, index["manifests"][0]["digest"])
+            config = blob(tar, manifest["config"]["digest"])
+    except (KeyError, IndexError, tarfile.TarError, json.JSONDecodeError) as exc:
+        msg = f"cannot read the saved image: {exc!r}"
+        raise SmokeFailure(msg) from exc
+    test = config.get("config", {}).get("Healthcheck", {}).get("Test")
+    return test if isinstance(test, list) else None
+
+
+def _podman_health_cmd(engine: Engine) -> str | None:
+    """
+    Recover an image HEALTHCHECK that Podman cannot see, as ``--health-cmd``.
+
+    Podman applies a HEALTHCHECK only from a Docker-format image config. An
+    OCI-format image (what a registry push from BuildKit produces) still
+    carries the HEALTHCHECK in its config blob, but Podman drops it, so the
+    container would have none. In that case the image is saved as an OCI
+    archive and its own HEALTHCHECK test is read back from the config blob, to
+    be passed to ``run`` verbatim. The probe is still the image's own command;
+    nothing here writes one.
+
+    Args:
+        engine: The Podman engine and the image under test.
+
+    Returns:
+        The image's HEALTHCHECK test as a JSON array, or ``None`` when Podman
+        already sees it or the image defines none.
+
+    Raises:
+        SmokeFailure: The image could not be inspected or saved.
+
+    """
+    seen = engine.sh(
+        'exec "$SMOKE_DOCKER" image inspect --format "{{json .HealthCheck}}" '
+        '"$SMOKE_IMAGE"'
+    )
+    _require_success(seen, "inspecting the image's healthcheck")
+    if seen.stdout.strip() not in {"", "null"}:
+        return None
+    with tempfile.TemporaryDirectory(prefix="saneless-smoke-") as scratch:
+        archive = Path(scratch) / "image.tar"
+        saved = engine.sh(
+            'exec "$SMOKE_DOCKER" save --format oci-archive -o "$SMOKE_ARCHIVE" '
+            '"$SMOKE_IMAGE"',
+            archive=str(archive),
+        )
+        _require_success(saved, "saving the image to read its healthcheck")
+        test = _archived_healthcheck(archive)
+    return json.dumps(test) if test else None
+
+
 @contextlib.contextmanager
-def _served(engine: Engine) -> Generator[str]:
+def _served(engine: Engine, health_cmd: str | None = None) -> Generator[str]:
     """
     Run the image's default command detached, and always remove it after.
 
@@ -390,6 +472,8 @@ def _served(engine: Engine) -> Generator[str]:
 
     Args:
         engine: The engine and image under test.
+        health_cmd: The image's own HEALTHCHECK test, when the engine could
+            not read it from the image itself.
 
     Yields:
         The container's name.
@@ -400,12 +484,22 @@ def _served(engine: Engine) -> Generator[str]:
     """
     name = _container_name()
     try:
-        started = engine.sh(
-            'exec "$SMOKE_DOCKER" run -d --name "$SMOKE_NAME" --health-interval=1s '
-            '-p "127.0.0.1::$SMOKE_PORT" "$SMOKE_IMAGE"',
-            name=name,
-            port=str(_PORT),
-        )
+        if health_cmd is None:
+            started = engine.sh(
+                'exec "$SMOKE_DOCKER" run -d --name "$SMOKE_NAME" '
+                '--health-interval=1s -p "127.0.0.1::$SMOKE_PORT" "$SMOKE_IMAGE"',
+                name=name,
+                port=str(_PORT),
+            )
+        else:
+            started = engine.sh(
+                'exec "$SMOKE_DOCKER" run -d --name "$SMOKE_NAME" '
+                '--health-cmd "$SMOKE_HEALTH_CMD" --health-interval=1s '
+                '-p "127.0.0.1::$SMOKE_PORT" "$SMOKE_IMAGE"',
+                name=name,
+                port=str(_PORT),
+                health_cmd=health_cmd,
+            )
         _require_success(started, "starting the served container")
         yield name
     finally:
@@ -471,7 +565,8 @@ def check_healthcheck(engine: Engine) -> str:
         SmokeFailure: It was not healthy before the deadline.
 
     """
-    with _served(engine) as name:
+    health_cmd = _podman_health_cmd(engine) if engine.podman else None
+    with _served(engine, health_cmd) as name:
         start = time.monotonic()
         deadline = start + engine.health_seconds
         said = ""
