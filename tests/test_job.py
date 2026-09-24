@@ -8,6 +8,7 @@ STOR-05, APPL-08, APPL-09.
 from __future__ import annotations
 
 import ast
+import hashlib
 import inspect
 import sqlite3
 import threading
@@ -260,6 +261,18 @@ def _build_s2_schema(db_path: str) -> None:
             correspondent INTEGER, thumbnail TEXT, created_at TEXT NOT NULL
         )"""
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _build_newer_schema(db_path: str, version: int) -> None:
+    """Write a rollback-journal database stamped with the given schema version."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY)")
+        # A PRAGMA argument cannot be bound; version is an int from the caller.
+        conn.execute(f"PRAGMA user_version = {version}")
         conn.commit()
     finally:
         conn.close()
@@ -766,6 +779,43 @@ class TestMigrationLadder:
 
         assert str(exc_info.value).startswith(f"job database at {db_path} ")
         assert exc_info.value.__cause__ is None
+
+    def test_newer_schema_database_is_refused(self, tmp_path: Path) -> None:
+        """A database written by a newer release is refused with a precise message."""
+        db_path = str(tmp_path / "newer.db")
+        supported = len(job_module._MIGRATIONS)
+        newer = supported + 1
+        _build_newer_schema(db_path, newer)
+
+        with pytest.raises(StorageError, match="newer") as exc_info:
+            JobStore(db_path=db_path)
+
+        message = str(exc_info.value)
+        assert db_path in message
+        assert f"schema version {newer}" in message
+        assert f"({supported})" in message
+        assert "restore a backup" in message
+        assert "run a newer saneless" in message
+        assert "\n" not in message
+        assert exc_info.value.__cause__ is None
+
+    def test_newer_schema_database_is_left_untouched(self, tmp_path: Path) -> None:
+        """
+        A refused newer database is left exactly as it was found.
+
+        The fixture stays in rollback-journal mode, whose header the WAL pragma
+        would rewrite, so the refusal must come before any statement that writes.
+        """
+        db_file = tmp_path / "newer.db"
+        _build_newer_schema(str(db_file), len(job_module._MIGRATIONS) + 1)
+        before = hashlib.sha256(db_file.read_bytes()).hexdigest()
+
+        with pytest.raises(StorageError):
+            JobStore(db_path=str(db_file))
+
+        assert hashlib.sha256(db_file.read_bytes()).hexdigest() == before
+        assert not (tmp_path / "newer.db-wal").exists()
+        assert not (tmp_path / "newer.db-shm").exists()
 
     def test_unusable_non_sqlite_file_is_a_storage_error(self, tmp_path: Path) -> None:
         """
