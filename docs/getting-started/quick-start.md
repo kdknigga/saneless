@@ -22,7 +22,7 @@ The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyo
     docker run -p 8080:8080 \
       -v "$(pwd)/config:/etc/saneless" \
       -e SANELESS_SCANNER__HOST=192.168.1.50 \
-      ghcr.io/kdknigga/saneless:latest
+      ghcr.io/kdknigga/saneless:0.2.0-rc.6
     ```
 
     Replace `192.168.1.50` with the IP address of the machine running `saned`.
@@ -44,10 +44,10 @@ The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyo
     sudo dnf install sane-backends-devel
     ```
 
-    Then install saneless with pipx:
+    Then install saneless with pipx. saneless is not yet published on PyPI, so this installs the current default branch from GitHub:
 
     ```bash
-    pipx install saneless
+    pipx install git+https://github.com/kdknigga/saneless
     ```
 
     Start the web server:

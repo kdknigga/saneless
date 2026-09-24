@@ -55,12 +55,16 @@ decide what ships; the published wheel's metadata still carries them, so they
 remain the only thing a downstream non-lock install obeys (DEP-12, DEP-13,
 D-09, D-10, D-11, D-17).
 
-Plain-text assertions, with one stated exception: the contract is what an
-operator copies, not what a YAML parser makes of it. The exception is the
+Plain-text assertions, with two stated exceptions: the contract is what an
+operator copies, not what a YAML parser makes of it. The first is the
 floor-to-lock guard at the foot of this file, which parses ``uv.lock`` with
 ``tomllib`` because that file is machine-generated, is copied by nobody, and
 hides the one failure a line scanner cannot see -- two ``[[package]]`` entries
-for a single declared name.
+for a single declared name. The second is the published-image guard, which
+reads ``project.version`` from ``pyproject.toml`` and parses it with
+``packaging``: whether the version is a release candidate or a final release
+decides which image tag exists, and PEP 440 is not something to re-implement
+with a regular expression.
 """
 
 from __future__ import annotations
@@ -71,13 +75,19 @@ import re
 import subprocess
 import sys
 
-# The single exception to this module's plain-text rule, and the only import
-# here that parses anything. It serves the floor-to-lock guard at the foot of
-# the file, where the reason is set out in full: `uv.lock` is
-# machine-generated TOML that no operator copies, and a line scanner cannot
-# see two `[[package]]` entries for one name.
+# One of the two parsing imports this module's plain-text rule allows. It
+# serves the floor-to-lock guard at the foot of the file, where the reason is
+# set out in full: `uv.lock` is machine-generated TOML that no operator
+# copies, and a line scanner cannot see two `[[package]]` entries for one
+# name. It also reads `project.version` for the published-image guard.
 import tomllib
 from pathlib import Path
+
+import pytest
+
+# The other parsing import: the published-image guard parses the project
+# version with it to tell a release candidate from a final release.
+from packaging.version import Version
 
 from saneless.checks import CheckKey, check_name
 from saneless.config import (
@@ -1356,7 +1366,7 @@ def test_no_shipped_file_references_the_old_owner() -> None:
         "a shipped file still references the old GitHub owner, which DLVR-01 "
         "renames. Every project URL must use the kdknigga forms -- "
         "github.com/kdknigga/saneless, kdknigga.github.io/saneless and "
-        "ghcr.io/kdknigga/saneless:\n" + "\n".join(offenders)
+        f"{PUBLISHED_IMAGE}:\n" + "\n".join(offenders)
     )
 
 
@@ -1555,6 +1565,325 @@ def test_every_readme_docs_link_resolves_to_a_page() -> None:
         "itself rather than a hard-coded list, so a page renamed in a later "
         "phase cannot leave a dead link on the front page:\n" + "\n".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------------
+# Published image tags and install lines
+# ---------------------------------------------------------------------------
+
+# The published image name is assembled at runtime, the FORBIDDEN_OWNER_SLUG
+# idiom again: the sweep below reads every shipped file, this one included,
+# and a literal here would be a reference carrying no tag. An f-string over
+# named constants is the form ruff's FLY002 leaves alone.
+_IMAGE_REGISTRY = "ghcr.io"
+_IMAGE_OWNER = "kdknigga"
+_PROJECT_NAME = "saneless"
+PUBLISHED_IMAGE = f"{_IMAGE_REGISTRY}/{_IMAGE_OWNER}/{_PROJECT_NAME}"
+
+# One reference to the published image, with its tag if it has one. The
+# lookahead stops a longer repository name that merely starts with ours from
+# counting as an untagged reference to this image.
+IMAGE_REFERENCE = re.compile(
+    re.escape(PUBLISHED_IMAGE) + r"(?![\w-])(?::(?P<tag>[0-9A-Za-z._-]+))?"
+)
+
+# The release workflow names the image without a tag on purpose: its
+# ``images:`` key is the input the tagging action expands into every tag a
+# release publishes. That one line, in that one file, is the only reference
+# allowed to go untagged.
+_RELEASE_WORKFLOW_NAME = ".github/workflows/release.yml"
+_IMAGES_KEY = "images:"
+
+# The install-from-the-package-index command, assembled from fragments for the
+# same self-scan reason. It matches ``pip`` or ``pipx``, then ``install``, then
+# the project name as a whole name -- not a longer name that starts with it --
+# and ignores case, because the package index does.
+_PIP = "pip"
+_INSTALL = "install"
+PYPI_INSTALL = re.compile(
+    rf"\b{_PIP}x?\s+{_INSTALL}\s+{_PROJECT_NAME}(?![\w-])", re.IGNORECASE
+)
+_PYPI_INSTALL_LINE = f"{_PIP} {_INSTALL} {_PROJECT_NAME}"
+_PIPX_INSTALL_LINE = f"{_PIP}x {_INSTALL} {_PROJECT_NAME}"
+
+# A tag no published image could carry. Measuring the real tree against it
+# turns every reference into an offender, which counts how many the sweep saw.
+_IMPOSSIBLE_TAG = "never a published tag"
+
+
+def _declared_version() -> str:
+    """
+    Return ``project.version`` exactly as ``pyproject.toml`` spells it.
+
+    Returns:
+        The declared version string, unnormalised.
+
+    """
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    return pyproject["project"]["version"]
+
+
+def _expected_image_tag(declared: str) -> str:
+    """
+    Return the image tag the documentation must pin for a declared version.
+
+    A release candidate publishes only its own exact tag, so that is the only
+    tag a reader can pull. The tag is the version as ``pyproject.toml`` spells
+    it, which is the spelling the release tag and so the image tag carry. A
+    final release also publishes a ``major.minor`` tag that later patch
+    releases move forward, and that is the one the documentation pins.
+
+    Args:
+        declared: ``project.version`` as written in ``pyproject.toml``.
+
+    Returns:
+        The declared string for a pre-release, else ``major.minor``.
+
+    """
+    version = Version(declared)
+    if version.is_prerelease:
+        return declared
+    return f"{version.major}.{version.minor}"
+
+
+def _read_or_report(root: Path, name: str, offenders: list[str]) -> str | None:
+    """
+    Return a file's text, or record it as an offender and return ``None``.
+
+    Args:
+        root: The directory the name is relative to.
+        name: Repo-relative file name to read.
+        offenders: The list an unreadable file is reported into.
+
+    Returns:
+        The file's text, or ``None`` when it could not be read.
+
+    """
+    # Two clauses rather than one tuple, for the reason given in the owner
+    # guard above.
+    try:
+        return (root / name).read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        offenders.append(f"{name}: not UTF-8, so it was not checked: {exc}")
+    except OSError as exc:
+        offenders.append(f"{name}: unreadable, so it was not checked: {exc}")
+    return None
+
+
+def _image_tag_offenders(names: list[str], root: Path, expected: str) -> list[str]:
+    """
+    Return every image reference that does not carry the expected tag.
+
+    An untagged reference is an offender like any other: the registry resolves
+    it to ``latest``, which a release candidate never receives. A file the
+    guard cannot read is an offender too, since it has not been checked.
+
+    Args:
+        names: Repo-relative file names to check.
+        root: The directory the names are relative to.
+        expected: The one tag every reference must carry.
+
+    Returns:
+        One ``name:line: text`` entry per wrong or missing tag, and one
+        ``name: reason`` entry per file that could not be read.
+
+    """
+    offenders: list[str] = []
+    for name in names:
+        text = _read_or_report(root, name, offenders)
+        if text is None:
+            continue
+        for number, line in enumerate(text.splitlines(), start=1):
+            if name == _RELEASE_WORKFLOW_NAME and line.strip().startswith(_IMAGES_KEY):
+                continue
+            offenders.extend(
+                f"{name}:{number}: {line.strip()}"
+                for match in IMAGE_REFERENCE.finditer(line)
+                if match.group("tag") != expected
+            )
+    return offenders
+
+
+def _pip_install_offenders(names: list[str], root: Path) -> list[str]:
+    """
+    Return every line that installs the project from the package index.
+
+    Args:
+        names: Repo-relative file names to check.
+        root: The directory the names are relative to.
+
+    Returns:
+        One ``name:line: text`` entry per index install, and one
+        ``name: reason`` entry per file that could not be read.
+
+    """
+    offenders: list[str] = []
+    for name in names:
+        text = _read_or_report(root, name, offenders)
+        if text is None:
+            continue
+        offenders.extend(
+            f"{name}:{number}: {line.strip()}"
+            for number, line in enumerate(text.splitlines(), start=1)
+            if PYPI_INSTALL.search(line)
+        )
+    return offenders
+
+
+@pytest.mark.parametrize(
+    ("declared", "expected"),
+    [
+        ("0.2.0-rc.6", "0.2.0-rc.6"),
+        ("0.2.0", "0.2"),
+        ("1.4.3", "1.4"),
+    ],
+)
+def test_the_expected_image_tag_follows_the_kind_of_release(
+    declared: str, expected: str
+) -> None:
+    """A release candidate pins its exact tag; a final release pins major.minor."""
+    assert _expected_image_tag(declared) == expected
+
+
+def test_every_shipped_image_reference_carries_the_published_image_tag() -> None:
+    """
+    Every shipped reference to the image names a tag the registry holds.
+
+    The expected tag is derived from ``project.version``, so the commit that
+    makes the version final is the commit that has to move every example from
+    the release-candidate tag to ``major.minor``. Until then an example
+    pulling ``latest``, or no tag at all, fails with "manifest unknown".
+    """
+    names = _shipped_files()
+    expected = _expected_image_tag(_declared_version())
+
+    examined = _image_tag_offenders(names, REPO_ROOT, _IMPOSSIBLE_TAG)
+    assert len(examined) >= 10, (
+        f"the sweep found only {len(examined)} references to {PUBLISHED_IMAGE} "
+        "in the shipped files, so it is no longer looking where the "
+        "deployment examples live:\n" + "\n".join(examined)
+    )
+
+    offenders = _image_tag_offenders(names, REPO_ROOT, expected)
+    assert not offenders, (
+        f"a shipped reference to {PUBLISHED_IMAGE} does not carry the tag "
+        f"{expected!r} that project.version publishes, or a file could not be "
+        "read. A release candidate publishes only its exact tag and never "
+        "latest; a final release pins major.minor:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_image_tag_guard_reports_wrong_missing_and_unread_tags(
+    tmp_path: Path,
+) -> None:
+    """Wrong and missing tags are reported, and so is a file that was not read."""
+    expected = "0.2.0-rc.6"
+    workflows = tmp_path / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "release.yml").write_text(
+        f"          {_IMAGES_KEY} {PUBLISHED_IMAGE}\n"
+        f"          run: docker pull {PUBLISHED_IMAGE}\n",
+        encoding="utf-8",
+    )
+    seeded = {
+        "latest.yml": f"    image: {PUBLISHED_IMAGE}:latest\n",
+        "untagged.md": f"docker run -p 8080:8080 {PUBLISHED_IMAGE}\n",
+        "older.md": f"docker pull {PUBLISHED_IMAGE}:0.2.0-rc.5\n",
+        "elsewhere.yml": f"{_IMAGES_KEY} {PUBLISHED_IMAGE}\n",
+        "pinned.md": f"docker pull {PUBLISHED_IMAGE}:{expected}\n",
+        "longer-name.md": f"docker pull {PUBLISHED_IMAGE}-other:latest\n",
+    }
+    for name, text in seeded.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    (tmp_path / "latin1.md").write_bytes(b"caf\xe9\n")
+
+    offenders = _image_tag_offenders(
+        [_RELEASE_WORKFLOW_NAME, *seeded, "latin1.md", "gone.md"],
+        tmp_path,
+        expected,
+    )
+
+    assert [entry.split(": ", 1)[0] for entry in offenders] == [
+        f"{_RELEASE_WORKFLOW_NAME}:2",
+        "latest.yml:1",
+        "untagged.md:1",
+        "older.md:1",
+        "elsewhere.yml:1",
+        "latin1.md",
+        "gone.md",
+    ]
+    assert "not UTF-8" in offenders[-2]
+    assert "unreadable" in offenders[-1]
+
+
+def test_the_image_tag_guard_moves_to_major_minor_at_a_final_release(
+    tmp_path: Path,
+) -> None:
+    """Once the version is final, the release-candidate tag is stale."""
+    (tmp_path / "rc.md").write_text(
+        f"docker pull {PUBLISHED_IMAGE}:0.2.0-rc.6\n", encoding="utf-8"
+    )
+    (tmp_path / "final.md").write_text(
+        f"docker pull {PUBLISHED_IMAGE}:0.2\n", encoding="utf-8"
+    )
+
+    offenders = _image_tag_offenders(
+        ["rc.md", "final.md"], tmp_path, _expected_image_tag("0.2.0")
+    )
+
+    assert [entry.split(":", 1)[0] for entry in offenders] == ["rc.md"]
+
+
+def test_no_shipped_pip_install_line_uses_the_package_index_before_final() -> None:
+    """
+    While the version is a pre-release, nothing installs from the package index.
+
+    The project name is not yet held on the package index, so an install line
+    naming it there resolves to whoever registers it first. Install lines
+    point at the project's own repository instead until a final release has
+    claimed the name. Once the version is final this guard stands down,
+    because no offline test can know whether that claim has happened.
+    """
+    declared = _declared_version()
+    if not Version(declared).is_prerelease:
+        pytest.skip(
+            f"project.version {declared} is final, so installing from the "
+            "package index is allowed again"
+        )
+    offenders = _pip_install_offenders(_shipped_files(), REPO_ROOT)
+    assert not offenders, (
+        f"a shipped file installs {_PROJECT_NAME} from the package index "
+        f"while project.version is the pre-release {declared}, or a file "
+        "could not be read. Until a final release claims the name, install "
+        "from git+https://github.com/kdknigga/saneless:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_pip_install_guard_tells_the_index_from_the_repository(
+    tmp_path: Path,
+) -> None:
+    """Index installs and unread files are reported; repository installs are not."""
+    seeded = {
+        "pip.md": f"    {_PYPI_INSTALL_LINE}\n",
+        "pipx.md": f"    {_PIPX_INSTALL_LINE}\n",
+        "prose.md": f"then retry `{_PYPI_INSTALL_LINE}`.\n",
+        "git-pipx.md": "pipx install git+https://github.com/kdknigga/saneless\n",
+        "git-pip.md": "pip install git+https://github.com/kdknigga/saneless\n",
+        "other.md": f"{_PIPX_INSTALL_LINE}-plugin\n",
+    }
+    for name, text in seeded.items():
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    (tmp_path / "latin1.md").write_bytes(b"caf\xe9\n")
+
+    offenders = _pip_install_offenders([*seeded, "latin1.md", "gone.md"], tmp_path)
+
+    assert [entry.split(":", 1)[0] for entry in offenders] == [
+        "pip.md",
+        "pipx.md",
+        "prose.md",
+        "latin1.md",
+        "gone.md",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3002,8 +3331,8 @@ def test_every_declared_floor_equals_the_version_uv_lock_resolves() -> None:
 
     The container is no longer the surface at risk here -- it installs a
     hash-checked export of the lock -- but the published wheel's metadata
-    carries these floors verbatim, so they are what a downstream
-    ``pip install saneless`` resolves against. A floor left below the locked
+    carries these floors verbatim, so they are what a downstream installer
+    resolves against. A floor left below the locked
     version therefore admits into a fresh install the very tree this project
     upgraded away from, and nothing else in the repository would notice. The
     rule is equality, not satisfaction, so the comparison is plain string

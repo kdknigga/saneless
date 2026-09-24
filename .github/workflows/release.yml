@@ -113,8 +113,8 @@ jobs:
           # an unconditional raw `latest` line, which would have moved the
           # floating tag onto whatever was published most recently -- including
           # a release-candidate rehearsal. The hard constraint is that a
-          # rehearsal must never leave GHCR's floating tag, or a plain
-          # `pip install saneless`, resolving to a pre-release.
+          # rehearsal must never leave GHCR's floating tag, or PyPI,
+          # resolving to a pre-release.
           #
           # Deleting the line is the whole fix: metadata-action's default
           # `flavor: latest=auto` already withholds the floating tag from a
