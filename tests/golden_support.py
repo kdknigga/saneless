@@ -19,6 +19,8 @@ metadata, reaching paperless-ngx exactly once:
   untouched, so equal bytes mean the PDF page *is* that spooled file.
 - ``web_client_builder`` and ``cli_client_builder`` stand in for the two
   places the application builds its ``PaperlessClient``.
+- ``loopback_paperless`` answers the same API over a real socket on
+  127.0.0.1, for the checks an in-memory transport cannot make.
 
 Import it as ``from tests.golden_support import ...``; the bare
 ``golden_support`` form raises ``ModuleNotFoundError`` under pytest 9's
@@ -28,11 +30,17 @@ package path.
 
 from __future__ import annotations
 
+import contextlib
 import email.parser
 import email.policy
 import io
+import json
+import threading
+from dataclasses import dataclass, field
 from email.message import EmailMessage
-from typing import TYPE_CHECKING
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import TYPE_CHECKING, override
+from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pikepdf
@@ -42,7 +50,7 @@ from saneless.paperless import PaperlessClient
 from tests.conftest import StubScannerBackend, scan_batch
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Generator, Sequence
     from pathlib import Path
 
     from saneless.scanner.base import PageRecord, PageSink, ScanBatch, ScanSettings
@@ -498,3 +506,165 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
         )
 
     return build_client
+
+
+# The session cookie the loopback server sets on every upload answer.  Nothing
+# saneless itself logs carries response headers, so this value can reach a log
+# only through httpcore2's DEBUG trace, which prints them: a test that finds it
+# has found that trace switched on.
+LOOPBACK_SESSION_COOKIE = "sessionid=lb-5f0c8e2d91"
+
+LOOPBACK_TASK_ID = "loopback-task-1"
+
+
+@dataclass(frozen=True)
+class LoopbackHit:
+    """
+    One request the loopback server received.
+
+    Attributes:
+        method: The HTTP method.
+        path: The URL path, without the query string.
+        authorization: The ``Authorization`` header as received, or None.
+
+    """
+
+    method: str
+    path: str
+    authorization: str | None
+
+
+@dataclass(frozen=True)
+class LoopbackPaperless:
+    """
+    A running loopback paperless-ngx: where it listens and what it was sent.
+
+    Attributes:
+        url: The base URL to hand to ``PaperlessClient``.
+        hits: Every request received, in arrival order.  Empty means nothing
+            reached the socket at all.
+
+    """
+
+    url: str
+    hits: list[LoopbackHit] = field(default_factory=list)
+
+
+def _loopback_handler(hits: list[LoopbackHit]) -> type[BaseHTTPRequestHandler]:
+    """
+    Build a request handler class that records into ``hits``.
+
+    Args:
+        hits: The list every received request is appended to.
+
+    Returns:
+        A handler class for ``ThreadingHTTPServer``.
+
+    """
+
+    class _Handler(BaseHTTPRequestHandler):
+        """Answer the paperless-ngx endpoints a client uses, and record each call."""
+
+        def _record(self) -> str:
+            """
+            Record this request and return its path.
+
+            Returns:
+                The URL path, without the query string.
+
+            """
+            path = urlsplit(self.path).path
+            hits.append(
+                LoopbackHit(self.command, path, self.headers.get("Authorization"))
+            )
+            return path
+
+        def _answer(
+            self, status: int, payload: object, headers: dict[str, str] | None = None
+        ) -> None:
+            """
+            Send one JSON response and end it.
+
+            Args:
+                status: The HTTP status code.
+                payload: The value to encode as the JSON body.
+                headers: Extra response headers.
+
+            """
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            """Accept an upload and issue a task id; refuse any other POST."""
+            path = self._record()
+            length = self.headers.get("Content-Length")
+            if length is None:
+                # The body has to be drained before answering, and a chunked
+                # one is more than this server needs to read: a client that
+                # stops sending a length fails here, loudly.
+                self._answer(411, {"detail": "Length Required"})
+                return
+            self.rfile.read(int(length))
+            if path != DOCUMENTS_PATH:
+                self._answer(404, {"detail": "Not found."})
+                return
+            self._answer(200, LOOPBACK_TASK_ID, {"Set-Cookie": LOOPBACK_SESSION_COOKIE})
+
+        def do_GET(self) -> None:
+            """Answer a task poll and the tag and correspondent lists."""
+            path = self._record()
+            if path == TASKS_PATH:
+                query = parse_qs(urlsplit(self.path).query)
+                task_id = query.get("task_id", [""])[0]
+                self._answer(200, [{"task_id": task_id, "status": "SUCCESS"}])
+            elif path in {TAGS_PATH, CORRESPONDENTS_PATH}:
+                self._answer(200, _EMPTY_COLLECTION)
+            else:
+                self._answer(404, {"detail": "Not found."})
+
+        @override
+        def log_message(self, format: str, *args: object) -> None:
+            """Stay silent: the default writes every request to stderr."""
+
+    return _Handler
+
+
+@contextlib.contextmanager
+def loopback_paperless() -> Generator[LoopbackPaperless]:
+    """
+    Serve a minimal paperless-ngx on a real socket on 127.0.0.1.
+
+    ``httpx2.MockTransport`` replaces the network transport, h11 included, so
+    a request h11 would refuse to put on the wire -- a header value with
+    surrounding whitespace or a control character in it -- sails through a
+    mock and is answered.  Only a real socket shows what the production
+    transport does with it, and whether anything reached the server at all.
+
+    The server answers an upload with a task id and a ``Set-Cookie`` header
+    (``LOOPBACK_SESSION_COOKIE``), a task poll with SUCCESS, and the tag and
+    correspondent lists with an empty page.  Anything else is a 404.  It
+    listens on an ephemeral port and is shut down and closed on exit, so no
+    socket outlives the test.
+
+    Yields:
+        Where the server listens, and every request it received.
+
+    """
+    hits: list[LoopbackHit] = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _loopback_handler(hits))
+    thread = threading.Thread(
+        target=server.serve_forever, name="loopback-paperless", daemon=True
+    )
+    thread.start()
+    try:
+        yield LoopbackPaperless(url=f"http://127.0.0.1:{server.server_port}", hits=hits)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

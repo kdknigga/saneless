@@ -12,17 +12,33 @@ from typing import TYPE_CHECKING
 import httpx2
 import pytest
 
-from saneless.exceptions import PaperlessError, PaperlessTimeoutError, describe
+from saneless.exceptions import (
+    ConfigError,
+    PaperlessError,
+    PaperlessTimeoutError,
+    describe,
+)
+from saneless.logging_config import configure_logging
 from saneless.paperless import (
     PaperlessClient,
     UploadResult,
     _render_error_body,
+    _retry_decision,
+    _RetryDecision,
     _without_userinfo,
 )
 from saneless.vocabulary import ConnectionStatus
+from tests.golden_support import (
+    DOCUMENTS_PATH,
+    LOOPBACK_SESSION_COOKIE,
+    LOOPBACK_TASK_ID,
+    TASKS_PATH,
+    LoopbackHit,
+    loopback_paperless,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
     from pathlib import Path
     from typing import BinaryIO
 
@@ -433,6 +449,37 @@ _UNSUPPORTED_PROTOCOL_TEXT = (
     "Request URL is missing an 'http://' or 'https://' protocol."
 )
 
+# The fixed text an upload with an unset or scheme-less paperless.url fails
+# with.  Fixed so that nothing httpx2 or h11 says -- which for a refused header
+# value is the header value itself -- can reach it.
+_UNSET_URL_UPLOAD_MESSAGE = (
+    "Uploading to Paperless: paperless.url is not set, or has no http or https "
+    "scheme; set it to the paperless-ngx address"
+)
+
+# The fixed text for a request the transport refused to send.
+_UNSENDABLE_REQUEST_REASON = (
+    "the request could not be sent with the configured paperless.url and "
+    "paperless.token; check both for spaces, line breaks or control characters"
+)
+
+
+def _assert_token_absent(token: str, text: str) -> None:
+    """
+    Assert neither the token as configured nor its stripped form is in ``text``.
+
+    Library text shows a header value as a ``bytes`` repr, where a trailing
+    carriage return is spelled out as an escape and no longer matches the raw
+    token, so the stripped form is what catches it there.
+
+    Args:
+        token: The configured token.
+        text: The message, log text or repr to search.
+
+    """
+    assert token not in text
+    assert token.strip() not in text
+
 
 class _CountingHandler:
     """A mock transport handler that counts calls and replays a script."""
@@ -657,13 +704,12 @@ class TestUrlCredentialsNeverShown:
             url=f"scanner:{_URL_SECRET}@paperless:8000", token=_MOCK_AUTH
         )
         try:
-            with pytest.raises(PaperlessError) as exc_info:
+            with pytest.raises(ConfigError) as exc_info:
                 client.upload_document(sample_pdf, title="No scheme")
         finally:
             client.close()
-        assert str(exc_info.value).startswith(
-            "Could not reach Paperless at paperless:8000: "
-        )
+        assert str(exc_info.value) == _UNSET_URL_UPLOAD_MESSAGE
+        assert exc_info.value.__cause__ is None
         assert all(_URL_SECRET not in message for message in caplog.messages)
         assert sleeps == []
 
@@ -701,6 +747,78 @@ class TestUrlCredentialsNeverShown:
             "https://paperless.example/api/; check paperless.url"
         )
         assert sleeps == []
+
+
+_CLASSIFIED_REQUEST = httpx2.Request("POST", "http://paperless:8000/api/documents/")
+
+
+def _status_error(status_code: int) -> httpx2.HTTPStatusError:
+    """
+    Build the ``HTTPStatusError`` ``raise_for_status`` raises for a status.
+
+    Args:
+        status_code: The response status.
+
+    Returns:
+        The error, carrying a response with that status.
+
+    """
+    response = httpx2.Response(status_code, request=_CLASSIFIED_REQUEST)
+    return httpx2.HTTPStatusError(
+        f"status {status_code}", request=_CLASSIFIED_REQUEST, response=response
+    )
+
+
+_RETRY_DECISION_CASES = [
+    pytest.param(
+        httpx2.LocalProtocolError("Illegal header value"),
+        _RetryDecision.MISCONFIGURED,
+        id="local-protocol-error",
+    ),
+    pytest.param(
+        httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT),
+        _RetryDecision.MISCONFIGURED,
+        id="unsupported-protocol",
+    ),
+    pytest.param(httpx2.ConnectError("refused"), _RetryDecision.RETRY, id="connect"),
+    pytest.param(
+        httpx2.ConnectTimeout("slow"), _RetryDecision.RETRY, id="connect-timeout"
+    ),
+    pytest.param(httpx2.ReadTimeout("slow"), _RetryDecision.RETRY, id="read-timeout"),
+    pytest.param(httpx2.ReadError("reset"), _RetryDecision.RETRY, id="read-error"),
+    pytest.param(httpx2.WriteError("pipe"), _RetryDecision.RETRY, id="write-error"),
+    pytest.param(
+        httpx2.RemoteProtocolError("server hung up"),
+        _RetryDecision.RETRY,
+        id="remote-protocol-error",
+    ),
+    pytest.param(_status_error(503), _RetryDecision.RETRY, id="503"),
+    pytest.param(_status_error(500), _RetryDecision.RETRY, id="500"),
+    pytest.param(_status_error(404), _RetryDecision.REFUSED, id="404"),
+    pytest.param(_status_error(302), _RetryDecision.REFUSED, id="302"),
+    pytest.param(
+        httpx2.DecodingError("corrupt gzip", request=_CLASSIFIED_REQUEST),
+        _RetryDecision.UNEXPECTED,
+        id="decoding-error",
+    ),
+]
+
+
+class TestRetryDecision:
+    """One pure function decides what the client does with every httpx2 error."""
+
+    @pytest.mark.parametrize(("exc", "expected"), _RETRY_DECISION_CASES)
+    def test_retry_decision_classifies_each_error(
+        self, exc: httpx2.HTTPError, expected: _RetryDecision
+    ) -> None:
+        """
+        Client-side protocol errors are configuration, never transient.
+
+        ``LocalProtocolError`` and ``UnsupportedProtocol`` are both
+        ``TransportError`` subclasses, so a classifier that tests for
+        ``TransportError`` first would retry them.
+        """
+        assert _retry_decision(exc) is expected
 
 
 class TestUploadFailureTranslation:
@@ -800,43 +918,53 @@ class TestUploadFailureTranslation:
         self, sample_pdf: Path, sleeps: list[float]
     ) -> None:
         """
-        T-28-22: a scheme-less URL is never retried with backoff.
+        A URL with no usable scheme is a configuration error, never retried.
 
-        UnsupportedProtocol is a TransportError, so it must be caught before
-        the retrying clause.
+        UnsupportedProtocol is a TransportError, so a classifier that tests for
+        TransportError first would retry it with backoff.  The message is fixed
+        text naming the setting, never httpx2's own words, and it carries no
+        cause.
         """
         failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
         client = _upload_client(handler)
         try:
-            with pytest.raises(
-                PaperlessError, match=re.escape(_UNSUPPORTED_PROTOCOL_TEXT)
-            ) as exc_info:
+            with pytest.raises(ConfigError) as exc_info:
+                client.upload_document(sample_pdf, title="No scheme")
+        finally:
+            client.close()
+        assert str(exc_info.value) == _UNSET_URL_UPLOAD_MESSAGE
+        assert _UNSUPPORTED_PROTOCOL_TEXT not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__
+        assert handler.calls == 1
+        assert sleeps == []
+
+    def test_unsupported_protocol_url_never_takes_the_fallback(
+        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
+    ) -> None:
+        """
+        A configured consume directory does not turn it into a fallback.
+
+        Every scan would otherwise land in the folder without its metadata and
+        be reported as saved; the scan is kept in ``failed/`` by the pipeline
+        instead.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
+        handler = _CountingHandler(_raising(failure))
+        client = _upload_client(handler, consume_dir=consume_dir)
+        try:
+            with pytest.raises(ConfigError):
                 client.upload_document(sample_pdf, title="No scheme")
         finally:
             client.close()
         assert handler.calls == 1
         assert sleeps == []
-        assert exc_info.value.__cause__ is failure
+        assert list(consume_dir.iterdir()) == []
 
-    def test_unsupported_protocol_url_still_takes_the_fallback(
-        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
-    ) -> None:
-        """D-10: no retry is not no fallback -- the scan is never lost."""
-        consume_dir = tmp_path / "consume"
-        failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
-        handler = _CountingHandler(_raising(failure))
-        client = _upload_client(handler, consume_dir=consume_dir)
-        try:
-            result = client.upload_document(sample_pdf, title="No scheme")
-        finally:
-            client.close()
-        assert handler.calls == 1
-        assert sleeps == []
-        assert result.delivered_to_api is False
-        assert result.consume_dir_path == consume_dir / "test.pdf"
-
-    def test_unsupported_protocol_fallback_logs_the_cause(
+    def test_unsupported_protocol_logs_no_attempt_and_copies_nothing(
         self,
         sample_pdf: Path,
         tmp_path: Path,
@@ -844,38 +972,102 @@ class TestUploadFailureTranslation:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """
-        WR-04: a fallback caused by an unusable URL says so in the log.
+        No retry warning and no consume-folder line is logged for it.
 
-        No attempt is logged by the backoff for it, so without this line the
-        job ends "Saved to folder" and nothing anywhere names the URL.
+        The configuration error the caller raises is the whole report; a retry
+        line would repeat httpx2's text, and a fallback line would claim a copy
+        that was never made.
         """
-        caplog.set_level(logging.WARNING, logger="saneless.paperless")
+        caplog.set_level(logging.DEBUG, logger="saneless.paperless")
         consume_dir = tmp_path / "consume"
         failure = httpx2.UnsupportedProtocol(_UNSUPPORTED_PROTOCOL_TEXT)
         handler = _CountingHandler(_raising(failure))
         client = _upload_client(handler, consume_dir=consume_dir)
         try:
-            client.upload_document(sample_pdf, title="No scheme")
+            with pytest.raises(ConfigError):
+                client.upload_document(sample_pdf, title="No scheme")
         finally:
             client.close()
         assert sleeps == []
-        assert (
-            "Paperless URL http://paperless:8000 cannot be used "
-            f"({_UNSUPPORTED_PROTOCOL_TEXT}); not retrying"
-        ) in caplog.messages
+        assert not consume_dir.exists()
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.paperless" and record.levelno >= logging.INFO
+        ] == []
 
-    def test_empty_url_fails_fast_through_the_real_transport(
-        self, sample_pdf: Path, sleeps: list[float]
+    def test_empty_url_is_a_configuration_error_through_the_real_transport(
+        self, sample_pdf: Path, tmp_path: Path, sleeps: list[float]
     ) -> None:
-        """An empty paperless.url raises httpx2's own text on the first request."""
-        client = PaperlessClient(url="", token=_MOCK_AUTH, max_retries=3)
+        """
+        An unset paperless.url fails at once, names the setting, copies nothing.
+
+        The real transport, not a mock: this is the one way UnsupportedProtocol
+        is still reachable once a set URL is checked at load.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        client = PaperlessClient(
+            url="", token=_MOCK_AUTH, consume_dir=consume_dir, max_retries=3
+        )
         try:
-            with pytest.raises(PaperlessError, match="protocol") as exc_info:
+            with pytest.raises(ConfigError) as exc_info:
                 client.upload_document(sample_pdf, title="Empty URL")
         finally:
             client.close()
-        assert isinstance(exc_info.value.__cause__, httpx2.UnsupportedProtocol)
+        assert str(exc_info.value) == _UNSET_URL_UPLOAD_MESSAGE
+        assert "paperless.url" in str(exc_info.value)
+        assert _MOCK_AUTH not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__
         assert sleeps == []
+        assert list(consume_dir.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "token",
+        [
+            pytest.param("tok-9e41d2", id="plain"),
+            pytest.param("\ttok-5c7b20 ", id="padded"),
+        ],
+    )
+    def test_retry_and_final_messages_redact_the_token(
+        self,
+        token: str,
+        sample_pdf: Path,
+        sleeps: list[float],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """
+        Third-party text naming the token is struck before it is interpolated.
+
+        A transport error whose own text carries the token -- as h11's refusal
+        of a header value does -- is still retried when it is transient, and
+        neither the retry warnings nor the final message may repeat it.  The
+        rest of the text survives, so the line still says what happened.
+        """
+        caplog.set_level(logging.WARNING, logger="saneless.paperless")
+        failure = httpx2.ConnectError(f"refused: Token {token} user:pass@h")
+        handler = _CountingHandler(_raising(failure))
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token=token,
+            max_retries=3,
+            transport=_make_transport(handler),
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                client.upload_document(sample_pdf, title="Redacted")
+        finally:
+            client.close()
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 3
+        assert "refused: Token" in str(exc_info.value)
+        for text in [str(exc_info.value), *warnings]:
+            _assert_token_absent(token, text)
 
     @pytest.mark.parametrize("consume_name", ["", "consume"], ids=["plain", "fallback"])
     def test_4xx_body_is_rendered_and_never_falls_back(
@@ -1838,6 +2030,235 @@ class TestMetadataFetchTranslation:
             client.close()
 
 
+# Tokens h11 refuses to put in a header: edge whitespace, and a control
+# character.  Neither id nor any test name here contains a token's text,
+# because tmp_path is named after the test and job text names paths under it.
+_UNSENDABLE_TOKENS = [
+    pytest.param("abc ", id="trailing-space"),
+    pytest.param("tok-7f3a9c\r", id="carriage-return"),
+]
+
+_HTTP_LIBRARIES = frozenset({"httpx2", "httpcore2"})
+
+
+def _is_http_library_record(record: logging.LogRecord) -> bool:
+    """
+    Tell whether a log record came from httpx2 or httpcore2.
+
+    Args:
+        record: The captured record.
+
+    Returns:
+        True for a record from either library's logger or one of its children.
+
+    """
+    return record.name.split(".", 1)[0] in _HTTP_LIBRARIES
+
+
+@pytest.fixture
+def production_debug_logging(caplog: pytest.LogCaptureFixture) -> Iterator[None]:
+    """
+    Configure logging as ``output.log_level = "DEBUG"`` does, and capture it all.
+
+    The production configuration, not only ``caplog.set_level``: a raised root
+    level with nothing capping the HTTP libraries would capture httpcore2's
+    header trace, and the test would be checking a setup nobody runs.  Root
+    handlers and levels are restored afterwards; the HTTP library loggers are
+    reset by the suite-wide fixture.
+
+    Yields:
+        Nothing; the restore runs after the test.
+
+    """
+    root = logging.getLogger()
+    before = root.handlers[:]
+    level = root.level
+    configure_logging(None, "DEBUG", max_bytes=1024, backup_count=1)
+    caplog.set_level(logging.DEBUG)
+    yield
+    for handler in root.handlers[:]:
+        if handler not in before:
+            handler.close()
+            root.removeHandler(handler)
+    root.setLevel(level)
+    logging.getLogger("saneless").setLevel(logging.NOTSET)
+
+
+class TestLoopbackClientSideProtocolErrors:
+    """
+    A token the transport refuses to send is a configuration error, end to end.
+
+    Over a real socket, because ``httpx2.MockTransport`` replaces the layer
+    that refuses: h11 raises ``LocalProtocolError`` with the header value --
+    the token -- in its text.  That error is a ``TransportError``, so without
+    its own classification it would be retried, logged on every attempt,
+    copied to the consume folder and stored in the job's error.
+    """
+
+    @pytest.mark.parametrize("token", _UNSENDABLE_TOKENS)
+    @pytest.mark.usefixtures("production_debug_logging")
+    def test_upload_refuses_without_retry_copy_or_leak(
+        self,
+        token: str,
+        sample_pdf: Path,
+        tmp_path: Path,
+        sleeps: list[float],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Nothing reaches the server, nothing is retried, copied or echoed."""
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        with loopback_paperless() as server:
+            client = PaperlessClient(
+                url=server.url, token=token, consume_dir=consume_dir, max_retries=3
+            )
+            try:
+                with pytest.raises(ConfigError) as exc_info:
+                    client.upload_document(sample_pdf, title="Refused header")
+            finally:
+                client.close()
+        error = exc_info.value
+        assert str(error) == f"Uploading to Paperless: {_UNSENDABLE_REQUEST_REASON}"
+        # A chained cause would put h11's text, and so the token, into the
+        # worker's traceback however clean the message is.
+        assert error.__cause__ is None
+        assert error.__suppress_context__
+        assert server.hits == []
+        assert sleeps == []
+        assert list(consume_dir.iterdir()) == []
+        for text in (str(error), repr(error), caplog.text):
+            _assert_token_absent(token, text)
+
+    @pytest.mark.parametrize("token", _UNSENDABLE_TOKENS)
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    @pytest.mark.usefixtures("production_debug_logging")
+    def test_metadata_fetch_refuses_without_leak(
+        self,
+        method: str,
+        noun: str,
+        token: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Tag and correspondent fetches take the same arm, with the same text."""
+        with loopback_paperless() as server:
+            client = PaperlessClient(url=server.url, token=token)
+            try:
+                with pytest.raises(ConfigError) as exc_info:
+                    getattr(client, method)()
+            finally:
+                client.close()
+        error = exc_info.value
+        assert str(error) == (
+            f"Could not fetch {noun} from Paperless at {server.url}: "
+            f"{_UNSENDABLE_REQUEST_REASON}"
+        )
+        assert error.__cause__ is None
+        assert error.__suppress_context__
+        assert server.hits == []
+        for text in (str(error), repr(error), caplog.text):
+            _assert_token_absent(token, text)
+
+    @pytest.mark.usefixtures("production_debug_logging")
+    def test_valid_token_is_sent_once_and_no_library_debug_is_logged(
+        self, sample_pdf: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The control: the same server takes a sendable token, under DEBUG.
+
+        It proves the refusals above are the token's doing, and that a real
+        request at ``log_level = "DEBUG"`` produces no httpcore2 or httpx2
+        DEBUG record -- the trace that prints request and response headers --
+        and so no ``Set-Cookie`` value in the log.
+        """
+        with loopback_paperless() as server:
+            client = PaperlessClient(url=server.url, token=_MOCK_AUTH)
+            try:
+                result = client.upload_document(sample_pdf, title="Control")
+                task = client.poll_task(LOOPBACK_TASK_ID, timeout=5)
+            finally:
+                client.close()
+        assert result == UploadResult(delivered_to_api=True, task_uuid=LOOPBACK_TASK_ID)
+        assert task["status"] == "SUCCESS"
+        assert server.hits == [
+            LoopbackHit("POST", DOCUMENTS_PATH, f"Token {_MOCK_AUTH}"),
+            LoopbackHit("GET", TASKS_PATH, f"Token {_MOCK_AUTH}"),
+        ]
+        library_records = [r for r in caplog.records if _is_http_library_record(r)]
+        # httpx2's INFO request line is captured, so the libraries' records do
+        # reach caplog and the DEBUG check below can fail.
+        assert library_records != []
+        assert [r for r in library_records if r.levelno <= logging.DEBUG] == []
+        assert LOOPBACK_SESSION_COOKIE not in caplog.text
+
+
+_REDACTED_TOKENS = [
+    pytest.param("tok-9e41d2", id="plain"),
+    pytest.param("\ttok-5c7b20 ", id="padded"),
+]
+
+
+def _token_bearing_failure(token: str) -> httpx2.ConnectError:
+    """
+    Build a transport error whose own text carries the token.
+
+    Args:
+        token: The configured token.
+
+    Returns:
+        A ConnectError naming the token as a library message might.
+
+    """
+    return httpx2.ConnectError(f"refused: Token {token} user:pass@h")
+
+
+class TestThirdPartyTextIsRedacted:
+    """Every place the client quotes library text strikes the token out first."""
+
+    @pytest.mark.parametrize("token", _REDACTED_TOKENS)
+    def test_poll_warning_and_timeout_redact_the_token(
+        self, token: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A failed poll's warning and the timeout that follows it are clean."""
+        caplog.set_level(logging.WARNING, logger="saneless.paperless")
+        handler = _CountingHandler(_raising(_token_bearing_failure(token)))
+        client = PaperlessClient(
+            url="http://paperless:8000", token=token, transport=_make_transport(handler)
+        )
+        try:
+            with pytest.raises(PaperlessTimeoutError) as exc_info:
+                client.poll_task("t1", timeout=0)
+        finally:
+            client.close()
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        ]
+        assert any("refused: Token" in message for message in warnings)
+        assert "refused: Token" in str(exc_info.value)
+        for text in [str(exc_info.value), *warnings]:
+            _assert_token_absent(token, text)
+
+    @pytest.mark.parametrize("token", _REDACTED_TOKENS)
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_metadata_failure_redacts_the_token(
+        self, method: str, noun: str, token: str
+    ) -> None:
+        """A failed tag or correspondent fetch names the failure, not the token."""
+        handler = _CountingHandler(_raising(_token_bearing_failure(token)))
+        client = PaperlessClient(
+            url="http://paperless:8000", token=token, transport=_make_transport(handler)
+        )
+        try:
+            with pytest.raises(PaperlessError) as exc_info:
+                getattr(client, method)()
+        finally:
+            client.close()
+        assert str(exc_info.value).startswith(f"Could not fetch {noun} from Paperless")
+        assert "refused: Token" in str(exc_info.value)
+        _assert_token_absent(token, str(exc_info.value))
+
+
 _CONFIGURED_HOST = "paperless.test"
 _FOREIGN_HOST = "evil.example"
 
@@ -2702,8 +3123,8 @@ class TestUploadResultContract:
 
     def test_api_delivery_carries_a_task_uuid(self) -> None:
         """A result claiming API delivery must carry the task id (CTR-03)."""
-        result = UploadResult(delivered_to_api=True, task_uuid="abc-123")
-        assert result.task_uuid == "abc-123"
+        result = UploadResult(delivered_to_api=True, task_uuid="task-123")
+        assert result.task_uuid == "task-123"
         assert result.consume_dir_path is None
 
     def test_consume_dir_delivery_carries_a_path(self, tmp_path: Path) -> None:
@@ -2736,13 +3157,13 @@ class TestUploadResultContract:
         with pytest.raises(ValueError, match="cannot carry a consume_dir_path"):
             UploadResult(
                 delivered_to_api=True,
-                task_uuid="abc-123",
+                task_uuid="task-123",
                 consume_dir_path=dest,
             )
         with pytest.raises(ValueError, match="cannot carry a task_uuid"):
             UploadResult(
                 delivered_to_api=False,
-                task_uuid="abc-123",
+                task_uuid="task-123",
                 consume_dir_path=dest,
             )
 
