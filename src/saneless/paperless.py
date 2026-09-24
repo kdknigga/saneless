@@ -1,10 +1,11 @@
 """
 Paperless-ngx REST API client with retry, polling, and connection test.
 
-Uploads PDFs with metadata (title, tags, correspondent, created date),
-polls the task endpoint with exponential backoff until a terminal state
-and raises when that state is not success, and probes connections,
-reporting one of the five ConnectionStatus outcomes.
+Uploads PDFs with metadata (title, tags, correspondent) but no document
+date, which paperless-ngx chooses itself; polls the task endpoint with
+exponential backoff until a terminal state and raises when that state is
+not success; and probes connections, reporting one of the five
+ConnectionStatus outcomes.
 """
 
 from __future__ import annotations
@@ -571,15 +572,17 @@ class PaperlessClient:
     ``PaperlessError`` naming the configured base URL and the original text
     with the token struck out, chained to its cause -- or, for a request that
     could not be sent at all, as a ``ConfigError`` with fixed text and no
-    cause.
+    cause.  A URL or token the constructor refuses is a ``PaperlessError``
+    with fixed text and no cause.
 
     ``_retry_decision`` sorts every httpx2 error, and upload failures fall
     into three groups:
 
     * **Retried** with exponential backoff, for ``max_retries`` attempts in
       total: every transient ``httpx2.TransportError`` -- ConnectError, the
-      timeouts, ReadError, WriteError, RemoteProtocolError (a reverse proxy
-      closing the connection), ProxyError -- and any 5xx response.
+      timeouts, ReadError, WriteError, RemoteProtocolError (a proxy in
+      front of paperless-ngx closing the connection), ProxyError -- and any
+      5xx response.
     * **Fail fast**, with no further attempt: a 4xx rejection, any other
       non-2xx that is not a server error (a redirect, which names its target
       so ``paperless.url`` can be corrected), any other ``httpx2.HTTPError``,
@@ -608,10 +611,8 @@ class PaperlessClient:
         token: API authentication token.  It is sent only in the
             ``Authorization`` header and never interpolated into a message;
             the client keeps it only to strike it out of library text it
-            quotes.
-            Any ``user:password@`` in ``url`` is sent as Basic auth, exactly
-            as httpx2 would send it, and is stripped from every message and
-            log line.
+            quotes.  It is the only credential sent: a ``url`` carrying a
+            user name or password is refused, never sent in its place.
         consume_dir: Optional fallback directory for PDF upload failures;
             None disables the fallback copy.
         max_retries: Maximum number of upload attempts, including the first.
@@ -621,9 +622,12 @@ class PaperlessClient:
             ``httpx2.MockTransport``) and for custom transports.
 
     Raises:
-        PaperlessError: If ``url`` is not a valid URL (``httpx2.InvalidURL``),
-            or if the TLS trust store named by ``SSL_CERT_FILE`` or
-            ``SSL_CERT_DIR`` cannot be read.
+        PaperlessError: If ``url`` is not a valid URL (``httpx2.InvalidURL``)
+            or carries a user name or password, or if ``token`` holds a
+            character an HTTP header cannot carry -- each with fixed text and
+            no chained cause, since the library's text can quote a password or
+            the token -- or if the TLS trust store named by ``SSL_CERT_FILE``
+            or ``SSL_CERT_DIR`` cannot be read.
 
     """
 
@@ -638,24 +642,24 @@ class PaperlessClient:
     ) -> None:
         """Initialize the paperless-ngx API client."""
         base_url = url.rstrip("/")
-        # The only form of the URL any message or log line may carry: a
-        # paperless.url with user:password@ in it (Basic auth for a reverse
-        # proxy) must not put that password in job.error, on the terminal or
-        # in the log.
+        # The only form of the URL any message or log line may carry.  A user
+        # name or password is refused below, but an invalid URL is still
+        # shown, and it may hold one the parser could not read.
         self._display_url = _without_userinfo(base_url)
-        auth: httpx2.BasicAuth | None = None
         try:
             parsed = httpx2.URL(base_url)
             if parsed.userinfo:
-                # The credentials travel as the Basic auth httpx2 would derive
-                # from the URL anyway, so the request is unchanged, while the
-                # base URL itself -- which httpx2 names in its own request log
-                # line and exception text -- no longer carries them.
-                auth = httpx2.BasicAuth(parsed.username, parsed.password)
-                base_url = str(parsed.copy_with(userinfo=b"")).rstrip("/")
+                # httpx2 would turn the userinfo into a Basic Authorization
+                # header that replaces the token, and name the URL in its own
+                # request log line.  Refused, with the credential-free form.
+                msg = (
+                    f"Paperless URL {self._display_url} carries a user name or "
+                    "password; remove it from paperless.url and put the "
+                    "paperless-ngx API token in paperless.token"
+                )
+                raise PaperlessError(msg) from None
             self._client = httpx2.Client(
                 base_url=base_url,
-                auth=auth,
                 headers={
                     "Authorization": f"Token {token}",
                     "Accept": _API_VERSION_ACCEPT,
@@ -663,9 +667,22 @@ class PaperlessClient:
                 timeout=30.0,
                 transport=transport,
             )
-        except httpx2.InvalidURL as exc:
-            msg = f"Paperless URL {self._display_url} is not valid: {describe(exc)}"
-            raise PaperlessError(msg) from exc
+        except httpx2.InvalidURL:
+            # The parser's own text can quote part of a password: a "/" in
+            # one makes httpx2 read what comes before it as the port, and
+            # its complaint names that port.  Nothing of it is kept, not even
+            # as the chained cause.
+            msg = f"Paperless URL {self._display_url} is not valid"
+            raise PaperlessError(msg) from None
+        except UnicodeEncodeError:
+            # Only header values are encoded here and the Accept value is a
+            # constant, so the token holds the character; the codec's text
+            # quotes it.
+            msg = (
+                "Paperless API token in paperless.token contains a character "
+                "an HTTP header cannot carry"
+            )
+            raise PaperlessError(msg) from None
         except OSError as exc:
             # The TLS trust anchors are read while the client is being built,
             # so a SSL_CERT_FILE naming a path that does not exist arrives
@@ -693,13 +710,13 @@ class PaperlessClient:
         title: str,
         tags: list[int] | None = None,
         correspondent: int | None = None,
-        created: str | None = None,
     ) -> UploadResult:
         """
         Upload a PDF document to paperless-ngx.
 
         Builds multipart form data with title and optional metadata.
-        Tags are submitted as repeated form fields.  Every transient
+        Tags are submitted as repeated form fields.  No document date is
+        sent: paperless-ngx dates the document itself.  Every transient
         transport failure and every 5xx is retried with exponential backoff
         for ``max_retries`` attempts; a 4xx, a redirect or any other non-2xx
         that is not a 5xx, a request that cannot be sent from the configured
@@ -714,7 +731,6 @@ class PaperlessClient:
             title: Document title.
             tags: Optional list of tag IDs to attach.
             correspondent: Optional correspondent ID.
-            created: Optional creation date string (e.g. "2026-03-20").
 
         Returns:
             An UploadResult. On success ``delivered_to_api`` is True and
@@ -743,7 +759,7 @@ class PaperlessClient:
                 library text it quotes has the token struck out.
 
         """
-        data = self._form_fields(title, tags, correspondent, created)
+        data = self._form_fields(title, tags, correspondent)
         last_error: httpx2.HTTPError | None = None
 
         for attempt in range(self._max_retries):
@@ -800,7 +816,6 @@ class PaperlessClient:
         title: str,
         tags: list[int] | None,
         correspondent: int | None,
-        created: str | None,
     ) -> dict[str, str | list[str]]:
         """
         Build the multipart form fields for an upload.
@@ -809,15 +824,12 @@ class PaperlessClient:
             title: Document title.
             tags: Optional tag IDs, submitted as repeated form fields.
             correspondent: Optional correspondent ID.
-            created: Optional creation date string.
 
         Returns:
             The form fields, with absent metadata left out.
 
         """
         data: dict[str, str | list[str]] = {"title": title}
-        if created is not None:
-            data["created"] = created
         if correspondent is not None:
             data["correspondent"] = str(correspondent)
         if tags:
@@ -1283,7 +1295,7 @@ class PaperlessClient:
         URL until a page's ``next`` is null, a page comes back empty, or the
         items collected reach the server's own ``count``.  The ``next`` link
         itself is only read as "there is another page" and is never
-        requested: a server behind a misconfigured reverse proxy builds it
+        requested: a server behind a misconfigured proxy builds it
         from the wrong host or scheme, and following it would send the API
         token there.  A redirect is not followed either; it fails the fetch.
         A bare-list response on page 1 is the whole collection; on a later

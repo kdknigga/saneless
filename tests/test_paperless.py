@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import time
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import httpx2
@@ -34,6 +35,7 @@ from tests.golden_support import (
     TASKS_PATH,
     LoopbackHit,
     loopback_paperless,
+    multipart_fields,
     production_debug_logging,
 )
 
@@ -217,6 +219,44 @@ class TestClientSignature:
         assert parameter.default is inspect.Parameter.empty
 
 
+def _uploaded_fields(
+    pdf: Path,
+    title: str,
+    tags: list[int] | None = None,
+    correspondent: int | None = None,
+) -> list[tuple[str, str | bytes]]:
+    """
+    Upload ``pdf`` once and read back the form parts that went on the wire.
+
+    Args:
+        pdf: The PDF to upload.
+        title: Document title.
+        tags: Optional tag ids.
+        correspondent: Optional correspondent id.
+
+    Returns:
+        The parsed ``(name, value)`` form parts of the one upload request.
+
+    """
+    uploads: list[list[tuple[str, str | bytes]]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        uploads.append(multipart_fields(request))
+        return httpx2.Response(200, json="task-id")
+
+    client = PaperlessClient(
+        url="http://paperless:8000",
+        token=_MOCK_AUTH,
+        transport=_make_transport(handler),
+    )
+    try:
+        client.upload_document(pdf, title, tags=tags, correspondent=correspondent)
+    finally:
+        client.close()
+    assert len(uploads) == 1
+    return uploads[0]
+
+
 class TestUploadDocument:
     """Document upload tests."""
 
@@ -240,94 +280,63 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_with_tags(self, sample_pdf: Path) -> None:
-        """Upload includes repeated tag form fields."""
-        captured_data: dict[str, str] = {}
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            content = _request.content.decode("utf-8", errors="replace")
-            captured_data["content"] = content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        """Each tag id travels as its own ``tags`` form field, and nothing else."""
+        fields = _uploaded_fields(sample_pdf, "Test", tags=[1, 2, 3])
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test"),
+                ("tags", "1"),
+                ("tags", "2"),
+                ("tags", "3"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test", tags=[1, 2, 3])
-        # Tags should appear as repeated form fields
-        content = captured_data["content"]
-        assert content.count("tags") >= 3
-        client.close()
 
     def test_upload_with_correspondent(self, sample_pdf: Path) -> None:
-        """Upload includes correspondent field."""
-        captured_data: dict[str, str] = {}
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            content = _request.content.decode("utf-8", errors="replace")
-            captured_data["content"] = content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        """The correspondent id travels as one exact ``correspondent`` field."""
+        fields = _uploaded_fields(sample_pdf, "Test", correspondent=5)
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test"),
+                ("correspondent", "5"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test", correspondent=5)
-        assert "correspondent" in captured_data["content"]
-        assert "5" in captured_data["content"]
-        client.close()
 
-    def test_upload_with_created(self, sample_pdf: Path) -> None:
-        """Upload includes created date field."""
-        captured_data: dict[str, str] = {}
+    def test_upload_never_sends_created(self, sample_pdf: Path) -> None:
+        """
+        No document date is sent, so paperless-ngx dates the document itself.
 
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            content = _request.content.decode("utf-8", errors="replace")
-            captured_data["content"] = content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        The full metadata set goes out and nothing more: no ``created`` field,
+        and ``upload_document`` has no way to be given one.
+        """
+        fields = _uploaded_fields(sample_pdf, "Test", tags=[1, 2, 3], correspondent=5)
+        assert "created" not in [name for name, _ in fields]
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test"),
+                ("correspondent", "5"),
+                ("tags", "1"),
+                ("tags", "2"),
+                ("tags", "3"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test", created="2026-03-20")
-        content = captured_data["content"]
-        assert "2026-03-20" in content
-        # Ensure no ISO 8601 time component (T...) after the date value
-        date_segment = content.split("2026-03-20")[1].split("\r\n")[0]
-        assert "T" not in date_segment
-        client.close()
+        parameters = inspect.signature(PaperlessClient.upload_document).parameters
+        assert "created" not in parameters
 
     def test_form_fields_sent_as_data_not_files(self, sample_pdf: Path) -> None:
-        """Form fields (title, created) use data= parameter, PDF uses files= parameter."""
-        captured_data: dict[str, bytes] = {}
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            captured_data["body"] = _request.content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        """The title is a plain form field; only the PDF is a file part."""
+        fields = _uploaded_fields(sample_pdf, "Test Doc")
+        # multipart_fields decodes a part without a filename to str and keeps
+        # a file part's raw bytes, so an exact match also shows how each part
+        # was sent: a title sent as a file would arrive as b"Test Doc".
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test Doc"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test Doc", created="2026-03-22")
-        body = captured_data["body"].decode("utf-8", errors="replace")
-        # Document field has filename attribute (file upload via files=)
-        assert 'name="document"; filename=' in body
-        # Title field has NO filename attribute (form data via data=)
-        assert 'name="title"' in body
-        assert 'name="title"; filename=' not in body
-        # Created field has NO filename attribute (form data via data=)
-        assert 'name="created"' in body
-        assert 'name="created"; filename=' not in body
-        client.close()
 
     def test_upload_retry_on_network_error(
         self, sample_pdf: Path, sleeps: list[float]
@@ -535,24 +544,57 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 
 class TestPaperlessUrlValidation:
-    """D-08: a malformed paperless.url is a PaperlessError at construction."""
+    """
+    A URL or token the client cannot use is refused at construction.
 
-    def test_invalid_url_raises_a_paperless_error(self) -> None:
-        """
-        ``http://host:abc`` names the URL and httpx2's own text.
+    Load-time validation already refuses all of these, so they reach the
+    client only when it is built directly.  Each refusal is a fixed-text
+    ``PaperlessError`` with no chained cause: the parser's and the codec's own
+    text can quote a password or a token character, and a traceback prints the
+    cause.
+    """
 
-        The token must never reach the message (T-28-20, Pitfall 1): only the
-        configured URL and the httpx2 text are interpolated.
-        """
-        with pytest.raises(
-            PaperlessError,
-            match=re.escape(
-                "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
-            ),
-        ) as exc_info:
+    def test_invalid_url_is_refused_without_the_parser_text(self) -> None:
+        """``http://host:abc`` names the URL, not httpx2's complaint about it."""
+        with pytest.raises(PaperlessError) as exc_info:
             PaperlessClient("http://host:abc", "tok-SECRET-5d1")
-        assert isinstance(exc_info.value.__cause__, httpx2.InvalidURL)
-        assert "tok-SECRET-5d1" not in str(exc_info.value)
+        message = str(exc_info.value)
+        assert message == "Paperless URL http://host:abc is not valid"
+        assert "Invalid port" not in message
+        assert "tok-SECRET-5d1" not in message
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__
+
+    def test_invalid_url_never_quotes_a_password_the_parser_misread(self) -> None:
+        """
+        A ``/`` in a password makes httpx2 read the password as a port.
+
+        Its own text would then quote the first half of the password
+        (``Invalid port: 'hunter'``); the message shows the URL with its
+        userinfo cut through the last ``@`` and nothing else.
+        """
+        with pytest.raises(PaperlessError) as exc_info:
+            PaperlessClient("http://scanner:hunter/2secret@host", _MOCK_AUTH)
+        message = str(exc_info.value)
+        assert message == "Paperless URL http://host is not valid"
+        for fragment in ("hunter", "2secret", "scanner", "Invalid port"):
+            assert fragment not in message
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__
+
+    def test_non_ascii_token_is_refused_with_a_fixed_message(self) -> None:
+        """A token no HTTP header can carry is named by key, never quoted."""
+        with pytest.raises(PaperlessError) as exc_info:
+            PaperlessClient("http://paperless:8000", "tök")
+        message = str(exc_info.value)
+        assert message == (
+            "Paperless API token in paperless.token contains a character an "
+            "HTTP header cannot carry"
+        )
+        assert "tök" not in message
+        assert "ö" not in message
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__
 
 
 class TestTrustStoreConfigErrors:
@@ -612,88 +654,66 @@ _URL_SECRET = "pr0xy-S3CRET"
 
 class TestUrlCredentialsNeverShown:
     """
-    WR-08 / D-08: a ``user:password@`` in paperless.url never reaches a message.
+    A ``user:password@`` in paperless.url never reaches a request or a message.
 
-    Messages land in ``job.error`` (rendered in the web status area), on the
-    terminal and in the log, so each surface is checked for the password.
+    The client refuses such a URL outright rather than turning its userinfo
+    into Basic auth that would replace the API token.  Messages land in
+    ``job.error`` (rendered in the web status area), on the terminal and in
+    the log, so the refusal is checked for the password as well.
     """
 
-    def test_unreachable_message_names_the_url_without_its_password(
-        self, sample_pdf: Path, sleeps: list[float]
-    ) -> None:
-        """The exhausted-retry message shows the host, not the credentials."""
-        handler = _CountingHandler(_raising(httpx2.ConnectError("refused")))
-        client = PaperlessClient(
-            url=f"https://scanner:{_URL_SECRET}@paperless.example",
-            token=_MOCK_AUTH,
-            transport=_make_transport(handler),
-            max_retries=3,
+    def test_userinfo_url_is_refused_at_construction(self) -> None:
+        """The refusal names both keys and carries no part of the credentials."""
+        with pytest.raises(PaperlessError) as exc_info:
+            PaperlessClient("http://u:secretpw@paperless:8000", "tok")
+        message = str(exc_info.value)
+        assert message == (
+            "Paperless URL http://paperless:8000 carries a user name or "
+            "password; remove it from paperless.url and put the paperless-ngx "
+            "API token in paperless.token"
         )
-        try:
-            with pytest.raises(PaperlessError) as exc_info:
-                client.upload_document(sample_pdf, title="Behind a proxy")
-        finally:
-            client.close()
-        assert str(exc_info.value) == (
-            "Upload to Paperless at https://paperless.example failed after "
-            "3 attempts: refused"
-        )
-        assert len(sleeps) == 2
+        assert "secretpw" not in message
+        assert "u:" not in message
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__suppress_context__
 
-    def test_credentials_are_still_sent_as_basic_auth(self) -> None:
-        """Stripping the userinfo from the URL does not change the request."""
+    def test_userinfo_url_never_sends_basic_auth(self) -> None:
+        """No request is made, so no Basic header can replace the token."""
         seen: list[httpx2.Request] = []
 
         def handler(request: httpx2.Request) -> httpx2.Response:
             seen.append(request)
             return httpx2.Response(200, json={"results": []})
 
-        client = PaperlessClient(
-            url=f"https://scanner:{_URL_SECRET}@paperless.example/sub/",
-            token=_MOCK_AUTH,
-            transport=_make_transport(handler),
-        )
-        try:
-            client.get_tags()
-        finally:
-            client.close()
-        expected = httpx2.BasicAuth("scanner", _URL_SECRET)
-        probe = next(expected.auth_flow(httpx2.Request("GET", "https://x/")))
-        assert seen[0].headers["authorization"] == probe.headers["authorization"]
-        assert str(seen[0].url).startswith("https://paperless.example/sub/api/tags/")
-        assert _URL_SECRET not in str(seen[0].url)
+        with pytest.raises(PaperlessError):
+            PaperlessClient(
+                url=f"https://scanner:{_URL_SECRET}@paperless.example/sub/",
+                token=_MOCK_AUTH,
+                transport=_make_transport(handler),
+            )
+        assert seen == []
 
-    def test_no_log_record_carries_the_password(
-        self, sample_pdf: Path, sleeps: list[float], caplog: pytest.LogCaptureFixture
+    def test_userinfo_refusal_logs_nothing_carrying_the_password(
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Neither saneless's log lines nor httpx2's request log name it."""
+        """Neither the message nor any log record names the password."""
         caplog.set_level(logging.DEBUG)
-
-        def respond(call: int) -> httpx2.Response:
-            if call == 1:
-                return httpx2.Response(503, text="down")
-            return httpx2.Response(200, json="task-id")
-
-        client = PaperlessClient(
-            url=f"https://scanner:{_URL_SECRET}@paperless.example",
-            token=_MOCK_AUTH,
-            transport=_make_transport(_CountingHandler(respond)),
-        )
-        try:
-            client.upload_document(sample_pdf, title="Logged")
-        finally:
-            client.close()
-        assert caplog.records
+        with pytest.raises(PaperlessError) as exc_info:
+            PaperlessClient(
+                url=f"https://scanner:{_URL_SECRET}@paperless.example",
+                token=_MOCK_AUTH,
+                transport=_make_transport(_CountingHandler(_raising(AssertionError()))),
+            )
+        assert _URL_SECRET not in str(exc_info.value)
+        assert _URL_SECRET not in repr(exc_info.value)
         assert all(_URL_SECRET not in record.getMessage() for record in caplog.records)
-        assert sleeps == [1]
 
-    def test_invalid_url_message_strips_the_password(self) -> None:
-        """A URL httpx2 rejects is shown without its userinfo too."""
+    def test_invalid_url_with_userinfo_is_refused_without_the_password(self) -> None:
+        """A URL httpx2 rejects is shown without its userinfo and parser text."""
         with pytest.raises(PaperlessError) as exc_info:
             PaperlessClient(f"http://scanner:{_URL_SECRET}@host:abc", _MOCK_AUTH)
-        assert str(exc_info.value) == (
-            "Paperless URL http://host:abc is not valid: Invalid port: 'abc'"
-        )
+        assert str(exc_info.value) == "Paperless URL http://host:abc is not valid"
+        assert exc_info.value.__cause__ is None
 
     def test_scheme_less_url_message_strips_the_password(
         self, sample_pdf: Path, sleeps: list[float], caplog: pytest.LogCaptureFixture
