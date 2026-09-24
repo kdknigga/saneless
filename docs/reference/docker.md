@@ -42,6 +42,43 @@ Until a minor version's first final release is published, the examples in these
 docs pin the current release-candidate tag, because that version's `X.Y` tag
 does not exist yet. From its first final release on, they pin `X.Y`.
 
+## Verifying the image
+
+Images published by the release pipeline from the next release onward carry
+two signed attestations, recorded with GitHub and pushed beside the image to
+the registry: a SLSA
+build-provenance attestation, recording which workflow run in
+`kdknigga/saneless` built it from which commit, and an SPDX SBOM attestation
+listing what the image contains. **Images published before that -- 0.2.0-rc.6
+and every earlier tag -- carry neither**, so verifying one of them fails.
+
+Attestations are bound to the image's digest, not to a tag, so start from the
+digest of the image you actually run:
+
+```bash
+docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/kdknigga/saneless:0.2.0-rc.6
+```
+
+That prints `ghcr.io/kdknigga/saneless@sha256:<digest>`. Check the provenance
+with the [GitHub CLI](https://cli.github.com/):
+
+```bash
+gh attestation verify oci://ghcr.io/kdknigga/saneless@sha256:<digest> -R kdknigga/saneless
+```
+
+and the SBOM by naming its predicate type:
+
+```bash
+gh attestation verify oci://ghcr.io/kdknigga/saneless@sha256:<digest> -R kdknigga/saneless \
+    --predicate-type https://spdx.dev/Document/v2.3
+```
+
+`gh` resolves an `oci://` reference against the registry, so it needs you to be
+logged in there already (`docker login ghcr.io`), and it fetches the
+attestations through GitHub's API, so it needs `gh auth login` as well. A
+successful check proves the image was built by this repository's
+release workflow; it does not replace pinning a tag you have reviewed.
+
 ## User and file ownership
 
 The container runs as UID/GID **1000**, not root, and everything it writes on a
@@ -68,9 +105,15 @@ the container as your own UID instead.
 The image includes a built-in healthcheck:
 
 ```dockerfile
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=4)"]
 ```
+
+The probe is Python's standard library, run by the image's own interpreter; the
+image carries no separate HTTP client. `urlopen` raises on a refused connection
+and on any non-2xx response, so either one exits non-zero and counts as a failed
+check. `--start-period=30s` gives the first SANE initialisation 30 seconds
+before failed checks start to count.
 
 The `/health` endpoint returns `200` when saneless is healthy. It returns `503` when the worker thread is down (`worker thread is down`) or when the worker is degraded because its job store is failing (`job store failing`); see [`GET /health`](web-api.md#get-health). After three failed checks in a row, Docker reports the container as unhealthy.
 
@@ -105,10 +148,14 @@ PDF into `/var/lib/saneless/failed/`. That copy is then the only remaining copy
 of the document. Pruning the volume, or leaving it unmounted so that it vanishes
 when the container is recreated, destroys scans that were never ingested.
 
-The image sets `SANELESS_OUTPUT__DATA_DIR=/var/lib/saneless` and declares it as
-a `VOLUME`, so a plain `docker run -v saneless-data:/var/lib/saneless` is correct
-without setting anything else. `/tmp/saneless` is not mounted by the compose
-files below: it holds nothing worth keeping between runs.
+The image sets `XDG_STATE_HOME=/var/lib`, so `data_dir` defaults to
+`/var/lib/saneless` -- the directory it declares as a `VOLUME` -- and one-shot
+commands such as `docker compose exec saneless saneless jobs` log to
+`/var/lib/saneless/saneless.log`. It is only a default: `[output] data_dir` in
+`saneless.toml`, or `SANELESS_OUTPUT__DATA_DIR`, still overrides it. A plain
+`docker run -v saneless-data:/var/lib/saneless` is therefore correct without
+setting anything else. `/tmp/saneless` is not mounted by the compose files
+below: it holds nothing worth keeping between runs.
 
 ### Preserved scans in `failed/`
 
@@ -161,7 +208,7 @@ All `SANELESS_*` environment variables are supported inside the container. Commo
 | `SANELESS_PAPERLESS__URL` | `http://paperless:8000` | Paperless-ngx URL (Docker network) |
 | `SANELESS_PAPERLESS__TOKEN` | `abc123def456` | Paperless-ngx API token. Prefer `saneless.toml` -- see below |
 | `SANELESS_OUTPUT__WEB_PORT` | `8080` | **The container's port is fixed at 8080.** `web_port` is a bare-metal setting: setting it here moves the server off the port the image exposes and the healthcheck probes, so the container reports unhealthy while the UI is in fact running somewhere else. Remap on the host instead -- `-p 8888:8080` |
-| `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. **Already set by the image** -- override it only if you mount the volume somewhere else |
+| `SANELESS_OUTPUT__DATA_DIR` | `/var/lib/saneless` | Durable state directory. Not set by the image: it defaults to `/var/lib/saneless` because the image sets `XDG_STATE_HOME=/var/lib`. Set it only if you mount the volume somewhere else; it overrides `[output] data_dir` in `saneless.toml` |
 | `TZ` | `America/Chicago` | Standard container variable, **not** a saneless setting. A container's clock reports UTC without it, and saneless renders every timestamp in the server's local zone, so `TZ` is what makes the job history, `saneless jobs` and the fallback document title show your local time |
 
 See [Environment Variables](environment-variables.md) for the full list.
@@ -207,11 +254,22 @@ next time the container is recreated.
 
 ## Scanner Access
 
-The container never reaches a scanner directly, not even one plugged into its own
-host. It reaches every scanner over the SANE network protocol, which is why no
-device mapping and no `--privileged` flag appear anywhere on this page: `saned`
-owns the scanner, and saneless talks to `saned`. Set the scanner host to the
-machine `saned` runs on -- the container's own host, or another one:
+The container reaches scanners over the network only. No device mapping and no
+`--privileged` flag appear anywhere on this page, and none is needed.
+
+The image enables exactly two SANE backends, `net` and `escl`. The stock list
+enables about eighty, and SANE probes every one of them the first time it looks
+for devices, which slows that first scan by seconds even with no scanner
+attached. The consequence is that USB and every other local backend are not
+available inside the container: a scanner plugged into the host is reached
+through `saned` on that host, like any other.
+
+### Through `saned` (primary route)
+
+`saned` owns the scanner, and saneless talks to `saned` over the SANE network
+protocol. This works for any scanner SANE supports, including USB scanners on
+the container's own host. Set the scanner host to the machine `saned` runs on --
+the container's own host, or another one:
 
 ```yaml
 services:
@@ -228,6 +286,47 @@ services:
 saneless injects this value into `SANE_NET_HOSTS` before initializing the SANE backend, enabling automatic scanner discovery inside the container.
 
 For detailed setup instructions, see [Scanner Host Discovery](../how-to/scanner-host-discovery.md).
+
+### Direct eSCL (driverless network scanners)
+
+Many current network scanners and multifunction printers speak eSCL (Apple
+AirScan), which the image's `escl` backend reaches directly, with no `saned` in
+between. Name the scanner in an `escl.conf` holding one `device` line -- its URL,
+then an optional model name:
+
+```text
+device http://192.168.1.60:80
+```
+
+Use `https://` and the matching port when the scanner serves eSCL over TLS.
+Mount the file read-only over the image's own copy:
+
+```yaml
+services:
+  saneless:
+    image: ghcr.io/kdknigga/saneless:0.2.0-rc.6
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/etc/saneless
+      - saneless-data:/var/lib/saneless
+      - ./escl.conf:/etc/sane.d/escl.conf:ro
+
+volumes:
+  saneless-data:
+```
+
+`saneless devices` lists the scanner under a name beginning `escl:`. With
+`scanner.device` empty saneless uses the first device it finds; set
+`scanner.device` to that name to choose it explicitly when `saned` offers
+others too.
+
+Automatic eSCL discovery over mDNS, with no `device` line, is **untested** in
+the container. The `escl` backend discovers scanners through the host's
+avahi-daemon over the system D-Bus, so it would need the host's avahi-daemon
+running and its D-Bus socket (`/run/dbus/system_bus_socket`) mounted into the
+container. Host networking alone is not enough: the container still has no
+avahi-daemon to ask. Prefer the explicit `device` line.
 
 ## Full Example
 
