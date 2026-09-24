@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import time
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import httpx2
@@ -34,6 +35,7 @@ from tests.golden_support import (
     TASKS_PATH,
     LoopbackHit,
     loopback_paperless,
+    multipart_fields,
     production_debug_logging,
 )
 
@@ -217,6 +219,44 @@ class TestClientSignature:
         assert parameter.default is inspect.Parameter.empty
 
 
+def _uploaded_fields(
+    pdf: Path,
+    title: str,
+    tags: list[int] | None = None,
+    correspondent: int | None = None,
+) -> list[tuple[str, str | bytes]]:
+    """
+    Upload ``pdf`` once and read back the form parts that went on the wire.
+
+    Args:
+        pdf: The PDF to upload.
+        title: Document title.
+        tags: Optional tag ids.
+        correspondent: Optional correspondent id.
+
+    Returns:
+        The parsed ``(name, value)`` form parts of the one upload request.
+
+    """
+    uploads: list[list[tuple[str, str | bytes]]] = []
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        uploads.append(multipart_fields(request))
+        return httpx2.Response(200, json="task-id")
+
+    client = PaperlessClient(
+        url="http://paperless:8000",
+        token=_MOCK_AUTH,
+        transport=_make_transport(handler),
+    )
+    try:
+        client.upload_document(pdf, title, tags=tags, correspondent=correspondent)
+    finally:
+        client.close()
+    assert len(uploads) == 1
+    return uploads[0]
+
+
 class TestUploadDocument:
     """Document upload tests."""
 
@@ -240,94 +280,63 @@ class TestUploadDocument:
         client.close()
 
     def test_upload_with_tags(self, sample_pdf: Path) -> None:
-        """Upload includes repeated tag form fields."""
-        captured_data: dict[str, str] = {}
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            content = _request.content.decode("utf-8", errors="replace")
-            captured_data["content"] = content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        """Each tag id travels as its own ``tags`` form field, and nothing else."""
+        fields = _uploaded_fields(sample_pdf, "Test", tags=[1, 2, 3])
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test"),
+                ("tags", "1"),
+                ("tags", "2"),
+                ("tags", "3"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test", tags=[1, 2, 3])
-        # Tags should appear as repeated form fields
-        content = captured_data["content"]
-        assert content.count("tags") >= 3
-        client.close()
 
     def test_upload_with_correspondent(self, sample_pdf: Path) -> None:
-        """Upload includes correspondent field."""
-        captured_data: dict[str, str] = {}
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            content = _request.content.decode("utf-8", errors="replace")
-            captured_data["content"] = content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        """The correspondent id travels as one exact ``correspondent`` field."""
+        fields = _uploaded_fields(sample_pdf, "Test", correspondent=5)
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test"),
+                ("correspondent", "5"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test", correspondent=5)
-        assert "correspondent" in captured_data["content"]
-        assert "5" in captured_data["content"]
-        client.close()
 
-    def test_upload_with_created(self, sample_pdf: Path) -> None:
-        """Upload includes created date field."""
-        captured_data: dict[str, str] = {}
+    def test_upload_never_sends_created(self, sample_pdf: Path) -> None:
+        """
+        No document date is sent, so paperless-ngx dates the document itself.
 
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            content = _request.content.decode("utf-8", errors="replace")
-            captured_data["content"] = content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        The full metadata set goes out and nothing more: no ``created`` field,
+        and ``upload_document`` has no way to be given one.
+        """
+        fields = _uploaded_fields(sample_pdf, "Test", tags=[1, 2, 3], correspondent=5)
+        assert "created" not in [name for name, _ in fields]
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test"),
+                ("correspondent", "5"),
+                ("tags", "1"),
+                ("tags", "2"),
+                ("tags", "3"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test", created="2026-03-20")
-        content = captured_data["content"]
-        assert "2026-03-20" in content
-        # Ensure no ISO 8601 time component (T...) after the date value
-        date_segment = content.split("2026-03-20")[1].split("\r\n")[0]
-        assert "T" not in date_segment
-        client.close()
+        parameters = inspect.signature(PaperlessClient.upload_document).parameters
+        assert "created" not in parameters
 
     def test_form_fields_sent_as_data_not_files(self, sample_pdf: Path) -> None:
-        """Form fields (title, created) use data= parameter, PDF uses files= parameter."""
-        captured_data: dict[str, bytes] = {}
-
-        def handler(_request: httpx2.Request) -> httpx2.Response:
-            captured_data["body"] = _request.content
-            return httpx2.Response(200, json="task-id")
-
-        transport = _make_transport(handler)
-        client = PaperlessClient(
-            url="http://paperless:8000",
-            token=_MOCK_AUTH,
-            transport=transport,
+        """The title is a plain form field; only the PDF is a file part."""
+        fields = _uploaded_fields(sample_pdf, "Test Doc")
+        # multipart_fields decodes a part without a filename to str and keeps
+        # a file part's raw bytes, so an exact match also shows how each part
+        # was sent: a title sent as a file would arrive as b"Test Doc".
+        assert Counter(fields) == Counter(
+            [
+                ("title", "Test Doc"),
+                ("document", sample_pdf.read_bytes()),
+            ]
         )
-        client.upload_document(sample_pdf, title="Test Doc", created="2026-03-22")
-        body = captured_data["body"].decode("utf-8", errors="replace")
-        # Document field has filename attribute (file upload via files=)
-        assert 'name="document"; filename=' in body
-        # Title field has NO filename attribute (form data via data=)
-        assert 'name="title"' in body
-        assert 'name="title"; filename=' not in body
-        # Created field has NO filename attribute (form data via data=)
-        assert 'name="created"' in body
-        assert 'name="created"; filename=' not in body
-        client.close()
 
     def test_upload_retry_on_network_error(
         self, sample_pdf: Path, sleeps: list[float]
