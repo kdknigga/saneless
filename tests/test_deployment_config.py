@@ -2539,6 +2539,14 @@ def _builder_stage_offenders(builder: list[tuple[int, str]]) -> list[str]:
         for number, text in syncs
         if "--no-editable" not in text
     )
+    # Without it, uv adds the default groups to whatever the command names:
+    # the whole dev toolchain, and the build group, would ship in /opt/venv.
+    offenders.extend(
+        f"line {number}: `{LOCKED_SYNC}` without --no-default-groups installs "
+        f"the default dependency groups into the shipped venv: {text}"
+        for number, text in syncs
+        if "--no-default-groups" not in text
+    )
     return offenders
 
 
@@ -2661,6 +2669,16 @@ def test_the_runtime_guard_accepts_the_target_shape(tmp_path: Path) -> None:
         ),
         ("--group build --no-install-project", "--no-install-project", "--group build"),
         ("--no-default-groups --no-editable", "--no-default-groups", "--no-editable"),
+        (
+            "--locked --no-default-groups --group build",
+            "--locked --group build",
+            "--no-default-groups",
+        ),
+        (
+            "--locked --no-default-groups --no-editable",
+            "--locked --no-editable",
+            "--no-default-groups",
+        ),
     ],
 )
 def test_the_runtime_guard_reports_a_seeded_break(
