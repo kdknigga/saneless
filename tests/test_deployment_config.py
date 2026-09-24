@@ -4804,9 +4804,19 @@ BLOCK_SCALAR = re.compile(r"^[|>][+-]?$")
 # ``ubuntu-latest`` runner label.
 LATEST_WORD = re.compile(r"(?<![\w-])latest(?![\w-])")
 
-# The one output that routes a release, as every expression reading it spells
-# it. The gate derives it from the parsed version, not from the tag's text.
-GATE_ROUTING = "needs.gate.outputs.is_prerelease"
+# The exact expressions that route a release by the gate's one output, which
+# it derives from the parsed version, not from the tag's text. Only the literal answer ``false`` selects the
+# real index, so an empty or missing gate output falls through to TestPyPI,
+# where an upload can be abandoned, never to PyPI, where it cannot be undone.
+# Pinned whole rather than by substring: swapping the two arms keeps every
+# substring and sends each release candidate to the real index.
+GATE_ENVIRONMENT = (
+    "${{ needs.gate.outputs.is_prerelease == 'false' && 'pypi' || 'testpypi' }}"
+)
+GATE_INDEX_URL = (
+    "${{ needs.gate.outputs.is_prerelease == 'false' && "
+    "'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}"
+)
 # The gate's command, and the install it runs after.
 GATE_SCRIPT = "scripts/release_gate.py"
 GATE_INSTALL = "uv sync --locked --only-group release --no-install-project"
@@ -5167,9 +5177,22 @@ def test_release_gate_job_runs_the_gate_script_and_outputs_the_routing() -> None
         f"the gate job does not run {GATE_SCRIPT}. Run lines: {scripts}"
     )
     outputs = _key_mapping(block, "outputs", 4) or {}
-    assert "steps.gate.outputs.is_prerelease" in outputs.get("is_prerelease", ""), (
+    assert outputs.get("is_prerelease") == "${{ steps.gate.outputs.is_prerelease }}", (
         "the gate job does not output is_prerelease from its gate step, so "
         f"nothing downstream can route by it. Outputs: {outputs}"
+    )
+    # The output names a step by id, and a renamed id leaves it empty without
+    # any error. So the step it names must exist and must be the gate itself.
+    gate_steps = [
+        step for step in _job_steps(block) if _step_value(step, "id") == "gate"
+    ]
+    assert len(gate_steps) == 1, (
+        "the gate job has no single step with `id: gate`, so the is_prerelease "
+        "output it declares is always empty"
+    )
+    assert GATE_SCRIPT in (_step_value(gate_steps[0], "run") or ""), (
+        f"the `id: gate` step does not run {GATE_SCRIPT}, so the routing output "
+        f"is not the version gate's answer: {gate_steps[0]}"
     )
 
 
@@ -5182,27 +5205,31 @@ def test_both_publish_jobs_route_by_the_gate_not_by_a_hyphen_in_the_tag() -> Non
     select their environment with the same expression, so a final release is
     approved before the image push as well as before the upload, and the
     upload URL follows the same answer.
+
+    The direction is pinned, not just the output's presence: only the literal
+    answer ``false`` may select the real index, so a missing answer, or arms
+    swapped by an edit, cannot send a release candidate there.
     """
     names = {
         job: (_key_mapping(_release_job(job), "environment", 4) or {}).get("name", "")
         for job in ("publish-docker", "publish-pypi")
     }
-    assert GATE_ROUTING in names["publish-pypi"], (
-        f"publish-pypi's environment is {names['publish-pypi']!r}; it must be "
-        f"selected by {GATE_ROUTING}"
-    )
-    assert names["publish-docker"] == names["publish-pypi"], (
-        "the two publish jobs select their environment differently, so one of "
-        f"them can run without the approval the other waits for: {names}"
-    )
+    for job, name in names.items():
+        assert name == GATE_ENVIRONMENT, (
+            f"{job}'s environment is {name!r}; it must be exactly "
+            f"{GATE_ENVIRONMENT!r}, which picks pypi only on an explicit "
+            "`false` from the gate and TestPyPI on anything else"
+        )
 
     pypi_steps = _steps_using(
         _release_job("publish-pypi"), "pypa/gh-action-pypi-publish@"
     )
     assert len(pypi_steps) == 1, "publish-pypi has no single upload step"
     url = _step_value(pypi_steps[0], "repository-url") or ""
-    assert GATE_ROUTING in url, (
-        f"the upload's repository-url is {url!r}; it must be chosen by {GATE_ROUTING}"
+    assert url == GATE_INDEX_URL, (
+        f"the upload's repository-url is {url!r}; it must be exactly "
+        f"{GATE_INDEX_URL!r}, which picks the real index only on an explicit "
+        "`false` from the gate"
     )
 
     offenders = [

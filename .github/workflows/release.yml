@@ -106,8 +106,13 @@ jobs:
     # tag the maintainer approves here, before the image is pushed, and again
     # before the package upload. Pre-releases resolve to `testpypi` and run
     # unblocked.
+    #
+    # Only the literal answer `false` selects `pypi`. An empty or missing gate
+    # output -- a renamed step id, a script that stopped writing its output --
+    # falls through to `testpypi`, the index an upload can be abandoned on,
+    # rather than to the one it cannot be taken back from.
     environment:
-      name: ${{ needs.gate.outputs.is_prerelease == 'true' && 'testpypi' || 'pypi' }}
+      name: ${{ needs.gate.outputs.is_prerelease == 'false' && 'pypi' || 'testpypi' }}
     permissions:
       contents: read
       packages: write # push the image, and its attestations beside it
@@ -220,7 +225,7 @@ jobs:
     # The manual approval rule lives on `pypi`, so it gates exactly the runs
     # where this expression resolves to `pypi` and leaves rehearsals unblocked.
     environment:
-      name: ${{ needs.gate.outputs.is_prerelease == 'true' && 'testpypi' || 'pypi' }}
+      name: ${{ needs.gate.outputs.is_prerelease == 'false' && 'pypi' || 'testpypi' }}
     permissions:
       contents: read
       id-token: write # trusted publishing, and the PEP 740 attestation signature
@@ -241,9 +246,10 @@ jobs:
           # PEP 740 attestations, signed with the OIDC identity this job
           # already holds. Supported on both PyPI and TestPyPI.
           attestations: true
-          # Chosen by the same gate output as the environment. The URL is
+          # Chosen by the same gate output as the environment, and failing
+          # toward TestPyPI the same way when that output is missing. The URL is
           # always written out rather than left empty for pypi: whether the
           # action treats an empty repository-url as "use the default index"
           # is not something this repo has verified, and an explicit URL
           # removes the question entirely.
-          repository-url: ${{ needs.gate.outputs.is_prerelease == 'true' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          repository-url: ${{ needs.gate.outputs.is_prerelease == 'false' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
