@@ -14,7 +14,6 @@ import tempfile
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, assert_never
@@ -1484,7 +1483,6 @@ def _handle_duplex_mismatch(
     )
 
     notify(PipelineEvent.UPLOADING)
-    created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     title = request.title
     # One guard over both halves: they are a single document between them, so
     # a failure on either one has to keep both.
@@ -1494,14 +1492,12 @@ def _handle_duplex_mismatch(
             f"{title} (fronts)",
             request.tags,
             request.correspondent,
-            created,
         )
         backs_result = paperless.upload_document(
             backs_pdf,
             f"{title} (backs)",
             request.tags,
             request.correspondent,
-            created,
         )
 
         # UploadResult.__post_init__ guarantees a task_uuid iff the document
@@ -1943,14 +1939,12 @@ def _deliver(
     """
     notify = request.status_callback or _noop_callback
     notify(PipelineEvent.UPLOADING)
-    created = datetime.now(tz=UTC).strftime("%Y-%m-%d")
     with _preserving([pdf_path], settings.output.failed_dir):
         upload_result = paperless.upload_document(
             pdf_path,
             request.title,
             request.tags,
             request.correspondent,
-            created,
         )
 
         # Poll for the result.  UploadResult.__post_init__ guarantees a

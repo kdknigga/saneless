@@ -1,10 +1,11 @@
 """
 Paperless-ngx REST API client with retry, polling, and connection test.
 
-Uploads PDFs with metadata (title, tags, correspondent, created date),
-polls the task endpoint with exponential backoff until a terminal state
-and raises when that state is not success, and probes connections,
-reporting one of the five ConnectionStatus outcomes.
+Uploads PDFs with metadata (title, tags, correspondent) but no document
+date, which paperless-ngx chooses itself; polls the task endpoint with
+exponential backoff until a terminal state and raises when that state is
+not success; and probes connections, reporting one of the five
+ConnectionStatus outcomes.
 """
 
 from __future__ import annotations
@@ -709,13 +710,13 @@ class PaperlessClient:
         title: str,
         tags: list[int] | None = None,
         correspondent: int | None = None,
-        created: str | None = None,
     ) -> UploadResult:
         """
         Upload a PDF document to paperless-ngx.
 
         Builds multipart form data with title and optional metadata.
-        Tags are submitted as repeated form fields.  Every transient
+        Tags are submitted as repeated form fields.  No document date is
+        sent: paperless-ngx dates the document itself.  Every transient
         transport failure and every 5xx is retried with exponential backoff
         for ``max_retries`` attempts; a 4xx, a redirect or any other non-2xx
         that is not a 5xx, a request that cannot be sent from the configured
@@ -730,7 +731,6 @@ class PaperlessClient:
             title: Document title.
             tags: Optional list of tag IDs to attach.
             correspondent: Optional correspondent ID.
-            created: Optional creation date string (e.g. "2026-03-20").
 
         Returns:
             An UploadResult. On success ``delivered_to_api`` is True and
@@ -759,7 +759,7 @@ class PaperlessClient:
                 library text it quotes has the token struck out.
 
         """
-        data = self._form_fields(title, tags, correspondent, created)
+        data = self._form_fields(title, tags, correspondent)
         last_error: httpx2.HTTPError | None = None
 
         for attempt in range(self._max_retries):
@@ -816,7 +816,6 @@ class PaperlessClient:
         title: str,
         tags: list[int] | None,
         correspondent: int | None,
-        created: str | None,
     ) -> dict[str, str | list[str]]:
         """
         Build the multipart form fields for an upload.
@@ -825,15 +824,12 @@ class PaperlessClient:
             title: Document title.
             tags: Optional tag IDs, submitted as repeated form fields.
             correspondent: Optional correspondent ID.
-            created: Optional creation date string.
 
         Returns:
             The form fields, with absent metadata left out.
 
         """
         data: dict[str, str | list[str]] = {"title": title}
-        if created is not None:
-            data["created"] = created
         if correspondent is not None:
             data["correspondent"] = str(correspondent)
         if tags:
