@@ -20,6 +20,9 @@ Exactly two things are stubbed, and nothing else:
   ``PaperlessClient(..., transport=...)``, the seam ``tests/test_paperless.py``
   uses throughout.  It sits *below* ``httpx2.Client``, so the real
   ``upload_document`` and ``poll_task`` bodies execute, retries and all.
+  The two client-side misconfiguration cases stub even less: a request the
+  transport refuses never reaches a mock, so they run the production transport,
+  one of them against a real socket on 127.0.0.1.
 
 Everything else is production code: real PDF assembly, real empty-page
 filtering, real preservation into ``<data_dir>/failed/``, a real file-backed
@@ -54,7 +57,8 @@ tests, for a problem two existing constructor parameters already solve.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 from unittest.mock import MagicMock
 
@@ -82,6 +86,7 @@ from saneless.vocabulary import (
 )
 from saneless.worker import ScanWorker
 from tests.conftest import spooling_in_turn
+from tests.golden_support import loopback_paperless, production_debug_logging
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -92,6 +97,9 @@ if TYPE_CHECKING:
 
 _DOCUMENTS_PATH = "/api/documents/post_document/"
 _TASKS_PATH = "/api/tasks/"
+
+_PAPERLESS_URL = "http://paperless.invalid:8000"
+_TOKEN = "e2e-token"
 
 _DEVICE = "test:device:001"
 _TITLE = "Quarterly Report"
@@ -579,7 +587,9 @@ def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
     return scanner
 
 
-def _build_settings(tmp_path: Path, case: _Case) -> Settings:
+def _build_settings(
+    tmp_path: Path, case: _Case, *, paperless_url: str = _PAPERLESS_URL
+) -> Settings:
     """
     Build Settings whose directories are three separate subtrees of tmp_path.
 
@@ -592,6 +602,7 @@ def _build_settings(tmp_path: Path, case: _Case) -> Settings:
     Args:
         tmp_path: pytest's per-test directory.
         case: The case being built, for its source, duplex mode and timeouts.
+        paperless_url: ``paperless.url``; ``""`` is the unset state.
 
     Returns:
         Settings pointing at scratch, durable state and consume directories
@@ -605,8 +616,8 @@ def _build_settings(tmp_path: Path, case: _Case) -> Settings:
     return Settings(
         scanner=ScannerConfig(device=_DEVICE),
         paperless=PaperlessConfig(
-            url="http://paperless.invalid:8000",
-            token="e2e-token",
+            url=paperless_url,
+            token=_TOKEN,
             consume_dir=tmp_path / "consume" if case.with_consume_dir else None,
         ),
         output=OutputConfig(
@@ -889,3 +900,132 @@ class TestFlipTimeoutReleasesTheWorker:
         assert "flip wait timed out" in timed_out.error
         assert finished.state is JobState.DONE
         assert finished.pages_scanned == 2
+
+
+# A configuration failure after the scan: the document is assembled, the upload
+# cannot even be attempted, and the PDF is kept in failed/ -- never copied to
+# the consume directory, which is configured in both cases below.
+_MISCONFIGURED = _Case(
+    label="misconfigured",
+    handler_factory=_accepting_handler,
+    expected_state=JobState.ERROR,
+    expected_outcome=None,
+    expected_pages=(None, None, None),
+    expected_failed_pdfs=1,
+    expected_consume_pdfs=0,
+    with_consume_dir=True,
+)
+
+
+def _scan_once(
+    settings: Settings,
+    paperless: PaperlessClient,
+    wait_for_state: Callable[..., Job],
+) -> Job:
+    """
+    Run one simplex scan through the real worker and return its finished row.
+
+    Args:
+        settings: The settings the worker runs under.
+        paperless: The client the worker uploads with.
+        wait_for_state: The suite's wait helper, from its fixture.
+
+    Returns:
+        The job row, re-read once it reached a terminal state.
+
+    """
+    store = JobStore(db_path=settings.output.db_path)
+    worker = ScanWorker(_build_scanner((2,)), paperless, settings, store)
+    try:
+        worker.start()
+        job = store.create_job(_PROFILE, _TITLE)
+        worker.submit(job)
+        # 2 s, less than the 3 s two backoff pauses would take: a client that
+        # retried would miss this budget.
+        return wait_for_state(store, job.id, TERMINAL_STATES, 2.0)
+    finally:
+        worker.stop()
+        paperless.close()
+        store.close()
+
+
+class TestClientSideMisconfigurationEndToEnd:
+    """
+    A request the client cannot send fails the scan as a configuration error.
+
+    These two cases leave the in-memory transport the rest of this module uses:
+    a refused header value is refused by h11, below where ``MockTransport``
+    plugs in, and an unset URL is refused by the real transport's scheme check.
+    So each runs the production transport -- the first against a real socket
+    on 127.0.0.1 -- with the production retry count.
+    """
+
+    def test_padded_token_fails_as_configuration_without_leaking(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """A token with a trailing space ends ERROR/CONFIG, token nowhere."""
+        token = "abc "
+        settings = _build_settings(tmp_path, _MISCONFIGURED)
+        # caplog before the production configuration, so the root level it
+        # restores at teardown is the one from before that lowered it.
+        caplog.set_level(logging.DEBUG)
+        with production_debug_logging(), loopback_paperless() as server:
+            finished = _scan_once(
+                settings,
+                PaperlessClient(
+                    url=server.url,
+                    token=token,
+                    consume_dir=settings.paperless.consume_dir,
+                    max_retries=3,
+                ),
+                wait_for_state,
+            )
+        assert server.hits == []
+        assert finished.error_category is ErrorCategory.CONFIG
+        assert finished.error is not None
+        assert "paperless.token" in finished.error
+        for text in (finished.error, caplog.text):
+            assert token not in text
+            assert token.strip() not in text
+        _assert_persisted_row(_MISCONFIGURED, finished)
+        _assert_files(
+            replace(_MISCONFIGURED, error_contains=("paperless.token",)),
+            finished,
+            settings.output.failed_dir,
+            tmp_path / "consume",
+        )
+
+    def test_unset_url_fails_as_configuration_without_fallback(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """``paperless.url = ""`` is not a consume-folder setup: ERROR/CONFIG."""
+        settings = _build_settings(tmp_path, _MISCONFIGURED, paperless_url="")
+        caplog.set_level(logging.DEBUG)
+        with production_debug_logging():
+            finished = _scan_once(
+                settings,
+                PaperlessClient(
+                    url=settings.paperless.url,
+                    token=settings.paperless.token.get_secret_value(),
+                    consume_dir=settings.paperless.consume_dir,
+                    max_retries=3,
+                ),
+                wait_for_state,
+            )
+        assert finished.error_category is ErrorCategory.CONFIG
+        assert finished.error is not None
+        assert _TOKEN not in finished.error
+        assert _TOKEN not in caplog.text
+        _assert_persisted_row(_MISCONFIGURED, finished)
+        _assert_files(
+            replace(_MISCONFIGURED, error_contains=("paperless.url",)),
+            finished,
+            settings.output.failed_dir,
+            tmp_path / "consume",
+        )
