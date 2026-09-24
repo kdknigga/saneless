@@ -53,10 +53,12 @@ listing what the image contains. **Images published before that -- 0.2.0-rc.6
 and every earlier tag -- carry neither**, so verifying one of them fails.
 
 Attestations are bound to the image's digest, not to a tag, so start from the
-digest of the image you actually run:
+digest of the image you actually run. Replace `<image>` with the reference you
+pulled, exactly as your compose file or `docker run` line names it, tag
+included -- a release published after 0.2.0-rc.6:
 
 ```bash
-docker image inspect --format '{{index .RepoDigests 0}}' ghcr.io/kdknigga/saneless:0.2.0-rc.6
+docker image inspect --format '{{index .RepoDigests 0}}' <image>
 ```
 
 That prints `ghcr.io/kdknigga/saneless@sha256:<digest>`. Check the provenance
