@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import os
 import threading
 import time
@@ -215,6 +216,25 @@ def sane_process_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     reset_sane_process_state()
     yield
     reset_sane_process_state()
+
+
+@pytest.fixture(autouse=True)
+def library_logger_levels() -> Iterator[None]:
+    """
+    Return the HTTP library loggers to NOTSET after every test.
+
+    ``configure_logging`` sets a level on these shared library loggers, and a
+    few tests outside ``test_logging.py`` run the real function. A level left
+    behind changes what a later test's ``caplog`` or log file captures from
+    httpx2 and friends, so it is reset for the whole suite, not per module.
+
+    Yields:
+        Nothing; the reset runs after the test.
+
+    """
+    yield
+    for name in ("httpx2", "httpcore2", "hpack", "multipart", "python_multipart"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
 
 
 @pytest.fixture(autouse=True)

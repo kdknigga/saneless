@@ -27,6 +27,26 @@ if TYPE_CHECKING:
 # discarded rather than merely reformatted.
 _LIBRARY_DEBUG_SENTINEL = "Token 4f2b9ac81de7350649fc2e0bd85a71c3"
 
+# The HTTP-stack loggers whose DEBUG output must never reach saneless's log,
+# listed here rather than imported so that dropping a name from the module's own
+# list fails a test. ``httpcore2.http11`` is the child that writes the header
+# trace; it has no level of its own and must inherit the cap from its parent.
+# ``python_multipart`` is the real logger name, ``multipart`` its shim.
+_LIBRARY_LOGGER_NAMES = (
+    "httpx2",
+    "httpcore2",
+    "httpcore2.http11",
+    "hpack",
+    "multipart",
+    "python_multipart",
+)
+
+
+def _reset_library_loggers() -> None:
+    """Return every HTTP library logger to NOTSET, so no test's level leaks."""
+    for name in _LIBRARY_LOGGER_NAMES:
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
 
 def _raise_runtime_error(message: str) -> None:
     """
@@ -74,7 +94,8 @@ class TestConfigureLogging:
         Remove all handlers from root logger to prevent leaks.
 
         The ``saneless`` logger is reset too: a verbose call sets it to DEBUG,
-        and that must not leak into whichever test runs next.
+        and that must not leak into whichever test runs next. So are the HTTP
+        library loggers, whose level every call sets.
         """
         root = logging.getLogger()
         for handler in root.handlers[:]:
@@ -82,6 +103,7 @@ class TestConfigureLogging:
             root.removeHandler(handler)
         root.setLevel(logging.WARNING)
         logging.getLogger("saneless").setLevel(logging.NOTSET)
+        _reset_library_loggers()
 
     def test_configure_logging_creates_file_handler(self, tmp_path: Path) -> None:
         """configure_logging adds a RotatingFileHandler to the root logger."""
@@ -451,7 +473,8 @@ class TestConfigureLoggingStreamMode:
         Remove all handlers from root logger to prevent leaks.
 
         The ``saneless`` logger is reset too: a verbose call sets it to DEBUG,
-        and that must not leak into whichever test runs next.
+        and that must not leak into whichever test runs next. So are the HTTP
+        library loggers, whose level every call sets.
         """
         root = logging.getLogger()
         for handler in root.handlers[:]:
@@ -459,6 +482,7 @@ class TestConfigureLoggingStreamMode:
             root.removeHandler(handler)
         root.setLevel(logging.WARNING)
         logging.getLogger("saneless").setLevel(logging.NOTSET)
+        _reset_library_loggers()
 
     def test_stream_mode_attaches_no_file_handler(self) -> None:
         """
@@ -605,6 +629,7 @@ class TestConfigureLoggingIsIdempotent:
                 root.removeHandler(handler)
         root.setLevel(level)
         logging.getLogger("saneless").setLevel(logging.NOTSET)
+        _reset_library_loggers()
 
     def test_two_file_mode_calls_leave_one_file_handler(self, tmp_path: Path) -> None:
         """A second call replaces the first call's file handler, not adds to it."""
@@ -682,6 +707,112 @@ class TestConfigureLoggingIsIdempotent:
         err = capsys.readouterr().err
         assert err.count("it failed 2b64") == 1
         assert "Traceback" not in err
+
+
+class TestLibraryLoggerCap:
+    """
+    The HTTP library loggers stay at INFO or above whatever the log level says.
+
+    ``output.log_level = "DEBUG"`` sets the root logger, and without a level of
+    their own the library loggers would inherit it. httpcore2's DEBUG trace
+    carries response headers today, and a request header -- the Paperless
+    Authorization header among them -- is one library release away. The cap
+    keeps that out of saneless's log on saneless's side, not the library's.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_root(self) -> Iterator[None]:
+        """
+        Remove every handler the test added and reset the levels it changed.
+
+        Yields:
+            Nothing; the restore runs after the test.
+
+        """
+        root = logging.getLogger()
+        before = root.handlers[:]
+        level = root.level
+        yield
+        for handler in root.handlers[:]:
+            if handler not in before:
+                handler.close()
+                root.removeHandler(handler)
+        root.setLevel(level)
+        logging.getLogger("saneless").setLevel(logging.NOTSET)
+        _reset_library_loggers()
+
+    @pytest.mark.parametrize("name", _LIBRARY_LOGGER_NAMES)
+    def test_debug_level_leaves_library_logger_off_debug(
+        self, tmp_path: Path, name: str
+    ) -> None:
+        """Under a DEBUG root no HTTP library logger is enabled for DEBUG."""
+        configure_logging(
+            tmp_path / "test.log", "DEBUG", max_bytes=1024, backup_count=1
+        )
+
+        library_logger = logging.getLogger(name)
+        assert not library_logger.isEnabledFor(logging.DEBUG)
+        assert library_logger.getEffectiveLevel() >= logging.INFO
+
+    def test_debug_level_keeps_library_header_trace_out_of_the_log(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """
+        A DEBUG record on httpcore2's header-trace logger reaches no handler.
+
+        ``-v`` is on so the stderr mirror is attached too, and both surfaces are
+        read. A saneless DEBUG record written alongside it is the control: it
+        proves the file really takes DEBUG records, so the sentinel's absence
+        means the library record was discarded, not that nothing was written.
+        """
+        log_file = tmp_path / "test.log"
+        configure_logging(
+            log_file, "DEBUG", max_bytes=1024 * 1024, backup_count=1, verbose=True
+        )
+
+        logging.getLogger("httpcore2.http11").debug(_LIBRARY_DEBUG_SENTINEL)
+        logging.getLogger("saneless.test").debug("control-7c1e")
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+
+        written = log_file.read_text()
+        err = capsys.readouterr().err
+        assert "control-7c1e" in written
+        assert "control-7c1e" in err
+        assert _LIBRARY_DEBUG_SENTINEL not in written
+        assert _LIBRARY_DEBUG_SENTINEL not in err
+
+    def test_warning_level_keeps_library_info_off(self, tmp_path: Path) -> None:
+        """
+        The cap never lowers a library logger below the configured level.
+
+        A flat INFO would enable httpx2's per-request INFO line under a WARNING
+        root, because a logger's own level, not the root's, gates emission.
+        """
+        configure_logging(
+            tmp_path / "test.log", "WARNING", max_bytes=1024, backup_count=1
+        )
+
+        assert not logging.getLogger("httpx2").isEnabledFor(logging.INFO)
+
+    def test_verbose_raises_saneless_but_not_the_library_loggers(
+        self, tmp_path: Path
+    ) -> None:
+        """-v enables DEBUG for saneless's loggers and leaves httpcore2 alone."""
+        configure_logging(
+            tmp_path / "test.log", "INFO", max_bytes=1024, backup_count=1, verbose=True
+        )
+
+        assert logging.getLogger("saneless.pipeline").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("httpcore2").isEnabledFor(logging.DEBUG)
+
+    def test_library_logger_level_follows_the_latest_call(self, tmp_path: Path) -> None:
+        """A DEBUG call followed by a WARNING call leaves httpx2 at WARNING."""
+        log_file = tmp_path / "test.log"
+        configure_logging(log_file, "DEBUG", max_bytes=1024, backup_count=1)
+        configure_logging(log_file, "WARNING", max_bytes=1024, backup_count=1)
+
+        assert logging.getLogger("httpx2").level == logging.WARNING
 
 
 def test_rotation_values_have_no_default() -> None:
