@@ -58,7 +58,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run ty check
-      - run: uv run pyrefly check src tests
+      - run: uv run pyrefly check src tests scripts
       # The workflow audit, in the same bare shape as the five other checks in
       # this job: a clean run exits 0 and any finding exits 14, so a plain
       # `run:` already fails the build on the first finding. No severity or

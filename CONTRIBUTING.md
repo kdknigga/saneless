@@ -63,7 +63,7 @@ three parallel jobs in `.github/workflows/ci.yml`:
 | `lint` | `uv run ruff check .` |
 | `lint` | `uv run ruff format --check .` |
 | `lint` | `uv run ty check` |
-| `lint` | `uv run pyrefly check src tests` |
+| `lint` | `uv run pyrefly check src tests scripts` |
 | `test` | `uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"` |
 | `test` | `uv run env HOME="$(mktemp -d)" pytest -m sane_hardware` |
 | `browser` | `uv run env HOME="$(mktemp -d)" PLAYWRIGHT_BROWSERS_PATH="$HOME/.cache/ms-playwright" pytest -m browser` |
@@ -74,7 +74,7 @@ You can reproduce the gate exactly, in the same order, with:
 uv run ruff check .
 uv run ruff format --check .
 uv run ty check
-uv run pyrefly check src tests
+uv run pyrefly check src tests scripts
 uv run env HOME="$(mktemp -d)" pytest -m "not browser and not sane_hardware"
 uv run env HOME="$(mktemp -d)" pytest -m sane_hardware
 uv run playwright install chromium   # once, to fetch the browser
@@ -172,7 +172,7 @@ test -- a test that names a function or class that does not exist yet -- with ev
 hook enabled. A type error in `src/` is still rejected at commit.
 
 At merge and push time the full type check runs: ty over the whole project, and
-pyrefly over `src tests`. A `git merge --no-ff` that creates the merge commit by
+pyrefly over `src tests scripts`. A `git merge --no-ff` that creates the merge commit by
 itself runs it at `pre-merge-commit`, and `git push` runs it at `pre-push`. No
 file-modifying hook runs at either of those stages, so a fixer can never abort a
 merge or a push by rewriting a file.
@@ -200,11 +200,12 @@ check, so the error you were just shown would get through.
 ### Why pyrefly always gets explicit paths
 
 Every pyrefly command in this repository names its paths: `src` at commit time, and
-`src tests` everywhere else. pyrefly's `use-ignore-files` is on by default and is
-only bypassed when files are named on the command line. In a checkout inside a
+`src tests scripts` everywhere else. pyrefly's `use-ignore-files` is on by default and
+is only bypassed when files are named on the command line. In a checkout inside a
 gitignored directory (a `.claude/worktrees/` git worktree), running pyrefly without
 paths filters out every source file, so it can report success having checked nothing.
-Copy the commands as written, paths included.
+A directory left off the list is not checked either, which is why `scripts` is named
+alongside `src` and `tests`. Copy the commands as written, paths included.
 
 ## `--no-verify` no longer skips the gate
 

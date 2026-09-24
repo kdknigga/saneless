@@ -130,7 +130,10 @@ repos:
       # `use-ignore-files` is on by default and is only bypassed when files are
       # named on the command line.  Without them, a checkout inside a gitignored
       # directory (a `.claude/worktrees/` git worktree) has every source file
-      # filtered out and the hook fails with "No Python files matched".
+      # filtered out and the hook fails with "No Python files matched".  The
+      # full hook below names `scripts` for the same reason: a directory that
+      # is not named is not checked at all, so the release scripts would pass
+      # the gate unexamined.
       - id: pyrefly-checker
         name: pyrefly type checker (src)
         entry: uv run pyrefly check src
@@ -160,7 +163,7 @@ repos:
 
       - id: pyrefly-checker-full
         name: pyrefly type checker (full)
-        entry: uv run pyrefly check src tests
+        entry: uv run pyrefly check src tests scripts
         language: system
         pass_filenames: false
         always_run: true
