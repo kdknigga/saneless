@@ -73,6 +73,18 @@ constraint-dependencies = ["anyio<4.15"]
 # it -- the Dockerfile's uv tool stage and the `uv_build` build-system
 # requirement -- so they stay pinned, and a test holds both inside this range.
 required-version = ">=0.12.18,<0.13"
+# python-sane publishes an sdist and no wheel, so every install compiles it,
+# and the build backend that does the compiling is code run with the
+# installer's privileges.  `uv.lock` does not lock build dependencies, and a
+# build constraint pins a version without checking any hash, so left to build
+# isolation that backend is resolved fresh at build time and never verified.
+# Instead the backend is declared as the locked `build` group, installed from
+# the lock with its sha256 checked like any other package, and python-sane is
+# built against that installed copy with isolation off.  `build` is a default
+# group so a plain `uv sync` works; a sync that leaves the group out fails with
+# uv's own hint rather than falling back to an unhashed build.
+no-build-isolation-package = ["python-sane"]
+default-groups = ["dev", "build"]
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
@@ -273,4 +285,9 @@ dev = [
 # to run the version gate before anything is published.
 release = [
     "packaging>=26.0",
+]
+# The build backend python-sane compiles against; see `no-build-isolation-package`
+# under [tool.uv] for why it is a locked group rather than a build requirement.
+build = [
+    "setuptools>=84.0.0",
 ]
