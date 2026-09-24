@@ -65,8 +65,16 @@ _DEFAULT_DB = "/var/lib/saneless/saneless.db"
 # (net) and driverless eSCL/AirScan devices (escl).
 _EXPECTED_BACKENDS = frozenset({"net", "escl"})
 
-# Tools a runtime image has no use for; any of them is attack surface.
-_FORBIDDEN_TOOLS = ("curl", "gcc", "cc", "uv")
+# Tools a runtime image has no use for; any of them is attack surface. pip's
+# console scripts live in the base image's /usr/local/bin, which stays on PATH
+# behind the venv, so an installer the Dockerfile failed to remove shows up
+# here even though the venv's own interpreter cannot import it.
+_FORBIDDEN_TOOLS = ("curl", "gcc", "cc", "uv", "pip", "pip3")
+
+# Every interpreter in the runtime image. The venv's is the one PATH finds
+# first, but it does not see the base image's site-packages, which is where
+# pip lives if it was not removed; the base interpreter does see them.
+_INTERPRETERS = ("/opt/venv/bin/python", "/usr/local/bin/python3")
 
 _PORT = 8080
 _HTTP_OK = 200
@@ -90,6 +98,24 @@ _DATA_DIR_PROBE = (
 _DLL_PROBE = (
     "cat /etc/sane.d/dll.conf && echo --- && "
     "{ [ ! -d /etc/sane.d/dll.d ] || ls -A /etc/sane.d/dll.d; }"
+)
+
+# Run by each interpreter in turn: it reports its own path and whether pip is
+# importable from it. The program reaches the container as the probe's first
+# positional argument, so it is never pasted into the shell text.
+_PIP_PROGRAM = """\
+import importlib.util
+import sys
+found = importlib.util.find_spec("pip") is not None
+sys.stdout.write(f"{sys.executable} {found}\\n")
+"""
+
+# A missing interpreter fails the loop, so the probe cannot pass vacuously by
+# asking an interpreter that is not there.
+_PIP_SENTINEL = "pip-checked"
+_PIP_PROBE = (
+    f'for py in {" ".join(_INTERPRETERS)}; do "$py" -c "$1" || exit 1; done; '
+    f"echo {_PIP_SENTINEL}"
 )
 
 _TOOLS_SENTINEL = "tools-checked"
@@ -703,33 +729,46 @@ def check_dll_conf(engine: Engine) -> None:
 
 def check_no_pip(engine: Engine) -> None:
     """
-    Check that the runtime image carries no importable ``pip``.
+    Check that no interpreter in the runtime image can import ``pip``.
+
+    Both interpreters are asked. The venv's alone would pass whether or not
+    the Dockerfile removed pip, because a uv venv does not see the base
+    image's site-packages, and that is exactly where pip would be left.
 
     Args:
         engine: The engine and image under test.
 
     Raises:
-        SmokeFailure: ``import pip`` succeeded, or failed for some other
-            reason than the module being absent.
+        SmokeFailure: Any interpreter can import pip, one of them is missing,
+            or the probe did not finish.
 
     """
     result = engine.sh(
         'exec "$SMOKE_DOCKER" run --rm --name "$SMOKE_NAME" '
-        '--entrypoint python "$SMOKE_IMAGE" -c "import pip"'
+        '--entrypoint sh "$SMOKE_IMAGE" -c "$SMOKE_PROBE" probe "$SMOKE_PROGRAM"',
+        probe=_PIP_PROBE,
+        program=_PIP_PROGRAM,
     )
-    if result.returncode == 0:
-        msg = "import pip succeeded"
+    _require_success(result, "the pip probe")
+    lines = result.stdout.strip().splitlines()
+    if not lines or lines[-1] != _PIP_SENTINEL:
+        msg = f"the pip probe did not finish\n{_tail(result.stdout)}"
         raise SmokeFailure(msg)
-    if "No module named 'pip'" not in result.stderr:
-        msg = (
-            f"import pip failed, but not because pip is absent\n{_tail(result.stderr)}"
-        )
+    answers: dict[str, str] = {}
+    for line in lines[:-1]:
+        path, _, found = line.rpartition(" ")
+        answers[path] = found
+    if set(answers) != set(_INTERPRETERS):
+        msg = f"the pip probe asked {sorted(answers)}, expected {list(_INTERPRETERS)}"
+        raise SmokeFailure(msg)
+    if importable := [path for path, found in answers.items() if found != "False"]:
+        msg = f"pip is importable from {', '.join(importable)}"
         raise SmokeFailure(msg)
 
 
 def check_no_tools(engine: Engine) -> None:
     """
-    Check that the runtime image carries no curl, compiler or uv.
+    Check that the runtime image carries no curl, compiler, uv or pip.
 
     Args:
         engine: The engine and image under test.
@@ -762,8 +801,8 @@ CHECKS: tuple[Check, ...] = (
     Check("healthy via the image's HEALTHCHECK", check_healthcheck),
     Check("host GET /health returns 200", check_host_health),
     Check("dll.conf holds exactly net and escl, dll.d empty", check_dll_conf),
-    Check("no importable pip", check_no_pip),
-    Check("no curl, compiler or uv", check_no_tools),
+    Check("no interpreter can import pip", check_no_pip),
+    Check("no curl, compiler, uv or pip on PATH", check_no_tools),
 )
 
 
