@@ -204,7 +204,7 @@ def test_metadata_fetch_failure_falls_back_to_an_empty_list(
     Nothing has fetched the tags in this app yet, so there is no previous list
     to fall back on (``tests/test_metadata_fallback.py`` covers the case where
     there is).  The failure here is not a Paperless error, so the warning
-    carries the traceback as well as the cause.
+    names its class alone: neither its text nor a traceback is logged.
     """
     app = _app(client)
 
@@ -225,8 +225,9 @@ def test_metadata_fetch_failure_falls_back_to_an_empty_list(
         if r.levelno == logging.WARNING and "using empty list" in r.getMessage()
     ]
     assert len(records) == 1
-    assert "paperless unreachable" in records[0].getMessage()
-    assert records[0].exc_info is not None
+    assert records[0].getMessage().endswith("using empty list: ConnectionError")
+    assert "paperless unreachable" not in caplog.text
+    assert records[0].exc_info is None
 
 
 def test_health_reports_degraded_worker(
@@ -2804,13 +2805,14 @@ _CREDENTIALLED_URL = "https://user:pass@paperless.example/api/tags/"
 
 class TestRouteLogsNameExceptionsOnly:
     """
-    IN-02: no handler in ``web/routes.py`` renders an exception into a log.
+    No handler in ``web/routes.py`` hands an exception object to a logger.
 
-    The Paperless URL may carry ``user:pass@`` (``checks.py`` says so in as
-    many words), so an exception object interpolated with ``%s`` is a
-    credential in the log file.  Every other handler in the module already
-    logs the class name; the guard below is what stops a future one drifting
-    back, which a single behavioural test could not do.
+    Third-party exception text can quote a URL, a header or a token, so an
+    exception interpolated with ``%s`` can put a credential in the log file.
+    The routes log a client exception's message only when the client built it
+    (``TestWebLogsNoClientSecret`` feeds marker text through every such path);
+    the guard below stops a future handler passing ``exc`` itself, which a
+    single behavioural test could not do.
     """
 
     def test_a_failed_connection_test_logs_only_the_class_name(
@@ -2860,3 +2862,126 @@ class TestRouteLogsNameExceptionsOnly:
         ]
 
         assert offenders == []
+
+
+# Text no log record may carry: a stand-in for a configured token, and the
+# userinfo of a URL that third-party exception text might quote.
+_MARKER = "tok-MARKER-9b1e5c"
+_MARKED_TEXT = f"refused: Token {_MARKER} user:pass@paperless.invalid"
+
+
+def _marked_client(error: Exception) -> PaperlessClient:
+    """
+    Build a real Paperless client whose token is the marker and whose requests fail.
+
+    Args:
+        error: What every request raises, from inside the transport, so the
+            client's own handling decides what reaches the log.
+
+    Returns:
+        The client, ready to replace ``app.state.paperless``.
+
+    """
+
+    def refuse(request: httpx2.Request) -> NoReturn:
+        _ = request
+        raise error
+
+    return PaperlessClient(
+        url="http://paperless.invalid:8000",
+        token=_MARKER,
+        transport=httpx2.MockTransport(refuse),
+    )
+
+
+def _client_refuses_the_connection(app: FastAPI) -> None:
+    """Make the tag fetch fail inside a real client, quoting its token."""
+    app.state.paperless = _marked_client(httpx2.ConnectError(f"refused: {_MARKER}"))
+
+
+def _client_cannot_send_the_request(app: FastAPI) -> None:
+    """Make the tag fetch fail the way h11 refuses a token it cannot send."""
+    app.state.paperless = _marked_client(
+        httpx2.LocalProtocolError(f"Illegal header value b'Token {_MARKER} '")
+    )
+
+
+def _fetch_raises_a_foreign_exception(app: FastAPI) -> None:
+    """Make the tag fetch raise something no saneless code wrote."""
+    app.state.paperless.get_tags = _raise_factory(RuntimeError, _MARKED_TEXT)
+
+
+def _connection_test_raises(app: FastAPI) -> None:
+    """Make the connection test raise httpx2's error, quoting the marker."""
+    app.state.paperless.test_connection = _raise_factory(
+        httpx2.ConnectError, _MARKED_TEXT
+    )
+
+
+class TestWebLogsNoClientSecret:
+    """
+    Marker text fed through every web logging path never reaches the log.
+
+    Each case makes a Paperless call fail with text carrying the marker, then
+    reads ``caplog.text``, which includes any formatted traceback.  Where the
+    exception comes from the client (a ``PaperlessError`` or ``ConfigError``),
+    it is raised by a real client configured with the marker as its token, so
+    the test proves the client's redaction rather than a hand-made message.
+    ``tests/test_cache.py`` covers the cache's own stale-copy warnings.
+    """
+
+    @pytest.mark.parametrize(
+        ("install", "path", "logged"),
+        [
+            pytest.param(
+                _client_refuses_the_connection,
+                "/api/tags",
+                "Could not fetch tags from Paperless at http://paperless.invalid:8000",
+                id="fetch-paperless-error",
+            ),
+            pytest.param(
+                _client_cannot_send_the_request,
+                "/api/tags",
+                "the request could not be sent with the configured paperless.url",
+                id="fetch-config-error",
+            ),
+            pytest.param(
+                _fetch_raises_a_foreign_exception,
+                "/api/tags",
+                "using empty list: RuntimeError",
+                id="fetch-other",
+            ),
+            pytest.param(
+                _connection_test_raises,
+                "/api/paperless/test",
+                "Paperless connection test failed: ConnectError",
+                id="connection-test",
+            ),
+        ],
+    )
+    def test_marker_text_never_reaches_the_log(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        install: Callable[[FastAPI], None],
+        path: str,
+        logged: str,
+    ) -> None:
+        """The request still answers, and the warning says what failed without it."""
+        app = _simple_form_app(tmp_path)
+        install(app)
+        caplog.set_level(logging.DEBUG)
+        with TestClient(app) as client:
+            response = client.get(path)
+
+        assert response.status_code in {200, 502}
+        assert _MARKER not in caplog.text
+        assert "user:pass" not in caplog.text
+        web_records = [
+            record
+            for record in caplog.records
+            if record.name.startswith("saneless.web")
+            and record.levelno >= logging.WARNING
+        ]
+        assert [record.exc_info for record in web_records] == [None]
+        assert logged in web_records[0].getMessage()
