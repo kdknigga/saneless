@@ -65,6 +65,7 @@ from tests.conftest import (
     spooling_in_turn,
 )
 from tests.fake_sane import FakeSaneDev, FakeSaneModule
+from tests.golden_support import distinct_page, embedded_streams, png_idat
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -249,36 +250,6 @@ def _make_empty_image() -> Image.Image:
 _TEST_RESERVE_MB = 1
 
 
-def _distinct_page(index: int) -> Image.Image:
-    """
-    Draw a page no other page of the same job can be mistaken for.
-
-    The index is drawn as a run of marks along the top edge, so two pages
-    differ in their **pixels** -- and therefore in their spooled PNG bytes and
-    in the stream the PDF embeds -- rather than only in a file name.  A test
-    that reads a PDF back to prove page order needs exactly that: content it
-    can tell apart without trusting the thing under test.
-
-    The body rectangle keeps every page far from the blank-page thresholds, so
-    empty-page detection never removes one by accident.
-
-    Args:
-        index: The 0-based page number.  Up to 28 pages fit across the top
-            edge, which is more than any test here scans.
-
-    Returns:
-        A 120x160 RGB page carrying that index.
-
-    """
-    page = Image.new("RGB", (120, 160), "white")
-    draw = ImageDraw.Draw(page)
-    draw.rectangle((10, 30, 110, 150), fill="black")
-    for mark in range(index + 1):
-        left = 2 + mark * 4
-        draw.rectangle((left, 2, left + 2, 8), fill="black")
-    return page
-
-
 def _spool_pass(
     directory: Path, label: str, pages: Sequence[Image.Image]
 ) -> list[PageRecord]:
@@ -327,12 +298,12 @@ def _duplex_spool(
     spool_dir = tmp_path / "spool"
     spool_dir.mkdir()
     front_records = _spool_pass(
-        spool_dir, _SPOOL_LABEL_A, [_distinct_page(index) for index in range(fronts)]
+        spool_dir, _SPOOL_LABEL_A, [distinct_page(index) for index in range(fronts)]
     )
     back_records = _spool_pass(
         spool_dir,
         _SPOOL_LABEL_B,
-        [_distinct_page(fronts + index) for index in range(backs)],
+        [distinct_page(fronts + index) for index in range(backs)],
     )
     return spool_dir, front_records, back_records
 
@@ -395,57 +366,6 @@ def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[...,
         return pdf_path
 
     return _assemble
-
-
-def _png_idat(png_bytes: bytes) -> bytes:
-    """
-    Concatenate a PNG's IDAT payloads: its compressed pixel data itself.
-
-    This is what img2pdf embeds when it passes a suitable PNG through -- the
-    zlib stream is copied into a ``/FlateDecode`` image object untouched -- so
-    it is directly comparable with what pikepdf reads back out of the PDF.
-    Comparing these bytes is a much stronger claim than comparing decoded
-    pixels: it says the PDF's page *is* that spooled file, not merely a page
-    that looks like it.
-
-    Args:
-        png_bytes: A whole PNG file, as the spool wrote it.
-
-    Returns:
-        Every IDAT chunk's payload, concatenated in file order.
-
-    """
-    payload = bytearray()
-    # 8-byte signature, then length/type/data/CRC chunks to the end.
-    position = 8
-    while position < len(png_bytes):
-        length = int.from_bytes(png_bytes[position : position + 4], "big")
-        chunk_type = png_bytes[position + 4 : position + 8]
-        if chunk_type == b"IDAT":
-            payload += png_bytes[position + 8 : position + 8 + length]
-        position += 12 + length
-    return bytes(payload)
-
-
-def _embedded_streams(pdf_path: Path) -> list[bytes]:
-    """
-    Read each PDF page's single embedded image stream, in page order.
-
-    Raw, not decoded, so the result can be compared with ``_png_idat``.
-
-    Args:
-        pdf_path: The assembled PDF to read.
-
-    Returns:
-        One raw stream per page, in the order the pages appear in the PDF.
-
-    """
-    streams: list[bytes] = []
-    with pikepdf.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            (image,) = pikepdf.Page(page).get_images().values()
-            streams.append(image.read_raw_bytes())
-    return streams
 
 
 class _AssemblingSomewhereDurable:
@@ -623,7 +543,7 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         somewhere that outlives the job's workspace.
         """
         default_settings.output.tmp_dir = tmp_path / "scratch"
-        pages = [_distinct_page(index) for index in range(12)]
+        pages = [distinct_page(index) for index in range(12)]
 
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(pages)
@@ -646,9 +566,9 @@ class TestPageOrderComesFromTheRecordsNeverTheFilesystem:
         assert len(set(assembly.page_bytes)) == 12
 
         assert assembly.pdf_path is not None
-        streams = _embedded_streams(assembly.pdf_path)
+        streams = embedded_streams(assembly.pdf_path)
         assert len(streams) == 12
-        assert streams == [_png_idat(page) for page in assembly.page_bytes]
+        assert streams == [png_idat(page) for page in assembly.page_bytes]
 
     def test_interleave_records_never_recovers_order_from_the_filesystem(
         self, tmp_path: Path
@@ -2837,7 +2757,7 @@ def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
     """
     scanner = MagicMock(spec=ScannerBackend)
     scanner.scan_pages.side_effect = _spooling_then_failing(
-        [_distinct_page(index) for index in range(pages)], failure
+        [distinct_page(index) for index in range(pages)], failure
     )
     return scanner
 
@@ -3131,10 +3051,10 @@ def _failing_in_pass_b(
         index = calls
         calls += 1
         if index == 0:
-            pages = [_distinct_page(number) for number in range(fronts)]
+            pages = [distinct_page(number) for number in range(fronts)]
             return spooling(pages)(device_id, settings, sink)
         for number in range(backs):
-            sink.add(_distinct_page(fronts + number))
+            sink.add(distinct_page(fronts + number))
         raise failure
 
     return _spool_next
@@ -3235,7 +3155,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         failed_dir = _duplex_settings(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling_in_turn(
-            [_distinct_page(index) for index in range(2)], []
+            [distinct_page(index) for index in range(2)], []
         )
 
         with pytest.raises(ScanError) as excinfo:
@@ -3268,7 +3188,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         default_settings.output.flip_timeout_seconds = 17
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
 
         with pytest.raises(ScanError) as excinfo:
@@ -3301,7 +3221,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         cause = OSError(5, "Input/output error")
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(2)]
+            [distinct_page(index) for index in range(2)]
         )
 
         with pytest.raises(ScanError) as excinfo:
@@ -3336,7 +3256,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         failed_dir = _duplex_settings(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
 
         with pytest.raises(
@@ -3376,7 +3296,7 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         failed_dir = _duplex_settings(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = _spooling_then_failing(
-            [_distinct_page(index) for index in range(2)],
+            [distinct_page(index) for index in range(2)],
             ScanError("Scanner error on page 3: Paper jam"),
         )
 
@@ -3858,7 +3778,7 @@ class TestPreservationNamesWhatItDidKeep:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
         real_move = shutil.move
         moved: list[Path] = []
@@ -3954,7 +3874,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
         scanner.scan_pages.side_effect = spooling(
-            [_distinct_page(index) for index in range(3)]
+            [distinct_page(index) for index in range(3)]
         )
         paperless = MagicMock()
 
@@ -3996,7 +3916,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         """
         _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = spooling([_distinct_page(0)])
+        scanner.scan_pages.side_effect = spooling([distinct_page(0)])
         original = PdfError("img2pdf refused the page")
 
         with (
@@ -4037,7 +3957,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         for job_id in ("pdf-one", "pdf-two"):
             scanner = MagicMock(spec=ScannerBackend)
             scanner.scan_pages.side_effect = spooling(
-                [_distinct_page(index) for index in range(2)]
+                [distinct_page(index) for index in range(2)]
             )
             with (
                 patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
@@ -4067,7 +3987,7 @@ class TestAssemblyFailureKeepsThePageFiles:
         """The workspace still unwinds; only the page files escaped it."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         scanner = MagicMock(spec=ScannerBackend)
-        scanner.scan_pages.side_effect = spooling([_distinct_page(0)])
+        scanner.scan_pages.side_effect = spooling([distinct_page(0)])
 
         with (
             patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
