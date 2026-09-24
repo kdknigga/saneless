@@ -13,7 +13,7 @@ SANE scanner to paperless-ngx bridge. Web UI and CLI for triggering scans, assem
 | Arch | `sane` |
 | Alpine | `sane-dev` |
 
-Install before `pip install saneless`:
+Install them before installing saneless:
 
 ```bash
 # Debian/Ubuntu
@@ -25,8 +25,11 @@ sudo dnf install sane-backends-devel
 
 ## Install
 
+saneless is not yet published on PyPI, so this installs the current default
+branch from GitHub:
+
 ```bash
-pip install saneless
+pip install git+https://github.com/kdknigga/saneless
 ```
 
 ## Docker

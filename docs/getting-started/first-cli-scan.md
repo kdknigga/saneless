@@ -24,10 +24,10 @@ Before you begin, make sure you have:
     sudo dnf install sane-backends-devel
     ```
 
-    Then install saneless:
+    Then install saneless. It is not yet published on PyPI, so this installs the current default branch from GitHub:
 
     ```bash
-    pipx install saneless
+    pipx install git+https://github.com/kdknigga/saneless
     ```
 
 === "Docker"

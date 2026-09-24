@@ -44,10 +44,10 @@ The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyo
     sudo dnf install sane-backends-devel
     ```
 
-    Then install saneless with pipx:
+    Then install saneless with pipx. saneless is not yet published on PyPI, so this installs the current default branch from GitHub:
 
     ```bash
-    pipx install saneless
+    pipx install git+https://github.com/kdknigga/saneless
     ```
 
     Start the web server:

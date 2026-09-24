@@ -22,18 +22,20 @@ saneless depends on `python-sane`, which compiles against SANE's C library. Inst
 
 ## Step 2: Install saneless
 
+saneless is not yet published on PyPI, so both commands below install the current default branch from GitHub.
+
 === "pipx (recommended)"
 
     [pipx](https://pipx.pypa.io/) installs saneless in an isolated virtual environment, avoiding dependency conflicts:
 
     ```bash
-    pipx install saneless
+    pipx install git+https://github.com/kdknigga/saneless
     ```
 
 === "pip"
 
     ```bash
-    pip install saneless
+    pip install git+https://github.com/kdknigga/saneless
     ```
 
 !!! tip
@@ -76,7 +78,7 @@ See [Configure Scan Profiles](configure-scan-profiles.md) for more profile optio
 
 **`python-sane` fails to compile**
 
-The SANE development headers are missing. Install the package for your distribution from the table in Step 1, then retry `pip install saneless`.
+The SANE development headers are missing. Install the package for your distribution from the table in Step 1, then retry the install command from [Step 2](#step-2-install-saneless).
 
 **saneless says python-sane cannot be imported**
 
