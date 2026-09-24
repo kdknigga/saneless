@@ -1,4 +1,4 @@
-# SHAs resolved 2026-09-18 via gh api; comments must carry the full version.
+# SHAs resolved 2026-09-24 via gh api; comments must carry the full version.
 name: Release
 
 on:
@@ -10,6 +10,15 @@ on:
 permissions:
   contents: read
 
+# One release at a time, in the order the tags were pushed. Two tags pushed
+# close together must not finish out of order: the older release finishing
+# last would leave `latest` on it. An in-flight release is never cancelled,
+# because stopping one between the image push and the package upload is a
+# half-publish.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   # The release gate is the CI workflow itself, called as a reusable workflow,
   # so "green" has one definition and the release path can never drift from the
@@ -19,7 +28,9 @@ jobs:
   # `uv run pytest` collected the browser tests on a runner with no Chromium.
   #
   # Calling CI here pulls its `browser` job into the release path, which costs
-  # one Chromium download per release. That is the intended trade.
+  # one Chromium download per release. That is the intended trade. It also
+  # pulls in CI's `docker` job, so the image is built and smoke-tested from
+  # this exact commit before anything is published.
   #
   # `$/` is GitHub's self-repository reference: it resolves to this repository
   # at the exact commit being run (the tagged one) with no checkout, and it
@@ -37,64 +48,64 @@ jobs:
     permissions:
       contents: read
 
-  publish-pypi:
-    name: publish-pypi
-    needs: ci
+  # The tag and `pyproject.toml` must name the same PEP 440 version, or nothing
+  # publishes. The parsed version, not the tag's spelling, decides whether this
+  # is a pre-release: `v0.2.0rc7` is one even though it has no hyphen, and it
+  # routes to TestPyPI like `v0.2.0-rc.7` does. The script reads the tag from
+  # GITHUB_REF_NAME in its environment, so no tag text is ever pasted into a
+  # shell command.
+  #
+  # `packaging` is the gate's one dependency. It comes from the lockfile's
+  # `release` group, hash-checked, and never from an ad hoc `--with` fetch
+  # inside a publishing workflow.
+  #
+  # A tag that is a valid version but not semver-shaped (`v0.2.0rc7`) still
+  # passes, with a warning in the log: the image tagging action emits no tag
+  # for it, so publish-docker fails -- before publish-pypi, which is the order
+  # that makes that failure harmless.
+  #
+  # Runs in parallel with `ci`; both publish jobs wait for both.
+  gate:
+    name: gate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    # Object form. Putting the expression inline as a scalar on the same line
-    # is rejected at parse time with `Unrecognized named-value`, so the name
-    # has to hang off a nested key. One job, one code path,
-    # two environments -- which is what the trusted-publisher binding requires,
-    # since a pending publisher binds to a single environment name. The manual
-    # approval rule lives on `pypi`, so it gates exactly the runs where this
-    # expression resolves to `pypi` and leaves rehearsals unblocked.
-    environment:
-      name: ${{ contains(github.ref_name, '-') && 'testpypi' || 'pypi' }}
+    timeout-minutes: 5
     permissions:
       contents: read
-      id-token: write
+    outputs:
+      is_prerelease: ${{ steps.gate.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          # This workflow is tag-triggered and publishing, so a cache entry
-          # written by a lower-privilege ref must never be restored into it.
+          # This job installs one locked group and runs one script; a cache
+          # would save nothing, and a tag-triggered run has no business
+          # restoring one.
           enable-cache: false
-      # A hyphen in the tag means a pre-release, by semver's own rule. The URL
-      # is computed here rather than inlined on the publish step so the action
-      # always receives a non-empty value: whether it treats an empty
-      # repository-url as "use the default index" is not something this repo
-      # has verified, and an explicit URL removes the question entirely.
-      - id: index
-        run: |
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-            echo "url=https://test.pypi.org/legacy/" >> "$GITHUB_OUTPUT"
-          else
-            echo "url=https://upload.pypi.org/legacy/" >> "$GITHUB_OUTPUT"
-          fi
-      - run: uv build
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-        with:
-          # PEP 740 attestations, signed with the OIDC identity this job
-          # already holds. Supported on both PyPI and TestPyPI.
-          attestations: true
-          repository-url: ${{ steps.index.outputs.url }}
+      - run: uv sync --locked --only-group release --no-install-project
+      - id: gate
+        run: uv run --no-sync python scripts/release_gate.py
 
   publish-docker:
     name: publish-docker
-    needs: ci
+    needs: [ci, gate]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Object form. Putting the expression inline as a scalar on the same line
+    # is rejected at parse time with `Unrecognized named-value`, so the name
+    # has to hang off a nested key. This is the same expression publish-pypi
+    # uses, on purpose: the manual approval rule lives on `pypi`, so on a final
+    # tag the maintainer approves here, before the image is pushed, and again
+    # before the package upload. Pre-releases resolve to `testpypi` and run
+    # unblocked.
+    environment:
+      name: ${{ needs.gate.outputs.is_prerelease == 'true' && 'testpypi' || 'pypi' }}
     permissions:
       contents: read
-      packages: write
-      # id-token and attestations are what build-provenance needs; without
-      # both, the provenance flag below fails at upload time.
-      id-token: write
-      attestations: write
+      packages: write # push the image, and its attestations beside it
+      id-token: write # the OIDC identity the Sigstore signing certificate binds
+      attestations: write # store the attestations in GitHub's attestation API
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,37 +119,124 @@ jobs:
         id: meta
         with:
           images: ghcr.io/kdknigga/saneless
-          # A semver version tag and nothing else. This workflow used to carry
-          # an unconditional raw `latest` line, which would have moved the
-          # floating tag onto whatever was published most recently -- including
-          # a release-candidate rehearsal. The hard constraint is that a
-          # rehearsal must never leave GHCR's floating tag, or PyPI,
-          # resolving to a pre-release.
+          # The exact version on every release (`0.2.0-rc.6`, `0.2.0`), and
+          # `X.Y` (`0.2`) from final releases only: the tagging action skips
+          # partial patterns for a semver pre-release, so `0.2` cannot appear
+          # before the final `v0.2.0`, and each later patch release moves it.
+          # `latest` comes from the action's default `flavor: latest=auto`,
+          # which applies it to final releases and withholds it from
+          # pre-releases.
           #
-          # Deleting the line is the whole fix: metadata-action's default
-          # `flavor: latest=auto` already withholds the floating tag from a
-          # semver pre-release and applies it to a final release. Do not
-          # reinstate the line with an `enable=` guard -- that restores the
-          # exact construct this removes, and adds a condition that then has to
+          # This workflow used to carry an unconditional raw `latest` line,
+          # which would have moved the floating tag onto whatever was
+          # published most recently -- including a release-candidate
+          # rehearsal. A rehearsal must never leave GHCR's floating tag, or
+          # PyPI, resolving to a pre-release. Do not reinstate that line, with
+          # or without an `enable=` guard: it restores the exact construct
+          # the default already handles, and adds a condition that then has to
           # stay correct forever.
           #
           # The PyPI half of the same constraint holds structurally rather than
-          # by configuration: a pre-release tag only ever reaches TestPyPI, so
-          # real PyPI stays empty until the final tag is pushed.
+          # by configuration: a pre-release only ever reaches TestPyPI, so real
+          # PyPI stays empty until the final tag is pushed.
           tags: |
             type=semver,pattern={{version}}
-      # `provenance: true` below emits a SLSA attestation, and attestations are a
-      # BuildKit feature: they need the docker-container driver. Without this step
-      # the build runs on the default docker driver and buildx fails outright with
-      # "Attestation is not supported for the docker driver" -- which is exactly how
-      # the v0.2.0-rc.1 rehearsal failed, after publish-pypi had already succeeded.
+            type=semver,pattern={{major}}.{{minor}}
+      # The GHA build cache below needs the docker-container driver, which the
+      # default docker driver lacks. This step first went in for BuildKit's own
+      # provenance, which needs the same driver: without it the v0.2.0-rc.1
+      # rehearsal failed with "Attestation is not supported for the docker
+      # driver" -- after publish-pypi had already succeeded, which is why the
+      # package upload now runs only after this job.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build
         with:
           context: .
           push: true
-          # SLSA build provenance, riding the same OIDC identity. Nothing here
-          # is hand-rolled.
-          provenance: true
+          # BuildKit would otherwise attach an unsigned provenance manifest by
+          # default, because the repository is public. The signed attestations
+          # below replace it.
+          provenance: false
+          # CI's docker job, earlier in this same run, builds this commit and
+          # writes the layers to the tag's cache scope, so this rebuild reuses
+          # the smoke-tested layers wherever they are cached. A tag run cannot
+          # restore a pull request's cache, so no lower-privilege ref can feed
+          # layers into a publish.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      # A Sigstore-signed SLSA build provenance attestation for the pushed
+      # digest, stored in GitHub's attestation API and pushed to GHCR beside the
+      # image. Verify with `gh attestation verify oci://<image>:<tag>
+      # -R kdknigga/saneless`, where <image> is the subject-name below. Storage records are for organisation-owned repositories only, so none
+      # is requested, and the job holds no permission to write one.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/kdknigga/saneless
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      # An SPDX SBOM of the pushed image, read by digest so it describes exactly
+      # the bytes that were published. It is kept only as the input to the
+      # attestation below: no workflow artifact, no release asset.
+      - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ghcr.io/kdknigga/saneless@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      # A Sigstore-signed SBOM attestation for the same digest, stored and
+      # pushed the same way. Verify with the command above plus
+      # `--predicate-type https://spdx.dev/Document/v2.3`.
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/kdknigga/saneless
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+  publish-pypi:
+    name: publish-pypi
+    # Last, after everything else has succeeded. A GHCR tag can be deleted and
+    # pushed again; a PyPI upload cannot, so the irreversible step waits for
+    # CI, the version gate and the image publish.
+    needs: [ci, gate, publish-docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Object form, for the reason given on publish-docker. One job, one code
+    # path, two environments -- which is what the trusted-publisher binding
+    # requires, since a pending publisher binds to a single environment name.
+    # The manual approval rule lives on `pypi`, so it gates exactly the runs
+    # where this expression resolves to `pypi` and leaves rehearsals unblocked.
+    environment:
+      name: ${{ needs.gate.outputs.is_prerelease == 'true' && 'testpypi' || 'pypi' }}
+    permissions:
+      contents: read
+      id-token: write # trusted publishing, and the PEP 740 attestation signature
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          # Nothing in this job benefits from uv's cache: it builds one sdist
+          # and one wheel from the checked-out tree. With nothing to gain, a
+          # job that uploads irreversibly restores nothing. The image layer
+          # cache is a different trade, explained on publish-docker.
+          enable-cache: false
+      - run: uv build
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          # PEP 740 attestations, signed with the OIDC identity this job
+          # already holds. Supported on both PyPI and TestPyPI.
+          attestations: true
+          # Chosen by the same gate output as the environment. The URL is
+          # always written out rather than left empty for pypi: whether the
+          # action treats an empty repository-url as "use the default index"
+          # is not something this repo has verified, and an explicit URL
+          # removes the question entirely.
+          repository-url: ${{ needs.gate.outputs.is_prerelease == 'true' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
