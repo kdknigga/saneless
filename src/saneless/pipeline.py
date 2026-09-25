@@ -992,11 +992,13 @@ def _preserve_partial_passes(
     """
     _make_failed_dir(failed_dir)
     for suffix, records in ledger.spooled():
+        partial_title = f"{request.title} {suffix}"
         partial_pdf = assemble_pdf(
             records,
             tmp_path / _PARTIAL_DIR_NAME,
-            filename=build_pdf_filename(request.job_id, f"{request.title} {suffix}"),
+            filename=build_pdf_filename(request.job_id, partial_title),
             dpi=ledger.dpi,
+            title=partial_title,
         )
         destination = failed_dir / partial_pdf.name
         # Owner-only before the move, for the reason ``_preserving`` gives.
@@ -1573,6 +1575,10 @@ def _handle_duplex_mismatch(
 
     """
     fronts, backs = passes
+    # One composition per half, used for the file name, the PDF's own /Title
+    # and the upload, so the three cannot drift apart.
+    fronts_title = f"{request.title} {_FRONTS_SUFFIX}"
+    backs_title = f"{request.title} {_BACKS_SUFFIX}"
     # Derived rather than passed: it is exactly what the caller would hand us,
     # and the caller is already handing us the request it comes from.
     notify = request.status_callback or _noop_callback
@@ -1600,14 +1606,16 @@ def _handle_duplex_mismatch(
         fronts_pdf = assemble_pdf(
             fronts,
             tmp_path / "fronts",
-            filename=build_pdf_filename(request.job_id, f"{request.title} (fronts)"),
+            filename=build_pdf_filename(request.job_id, fronts_title),
             dpi=delivery.dpi,
+            title=fronts_title,
         )
         backs_pdf = assemble_pdf(
             backs,
             tmp_path / "backs",
-            filename=build_pdf_filename(request.job_id, f"{request.title} (backs)"),
+            filename=build_pdf_filename(request.job_id, backs_title),
             dpi=delivery.dpi,
+            title=backs_title,
         )
     logger.info(
         "Duplex mismatch: assembled %d fronts and %d backs as separate PDFs",
@@ -1616,19 +1624,18 @@ def _handle_duplex_mismatch(
     )
 
     notify(PipelineEvent.UPLOADING)
-    title = request.title
     # One guard over both halves: they are a single document between them, so
     # a failure on either one has to keep both.
     with _preserving([fronts_pdf, backs_pdf], delivery.failed_dir):
         fronts_result = paperless.upload_document(
             fronts_pdf,
-            f"{title} (fronts)",
+            fronts_title,
             request.tags,
             request.correspondent,
         )
         backs_result = paperless.upload_document(
             backs_pdf,
-            f"{title} (backs)",
+            backs_title,
             request.tags,
             request.correspondent,
         )
@@ -2348,6 +2355,7 @@ def run_pipeline(
                 tmp_path,
                 filename=pdf_filename,
                 dpi=actual_dpi,
+                title=request.title,
             )
         logger.info("PDF assembled: %s", pdf_path)
 

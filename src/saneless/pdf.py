@@ -19,6 +19,7 @@ import logging
 import re
 import tempfile
 from datetime import UTC, datetime
+from importlib.metadata import version
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -144,6 +145,8 @@ def assemble_pdf(
     output_dir: Path,
     filename: str,
     dpi: int,
+    *,
+    title: str,
 ) -> Path:
     """
     Assemble spooled pages into a single PDF using img2pdf.
@@ -206,6 +209,24 @@ def assemble_pdf(
     so the visible effect is one briefly frozen status poll -- and the
     alternative is gigabytes of resident memory.
 
+    **The document describes itself.** Its ``/Info`` dictionary carries
+    ``/Title`` (the ``title`` given, which is also the title the document is
+    uploaded under), ``/Producer`` (``saneless`` and the installed version) and
+    ``/Creator``. Only the *first* single-page PDF is converted with that
+    metadata, and that same file is qpdf's primary input rather than
+    ``--empty``: qpdf keeps the primary input's ``/Info`` and takes the pages
+    solely from ``--pages``, so the first page is not duplicated. Measured,
+    ``--empty`` left ``/Info`` as ``{}``. Writing the metadata this way costs
+    nothing, where setting it afterwards with pikepdf would mean a second full
+    write of the whole PDF. XMP metadata is not written.
+
+    **A recovered merge is not silent.** qpdf exits 3 -- reported as
+    ``pikepdf.Job.has_warnings`` -- when it had to repair an input on the way
+    through. The merge still produced a PDF, so this is not a failure and the
+    path is returned, but one WARNING names the page count and the PDF, so
+    whoever later finds a damaged page knows where it came from. qpdf's own
+    text reaches the log separately, through pikepdf's logger.
+
     The single-page PDFs are named from each record's **position in
     ``records``**, not from ``PageRecord.sequence``: sequence numbers are
     assigned per acquisition pass, so after a manual-duplex interleave two
@@ -240,6 +261,8 @@ def assemble_pdf(
             guarantees that.
         dpi: Resolution the pages were actually scanned at, as read back from
             the device. Determines the page size the PDF declares.
+        title: The document's title, written to ``/Info`` as ``/Title``.
+            Required, like ``filename``: each caller names what it built.
 
     Returns:
         Path to the generated PDF file.
@@ -269,9 +292,17 @@ def assemble_pdf(
 
         with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmp_dir:
             work_dir = Path(tmp_dir)
+            # Only the first page carries the document metadata: that file is
+            # the merge's primary input, and qpdf keeps the primary's /Info.
+            metadata = {
+                "title": title,
+                "producer": f"saneless {version('saneless')}",
+                "creator": "saneless",
+            }
             singles: list[str] = []
             for position, record in enumerate(records, start=1):
                 single = work_dir / f"{position:04d}.pdf"
+                page_metadata = metadata if position == 1 else {}
                 # convert returns None once outputstream= is supplied -- that
                 # is its documented contract, not a failure, so there is
                 # nothing here to guard against.
@@ -280,15 +311,26 @@ def assemble_pdf(
                         [str(record.path)],
                         layout_fun=layout_fun,
                         outputstream=stream,
+                        **page_metadata,
                     )
                 singles.append(str(single))
 
             # An in-process qpdf API, not a shell invocation: every element of
             # this argv is a literal or a file this call just wrote inside its
-            # own scratch directory, so no operator string reaches it.
-            pikepdf.Job(
-                ["qpdf", "--empty", "--pages", *singles, "--", str(pdf_path)]
-            ).run()
+            # own scratch directory, so no operator string reaches it.  The
+            # first single is the primary input, so its /Info is kept; the
+            # pages come from --pages alone, so it is not merged twice.
+            job = pikepdf.Job(
+                ["qpdf", singles[0], "--pages", *singles, "--", str(pdf_path)]
+            )
+            job.run()
+            if job.has_warnings:
+                logger.warning(
+                    "qpdf reported warnings while merging %d page(s) into %s; "
+                    "the PDF may be damaged",
+                    len(records),
+                    pdf_path,
+                )
 
         logger.info("Assembled %d page(s) into %s", len(records), pdf_path)
     except PdfError:

@@ -361,6 +361,7 @@ def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[...,
         *,
         filename: str,
         dpi: int,
+        title: str,
     ) -> Path:
         """Open every spooled page, then report the PDF path."""
         for record in records:
@@ -410,6 +411,7 @@ class _AssemblingSomewhereDurable:
         *,
         filename: str,
         dpi: int,
+        title: str,
     ) -> Path:
         """
         Copy the spooled pages out, then assemble them for real.
@@ -421,6 +423,7 @@ class _AssemblingSomewhereDurable:
                 is exactly what this stand-in exists to override.
             filename: The PDF's file name, used unchanged.
             dpi: The resolution the device reported, used unchanged.
+            title: The document title, used unchanged.
 
         Returns:
             The assembled PDF's path, outside the workspace.
@@ -429,7 +432,7 @@ class _AssemblingSomewhereDurable:
         self.records = list(records)
         self.page_bytes = [record.path.read_bytes() for record in records]
         self.pdf_path = assemble_pdf(
-            records, self._output_dir, filename=filename, dpi=dpi
+            records, self._output_dir, filename=filename, dpi=dpi, title=title
         )
         return self.pdf_path
 
@@ -2063,10 +2066,11 @@ def _page_colours(pdf: bytes) -> list[tuple[int, int, int]]:
     with pikepdf.open(io.BytesIO(pdf)) as document:
         for page in document.pages:
             (image,) = pikepdf.Page(page).get_images().values()
+            assert isinstance(image, pikepdf.Stream)
             decoded = pikepdf.PdfImage(image).as_pil_image().convert("RGB")
-            red, green, blue = decoded.getpixel(
-                (decoded.width // 2, decoded.height // 2)
-            )
+            pixel = decoded.getpixel((decoded.width // 2, decoded.height // 2))
+            assert isinstance(pixel, tuple)
+            red, green, blue = pixel
             colours.append((red, green, blue))
     return colours
 
@@ -4147,12 +4151,14 @@ class TestPreservationNamesWhatItDidKeep:
             output_dir: Path,
             filename: str,
             dpi: int,
+            *,
+            title: str,
         ) -> Path:
             """Assemble the fronts for real, then refuse the backs."""
             nonlocal calls
             calls += 1
             if calls == 1:
-                return assemble_pdf(records, output_dir, filename, dpi)
+                return assemble_pdf(records, output_dir, filename, dpi, title=title)
             msg = "qpdf refused the backs"
             raise PdfError(msg)
 
