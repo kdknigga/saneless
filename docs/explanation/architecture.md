@@ -34,14 +34,32 @@ The `run_pipeline()` function coordinates the full scan flow:
 5. **Assemble PDF** -- embed the spooled page files into a PDF document.
 6. **Upload to paperless-ngx** -- send the PDF with metadata via the REST API, or fall back to the [consume directory](consume-directory-fallback.md) if the API is unavailable.
 
-Because the pages are already on disk, a scan that fails part-way through does not cost the operator the sheets that were already fed. What is kept depends on how the scan ended:
-
-- **A failure after N pages** -- a scanner fault, a page timeout, the feeder page cap, or the spool running out of room -- keeps those N pages as a partial PDF in `failed/` inside the data directory, and the error names the count and the path. It is never uploaded, and blank pages are not removed from it.
-- **A manual duplex scan whose pass B or flip fails** keeps the fronts pass A already scanned (and any backs pass B managed) as separately named PDFs in the same place. That covers a fault during pass B, an empty pass B, a flip wait that timed out, and a flip prompt that could not be read. The `(backs)` PDF is in sheet order here too, so its page N is the back of the `(fronts)` PDF's page N.
-- **A failure to assemble the PDF at all** keeps the spooled page files themselves, moved into a job-keyed directory under `failed/`, named in the error.
-- **An operator's cancel keeps nothing.** Aborting at the flip prompt, answering no, or Ctrl-C is a decision to stop, and saneless never prunes `failed/`, so a cancel that preserved pages would leave the operator files to clean up after choosing not to scan.
-
 Each stage emits a `PipelineEvent` (`SCANNING`, `AWAITING_FLIP`, `SCANNING_REVERSE`, `ASSEMBLING`, `UPLOADING`, `DONE`). `AWAITING_FLIP` marks the start of the flip wait and `SCANNING_REVERSE` the start of pass B, and each becomes a job state of the same name. The web UI uses these events to update the live status indicator via HTMX polling.
+
+### What a failed scan keeps
+
+Once paper has gone through the feeder, a scan either delivers its document or keeps its pages. One guard spans the whole run, from the moment scanning starts until paperless-ngx has accepted the document, and no step falls outside it: whatever fails -- the scanner, the disk, assembly, the upload, the wait for paperless-ngx, or a bug in saneless itself -- the guard keeps the most finished artefact the run had produced, in `failed/` inside the data directory. Nothing kept is ever uploaded, and nothing in `failed/` is ever deleted by saneless.
+
+| The run failed... | What is kept in `failed/` |
+|---|---|
+| while acquiring pages | Each pass spooled so far, as its own PDF: `(partial)` for a single-pass scan; `(fronts)` and `(backs)` for manual duplex, with `(backs)` in sheet order, so its page N is the back of the `(fronts)` PDF's page N. This covers a scanner fault, a page timeout, the feeder page cap, the spool running out of room, an empty pass B, a flip wait that timed out and a flip prompt that could not be read. |
+| after acquiring, including when every page looked blank | The whole document, unfiltered, as one PDF in document order. |
+| while assembling the PDF, or when assembly was refused for lack of space | The spooled page files themselves, in a job-keyed directory. |
+| while uploading, or while waiting for paperless-ngx to consume it | The assembled PDF, or both halves of a mismatched manual-duplex run. |
+| after delivery | Nothing: the document is in paperless-ngx. |
+
+Blank pages are never removed from what is kept. A PDF built for `failed/` follows the same twice-the-spool rule as any other (see [Memory, disk and timeouts](#memory-disk-and-timeouts)); if it cannot be built, or the rule refuses it, the page files are kept as well.
+
+The failure keeps its own identity. The error a job records, and the line a command prints, is the original one -- a scanner fault is still a scanner fault, a paperless-ngx timeout still a timeout, and a bug in saneless still an unexpected error (exit 5) rather than being blamed on the scanner or on paperless-ngx -- followed by one sentence saying what was kept and where. That sentence is composed from what really reached `failed/`: it says the scan could not be preserved only when nothing was, and when only part of it was kept it names the part.
+
+Whether anything is kept turns on whether anyone chose to stop:
+
+- **An operator's cancel keeps nothing.** Aborting at the flip prompt, answering no, or Ctrl-C is a decision to stop, and saneless never prunes `failed/`, so a cancel that preserved pages would leave the operator files to clean up after choosing not to scan.
+- **An interruption keeps the pages, like a failure.** A `saneless` command stopped by SIGTERM or SIGHUP -- `kill`, or a dropped SSH session -- or a server that stops mid-scan made no decision about the scan, so the pages already scanned are kept.
+
+Status updates cannot change how a scan ends. The progress the web UI shows, the first page's preview and the page count between manual-duplex passes are reported as the run goes, and a failure to record one of them -- a busy job database, say -- is logged as a warning while the scan carries on to its real outcome.
+
+**Workspaces.** Each run works in its own directory under `tmp_dir`, named `job-<the first 8 characters of the job id>-<random>`, which holds the spooled pages and the assembled PDFs and is removed when the run ends, however it ends. It is created under a hidden staging name, locked, and only then given its `job-` name, and it stays locked for as long as the run lives, so anything that looks through `tmp_dir` can tell a live run's workspace from one a killed process left behind.
 
 ### PDF Assembly
 
