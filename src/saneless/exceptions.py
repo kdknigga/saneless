@@ -6,6 +6,7 @@ allowing callers to catch broad or narrow exception types.
 """
 
 __all__ = [
+    "AllPagesBlankError",
     "ConfigError",
     "FeederEmptyError",
     "PaperlessError",
@@ -14,9 +15,16 @@ __all__ = [
     "SanelessError",
     "ScanCancelledError",
     "ScanError",
+    "ScanInterrupted",
     "StorageError",
     "describe",
+    "failure_text",
+    "note_text",
 ]
+
+# What ends a sentence already, so failure_text joins a note with one space
+# rather than adding a second full stop.
+_SENTENCE_ENDINGS = (".", "!", "?")
 
 
 class SanelessError(Exception):
@@ -52,6 +60,51 @@ class PdfError(SanelessError):
     A sibling of ``ScanError`` rather than a subclass, so a full disk or an
     image the PDF writer rejects is never recorded as a scanner failure.
     """
+
+
+class AllPagesBlankError(SanelessError):
+    """
+    Empty-page detection judged every scanned page blank.
+
+    The scanner worked: it returned pages, and the detector removed all of
+    them.  A sibling of ``ScanError`` rather than a subclass, like
+    ``PdfError``, so no ``except ScanError`` can absorb it and blame the
+    scanner for pages the detector judged blank.
+    """
+
+
+class ScanInterrupted(BaseException):
+    """
+    A scan was interrupted by something other than the operator's decision.
+
+    A SIGTERM or SIGHUP to a one-shot command, or the server stopping (then
+    ``signum`` is ``None``), ends the scan without anyone choosing to discard
+    it, so the pages already scanned are kept.  That is what separates it
+    from a cancel, which keeps nothing.
+
+    It is a ``BaseException`` because a signal can land inside a backend
+    ``except Exception: raise ScanError(...) from exc``, which would re-type
+    an ``Exception`` into a scanner failure.  It is deliberately not a
+    ``KeyboardInterrupt`` subclass: that would send it down every "Ctrl-C
+    means cancel" branch.
+
+    Attributes:
+        signum: The signal that interrupted the command, or ``None`` when the
+            server is stopping.
+
+    """
+
+    def __init__(self, message: str, *, signum: int | None = None) -> None:
+        """
+        Record the message and the signal that caused the interruption.
+
+        Args:
+            message: What interrupted the scan, for the one line reporting it.
+            signum: The signal number, or ``None`` for a server stop.
+
+        """
+        super().__init__(message)
+        self.signum = signum
 
 
 class PaperlessError(SanelessError):
@@ -96,3 +149,50 @@ def describe(exc: BaseException) -> str:
 
     """
     return " ".join(str(exc).split()) or type(exc).__name__
+
+
+def note_text(exc: BaseException) -> str:
+    """
+    Return every note attached to an exception, on one line.
+
+    ``add_note`` stores notes in ``__notes__``, which ``str(exc)`` ignores.
+    Each note's whitespace is collapsed as ``describe`` collapses a message,
+    so a note can never add a line to the CLI's report or to ``job.error``.
+
+    Args:
+        exc: The exception whose notes to render.
+
+    Returns:
+        The notes in the order they were added, joined by one space, or an
+        empty string when there are none.  A note that is only whitespace is
+        left out.
+
+    """
+    collapsed = (" ".join(str(note).split()) for note in getattr(exc, "__notes__", ()))
+    return " ".join(note for note in collapsed if note)
+
+
+def failure_text(exc: BaseException) -> str:
+    """
+    Return the one line a failure surface reports an exception as.
+
+    ``str(exc)`` ignores the notes ``add_note`` attached, and a note is how a
+    preserved scan says where its pages went, so this is the one way a failure
+    surface -- the CLI's stderr line, the log and ``job.error`` -- renders an
+    exception.
+
+    Args:
+        exc: The exception to render.
+
+    Returns:
+        ``describe(exc)``, followed by ``note_text(exc)`` when there are
+        notes: separated by ``". "``, or by one space when the message already
+        ends a sentence.
+
+    """
+    message = describe(exc)
+    notes = note_text(exc)
+    if not notes:
+        return message
+    separator = " " if message.endswith(_SENTENCE_ENDINGS) else ". "
+    return f"{message}{separator}{notes}"

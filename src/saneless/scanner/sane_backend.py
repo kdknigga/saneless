@@ -34,7 +34,13 @@ from typing import TYPE_CHECKING, Any, Protocol, assert_never
 
 from PIL import Image
 
-from saneless.exceptions import ConfigError, FeederEmptyError, ScanError, describe
+from saneless.exceptions import (
+    ConfigError,
+    FeederEmptyError,
+    ScanError,
+    ScanInterrupted,
+    describe,
+)
 from saneless.paper_sizes import PAPER_SIZES_MM, crop_to_paper_size
 from saneless.scanner.base import (
     DeviceCapabilities,
@@ -1316,7 +1322,14 @@ def _acquire_with_timeout(
         reader.start()
         started = True
         finished = done.wait(timeout)
-    except KeyboardInterrupt:
+    except KeyboardInterrupt, ScanInterrupted:
+        # Ctrl-C, or a SIGTERM/SIGHUP (or a server stop) raised as
+        # ScanInterrupted, landed while this thread waited on the read.  A
+        # signal interruption must leave the device settled exactly as Ctrl-C
+        # does: cancel the read and wait for it, so the handle is never closed
+        # under a read that is still running.  With no reader started there
+        # is nothing to settle.  The exception is re-raised unchanged either
+        # way, so the caller still tells a cancel from an interruption.
         if started or reader.is_alive():
             _settle_or_wedge(dev, done, grace, page_label)
         raise

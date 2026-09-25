@@ -61,6 +61,8 @@ from .exceptions import (
     ScanError,
     StorageError,
     describe,
+    failure_text,
+    note_text,
 )
 from .job import CLI_JOBS_DEFAULT_LIMIT, JobStore
 from .logging_config import configure_logging
@@ -334,10 +336,12 @@ def _unexpected_line(exc: BaseException) -> str:
         exc: The exception to report.
 
     Returns:
-        ``Unexpected error (<Type>): <message>``, with no trailing hint.
+        ``Unexpected error (<Type>): <message>``, with no trailing hint.  The
+        message is ``failure_text``'s, so any note on the exception is part of
+        it.
 
     """
-    return f"Unexpected error ({type(exc).__name__}): {describe(exc)}"
+    return f"Unexpected error ({type(exc).__name__}): {failure_text(exc)}"
 
 
 def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
@@ -352,6 +356,11 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
     escapes, because its text can carry something from outside saneless,
     such as a device name that LAN discovery reported.
 
+    Every message is rendered through ``failure_text`` rather than ``str``, so
+    a note attached with ``add_note`` -- where a failed scan's pages were
+    kept, for one -- is on the line too.  The configuration arm keeps the
+    loader's text as written and appends only the notes.
+
     Args:
         exc: The failure.
         category: What ``classify_error`` made of it.
@@ -362,13 +371,14 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
     """
     match category:
         case ErrorCategory.FEEDER | ErrorCategory.SCANNER:
-            line = f"Scan error: {exc}"
+            line = f"Scan error: {failure_text(exc)}"
         case ErrorCategory.CONFIG:
-            return str(exc)
+            notes = note_text(exc)
+            return f"{exc} {neutralise_controls(notes)}" if notes else str(exc)
         case ErrorCategory.UPLOAD:
-            line = f"Paperless error: {exc}"
+            line = f"Paperless error: {failure_text(exc)}"
         case ErrorCategory.ASSEMBLY:
-            line = f"PDF error: {exc}"
+            line = f"PDF error: {failure_text(exc)}"
         case ErrorCategory.UNKNOWN | ErrorCategory.REJECTED:
             line = _unexpected_line(exc)
         case _:
@@ -394,7 +404,7 @@ def _log_failure(ctx: click.Context, exc: Exception) -> None:
         logger.error(
             "saneless %s failed: %r",
             ctx.invoked_subcommand,
-            describe(exc),
+            failure_text(exc),
             exc_info=exc,
         )
 
@@ -489,11 +499,11 @@ class _GuardedGroup(click.Group):
             ctx.exit(ExitCode.CANCELLED)
         except ScanCancelledError as exc:
             logger.info("Scan cancelled: %s", exc)
-            click.echo(str(exc), err=True)
+            click.echo(failure_text(exc), err=True)
             ctx.exit(ExitCode.CANCELLED)
         except StorageError as exc:
             _log_failure(ctx, exc)
-            click.echo(f"Job database error: {exc}", err=True)
+            click.echo(f"Job database error: {failure_text(exc)}", err=True)
             ctx.exit(ExitCode.CONFIG)
         except SanelessError as exc:
             category = classify_error(exc)

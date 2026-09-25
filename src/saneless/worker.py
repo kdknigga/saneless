@@ -27,7 +27,7 @@ from .config import (
     config_search_paths,
     profile_storage_for_loaded,
 )
-from .exceptions import ConfigError, ScanCancelledError
+from .exceptions import ConfigError, ScanCancelledError, failure_text
 from .job import JobResult
 from .pipeline import (
     SCAN_LABEL_FRONT,
@@ -1184,12 +1184,13 @@ class ScanWorker:
         Returns:
             ``RESTART_REASON`` with no category when the job ended at a flip
             answer shutdown claimed, otherwise the exception's own text and its classified
-            category.
+            category.  The text is ``failure_text``'s, so a note attached with
+            ``add_note`` is recorded with it.
 
         """
         if _ended_by_shutdown(exc, coordinator):
             return RESTART_REASON, None
-        return str(exc), classify_error(exc)
+        return failure_text(exc), classify_error(exc)
 
     def _record_loop_failure(self) -> None:
         """Count one loop-level failure, degrading at ``_DEGRADED_AFTER``."""
@@ -1595,21 +1596,25 @@ class ScanWorker:
                 # The operator ended the scan.  Not a failure, so no category,
                 # no ERROR line and no traceback.
                 self._finish_or_owe(
-                    job.id, _OwedWrite(JobState.CANCELLED, error=str(exc))
+                    job.id, _OwedWrite(JobState.CANCELLED, error=failure_text(exc))
                 )
                 logger.info("Job %s cancelled: %s", job.id, exc)
             else:
+                # failure_text rather than the bare message: str() drops the
+                # notes add_note attached, and a note is where a failed scan
+                # says its pages were kept.
                 category = classify_error(exc)
+                error = failure_text(exc)
                 self._finish_or_owe(
                     job.id,
-                    _OwedWrite(JobState.ERROR, error=str(exc), category=category),
+                    _OwedWrite(JobState.ERROR, error=error, category=category),
                 )
                 # Inside the except block, so the record carries the traceback
                 # the operator needs to find the cause.  The text is quoted
                 # with %r: it can come from outside saneless, and repr shows a
                 # control character in it as its escape.
                 kind = category.value.lower()
-                logger.exception("Job %s failed (%s): %r", job.id, kind, str(exc))
+                logger.exception("Job %s failed (%s): %r", job.id, kind, error)
             return
         # The terminal state is derived from the outcome the pipeline returned,
         # never assumed.  The mapping below is a match with assert_never, so a
