@@ -61,6 +61,16 @@ def test_has_control_characters(*, text: str, expected: bool) -> None:
         pytest.param("\u00e9\u00a0", "\u00e9\u00a0", id="accented-and-nbsp-kept"),
         pytest.param("it's \\ fine", "it's \\ fine", id="quote-and-backslash-kept"),
         pytest.param("", "", id="empty"),
+        pytest.param("a\u202eb", "a\\u202eb", id="bidi-right-to-left-override"),
+        pytest.param("a\u202ab", "a\\u202ab", id="bidi-embedding"),
+        pytest.param("a\u2066b\u2069", "a\\u2066b\\u2069", id="bidi-isolate"),
+        pytest.param("a\u2028b", "a\\u2028b", id="line-separator"),
+        pytest.param("a\u2029b", "a\\u2029b", id="paragraph-separator"),
+        pytest.param(
+            "\u05e9\u05dc\u05d5\u05dd \u200f!",
+            "\u05e9\u05dc\u05d5\u05dd \u200f!",
+            id="right-to-left-text-and-mark-kept",
+        ),
     ],
 )
 def test_neutralise_controls(*, text: str, expected: str) -> None:
@@ -79,6 +89,18 @@ def test_neutralise_controls(*, text: str, expected: str) -> None:
 def test_neutralise_controls_output_has_no_control_character(text: str) -> None:
     """Whatever goes in, what comes out holds no control character."""
     assert not has_control_characters(neutralise_controls(text))
+
+
+def test_display_hazards_are_not_refused_as_controls() -> None:
+    """
+    Bidi controls and Unicode separators are escaped for display only.
+
+    ``has_control_characters`` decides which titles are refused, and that
+    rule stays exactly the ``Cc`` category.
+    """
+    for hazard in ("\u202e", "\u2066", "\u2028", "\u2029"):
+        assert not has_control_characters(hazard)
+        assert neutralise_controls(hazard) != hazard
 
 
 @pytest.mark.parametrize(
