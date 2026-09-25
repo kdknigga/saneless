@@ -29,6 +29,16 @@ As in Go, the scheme is not compared and default ports are not normalised;
 browsers omit ``:80`` and ``:443`` from both ``Origin`` and ``Host``.  Unlike
 Go, hosts are compared case-insensitively, because a non-browser client may
 send a mixed-case ``Host``.
+
+Also unlike Go, an empty value counts as present.  Go treats an empty
+``Sec-Fetch-Site`` or ``Origin`` as absent and allows the request; here an
+empty ``Sec-Fetch-Site`` is not ``same-origin`` or ``none``, and an empty
+``Origin`` names no host, so both are rejected.  No browser sends either header
+empty, so this fails closed on purpose: a request that sends one is refused
+rather than waved through as if it came from curl.
+
+This check does not look at whether ``Host`` names saneless at all; that is
+``host_guard``'s job, and it runs first.
 """
 
 from __future__ import annotations
@@ -112,6 +122,10 @@ class CrossOriginGuard:
     It is installed app-wide and inspects every HTTP request, so a
     state-changing route added later is covered without a per-route
     dependency.
+
+    An empty ``Sec-Fetch-Site`` or ``Origin`` is rejected, where Go's
+    ``CrossOriginProtection`` would treat it as absent and allow it; the
+    difference fails closed on purpose.
 
     It is a plain ASGI class rather than ``BaseHTTPMiddleware``, which does
     not propagate ``contextvars`` changes and wraps streaming responses.

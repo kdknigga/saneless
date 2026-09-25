@@ -853,8 +853,14 @@ class OutputConfig(BaseModel):
         return self.data_dir / "failed"
 
 
+# One ``allowed_hosts`` entry once stripped and lower-cased: dot-separated
+# labels of ASCII letters, digits, hyphens and underscores, optionally led by
+# one dot.  No room for ``*``, ``:``, ``/``, ``@``, whitespace or ``..``.
+_ALLOWED_HOST_ENTRY: Final = re.compile(r"\.?[a-z0-9_-]+(?:\.[a-z0-9_-]+)*")
+
+
 class WebConfig(BaseModel):
-    """Which optional controls the scan form shows."""
+    """Which optional controls the scan form shows, and which names it answers."""
 
     # An unknown key is an error, not silently dropped. Here it also means a
     # mistyped key cannot quietly leave a control visible that the operator
@@ -871,14 +877,69 @@ class WebConfig(BaseModel):
     # upgrade.
     show_tags: bool = True
     show_correspondent: bool = True
+    # Extra names the web app answers to, on top of the zero-configuration set
+    # web/host_guard.py always trusts (IP literals, localhost, single-label
+    # names and the private suffixes).  Exact names or ``.suffix`` entries;
+    # never a replacement for the defaults, so adding a name cannot lock
+    # anyone out of the LAN address.
+    allowed_hosts: tuple[str, ...] = ()
+
+    @field_validator("allowed_hosts", mode="before")
+    @classmethod
+    def _normalise_allowed_hosts(cls, value: object) -> object:
+        """
+        Strip and lower-case each entry, and refuse one that is not a name.
+
+        An entry is an exact host name or a leading-dot suffix.  There is no
+        ``*``: one line would reopen DNS rebinding for every name at once.  A
+        port, scheme or path means a URL was pasted where a name belongs, and
+        an IP literal needs no entry, since every IP literal is already
+        trusted.  One trailing dot is dropped, as it is from a Host.  A suffix
+        must hold a dot after its leading one, so ``.com`` cannot trust a whole
+        top-level domain.
+
+        The message names the rule, never the value, like ``paperless.url``'s.
+
+        Args:
+            value: The raw ``allowed_hosts`` input.
+
+        Returns:
+            The normalised entries in order, without repeats, when the input
+            is a list or tuple of strings; else the input unchanged for
+            pydantic's own type check.
+
+        Raises:
+            ValueError: An entry is not a host name or a ``.suffix``.
+
+        """
+        if not isinstance(value, list | tuple) or not all(
+            isinstance(entry, str) for entry in value
+        ):
+            return value
+        entries: dict[str, None] = {}
+        for raw in value:
+            entry = str(raw).strip()
+            # ASCII before lower-casing: str.lower maps a few non-ASCII
+            # letters, such as the Kelvin sign, onto ASCII ones.
+            entry = entry.lower().removesuffix(".") if entry.isascii() else ""
+            if _ALLOWED_HOST_ENTRY.fullmatch(entry) is None or (
+                entry.startswith(".") and "." not in entry[1:]
+            ):
+                msg = (
+                    "must be a host name or a .suffix, with no scheme, port, "
+                    "path or '*'"
+                )
+                raise ValueError(msg)
+            entries[entry] = None
+        return tuple(entries)
 
 
 # ``web_host`` and ``web_port`` are NOT here: they stay in ``[output]``
 # (config.py's OutputConfig) because moving them would be a breaking config
-# change for every deployment that sets them. So ``[web]`` currently holds only
-# the form-shape keys, and ``[output]`` holds the server's bind address -- an
-# acknowledged incoherence, preferred over breaking a key operators already
-# write.
+# change for every deployment that sets them. So ``[web]`` holds the
+# form-shape keys and ``allowed_hosts``, the names the app answers to, while
+# ``[output]`` holds the server's bind address -- an acknowledged incoherence,
+# preferred over breaking a key operators already write.
 
 _ENV_PREFIX: Final = "SANELESS_"
 """The environment variable prefix; the unknown-variable scan uses it too."""

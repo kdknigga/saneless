@@ -42,6 +42,7 @@ from .cache import MetadataCache
 from .checks_cache import CheckCache
 from .cross_origin import CrossOriginGuard
 from .errors import install_error_handlers
+from .host_guard import HostGuard
 from .refresher import CheckRefresher
 from .routes import router
 from .throttle import (
@@ -402,6 +403,11 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     # added later cannot forget the cross-site check.  web_host still
     # defaults to 0.0.0.0; the LAN exposure that implies is documented.
     app.add_middleware(CrossOriginGuard)
+    # add_middleware is LIFO: the last one added is outermost, so the Host
+    # check wraps the cross-site check and runs before it.  It applies to every
+    # method, GET and /health included, because a DNS-rebinding page can read
+    # as easily as it can start a scan.
+    app.add_middleware(HostGuard, allowed_hosts=settings.web.allowed_hosts)
 
     app.state.worker = worker
     app.state.job_store = job_store

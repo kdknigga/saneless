@@ -421,6 +421,9 @@ class RequestRejection(StrEnum):
     METHOD_NOT_ALLOWED = "METHOD_NOT_ALLOWED"
     INTERNAL = "INTERNAL"
     CLIENT_ERROR = "CLIENT_ERROR"
+    # A well-formed Host that does not name saneless, sent with 421.  The
+    # sentence is fixed; the refused Host travels beside it, never inside it.
+    HOST_NOT_ALLOWED = "HOST_NOT_ALLOWED"
 
 
 # The one title length cap.  The ``Form(max_length=...)`` validation on the scan
@@ -1131,6 +1134,60 @@ def _reload_page_message(
     return message
 
 
+def _config_file_message(
+    rejection: Literal[
+        RequestRejection.TOKEN_UNSET,
+        RequestRejection.URL_UNSET,
+        RequestRejection.HOST_NOT_ALLOWED,
+    ],
+) -> str:
+    """
+    Return the message for a rejection whose remedy is an edit to the config file.
+
+    These three are one group: each names the one setting to change and ends
+    in the same instruction, because saneless reads its config file only at
+    start-up.  Each names the setting and never a value -- not the token, not
+    the paperless-ngx URL (which says where paperless-ngx runs), and not the
+    refused Host, which is shown beside the sentence, neutralised and bounded
+    (ASVS V7).
+
+    The parameter is typed as the three members this arm can pass, so the
+    ``assert_never`` below still fails the type gate if the group ever grows.
+
+    Args:
+        rejection: One of the three config-file rejections.
+
+    Returns:
+        The approved sentence for that rejection.
+
+    Raises:
+        AssertionError: If the value is outside the three-member group.
+
+    """
+    match rejection:
+        case RequestRejection.TOKEN_UNSET:
+            message = (
+                "The paperless-ngx API token has not been set, so the scan was "
+                "not started. Put a real API token in the saneless config "
+                "file, then restart saneless."
+            )
+        case RequestRejection.URL_UNSET:
+            message = (
+                "The paperless-ngx address has not been set, so the scan was "
+                "not started. Set paperless.url in the saneless config file, "
+                "then restart saneless."
+            )
+        case RequestRejection.HOST_NOT_ALLOWED:
+            message = (
+                "saneless does not answer to this address. Add the host name "
+                "you used to [web] allowed_hosts in the saneless config file, "
+                "then restart saneless."
+            )
+        case _:
+            assert_never(rejection)
+    return message
+
+
 def rejection_message(rejection: RequestRejection) -> str:
     """
     Return the user-facing message for a web-layer rejection.
@@ -1166,22 +1223,12 @@ def rejection_message(rejection: RequestRejection) -> str:
                 "started. Check the server's free disk space and log, then try "
                 "again."
             )
-        case RequestRejection.TOKEN_UNSET:
-            message = (
-                # Names the problem and the file to edit, never the token
-                # value and never the paperless-ngx URL, which says where
-                # paperless-ngx runs (ASVS V7).
-                "The paperless-ngx API token has not been set, so the scan was "
-                "not started. Put a real API token in the saneless config "
-                "file, then restart saneless."
-            )
-        case RequestRejection.URL_UNSET:
-            message = (
-                # Names the setting, never its value (ASVS V7).
-                "The paperless-ngx address has not been set, so the scan was "
-                "not started. Set paperless.url in the saneless config file, "
-                "then restart saneless."
-            )
+        case (
+            RequestRejection.TOKEN_UNSET
+            | RequestRejection.URL_UNSET
+            | RequestRejection.HOST_NOT_ALLOWED
+        ):
+            message = _config_file_message(rejection)
         case RequestRejection.UNKNOWN_PROFILE:
             message = (
                 "That scan profile does not exist. Reload the page to see the "
@@ -1261,6 +1308,8 @@ def rejection_status_code(rejection: RequestRejection) -> int:
             status_code = 500
         case RequestRejection.CLIENT_ERROR:
             status_code = 400
+        case RequestRejection.HOST_NOT_ALLOWED:
+            status_code = 421
         case _:
             assert_never(rejection)
     return status_code

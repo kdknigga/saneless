@@ -227,6 +227,20 @@ _PATH_PARAM = re.compile(r"\{[^}]+\}")
             False,
             id="delete-branch3-no-headers-allowed",
         ),
+        # Go treats an empty value as absent and would allow both of these;
+        # saneless rejects them, failing closed on purpose.
+        pytest.param(
+            "POST",
+            {"sec-fetch-site": "", "host": LAN_HOST},
+            True,
+            id="post-empty-sec-fetch-site-rejected",
+        ),
+        pytest.param(
+            "POST",
+            {"origin": "", "host": LAN_HOST},
+            True,
+            id="post-empty-origin-rejected",
+        ),
     ],
 )
 def test_is_cross_origin_request(

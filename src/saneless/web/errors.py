@@ -14,10 +14,13 @@ whose failure goes to the slot like any other click's.  Any other request gets
 ``{"status": "error", "detail": <message>}`` with the same status code, and a
 429 carries ``Retry-After`` on both branches.
 
-Every message is a ``RequestRejection`` vocabulary constant.  No request input
-and no exception text reaches a response body from here.  The only request
-input a log line carries is the method and path, formatted with ``%r`` so a
-control character in them is escaped and cannot forge a log line, as in
+Every message is a ``RequestRejection`` vocabulary constant.  No exception
+text reaches a response body from here, and only one piece of request input
+does: the refused ``Host`` of a 421, which ``host_guard`` neutralises and cuts
+to 255 characters before handing it over, and which is shown beside the fixed
+sentence rather than inside it, autoescaped in the htmx fragment.  The only
+request input a log line carries is the method and path, formatted with ``%r``
+so a control character in them is escaped and cannot forge a log line, as in
 ``cross_origin``.
 
 The catch-all handler logs the traceback with ``exc_info``.  Starlette's
@@ -31,6 +34,7 @@ catch-all handler.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from fastapi import HTTPException
@@ -54,6 +58,7 @@ __all__ = [
     "CHECKS_POLL_TARGET_ID",
     "RETRY_AFTER_SECONDS",
     "RequestRejected",
+    "TechnicalDetails",
     "install_error_handlers",
     "rejection_for_status",
     "render_error",
@@ -104,6 +109,32 @@ _TOO_LONG_TYPE = "string_too_long"
 # The error type the scan route's title validator raises for a control
 # character.  Matched by value here, so the two spellings must stay equal.
 _TITLE_CONTROL_TYPE = "title_control_character"
+
+
+@dataclass(frozen=True, slots=True)
+class TechnicalDetails:
+    """
+    The facts an error's "Technical details" disclosure may show, beyond status.
+
+    This is the slot's whole permitted vocabulary in one place.  Each field is
+    either a value saneless made or a value its caller has already made safe;
+    exception text, other request input and the log path have no field here
+    (ASVS V7).
+    """
+
+    job_id: str | None = None
+    """The job row the refused attempt wrote, or None when it wrote none."""
+
+    echoed_host: str | None = None
+    """
+    The refused Host of a 421, or None.
+
+    The caller neutralises and bounds it.  It is shown in Technical details
+    and as the JSON ``"host"`` field, never inside the sentence.
+    """
+
+
+_NO_DETAILS: Final = TechnicalDetails()
 
 
 class RequestRejected(HTTPException):
@@ -202,7 +233,7 @@ def render_error(
     rejection: RequestRejection,
     *,
     status_code: int,
-    job_id: str | None = None,
+    details: TechnicalDetails = _NO_DETAILS,
     extra_headers: Mapping[str, str] | None = None,
 ) -> Response:
     """
@@ -210,10 +241,13 @@ def render_error(
 
     The htmx body offers a short "Technical details" disclosure carrying the
     status code and, when the refused attempt wrote a job row, that row's id.
-    Those two are the whole permitted vocabulary of the slot: exception text,
-    request input and the log path must never reach it (ASVS V7), and a
-    uniform affordance that sometimes lied about having detail would be worse
-    than one that says what it has.
+    Those two are the whole permitted vocabulary of the slot, with one
+    exception: a 421 also names the Host it refused, so the operator knows
+    which name to add to ``[web] allowed_hosts``.  That Host arrives already
+    neutralised and bounded, and the template escapes it.  Otherwise
+    exception text, request input and the log path must never reach the slot
+    (ASVS V7), and a uniform affordance that sometimes lied about having
+    detail would be worse than one that says what it has.
 
     Whether Job History reloads is decided here rather than in the template, so
     the partial keeps no rule of its own: it reloads exactly when a row was
@@ -238,7 +272,8 @@ def render_error(
         request: The request being answered.
         rejection: The vocabulary member whose message is shown.
         status_code: The HTTP status code to send.
-        job_id: The row the refused attempt wrote, or None when it wrote none.
+        details: The facts beyond the status code that Technical details
+            may show; none by default.
         extra_headers: Headers the exception carries and the response must
             keep, such as a 405's ``Allow`` (RFC 9110 section 15.5.6).
 
@@ -263,17 +298,17 @@ def render_error(
             {
                 "message": message,
                 "status_code": status_code,
-                "job_id": job_id,
-                "refresh_history": job_id is not None,
+                "job_id": details.job_id,
+                "refresh_history": details.job_id is not None,
+                "host": details.echoed_host,
             },
             status_code=status_code,
             headers=headers,
         )
-    return JSONResponse(
-        {"status": "error", "detail": message},
-        status_code=status_code,
-        headers=headers,
-    )
+    body = {"status": "error", "detail": message}
+    if details.echoed_host is not None:
+        body["host"] = details.echoed_host
+    return JSONResponse(body, status_code=status_code, headers=headers)
 
 
 async def _http_exception(request: Request, exc: Exception) -> Response:
@@ -285,7 +320,7 @@ async def _http_exception(request: Request, exc: Exception) -> Response:
             request,
             exc.rejection,
             status_code=exc.status_code,
-            job_id=exc.job_id,
+            details=TechnicalDetails(job_id=exc.job_id),
         )
     # The exception's own headers are kept: the router's 405 carries the
     # ``Allow`` header RFC 9110 requires on a 405.

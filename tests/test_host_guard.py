@@ -24,19 +24,19 @@ from typing import TYPE_CHECKING
 
 import pytest
 from fastapi.testclient import TestClient
-from saneless.web.host_guard import (
-    DEFAULT_TRUSTED_SUFFIXES,
-    HostGuard,
-    HostVerdict,
-    host_verdict,
-)
 from starlette.requests import Request
 
 from saneless.config import ProfileConfig, Settings, WebConfig
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import RequestRejection, rejection_message
 from saneless.web.app import create_app
-from saneless.web.errors import render_error
+from saneless.web.errors import TechnicalDetails, render_error
+from saneless.web.host_guard import (
+    DEFAULT_TRUSTED_SUFFIXES,
+    HostGuard,
+    HostVerdict,
+    host_verdict,
+)
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
@@ -324,7 +324,10 @@ def test_an_echoed_host_is_escaped_in_the_fragment(client: TestClient) -> None:
     )
     rejection = RequestRejection.HOST_NOT_ALLOWED
     response = render_error(
-        request, rejection, status_code=421, echoed_host="<b>x</b>.example"
+        request,
+        rejection,
+        status_code=421,
+        details=TechnicalDetails(echoed_host="<b>x</b>.example"),
     )
     body = bytes(response.body).decode()
     assert "<b>x</b>" not in body
