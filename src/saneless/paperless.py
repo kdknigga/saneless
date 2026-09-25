@@ -699,6 +699,9 @@ class PaperlessClient:
         # name or password is refused below, but an invalid URL is still
         # shown, and it may hold one the parser could not read.
         self._display_url = _without_userinfo(base_url)
+        # " at <url>" for a message, or nothing when no address is set: an
+        # unset paperless.url would otherwise read "Paperless at : ...".
+        self._at_url = f" at {self._display_url}" if self._display_url else ""
         try:
             parsed = httpx2.URL(base_url)
             if parsed.userinfo:
@@ -747,8 +750,8 @@ class PaperlessClient:
             # None, so the message names the two variables that steer the
             # trust store and can be corrected.
             msg = (
-                "Could not build the TLS trust store for Paperless at "
-                f"{self._display_url}: {describe(exc)}; "
+                f"Could not build the TLS trust store for Paperless{self._at_url}: "
+                f"{describe(exc)}; "
                 "check SSL_CERT_FILE and SSL_CERT_DIR"
             )
             raise PaperlessError(msg) from exc
@@ -843,7 +846,7 @@ class PaperlessClient:
                         # _retry_decision never gives it; it is reported as
                         # unexpected rather than dropped.
                         msg = (
-                            f"Could not upload to Paperless at {self._display_url}: "
+                            f"Could not upload to Paperless{self._at_url}: "
                             f"{self._reason(exc)}"
                         )
                         raise PaperlessError(msg) from self._cause(exc)
@@ -860,7 +863,7 @@ class PaperlessClient:
             "no attempt was made" if last_error is None else self._reason(last_error)
         )
         msg = (
-            f"Upload to Paperless at {self._display_url} failed after "
+            f"Upload to Paperless{self._at_url} failed after "
             f"{self._max_retries} attempts: {reason}"
         )
         cause = None if last_error is None else self._cause(last_error)
@@ -932,7 +935,7 @@ class PaperlessClient:
             task_id = response.json()
         except ValueError as exc:
             msg = (
-                f"Paperless at {self._display_url} returned a response that is "
+                f"Paperless{self._at_url} returned a response that is "
                 f"not JSON: {self._reason(exc)}"
             )
             raise PaperlessError(msg) from self._cause(exc)
@@ -1227,7 +1230,7 @@ class PaperlessClient:
             payload = response.json()
         except ValueError as exc:
             msg = (
-                f"Paperless at {self._display_url} returned a task response that is "
+                f"Paperless{self._at_url} returned a task response that is "
                 f"not JSON: {self._reason(exc)}"
             )
             raise PaperlessError(msg) from self._cause(exc)
@@ -1402,7 +1405,8 @@ class PaperlessClient:
         Raises:
             ConfigError: ``Could not fetch <noun> from Paperless at <url>:
                 <fixed problem>``, with no cause, when the request cannot be
-                sent from the configured URL and token.
+                sent from the configured URL and token.  With no URL set the
+                `` at <url>`` is left out.
             PaperlessError: ``Could not fetch <noun> from Paperless at <url>:
                 <reason>``, chained to the httpx2 error or the ValueError
                 unless its chain quotes the token, or
@@ -1411,7 +1415,7 @@ class PaperlessClient:
                 ``count`` allows.
 
         """
-        prefix = f"Could not fetch {noun} from Paperless at {self._display_url}"
+        prefix = f"Could not fetch {noun} from Paperless{self._at_url}"
         results: list[dict[str, object]] = []
         previous: object = None
         page_limit = _METADATA_MAX_PAGES

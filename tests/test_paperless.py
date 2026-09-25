@@ -2025,6 +2025,22 @@ class TestMetadataFetchTranslation:
         assert handler.calls == 1
 
     @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
+    def test_empty_url_metadata_message_names_no_empty_address(
+        self, method: str, noun: str
+    ) -> None:
+        """With no address to name, the message leaves the "at <url>" out."""
+        client = PaperlessClient(url="", token=_MOCK_AUTH)
+        try:
+            with pytest.raises(ConfigError) as exc_info:
+                getattr(client, method)()
+        finally:
+            client.close()
+        assert str(exc_info.value) == (
+            f"Could not fetch {noun} from Paperless: paperless.url is not set, or "
+            "has no http or https scheme; set it to the paperless-ngx address"
+        )
+
+    @pytest.mark.parametrize(("method", "noun"), _METADATA_METHODS)
     def test_metadata_list_response_is_returned(self, method: str, noun: str) -> None:
         """A bare-list response is returned unchanged."""
         items = [{"id": 1, "name": f"first {noun}"}]
