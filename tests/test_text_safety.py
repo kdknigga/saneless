@@ -15,13 +15,13 @@ import textwrap
 from pathlib import Path
 
 import pytest
+
+import saneless
 from saneless.text_safety import (
     has_control_characters,
     neutralise_bounded,
     neutralise_controls,
 )
-
-import saneless
 
 _ELLIPSIS = "\u2026"
 
