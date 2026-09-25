@@ -5,7 +5,7 @@ Covers requirements: UI-03, UI-07, CTR-01, ROBU-01, ROBU-04, ROBU-08.
 
 The templates are the one surface neither ``ty`` nor ``pyrefly`` can see. Once
 the hand-written state lists moved behind ``Job.is_active`` / ``Job.is_busy``
-and the ``state_label`` / ``progress_label`` filters, nothing mechanical pinned
+and the ``job_label`` / ``progress_label`` filters, nothing mechanical pinned
 *which* state produces *which* markup any more: the grep gates in the plan only
 prove the string literals are gone, and the browser suite only exercises the
 idle page. These tests pin the mapping for every ``JobState`` member.

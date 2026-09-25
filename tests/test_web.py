@@ -1013,7 +1013,13 @@ class TestAppComposition:
     def test_the_existing_state_entries_and_filters_are_unchanged(
         self, unstarted_app: FastAPI, web_settings: Settings
     ) -> None:
-        """The five earlier injections and three earlier filters still hold."""
+        """
+        The five earlier injections hold, and the label filters are the right ones.
+
+        ``state_label`` is deliberately absent: it reads the state alone, so it
+        would call a warned upload "Complete".  Every label goes through
+        ``job_label``, which also reads the warning.
+        """
         state = unstarted_app.state
         assert isinstance(state.worker, ScanWorker)
         assert isinstance(state.job_store, JobStore)
@@ -1021,7 +1027,8 @@ class TestAppComposition:
         assert state.paperless is not None
         assert state.cache is not None
         filters = state.templates.env.filters
-        assert {"state_label", "progress_label", "flip_answer_label"} <= set(filters)
+        assert {"job_label", "progress_label", "flip_answer_label"} <= set(filters)
+        assert "state_label" not in filters
 
     def test_building_the_app_does_not_start_the_refresher_thread(
         self, unstarted_app: FastAPI

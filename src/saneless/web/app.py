@@ -33,7 +33,6 @@ from saneless.vocabulary import (
     outcome_line,
     page_counts,
     progress_label,
-    state_label,
 )
 from saneless.worker import STOP_JOIN_SECONDS, ScanWorker
 
@@ -79,10 +78,12 @@ def _build_templates() -> Jinja2Templates:
 
     """
     templates = Jinja2Templates(directory=str(TEMPLATE_DIR))
-    templates.env.filters["state_label"] = state_label
     # A warned upload's label and headline are chosen from the state plus its
     # warning, so they cannot be a lookup on the state alone: these two take
     # the warning (and the headline the title) as filter arguments.
+    # ``state_label`` is deliberately NOT registered: it reads the state alone
+    # and so calls a warned upload "Complete", and a template that reached for
+    # it would bring that label back.
     templates.env.filters["job_label"] = job_label
     templates.env.filters["outcome_line"] = outcome_line
     templates.env.filters["progress_label"] = progress_label
