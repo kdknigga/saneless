@@ -72,6 +72,7 @@ from .pipeline import (
     PipelineRequest,
     run_pipeline,
 )
+from .private_dirs import make_private_dir
 from .scanner.sane_backend import SaneBackend, require_sane
 from .text_safety import neutralise_controls
 from .vocabulary import (
@@ -1055,7 +1056,8 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
     # sqlite3.connect does not create parent directories, so data_dir must
     # exist before JobStore opens the database. Deliberately not hidden inside
     # the db_path property: a property with a filesystem side effect surprises.
-    settings.output.data_dir.mkdir(parents=True, exist_ok=True)
+    # Created owner-only: it holds the job history and any preserved scans.
+    make_private_dir(settings.output.data_dir)
     store = JobStore(db_path=settings.output.db_path)
     try:
         recent = store.list_recent(limit=limit)
@@ -1079,6 +1081,12 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                             "created_at": j.created_at.isoformat(),
                             "outcome": j.outcome.value if j.outcome else None,
                             "warning": j.warning,
+                            # The full stored text, host paths and the
+                            # paperless URL included: the web page shows only
+                            # a path-free sentence that points here. Added
+                            # after the other keys, so existing scripts are
+                            # unaffected.
+                            "error": j.error,
                         }
                         for j in recent
                     ],

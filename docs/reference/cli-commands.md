@@ -174,7 +174,9 @@ saneless [--config PATH] [-v] jobs [--json] [--limit N]
 
 The table's `Timestamp` column renders each job's start time in the server's local timezone with the zone named, for example `2026-03-22 09:30 CDT`, and drops seconds. `--json` is a machine contract and is unaffected: its `created_at` stays a UTC ISO-8601 string carrying the `+00:00` offset. See [Use the CLI for Scripting](../how-to/cli-scripting.md#job-history-json).
 
-`jobs` does not need python-sane, and on a fresh install it creates the data directory and prints an empty history.
+Each `--json` entry also carries an `error` field: the full stored text of what stopped the job, file paths on the server and the paperless-ngx URL included, or `null`. The web page shows a failure only as a sentence without paths, and points here for the rest.
+
+`jobs` does not need python-sane, and on a fresh install it creates the data directory, readable only by the user running saneless, and prints an empty history.
 
 ---
 

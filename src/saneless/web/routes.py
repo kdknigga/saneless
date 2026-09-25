@@ -118,10 +118,16 @@ MetadataResource = Literal["tags", "correspondents"]
 # The cookie naming the browser that started a scan.  Every attribute it
 # is set with is deliberate: ``HttpOnly`` so no script can read it -- there is
 # no script file in this application at all; ``SameSite=Lax`` so the browser
-# withholds it on any cross-site POST; no lifetime attribute, so it is a
-# session cookie that dies when the browser closes; and deliberately no
-# ``Secure``, because the appliance is served over plain HTTP on a LAN and that
-# flag would silently stop the cookie being sent rather than harden it.
+# withholds it on any cross-site POST; ``Max-Age`` of one year, so a browser
+# keeps seeing its own scans' titles and previews after it restarts; and
+# deliberately no ``Secure``, because the appliance is served over plain HTTP
+# on a LAN and that flag would silently stop the cookie being sent rather than
+# harden it.
+#
+# The cookie is re-set on every accepted submit, with the value the browser
+# presented or a fresh one when it presented none.  That renews the year each
+# time, and it is how a session cookie set by an older release gains the
+# lifetime: its token comes back unchanged, now persistent.
 #
 # The token's position, recorded here so a later reader does not mistake this
 # for something it is not: the token is a footgun guard for the flip prompt,
@@ -132,6 +138,10 @@ MetadataResource = Literal["tags", "correspondents"]
 # standing at the same appliance pressing Continue on a stack they did not
 # load, which is the failure the token exists to close.
 OWNER_COOKIE: Final = "saneless_owner"
+
+# One year in seconds: the owner cookie's lifetime, renewed on every accepted
+# submit.
+OWNER_COOKIE_MAX_AGE: Final = 365 * 24 * 60 * 60
 
 
 def _presented_owner(request: Request) -> str | None:
@@ -1414,8 +1424,9 @@ def start_scan(
 
     # The mint rule: a token is minted on the first submit from a browser
     # and reused for every later job from it, so two tabs on one device do not
-    # disown each other.  It is recorded on the row either way; only a mint
-    # reaches the response as a cookie.
+    # disown each other.  It is recorded on the row either way, and an
+    # accepted submit sends it back as a cookie either way, so the lifetime is
+    # renewed.
     presented = _presented_owner(request)
     owner = presented or secrets.token_urlsafe(32)
     job = state.job_store.create_job(
@@ -1460,14 +1471,14 @@ def start_scan(
                     **_checks_context(state),
                 },
             )
-            if presented is None:
-                response.set_cookie(
-                    OWNER_COOKIE,
-                    owner,
-                    httponly=True,
-                    samesite="lax",
-                    path="/",
-                )
+            response.set_cookie(
+                OWNER_COOKIE,
+                owner,
+                max_age=OWNER_COOKIE_MAX_AGE,
+                httponly=True,
+                samesite="lax",
+                path="/",
+            )
             return response
         case SubmitResult.QUEUE_FULL:
             rejection, error = RequestRejection.QUEUE_FULL, QUEUE_FULL_JOB_ERROR
