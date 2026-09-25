@@ -40,6 +40,7 @@ import pytest
 from click.testing import CliRunner
 from fastapi import FastAPI
 
+from saneless import pipeline as pipeline_module
 from saneless import preservation
 from saneless import workspace as workspace_module
 from saneless.cli import _INTERRUPTION, cli
@@ -659,6 +660,79 @@ def test_a_signal_after_delivery_leaves_the_success_alone(
         real_remove(path, what)
 
     monkeypatch.setattr(workspace_module, "_remove_quietly", remove_quietly)
+
+    run = _run_cli(tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGTERM]
+    assert run.result.exit_code == ExitCode.SUCCESS, run.result.output
+    assert len(run.recorder.uploads()) == 1
+    assert run.failed == []
+    assert run.interrupted_lines == []
+    assert list((tmp_path / "scratch").glob("job-*")) == []
+
+
+def _signal_as_the_run_settles(
+    monkeypatch: pytest.MonkeyPatch, signaller: _Signaller
+) -> None:
+    """
+    Make SIGTERM arrive the first time the run settles, before it has.
+
+    The handler runs at the settling call's own entry, which is the first
+    moment a signal still pending as the run's outcome arrived can land.
+
+    Args:
+        monkeypatch: Replaces ``_PipelineRun._settle``.
+        signaller: Sends the signal.
+
+    """
+    real_settle = pipeline_module._PipelineRun._settle
+
+    def settle(run: pipeline_module._PipelineRun) -> None:
+        """Send SIGTERM on the first call, then settle."""
+        if not signaller.sent:
+            signaller.send(signal.SIGTERM)
+        real_settle(run)
+
+    monkeypatch.setattr(pipeline_module._PipelineRun, "_settle", settle)
+
+
+def test_a_signal_landing_as_a_failure_settles_still_keeps_every_page(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    SIGTERM pending as a scanner fault reaches the run's guard: all kept.
+
+    The signal lands before the run has marked its outcome as settled, so the
+    handler raises rather than defers.  That late interruption must not
+    abandon the failure it arrived behind: the pages are kept, and the
+    command reports the fault it really had.
+    """
+    signaller = _Signaller()
+    scanner = _ObservingScanner(
+        passes=((0, 1, 2),), failure=ScanError("The scanner jammed")
+    )
+    _signal_as_the_run_settles(monkeypatch, signaller)
+
+    run = _run_cli(tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGTERM]
+    assert run.result.exit_code == ExitCode.SCAN, run.result.output
+    (kept,) = run.failed
+    assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1, 2))
+    assert str(kept) in run.result.stderr
+    assert run.interrupted_lines == []
+    assert list((tmp_path / "scratch").glob("job-*")) == []
+
+
+def test_a_signal_landing_as_a_delivery_settles_leaves_the_success_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM pending as the delivered run settles: still exit 0, nothing kept."""
+    signaller = _Signaller()
+    scanner = DistinctPageScanner(passes=((0, 1),))
+    _signal_as_the_run_settles(monkeypatch, signaller)
 
     run = _run_cli(tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner)
 

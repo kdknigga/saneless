@@ -1145,7 +1145,11 @@ class _PipelineRun:
         """
         # Every arm settles the run before anything else, so a signal arriving
         # while the pages are kept, or while the workspace is removed, cannot
-        # abandon either half way.
+        # abandon either half way.  A signal still pending as the failure
+        # arrived lands at the settling call's own entry, before the run is
+        # settled, and so is raised: each arm's first call is therefore inside
+        # a try that absorbs it.  Nothing between the except clause matching
+        # and that call gives a signal handler a chance to run.
         try:
             return self._run()
         except ScanCancelledError:
@@ -1155,13 +1159,19 @@ class _PipelineRun:
             # below would otherwise file a scan the operator chose to abandon
             # into a directory saneless never prunes.  Nobody asked for those
             # pages to be kept, so they are not.
-            self._settle()
+            try:
+                self._settle()
+            except ScanInterrupted as late:
+                self._absorb(late)
             raise
         except (Exception, ScanInterrupted) as exc:
             # ScanInterrupted is a BaseException so that nothing on the way up
             # can re-type it, and it is caught here because an interruption is
             # not anyone's decision to stop: the pages are kept.
-            self._settle()
+            try:
+                self._settle()
+            except ScanInterrupted as late:
+                self._absorb(late)
             # The ledger knows what each pass spooled, and each record the
             # dpi it was read back at; the artefacts are what the
             # preservation reads.
@@ -1194,7 +1204,10 @@ class _PipelineRun:
         except BaseException:
             # KeyboardInterrupt, above all: Ctrl-C is the operator's cancel,
             # and keeps nothing either.
-            self._settle()
+            try:
+                self._settle()
+            except ScanInterrupted as late:
+                self._absorb(late)
             raise
 
     def _settle(self) -> None:
@@ -1203,10 +1216,38 @@ class _PipelineRun:
         if settled is not None:
             settled.set()
 
-    def _delivered(self) -> None:
-        """Record that the document was delivered, which settles the run."""
-        self.artefacts.stage = preservation.RunStage.DELIVERED
+    def _absorb(self, late: ScanInterrupted) -> None:
+        """
+        Let the run's own outcome stand over a signal that landed as it settled.
+
+        The signal handler ignores both signals before it raises, so no
+        second one can follow this, and the run is settled here after all.
+
+        Args:
+            late: The interruption raised as the run settled.
+
+        """
+        logger.info(
+            "%s arrived as the run's outcome was settled, so the run finishes "
+            "with its own outcome",
+            late,
+        )
         self._settle()
+
+    def _delivered(self) -> None:
+        """
+        Record that the document was delivered, which settles the run.
+
+        Settled first, and the stage recorded only afterwards: a signal that
+        lands as the run settles is absorbed, because the document is already
+        delivered, and nothing may leave the run failing at stage DELIVERED,
+        which keeps nothing.
+        """
+        try:
+            self._settle()
+        except ScanInterrupted as late:
+            self._absorb(late)
+        self.artefacts.stage = preservation.RunStage.DELIVERED
 
     def _preserve(self) -> preservation.PreservationReport:
         """
