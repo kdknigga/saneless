@@ -335,6 +335,17 @@ class RecordingPaperless:
         self.issued: list[str] = []
         self._refuse_uploads = refuse_uploads
 
+    @property
+    def refuses_uploads(self) -> bool:
+        """
+        Say whether every upload is answered with a 500.
+
+        Returns:
+            The ``refuse_uploads`` this recorder was built with.
+
+        """
+        return self._refuse_uploads
+
     def __call__(self, request: httpx2.Request) -> httpx2.Response:
         """
         Record a request and answer it.
@@ -441,9 +452,11 @@ def web_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
     Build the stand-in for ``saneless.web.app.PaperlessClient``.
 
     ``create_app`` builds its client with keyword arguments, so the stand-in
-    takes the same keywords and returns a real client over ``recorder``.  One
-    attempt per upload: the fallback is reached exactly as at any retry count,
-    and no backoff pause is ever reached.
+    takes the same keywords and returns a real client over ``recorder``.  The
+    client keeps the production retry count, so "uploaded exactly once" is
+    proved at the count a real appliance runs with.  Only when ``recorder``
+    refuses every upload does it get one attempt: the fallback is reached
+    exactly as at any retry count, and no backoff pause is ever reached.
 
     Args:
         recorder: The in-memory paperless-ngx every request goes to.
@@ -463,11 +476,18 @@ def web_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
             A client that never opens a socket.
 
         """
+        if recorder.refuses_uploads:
+            return PaperlessClient(
+                url=url,
+                token=token,
+                consume_dir=consume_dir,
+                max_retries=1,
+                transport=httpx2.MockTransport(recorder),
+            )
         return PaperlessClient(
             url=url,
             token=token,
             consume_dir=consume_dir,
-            max_retries=1,
             transport=httpx2.MockTransport(recorder),
         )
 
@@ -479,7 +499,8 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
     Build the stand-in for ``saneless.cli.PaperlessClient``.
 
     The ``scan`` command passes its arguments positionally, so this stand-in
-    takes them positionally; otherwise it is ``web_client_builder``'s client.
+    takes them positionally; otherwise it is ``web_client_builder``'s client,
+    with the production retry count unless ``recorder`` refuses every upload.
 
     Args:
         recorder: The in-memory paperless-ngx every request goes to.
@@ -499,12 +520,16 @@ def cli_client_builder(recorder: RecordingPaperless) -> Callable[..., PaperlessC
             A client that never opens a socket.
 
         """
+        if recorder.refuses_uploads:
+            return PaperlessClient(
+                url,
+                token,
+                consume_dir,
+                max_retries=1,
+                transport=httpx2.MockTransport(recorder),
+            )
         return PaperlessClient(
-            url,
-            token,
-            consume_dir,
-            max_retries=1,
-            transport=httpx2.MockTransport(recorder),
+            url, token, consume_dir, transport=httpx2.MockTransport(recorder)
         )
 
     return build_client

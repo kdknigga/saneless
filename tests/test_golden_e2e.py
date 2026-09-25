@@ -279,7 +279,11 @@ class _WebRun:
 
 
 def _run_web(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: _Scenario
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: _Scenario,
+    *,
+    refuse_uploads: bool = False,
 ) -> _WebRun:
     """
     Scan once through the web app, exactly as a browser would.
@@ -288,13 +292,18 @@ def _run_web(
         tmp_path: pytest's per-test directory.
         monkeypatch: Swaps the app's ``PaperlessClient`` for the recording one.
         scenario: What the scanner feeds.
+        refuse_uploads: Answer every upload with a 500 and give the run a
+            consume folder, so it falls back to it.
 
     Returns:
         What the run left behind.
 
     """
-    settings = _settings(tmp_path, profile_metadata=False)
-    recorder = RecordingPaperless()
+    consume_dir = tmp_path / "consume" if refuse_uploads else None
+    if consume_dir is not None:
+        consume_dir.mkdir()
+    settings = _settings(tmp_path, profile_metadata=False, consume_dir=consume_dir)
+    recorder = RecordingPaperless(refuse_uploads=refuse_uploads)
     scanner = DistinctPageScanner(passes=scenario.passes, rejected=scenario.rejected)
     monkeypatch.setattr(
         "saneless.web.app.PaperlessClient", web_client_builder(recorder)
@@ -404,6 +413,30 @@ def test_web_status_renders_the_outcome_and_warning(
         r'<td class="status-fallback">\s*Uploaded with a warning\s*</td>',
         run.history_html,
     )
+
+
+def test_web_consume_folder_fallback_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan saved to the consume folder says so on every web surface."""
+    run = _run_web(tmp_path, monkeypatch, _SIMPLEX_RUN, refuse_uploads=True)
+
+    assert run.job.state is JobState.FALLBACK
+    assert run.job.warning is not None
+    assert _CONSUME_FOLDER_SENTENCE in run.job.warning
+    assert len(run.recorder.uploads()) == 1
+    assert run.recorder.issued == []
+    assert run.recorder.polls() == []
+    assert len(list((tmp_path / "consume").glob("*.pdf"))) == 1
+    for page in (run.status_html, run.index_html):
+        assert _FALLBACK_LINE in page
+        assert run.job.warning in page
+        assert _DONE_LINE not in page
+        assert _WARNED_LINE not in page
+    assert re.search(
+        r'<td class="status-fallback">\s*Saved to folder\s*</td>', run.history_html
+    )
+    assert "Complete" not in run.history_html
 
 
 # --------------------------------------------------------------------------
@@ -557,6 +590,7 @@ def test_cli_clean_scan_prints_done_and_exits_zero(
 
     assert run.result.exit_code == 0, run.result.output
     assert _DONE_LINE in run.result.stdout
+    assert "Warning:" not in run.result.stdout
     assert _warning_lines(run.result.stderr) == []
     assert run.recorder.issued == ["golden-task-1"]
     assert _task_ids(run.recorder) == run.recorder.issued
@@ -572,6 +606,7 @@ def test_cli_skipped_sheet_is_reported_and_exits_7(
     assert run.result.exit_code == 7, run.result.output
     assert _WARNED_LINE in run.result.stdout
     assert "Done:" not in run.result.stdout
+    assert "Warning:" not in run.result.stdout
     assert _warning_lines(run.result.stderr) == [f"Warning: {_SKIPPED_SHEET}"]
     assert len(run.recorder.uploads()) == 1
 
@@ -597,6 +632,7 @@ def test_cli_duplex_count_mismatch_is_reported_and_exits_7(
     _assert_operator_metadata(run.recorder.upload_fields(1), f"{_TITLE} (backs)")
     assert _WARNED_LINE in run.result.stdout
     assert "Done:" not in run.result.stdout
+    assert "Warning:" not in run.result.stdout
     assert any(
         line.startswith("Warning: Page count mismatch")
         for line in _warning_lines(run.result.stderr)
@@ -612,6 +648,8 @@ def test_cli_consume_folder_fallback_is_reported_and_exits_6(
     assert run.result.exit_code == 6, run.result.output
     assert _FALLBACK_LINE in run.result.stdout
     assert "Done:" not in run.result.stdout
+    assert "Warning:" not in run.result.stdout
+    assert "Not uploaded" not in run.result.stdout
     assert _NOT_UPLOADED_LINE in run.result.stderr.splitlines()
     warnings = _warning_lines(run.result.stderr)
     assert len(warnings) == 1
@@ -628,6 +666,8 @@ def test_cli_fallback_with_a_skipped_sheet_exits_6(
     assert run.result.exit_code == 6, run.result.output
     assert _FALLBACK_LINE in run.result.stdout
     assert "Done:" not in run.result.stdout
+    assert "Warning:" not in run.result.stdout
+    assert "Not uploaded" not in run.result.stdout
     assert _NOT_UPLOADED_LINE in run.result.stderr.splitlines()
     warned = "\n".join(_warning_lines(run.result.stderr))
     assert _CONSUME_FOLDER_SENTENCE in warned
