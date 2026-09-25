@@ -27,7 +27,7 @@ from saneless.exceptions import (
     ScanInterrupted,
     describe,
 )
-from saneless.pages import filter_empty_pages
+from saneless.pages import BlankFilterResult, filter_blank_pages
 from saneless.pdf import assemble_pdf, build_pdf_filename
 from saneless.private_dirs import ensure_private_dir
 from saneless.scanner.base import ScanBatch, ScanSettings
@@ -390,13 +390,31 @@ class PipelineRequest:
 
 @dataclass
 class ScanResult:
-    """How a scan pipeline run resolved, and how many pages it moved."""
+    """
+    How a scan pipeline run resolved, and how many pages it moved.
+
+    Attributes:
+        outcome: Whether the document reached paperless-ngx's API.
+        pages_scanned: How many pages the scanner produced.
+        pages_removed: How many of them blank-page detection removed.
+        pages_uploaded: How many pages the delivered document carries.
+        warning: What the operator must know about a delivered document, or
+            None.
+        removed_positions: The 1-based scanned positions, in document order,
+            of the pages blank-page detection removed -- for manual duplex,
+            places in the interleaved document.  Information shown beside
+            ``pages_removed``, never a warning: removing blank pages is an
+            ordinary success.  Empty when nothing was removed, when detection
+            is off, and on the duplex-mismatch route, which never filters.
+
+    """
 
     outcome: ScanOutcome
     pages_scanned: int
     pages_removed: int
     pages_uploaded: int
     warning: str | None = None
+    removed_positions: tuple[int, ...] = ()
 
 
 def _observe(request: PipelineRequest, what: str, call: Callable[[], None]) -> None:
@@ -559,7 +577,7 @@ def _require_pages(batch: ScanBatch) -> None:
     It never pre-empts the backend's truthful feeder message: the SANE
     backend raises its own, more specific ``FeederEmptyError`` for an empty
     feeder, or an all-unreadable ``ScanError``, before it ever returns a
-    batch. What it guarantees is that ``_drop_empty_pages`` and
+    batch. What it guarantees is that ``_drop_blank_pages`` and
     ``assemble_pdf`` never see an empty list.
 
     Args:
@@ -638,24 +656,25 @@ class _SpoolLedger:
         return sum(len(sink.records) for _, sink in self.passes)
 
 
-def _drop_empty_pages(
+def _drop_blank_pages(
     pages: Sequence[PageRecord],
     profile: ProfileConfig,
-) -> list[PageRecord]:
+) -> BlankFilterResult:
     """
     Drop blank pages when the profile enables empty-page detection.
 
-    Records in, records out. The judgement is made from the statistics each
-    record already carries, measured once when the page was spooled;
-    nothing here re-opens a page file, and nothing here deletes one.
+    Records in, records out. The judgement is made from the ink coverage and
+    paper white each record already carries, measured once when the page was
+    spooled, against the profile's ``empty_page_coverage_threshold``; nothing
+    here re-opens a page file, and nothing here deletes or copies one.
 
     Args:
         pages: The scanned page records, in document order.
-        profile: The profile whose toggle and thresholds apply.
+        profile: The profile whose toggle and threshold apply.
 
     Returns:
-        The records to assemble: filtered when detection is on, the input
-        sequence's records unchanged when it is off.
+        The records to assemble and the 1-based positions removed: filtered
+        when detection is on, every record and no positions when it is off.
 
     Raises:
         AllPagesBlankError: If every page of a non-empty batch was detected as
@@ -667,22 +686,25 @@ def _drop_empty_pages(
     """
     if not profile.enable_empty_page_detection:
         logger.info("Empty page detection disabled for profile")
-        return list(pages)
+        return BlankFilterResult(kept=list(pages), removed_positions=())
 
-    filtered = filter_empty_pages(
-        pages,
-        mean_threshold=profile.empty_page_mean_threshold,
-        stddev_threshold=profile.empty_page_stddev_threshold,
+    result = filter_blank_pages(
+        pages, coverage_threshold=profile.empty_page_coverage_threshold
     )
-    if len(filtered) < len(pages):
-        logger.info("Empty page filter: %d -> %d pages", len(pages), len(filtered))
-    if not filtered:
+    if result.removed_positions:
+        logger.info(
+            "Blank-page filter: %d -> %d pages (removed pages %s)",
+            len(pages),
+            len(result.kept),
+            ", ".join(str(position) for position in result.removed_positions),
+        )
+    if not result.kept:
         msg = (
             f"All {len(pages)} page(s) looked blank to empty-page detection, "
             "so nothing was uploaded"
         )
         raise AllPagesBlankError(msg)
-    return filtered
+    return result
 
 
 def _consume_dir_warning(destination: Path | None) -> str:
@@ -1458,7 +1480,7 @@ class _PipelineRun:
         # the ``exif`` argument, which neither the spool's PNG save nor the
         # thumbnail's JPEG save ever does.  An orientation tag that img2pdf
         # or a browser would act on therefore cannot reach either file.
-        filtered = _drop_empty_pages(records, self.profile)
+        filtered = _drop_blank_pages(records, self.profile)
 
         # Each page is laid out at the dpi on its own record: the resolution
         # the device read back, not the one the profile asked for. SANE
@@ -1466,7 +1488,7 @@ class _PipelineRun:
         # 1200 -- and the read-back value is the same one the backend's crop
         # arithmetic used, so the cropped shape and the declared page size
         # cannot disagree.
-        pdf_path = self._assemble(filtered)
+        pdf_path = self._assemble(filtered.kept)
         outcome, warning = self._deliver_document(pdf_path)
 
         result = ScanResult(
@@ -1475,9 +1497,12 @@ class _PipelineRun:
             # Blank-page detection only. A sheet the scanner could not read is
             # reported through the warning instead, because the web UI shows
             # this number to users as pages removed for being blank.
-            pages_removed=len(records) - len(filtered),
-            pages_uploaded=len(filtered),
+            pages_removed=len(filtered.removed_positions),
+            pages_uploaded=len(filtered.kept),
             warning=_join_warnings(warning, rejected_warning),
+            # Information beside the count, never folded into the warning:
+            # removing blank pages leaves a plain success.
+            removed_positions=filtered.removed_positions,
         )
         self._notify(PipelineEvent.DONE)
         logger.info("Pipeline complete for %r", self.request.title)
@@ -1593,9 +1618,9 @@ class _PipelineRun:
         each other on the way into ``failed/``.
 
         The blank-page filter does not run here, on purpose, so
-        ``pages_removed`` is simply 0.  A mismatched run is an anomaly sent to
-        a person for manual review, and a blank back side is evidence about
-        why the two passes disagreed.
+        ``pages_removed`` is simply 0 and no position is named as removed.  A
+        mismatched run is an anomaly sent to a person for manual review, and a
+        blank back side is evidence about why the two passes disagreed.
 
         Args:
             mismatch: Both passes, whose records carry the resolution each

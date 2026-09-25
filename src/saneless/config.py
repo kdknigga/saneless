@@ -672,9 +672,16 @@ class ProfileConfig(BaseModel):
     # the route's Form(max_length=...) only checks the typed title, so an
     # unbounded profile title would bypass the length limit a typed one gets.
     default_title: str = Field(default="", alias="title", max_length=TITLE_MAX_LENGTH)
-    empty_page_mean_threshold: float = 250.0
-    empty_page_stddev_threshold: float = 5.0
     enable_empty_page_detection: bool = True
+    # The one blank-page knob, in percent of the page inside a 3 % margin on
+    # every edge: a page is removed when its ink coverage is at or below this
+    # (and its paper is light enough to be paper at all).  At 0 only a page
+    # with no ink pixel is removed.  The default keeps a lone page number and
+    # a few faint pencil lines, and may keep a dusty blank back: keeping a
+    # blank costs a page, dropping content costs the only copy.  Bounded to a
+    # percentage; the edge trim and the darkness margin are constants in
+    # saneless.pages, deliberately not settings.
+    empty_page_coverage_threshold: float = Field(default=0.001, ge=0.0, le=100.0)
     auto_generated: bool = False
 
     @model_validator(mode="before")

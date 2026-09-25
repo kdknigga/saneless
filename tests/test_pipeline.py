@@ -3539,9 +3539,9 @@ class TestPartialScanPreservation:
         """
         An anomaly is delivered whole for review, following the mismatch path.
 
-        Every spooled sheet here is blank enough that ``_drop_empty_pages``
-        would have removed it -- and removing them all would raise "All pages
-        were blank" and destroy the very evidence the operator needs.
+        Every spooled sheet here is blank enough that ``_drop_blank_pages``
+        would have removed it -- and removing them all would fail the run as
+        all-blank rather than deliver the evidence the operator needs.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         assert default_settings.profiles["default"].enable_empty_page_detection

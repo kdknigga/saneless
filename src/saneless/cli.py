@@ -98,6 +98,7 @@ from .vocabulary import (
     local_time,
     outcome_line,
     progress_label,
+    removed_pages_note,
     state_label,
 )
 from .web.app import create_app
@@ -998,6 +999,13 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     click.echo(
         outcome_line(job_state_for(result.outcome), result.warning, resolved_title)
     )
+    # Removed pages are not kept anywhere, so naming them is how the operator
+    # learns which sheets to rescan if a real page was taken for a blank.  It
+    # goes to stdout beside the outcome and leaves the exit code alone: it is
+    # information about a success, not a warning.
+    removed_note = removed_pages_note(result.removed_positions, result.pages_scanned)
+    if removed_note is not None:
+        click.echo(removed_note)
     if result.outcome is ScanOutcome.FALLBACK:
         click.echo(FALLBACK_NOT_UPLOADED_LINE, err=True)
     if result.warning:

@@ -749,11 +749,11 @@ def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     the floor rather than this formula.
 
     Blank-page policy deliberately does not live here. The profile exposes
-    ``enable_empty_page_detection`` along with user-visible mean and stddev
-    thresholds, so a page discarded at this level would be discarded behind the
+    ``enable_empty_page_detection`` along with a user-visible ink-coverage
+    threshold, so a page discarded at this level would be discarded behind the
     user's back and would make that toggle untrue -- which is precisely how
     real pages used to vanish, and what broke manual-duplex parity. Content is
-    judged in exactly one place, ``pipeline._drop_empty_pages``.
+    judged in exactly one place, ``pipeline._drop_blank_pages``.
 
     Args:
         page_image: The acquired page.

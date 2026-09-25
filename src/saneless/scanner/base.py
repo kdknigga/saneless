@@ -277,11 +277,11 @@ class PageRecord:
     while the page was in memory; nothing here is a judgement about what the
     page means. In particular there is deliberately **no** ``is_blank`` field:
     blank-page policy belongs to the pipeline, under the profile's toggle,
-    and ``pipeline._drop_empty_pages`` applies the profile's
-    ``empty_page_mean_threshold`` / ``empty_page_stddev_threshold`` to the
-    ``mean`` and ``stddev`` stored here. A verdict baked in at acquisition
-    would freeze one profile's thresholds into the record and make the toggle
-    a lie.
+    and the pipeline's blank-page filter applies the profile's
+    ``empty_page_coverage_threshold`` to the ``ink_coverage`` and
+    ``paper_white`` stored here. A verdict baked in at acquisition would
+    freeze one profile's threshold into the record and make both the
+    threshold and the toggle a lie.
 
     ``sequence`` is 1-based and is assigned at acquisition, by the sink, in the
     order the device produced the sheets. It is the proof of document order,
@@ -309,8 +309,11 @@ class PageRecord:
             PDF lays the page out at: the document, a mismatch half and a
             preserved partial alike. A fact, like the rest: it is what the
             device said, not what the profile asked for.
-        mean: Greyscale mean luminance, measured once at spool time.
-        stddev: Greyscale standard deviation, measured once at spool time.
+        ink_coverage: The share of the page, inside a thin trimmed margin,
+            that is ink, in percent (0-100), measured once at spool time by
+            ``pages.measure_ink``.
+        paper_white: The paper's grey level (0-255) in the page's darkest
+            channel, measured at the same moment.
 
     """
 
@@ -319,8 +322,8 @@ class PageRecord:
     size: tuple[int, int]
     mode: str
     dpi: int
-    mean: float
-    stddev: float
+    ink_coverage: float
+    paper_white: int
 
 
 class PageSink(ABC):

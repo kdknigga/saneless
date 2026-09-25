@@ -1690,6 +1690,7 @@ class ScanWorker:
                     pages_scanned=result.pages_scanned,
                     pages_removed=result.pages_removed,
                     pages_uploaded=result.pages_uploaded,
+                    removed_positions=result.removed_positions,
                 ),
             ),
         )

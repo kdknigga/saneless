@@ -43,10 +43,8 @@ import shutil
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
-from PIL.ImageStat import Stat
-
 from .exceptions import ScanError, describe
-from .pages import generate_thumbnail
+from .pages import generate_thumbnail, measure_ink
 from .scanner.base import PageRecord, PageSink
 
 if TYPE_CHECKING:
@@ -225,11 +223,14 @@ class SpooledPageSink(PageSink):
         page as it will be written rather than as it arrived.  Then the page
         is written, and then measured.
 
-        The page is measured exactly once, here, while it is already decoded:
-        the greyscale conversion the blank-page thresholds need used to happen
-        again later in ``is_empty_page``, and this one replaces it.  The first
-        page's thumbnail is generated here for the same reason -- reopening a
-        26 MB page afterwards would be a second decode of something that is in
+        The page is measured exactly once, here, while it is already decoded,
+        by ``pages.measure_ink``: its ink coverage and paper white go on the
+        record, and the blank-page filter judges those two numbers later
+        without opening the file again.  No threshold is applied here, because
+        the threshold is the profile's.  The measurement runs on the
+        normalised page, which is the page as written.  The first page's
+        thumbnail is generated here for the same reason -- reopening a 26 MB
+        page afterwards would be a second decode of something that is in
         memory right now.
 
         Args:
@@ -241,8 +242,8 @@ class SpooledPageSink(PageSink):
 
         Returns:
             A PageRecord with the next 1-based sequence, the spooled path, the
-            page's size, its mode as spooled, its dpi, and its greyscale mean
-            and stddev.
+            page's size, its mode as spooled, its dpi, and its ink coverage and
+            paper white.
 
         Raises:
             ScanError: If the page's mode is one the spool refuses, if the page
@@ -258,16 +259,15 @@ class SpooledPageSink(PageSink):
         self._check_room_for(image, sequence, png_path)
         self._write(image, sequence, png_path, dpi)
 
-        grey = image.convert("L")
-        stats = Stat(grey)
+        measurement = measure_ink(image)
         record = PageRecord(
             sequence=sequence,
             path=png_path,
             size=image.size,
             mode=image.mode,
             dpi=dpi,
-            mean=stats.mean[0],
-            stddev=stats.stddev[0],
+            ink_coverage=measurement.coverage,
+            paper_white=measurement.paper_white,
         )
 
         self._records.append(record)
@@ -297,15 +297,15 @@ class SpooledPageSink(PageSink):
                 )
 
         logger.debug(
-            "Spooled page %d to %s (%dx%d %s at %d dpi, mean %.1f, stddev %.1f)",
+            "Spooled page %d to %s (%dx%d %s at %d dpi, ink %r%%, paper white %d)",
             sequence,
             png_path,
             record.size[0],
             record.size[1],
             record.mode,
             record.dpi,
-            record.mean,
-            record.stddev,
+            record.ink_coverage,
+            record.paper_white,
         )
         return record
 

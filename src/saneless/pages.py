@@ -1,17 +1,17 @@
 """
-Page processing utilities: empty page detection and thumbnail generation.
+Page processing utilities: blank-page detection and thumbnail generation.
 
 Measures how much of a page is ink -- the share of the page, inside a thin
 trimmed margin, that is clearly darker than the paper it is printed on -- and
 judges a page blank from that measurement and a per-profile threshold.  Also
-provides the pipeline's current blank-page filter, which judges a page from
-the greyscale statistics its ``PageRecord`` carries rather than from the page
-itself, and generates base64-encoded JPEG thumbnails of scanned pages.
+provides the pipeline's blank-page filter, which judges each page from the
+measurement its ``PageRecord`` carries rather than from the page itself, and
+generates base64-encoded JPEG thumbnails of scanned pages.
 
-Only the thumbnail half still takes an image. The filter half takes records,
-because the measurements it needs were made once already, at spool time, while
-the page was in memory -- reading them off the record is what stops the
-same greyscale conversion being paid a second time per page.
+``measure_ink`` and the thumbnail take an image; the filter takes records,
+because the measurement it needs was made once already, at spool time, while
+the page was in memory -- reading it off the record is what stops the page
+being decoded a second time.
 """
 
 from __future__ import annotations
@@ -34,12 +34,12 @@ __all__ = [
     "INK_DELTA",
     "PAPER_PERCENTILE",
     "PAPER_WHITE_FLOOR",
+    "BlankFilterResult",
     "InkMeasurement",
     "allow_large_scans",
-    "filter_empty_pages",
+    "filter_blank_pages",
     "generate_thumbnail",
     "is_blank",
-    "is_empty_page",
     "measure_ink",
 ]
 
@@ -92,6 +92,22 @@ class InkMeasurement(NamedTuple):
 
     coverage: float
     paper_white: int
+
+
+class BlankFilterResult(NamedTuple):
+    """
+    What the blank-page filter kept, and where the pages it removed were.
+
+    Attributes:
+        kept: The records to assemble, in document order.
+        removed_positions: The 1-based places in the scanned document of the
+            pages removed as blank, in document order.  Empty when nothing
+            was removed.
+
+    """
+
+    kept: list[PageRecord]
+    removed_positions: tuple[int, ...]
 
 
 def _darkest_channel(image: Image.Image) -> Image.Image:
@@ -224,91 +240,70 @@ def allow_large_scans() -> None:
     Image.MAX_IMAGE_PIXELS = 200_000_000
 
 
-def is_empty_page(
-    mean: float,
-    stddev: float,
-    *,
-    mean_threshold: float,
-    stddev_threshold: float,
-) -> bool:
+def filter_blank_pages(
+    pages: Sequence[PageRecord], *, coverage_threshold: float
+) -> BlankFilterResult:
     """
-    Detect whether a scanned page is empty (blank) from its statistics.
+    Remove blank pages from a record sequence, and say where they were.
 
-    Checks if the mean luminance exceeds ``mean_threshold`` AND the
-    standard deviation is below ``stddev_threshold``. Both conditions must
-    be true for the page to be considered empty. The two thresholds, the
-    AND between them and the strictness of both comparisons are exactly as
-    they were; only where the two numbers come from has changed.
+    Each page is judged by ``is_blank`` from the ink coverage and paper white
+    its record carries, measured once when it was spooled; nothing here opens
+    a page file.
 
-    The page itself no longer arrives here. This used to
-    convert the image to greyscale and run Pillow's image-statistics helper
-    over the result -- measured at 6 ms for the conversion and 3 ms for the
-    statistics, plus a
-    full-size intermediate, for every page of every job. The spool already
-    does that work once, while the page is in memory at write time, and
-    carries the answers on the record. Doing it again here was the second of
-    two reads of the same pixels, and it is the one that goes.
-
-    Args:
-        mean: Greyscale mean luminance, as measured when the page was spooled.
-        stddev: Greyscale standard deviation, measured at the same moment.
-        mean_threshold: Pages with mean luminance above this are
-            candidates for empty detection.  The profile supplies it.
-        stddev_threshold: Pages with stddev below this (combined
-            with high mean) are considered empty.  The profile supplies it.
-
-    Returns:
-        True if the page is considered empty, False otherwise.
-
-    """
-    is_blank = mean > mean_threshold and stddev < stddev_threshold
-    logger.debug(
-        "Page stats: mean=%.1f, stddev=%.1f -> %s",
-        mean,
-        stddev,
-        "DISCARD" if is_blank else "KEEP",
-    )
-    return is_blank
-
-
-def filter_empty_pages(
-    pages: Sequence[PageRecord],
-    *,
-    mean_threshold: float,
-    stddev_threshold: float,
-) -> list[PageRecord]:
-    """
-    Remove empty pages from a record sequence, by the dual-threshold rule.
-
-    Records in, records out. The pages are files on the spool by the time this
-    runs, so what gets filtered is the list, never the directory: a discarded
-    page is simply not referenced by the result, and nothing here unlinks it.
+    Records in, records out.  The pages are files on the spool by the time
+    this runs, so what gets filtered is the list, never the directory: a
+    removed page is simply not referenced by the result, and nothing here
+    unlinks it or copies it anywhere.  It goes when the job's workspace does.
     The surviving records keep their relative order, and their ``sequence``
-    values keep the gaps the discards left -- the numbers name the sheet the
-    device fed, not the position in this list.
+    values keep the gaps the removals left -- those numbers name the sheet
+    the device fed within its pass.
+
+    What was removed is reported by **position** instead: the page's 1-based
+    place in ``pages``, which is the scanned document in order -- for manual
+    duplex, the interleaved one.  That is the number the operator reads on
+    every surface and rescans by, and it is the number each log line gives.
+
+    One INFO line is logged per page, whether kept or removed, naming its
+    position, its spooled file, its coverage at full precision, its paper
+    white, the threshold and the verdict, so a page that went missing can be
+    traced from the log alone.
 
     Args:
         pages: The page records to filter, in document order.
-        mean_threshold: Mean luminance threshold for empty detection.
-        stddev_threshold: Stddev threshold for empty detection.
+        coverage_threshold: The most ink, in percent of the trimmed page, a
+            blank page may carry.  The profile supplies it.
 
     Returns:
-        List of non-empty records (may be empty if all pages are blank).
+        The records kept, and the 1-based positions of those removed, in
+        document order.  Both may be empty; ``kept`` is empty when every page
+        was blank.
 
     """
+    total = len(pages)
     kept: list[PageRecord] = []
-    for record in pages:
-        if is_empty_page(
-            record.mean,
-            record.stddev,
-            mean_threshold=mean_threshold,
-            stddev_threshold=stddev_threshold,
-        ):
-            logger.info("Page %d: DISCARD (empty)", record.sequence)
+    removed: list[int] = []
+    for position, record in enumerate(pages, start=1):
+        blank = is_blank(
+            record.ink_coverage,
+            record.paper_white,
+            coverage_threshold=coverage_threshold,
+        )
+        logger.info(
+            "Blank-page check: page %d of %d (%s): ink %r%% of the inset, "
+            "paper white %d, threshold %r%% -> %s",
+            position,
+            total,
+            record.path.name,
+            record.ink_coverage,
+            record.paper_white,
+            coverage_threshold,
+            "REMOVE" if blank else "KEEP",
+        )
+        if blank:
+            removed.append(position)
         else:
-            logger.info("Page %d: KEEP", record.sequence)
             kept.append(record)
-    return kept
+    return BlankFilterResult(kept=kept, removed_positions=tuple(removed))
 
 
 def generate_thumbnail(

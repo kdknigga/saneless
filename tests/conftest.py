@@ -414,7 +414,7 @@ def _inked_page() -> Image.Image:
     Return a 100x100 page with a black square on it.
 
     Inked rather than blank, because a blank page is what
-    ``pipeline._drop_empty_pages`` exists to remove: a stub handing back a
+    ``pipeline._drop_blank_pages`` exists to remove: a stub handing back a
     white rectangle makes every empty-page-detection profile delete the whole
     scan, and the test then fails somewhere that has nothing to do with it.
 

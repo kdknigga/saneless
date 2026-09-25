@@ -502,9 +502,8 @@ def _pages(count: int) -> list[Image.Image]:
     Draw pages with enough ink that the real empty-page filter keeps them.
 
     Empty-page detection is left enabled, as it is by default in production, so
-    the pages have to be genuinely non-blank or ``_drop_empty_pages`` raises
-    "All pages were blank" and every case fails for the wrong
-    reason.
+    the pages have to be genuinely non-blank or ``_drop_blank_pages`` raises
+    ``AllPagesBlankError`` and every case fails for the wrong reason.
 
     Args:
         count: How many pages to produce.
