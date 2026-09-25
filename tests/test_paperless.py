@@ -3756,6 +3756,35 @@ class TestConsumeCopyMode:
         assert stat.S_IMODE((consume_dir / "test.pdf").stat().st_mode) == 0o644
         _assert_no_staging_files(consume_dir)
 
+    def test_consume_copy_is_never_group_writable_while_written(
+        self, sample_pdf: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The staging copy has its final mode before the first byte goes in.
+
+        The consume folder is often shared with a group, so a staging file
+        created with the umask's mode could be written to by others while
+        the scan's bytes were going in.  A umask of 000 makes that visible.
+        """
+        consume_dir = tmp_path / "consume"
+        consume_dir.mkdir()
+        modes: list[int] = []
+        original = shutil.copyfileobj
+
+        def recording(source: BinaryIO, target: BinaryIO) -> None:
+            modes.append(stat.S_IMODE(os.fstat(target.fileno()).st_mode))
+            original(source, target)
+
+        monkeypatch.setattr(shutil, "copyfileobj", recording)
+        old = os.umask(0)
+        try:
+            _deliver_to_consume_dir(sample_pdf, consume_dir)
+        finally:
+            os.umask(old)
+
+        assert modes == [0o644]
+        assert stat.S_IMODE((consume_dir / "test.pdf").stat().st_mode) == 0o644
+
     @pytest.mark.parametrize("code", _REFUSING_ERRNOS)
     def test_consume_mode_refusal_still_delivers_the_file(
         self,

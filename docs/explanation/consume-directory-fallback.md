@@ -49,7 +49,7 @@ volumes:
 
 ### Who can read the copy
 
-saneless writes the copy with mode `0644`, whatever its umask, so paperless-ngx can read it whichever user it runs as. The mode is set on the hidden staging file before the rename, so the PDF never appears under its final name with any other mode. On a filesystem that has no Unix modes, such as some CIFS, vfat or FUSE mounts, the mode is left as it is and the copy is still delivered.
+saneless writes the copy with mode `0644`, whatever its umask, so paperless-ngx can read it whichever user it runs as. The hidden staging file is created readable and writable only by saneless, and gets `0644` before the first byte of the PDF is written, so nobody else can write to it at any point and the PDF never appears under its final name with any other mode. On a filesystem that has no Unix modes, such as some CIFS, vfat or FUSE mounts, the mode is left as it is and the copy is still delivered.
 
 The consume folder's own directory mode decides who can reach the file, so restrict the folder rather than the file. For example, make it group-owned by a group that both saneless's user and paperless-ngx's user belong to, and give it mode `0770`:
 

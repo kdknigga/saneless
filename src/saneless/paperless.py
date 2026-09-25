@@ -1179,15 +1179,22 @@ class PaperlessClient:
         """
         staged = dest_dir / f".{pdf_path.name}.part"
         try:
-            with staged.open("wb") as staged_file, pdf_path.open("rb") as source:
-                shutil.copyfileobj(source, staged_file)
+            # Created owner-only, so under no umask can anyone else write to
+            # it, even for an instant: the consume folder is often shared
+            # with a group.
+            descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with (
+                os.fdopen(descriptor, "wb") as staged_file,
+                pdf_path.open("rb") as source,
+            ):
                 # 0644 so paperless-ngx can read the copy whatever UID it runs
                 # as; the consume folder's own mode decides who can reach it.
                 # A chmod is not subject to the umask, and it is applied
-                # before the rename so the final name never exists with any
-                # other mode. A filesystem without Unix modes refuses it, and
-                # that must not fail a handoff that would otherwise save the
-                # scan.
+                # before the first byte is written, so the document is never
+                # in a file with any other mode, and never under its final
+                # name with one. A filesystem without Unix modes refuses it,
+                # and that must not fail a handoff that would otherwise save
+                # the scan.
                 try:
                     os.fchmod(staged_file.fileno(), 0o644)
                 except OSError as exc:
@@ -1196,6 +1203,7 @@ class PaperlessClient:
                     logger.debug(
                         "Not setting the consume copy's mode: %s", exc.strerror
                     )
+                shutil.copyfileobj(source, staged_file)
                 staged_file.flush()
                 os.fsync(staged_file.fileno())
             staged.replace(dest)
