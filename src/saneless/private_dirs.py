@@ -8,6 +8,13 @@ there could then be read or replaced. A missing directory is therefore
 created owner-only, and an existing one is trusted only after ``lstat`` shows
 a real directory this process owns that nobody else can write to.
 
+Only the directory itself is checked, not its parent. That is enough when
+the parent is not writable by other users, or is sticky as ``/tmp`` is: then
+nobody else can rename the checked directory away and put a symlink in its
+place. A directory inside a parent that others can write to and that is not
+sticky can be swapped that way after the check, so ``tmp_dir`` must not be
+placed in one.
+
 The default scratch directory is named with ``os.getuid()``, the real user,
 while ownership is compared with ``os.geteuid()``, the identity that creates
 files. The two are equal in every supported deployment.
@@ -79,6 +86,9 @@ def check_private_dir(path: Path, *, key: str) -> None:
     another user, and one with group- or world-write. Group- or world-*read*
     is accepted, because every workspace created inside is itself 0700.
     Nothing is created or changed.
+
+    The parent is not checked; the module docstring says why a parent that
+    others can write to, and that is not sticky, must not hold ``path``.
 
     Args:
         path: The directory to check.
