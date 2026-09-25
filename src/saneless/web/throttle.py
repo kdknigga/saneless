@@ -162,6 +162,9 @@ class SingleFlightResult[T]:
     Only before any result exists does a follower wait, because it has
     nothing else to say.  That is once per process, and the wait is bounded
     by ``wait_bound``: a follower that outlasts it gets a ``TimeoutError``.
+    At most ``max_waiters`` followers wait at a time, and one more gets the
+    ``TimeoutError`` at once, so a burst of callers straight after a restart
+    cannot hold the thread pool for the length of the bound either.
 
     ``compute`` must not raise: an outcome worth sharing, failure included, is
     a value.  If it raises regardless, nothing is stored, the exception
@@ -171,6 +174,8 @@ class SingleFlightResult[T]:
         ttl: How many seconds a stored result is reused for.
         wait_bound: How many seconds a follower with no result to fall back
             on waits for the leader before giving up.
+        max_waiters: How many followers with no result to fall back on may
+            wait at once.
         clock: The monotonic source the TTL is measured with.
 
     """
@@ -180,18 +185,22 @@ class SingleFlightResult[T]:
         *,
         ttl: float,
         wait_bound: float,
+        max_waiters: int = 2,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        """Initialize an empty holder with the given TTL, wait bound and clock."""
+        """Initialize an empty holder with the given TTL, bounds and clock."""
         self._ttl = ttl
         self._wait_bound = wait_bound
+        self._max_waiters = max_waiters
         self._clock = clock
         # Held by the leader for the length of one compute, and by nobody
         # else.  Never taken while _state_lock is held.
         self._flight = threading.Lock()
-        # Guards every read and every rebind of self._last, and nothing else;
-        # never a compute.
+        # Guards every read and every rebind of self._last and of
+        # self._waiters, and nothing else; never a compute.
         self._state_lock = threading.Lock()
+        # How many followers are waiting for a leader right now.
+        self._waiters = 0
         # The last result and the monotonic reading it was stored at, as one
         # tuple rebound whole, so a reader never pairs a value with another
         # value's stamp.
@@ -209,8 +218,9 @@ class SingleFlightResult[T]:
             result as leader, or the previous result while a leader computes.
 
         Raises:
-            TimeoutError: If no result exists yet and the in-flight leader did
-                not finish within the wait bound.
+            TimeoutError: If no result exists yet and either the in-flight
+                leader did not finish within the wait bound or as many
+                followers as may wait already are.
 
         """
         last = self._fresh()
@@ -221,7 +231,7 @@ class SingleFlightResult[T]:
         previous = self._read()
         if previous is not None:
             return previous[0]
-        if not self._flight.acquire(timeout=self._wait_bound):
+        if not self._wait_for_leader():
             msg = "the in-flight computation did not finish within the wait bound"
             raise TimeoutError(msg)
         # The leader this follower waited on has stored its result, unless it
@@ -231,6 +241,28 @@ class SingleFlightResult[T]:
             self._flight.release()
             return waited_for[0]
         return self._lead(compute)
+
+    def _wait_for_leader(self) -> bool:
+        """
+        Wait, bounded, for the flight lock, unless enough followers already do.
+
+        Returns:
+            Whether the flight lock was acquired.
+
+        Raises:
+            TimeoutError: If ``max_waiters`` followers are already waiting.
+
+        """
+        with self._state_lock:
+            if self._waiters >= self._max_waiters:
+                msg = "too many callers are already waiting for the computation"
+                raise TimeoutError(msg)
+            self._waiters += 1
+        try:
+            return self._flight.acquire(timeout=self._wait_bound)
+        finally:
+            with self._state_lock:
+                self._waiters -= 1
 
     def _lead(self, compute: Callable[[], T]) -> T:
         """

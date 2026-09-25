@@ -299,6 +299,41 @@ class TestSingleFlightResult:
         assert leader.calls == 1
         assert follower.calls == 0
 
+    def test_only_two_followers_with_no_result_wait(self) -> None:
+        """
+        A third caller before any result exists is refused at once.
+
+        Each waiting follower holds one of anyio's 40 worker threads for up to
+        the wait bound, so a burst of callers straight after a restart,
+        against an unreachable paperless, would otherwise hold the whole pool
+        and stall every other route.  The wait bound here is far longer than
+        the test watches, so only the cap can answer the third caller in time.
+        """
+        flight = self._flight(_FakeClock(), wait_bound=30.0)
+        leader = _Gate("connected")
+        third = _Counter("never")
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            leading = pool.submit(flight.get, leader)
+            try:
+                assert leader.entered.wait(_EVENT_TIMEOUT_SECONDS)
+                waiting = [pool.submit(flight.get, _Counter("never")) for _ in "ab"]
+                for follower in waiting:
+                    with pytest.raises(FutureTimeout):
+                        follower.result(timeout=_STILL_BLOCKED_SECONDS)
+                refused = pool.submit(flight.get, third)
+                error = refused.exception(timeout=_EVENT_TIMEOUT_SECONDS)
+                assert isinstance(error, TimeoutError), error
+                assert not leader.release.is_set()
+            finally:
+                leader.release.set()
+            assert leading.result(timeout=_EVENT_TIMEOUT_SECONDS) == "connected"
+            for follower in waiting:
+                assert follower.result(timeout=_EVENT_TIMEOUT_SECONDS) == "connected"
+
+        assert third.calls == 0
+        assert flight.get(_Counter("never")) == "connected"
+
     def test_a_follower_gives_up_after_the_wait_bound(self) -> None:
         """A leader slower than the wait bound leaves its follower a TimeoutError."""
         flight = self._flight(_FakeClock(), wait_bound=0.05)

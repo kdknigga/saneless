@@ -1146,8 +1146,9 @@ def paperless_test(request: Request) -> JSONResponse:
     in flight a caller with a previous answer gets that answer at once rather
     than holding a worker thread behind it -- against an unreachable
     paperless-ngx the probe takes the client's full timeout.  Only the very
-    first callers, before any answer exists, wait for the probe, and a wait
-    that outlasts its bound answers the usual 502 naming ``TimeoutError``.
+    first callers, before any answer exists, wait for the probe, two at most
+    at a time; a wait that outlasts its bound, and a caller refused a place
+    to wait, answers the usual 502 naming ``TimeoutError``.
     """
     state = request.app.state
 

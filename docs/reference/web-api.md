@@ -77,8 +77,9 @@ that ran the test, the `502` included, so calling the endpoint in a loop sends a
 request to paperless-ngx every 2 seconds. While a test is running, a caller that has a
 previous result to fall back on gets that result at once instead of waiting -- against an
 unreachable paperless-ngx a test can take the client's full 30-second timeout. Only the
-first callers after start-up, before any result exists, wait for the running test; one
-that waits longer than 35 seconds is answered `502` with `"detail": "TimeoutError"`.
+first callers after start-up, before any result exists, wait for the running test, and
+no more than two of them at a time. One that waits longer than 35 seconds, or that arrives
+while two others are already waiting, is answered `502` with `"detail": "TimeoutError"`.
 
 ---
 
