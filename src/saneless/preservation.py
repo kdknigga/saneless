@@ -61,8 +61,10 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# What a preserved artefact's title says it is, appended to the operator's own
-# title before ``build_pdf_filename`` sanitises the whole thing.  The bracketed
+# What a preserved artefact's title says it is.  It is appended to the
+# operator's own title for the PDF's /Title, and passed to
+# ``build_pdf_filename`` as its ``part`` segment, placed after the title slug
+# where the slug's length cap cannot cut it off.  The bracketed
 # spelling is the one the duplex-mismatch delivery already uses, and the two
 # paths have to agree: an operator looking in ``failed/`` should not have to
 # learn that a pass-B failure and a page-count mismatch name their halves
@@ -308,8 +310,9 @@ def move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> No
         target = destination / page_file.name
         # Owner-only before the move, not after. The source sits in the 0700
         # workspace, so nobody else can open it in the meantime; a
-        # same-filesystem move is a rename, which keeps the mode, and a
-        # cross-filesystem one copies into a file created 0600.
+        # same-filesystem move is a hard link and an unlink, which keeps the
+        # mode, and a cross-filesystem one copies into a file created 0600
+        # with O_EXCL.  Neither ever replaces a file already there.
         best_effort_chmod(page_file, _PRIVATE_FILE_MODE)
         move_private(page_file, target)
         moved.append(target)

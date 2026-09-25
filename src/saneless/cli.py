@@ -1082,10 +1082,12 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             # one, every CLI run composed {timestamp}-{title-slug}.pdf and
             # rested on the timestamp alone -- while build_pdf_filename's whole
             # collision argument is "uniqueness comes from the job id".  That is
-            # not cosmetic: preservation moves onto an explicit destination
-            # path, which overwrites silently, so two same-second scans of the
-            # same title would have destroyed one of them in failed/. Four kinds
-            # of artefact land there, and every mid-scan fault can reach it.
+            # not cosmetic: preservation never replaces a file in failed/, so
+            # two same-second scans of the same title would share a name there,
+            # leaving the later PDF under a numbered name that no longer says
+            # which scan it was, and refusing the later page files outright.
+            # Four kinds of artefact land there, and every mid-scan fault can
+            # reach it.
             job_id=str(uuid4()),
             tags=settings.profiles[profile].default_tags or None,
             correspondent=settings.profiles[profile].default_correspondent,

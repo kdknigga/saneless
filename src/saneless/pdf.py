@@ -135,9 +135,11 @@ def build_pdf_filename(job_id: str, title: str, *, part: str = "") -> str:
     a uuid4 -- ``job.id`` from the worker, and one minted per run by ``saneless
     scan``; the timestamp is only there to make a directory listing sort
     usefully. Two jobs submitted in the same second with the same title would
-    collide on the timestamp alone, and a collision is not cosmetic here:
-    ``shutil.move`` onto an explicit destination path overwrites silently, so
-    two same-named PDFs preserved into ``failed/`` would destroy one scan.
+    collide on the timestamp alone, and a collision is not free: preservation
+    never replaces a file in ``failed/`` -- its move links, or copies with
+    ``O_EXCL``, and refuses an existing name -- so a clash leaves the later
+    PDF under a numbered name (``-2``, ``-3``) that no longer says which job
+    it was, and refuses a later page file outright.
 
     Only the first ``_JOB_ID_LENGTH`` characters of the id are used, so two
     uuid4s that agree on that prefix, in the same second, under the same title,
