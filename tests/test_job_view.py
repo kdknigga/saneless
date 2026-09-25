@@ -13,10 +13,9 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
 import pytest
-from saneless.web.job_view import JobView, build_job_view, owns_detail
 
 from saneless.config import OutputConfig, PaperlessConfig
 from saneless.job import Job, JobStore
@@ -33,6 +32,7 @@ from saneless.vocabulary import (
     job_label,
     page_counts,
 )
+from saneless.web.job_view import JobView, build_job_view, owns_detail
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -91,7 +91,18 @@ def settings(make_settings: Callable[..., Settings], tmp_path: Path) -> Settings
     )
 
 
-def _job(**overrides: object) -> Job:
+class _JobOverrides(TypedDict, total=False):
+    """The job fields a test here changes from ``_job``'s defaults."""
+
+    state: JobState
+    error: str | None
+    error_category: ErrorCategory | None
+    outcome: ScanOutcome | None
+    warning: str | None
+    owner_token: str | None
+
+
+def _job(**overrides: Unpack[_JobOverrides]) -> Job:
     """Build a finished job with a title, a thumbnail, counts and an owner."""
     job = Job(
         id="job-1",
@@ -100,7 +111,7 @@ def _job(**overrides: object) -> Job:
         state=JobState.DONE,
         created_at=datetime(2026, 3, 1, 9, 30, tzinfo=UTC),
         thumbnail="aGVsbG8=",
-        outcome=ScanOutcome.DONE,
+        outcome=ScanOutcome.SUCCESS,
         pages_scanned=4,
         pages_removed=1,
         pages_uploaded=3,
