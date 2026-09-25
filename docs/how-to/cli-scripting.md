@@ -100,7 +100,8 @@ saneless jobs --json --limit 5
     "state": "DONE",
     "created_at": "2026-03-22T14:30:00+00:00",
     "outcome": "SUCCESS",
-    "warning": null
+    "warning": null,
+    "error": null
   }
 ]
 ```
@@ -123,6 +124,13 @@ correspondent were not applied. A job whose `state` is `DONE` and whose
 `warning` is set was uploaded with a warning -- a sheet the scanner skipped, or
 a manual duplex scan uploaded as two documents -- and the table view labels it
 "Uploaded with a warning" rather than "Complete".
+
+`error` holds the full stored text of what stopped a job -- a failure, a
+refused submit or a cancellation -- or `null`. It includes any file path on the
+server and the paperless-ngx URL. The web page shows the same failure only as a sentence with
+no paths in it, which points here: `saneless jobs --json` is where to find
+where a failed scan's PDF was kept. `error` was added after the other keys, so
+a script that reads only those is unaffected.
 
 ## Exit codes
 

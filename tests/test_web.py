@@ -1055,15 +1055,19 @@ _OWNER_COOKIE = "saneless_owner"
 # suite can see the entropy behind the value it is handed.
 _MINIMUM_OWNER_COOKIE_LENGTH = 43
 
+# The owner cookie's lifetime, spelled out for the same reason as its name: a
+# year in seconds, so a browser keeps its ownership across restarts.
+_OWNER_COOKIE_MAX_AGE_ATTRIBUTE = "max-age=31536000"
+
 
 def _owner_set_cookie(response: httpx2.Response) -> str | None:
     """
     Return the raw ``Set-Cookie`` header carrying the owner token, if any.
 
     The raw header is parsed instead of the client's cookie jar because the jar
-    normalises away exactly what D-23 pins: an absent ``Max-Age`` and an absent
+    normalises away exactly what D-06 pins: the ``Max-Age`` value and an absent
     ``Secure`` are both invisible once httpx2 has turned the header into a jar
-    entry, so a jar assertion could not tell a session cookie from a persistent
+    entry, so a jar assertion could not tell a year-long cookie from a session
     one.
 
     Args:
@@ -1077,6 +1081,20 @@ def _owner_set_cookie(response: httpx2.Response) -> str | None:
         if header.startswith(f"{_OWNER_COOKIE}="):
             return header
     return None
+
+
+def _owner_cookie_value(header: str) -> str:
+    """
+    Return the token a raw owner ``Set-Cookie`` header carries.
+
+    Args:
+        header: A header line returned by ``_owner_set_cookie``.
+
+    Returns:
+        The value between the cookie's name and its first attribute.
+
+    """
+    return header.split(";", 1)[0].removeprefix(f"{_OWNER_COOKIE}=")
 
 
 def _newest_job(client: TestClient) -> Job:
@@ -1169,14 +1187,15 @@ class TestOwnerCookie:
     """
     The owner token's mint, its reuse, and the gate it puts on a flip answer.
 
-    Covers APPL-09 and decisions D-23 (a session cookie, one per browser) and
-    D-24 (the token gates the two flip buttons and nothing else).
+    Covers APPL-09 and decisions D-23 (one token per browser), D-24 (the token
+    gates the two flip buttons) and D-06 (the cookie lives a year, so ownership
+    survives a browser restart).
     """
 
-    def test_owner_cookie_is_httponly_lax_and_session_only(
+    def test_owner_cookie_is_httponly_lax_and_lives_a_year(
         self, accepting_client: TestClient
     ) -> None:
-        """The first submit mints D-23's exact attribute set, and nothing else."""
+        """The first submit mints D-06's exact attribute set, and nothing else."""
         response = accepting_client.post(
             "/api/scan", data={"profile": "duplex", "title": "First Scan"}
         )
@@ -1187,12 +1206,11 @@ class TestOwnerCookie:
         assert "httponly" in attributes
         assert "samesite=lax" in attributes
         assert "path=/" in attributes
-        # A session cookie dies with the browser, so neither lifetime attribute
-        # may appear.  Secure is deliberately absent too: the appliance is
-        # served over plain HTTP on a LAN, and Secure would silently disable
-        # the cookie rather than harden it.
-        assert "max-age" not in attributes
-        assert "expires" not in attributes
+        # A year-long lifetime, so a browser still sees its own scans after it
+        # restarts.  Secure is deliberately absent: the appliance is served
+        # over plain HTTP on a LAN, and Secure would silently disable the
+        # cookie rather than harden it.
+        assert _OWNER_COOKIE_MAX_AGE_ATTRIBUTE in attributes
         assert "secure" not in attributes
 
     def test_owner_cookie_value_is_recorded_on_the_job(
@@ -1208,10 +1226,15 @@ class TestOwnerCookie:
             == accepting_client.cookies[_OWNER_COOKIE]
         )
 
-    def test_owner_cookie_is_minted_once_per_browser(
+    def test_owner_cookie_is_minted_once_and_re_set_on_every_submit(
         self, accepting_client: TestClient
     ) -> None:
-        """A second submit from the same browser mints nothing (D-23)."""
+        """
+        A second submit re-sets the same token with the year-long lifetime.
+
+        The mint rule still holds -- one value per browser (D-23) -- but every
+        accepted submit sends it back, so the lifetime is renewed each time.
+        """
         first = accepting_client.post(
             "/api/scan", data={"profile": "duplex", "title": "One"}
         )
@@ -1219,8 +1242,35 @@ class TestOwnerCookie:
             "/api/scan", data={"profile": "duplex", "title": "Two"}
         )
 
-        assert _owner_set_cookie(first) is not None
-        assert _owner_set_cookie(second) is None
+        first_header = _owner_set_cookie(first)
+        second_header = _owner_set_cookie(second)
+        assert first_header is not None
+        assert second_header is not None
+        assert _owner_cookie_value(second_header) == _owner_cookie_value(first_header)
+        assert _OWNER_COOKIE_MAX_AGE_ATTRIBUTE in second_header.lower()
+
+    def test_owner_cookie_from_an_older_release_gains_the_lifetime(
+        self, accepting_client: TestClient
+    ) -> None:
+        """
+        A token the browser already holds comes back unchanged, now with Max-Age.
+
+        A browser upgraded from a release that set a session cookie presents
+        that token on its next submit; it keeps its ownership and the cookie
+        becomes persistent.
+        """
+        held = "a-token-set-by-an-older-release"
+        accepting_client.cookies.set(_OWNER_COOKIE, held)
+
+        response = accepting_client.post(
+            "/api/scan", data={"profile": "duplex", "title": "Upgraded"}
+        )
+
+        header = _owner_set_cookie(response)
+        assert header is not None
+        assert _owner_cookie_value(header) == held
+        assert _OWNER_COOKIE_MAX_AGE_ATTRIBUTE in header.lower()
+        assert _newest_job(accepting_client).owner_token == held
 
     def test_owner_cookie_reuse_records_the_same_value_on_a_second_job(
         self, accepting_client: TestClient
@@ -1259,7 +1309,7 @@ class TestOwnerCookie:
         assert header is not None
         # The value is read out of the header rather than the jar: the jar now
         # holds the blank cookie this test planted as well as the minted one.
-        minted = header.split(";", 1)[0].removeprefix(f"{_OWNER_COOKIE}=")
+        minted = _owner_cookie_value(header)
         assert minted.strip() != ""
         assert _newest_job(accepting_client).owner_token == minted
 

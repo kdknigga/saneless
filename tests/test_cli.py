@@ -2437,6 +2437,79 @@ class TestJobsCommand:
         data = json.loads(result.output)
         assert data == []
 
+    def test_jobs_json_error_carries_the_full_stored_text(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        ``--json`` adds the stored error verbatim, host path included (D-15).
+
+        The web page shows a failure only as a path-free sentence pointing
+        here, so this output is where the full text lives. The field is
+        additive: every key a script already reads is still present.
+        """
+        settings = self._settings_for(tmp_path)
+        stored = "kept at /x/failed/a.pdf"
+        store = JobStore(db_path=settings.output.db_path)
+        job = store.create_job(profile="default", title="Failed Doc")
+        store.update_state(job.id, JobState.ERROR, error=stored)
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        assert row["error"] == stored
+        assert {
+            "id",
+            "profile",
+            "title",
+            "state",
+            "created_at",
+            "outcome",
+            "warning",
+        } <= row.keys()
+        assert row["state"] == "ERROR"
+
+    def test_jobs_json_error_is_null_for_a_job_without_one(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A job that never failed carries ``"error": null``, not a missing key."""
+        settings = self._settings_for(tmp_path)
+        self._populate_store(settings.output.db_path, count=1)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        assert "error" in row
+        assert row["error"] is None
+
+    def test_jobs_data_dir_is_created_private(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A missing data_dir is created 0700 even under the common umask 022."""
+        data_dir = tmp_path / "data"
+        settings = _make_settings(
+            tmp_path,
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(data_dir),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        previous = os.umask(0o022)
+        try:
+            result = runner.invoke(cli, ["jobs"])
+        finally:
+            os.umask(previous)
+
+        assert result.exit_code == 0, result.output
+        assert (data_dir.stat().st_mode & 0o777) == 0o700
+
 
 _UVICORN_LOGGERS = ("uvicorn.error", "uvicorn.access", "uvicorn.asgi")
 
