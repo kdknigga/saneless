@@ -51,6 +51,7 @@ from saneless.text_safety import neutralise_bounded
 from saneless.vocabulary import RequestRejection, rejection_status_code
 
 from .errors import TechnicalDetails, render_error
+from .throttle import MinimumInterval
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -66,6 +67,15 @@ DEFAULT_TRUSTED_SUFFIXES: Final = (".local", ".home.arpa", ".internal", ".lan")
 
 ECHOED_HOST_MAX_LENGTH: Final = 255
 """The most characters of a refused Host the error body and log line repeat."""
+
+REPLACED_HOST_REPORT_SECONDS = 3600.0
+"""
+The shortest gap between two reports of a proxy that seems to replace Host.
+
+Limited per interval rather than once per process: any client that can reach
+the port can send a made-up ``X-Forwarded-Host``, and a once-only report it
+spent would hide a real misconfigured proxy added later until a restart.
+"""
 
 # A host name (letters, digits, dots, hyphens and the underscore Docker
 # Compose service names may carry), or an IPv6 literal in brackets, then an
@@ -240,7 +250,8 @@ class HostGuard:
         """
         self.app = app
         self.allowed_hosts = tuple(allowed_hosts)
-        self._reported_replaced_host = False
+        # Held shut for REPLACED_HOST_REPORT_SECONDS after each report.
+        self._replaced_host_report = MinimumInterval()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """
@@ -261,7 +272,7 @@ class HostGuard:
                 if key.lower() == _HOST_HEADER
             ]
             verdict = host_verdict(values, self.allowed_hosts)
-            if verdict is HostVerdict.TRUSTED and not self._reported_replaced_host:
+            if verdict is HostVerdict.TRUSTED:
                 self._report_replaced_host(scope, values[0])
             if verdict is not HostVerdict.TRUSTED:
                 request = Request(scope)
@@ -283,10 +294,12 @@ class HostGuard:
 
     def _report_replaced_host(self, scope: Scope, host: str) -> None:
         """
-        Log one WARNING the first time a proxy is seen replacing ``Host``.
+        Log a WARNING when a request looks as if a proxy replaced ``Host``.
 
-        Once per guard, so a misconfigured proxy costs one log line rather
-        than one per request.  The request itself is not affected.
+        At most once per ``REPLACED_HOST_REPORT_SECONDS``, so a misconfigured
+        proxy costs one log line an hour rather than one per request.  The
+        line is worded as an observation, because any client can send the
+        header that triggers it.  The request itself is not affected.
 
         Args:
             scope: The ASGI connection scope of a request with a trusted Host.
@@ -301,13 +314,14 @@ class HostGuard:
         forwarded_host = _replaced_host(host, forwarded)
         if forwarded_host is None:
             return
-        self._reported_replaced_host = True
+        if self._replaced_host_report.claim(REPLACED_HOST_REPORT_SECONDS) is None:
+            return
         logger.warning(
-            "A request arrived with Host %r and X-Forwarded-Host %r: a reverse "
-            "proxy is replacing the Host the browser sent, so the Host check "
-            "cannot refuse DNS rebinding through it. Have the proxy pass the "
-            "original Host header, and list its public name in [web] allowed_hosts. "
-            "This is logged once.",
+            "A request arrived with Host %r and X-Forwarded-Host %r. If saneless "
+            "is behind a reverse proxy, it is replacing the Host the browser "
+            "sent, so the Host check cannot refuse DNS rebinding through it: "
+            "have the proxy pass the original Host header, and list its public "
+            "name in [web] allowed_hosts. This is logged at most once an hour.",
             neutralise_bounded(host, ECHOED_HOST_MAX_LENGTH),
             neutralise_bounded(forwarded_host, ECHOED_HOST_MAX_LENGTH),
         )

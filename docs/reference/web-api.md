@@ -377,7 +377,7 @@ The port is ignored, case does not matter, and one trailing dot is dropped. To r
 
 Only `Host` decides. `X-Forwarded-Host` is never trusted, so a trusted value there does not rescue a request whose `Host` is refused.
 
-A reverse proxy must therefore pass the browser's original `Host`. One that replaces it with its upstream's name, such as `saneless:8080`, sends a name saneless always answers to, which turns the Host check off for every request through the proxy. saneless answers those requests as usual, but the first time a trusted `Host` arrives beside an `X-Forwarded-Host` naming a different host, it logs one warning naming both.
+A reverse proxy must therefore pass the browser's original `Host`. One that replaces it with its upstream's name, such as `saneless:8080`, sends a name saneless always answers to, which turns the Host check off for every request through the proxy. saneless answers those requests as usual, but when a trusted `Host` arrives beside an `X-Forwarded-Host` naming a different host, it logs a warning naming both, at most once an hour. Any client can send that pair of headers, so the warning describes what arrived rather than asserting that a proxy exists.
 
 A request whose `Host` is a well-formed name that saneless does not answer to gets `421` with the `HOST_NOT_ALLOWED` sentence and the refused `Host` beside it (see [Errors](#errors)). The server logs one warning per refusal naming the `Host`, the method and the path. A request with no `Host`, an empty one, two of them, or one that is not a valid host name gets `400` with the `CLIENT_ERROR` sentence.
 

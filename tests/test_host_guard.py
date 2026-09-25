@@ -29,6 +29,7 @@ from starlette.requests import Request
 from saneless.config import ProfileConfig, Settings, WebConfig
 from saneless.text_safety import has_control_characters
 from saneless.vocabulary import RequestRejection, rejection_message
+from saneless.web import host_guard as host_guard_module
 from saneless.web.app import create_app
 from saneless.web.errors import TechnicalDetails, render_error
 from saneless.web.host_guard import (
@@ -254,6 +255,9 @@ def test_a_proxy_that_rewrites_host_is_logged_once(
     """
     A trusted Host beside an X-Forwarded-Host naming another host warns once.
 
+    Once within the report interval, that is: two requests in a row log one
+    line between them.
+
     nginx without ``proxy_set_header Host`` sends its upstream's name, a
     single label saneless always answers to, and puts the browser's name in
     X-Forwarded-Host.  Every request through it passes the Host check, so the
@@ -273,6 +277,40 @@ def test_a_proxy_that_rewrites_host_is_logged_once(
     assert f"{PROXY_UPSTREAM_HOST!r}" in message
     assert f"{PUBLIC_NAME!r}" in message
     assert "original Host" in message
+
+
+def test_the_proxy_report_is_made_again_after_its_interval(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The report is limited per interval, not per process.
+
+    Any client that can reach the port can send a made-up X-Forwarded-Host
+    and spend a once-only report, and a real misconfigured proxy added later
+    would then never be reported until a restart.  With the interval at
+    zero, every such request is reported.
+    """
+    monkeypatch.setattr(
+        host_guard_module, "REPLACED_HOST_REPORT_SECONDS", 0.0, raising=False
+    )
+    headers = {"Host": PROXY_UPSTREAM_HOST, "X-Forwarded-Host": PUBLIC_NAME}
+    with caplog.at_level(logging.WARNING, logger=GUARD_LOGGER):
+        client.get("/health", headers=headers)
+        client.get("/health", headers=headers)
+    assert len(_rewrite_warnings(caplog)) == 2
+
+
+def test_the_proxy_report_is_worded_as_an_observation(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The report says what arrived and what it means only if there is a proxy."""
+    headers = {"Host": PROXY_UPSTREAM_HOST, "X-Forwarded-Host": PUBLIC_NAME}
+    with caplog.at_level(logging.WARNING, logger=GUARD_LOGGER):
+        client.get("/health", headers=headers)
+    [record] = _rewrite_warnings(caplog)
+    assert "If saneless is behind a reverse proxy" in record.getMessage()
 
 
 @pytest.mark.parametrize(
