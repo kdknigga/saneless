@@ -244,6 +244,33 @@ class TestJobWorkspaceLock:
         assert not path.exists()
         assert [r.levelno for r in caplog.records] == [logging.WARNING]
 
+    def test_an_unlocked_workspace_is_never_offered_to_a_sweep(
+        self, scratch: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A sweeper whose own lock works must still not take an unlocked scan.
+
+        The owner's flock failed, but locks may work again for a later sweep,
+        or on another mount of the same share: the lock would then be free and
+        prove nothing.  So the workspace is not published under ``job-``.
+        """
+        real_flock = workspace_mod.fcntl.flock
+
+        def no_locks(fd: int, operation: int) -> None:
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+        monkeypatch.setattr(workspace_mod.fcntl, "flock", no_locks)
+        workspace = JobWorkspace(
+            scratch, job_id=_JOB_ID, title=_TITLE, profile=_PROFILE
+        )
+        with workspace as path:
+            monkeypatch.setattr(workspace_mod.fcntl, "flock", real_flock)
+            assert path.name.startswith("unlocked-3f9c2a71-"), path.name
+            assert find_orphans(scratch) == []
+            assert sweep_orphans(scratch, scratch.parent / "failed", 0) == []
+            assert workspace.keep() is False
+        assert path.exists()
+
 
 class TestJobWorkspaceCleanup:
     """Leaving the block removes the workspace, whatever the reason."""

@@ -99,6 +99,12 @@ RECOVERED_TITLE: Final = "Recovered scan"
 
 _STAGING_PREFIX: Final = ".new-"
 
+# The name prefix of a workspace whose lock could not be taken.  Never
+# ``job-``: nothing would prove its owner alive, so a sweeper whose own lock
+# attempt succeeded -- a lock manager that recovered, another mount of the same
+# share -- would take a live scan.
+_UNLOCKED_PREFIX: Final = "unlocked-"
+
 # The same truncation build_pdf_filename applies to the job id, so a
 # workspace and the PDF it becomes share their job segment.
 _JOB_SEGMENT_LENGTH: Final = 8
@@ -226,6 +232,7 @@ class JobWorkspace:
         self._path: Path | None = None
         self._fd: int | None = None
         self._keep = False
+        self._locked = False
 
     @property
     def path(self) -> Path:
@@ -251,9 +258,10 @@ class JobWorkspace:
         rename because it belongs to the open lock file, not to a path.
 
         If ``flock`` is not supported (for example ENOLCK on some network
-        filesystems) the workspace is used unlocked, with a WARNING. A sweeper
-        that cannot take the lock treats the workspace as live, so nothing
-        live is ever touched; the cost is that such a workspace is never
+        filesystems) the workspace is used unlocked, with a WARNING, and is
+        published as ``unlocked-*`` rather than ``job-*``. No sweep looks at
+        that name, so a sweeper whose own lock attempt does succeed can never
+        take the live scan inside; the cost is that such a workspace is never
         recovered.
 
         Returns:
@@ -268,10 +276,10 @@ class JobWorkspace:
             msg = "The job workspace is already in use"
             raise RuntimeError(msg)
         staging = Path(tempfile.mkdtemp(prefix=_STAGING_PREFIX, dir=self._tmp_dir))
-        final = self._tmp_dir / (
-            f"{WORKSPACE_PREFIX}{_job_segment(self._job_id)}-"
-            f"{staging.name.removeprefix(_STAGING_PREFIX)}"
+        suffix = (
+            f"{_job_segment(self._job_id)}-{staging.name.removeprefix(_STAGING_PREFIX)}"
         )
+        final = self._tmp_dir / f"{WORKSPACE_PREFIX}{suffix}"
         published = False
         try:
             self._fd = os.open(
@@ -279,7 +287,9 @@ class JobWorkspace:
                 os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
                 _PRIVATE_FILE_MODE,
             )
-            self._lock(self._fd, staging)
+            self._locked = self._lock(self._fd, staging)
+            if not self._locked:
+                final = self._tmp_dir / f"{_UNLOCKED_PREFIX}{suffix}"
             _write_metadata(
                 staging,
                 {
@@ -299,7 +309,7 @@ class JobWorkspace:
         self._path = final
         return final
 
-    def keep(self) -> None:
+    def keep(self) -> bool:
         """
         Leave the workspace in place when the block ends, for the next sweep.
 
@@ -307,9 +317,16 @@ class JobWorkspace:
         pages still in the spool are then the only copy, and removing them
         would lose them.  The lock is still released on the way out, so the
         next sweep -- when ``serve`` starts, or before a ``saneless scan`` --
-        finds the workspace's owner gone and recovers it.
+        finds the workspace's owner gone and recovers it.  An ``unlocked-*``
+        workspace is left in place too, but no sweep ever looks at it.
+
+        Returns:
+            Whether the next sweep will recover the workspace: False for one
+            used unlocked.
+
         """
         self._keep = True
+        return self._locked
 
     def __exit__(self, *exc_info: object) -> None:
         """
@@ -330,8 +347,11 @@ class JobWorkspace:
             if path is not None and self._keep:
                 logger.warning(
                     "Leaving the job workspace %s in place: some of its pages "
-                    "could not be kept, and the next sweep will recover them",
+                    "could not be kept, and %s",
                     path,
+                    "the next sweep will recover them"
+                    if self._locked
+                    else "no sweep recovers an unlocked workspace",
                 )
             elif path is not None:
                 _remove_quietly(path, "the job workspace")
@@ -339,13 +359,16 @@ class JobWorkspace:
             self._close_lock()
 
     @staticmethod
-    def _lock(fd: int, staging: Path) -> None:
+    def _lock(fd: int, staging: Path) -> bool:
         """
         Take the workspace's exclusive lock, or warn that it cannot be had.
 
         Args:
             fd: The open lock file.
             staging: The staging directory, for the warning.
+
+        Returns:
+            Whether the lock is held.
 
         Raises:
             BlockingIOError: If someone already holds the brand-new lock.
@@ -362,6 +385,8 @@ class JobWorkspace:
                 staging.parent,
                 exc_info=True,
             )
+            return False
+        return True
 
     def _close_lock(self) -> None:
         """Close the lock file, which releases the lock."""

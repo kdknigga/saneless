@@ -1070,7 +1070,8 @@ class _PipelineRun:
             spool and the assembled PDFs and is removed when the run ends.
         keep_workspace: Leaves the workspace in place when the run ends, for
             the next sweep to recover; called when a failure's pages could
-            not all be kept in ``failed/``.
+            not all be kept in ``failed/``.  Returns whether a sweep will
+            recover it, which it will not for a workspace used unlocked.
         ledger: What each acquisition pass has spooled; built here.
         artefacts: What the run has produced and how far it got; built here.
 
@@ -1085,7 +1086,7 @@ class _PipelineRun:
     scan_settings: ScanSettings
     flip: _FlipContext | None
     workspace: Path
-    keep_workspace: Callable[[], None]
+    keep_workspace: Callable[[], bool]
     ledger: _SpoolLedger = field(init=False)
     artefacts: preservation.RunArtefacts = field(init=False)
 
@@ -1173,12 +1174,19 @@ class _PipelineRun:
                 # Removing the workspace now would delete the only copy of
                 # the pages the preservation could not move, so it stays for
                 # the next sweep, which retries into failed/.
-                self.keep_workspace()
-                exc.add_note(
-                    f"The pages that could not be kept are left in "
-                    f"{self.spool_dir}, and are moved into failed/ the next "
-                    f"time saneless serve starts or saneless scan runs"
-                )
+                if self.keep_workspace():
+                    exc.add_note(
+                        f"The pages that could not be kept are left in "
+                        f"{self.spool_dir}, and are moved into failed/ the "
+                        f"next time saneless serve starts or saneless scan runs"
+                    )
+                else:
+                    exc.add_note(
+                        f"The pages that could not be kept are left in "
+                        f"{self.spool_dir}, which no sweep recovers because "
+                        f"it could not be locked: move them into failed/ "
+                        f"yourself"
+                    )
             # A bare raise, never a rebuilt exception: the original object,
             # its type, attributes and traceback all survive, and
             # classify_error sees what really happened.

@@ -4696,6 +4696,40 @@ class TestPreservationNamesWhatItDidKeep:
         assert list(tmp_dir.glob("job-*")) == []
         assert len(list(failed_dir.glob("*.pdf"))) == 1
 
+    def test_pages_left_in_an_unlocked_workspace_say_no_sweep_will_come(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without a lock no sweep recovers the pages, so the note says so."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.parent.mkdir(parents=True, exist_ok=True)
+        failed_dir.write_text("a regular file where the directory should be")
+
+        def no_locks(fd: int, operation: int) -> None:
+            raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+        monkeypatch.setattr("saneless.workspace.fcntl.flock", no_locks)
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=_jamming_scanner(1, ScanError("Paper jam")),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Left Unlocked",
+                    job_id="job-left-2",
+                ),
+            )
+
+        (workspace,) = default_settings.output.tmp_dir.glob("unlocked-*")
+        message = failure_text(excinfo.value)
+        assert f"left in {workspace / SPOOL_DIR_NAME}" in message
+        assert "no sweep recovers" in message
+        assert "next time" not in message
+
 
 class TestAssemblyFailureKeepsThePageFiles:
     """
