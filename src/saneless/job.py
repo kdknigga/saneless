@@ -1494,6 +1494,16 @@ class JobStore:
         mode: int = self._conn.execute("PRAGMA auto_vacuum").fetchone()[0]
         if mode == _AUTO_VACUUM_INCREMENTAL:
             return False
+        # Announced before it starts: the rewrite runs before the server
+        # binds, and on an SD card it can outlast a container health check's
+        # start period, so the log must say what the pause is.
+        pages: int = self._conn.execute("PRAGMA page_count").fetchone()[0]
+        page_size: int = self._conn.execute("PRAGMA page_size").fetchone()[0]
+        logger.info(
+            "Converting the job database (%d MiB) to incremental auto-vacuum; "
+            "this runs once and rewrites the whole file",
+            pages * page_size // 2**20,
+        )
         self._conn.commit()
         self._conn.autocommit = True
         try:

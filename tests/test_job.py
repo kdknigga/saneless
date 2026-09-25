@@ -2546,6 +2546,42 @@ class TestIncrementalVacuum:
         finally:
             reopened.close()
 
+    def test_conversion_is_announced_before_it_runs(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The rewrite is logged, with the file's size, before it starts.
+
+        It runs before the server binds and can take long enough on an SD
+        card to outlast a container health check's start period, so the log
+        has to say what the pause is while it is happening.
+        """
+        db_path = tmp_path / "old.db"
+        JobStore(db_path=str(db_path)).close()
+        raw = sqlite3.connect(db_path)
+        try:
+            raw.execute("PRAGMA auto_vacuum = NONE")
+            raw.execute("VACUUM")
+        finally:
+            raw.close()
+
+        store = JobStore(db_path=str(db_path))
+        try:
+            with caplog.at_level(logging.INFO, logger=job_module.__name__):
+                assert store.enable_incremental_auto_vacuum() is True
+        finally:
+            store.close()
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == job_module.__name__
+        ]
+        assert len(messages) == 2, messages
+        assert messages[0].startswith("Converting the job database (0 MiB)")
+        assert "runs once" in messages[0]
+        assert messages[1].startswith("Converted the job database")
+
     def test_prune_vacuum_leaves_no_free_pages(self, tmp_path: Path) -> None:
         """Pruning 195 thumbnail-heavy rows leaves an empty freelist (D-12)."""
         db_path = tmp_path / "bloated.db"
