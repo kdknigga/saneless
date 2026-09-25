@@ -14,7 +14,7 @@ In a shell, `echo $?` right after the command prints its exit code.
 |---|---|---|
 | 0 | The command succeeded | -- |
 | 1 | The scanner failed, or the scan produced no usable pages | [Scanner errors](#scanner-errors-exit-1) |
-| 2 | saneless could not start: configuration, profile or setup; or `paperless.url` is not set when a scan uploads | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
+| 2 | saneless could not start: configuration, profile or setup; or `paperless.url` is not set when a scan is started | [Configuration errors](#configuration-errors-exit-2), [python-sane is not installed](#python-sane-is-not-installed-exit-2) |
 | 3 | paperless-ngx could not be reached or rejected the upload | [Paperless errors](#paperless-errors-exit-3) |
 | 4 | The scanned pages could not be written as a PDF | [PDF assembly errors](#pdf-assembly-errors-exit-4) |
 | 5 | An error saneless did not anticipate: a bug | [Unexpected errors](#unexpected-errors-exit-5) |

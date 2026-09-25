@@ -21,7 +21,7 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 |------|---------|
 | 0 | Success |
 | 1 | Scan error: the scanner failed, the feeder was empty, no pages were scanned, or the flip wait timed out |
-| 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan uploads |
+| 2 | Configuration, profile or setup error: invalid config, unknown profile, python-sane not installed, the web server cannot start, a job database saneless cannot use (unreadable, or an unsupported schema), a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan is started |
 | 3 | Paperless-ngx error: unreachable after retries, or upload rejected |
 | 4 | PDF assembly error: the scanned pages could not be written as a PDF |
 | 5 | Unexpected error only: a saneless bug. The line names the exception type and the traceback is in the log file -- or, under `saneless serve`, in the stream, because a service writes no file |
@@ -52,7 +52,7 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
 |------|---------|
 | 0 | Scan and upload completed successfully |
 | 1 | Scan error (scanner unavailable, feeder jam, empty feeder, no pages scanned, flip wait timed out, or a read error at the flip prompt) |
-| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, an unset or placeholder paperless-ngx API token, no scanner found, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set when a scan uploads) |
+| 2 | Configuration or profile error (unknown profile, invalid config, a `--config` file that does not exist, an unknown config key or `SANELESS_*` variable, a manual duplex profile run without an interactive terminal, an unset or placeholder paperless-ngx API token, no scanner found, python-sane not installed, a malformed `paperless.url` or `paperless.token` (refused when the config loads), or `paperless.url` not set, refused before the scanner is opened) |
 | 3 | Paperless-ngx upload error (unreachable after retries, or upload rejected) |
 | 4 | PDF assembly error (disk full, unwritable output directory) |
 | 5 | Unexpected error (a saneless bug; the traceback is in the log file) |
@@ -62,7 +62,7 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
 
 With neither `--title` nor a profile `title`, the document title is the scan's start time rendered in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. Set `TZ` on the server (or in `docker-compose.yml`) if that zone is wrong; a container reports UTC unless you do.
 
-If the paperless-ngx API token is unset, blank or still one of the shipped placeholders such as `changeme`, `scan` refuses with exit code 2 before the scanner is opened, so no paper is fed for an upload that cannot succeed. A configured `paperless.consume_dir` fallback does not change this: run `saneless doctor` to see the same fact the web UI reports.
+If the paperless-ngx API token is unset, blank or still one of the shipped placeholders such as `changeme`, or `paperless.url` is empty, `scan` refuses with exit code 2 before the scanner is opened, so no paper is fed for an upload that cannot succeed. A configured `paperless.consume_dir` fallback does not change this: run `saneless doctor` to see the same fact the web UI reports.
 
 For a profile with `duplex = "manual"`, `scan` pauses between the two passes and asks `Flip the stack over and load it back into the feeder. Scan the back sides? [Y/n]:`. Yes (the default) scans the back sides. No, Ctrl-D (end of input, which is also what a terminal that closes produces) or Ctrl-C at the flip prompt cancels the scan, prints one line and exits with code 130. A read error at the flip prompt, such as an I/O error or undecodable input, fails the scan with exit code 1, and the error is logged with its traceback. When stdin is not a terminal, `scan` refuses the profile with exit code 2 before any page is fed. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
 
