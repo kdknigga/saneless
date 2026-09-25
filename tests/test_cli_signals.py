@@ -40,6 +40,7 @@ from click.testing import CliRunner
 from fastapi import FastAPI
 
 from saneless import preservation
+from saneless import workspace as workspace_module
 from saneless.cli import _INTERRUPTION, cli
 from saneless.config import (
     OutputConfig,
@@ -605,3 +606,65 @@ def test_second_signal_during_preservation_is_ignored(
     assert run.result.exit_code == ExitCode.TERMINATED, run.result.output
     (kept,) = run.failed
     assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1, 2))
+
+
+def test_first_signal_while_a_failure_is_kept_lets_the_keeping_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    SIGTERM while a scanner fault's pages are being kept: they are all kept.
+
+    The run had already failed on its own, and its outcome was settled, so
+    the signal is deferred: the preservation finishes, the workspace goes, and
+    the command reports the fault it really had rather than an interruption.
+    """
+    signaller = _Signaller()
+    scanner = _ObservingScanner(
+        passes=((0, 1, 2),), failure=ScanError("The scanner jammed")
+    )
+    real_move_private = preservation.move_private
+
+    def move_private(source: Path, destination: Path) -> None:
+        """Send the first SIGTERM as the first page lands, then move it."""
+        if not signaller.sent:
+            signaller.send(signal.SIGTERM)
+        real_move_private(source, destination)
+
+    monkeypatch.setattr("saneless.preservation.move_private", move_private)
+
+    run = _run_cli(tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGTERM]
+    assert run.result.exit_code == ExitCode.SCAN, run.result.output
+    (kept,) = run.failed
+    assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1, 2))
+    assert str(kept) in run.result.stderr
+    assert run.interrupted_lines == []
+    assert list((tmp_path / "scratch").glob("job-*")) == []
+
+
+def test_a_signal_after_delivery_leaves_the_success_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SIGTERM while a delivered scan's workspace is removed: still exit 0."""
+    signaller = _Signaller()
+    scanner = DistinctPageScanner(passes=((0, 1),))
+    real_remove = workspace_module._remove_quietly
+
+    def remove_quietly(path: Path, what: str) -> None:
+        """Send SIGTERM as the workspace starts to go, then remove it."""
+        signaller.send(signal.SIGTERM)
+        real_remove(path, what)
+
+    monkeypatch.setattr(workspace_module, "_remove_quietly", remove_quietly)
+
+    run = _run_cli(tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner)
+
+    assert signaller.refusals == []
+    assert signaller.sent == [signal.SIGTERM]
+    assert run.result.exit_code == ExitCode.SUCCESS, run.result.output
+    assert len(run.recorder.uploads()) == 1
+    assert run.failed == []
+    assert run.interrupted_lines == []
+    assert list((tmp_path / "scratch").glob("job-*")) == []

@@ -340,6 +340,11 @@ it is not treated as a cancel: the pages already scanned are kept as a PDF under
 data directory, and the line names the path. Nothing is uploaded. Scan the rest of the stack, or
 the whole stack again, and delete or upload the kept file yourself.
 
+A signal that arrives once the scan's outcome is settled -- the document already delivered, or a
+failure's pages already being kept -- does not interrupt it. The command finishes what it was doing
+and exits with that outcome's own code, so a delivered scan still exits 0 and a scanner fault still
+exits 1, with its line naming what was kept.
+
 Ctrl-C is different. It is a deliberate cancel, exits 130 and keeps nothing (see
 [Cancelled scans](#cancelled-scans-exit-130)). To run a long scan over SSH without a dropped
 connection interrupting it, start it under `tmux` or `screen`. `saneless serve` keeps the web

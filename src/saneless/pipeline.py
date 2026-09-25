@@ -391,6 +391,14 @@ class PipelineRequest:
     # failed/ rather than exit half way through copying them.  The worker
     # passes one; the CLI, which has no stop join to extend, passes none.
     preserving: threading.Event | None = None
+    # Set once the run's outcome is fixed -- the document delivered, or the
+    # run failed, was cancelled or was interrupted -- and never cleared by the
+    # run: whoever passed it owns it.  From that moment an interruption can
+    # only undo what the run did, by abandoning the pages half way into
+    # failed/ or by turning a delivered document into a failure, so the CLI's
+    # signal handler defers a SIGTERM or SIGHUP while it is set.  The worker,
+    # whose stop never raises into the run, passes none.
+    settled: threading.Event | None = None
 
 
 @dataclass
@@ -1129,6 +1137,9 @@ class _PipelineRun:
             Exception: Any other failure, re-raised as itself with the note.
 
         """
+        # Every arm settles the run before anything else, so a signal arriving
+        # while the pages are kept, or while the workspace is removed, cannot
+        # abandon either half way.
         try:
             return self._run()
         except ScanCancelledError:
@@ -1138,14 +1149,13 @@ class _PipelineRun:
             # below would otherwise file a scan the operator chose to abandon
             # into a directory saneless never prunes.  Nobody asked for those
             # pages to be kept, so they are not.
+            self._settle()
             raise
         except (Exception, ScanInterrupted) as exc:
-            # KeyboardInterrupt is deliberately not caught: Ctrl-C is the
-            # operator's cancel, and keeps nothing either.  ScanInterrupted is
-            # a BaseException so that nothing on the way up can re-type it,
-            # and it is caught here because an interruption is not anyone's
-            # decision to stop: the pages are kept.
-            #
+            # ScanInterrupted is a BaseException so that nothing on the way up
+            # can re-type it, and it is caught here because an interruption is
+            # not anyone's decision to stop: the pages are kept.
+            self._settle()
             # The ledger knows what each pass spooled, and each record the
             # dpi it was read back at; the artefacts are what the
             # preservation reads.
@@ -1158,6 +1168,22 @@ class _PipelineRun:
             # its type, attributes and traceback all survive, and
             # classify_error sees what really happened.
             raise
+        except BaseException:
+            # KeyboardInterrupt, above all: Ctrl-C is the operator's cancel,
+            # and keeps nothing either.
+            self._settle()
+            raise
+
+    def _settle(self) -> None:
+        """Mark the run's outcome as fixed, for whoever passed ``settled``."""
+        settled = self.request.settled
+        if settled is not None:
+            settled.set()
+
+    def _delivered(self) -> None:
+        """Record that the document was delivered, which settles the run."""
+        self.artefacts.stage = preservation.RunStage.DELIVERED
+        self._settle()
 
     def _preserve(self) -> preservation.PreservationReport:
         """
@@ -1629,7 +1655,7 @@ class _PipelineRun:
         self._notify(PipelineEvent.UPLOADING)
         upload = self._upload(pdf_path, self.request.title)
         self._poll(upload)
-        self.artefacts.stage = preservation.RunStage.DELIVERED
+        self._delivered()
         if upload.delivered_to_api:
             return ScanOutcome.SUCCESS, None
         # A state alone would leave the user to work out for themselves why the
@@ -1712,7 +1738,7 @@ class _PipelineRun:
         # one most likely to be holding a document the user actually needs.
         self._poll(fronts_result)
         self._poll(backs_result)
-        self.artefacts.stage = preservation.RunStage.DELIVERED
+        self._delivered()
         delivered = fronts_result.delivered_to_api and backs_result.delivered_to_api
 
         warning = _duplex_mismatch_warning(mismatch)

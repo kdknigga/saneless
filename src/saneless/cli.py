@@ -21,7 +21,7 @@ import threading
 import traceback
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, NoReturn, assert_never
+from typing import TYPE_CHECKING, Final, assert_never
 from uuid import uuid4
 
 import click
@@ -205,12 +205,22 @@ class _Interruption:
 
     Set by the signal handler on the main thread and read by the flip prompt's
     thread, which is why it is an ``Event`` and not a bare flag.
+
+    ``settled`` is the scan's ``PipelineRequest.settled``: the run sets it once
+    its outcome is fixed, and the guard sets it as it starts reporting a
+    failure.  From then on a signal is recorded and deferred rather than
+    raised, because raising it could only undo what is already done -- abandon
+    a failure's pages half way into ``failed/``, or turn a delivered document
+    into an interruption.  The command finishes and exits with its own
+    outcome's code.
     """
 
     def __init__(self) -> None:
-        """Start with no signal received."""
+        """Start with no signal received and nothing settled."""
         self._received = threading.Event()
         self.signum: int | None = None
+        self.deferred: int | None = None
+        self.settled = threading.Event()
 
     def record(self, signum: int) -> None:
         """
@@ -239,13 +249,15 @@ class _Interruption:
     def clear(self) -> None:
         """Forget any signal, once the command that received it is over."""
         self.signum = None
+        self.deferred = None
         self._received.clear()
+        self.settled.clear()
 
 
 _INTERRUPTION = _Interruption()
 
 
-def _interrupt_handler(signum: int, _frame: FrameType | None) -> NoReturn:
+def _interrupt_handler(signum: int, _frame: FrameType | None) -> None:
     """
     Turn SIGTERM or SIGHUP into ``ScanInterrupted`` on the main thread.
 
@@ -254,17 +266,25 @@ def _interrupt_handler(signum: int, _frame: FrameType | None) -> NoReturn:
     preservation this one starts. The command's context puts the original
     handlers back when it closes.
 
+    Once the command's outcome is settled (``_Interruption.settled``) the
+    signal is only recorded: the command is already delivering its result or
+    keeping a failure's pages, and it finishes that and exits as it would
+    have.
+
     Args:
         signum: The signal that arrived.
         _frame: The interrupted frame; unused.
 
     Raises:
-        ScanInterrupted: Always, carrying ``signum``.
+        ScanInterrupted: Carrying ``signum``, unless the outcome is settled.
 
     """
     for each in _INTERRUPT_SIGNALS:
         signal.signal(each, signal.SIG_IGN)
     _INTERRUPTION.record(signum)
+    if _INTERRUPTION.settled.is_set():
+        _INTERRUPTION.deferred = signum
+        return
     msg = f"Interrupted by {signal.Signals(signum).name}"
     raise ScanInterrupted(msg, signum=signum)
 
@@ -289,6 +309,8 @@ def _install_interrupt_handlers() -> Callable[[], None]:
     """
     if threading.current_thread() is not threading.main_thread():
         return _keep_handlers
+    # A fresh start, whatever an earlier in-process command left behind.
+    _INTERRUPTION.clear()
     previous = {
         signum: handler
         for signum in _INTERRUPT_SIGNALS
@@ -303,6 +325,13 @@ def _install_interrupt_handlers() -> Callable[[], None]:
         # _interrupt_handler and set the flag after it was cleared.
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+        deferred = _INTERRUPTION.deferred
+        if deferred is not None:
+            logger.info(
+                "%s arrived once the command's outcome was settled, so the "
+                "command finished first",
+                signal.Signals(deferred).name,
+            )
         _INTERRUPTION.clear()
 
     return restore
@@ -615,7 +644,9 @@ class _GuardedGroup(click.Group):
        interruption, not a cancel: nobody chose to stop, so the pages already
        scanned were kept. One ``Interrupted:`` line and 128 plus the signal
        number, 129 or 143. It is a ``BaseException``, so no later clause
-       would catch it.
+       would catch it. A signal that arrives once the outcome is settled --
+       delivered, or failed and being kept, or being reported here -- is
+       deferred instead, and the command exits with its own outcome's code.
     3. ``KeyboardInterrupt`` and ``ScanCancelledError`` are a cancel, not a
        failure: one line and exit 130.
     4. ``StorageError`` -- a job database saneless cannot use -- is a setup
@@ -643,7 +674,14 @@ class _GuardedGroup(click.Group):
 
         """
         try:
-            return super().invoke(ctx)
+            try:
+                return super().invoke(ctx)
+            except BaseException:
+                # From here the command only reports how it ended, so a signal
+                # is deferred rather than raised into the middle of an arm
+                # below, where it would escape the guard as a traceback.
+                _INTERRUPTION.settled.set()
+                raise
         except _CLICK_CONTROL_FLOW:
             raise
         except ScanInterrupted as exc:
@@ -1013,6 +1051,9 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
             # run_pipeline is synchronous, so the flip wait holds this thread;
             # only the click.confirm read itself moves to the prompt thread.
             flip_coordinator=ClickFlipCoordinator() if manual_duplex else None,
+            # The run sets it once its outcome is fixed, and from then on
+            # _interrupt_handler defers a signal instead of raising it.
+            settled=_INTERRUPTION.settled,
         )
         result = run_pipeline(
             scanner,
