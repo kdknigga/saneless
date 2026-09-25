@@ -15,11 +15,15 @@ journald -- owns retention.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from logging.handlers import RotatingFileHandler
 from typing import TYPE_CHECKING, Final
 
+from saneless.private_dirs import make_private_dir
+
 if TYPE_CHECKING:
+    from io import TextIOWrapper
     from pathlib import Path
 
 __all__ = ["configure_logging"]
@@ -71,6 +75,57 @@ class _TracebackFreeFormatter(logging.Formatter):
         return super().format(stripped)
 
 
+# A log file this module creates is readable by its owner only: records carry
+# document titles and preserved file names. An existing file keeps its mode.
+_LOG_FILE_MODE: Final = 0o600
+
+
+def _owner_only_opener(path: str, flags: int) -> int:
+    """
+    Open ``path`` as ``open`` would, creating a missing file 0600.
+
+    The mode applies only when ``O_CREAT`` really creates the file, so a log
+    an earlier release left with a wider mode is appended to unchanged.
+
+    Args:
+        path: The file to open.
+        flags: The ``os.open`` flags ``open`` computed from its mode.
+
+    Returns:
+        The open file descriptor.
+
+    """
+    return os.open(path, flags, _LOG_FILE_MODE)
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """
+    A rotating file handler whose every new log file is owner-only.
+
+    ``RotatingFileHandler`` opens a new base file on construction and again
+    after each rollover, both through ``_open`` and both with the umask's
+    mode, 0644 under the usual 022. Overriding ``_open`` covers both. A
+    rotated file is renamed, not copied, so it keeps the mode it was created
+    with.
+    """
+
+    def _open(self) -> TextIOWrapper:
+        """
+        Open the base file for appending, creating it 0600 if it is missing.
+
+        Returns:
+            The stream the handler writes to.
+
+        """
+        return open(
+            self.baseFilename,
+            "a",
+            encoding=self.encoding,
+            errors=self.errors,
+            opener=_owner_only_opener,
+        )
+
+
 _HANDLER_PREFIX = "saneless."
 
 
@@ -114,8 +169,10 @@ def configure_logging(
     prints a record twice and never silences someone else's handler.
 
     Given a ``log_file`` -- the one-shot CLI shape -- this creates parent
-    directories for it if they don't exist, then attaches a
-    RotatingFileHandler to the root logger. If the directory cannot be created
+    directories for it if they don't exist, the innermost one 0700, then
+    attaches a RotatingFileHandler to the root logger. Each log file it
+    creates, the first one and every one a rotation starts, is 0600; an
+    existing directory or file keeps its mode. If the directory cannot be created
     or the file cannot be opened, one stderr handler is attached instead and a
     warning names the log file; this function does not raise for an unwritable
     log, so the caller keeps running. Without ``verbose`` that fallback handler
@@ -183,8 +240,10 @@ def configure_logging(
         attached = False
     else:
         try:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            file_handler = RotatingFileHandler(
+            # Created owner-only, like the log file itself: a directory that
+            # already exists keeps whatever mode it has.
+            make_private_dir(log_file.parent)
+            file_handler = _PrivateRotatingFileHandler(
                 log_file,
                 maxBytes=max_bytes,
                 backupCount=backup_count,

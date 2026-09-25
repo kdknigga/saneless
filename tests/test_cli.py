@@ -1982,6 +1982,99 @@ class TestLazySettingsLoading:
         assert counts == {"load": 1, "logging": 1}
 
 
+class TestFirstRunFileModes:
+    """
+    A one-shot command run before the server creates private state.
+
+    The default log file sits inside the default ``data_dir``, so whichever
+    command runs first creates ``data_dir`` while it sets up logging. A bare
+    metal install commonly runs ``saneless doctor`` or ``saneless jobs`` before
+    ever starting the server, and later calls leave an existing directory's
+    mode alone. The directory and the log, which holds document titles, must
+    therefore come out owner-only from that first command.
+    """
+
+    @staticmethod
+    def _mode(path: Path) -> int:
+        """Return the permission bits of ``path``."""
+        return path.stat().st_mode & 0o777
+
+    def test_jobs_on_a_fresh_state_home_leaves_data_dir_and_log_private(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``saneless jobs`` first, on an empty state home, under umask 022."""
+        state_home = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        data_dir = state_home / "saneless"
+
+        previous = os.umask(0o022)
+        try:
+            with _restored_logging():
+                result = CliRunner().invoke(cli, ["jobs"])
+        finally:
+            os.umask(previous)
+
+        assert result.exit_code == 0, result.output
+        assert self._mode(data_dir) == 0o700
+        assert self._mode(data_dir / "saneless.log") == 0o600
+        assert self._mode(data_dir / "saneless.db") == 0o600
+
+    def test_a_log_nested_inside_data_dir_still_leaves_data_dir_private(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        ``data_dir`` is 0700 when the log sits in a subdirectory of it.
+
+        Logging creates the log's own directory 0700, but a plain parent
+        created on the way would get the umask's 0755.
+        """
+        data_dir = tmp_path / "data"
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            tomlkit.dumps(
+                {
+                    "output": {
+                        "tmp_dir": str(tmp_path / "tmp"),
+                        "data_dir": str(data_dir),
+                        "log_file": str(data_dir / "logs" / "saneless.log"),
+                    }
+                }
+            )
+        )
+
+        previous = os.umask(0o022)
+        try:
+            with _restored_logging():
+                result = CliRunner().invoke(cli, ["--config", str(config_file), "jobs"])
+        finally:
+            os.umask(previous)
+
+        assert result.exit_code == 0, result.output
+        assert self._mode(data_dir) == 0o700
+        assert self._mode(data_dir / "logs") == 0o700
+        assert self._mode(data_dir / "logs" / "saneless.log") == 0o600
+
+    def test_an_existing_data_dir_keeps_its_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A ``data_dir`` an earlier release left 0755 is not re-moded."""
+        state_home = tmp_path / "state"
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        data_dir = state_home / "saneless"
+        data_dir.mkdir(parents=True)
+        data_dir.chmod(0o755)
+
+        previous = os.umask(0o022)
+        try:
+            with _restored_logging():
+                result = CliRunner().invoke(cli, ["jobs"])
+        finally:
+            os.umask(previous)
+
+        assert result.exit_code == 0, result.output
+        assert self._mode(data_dir) == 0o755
+
+
 class TestStartupConfigLog:
     """
     One INFO record says where the configuration came from (CFG-11).

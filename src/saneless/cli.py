@@ -627,6 +627,8 @@ def _load_cli_settings(
 
     settings = load_settings(ctx.obj.get("config_path"))
     validate_settings_dirs(settings)
+    if not stream_logs:
+        _make_log_home_private(settings)
     # A service is handed no log file at all: configure_logging then attaches
     # one stderr handler and returns False, so the line below records no
     # log_file with no special case of its own. The rotation settings still go
@@ -658,6 +660,34 @@ def _load_cli_settings(
 
     ctx.obj["settings"] = settings
     return settings
+
+
+def _make_log_home_private(settings: Settings) -> None:
+    """
+    Create ``data_dir`` owner-only before logging can create it with the umask.
+
+    The default log file lives in ``data_dir``, so the first one-shot command
+    on a new install -- often ``saneless doctor`` -- creates that directory
+    while setting up logging, before anything that would create it privately.
+    Every later call finds it existing and leaves its mode alone, so it has to
+    come out 0700 here. ``configure_logging`` makes only the log file's own
+    directory private; this covers a log file nested deeper inside
+    ``data_dir``. A log file elsewhere leaves ``data_dir`` to the commands
+    that use it.
+
+    A failure is left to ``configure_logging``, which meets the same error
+    creating the log directory and falls back to stderr with a warning
+    naming the log file.
+
+    Args:
+        settings: The loaded settings.
+
+    """
+    output = settings.output
+    if not output.log_file.is_relative_to(output.data_dir):
+        return
+    with contextlib.suppress(OSError):
+        make_private_dir(output.data_dir)
 
 
 @cli.command()

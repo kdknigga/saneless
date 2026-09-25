@@ -8,6 +8,7 @@ import logging
 import logging.handlers
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -84,6 +85,26 @@ def _deny_mkdir(monkeypatch: pytest.MonkeyPatch, directory: Path) -> None:
         real_mkdir(self, mode, parents=parents, exist_ok=exist_ok)
 
     monkeypatch.setattr(Path, "mkdir", denied)
+
+
+def _mode(path: Path) -> int:
+    """Return the permission bits of ``path``, not following a symlink."""
+    return stat.S_IMODE(path.lstat().st_mode)
+
+
+@pytest.fixture
+def umask_022() -> Iterator[None]:
+    """
+    Run the test under umask 022, the common default.
+
+    Under it a plain create gives a file 0644 and a directory 0755, both
+    readable by every local user; the umask is restored afterwards.
+    """
+    old = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(old)
 
 
 class TestConfigureLogging:
@@ -428,6 +449,60 @@ class TestConfigureLogging:
                 logging.getLogger("saneless.test").exception("it failed")
             err = capsys.readouterr().err
             assert err.count("Traceback") == 1
+        finally:
+            self._cleanup_handlers()
+
+    @pytest.mark.usefixtures("umask_022")
+    def test_new_log_file_and_its_directory_are_owner_only(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A log file and directory created here are 0600 and 0700 under umask 022.
+
+        The log carries document titles, so another local user must not be
+        able to read it. Under 022 a plain create would give 0644 and 0755.
+        """
+        log_file = tmp_path / "logs" / "saneless.log"
+        try:
+            assert configure_logging(log_file, max_bytes=1024, backup_count=1)
+            assert _mode(log_file.parent) == 0o700
+            assert _mode(log_file) == 0o600
+        finally:
+            self._cleanup_handlers()
+
+    @pytest.mark.usefixtures("umask_022")
+    def test_log_file_started_by_rotation_is_owner_only(self, tmp_path: Path) -> None:
+        """The fresh file rotation opens is 0600, and the rotated one keeps 0600."""
+        log_file = tmp_path / "saneless.log"
+        try:
+            configure_logging(log_file, max_bytes=200, backup_count=1)
+            logger = logging.getLogger("saneless.test_rotation")
+            for number in range(10):
+                logger.warning("record %d fills the log toward rotation", number)
+            rotated = tmp_path / "saneless.log.1"
+            assert rotated.exists(), "the log never rotated; the test proves nothing"
+            assert _mode(rotated) == 0o600
+            assert _mode(log_file) == 0o600
+        finally:
+            self._cleanup_handlers()
+
+    @pytest.mark.usefixtures("umask_022")
+    def test_existing_log_file_and_directory_keep_their_modes(
+        self, tmp_path: Path
+    ) -> None:
+        """A log and directory an earlier release left 0644 and 0755 are not changed."""
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir()
+        log_dir.chmod(0o755)
+        log_file = log_dir / "saneless.log"
+        log_file.write_text("")
+        log_file.chmod(0o644)
+        try:
+            assert configure_logging(log_file, max_bytes=1024, backup_count=1)
+            logging.getLogger("saneless.test_modes").warning("appended")
+            assert _mode(log_dir) == 0o755
+            assert _mode(log_file) == 0o644
+            assert "appended" in log_file.read_text()
         finally:
             self._cleanup_handlers()
 
