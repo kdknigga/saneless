@@ -10,7 +10,7 @@ Get from zero to your first scanned document in paperless-ngx in under five minu
 
 Not sure which deployment shape you are in? Read [Which setup do I have?](which-setup.md) first -- it takes a minute and decides everything below.
 
-The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyone who can reach the port can scan; put it [behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy) if that is not what you want.
+The web UI has **no login** and binds `0.0.0.0`, all network interfaces, so anyone who can reach the port can scan. They can also see that scans run and how they end, but not what they are: only the browser that started a scan sees its title and preview. saneless answers only to its own host names, so a hostile web page cannot use your browser to reach it (see the [Host check](../reference/web-api.md#host-check)). Put it [behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy) if that is not what you want.
 
 ## Install
 

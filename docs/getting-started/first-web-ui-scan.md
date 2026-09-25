@@ -58,15 +58,17 @@ The status area below the form updates as the scan progresses through these stag
 
 When a scan finishes, a line beneath the result sums up what happened to the paper -- "12 pages scanned, 2 blank removed, 10 uploaded". A scan that ended in an error or was cancelled has no counts to show, and shows none.
 
-If another scan is already running when you press Scan, the status area keeps following *your* job rather than switching to whichever one is current, and tells you where you are in the queue -- "Waiting for 'Tax return' to finish (1 ahead of you)".
+If another scan is already running when you press Scan, the status area keeps following *your* job rather than switching to whichever one is current, and tells you where you are in the queue -- "Waiting for 'Tax return' to finish (1 ahead of you)". The running scan is named only if your browser started it too; otherwise it reads "Waiting for 'Scan (title hidden)' to finish".
 
-A thumbnail of the first scanned page appears once the first page is acquired.
+A thumbnail of the first scanned page appears once the first page is acquired, in the browser that started the scan.
 
 If your profile uses manual duplex scanning, a flip prompt appears after the front sides are scanned. Keep the pages in the same order, flip the whole stack over the long edge, load it back into the feeder, and click **Continue** to scan the back sides. As soon as the click is received, the prompt is replaced by a short confirmation, and the status moves on once the back sides start scanning. To stop instead, click **Abort scan** and confirm -- the browser asks *"Abort this scan? It will stop and cannot be resumed."* -- after which the back sides are not scanned and nothing is uploaded. If nobody answers the prompt within `flip_timeout_seconds` (10 minutes by default), the scan fails the same way. See [Set Up ADF Duplex Scanning](../how-to/set-up-adf-duplex.md#manual-duplex).
 
-**Only the browser that started the scan gets those buttons.** Somebody else watching the same page sees "Waiting for the stack to be flipped" instead, because the person holding the paper is the one who should answer. Everything else -- the state, title, counts and thumbnail -- is the same for both.
+**Only the browser that started the scan gets those buttons.** Somebody else watching the same page sees "Waiting for the stack to be flipped" instead, because the person holding the paper is the one who should answer.
 
-If an error occurs, the status area says in plain words what kind of problem it was and what to do next. Beneath that is a collapsed **Technical details** section: open it for the underlying message when you want to report the problem or dig further.
+**Only the browser that started a scan sees what it is.** saneless recognises that browser by a cookie it sets when you press Scan. The cookie lasts a year, so a browser still knows its own scans after a restart. Anyone else on your network who opens the page sees the state, the outcome and the page counts. They see the title as "Scan (title hidden)" and no thumbnail. A different browser on your own phone or laptop counts as somebody else.
+
+If an error occurs, the status area says in plain words what kind of problem it was and what to do next. Beneath that is a collapsed **Technical details** section. In the browser that started the scan it holds the underlying message, for when you want to report the problem or dig further. Folders on the server are named by the setting that holds them, so a PDF that saneless kept reads as `failed/<file>.pdf`. Every other browser sees a sentence pointing at the server instead: there, `saneless jobs --json` and the log have the full message.
 
 ## Check job history
 
@@ -74,7 +76,7 @@ The job history table at the bottom of the page lists recent scan jobs with four
 
 - **Time** -- When the scan was started, in the server's local timezone with the zone named. In a container that means setting `TZ`; without it the times read as UTC
 - **Profile** -- Which scan profile was used
-- **Title** -- The document title, with the page counts on a second line beneath it for jobs that recorded them
+- **Title** -- The document title, with the page counts on a second line beneath it for jobs that recorded them. A scan another browser started shows "Scan (title hidden)"
 - **Status** -- Current state of the job (Complete, Uploaded with a warning, Failed, Cancelled, Saved to folder, Scanning, and so on). The table says **Complete** where the status area above it says **Done**; they are the same state. A scan that was uploaded but did not go cleanly -- a sheet the scanner skipped, say -- reads **Uploaded with a warning** in both places, and the status area gives the warning beneath it
 
 The history table updates automatically when a job finishes.

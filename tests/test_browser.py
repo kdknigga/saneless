@@ -27,6 +27,8 @@ Requires: pytest-playwright, chromium browser (uv run playwright install chromiu
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import re
 import socket
@@ -90,6 +92,7 @@ from saneless.job import JobResult
 from saneless.paperless import UploadResult
 from saneless.scanner.base import DeviceInfo, ScanBatch
 from saneless.vocabulary import (
+    HIDDEN_JOB_TITLE,
     TERMINAL_STATES,
     ErrorCategory,
     FlipOutcome,
@@ -142,6 +145,33 @@ _CHECK_STATE_COLOURS = {
 
 _SCAN_GATE_TIMEOUT = 30.0
 """Longest a closed gate holds ``scan_pages``, so a test that forgets it cannot hang."""
+
+_RENDERING_BROWSER = "the-browser-these-rows-were-staged-for"
+"""
+The owner token a staged row records when its test reads the row's detail.
+
+A job's title, preview and error or warning text reach only the browser that
+started it, so a test that stages a row straight into the store and then reads
+its title has to be that browser: ``_as_owner`` hands the page the cookie.
+"""
+
+
+def _as_owner(page: Page, url: str) -> str:
+    """
+    Give the page's browser the owner cookie that ``_RENDERING_BROWSER`` rows record.
+
+    Args:
+        page: The page whose context should hold the cookie.
+        url: The server the cookie is for.
+
+    Returns:
+        The token, for ``create_job(owner_token=...)``.
+
+    """
+    page.context.add_cookies(
+        [{"name": "saneless_owner", "value": _RENDERING_BROWSER, "url": url}]
+    )
+    return _RENDERING_BROWSER
 
 
 def _spool_pages(sink: PageSink, count: int, resolution: int) -> ScanBatch:
@@ -1499,7 +1529,11 @@ class TestFallbackStatusRendering:
         """Drive the live app's current job to FALLBACK, then clear it again."""
         app = browser_server.app
         job_store: JobStore = app.state.job_store
-        job = job_store.create_job(profile="default", title="Fallback Doc")
+        job = job_store.create_job(
+            profile="default",
+            title="Fallback Doc",
+            owner_token=_as_owner(page, browser_server.url),
+        )
         # finish_job is the public writer for the warning column, and the worker
         # already reaches FALLBACK through it. This used to UPDATE the column
         # through job_store._conn, on a comment saying no warning writer landed
@@ -1650,7 +1684,11 @@ class TestWarnedDoneStatusRendering:
         """Drive the live app's current job to a warned DONE, then clear it again."""
         app = browser_server.app
         job_store: JobStore = app.state.job_store
-        job = job_store.create_job(profile="default", title="Warned Doc")
+        job = job_store.create_job(
+            profile="default",
+            title="Warned Doc",
+            owner_token=_as_owner(page, browser_server.url),
+        )
         job_store.finish_job(
             job.id,
             JobState.DONE,
@@ -1732,7 +1770,11 @@ class TestCancelledStatusRendering:
         """Drive the live app's current job to CANCELLED, then clear it again."""
         app = browser_server.app
         job_store: JobStore = app.state.job_store
-        job = job_store.create_job(profile="default", title="Cancelled Doc")
+        job = job_store.create_job(
+            profile="default",
+            title="Cancelled Doc",
+            owner_token=_as_owner(page, browser_server.url),
+        )
         job_store.finish_job(
             job.id,
             JobState.CANCELLED,
@@ -4039,7 +4081,11 @@ class TestErrorRenderingInChromium:
         server = empty_history_server
         job_store: JobStore = server.app.state.job_store
         worker = server.app.state.worker
-        job = job_store.create_job(profile="default", title="Broken Doc")
+        job = job_store.create_job(
+            profile="default",
+            title="Broken Doc",
+            owner_token=_as_owner(page, server.url),
+        )
         job_store.finish_job(
             job.id,
             JobState.ERROR,
@@ -4502,7 +4548,7 @@ _ABORT_CONFIRMATION = "Abort this scan? It will stop and cannot be resumed."
 _NO_THIRD_WAY_OUT = re.compile(r"override|take over|force", re.IGNORECASE)
 
 _FLIP_JOB_TITLE = "Two Browsers One Stack"
-"""The title both pages must agree on, so the comparison is not vacuous."""
+"""The title only the owner's page may show, so its absence elsewhere means something."""
 
 
 @pytest.fixture
@@ -4572,10 +4618,32 @@ def _history_row_text(page: Page) -> tuple[str, str]:
     )
 
 
+def _assert_only_the_owner_is_named(owner: Page, viewer: Page, title: str) -> None:
+    """
+    Assert the newest history row reads the same to both but for its title.
+
+    Args:
+        owner: The page of the browser that started the scan.
+        viewer: The page of any other browser.
+        title: The scan's real title.
+
+    """
+    owner_title, owner_state = _history_row_text(owner)
+    viewer_title, viewer_state = _history_row_text(viewer)
+    assert owner_state == viewer_state
+    assert owner_title.startswith(title)
+    assert viewer_title.startswith(HIDDEN_JOB_TITLE)
+    assert title not in viewer.content()
+
+
 @pytest.mark.browser
 class TestTwoBrowsersOneStack:
     """
     One appliance, two browsers, one owner (APPL-09, D-24, D-26, success 5).
+
+    The owner is offered the flip, and is the only one shown the scan's title
+    and preview; the second browser sees that a scan is waiting, and how it
+    ends, under the generic title.
 
     The owner gate is a statement about two cookie jars, and a cookie jar is
     something only a browser has. Staging the non-owner by writing a foreign
@@ -4671,13 +4739,13 @@ class TestTwoBrowsersOneStack:
                     c for c in viewer_ctx.cookies() if c["name"] == _OWNER_COOKIE_NAME
                 ] == []
 
-                # Only the controls differ. The two status areas cannot be
-                # compared directly -- the owner's holds the prompt and the
-                # viewer's the waiting line, which is the difference under test
-                # -- so the comparison is made where both pages report the same
-                # job: the newest Job History row, title and state alike.
-                assert _history_row_text(owner_page) == _history_row_text(viewer_page)
-                assert _history_row_text(owner_page)[0].startswith(_FLIP_JOB_TITLE)
+                # The controls are one difference and the title is the other.
+                # The comparison is made where both pages report the same job,
+                # the newest Job History row: its state reads the same to
+                # both, and its title names the scan to the owner alone.
+                _assert_only_the_owner_is_named(
+                    owner_page, viewer_page, _FLIP_JOB_TITLE
+                )
 
                 # D-26's absence guard, on both pages.
                 for reader in (owner_page, viewer_page):
@@ -4778,6 +4846,98 @@ class TestTwoBrowsersOneStack:
         wait_for_state(
             job_store, job_id, JobState.CANCELLED, timeout=_JOB_FINISH_TIMEOUT
         )
+
+
+_OWNED_TITLE = "Owned By One Browser"
+"""The title of the finished scan only its owner's page may show."""
+
+
+def _tiny_jpeg() -> str:
+    """Return a real 8x8 JPEG, base64-encoded, so the preview is a decodable image."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (8, 8), "white").save(buffer, format="JPEG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+@pytest.mark.browser
+class TestOnlyTheOwnerSeesTheScan:
+    """
+    Two browsers looking at one finished scan, in Chromium.
+
+    The browser that started the scan sees its title and preview; any other
+    browser on the LAN sees that a scan finished, and how, under the generic
+    title and with no preview at all -- not a hidden one.
+    """
+
+    def test_a_second_browser_sees_neither_the_title_nor_the_preview(
+        self,
+        page: Page,
+        browser: Browser,
+        browser_server: _BrowserServer,
+        egress_allowlist: list[str],
+    ) -> None:
+        """
+        One owned row, two cookie jars, two renderings.
+
+        The second context is built by hand, so it installs ``_make_gate`` and
+        the policy recorder itself and is checked after it closes, as the
+        two-browser flip test does; ``page`` comes from the gated fixture.
+        """
+        app = browser_server.app
+        job_store: JobStore = app.state.job_store
+        job = job_store.create_job(
+            profile="default",
+            title=_OWNED_TITLE,
+            owner_token=_as_owner(page, browser_server.url),
+        )
+        job_store.update_thumbnail(job.id, _tiny_jpeg())
+        job_store.finish_job(
+            job.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=None,
+                pages_scanned=1,
+                pages_removed=0,
+                pages_uploaded=1,
+            ),
+        )
+        app.state.worker._current_job_id = job.id
+
+        blocked: list[str] = []
+        seen: list[str] = []
+        violations: list[str] = []
+        viewer_ctx = browser.new_context()
+        try:
+            viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(viewer_ctx, violations)
+            viewer_page = viewer_ctx.new_page()
+
+            page.goto(browser_server.url)
+            viewer_page.goto(browser_server.url)
+
+            expect(page.locator("#status-area")).to_contain_text(_OWNED_TITLE)
+            expect(page.locator("#status-area img.thumbnail")).to_have_count(1)
+            expect(page.locator("#history-body")).to_contain_text(_OWNED_TITLE)
+
+            expect(viewer_page.locator("#status-area .status-done")).to_contain_text(
+                HIDDEN_JOB_TITLE
+            )
+            expect(viewer_page.locator("img")).to_have_count(0)
+            expect(viewer_page.locator("#history-body")).to_contain_text(
+                HIDDEN_JOB_TITLE
+            )
+            assert _OWNED_TITLE not in viewer_page.content()
+            assert "data:image/jpeg" not in viewer_page.content()
+        finally:
+            viewer_ctx.close()
+            app.state.worker._current_job_id = None
+            job_store.delete_job(job.id)
+            assert seen, "the hand-built context's gate handled no request"
+            assert blocked == [], f"a page tried to reach the network: {blocked}"
+            assert violations == [], (
+                f"a page violated its Content-Security-Policy: {violations}"
+            )
 
 
 # ---------------------------------------------------------------------------

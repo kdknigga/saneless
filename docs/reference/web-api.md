@@ -119,6 +119,8 @@ Returns the current or most recent job status. Used by HTMX polling to update th
 
 `DONE`, `ERROR`, `FALLBACK` and `CANCELLED` are terminal: once the job reaches one of them the partial stops polling and the Scan button is enabled again. The terminal partial also reloads the job history table and the checks strip once, so the finished job's row appears and the strip stops saying a scan is running. The main page (`GET /`) renders the same job without that reload, because it has just rendered both. `CANCELLED` means the operator stopped the scan on purpose, such as with Abort scan at the flip prompt. The web UI shows it as `Cancelled: <title>` in muted grey, not as an error.
 
+What the partial shows depends on who asks. The browser that started the job sees its title, preview and error or warning text. Every other client sees the state, the outcome and the page counts under the title `Scan (title hidden)`, with no preview and a fixed sentence in place of the text. See [who can read what](#what-an-unauthenticated-client-can-read).
+
 ---
 
 ### `GET /api/jobs/{job_id}/status`
@@ -132,6 +134,8 @@ Returns the status of one named job, rather than whichever job is current. The w
 | `job_id` | string | The job to report on. Opaque: it is a database lookup key and nothing else |
 
 **Response:** HTML partial, the same shape as [`GET /api/jobs/current/status`](#get-apijobscurrentstatus).
+
+Knowing a job's id does not show you more of it: the partial follows the same owner rule as [`GET /api/jobs/current/status`](#get-apijobscurrentstatus).
 
 An id that names no job is **not** a `404`. The partial falls back to the current-or-most-recent rendering, so a browser whose job has aged out of history keeps working, and a caller cannot use the status code to discover which job ids exist.
 
@@ -252,6 +256,8 @@ Returns the job history table body (most recent 50 jobs).
 
 **Response:** HTML partial (table rows for HTMX swap).
 
+Every client gets every row, with its time, profile, outcome and page counts. Only the rows this browser started show their title; every other row shows `Scan (title hidden)`. See [who can read what](#what-an-unauthenticated-client-can-read).
+
 ---
 
 ### `POST /api/flip/continue`
@@ -341,6 +347,22 @@ While the token is unset the Scan button also renders disabled with the reason b
 - Most endpoints return **HTML partials** designed for HTMX swap. Only `/health` and `/api/paperless/test` return JSON, along with the JSON error form described under [Errors](#errors).
 - There is no authentication on the API. saneless assumes a trusted LAN; use a reverse proxy for auth if needed. The web server binds to `web_host`, which defaults to `0.0.0.0` -- all network interfaces -- so every host that can reach the port can use the API.
 - `POST /api/scan` returns once the job is queued or refused; it does not wait for the scan. Poll `/api/jobs/current/status` for progress.
+
+### What an unauthenticated client can read
+
+Anything that can reach the port can read, without logging in:
+
+- the queue state: whether a scan is running or waiting, and how many are ahead;
+- each job's outcome, error category and page counts;
+- profile names and their descriptions;
+- `Scan (title hidden)` as the title of every scan another browser started;
+- the paperless-ngx tag and correspondent lists, because the scan form needs them.
+
+Only the browser that started a scan sees its title, its preview and the name of a kept PDF. saneless recognises that browser by its `saneless_owner` cookie. The cookie is set when the browser submits a scan and lasts a year. The kept PDF is named relative to the data directory, as `failed/<file>.pdf`. A job that recorded no owner is nobody's: every browser sees its generic title, although anyone may still answer its flip prompt. Jobs written before saneless recorded owners are like this, and so are most refused submits.
+
+Error and warning text on the web never carries a host path or the paperless-ngx URL. The owner sees the text with each directory and web address replaced by the name of its setting, such as `<output.tmp_dir>` or `<paperless.url>`. Every other browser sees a fixed sentence instead, which says where the full text is. On the server, the log and `saneless jobs --json` keep the full text.
+
+The cookie is not a password. A client that sends a guessed or copied cookie is treated as its owner. saneless assumes a trusted LAN, and a reverse proxy with authentication is the answer where that is not enough.
 
 ### Host check
 

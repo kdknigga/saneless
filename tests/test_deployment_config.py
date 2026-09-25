@@ -103,6 +103,7 @@ from saneless.config import (
     is_placeholder_token,
 )
 from saneless.vocabulary import (
+    HIDDEN_JOB_TITLE,
     ExitCode,
     JobState,
     RequestRejection,
@@ -6378,3 +6379,35 @@ def test_docs_that_list_the_checks_name_every_check() -> None:
         "every page that lists them must list all of them and must not count "
         "them as five:\n" + "\n".join(offenders)
     )
+
+
+WEB_API_REFERENCE = DOCS_DIR / "reference" / "web-api.md"
+FIRST_WEB_UI_SCAN = DOCS_DIR / "getting-started" / "first-web-ui-scan.md"
+
+
+def test_web_api_reference_states_what_an_unauthenticated_client_can_read() -> None:
+    """
+    The API reference says what the LAN can read, and where the rest lives.
+
+    The web UI has no login, so the reference is the one place a reader can
+    learn what any device on the network is shown: the generic title for
+    another browser's scan, and the server-side command that keeps the full
+    text.  The generic title is read from ``vocabulary`` so the page and the
+    code cannot name it differently.
+    """
+    text, name = _read(WEB_API_REFERENCE)
+    for needle in (
+        "What an unauthenticated client can read",
+        HIDDEN_JOB_TITLE,
+        "saneless jobs --json",
+    ):
+        assert needle in text, f"{name} does not mention {needle!r}"
+
+
+def test_first_web_ui_scan_no_longer_says_every_viewer_sees_the_same() -> None:
+    """The getting-started page no longer promises every browser the same view."""
+    text, name = _read(FIRST_WEB_UI_SCAN)
+    assert "is the same for both" not in text, (
+        f"{name} still says the title and thumbnail are the same for every viewer"
+    )
+    assert HIDDEN_JOB_TITLE in text, f"{name} does not name the generic title"
