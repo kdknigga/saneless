@@ -21,9 +21,15 @@ A Host is trusted when, ignoring case, the port and one trailing dot, it is:
 ``allowed_hosts`` adds to the defaults and never replaces them, so adding a
 name can never lock anyone out of ``http://<lan-ip>:8080``.
 
-Only ``Host`` is read.  ``X-Forwarded-Host`` is never consulted: a rebinding
+Only ``Host`` decides.  ``X-Forwarded-Host`` is never trusted: a rebinding
 page cannot set it on a simple request, but a client that can set it could
-name anything, so trusting it would let any value through.
+name anything, so trusting it would let any value through.  It is read for one
+thing only.  A reverse proxy that replaces ``Host`` with its upstream's name,
+nginx's default, sends a name saneless always answers to, such as
+``saneless:8080``, and so turns the check off for every request through it
+without a single refusal to show for it.  When a trusted ``Host`` arrives
+beside an ``X-Forwarded-Host`` naming a different host, the guard logs one
+WARNING saying so, and answers the request as before.
 
 A well-formed Host that is not trusted gets 421 Misdirected Request, with a
 sentence naming the key to set and the refused Host beside it.  A missing,
@@ -69,6 +75,7 @@ _HOST_PATTERN: Final = re.compile(
     r"(?P<name>[a-z0-9._-]+|\[[a-f0-9]*:[a-f0-9.:]+\])(?::[0-9]+)?"
 )
 _HOST_HEADER: Final = b"host"
+_FORWARDED_HOST_HEADER: Final = b"x-forwarded-host"
 _LOCALHOST: Final = "localhost"
 
 
@@ -180,6 +187,29 @@ def host_verdict(values: Sequence[str], allowed: tuple[str, ...]) -> HostVerdict
     return verdict
 
 
+def _replaced_host(host: str, forwarded: Sequence[str]) -> str | None:
+    """
+    Return the name a proxy forwarded when it differs from ``Host``.
+
+    Args:
+        host: The request's one ``Host`` value, already found well-formed.
+        forwarded: Every ``X-Forwarded-Host`` value the request carried.
+
+    Returns:
+        The first ``X-Forwarded-Host`` entry, the one the first proxy saw,
+        when it is a well-formed host naming another host than ``host``;
+        else None.  Ports are ignored, as the Host check ignores them.
+
+    """
+    if not forwarded:
+        return None
+    first = forwarded[0].split(",", 1)[0].strip()
+    name = _split_host(first)
+    if name is None or name == _split_host(host):
+        return None
+    return first
+
+
 class HostGuard:
     """
     Pure ASGI middleware that refuses a request whose Host does not name saneless.
@@ -209,6 +239,7 @@ class HostGuard:
         """
         self.app = app
         self.allowed_hosts = tuple(allowed_hosts)
+        self._reported_replaced_host = False
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         """
@@ -229,6 +260,8 @@ class HostGuard:
                 if key.lower() == _HOST_HEADER
             ]
             verdict = host_verdict(values, self.allowed_hosts)
+            if verdict is HostVerdict.TRUSTED and not self._reported_replaced_host:
+                self._report_replaced_host(scope, values[0])
             if verdict is not HostVerdict.TRUSTED:
                 request = Request(scope)
                 echoed_host = self._log_refusal(request, verdict, values)
@@ -246,6 +279,37 @@ class HostGuard:
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+    def _report_replaced_host(self, scope: Scope, host: str) -> None:
+        """
+        Log one WARNING the first time a proxy is seen replacing ``Host``.
+
+        Once per guard, so a misconfigured proxy costs one log line rather
+        than one per request.  The request itself is not affected.
+
+        Args:
+            scope: The ASGI connection scope of a request with a trusted Host.
+            host: That request's ``Host`` value.
+
+        """
+        forwarded = [
+            value.decode("latin-1")
+            for key, value in scope["headers"]
+            if key.lower() == _FORWARDED_HOST_HEADER
+        ]
+        forwarded_host = _replaced_host(host, forwarded)
+        if forwarded_host is None:
+            return
+        self._reported_replaced_host = True
+        logger.warning(
+            "A request arrived with Host %r and X-Forwarded-Host %r: a reverse "
+            "proxy is replacing the Host the browser sent, so the Host check "
+            "cannot refuse DNS rebinding through it. Have the proxy pass the "
+            "original Host header, and list its public name in [web] allowed_hosts. "
+            "This is logged once.",
+            neutralise_bounded(host, ECHOED_HOST_MAX_LENGTH),
+            neutralise_bounded(forwarded_host, ECHOED_HOST_MAX_LENGTH),
+        )
 
     @staticmethod
     def _log_refusal(

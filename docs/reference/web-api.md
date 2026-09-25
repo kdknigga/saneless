@@ -374,7 +374,9 @@ saneless answers a request only when its `Host` header names saneless. The check
 
 The port is ignored, case does not matter, and one trailing dot is dropped. To reach saneless by any other name, such as a reverse proxy's public name, add it to [`[web] allowed_hosts`](configuration.md#web). The list adds to the names above and never replaces them, so `http://<lan-ip>:8080` always keeps working.
 
-Only `Host` is read. `X-Forwarded-Host` is never consulted, so a trusted value there does not rescue a request whose `Host` is refused.
+Only `Host` decides. `X-Forwarded-Host` is never trusted, so a trusted value there does not rescue a request whose `Host` is refused.
+
+A reverse proxy must therefore pass the browser's original `Host`. One that replaces it with its upstream's name, such as `saneless:8080`, sends a name saneless always answers to, which turns the Host check off for every request through the proxy. saneless answers those requests as usual, but the first time a trusted `Host` arrives beside an `X-Forwarded-Host` naming a different host, it logs one warning naming both.
 
 A request whose `Host` is a well-formed name that saneless does not answer to gets `421` with the `HOST_NOT_ALLOWED` sentence and the refused `Host` beside it (see [Errors](#errors)). The server logs one warning per refusal naming the `Host`, the method and the path. A request with no `Host`, an empty one, two of them, or one that is not a valid host name gets `400` with the `CLIENT_ERROR` sentence.
 
@@ -388,7 +390,7 @@ saneless rejects state-changing requests that did not come from a saneless page,
 
 A rejected request gets `403` with the message "This request was blocked because it did not come from the saneless page. If saneless is behind a reverse proxy, make sure the proxy passes the original Host header.", and the server logs a warning that names the `Origin`, `Host`, `X-Forwarded-Host` and `Sec-Fetch-Site` values it saw.
 
-Browsers do not send `Sec-Fetch-Site` to a plain-HTTP address such as `http://<lan-ip>:8080`, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it at all, so those requests are checked by `Origin` against `Host`. A reverse proxy in front of saneless should therefore preserve the original `Host` header (nginx: `proxy_set_header Host $host;`) or set `X-Forwarded-Host`, over HTTPS as well as plain HTTP; otherwise every scan from such a browser is rejected. See [Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy).
+Browsers do not send `Sec-Fetch-Site` to a plain-HTTP address such as `http://<lan-ip>:8080`, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it at all, so those requests are checked by `Origin` against `Host`. A reverse proxy in front of saneless must therefore preserve the original `Host` header (nginx: `proxy_set_header Host $host;`), over HTTPS as well as plain HTTP; otherwise every scan from such a browser is rejected unless the proxy sets `X-Forwarded-Host`, and even then the [Host check](#host-check) cannot refuse DNS rebinding through the proxy. See [Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy).
 
 **The Host check is what stops DNS rebinding.** A hostile site can make its own hostname resolve first to its server and then to saneless's LAN address. The browser then treats the hostile page and saneless as the same origin, so the `Origin` and `Host` headers agree and the cross-site check above passes. Before the Host check existed, such a page could read job titles, scan previews and your paperless-ngx tag and correspondent names, as well as start scans. Its requests still carry the hostile hostname in `Host`, though, and the Host check refuses them with `421` before they reach anything else.
 

@@ -6440,3 +6440,36 @@ def test_allowed_hosts_docs_warn_against_a_shared_suffix() -> None:
         if needle not in body
     ]
     assert not offenders, "\n".join(offenders)
+
+
+def test_proxy_docs_require_the_original_host_header() -> None:
+    """
+    The proxy guidance makes passing ``Host`` mandatory, not an alternative.
+
+    saneless never trusts ``X-Forwarded-Host``.  A proxy that sets it and
+    replaces ``Host`` with its upstream's name sends a name saneless always
+    answers to, which turns the Host check off for every request through the
+    proxy, so offering that header as an alternative is wrong advice.
+    """
+    deploy_text, deploy_name = _read(DEPLOY_HOWTO)
+    api_text, api_name = _read(WEB_API_REFERENCE)
+    sections = {
+        f"{deploy_name} ## Running behind a reverse proxy": _section(
+            deploy_text, "## Running behind a reverse proxy", deploy_name
+        ),
+        f"{api_name} ### Host check": _subsection(api_text, "### Host check", api_name),
+        f"{api_name} ### Cross-site requests": _subsection(
+            api_text, "### Cross-site requests", api_name
+        ),
+    }
+    offenders = [
+        f"{where} still offers X-Forwarded-Host in place of the original Host"
+        for where, body in sections.items()
+        if "or set `X-Forwarded-Host`" in body
+    ]
+    offenders.extend(
+        f"{where} does not say a replaced Host turns the Host check off"
+        for where in list(sections)[:2]
+        if "turns the Host check off" not in sections[where]
+    )
+    assert not offenders, "\n".join(offenders)

@@ -232,6 +232,74 @@ def test_x_forwarded_host_never_rescues_a_foreign_host(client: TestClient) -> No
     assert response.status_code == 421
 
 
+PROXY_UPSTREAM_HOST = "saneless:8080"
+PUBLIC_NAME = "scan.example.com"
+
+
+def _rewrite_warnings(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """Return the guard's records about a proxy that replaced the Host."""
+    return [
+        r
+        for r in caplog.records
+        if r.name == GUARD_LOGGER and "X-Forwarded-Host" in r.getMessage()
+    ]
+
+
+def test_a_proxy_that_rewrites_host_is_logged_once(
+    client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A trusted Host beside an X-Forwarded-Host naming another host warns once.
+
+    nginx without ``proxy_set_header Host`` sends its upstream's name, a
+    single label saneless always answers to, and puts the browser's name in
+    X-Forwarded-Host.  Every request through it passes the Host check, so the
+    check is off for them.  The request is still answered: the header is
+    never trusted, only reported.
+    """
+    headers = {"Host": PROXY_UPSTREAM_HOST, "X-Forwarded-Host": PUBLIC_NAME}
+    with caplog.at_level(logging.WARNING, logger=GUARD_LOGGER):
+        first = client.get("/health", headers=headers)
+        second = client.get("/health", headers=headers)
+    assert first.status_code == 200
+    assert second.status_code == 200
+    records = _rewrite_warnings(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    message = records[0].getMessage()
+    assert f"{PROXY_UPSTREAM_HOST!r}" in message
+    assert f"{PUBLIC_NAME!r}" in message
+    assert "original Host" in message
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({"Host": PROXY_UPSTREAM_HOST}, id="no-forwarded-host"),
+        pytest.param(
+            {"Host": PROXY_UPSTREAM_HOST, "X-Forwarded-Host": "SANELESS"},
+            id="forwarded-host-names-the-same-host",
+        ),
+        pytest.param(
+            {"Host": "box.local:8080", "X-Forwarded-Host": "box.local, proxy.lan"},
+            id="first-forwarded-entry-matches",
+        ),
+        pytest.param(
+            {"Host": PROXY_UPSTREAM_HOST, "X-Forwarded-Host": "<b>"},
+            id="malformed-forwarded-host",
+        ),
+    ],
+)
+def test_a_proxy_that_keeps_host_is_not_reported(
+    client: TestClient, caplog: pytest.LogCaptureFixture, headers: dict[str, str]
+) -> None:
+    """Only a forwarded name that differs from Host means the Host was replaced."""
+    with caplog.at_level(logging.WARNING, logger=GUARD_LOGGER):
+        response = client.get("/health", headers=headers)
+    assert response.status_code == 200
+    assert _rewrite_warnings(caplog) == []
+
+
 def test_a_lan_address_with_a_port_is_answered(client: TestClient) -> None:
     """The address the documented deployment is reached at keeps working."""
     response = client.get("/health", headers={"Host": LAN_HOST})
