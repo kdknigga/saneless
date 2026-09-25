@@ -11,6 +11,10 @@ One class deliberately does keep a real page in the picture --
 ``TestStatisticsComeFromASpooledPage`` runs pages through a real
 ``SpooledPageSink`` -- so the numbers the rest of the file passes as literals
 are still proven to be the numbers a real page produces.
+
+The ink-coverage rule that replaces it -- ``measure_ink`` and ``is_blank`` --
+is judged on the synthetic pages in ``tests.blank_fixtures``, by verdict only:
+no test here compares a coverage or a paper-white level with a literal.
 """
 
 from __future__ import annotations
@@ -19,8 +23,10 @@ import base64
 import inspect
 import io
 import os
+import re
 import subprocess
 import sys
+from functools import partial
 from typing import TYPE_CHECKING
 
 import pytest
@@ -30,9 +36,31 @@ import saneless
 import saneless.cli as cli_module
 import saneless.pages as pages_module
 from saneless.config import ProfileConfig
-from saneless.pages import filter_empty_pages, generate_thumbnail, is_empty_page
+from saneless.pages import (
+    EDGE_TRIM,
+    INK_DELTA,
+    PAPER_PERCENTILE,
+    PAPER_WHITE_FLOOR,
+    InkMeasurement,
+    filter_empty_pages,
+    generate_thumbnail,
+    is_blank,
+    is_empty_page,
+    measure_ink,
+)
 from saneless.pipeline import _SPOOL_LABEL_A
 from saneless.spool import SpooledPageSink
+from tests.blank_fixtures import (
+    dusty_blank,
+    footer_page_number,
+    framed_blank,
+    highlighter_stroke,
+    lone_digit,
+    pencil_lines,
+    reverse_text_cover,
+    tinted_blank,
+    typed_line,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -51,6 +79,19 @@ _TEST_RESERVE_MB = 1
 _PROFILE_DEFAULTS = ProfileConfig()
 _MEAN_THRESHOLD = _PROFILE_DEFAULTS.empty_page_mean_threshold
 _STDDEV_THRESHOLD = _PROFILE_DEFAULTS.empty_page_stddev_threshold
+
+# The ink-coverage threshold, in percent of the inset, the verdict tests judge
+# at: the value the profile model will ship as its default once the coverage
+# rule replaces the mean/stddev one, where these verdicts are asserted again
+# against the real default.
+THRESHOLD = 0.001
+
+# A verdict, as the per-page log line names it.
+_KEEP = "KEEP"
+_REMOVE = "REMOVE"
+
+# The pixel size of an A4 page scanned at 300 dpi.
+_A4_300DPI = (2480, 3508)
 
 # The pixel ceiling the application relaxes Pillow's decompression-bomb check
 # to at start-up: above a 1200 dpi A4 colour page, about 139M pixels.
@@ -163,6 +204,63 @@ def _inked_page() -> Image.Image:
     draw = ImageDraw.Draw(page)
     draw.rectangle([20, 20, 180, 280], fill="black")
     return page
+
+
+def _white_a4_page() -> Image.Image:
+    """
+    Return an A4 300 dpi page with no noise and no ink at all.
+
+    Returns:
+        A pure white ``L`` image the size of a real scan.
+
+    """
+    return Image.new("L", _A4_300DPI, 255)
+
+
+def _verdict(image: Image.Image, *, threshold: float = THRESHOLD) -> str:
+    """
+    Measure a page's ink and judge it at a coverage threshold.
+
+    Args:
+        image: The page to judge.
+        threshold: The coverage threshold, in percent of the inset.
+
+    Returns:
+        ``"REMOVE"`` when the rule calls the page blank, else ``"KEEP"``.
+
+    """
+    measurement = measure_ink(image)
+    blank = is_blank(
+        measurement.coverage,
+        measurement.paper_white,
+        coverage_threshold=threshold,
+    )
+    return _REMOVE if blank else _KEEP
+
+
+# Every synthetic page and the verdict the review expects at ``THRESHOLD``:
+# sparse or faint content is kept, and blanks -- tinted, dusty or framed --
+# are removed.  The bright-paper cases are the pages today's mean/stddev rule
+# deletes; on the tinted paper the rest sit on, that rule keeps every blank.
+_FIXTURE_VERDICTS: list[tuple[str, Callable[[], Image.Image], str]] = [
+    ("footer-10mm", partial(footer_page_number, 10), _KEEP),
+    ("footer-12.5mm", partial(footer_page_number, 12.5), _KEEP),
+    ("footer-15mm", partial(footer_page_number, 15), _KEEP),
+    ("footer-21mm", partial(footer_page_number, 21), _KEEP),
+    ("footer-bright-paper", partial(footer_page_number, tint=255), _KEEP),
+    ("lone-digit", lone_digit, _KEEP),
+    ("pencil-lines", pencil_lines, _KEEP),
+    ("pencil-bright-paper", partial(pencil_lines, tint=255), _KEEP),
+    ("typed-line", typed_line, _KEEP),
+    ("highlighter", highlighter_stroke, _KEEP),
+    ("reverse-text-cover", reverse_text_cover, _KEEP),
+    ("tinted-noise-3", partial(tinted_blank, noise=3), _REMOVE),
+    ("tinted-noise-6", partial(tinted_blank, noise=6), _REMOVE),
+    ("dusty-5-specks", partial(dusty_blank, 5), _REMOVE),
+    ("frame-2mm", partial(framed_blank, 2), _REMOVE),
+    ("frame-3mm", partial(framed_blank, 3), _REMOVE),
+    ("frame-4mm", partial(framed_blank, 4), _REMOVE),
+]
 
 
 class TestEmptyPageDetection:
@@ -460,3 +558,123 @@ class TestThresholdsHaveOneSource:
         for name in ("mean_threshold", "stddev_threshold"):
             assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
             assert parameters[name].default is inspect.Parameter.empty
+
+
+class TestInkCoverage:
+    """
+    ``measure_ink`` and ``is_blank`` judge pages by the presence of ink.
+
+    A page is blank when the share of its inset darker than the paper by more
+    than a fixed margin is at or below the threshold, and its paper is light
+    enough to be paper at all.  Only verdicts are asserted: the measurement's
+    numbers are not pinned to literals.
+    """
+
+    @pytest.mark.parametrize(
+        ("build", "expected"),
+        [
+            pytest.param(build, expected, id=name)
+            for name, build, expected in _FIXTURE_VERDICTS
+        ],
+    )
+    def test_fixture_verdicts_at_the_shipped_threshold(
+        self, build: Callable[[], Image.Image], expected: str
+    ) -> None:
+        """Sparse and faint content is kept; tinted, dusty and framed blanks go."""
+        assert _verdict(build()) == expected
+
+    def test_the_existing_content_fixture_is_kept(
+        self, content_page_image: Image.Image
+    ) -> None:
+        """The shared inked fixture stays content under the new rule."""
+        assert _verdict(content_page_image) == _KEEP
+
+    def test_the_existing_near_white_fixture_is_removed(
+        self, empty_page_image: Image.Image
+    ) -> None:
+        """The shared near-white fixture stays blank under the new rule."""
+        assert _verdict(empty_page_image) == _REMOVE
+
+    def test_every_coloured_adf_page_is_kept(
+        self, multi_page_images: list[Image.Image]
+    ) -> None:
+        """
+        The solid red, blue, green and yellow pages are kept; the white one goes.
+
+        Yellow is the case a luminance-only measurement gets wrong: its darkest
+        channel is what shows it is not paper.
+        """
+        white, *coloured = multi_page_images
+
+        assert _verdict(white) == _REMOVE
+        assert [_verdict(page) for page in coloured] == [_KEEP] * len(coloured)
+
+    def test_threshold_zero_removes_only_inkless_pages(self) -> None:
+        """At a threshold of zero a noise-only blank goes and one digit stays."""
+        assert _verdict(tinted_blank(noise=3), threshold=0.0) == _REMOVE
+        assert _verdict(lone_digit(), threshold=0.0) == _KEEP
+
+    @pytest.mark.parametrize(
+        ("build", "expected"),
+        [
+            pytest.param(typed_line, _KEEP, id="typed-line"),
+            pytest.param(_white_a4_page, _REMOVE, id="white-page"),
+        ],
+    )
+    def test_measure_ink_accepts_one_bit_greyscale_and_rgb(
+        self, build: Callable[[], Image.Image], expected: str
+    ) -> None:
+        """
+        A page gets the same verdict in each mode the spool can hand over.
+
+        The one-bit version is thresholded without dithering, because the
+        default dither turns a tinted page into scattered black dots.
+        """
+        greyscale = build()
+        pages = {
+            "1": greyscale.convert("1", dither=Image.Dither.NONE),
+            "L": greyscale,
+            "RGB": greyscale.convert("RGB"),
+        }
+
+        verdicts = {mode: _verdict(page) for mode, page in pages.items()}
+
+        assert verdicts == dict.fromkeys(pages, expected)
+
+    @pytest.mark.parametrize("mode", ["RGBA", "CMYK", "I;16", "P"])
+    def test_measure_ink_refuses_other_modes(self, mode: str) -> None:
+        """Any mode but 1, L and RGB is refused by name rather than guessed at."""
+        with pytest.raises(ValueError, match=re.escape(mode)):
+            measure_ink(Image.new(mode, (200, 300)))
+
+    def test_measure_ink_names_its_two_fields(self) -> None:
+        """The result is an ``InkMeasurement`` of coverage and paper white."""
+        measurement = measure_ink(typed_line())
+
+        assert isinstance(measurement, InkMeasurement)
+        assert measurement == (measurement.coverage, measurement.paper_white)
+
+    def test_paper_white_floor_keeps_a_dark_page(self) -> None:
+        """Paper darker than the floor is kept at any threshold."""
+        assert is_blank(0.0, PAPER_WHITE_FLOOR - 1, coverage_threshold=100.0) is False
+
+    def test_blank_means_at_or_below_the_threshold(self) -> None:
+        """Coverage equal to the threshold is blank; any more is content."""
+        assert is_blank(THRESHOLD, PAPER_WHITE_FLOOR, coverage_threshold=THRESHOLD)
+        assert not is_blank(
+            THRESHOLD * 2, PAPER_WHITE_FLOOR, coverage_threshold=THRESHOLD
+        )
+
+    def test_constants_are_module_constants(self) -> None:
+        """The trim, percentile, delta and floor are design values, not knobs."""
+        assert EDGE_TRIM == 0.03
+        assert INK_DELTA == 40
+        assert PAPER_PERCENTILE == 0.99
+        assert PAPER_WHITE_FLOOR == 128
+
+    def test_the_threshold_is_a_required_keyword(self) -> None:
+        """``is_blank`` takes its threshold from the caller, never a default."""
+        parameter = inspect.signature(is_blank).parameters["coverage_threshold"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
