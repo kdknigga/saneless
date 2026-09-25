@@ -443,6 +443,9 @@ class RunArtefacts:
             run failed, with the words that say how.  Such a PDF is still
             kept, because paperless-ngx may yet fail to consume it, but the
             sentence says it got there, so nobody uploads it again unchecked.
+        unreadable_sheets: How many sheets the passes that finished reported
+            they could not read.  A pass that stopped part way never reports
+            its own, so zero means none is known, not that none was skipped.
 
     """
 
@@ -457,6 +460,7 @@ class RunArtefacts:
     document: tuple[PageRecord, ...] | None = None
     pdfs: list[Path] = field(default_factory=list)
     accepted: dict[Path, str] = field(default_factory=dict)
+    unreadable_sheets: int = 0
 
 
 class KeptKind(StrEnum):
@@ -639,8 +643,9 @@ def build_pass_pdf(
     sheet order. When pass B fed the whole stack and no sheet was skipped,
     its page N is the back of the ``(fronts)`` PDF's page N. A pass B that
     stopped part way fed only the last sheets of the stack, so with ``k``
-    backs of ``n`` fronts its page 1 is the back of fronts page ``n - k + 1``;
-    ``_keep_passes`` says so in the report.
+    backs of ``n`` fronts, and every sheet fed once, its page 1 is the back
+    of fronts page ``n - k + 1``; ``_keep_passes`` says so in the report, or
+    that no page can be named when a sheet could not be read.
 
     Nothing is blank-filtered: an anomaly is kept whole for a person to look
     at.
@@ -834,19 +839,55 @@ def _keep_passes(artefacts: RunArtefacts, report: PreservationReport) -> bool:
         (records for suffix, records in passes if suffix == FRONTS_SUFFIX), ()
     )
     backs = next((records for suffix, records in passes if suffix == BACKS_SUFFIX), ())
-    if complete and len(backs) < len(fronts) and backs:
-        # Only a pass B that stopped part way leaves fewer backs than fronts
-        # here, and it fed the stack from its last sheet.
-        report.cautions.append(
-            f"Pass B feeds the stack from its last sheet, so the {len(backs)} "
-            f"{BACKS_SUFFIX} page(s) are the backs of the last {len(backs)} of "
-            f"the {len(fronts)} sheets: {BACKS_SUFFIX} page 1 goes with "
-            f"{FRONTS_SUFFIX} page {len(fronts) - len(backs) + 1}"
-        )
+    pairing = _pairing_caution(len(fronts), len(backs), artefacts.unreadable_sheets)
+    if complete and pairing is not None:
+        report.cautions.append(pairing)
     if kept:
         out_of = total if pages < total else None
         report.groups.append(KeptGroup(KeptKind.PASSES, tuple(kept), pages, out_of))
     return complete
+
+
+def _pairing_caution(fronts: int, backs: int, unreadable: int) -> str | None:
+    """
+    Say how the kept ``(backs)`` pages pair with the ``(fronts)``, if needed.
+
+    Pairing by page number holds only while every sheet was fed exactly once
+    on both passes.  A sheet a pass reported it could not read breaks that
+    for certain, whatever the counts, so no page is named then.  Otherwise
+    the fewer backs of a pass B that stopped part way are the backs of the
+    last sheets, because pass B feeds the flipped stack from its last sheet;
+    that is still stated only on condition, because a pass B that stopped
+    part way never reports the sheets it skipped, and no pass reports a sheet
+    it missed or fed twice.
+
+    Args:
+        fronts: How many ``(fronts)`` pages were kept.
+        backs: How many ``(backs)`` pages were kept.
+        unreadable: How many sheets the finished passes could not read.
+
+    Returns:
+        The caution, or None when there are no backs to pair or the counts
+        match with no sheet known to be skipped.
+
+    """
+    if not backs:
+        return None
+    if unreadable:
+        return (
+            f"{unreadable} sheet(s) could not be read, so the {BACKS_SUFFIX} "
+            f"pages cannot be paired with the {FRONTS_SUFFIX} pages by page "
+            f"number: match them by what is on the pages"
+        )
+    if backs >= fronts:
+        return None
+    return (
+        f"Pass B feeds the stack from its last sheet, so if every sheet was fed "
+        f"exactly once, the {backs} {BACKS_SUFFIX} page(s) are the backs of the "
+        f"last {backs} of the {fronts} sheets and {BACKS_SUFFIX} page 1 goes "
+        f"with {FRONTS_SUFFIX} page {fronts - backs + 1}; a sheet skipped, "
+        f"missed or fed twice shifts that, so check by what is on the pages"
+    )
 
 
 def _keep_page_files(artefacts: RunArtefacts, report: PreservationReport) -> None:

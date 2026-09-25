@@ -628,10 +628,14 @@ class _SpoolLedger:
         passes: One ``(title suffix, sink)`` pair per acquisition pass, in
             pass order. The suffix is what the preserved PDF's name says the
             half is: ``(partial)``, ``(fronts)`` or ``(backs)``.
+        unreadable_sheets: How many sheets the passes that returned a batch
+            reported they could not read, so a kept pair of halves is not
+            said to pair by page number when they cannot.
 
     """
 
     passes: list[tuple[str, SpooledPageSink]] = field(default_factory=list)
+    unreadable_sheets: int = 0
 
     def register(self, suffix: str, sink: SpooledPageSink) -> None:
         """
@@ -1176,6 +1180,7 @@ class _PipelineRun:
             # dpi it was read back at; the artefacts are what the
             # preservation reads.
             self.artefacts.passes = self.ledger.spooled()
+            self.artefacts.unreadable_sheets = self.ledger.unreadable_sheets
             report = self._preserve()
             sentence = report.sentence()
             if sentence is not None:
@@ -1463,6 +1468,7 @@ class _PipelineRun:
         front_batch = self.scanner.scan_pages(
             self.device_id, self.scan_settings, front_sink
         )
+        self.ledger.unreadable_sheets += front_batch.pages_rejected
         # Before the flip prompt, so nobody is asked to flip nothing.
         _require_pages(front_batch)
         front_pages = front_batch.pages
@@ -1528,6 +1534,7 @@ class _PipelineRun:
         back_batch = self.scanner.scan_pages(
             self.device_id, self.scan_settings, back_sink
         )
+        self.ledger.unreadable_sheets += back_batch.pages_rejected
         # Before the count comparison, so no half is assembled from an empty list.
         # Not _require_pages: "No pages were scanned" is false once pass A fed the
         # fronts, so the message names the pass and what pass A scanned.

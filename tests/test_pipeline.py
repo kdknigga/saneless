@@ -3806,6 +3806,8 @@ def _failing_in_pass_b(
     fronts: int,
     backs: int,
     failure: BaseException,
+    *,
+    unreadable_fronts: int = 0,
 ) -> Callable[[str, ScanSettings, PageSink], ScanBatch]:
     """
     Build a manual-duplex ``side_effect`` whose second pass fails part-way.
@@ -3818,6 +3820,7 @@ def _failing_in_pass_b(
         fronts: How many sheets pass A feeds.
         backs: How many sheets pass B gets through before the fault.
         failure: What the device raises on the next sheet of pass B.
+        unreadable_fronts: How many sheets pass A reports it could not read.
 
     Returns:
         A callable with ``scan_pages``' own shape, for ``MagicMock.side_effect``.
@@ -3834,7 +3837,9 @@ def _failing_in_pass_b(
         calls += 1
         if index == 0:
             pages = [distinct_page(number) for number in range(fronts)]
-            return spooling(pages)(device_id, settings, sink)
+            return spooling(pages, rejected=unreadable_fronts)(
+                device_id, settings, sink
+            )
         for number in range(backs):
             sink.add(distinct_page(fronts + number), dpi=settings.resolution)
         raise failure
@@ -3922,6 +3927,43 @@ class TestPassBAndFlipFailuresKeepTheFronts:
         assert excinfo.value is original
         assert "4 page(s)" in failure_text(excinfo.value)
         paperless.upload_document.assert_not_called()
+
+    def test_a_sheet_pass_a_could_not_read_voids_the_page_pairing(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Pass A skipped a sheet, so the kept halves cannot be paired by number.
+
+        Four fronts for five sheets: counting back from the fourth front would
+        pair the first back with the wrong front, so the error says to pair
+        them by content instead of naming a page.
+        """
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        original = ScanError("Scanner error on page 3 of pass B: Paper jam")
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = _failing_in_pass_b(
+            4, 2, original, unreadable_fronts=1
+        )
+
+        with pytest.raises(ScanError) as excinfo:
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Skipped Front",
+                    job_id="job-passb-skip",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assert _preserved_page_counts(failed_dir) == {"fronts": 4, "backs": 2}
+        message = failure_text(excinfo.value)
+        assert "cannot be paired" in message
+        assert "goes with" not in message
 
     def test_pass_b_preserves_fronts_when_it_is_empty(
         self,

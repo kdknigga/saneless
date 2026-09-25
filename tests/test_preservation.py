@@ -342,8 +342,35 @@ class TestTheMostFinishedArtefactIsKept:
 
         sentence = report.sentence()
         assert sentence is not None
+        assert "if every sheet was fed exactly once" in sentence
         assert "the backs of the last 2 of the 5 sheets" in sentence
         assert f"{BACKS_SUFFIX} page 1 goes with {FRONTS_SUFFIX} page 4" in sentence
+
+    @pytest.mark.parametrize(("fronts", "backs"), [(4, 2), (3, 3)])
+    def test_an_unreadable_sheet_voids_the_page_pairing(
+        self, tmp_path: Path, fronts: int, backs: int
+    ) -> None:
+        """
+        A sheet a pass could not read shifts every later page of that pass.
+
+        So no front can be named for any back, whatever the counts, and the
+        caution says to pair the halves by content instead.
+        """
+        artefacts = _artefacts(tmp_path, RunStage.ACQUIRING)
+        front_records = _spool(artefacts.spool_dir, "a", fronts)
+        back_records = _spool(artefacts.spool_dir, "b", backs, first=fronts)
+        artefacts.passes = [
+            (FRONTS_SUFFIX, front_records),
+            (BACKS_SUFFIX, back_records),
+        ]
+        artefacts.unreadable_sheets = 1
+
+        report = preserve_most_finished(artefacts)
+
+        (caution,) = report.cautions
+        assert "1 sheet(s) could not be read" in caution
+        assert "cannot be paired" in caution
+        assert "goes with" not in caution
 
     def test_a_whole_pass_b_needs_no_pairing_caution(self, tmp_path: Path) -> None:
         """As many backs as fronts: nothing to explain."""
