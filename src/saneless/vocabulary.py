@@ -505,7 +505,7 @@ HIDDEN_WARNING_LINE: Final = (
     "This scan has a warning. On the server, saneless jobs --json shows it."
 )
 HIDDEN_PRESERVED_ERROR: Final = (
-    "The PDF was kept in the failed folder on the server. "
+    "The scan was kept in the failed folder on the server. "
     "saneless jobs --json shows where."
 )
 HIDDEN_ERROR_DETAIL: Final = (

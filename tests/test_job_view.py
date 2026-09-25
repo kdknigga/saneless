@@ -18,7 +18,13 @@ from typing import TYPE_CHECKING, TypedDict, Unpack
 import pytest
 
 from saneless.config import OutputConfig, PaperlessConfig
+from saneless.exceptions import PaperlessError, PdfError
 from saneless.job import Job, JobStore
+from saneless.pipeline import (
+    _preservation_failure_message,
+    _preserving,
+    _preserving_page_files,
+)
 from saneless.vocabulary import (
     HIDDEN_ERROR_DETAIL,
     HIDDEN_JOB_TITLE,
@@ -233,6 +239,123 @@ def test_preserved_error_relativised_for_owner_hidden_for_others(
     )
     assert other.error == HIDDEN_PRESERVED_ERROR
     assert other.error_category is ErrorCategory.UPLOAD
+
+
+def _stored_error(raised: pytest.ExceptionInfo[Exception]) -> str:
+    """Return the text a job stores for the exception a pipeline guard raised."""
+    return str(raised.value)
+
+
+def test_nothing_preserved_is_never_reported_kept(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A preservation that kept nothing does not tell anyone the scan is safe."""
+    failed_dir = settings.output.failed_dir
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=_preservation_failure_message(
+            PaperlessError("Upload failed"),
+            OSError(28, "No space left on device"),
+            failed_dir,
+            [],
+        ),
+    )
+
+    other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
+
+    assert other.error == HIDDEN_ERROR_DETAIL
+
+
+def test_nothing_preserved_naming_a_file_under_failed_is_not_kept(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A move failure that names its target under ``failed/`` kept nothing."""
+    failed_dir = settings.output.failed_dir
+    target = failed_dir / "20260301-job-1-tax.pdf"
+    page_dir = failed_dir / "20260301-job-1-tax"
+    for destination, failure in (
+        (failed_dir, OSError(28, "No space left on device", str(target))),
+        (page_dir, OSError(28, "No space left on device")),
+    ):
+        job = _job(
+            state=JobState.ERROR,
+            error_category=ErrorCategory.ASSEMBLY,
+            error=_preservation_failure_message(
+                PdfError("Assembly failed"), failure, destination, []
+            ),
+        )
+
+        other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
+
+        assert other.error == HIDDEN_ERROR_DETAIL, job.error
+
+
+def test_partly_preserved_is_reported_kept(settings: Settings, tmp_path: Path) -> None:
+    """A preservation that kept some of the scan says something was kept."""
+    failed_dir = settings.output.failed_dir
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=_preservation_failure_message(
+            PaperlessError("Upload failed"),
+            OSError(28, "No space left on device"),
+            failed_dir,
+            [failed_dir / "front.pdf"],
+        ),
+    )
+
+    other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
+
+    assert other.error == HIDDEN_PRESERVED_ERROR
+
+
+def test_preserved_pdf_is_reported_kept(settings: Settings, tmp_path: Path) -> None:
+    """The message a kept PDF produces tells everyone the scan was kept."""
+    pdf = tmp_path / "scratch-pdf" / "tax.pdf"
+    pdf.parent.mkdir()
+    pdf.write_bytes(b"%PDF-1.7\n")
+    upload_failed = "Upload failed"
+    with (
+        pytest.raises(PaperlessError) as raised,
+        _preserving([pdf], settings.output.failed_dir),
+    ):
+        raise PaperlessError(upload_failed)
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=_stored_error(raised),
+    )
+
+    other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
+
+    assert other.error == HIDDEN_PRESERVED_ERROR
+
+
+def test_preserved_page_files_are_reported_kept(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """Kept page files also count as a kept scan, in wording true of both."""
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    (spool / "page-0001.pnm").write_bytes(b"P5\n")
+    destination = settings.output.failed_dir / "20260301-job-1-tax"
+    assembly_failed = "Assembly failed"
+    with (
+        pytest.raises(PdfError) as raised,
+        _preserving_page_files(spool, destination),
+    ):
+        raise PdfError(assembly_failed)
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.ASSEMBLY,
+        error=_stored_error(raised),
+    )
+
+    other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
+
+    assert other.error == HIDDEN_PRESERVED_ERROR
+    assert "PDF" not in HIDDEN_PRESERVED_ERROR
 
 
 def test_tmp_dir_error_relativised_for_owner_hidden_for_others(

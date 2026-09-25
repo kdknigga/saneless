@@ -66,6 +66,13 @@ _URL_TRAILING = ").,:;'\"]>"
 _PATH_BEFORE = r"(?<![\w.-])"
 _PATH_AFTER = r"(?![\w-]|\.\w)"
 
+# What the pipeline writes directly before the path of something it kept in
+# the failed folder: "The scan was preserved at <path>", "The 3 page(s) ...
+# were preserved at <path>" and, after a partial failure, "Only <path> was
+# kept".  A preservation that kept nothing says "could NOT be preserved to"
+# instead, so none of these appears in its message.
+_KEPT_BEFORE = ("preserved at ", "Only ")
+
 
 @dataclass(frozen=True, slots=True)
 class JobView:
@@ -284,9 +291,15 @@ def _hidden_error(text: str, settings: Settings) -> str:
     """
     Choose the fixed sentence a non-owner sees in place of an error.
 
-    An error that names the failed folder says a PDF was kept, which is worth
-    knowing on any device; the file's name is not, because it carries the
-    document's title.  Every other error gets the pointer to the full text.
+    An error that says part of the scan was kept is worth knowing on any
+    device; the kept file's name is not, because it carries the document's
+    title.  Every other error gets the pointer to the full text.
+
+    Only the pipeline's own statement that something was kept counts: a path
+    inside the failed folder straight after one of ``_KEPT_BEFORE``'s
+    phrases.  Merely naming that folder is not enough, because the message
+    for a preservation that kept nothing names it too, as the destination it
+    could not reach and often again in the file system's own error.
 
     Args:
         text: The stored error text.
@@ -296,6 +309,10 @@ def _hidden_error(text: str, settings: Settings) -> str:
         ``HIDDEN_PRESERVED_ERROR`` or ``HIDDEN_ERROR_DETAIL``.
 
     """
-    if any(folder in text for folder in _spellings(settings.output.failed_dir)):
+    folders = "|".join(
+        re.escape(f"{spelling}/") for spelling in _spellings(settings.output.failed_dir)
+    )
+    phrases = "|".join(re.escape(phrase) for phrase in _KEPT_BEFORE)
+    if re.search(f"(?:{phrases})(?:{folders})", text):
         return HIDDEN_PRESERVED_ERROR
     return HIDDEN_ERROR_DETAIL
