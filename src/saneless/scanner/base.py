@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, assert_never
 
+from saneless.text_safety import neutralise_controls
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -129,6 +131,23 @@ class DeviceInfo:
     vendor: str
     model: str
     device_type: str
+
+    def __post_init__(self) -> None:
+        """
+        Escape control characters in the fields that are only ever shown.
+
+        A saned or eSCL device on the LAN chooses its own vendor, model and
+        type strings, and an ESC among them would reach the operator's terminal
+        as a live escape sequence. Those three are display-only, so they are
+        made safe once, here.
+
+        ``name`` is kept byte for byte: it is passed back to ``sane.open`` and
+        written into the configuration, so changing one character would break
+        the round trip. It is escaped at each place it is displayed instead.
+        """
+        self.vendor = neutralise_controls(self.vendor)
+        self.model = neutralise_controls(self.model)
+        self.device_type = neutralise_controls(self.device_type)
 
 
 @dataclass

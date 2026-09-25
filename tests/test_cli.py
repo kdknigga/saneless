@@ -1506,7 +1506,7 @@ class TestDevicesCommand:
         ]
         assert [
             r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
-        ] == [f"Could not read capabilities for hp:002: {_HALF_BROKEN_REASON}"]
+        ] == [f"Could not read capabilities for 'hp:002': {_HALF_BROKEN_REASON}"]
 
     def test_devices_text_capabilities_reports_a_failed_probe_and_lists_the_rest(
         self, monkeypatch: pytest.MonkeyPatch

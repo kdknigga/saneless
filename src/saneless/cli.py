@@ -73,6 +73,7 @@ from .pipeline import (
     run_pipeline,
 )
 from .scanner.sane_backend import SaneBackend, require_sane
+from .text_safety import neutralise_controls
 from .vocabulary import (
     FALLBACK_NOT_UPLOADED_LINE,
     WARNED_UPLOAD_LABEL,
@@ -813,7 +814,8 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
 
     """
     if caps.sources:
-        click.echo(f"  Sources: {', '.join(caps.sources)}")
+        sources = ", ".join(neutralise_controls(s) for s in caps.sources)
+        click.echo(f"  Sources: {sources}")
     if caps.resolutions:
         click.echo(f"  Resolutions: {', '.join(str(r) for r in caps.resolutions)}")
     elif caps.resolution_range is not None:
@@ -823,12 +825,13 @@ def _echo_capabilities(caps: DeviceCapabilities) -> None:
         low, high, step = caps.resolution_range
         click.echo(f"  Resolution range: {low:g} to {high:g} dpi in steps of {step:g}")
     if caps.modes:
-        click.echo(f"  Modes: {', '.join(caps.modes)}")
+        modes = ", ".join(neutralise_controls(m) for m in caps.modes)
+        click.echo(f"  Modes: {modes}")
     if caps.raw_options:
         click.echo("  Raw options:")
         for opt in caps.raw_options:
             if len(opt) >= 2:
-                click.echo(f"    {opt[1]}")
+                click.echo(f"    {neutralise_controls(str(opt[1]))}")
 
 
 def _capabilities_dict(caps: DeviceCapabilities) -> dict[str, object]:
@@ -885,8 +888,12 @@ def _probe_capabilities(scanner: ScannerBackend, name: str) -> DeviceCapabilitie
         return scanner.get_capabilities(name)
     except ScanError as exc:
         reason = describe(exc)
-        logger.warning("Could not read capabilities for %s: %s", name, reason)
-        click.echo(f"Capabilities for {name}: {reason}", err=True)
+        logger.warning("Could not read capabilities for %r: %s", name, reason)
+        click.echo(
+            f"Capabilities for {neutralise_controls(name)}: "
+            f"{neutralise_controls(reason)}",
+            err=True,
+        )
         return reason
 
 
@@ -907,10 +914,10 @@ def _echo_device_table(device_list: list[DeviceInfo]) -> None:
     click.echo("-" * min(len(header), cols))
     for d in device_list:
         click.echo(
-            f"{_truncate(d.name, name_w):<{name_w}} "
-            f"{_truncate(d.vendor, vendor_w):<{vendor_w}} "
-            f"{_truncate(d.model, model_w):<{model_w}} "
-            f"{d.device_type}"
+            f"{_truncate(neutralise_controls(d.name), name_w):<{name_w}} "
+            f"{_truncate(neutralise_controls(d.vendor), vendor_w):<{vendor_w}} "
+            f"{_truncate(neutralise_controls(d.model), model_w):<{model_w}} "
+            f"{neutralise_controls(d.device_type)}"
         )
 
 
@@ -981,7 +988,7 @@ def _devices_as_text(
             if isinstance(probed, str):
                 failed += 1
                 continue
-            click.echo(f"Capabilities for {d.name}:")
+            click.echo(f"Capabilities for {neutralise_controls(d.name)}:")
             _echo_capabilities(probed)
     return failed
 
@@ -1091,13 +1098,18 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
             click.echo(header)
             click.echo("-" * min(len(header), cols))
             for j in recent:
+                # A stored title or profile can hold a control character, and
+                # this table goes to a terminal. It is escaped before
+                # truncating, so the width is measured on what prints.
+                profile = _truncate(neutralise_controls(j.profile), profile_w)
+                title = _truncate(neutralise_controls(j.title), title_w)
                 click.echo(
                     # The one shared formatter the web history table reads, so
                     # the two surfaces cannot drift. Seconds are gone and
                     # the zone is named.
                     f"{local_time(j.created_at):<{ts_w}} "
-                    f"{_truncate(j.profile, profile_w):<{profile_w}} "
-                    f"{_truncate(j.title, title_w):<{title_w}} "
+                    f"{profile:<{profile_w}} "
+                    f"{title:<{title_w}} "
                     f"{job_label(j.state, j.warning)}"
                 )
     finally:
