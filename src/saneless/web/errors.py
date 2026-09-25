@@ -101,6 +101,9 @@ _SERVER_ERROR_FLOOR = 500
 
 _TITLE_LOC = ("body", "title")
 _TOO_LONG_TYPE = "string_too_long"
+# The error type the scan route's title validator raises for a control
+# character.  Matched by value here, so the two spellings must stay equal.
+_TITLE_CONTROL_TYPE = "title_control_character"
 
 
 class RequestRejected(HTTPException):
@@ -314,15 +317,20 @@ async def _validation_error(request: Request, exc: Exception) -> Response:
         request.url.path,
         failures,
     )
+    title_has_control = any(
+        loc == _TITLE_LOC and error_type == _TITLE_CONTROL_TYPE
+        for loc, error_type in failures
+    )
     title_too_long = any(
         loc == _TITLE_LOC and error_type == _TOO_LONG_TYPE
         for loc, error_type in failures
     )
-    rejection = (
-        RequestRejection.TITLE_TOO_LONG
-        if title_too_long
-        else RequestRejection.INVALID_REQUEST
-    )
+    if title_has_control:
+        rejection = RequestRejection.TITLE_HAS_CONTROL
+    elif title_too_long:
+        rejection = RequestRejection.TITLE_TOO_LONG
+    else:
+        rejection = RequestRejection.INVALID_REQUEST
     return render_error(
         request, rejection, status_code=rejection_status_code(rejection)
     )

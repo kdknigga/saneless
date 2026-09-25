@@ -91,8 +91,8 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `profile` | string | yes | Scan profile name from config |
-| `title` | string | no | Document title, at most 256 characters (auto-generated from timestamp if empty) |
-| `tags` | int[] | no | Paperless-ngx tag IDs |
+| `title` | string | no | Document title, at most 256 characters, with no tab or other control character (auto-generated from timestamp if empty) |
+| `tags` | int[] | no | Paperless-ngx tag IDs, at most 100 |
 | `correspondent` | int | no | Paperless-ngx correspondent ID |
 
 **Responses:**
@@ -101,11 +101,13 @@ Starts a new scan job. Accepts form data (designed for HTMX form submission).
 |-------------|---------|
 | 200 | The job is queued. HTML partial: the status indicator for HTMX swap, plus an out-of-band Scan button and an out-of-band clear of any earlier error message. |
 | 403 | The request was blocked as cross-site. See [Cross-site requests](#cross-site-requests). |
-| 422 | The request is not valid: the profile does not exist, the title is longer than 256 characters, or a required field is missing. No job is created. |
+| 422 | The request is not valid: the profile does not exist, the title is longer than 256 characters, the title contains a tab or another control character, more than 100 `tags` were sent, or a required field is missing. No job is created. |
 | 429 | The scan queue is full: 10 jobs are already waiting to start. The response carries `Retry-After: 30`. |
 | 503 | The worker is not running, or it is degraded (see [`GET /health`](#get-health)). |
 
 A `429` or `503` is a refused attempt, not a missing one: it is recorded in job history as a failed job ("Not started: ..."), provided the job store accepts the write. A `422` records nothing. Error bodies follow [Errors](#errors).
+
+A title holding a control character -- a tab, an escape character, any other C0 or C1 control, or DEL -- is refused rather than cleaned up, so the title stored is always the one that was typed. The web page's title box cannot produce a newline, so in practice this is a pasted tab or a request that did not come from the page. Accented letters and other ordinary characters, a no-break space included, are accepted.
 
 ---
 
@@ -194,7 +196,7 @@ Fetches paperless-ngx tags for the tag picker, which is a checkbox list. Uses ca
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `q` | string | no | Filter text, at most 100 characters. Longer is rejected with `422` before any work. Filtering is done by saneless over the cached list -- `q` is never sent to paperless-ngx, and never appears in the response |
-| `tags` | int[] | no | The tag ids currently ticked. They ride along so that a filtered re-render keeps your selection: a tag you ticked and then filtered out of view stays selected and is still submitted |
+| `tags` | int[] | no | The tag ids currently ticked, at most 100; more is rejected with `422`. They ride along so that a filtered re-render keeps your selection: a tag you ticked and then filtered out of view stays selected and is still submitted |
 
 **Response:** HTML partial (the whole tag block including its wrapper, for `outerHTML` swap).
 
@@ -234,7 +236,7 @@ If paperless-ngx cannot be reached, the response is built from the last list tha
 |-----------|------|-------------|
 | `resource` | string | Resource to invalidate: `tags` or `correspondents` |
 
-**Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched.
+**Response:** HTML partial with refreshed data. Any other `resource` value, or none, is rejected with `422` before the cache is touched. So is a form body carrying more than 100 `tags`, the ticked tag ids a tag refresh sends so it can keep the selection.
 
 At most one refetch per resource every 2 seconds; a sooner call returns the cached list. It
 is answered with the same status code and the same partial as a call that refetched,
@@ -317,6 +319,7 @@ One sentence per kind of refusal, and every sentence is a fixed developer consta
 | `URL_UNSET` | 503 | The paperless-ngx address has not been set, so the scan was not started. Set paperless.url in the saneless config file, then restart saneless. |
 | `UNKNOWN_PROFILE` | 422 | That scan profile does not exist. Reload the page to see the current profiles. |
 | `TITLE_TOO_LONG` | 422 | The title is too long. Shorten it to 256 characters or fewer. |
+| `TITLE_HAS_CONTROL` | 422 | The title contains a tab or another control character. Remove it, then try again. |
 | `INVALID_REQUEST` | 422 | The request was not valid. Reload the page, then try again. |
 | `CROSS_SITE` | 403 | This request was blocked because it did not come from the saneless page. If saneless is behind a reverse proxy, make sure the proxy passes the original Host header. |
 | `NOT_FOUND` | 404 | That page or action does not exist. Reload the page, then try again. |

@@ -412,6 +412,9 @@ class RequestRejection(StrEnum):
     URL_UNSET = "URL_UNSET"
     UNKNOWN_PROFILE = "UNKNOWN_PROFILE"
     TITLE_TOO_LONG = "TITLE_TOO_LONG"
+    # A tab, ESC or any other C0/C1 control in the title: refused, never
+    # stripped, and its sentence names the field to fix.
+    TITLE_HAS_CONTROL = "TITLE_HAS_CONTROL"
     INVALID_REQUEST = "INVALID_REQUEST"
     CROSS_SITE = "CROSS_SITE"
     NOT_FOUND = "NOT_FOUND"
@@ -1189,6 +1192,11 @@ def rejection_message(rejection: RequestRejection) -> str:
                 "The title is too long. Shorten it to "
                 f"{TITLE_MAX_LENGTH} characters or fewer."
             )
+        case RequestRejection.TITLE_HAS_CONTROL:
+            message = (
+                "The title contains a tab or another control character. Remove "
+                "it, then try again."
+            )
         case (
             RequestRejection.INVALID_REQUEST
             | RequestRejection.NOT_FOUND
@@ -1239,6 +1247,7 @@ def rejection_status_code(rejection: RequestRejection) -> int:
         case (
             RequestRejection.UNKNOWN_PROFILE
             | RequestRejection.TITLE_TOO_LONG
+            | RequestRejection.TITLE_HAS_CONTROL
             | RequestRejection.INVALID_REQUEST
         ):
             status_code = 422

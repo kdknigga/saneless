@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Annotated, Final, Literal, assert_never
 
 from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import AfterValidator
+from pydantic_core import PydanticCustomError
 
 # A runtime import although only annotations use it, because FastAPI resolves
 # each route's return annotation when the decorator runs, and a Response it
@@ -32,6 +34,7 @@ from saneless.config import is_placeholder_token, resolve_job_title
 from saneless.exceptions import ConfigError, PaperlessError, describe
 from saneless.job import WEB_HISTORY_LIMIT
 from saneless.scanner.base import SourceKind, classify_source
+from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     SCAN_BLOCKED_REASON,
@@ -75,13 +78,25 @@ logger = logging.getLogger(__name__)
 # metadata cache's per-key locks.
 router = APIRouter()
 
-_TAGS_FORM_DEFAULT = Form(default=[])
+TAGS_MAX_COUNT: Final = 100
+"""
+The cap on how many tag ids one request may carry, applied at the boundary.
+
+A hundred is far more than anyone ticks for one document, and it bounds
+what a single row can hold: the ids are stored as JSON on the job row, so
+an unbounded list would let one request, refused or not, write as much as
+it liked.  ``Form(max_length=...)`` and ``Query(max_length=...)`` turn a
+longer list into a 422 before the handler body runs, on the scan form, the
+tag list and the tag refresh alike.
+"""
+
+_TAGS_FORM_DEFAULT = Form(default=[], max_length=TAGS_MAX_COUNT)
 
 # The same "no tags ticked" default, for the GET that renders the list.  htmx
 # sends an ``hx-include``'s values in the query string of a GET and in the body
 # of a POST, so the two methods need one of these each.  Both are module-level
 # constants so the parameter defaults themselves stay call-free (B008).
-_TAGS_QUERY_DEFAULT = Query(default=[])
+_TAGS_QUERY_DEFAULT = Query(default=[], max_length=TAGS_MAX_COUNT)
 
 TAG_FILTER_MAX_LENGTH: Final = 100
 """
@@ -1251,11 +1266,51 @@ def _reject_created_job(
     return job_id
 
 
+# The error type the title validator raises, which the validation error
+# handler maps to TITLE_HAS_CONTROL by value, and the error's own message.  The
+# handler never reads that message and nothing renders it; the page shows the
+# rejection's fixed sentence instead.  The title tests fail if the two
+# spellings of the type ever drift apart.
+_TITLE_CONTROL_TYPE: Final = "title_control_character"
+_TITLE_CONTROL_MESSAGE: Final = "the title contains a control character"
+
+
+def _refuse_control_characters(value: str) -> str:
+    """
+    Refuse a title that holds any control character, tab included.
+
+    The title is refused, never repaired: silently stripping characters would
+    store a title the person did not type.  A browser's text input already
+    drops newlines, so what reaches here is a tab, a pasted escape sequence or
+    a request that did not come from the page, and a stored control character
+    could later rewrite a terminal or split a log line.  The error carries a
+    fixed message and never the value; the error handler reads only its
+    location and type.
+
+    Args:
+        value: The submitted title, already within ``TITLE_MAX_LENGTH``.
+
+    Returns:
+        The title, unchanged.
+
+    Raises:
+        PydanticCustomError: The title holds a control character.
+
+    """
+    if has_control_characters(value):
+        raise PydanticCustomError(_TITLE_CONTROL_TYPE, _TITLE_CONTROL_MESSAGE)
+    return value
+
+
 @router.post("/api/scan")
 def start_scan(
     request: Request,
     profile: Annotated[str, Form()],
-    title: Annotated[str, Form(max_length=TITLE_MAX_LENGTH)] = "",
+    title: Annotated[
+        str,
+        Form(max_length=TITLE_MAX_LENGTH),
+        AfterValidator(_refuse_control_characters),
+    ] = "",
     tags: list[int] = _TAGS_FORM_DEFAULT,
     correspondent: Annotated[int | None, Form()] = None,
 ) -> Response:
@@ -1263,8 +1318,10 @@ def start_scan(
     Start a new scan job from form submission.
 
     Input is validated before any job row exists: a title over
-    ``TITLE_MAX_LENGTH`` or a profile that is not configured (checked under
-    the worker's profile lock) is a 422 and writes nothing.
+    ``TITLE_MAX_LENGTH``, a title holding a tab or any other control
+    character, more than ``TAGS_MAX_COUNT`` tags, or a profile that is not
+    configured (checked under the worker's profile lock) is a 422 and writes
+    nothing.
 
     A valid submit creates the job row and offers it to the worker, returning
     the status partial once the job is queued.  That response re-renders the
