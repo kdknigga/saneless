@@ -28,8 +28,10 @@ process that exits early leaves an orphan for the next sweep instead.
 
 :func:`find_orphans` is the discovery half: it returns the ``job-*``
 directories whose lock is free, each still holding that lock so two sweepers
-never recover the same workspace. What to do with them is the caller's
-business.
+never recover the same workspace. :func:`sweep_orphans` is the recovery half,
+run when ``serve`` starts and before each ``saneless scan``: it turns each
+orphan's readable pages into a PDF in ``failed/`` (or moves the raw pages
+there) and removes the workspace.
 """
 
 from __future__ import annotations
@@ -46,8 +48,20 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from PIL import Image
+
+from saneless.pages import measure_ink
 from saneless.pdf import sanitise_title_for_filename
+from saneless.preservation import (
+    BACKS_SUFFIX,
+    FRONTS_SUFFIX,
+    PARTIAL_SUFFIX,
+    RunArtefacts,
+    RunStage,
+    preserve_most_finished,
+)
 from saneless.private_dirs import make_private_dir
+from saneless.scanner.base import PageRecord
 
 if TYPE_CHECKING:
     from typing import Self
@@ -60,7 +74,9 @@ __all__ = [
     "WORKSPACE_PREFIX",
     "JobWorkspace",
     "OrphanWorkspace",
+    "RecoveredWorkspace",
     "find_orphans",
+    "sweep_orphans",
 ]
 
 logger = logging.getLogger(__name__)
@@ -602,3 +618,283 @@ def find_orphans(tmp_dir: Path) -> list[OrphanWorkspace]:
             orphan.close()
         raise
     return orphans
+
+
+@dataclass(frozen=True)
+class RecoveredWorkspace:
+    """
+    What the sweep made of one orphaned workspace.
+
+    Attributes:
+        job_id: The job the workspace belonged to, as its metadata records it
+            (or as much of it as the directory name carries).
+        title: The job's title; untrusted text read from disk.
+        pages: How many spooled pages could be read back.
+        sentence: What was kept and where, every path directly after
+            "preserved at "; None when the workspace held no page to keep.
+
+    """
+
+    job_id: str
+    title: str
+    pages: int
+    sentence: str | None
+
+
+# The spool file names of each acquisition pass, as the pipeline's sink writes
+# them. Named for the side of the sheet rather than the pass, because ruff's
+# S105 reads any variable whose name contains "pass" as a hardcoded password.
+_FRONT_PAGES: Final = "a-*.png"
+_BACK_PAGES: Final = "b-*.png"
+
+
+def _read_page(path: Path, sequence: int) -> PageRecord:
+    """
+    Rebuild the record of one spooled page from the file alone.
+
+    The file is checked with ``verify()`` first, then reopened to read its
+    size, mode and the dpi in its pHYs chunk, and measured the way the spool
+    measures a page it writes.
+
+    Args:
+        path: The spooled PNG.
+        sequence: Its 1-based position in its pass.
+
+    Returns:
+        The page's record.
+
+    Raises:
+        ValueError: If the page carries no usable dpi, or its mode is one the
+            spool never writes.
+        OSError: If the file cannot be read or is not a whole image.
+
+    """
+    with Image.open(path) as probe:
+        probe.verify()
+    with Image.open(path) as image:
+        image.load()
+        dpi = image.info.get("dpi")
+        if not isinstance(dpi, tuple) or not dpi or round(dpi[0]) <= 0:
+            msg = f"{path.name} records no resolution"
+            raise ValueError(msg)
+        measurement = measure_ink(image)
+        return PageRecord(
+            sequence=sequence,
+            path=path,
+            size=image.size,
+            mode=image.mode,
+            dpi=round(dpi[0]),
+            ink_coverage=measurement.coverage,
+            paper_white=measurement.paper_white,
+        )
+
+
+def _page_files(spool: Path, pattern: str) -> list[Path]:
+    """
+    List one pass's spooled pages, in name order.
+
+    Name order is the pass's acquisition order, because the sink numbers each
+    page as it arrives. This is the one place order comes from names: a sweep
+    has no records, and it never orders across the two passes. A ``.part``
+    file is an interrupted write and never matches; a symbolic link is not a
+    page the sink wrote and is left out.
+
+    Args:
+        spool: The workspace's spool directory.
+        pattern: The pass's file-name pattern.
+
+    Returns:
+        The page files, possibly none.
+
+    """
+    return sorted(
+        path for path in spool.glob(pattern) if not path.is_symlink() and path.is_file()
+    )
+
+
+def _rebuild_pass(paths: list[Path]) -> tuple[PageRecord, ...] | None:
+    """
+    Rebuild one pass's records, dropping an unreadable last page.
+
+    A process killed while writing its last page may leave that page
+    truncated, so an unreadable *last* page is dropped and the rest kept. An
+    unreadable page anywhere else is not something a kill leaves behind, and
+    skipping it would silently close a gap in the document, so the pass is
+    then not assembled at all.
+
+    Args:
+        paths: The pass's page files, in acquisition order.
+
+    Returns:
+        The readable pages, or None if a page other than the last is
+        unreadable.
+
+    """
+    records: list[PageRecord] = []
+    for index, path in enumerate(paths):
+        try:
+            records.append(_read_page(path, index + 1))
+        except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+            if index < len(paths) - 1:
+                logger.warning(
+                    "Page %s of an orphaned workspace cannot be read (%s) and is "
+                    "not the last page, so the page files are kept instead of a PDF",
+                    path,
+                    exc,
+                )
+                return None
+            logger.warning(
+                "Skipping the unreadable last page %s of an orphaned workspace "
+                "(%s): its process died while writing it",
+                path,
+                exc,
+            )
+    return tuple(records)
+
+
+def _has_pages_left(spool: Path) -> bool:
+    """
+    Say whether any spooled page is still in ``spool``.
+
+    Args:
+        spool: The workspace's spool directory.
+
+    Returns:
+        True if a page file of either pass is still there.
+
+    """
+    return bool(_page_files(spool, _FRONT_PAGES) or _page_files(spool, _BACK_PAGES))
+
+
+def _recover_orphan(
+    orphan: OrphanWorkspace, failed_dir: Path, reserve_mb: int
+) -> RecoveredWorkspace:
+    """
+    Keep one orphan's pages in ``failed_dir``, then remove the workspace.
+
+    Each pass becomes its own PDF through ``preservation``, just as a run
+    that failed while acquiring keeps its passes: ``(partial)`` for a single
+    pass, ``(fronts)`` and ``(backs)`` (in sheet order) for manual duplex,
+    each under the twice-the-spool free-space rule. When a PDF cannot be
+    built, or the rule refuses it, the raw page files are moved instead.
+
+    The workspace is removed only once nothing in it is left un-kept: when
+    keeping went wrong and pages are still in the spool, it stays, and the
+    next sweep tries again.
+
+    Args:
+        orphan: The orphan, holding its lock.
+        failed_dir: The durable directory preserved scans go in.
+        reserve_mb: The ``min_free_space_mb`` reserve the free-space rule
+            keeps.
+
+    Returns:
+        What was recovered.
+
+    """
+    spool = orphan.spool
+    real_spool = _is_own_directory(spool)
+    fronts = _page_files(spool, _FRONT_PAGES) if real_spool else []
+    backs = _page_files(spool, _BACK_PAGES) if real_spool else []
+    front_records = _rebuild_pass(fronts)
+    back_records = _rebuild_pass(backs)
+    readable = sum(len(records or ()) for records in (front_records, back_records))
+    sentence: str | None = None
+    kept_everything = True
+    if fronts or backs:
+        passes: list[tuple[str, tuple[PageRecord, ...]]] = []
+        if front_records is not None and back_records is not None:
+            passes = [
+                (FRONTS_SUFFIX if backs else PARTIAL_SUFFIX, front_records),
+                (BACKS_SUFFIX, back_records),
+            ]
+        report = preserve_most_finished(
+            RunArtefacts(
+                job_id=orphan.job_id,
+                title=orphan.title,
+                workspace=orphan.path,
+                spool_dir=spool,
+                failed_dir=failed_dir,
+                reserve_mb=reserve_mb,
+                stage=RunStage.ACQUIRING,
+                passes=passes,
+            )
+        )
+        sentence = report.sentence()
+        kept_everything = not (report.problems and _has_pages_left(spool))
+    logger.warning(
+        "Recovered an interrupted scan's workspace for job %s (%r): %s",
+        orphan.job_id,
+        orphan.title,
+        sentence or "it held no page that could be kept",
+    )
+    if kept_everything:
+        _remove_quietly(orphan.path, "the recovered job workspace")
+    else:
+        logger.warning(
+            "Leaving %s in place: some of its pages could not be kept, and the "
+            "next sweep will try again",
+            orphan.path,
+        )
+    return RecoveredWorkspace(
+        job_id=orphan.job_id, title=orphan.title, pages=readable, sentence=sentence
+    )
+
+
+def sweep_orphans(
+    tmp_dir: Path, failed_dir: Path, reserve_mb: int
+) -> list[RecoveredWorkspace]:
+    """
+    Recover every workspace in ``tmp_dir`` whose process is gone.
+
+    Each orphan :func:`find_orphans` returns -- a ``job-*`` directory of ours
+    whose lock is free, so never a scan still running in this or another
+    process -- has its readable pages kept in ``failed_dir``, gets one
+    WARNING naming the job, its title and where the pages went, and is then
+    removed. Its lock is held throughout and released afterwards.
+
+    **This never raises an ``Exception``.** It runs at startup, and a sweep
+    must never stop the service starting or a scan running: a failure
+    recovering one orphan is logged with its traceback and the sweep moves on
+    to the next, leaving that workspace for a later sweep.
+    ``KeyboardInterrupt`` passes straight through.
+
+    Scratch directories from releases before job-named workspaces (``tmp*``
+    names) are never touched: nothing can prove their owner dead.
+
+    Args:
+        tmp_dir: The scratch directory workspaces are created in. A missing
+            one has nothing in it to recover.
+        failed_dir: The durable directory preserved scans go in.
+        reserve_mb: The ``min_free_space_mb`` reserve the free-space rule
+            keeps.
+
+    Returns:
+        One entry per orphan recovered, in name order.
+
+    """
+    if not tmp_dir.is_dir():
+        return []
+    orphans = find_orphans(tmp_dir)
+    recovered: list[RecoveredWorkspace] = []
+    try:
+        for orphan in orphans:
+            try:
+                recovered.append(_recover_orphan(orphan, failed_dir, reserve_mb))
+            except Exception:
+                logger.warning(
+                    "Could not recover the orphaned workspace %s (job %s, %r); "
+                    "it is left for the next sweep",
+                    orphan.path,
+                    orphan.job_id,
+                    orphan.title,
+                    exc_info=True,
+                )
+            finally:
+                orphan.close()
+    finally:
+        # Interrupted part way: release every lock still held. Closing twice
+        # is safe.
+        for orphan in orphans:
+            orphan.close()
+    return recovered

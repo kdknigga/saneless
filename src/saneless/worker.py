@@ -433,6 +433,10 @@ class ScanWorker:
         # Whether the first successful probe must also fail the rows a crashed
         # process left active, because startup recovery could not.
         self._restart_recovery_pending = False
+        # The error texts startup's workspace recovery composed for the rows
+        # whose pages it kept, by job id, still to be written.  Set before the
+        # thread exists and then touched only by the worker thread.
+        self._recovered_texts: dict[str, str] = {}
         # The device this worker's last auto-detecting job chose, handed to
         # every job's pipeline so a change between jobs is logged.  Touched
         # only by the worker thread, one job at a time.
@@ -448,17 +452,26 @@ class ScanWorker:
         self._thread.start()
         logger.info("ScanWorker started")
 
-    def mark_recovery_pending(self) -> None:
+    def mark_recovery_pending(self, texts: Mapping[str, str] | None = None) -> None:
         """
         Start degraded, owing startup's crash recovery to the first good probe.
 
-        The lifespan calls this before ``start()`` when ``fail_active_jobs``
+        The lifespan calls this before ``start()`` when its recovery writes
         raised at startup.  The app still starts, ``/health`` answers a
         truthful 503 and scans are rejected, instead of the service refusing to
         come up over a store that may recover.  The first successful idle probe
-        then fails the rows the previous process left active with
-        ``RESTART_REASON`` and clears degraded.
+        then writes ``texts`` onto the rows they name, fails the rows the
+        previous process left active with ``RESTART_REASON`` and clears
+        degraded.
+
+        Args:
+            texts: The error text for each row whose orphaned workspace
+                startup recovered, naming where its pages were kept, by job
+                id; written before the blanket ``RESTART_REASON``, so those
+                rows keep it.  None or empty when there is none.
+
         """
+        self._recovered_texts = dict(texts or {})
         self._restart_recovery_pending = True
         self._degraded.set()
 
@@ -1401,9 +1414,11 @@ class ScanWorker:
         written here.
 
         Each row gets a text that already exists: the failure the guard tried
-        to write, or ``RESTART_REASON`` for rows a failed startup recovery left
-        behind.  Any raise leaves the worker degraded to try again next tick;
-        it is not counted again, and whatever was written stays written.
+        to write; for a row whose orphaned workspace startup recovered, the
+        text naming where its pages were kept; or ``RESTART_REASON`` for the
+        other rows a failed startup recovery left behind.  Any raise leaves the
+        worker degraded to try again next tick; it is not counted again, and
+        whatever was written stays written.
         Clearing degraded also ends any owed-write streak, so a returning fault
         needs a fresh streak.
         """
@@ -1417,6 +1432,11 @@ class ScanWorker:
             # active, so the restart recovery below cannot give them its text.
             self._flush_unrecorded_failures()
             if self._restart_recovery_pending:
+                # The recovered rows' own texts next, for the same reason:
+                # the blanket restart text below would otherwise take them.
+                if self._recovered_texts:
+                    self._job_store.fail_recovered_jobs(self._recovered_texts)
+                    self._recovered_texts = {}
                 self._job_store.fail_active_jobs(RESTART_REASON)
                 self._restart_recovery_pending = False
         except Exception:

@@ -655,13 +655,14 @@ class TestSweepOrphans:
         whole = records[0].path.read_bytes()
         (spool / "a-0003.png").write_bytes(whole[:_TRUNCATED_BYTES])
         (spool / "a-0004.png.part").write_bytes(whole[: 2 * _TRUNCATED_BYTES])
+        expected = _streams(records)
 
         recovered = sweep_orphans(scratch, failed_dir, reserve_mb=0)
 
         assert [entry.pages for entry in recovered] == [2]
         pdfs = _pdfs(failed_dir)
         assert len(pdfs) == 1
-        assert embedded_streams(pdfs[0]) == _streams(records)
+        assert embedded_streams(pdfs[0]) == expected
         assert _page_dirs(failed_dir) == []
         assert not workspace.exists()
 
@@ -718,6 +719,8 @@ class TestSweepOrphans:
         spool = workspace / SPOOL_DIR_NAME
         fronts = _spool_pages(spool, "a", 3)
         backs = _spool_pages(spool, "b", 3, first=3)
+        expected_fronts = _streams(fronts)
+        expected_backs = _streams(list(reversed(backs)))
 
         (only,) = sweep_orphans(scratch, failed_dir, reserve_mb=0)
 
@@ -726,8 +729,8 @@ class TestSweepOrphans:
         assert len(pdfs) == 2
         (fronts_pdf,) = [pdf for pdf in pdfs if pdf.name.endswith("-fronts.pdf")]
         (backs_pdf,) = [pdf for pdf in pdfs if pdf.name.endswith("-backs.pdf")]
-        assert embedded_streams(fronts_pdf) == _streams(fronts)
-        assert embedded_streams(backs_pdf) == _streams(list(reversed(backs)))
+        assert embedded_streams(fronts_pdf) == expected_fronts
+        assert embedded_streams(backs_pdf) == expected_backs
         assert not workspace.exists()
 
     def test_the_free_space_rule_keeps_the_raw_pages_instead(

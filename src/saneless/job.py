@@ -35,7 +35,7 @@ from saneless.vocabulary import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
     from collections.abc import Set as AbstractSet
     from pathlib import Path
 
@@ -168,7 +168,8 @@ _UPDATE_JOBS = "UPDATE jobs"
 """The ``UPDATE`` verb and its target table, held under a name.
 
 Declared here so every statement in this module is assembled the same way, and
-consumed by ``_FAIL_ACTIVE`` below.  Its safety argument is ``_SELECT_JOBS``'s.
+consumed by ``_FAIL_ACTIVE`` and ``_FAIL_RECOVERED`` below.  Its safety argument is
+``_SELECT_JOBS``'s.
 """
 
 _DELETE_JOBS = "DELETE FROM jobs"
@@ -246,6 +247,20 @@ caller-supplied reason, each active-state value -- is a bound parameter.
 ``json_each(?)`` would make the statement fully static and was verified to work
 here, but JSON1 was a compile-time option before SQLite 3.38, so it would add a
 soft dependency on an extension this module otherwise does not need.
+"""
+
+_FAIL_RECOVERED = (
+    f"{_UPDATE_JOBS} SET state = ?, error = ? "
+    f"WHERE id = ? AND state IN ({_ACTIVE_MARKS})"
+)
+"""Move one named job to a failed state with its own error text, if still active.
+
+Bound parameters, in this order: the target state value, the error text, the
+job id, then one per entry of ``_ACTIVE_STATE_VALUES``.  Its safety argument is
+``_FAIL_ACTIVE``'s: the only interpolated values are the module-level
+``_UPDATE_JOBS`` literal and a run of ``?`` characters whose length comes from a
+module-level tuple.  The id and the text -- which quotes a title read back from a
+workspace on disk -- are bound, never written into the statement.
 """
 
 _DELETE_BY_ID = f"{_DELETE_JOBS} WHERE id = ?"
@@ -1473,6 +1488,43 @@ class JobStore:
 
         if failed > 0:
             logger.debug("Failed %d in-flight job(s): %s", failed, reason)
+        return failed
+
+    @_locked
+    def fail_recovered_jobs(self, texts: Mapping[str, str]) -> int:
+        """
+        Fail each named job still in flight, each with its own error text.
+
+        Startup's workspace recovery calls this before ``fail_active_jobs``:
+        a job whose workspace a killed process left behind has had its pages
+        kept in ``failed/``, and its row should say where rather than carry
+        the bare restart text.  Only a row whose id is in ``texts`` *and*
+        whose state is in ``ACTIVE_STATES`` moves, to ``JobState.ERROR``
+        carrying its text, so a finished job's recorded history is never
+        rewritten and an id with no row is ignored.  Every row is written in
+        one transaction.
+
+        ``error_category`` is deliberately not written, for the reason
+        ``fail_active_jobs`` gives: an interrupted restart is a precisely known
+        failure, and with no category the status area shows the text itself.
+
+        Args:
+            texts: The error text to record, by job id.
+
+        Returns:
+            How many jobs were moved to ERROR.
+
+        """
+        failed = 0
+        with self._conn:
+            for job_id, text in texts.items():
+                failed += self._conn.execute(
+                    _FAIL_RECOVERED,
+                    (JobState.ERROR.value, text, job_id, *_ACTIVE_STATE_VALUES),
+                ).rowcount
+
+        if failed > 0:
+            logger.debug("Failed %d in-flight job(s) with recovered pages", failed)
         return failed
 
     @_locked
