@@ -1403,6 +1403,32 @@ class TestRenderErrorBody:
         assert len(result) <= 201
         assert result.endswith("…")
 
+    @pytest.mark.parametrize(
+        "response",
+        [
+            pytest.param(
+                httpx2.Response(502, text="<p>\x1b]0;owned\x07Bad \x9bGateway</p>"),
+                id="text-body",
+            ),
+            pytest.param(
+                httpx2.Response(400, json={"detail": "bad\x1b[2Jrequest\x00"}),
+                id="json-detail",
+            ),
+        ],
+    )
+    def test_body_controls_are_shown_as_escapes(
+        self, response: httpx2.Response
+    ) -> None:
+        """
+        ESC, BEL, NUL and a C1 CSI in a body never reach the message live.
+
+        None of them is whitespace, so collapsing whitespace alone keeps
+        them, and the message is printed on the terminal and logged.
+        """
+        result = _render_error_body(response, _MOCK_AUTH)
+        assert not has_control_characters(result)
+        assert "\\x1b" in result
+
     def test_empty_body_says_so(self) -> None:
         """An empty body renders as an explicit marker, never an empty string."""
         response = httpx2.Response(500, text="")
@@ -1900,6 +1926,22 @@ class TestPollTaskFailureTranslation:
             )
         )
         assert message == "Paperless task t1 ended FAILURE: bad things"
+
+    def test_poll_failure_text_shows_controls_as_escapes(self) -> None:
+        """A terminal escape in a task failure reaches job.error as visible text."""
+        message = _failed_poll_message(
+            _task_answer(
+                {
+                    "task_id": "t1",
+                    "status": "FAILURE",
+                    "result": "OCR \x1b]0;owned\x07failed\x1b[2J",
+                }
+            )
+        )
+        assert not has_control_characters(message)
+        assert message == (
+            "Paperless task t1 ended FAILURE: OCR \\x1b]0;owned\\x07failed\\x1b[2J"
+        )
 
     def test_poll_failure_text_is_length_bounded(self) -> None:
         """

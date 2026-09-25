@@ -1605,9 +1605,11 @@ class ScanWorker:
                     _OwedWrite(JobState.ERROR, error=str(exc), category=category),
                 )
                 # Inside the except block, so the record carries the traceback
-                # the operator needs to find the cause.
+                # the operator needs to find the cause.  The text is quoted
+                # with %r: it can come from outside saneless, and repr shows a
+                # control character in it as its escape.
                 kind = category.value.lower()
-                logger.exception("Job %s failed (%s): %s", job.id, kind, exc)
+                logger.exception("Job %s failed (%s): %r", job.id, kind, str(exc))
             return
         # The terminal state is derived from the outcome the pipeline returned,
         # never assumed.  The mapping below is a match with assert_never, so a

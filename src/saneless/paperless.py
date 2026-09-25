@@ -25,7 +25,7 @@ import httpx2
 
 from .atomic_write import refused_mode_change
 from .exceptions import ConfigError, PaperlessError, PaperlessTimeoutError, describe
-from .text_safety import neutralise_bounded
+from .text_safety import neutralise_bounded, neutralise_controls
 from .vocabulary import ConnectionStatus
 
 if TYPE_CHECKING:
@@ -523,21 +523,25 @@ def _without_userinfo(url: str) -> str:
 
 def _bounded_line(text: str) -> str:
     """
-    Collapse ``text`` to one line and cut it to ``_MAX_BODY_LINE_CHARS``.
+    Collapse ``text`` to one line, tame its controls and cut it to length.
 
-    Text from Paperless -- an error body, a redirect target -- is recorded in
-    the job store and printed on the terminal, so no newline in it may forge
-    an extra line and no length of it may flood either.
+    Text from Paperless -- an error body, a redirect target, a task's failure
+    -- is recorded in the job store, printed on the terminal and logged, so
+    no newline in it may forge an extra line, no length of it may flood
+    either, and no control character may reach a terminal live.  ESC, BEL,
+    NUL and most C1 controls are not whitespace, so each is shown as its
+    escape instead.  The cut comes last, at ``_MAX_BODY_LINE_CHARS``, so it
+    bounds what is printed.
 
     Args:
         text: Upstream text of any shape.
 
     Returns:
-        The text on one line, with an ellipsis when it was cut; empty when
-        it held nothing but whitespace.
+        The text on one line with no control character in it, with an
+        ellipsis when it was cut; empty when it held nothing but whitespace.
 
     """
-    line = " ".join(text.split())
+    line = neutralise_controls(" ".join(text.split()))
     if len(line) > _MAX_BODY_LINE_CHARS:
         line = f"{line[:_MAX_BODY_LINE_CHARS]}…"
     return line

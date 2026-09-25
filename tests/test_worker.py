@@ -50,6 +50,7 @@ from saneless.job import (
 from saneless.paperless import UploadResult
 from saneless.pipeline import DeviceMemory, PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
+from saneless.text_safety import has_control_characters
 from saneless.vocabulary import (
     RESTART_REASON,
     TERMINAL_STATES,
@@ -2265,6 +2266,43 @@ class TestWorkerGuard:
         records = _worker_records(caplog, logging.ERROR, first.id)
         assert records
         assert records[0].exc_info is not None
+
+    def test_the_failure_line_shows_controls_in_the_error_as_escapes(
+        self,
+        worker_for: Callable[[JobStore], ScanWorker],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        A failure's text is logged quoted, with each control as its escape.
+
+        The text can come from outside saneless -- a device, a proxy's error
+        page -- so an ESC in it must not reach a terminal tailing the log live.
+        """
+        caplog.set_level(logging.INFO, logger="saneless.worker")
+
+        def failing_pipeline(*_args: object, **_kwargs: object) -> ScanResult:
+            msg = "upstream said \x1b]0;owned\x07no"
+            raise PaperlessError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing_pipeline)
+        store = JobStore()
+        worker = worker_for(store)
+        try:
+            worker.start()
+            job = store.create_job("default", "Hostile Failure")
+            worker.submit(job)
+            failed = wait_for_state(store, job.id, TERMINAL_STATES, _STATE_BUDGET)
+        finally:
+            worker.stop()
+            store.close()
+
+        assert failed.state is JobState.ERROR
+        (record,) = _worker_records(caplog, logging.ERROR, job.id)
+        message = record.getMessage()
+        assert not has_control_characters(message)
+        assert "'upstream said \\x1b]0;owned\\x07no'" in message
 
     def test_a_failed_error_write_after_a_pipeline_failure_does_not_end_the_worker(
         self,
