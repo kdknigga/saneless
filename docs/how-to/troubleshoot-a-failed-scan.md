@@ -347,7 +347,8 @@ exits 1, with its line naming what was kept.
 
 Ctrl-C is different. It is a deliberate cancel, exits 130 and keeps nothing (see
 [Cancelled scans](#cancelled-scans-exit-130)). To run a long scan over SSH without a dropped
-connection interrupting it, start it under `tmux` or `screen`. `saneless serve` keeps the web
+connection interrupting it, start it under `tmux` or `screen`, or with `nohup`: a signal the
+command was started with ignored stays ignored, so under `nohup` a hangup does not interrupt it. `saneless serve` keeps the web
 server's own signal handling, where SIGTERM is a graceful stop.
 
 ## A scan stopped by a crash or a power cut

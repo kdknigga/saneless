@@ -32,7 +32,7 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | 130 | Cancelled by the operator |
 | 143 | Interrupted by SIGTERM. Pages already scanned were kept in `failed/` |
 
-Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had. `serve` keeps the web server's own handling, where SIGTERM is a graceful stop. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
+Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. `serve` keeps the web server's own handling, where SIGTERM is a graceful stop. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
 
 ---
 

@@ -668,3 +668,53 @@ def test_a_signal_after_delivery_leaves_the_success_alone(
     assert run.failed == []
     assert run.interrupted_lines == []
     assert list((tmp_path / "scratch").glob("job-*")) == []
+
+
+class _HangupAtUpload(RecordingPaperless):
+    """The in-memory paperless-ngx, sending SIGHUP as an upload arrives."""
+
+    def __init__(self) -> None:
+        """Record the hangup's disposition at the moment it is sent."""
+        super().__init__()
+        self.dispositions: list[_Disposition] = []
+
+    @override
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
+        """
+        Send SIGHUP before an upload is answered, if it is ignored.
+
+        Args:
+            request: The request the client sent.
+
+        Returns:
+            The recorder's answer.
+
+        """
+        if request.method == "POST" and request.url.path == DOCUMENTS_PATH:
+            disposition = signal.getsignal(signal.SIGHUP)
+            self.dispositions.append(disposition)
+            # Only while ignored, so it can never reach pytest itself.
+            if disposition is signal.SIG_IGN:
+                os.kill(os.getpid(), signal.SIGHUP)
+        return super().__call__(request)
+
+
+def test_a_hangup_ignored_by_nohup_stays_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Under ``nohup`` a dropped terminal does not stop the scan: it delivers."""
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    recorder = _HangupAtUpload()
+    scanner = _ObservingScanner(passes=((0, 1),))
+
+    run = _run_cli(
+        tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner, recorder=recorder
+    )
+
+    assert recorder.dispositions == [signal.SIG_IGN]
+    assert run.result.exit_code == ExitCode.SUCCESS, run.result.output
+    assert len(run.recorder.uploads()) == 1
+    assert run.failed == []
+    # SIGTERM was not ignored, so it is still turned into an interruption.
+    assert callable(scanner.dispositions[signal.SIGTERM])
+    assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN

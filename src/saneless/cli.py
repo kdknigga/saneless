@@ -300,7 +300,9 @@ def _install_interrupt_handlers() -> Callable[[], None]:
     Only the main thread can install a signal handler, so anywhere else this
     installs nothing. A signal whose current handler was installed from
     outside Python (``getsignal`` returns ``None``) is left alone, because
-    that handler could not be put back afterwards.
+    that handler could not be put back afterwards. So is a signal the command
+    was started with ignored: ``nohup saneless scan`` asked for the hangup to
+    be ignored, and it stays ignored.
 
     Returns:
         A function that restores the handlers found here and forgets any
@@ -315,6 +317,7 @@ def _install_interrupt_handlers() -> Callable[[], None]:
         signum: handler
         for signum in _INTERRUPT_SIGNALS
         if (handler := signal.getsignal(signum)) is not None
+        and handler is not signal.SIG_IGN
     }
     for signum in previous:
         signal.signal(signum, _interrupt_handler)
