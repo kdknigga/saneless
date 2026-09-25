@@ -47,6 +47,19 @@ volumes:
   consume:
 ```
 
+### Who can read the copy
+
+saneless writes the copy with mode `0644`, whatever its umask, so paperless-ngx can read it whichever user it runs as. The mode is set on the hidden staging file before the rename, so the PDF never appears under its final name with any other mode. On a filesystem that has no Unix modes, such as some CIFS, vfat or FUSE mounts, the mode is left as it is and the copy is still delivered.
+
+The consume folder's own directory mode decides who can reach the file, so restrict the folder rather than the file. For example, make it group-owned by a group that both saneless's user and paperless-ngx's user belong to, and give it mode `0770`:
+
+```bash
+chgrp paperless /path/to/paperless/consume
+chmod 0770 /path/to/paperless/consume
+```
+
+Other local users then cannot list or open anything in it. The folder is a short-lived handoff: paperless-ngx imports each file and removes it, so a copy stays there only until paperless-ngx is back.
+
 ## When It Activates
 
 The fallback activates only when **all** of these conditions are true:
