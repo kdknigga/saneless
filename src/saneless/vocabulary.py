@@ -31,6 +31,10 @@ __all__ = [
     "ACTIVE_STATES",
     "BUSY_STATES",
     "FALLBACK_NOT_UPLOADED_LINE",
+    "HIDDEN_ERROR_DETAIL",
+    "HIDDEN_JOB_TITLE",
+    "HIDDEN_PRESERVED_ERROR",
+    "HIDDEN_WARNING_LINE",
     "LOCAL_TIME_FORMAT",
     "QUEUE_FULL_JOB_ERROR",
     "RESTART_REASON",
@@ -481,6 +485,31 @@ RESTART_REASON: Final = "The server restarted before this scan finished"
 WARNED_UPLOAD_LABEL: Final = "Uploaded with a warning"
 FALLBACK_NOT_UPLOADED_LINE: Final = (
     "Not uploaded: saved to the consume folder without its title, tags or correspondent"
+)
+
+# What the web page shows of a job in place of its detail, to every browser
+# other than the one that submitted it.  They see that a scan happened and how
+# it ended -- profile, state, time, outcome and page counts -- never what the
+# document is: no title, no thumbnail and none of the stored error or warning
+# text, which names host paths, the kept file (whose name carries the title)
+# and the paperless-ngx address.  ``saneless.web.job_view`` is the one place
+# that decides who sees which.
+#
+# Every string here is a developer constant with no path and no URL in it.
+# The warning line must stay non-empty: ``job_label`` and ``outcome_line`` read
+# a warning's truthiness to say "Uploaded with a warning", and a hidden
+# warning still has to read as one.  The full text stays in the log and in
+# ``saneless jobs --json``, which is where each sentence sends the reader.
+HIDDEN_JOB_TITLE: Final = "Scan (title hidden)"
+HIDDEN_WARNING_LINE: Final = (
+    "This scan has a warning. On the server, saneless jobs --json shows it."
+)
+HIDDEN_PRESERVED_ERROR: Final = (
+    "The PDF was kept in the failed folder on the server. "
+    "saneless jobs --json shows where."
+)
+HIDDEN_ERROR_DETAIL: Final = (
+    "On the server, saneless jobs --json and the log show the full message."
 )
 
 # How every user-facing timestamp is spelled, on the web page and in the CLI
