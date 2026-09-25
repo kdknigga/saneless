@@ -321,7 +321,6 @@ def _artefacts(settings: Settings, tmp_path: Path, stage: RunStage) -> RunArtefa
         spool_dir=spool,
         failed_dir=settings.output.failed_dir,
         reserve_mb=0,
-        dpi=300,
         stage=stage,
     )
 

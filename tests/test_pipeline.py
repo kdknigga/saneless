@@ -374,7 +374,6 @@ def _reading_the_pages(pdf_path: Path, seen: list[Image.Image]) -> Callable[...,
         output_dir: Path,
         *,
         filename: str,
-        dpi: int,
         title: str,
     ) -> Path:
         """Open every spooled page, then report the PDF path."""
@@ -424,7 +423,6 @@ class _AssemblingSomewhereDurable:
         output_dir: Path,
         *,
         filename: str,
-        dpi: int,
         title: str,
     ) -> Path:
         """
@@ -436,7 +434,6 @@ class _AssemblingSomewhereDurable:
             output_dir: The workspace directory the pipeline asked for, which
                 is exactly what this stand-in exists to override.
             filename: The PDF's file name, used unchanged.
-            dpi: The resolution the device reported, used unchanged.
             title: The document title, used unchanged.
 
         Returns:
@@ -446,7 +443,7 @@ class _AssemblingSomewhereDurable:
         self.records = list(records)
         self.page_bytes = [record.path.read_bytes() for record in records]
         self.pdf_path = assemble_pdf(
-            records, self._output_dir, filename=filename, dpi=dpi, title=title
+            records, self._output_dir, filename=filename, title=title
         )
         return self.pdf_path
 
@@ -3864,7 +3861,6 @@ class TestFailedDirWarningFiresOncePerGuard:
             spool_dir=tmp_path / "spool",
             failed_dir=failed_dir,
             reserve_mb=0,
-            dpi=300,
             stage=preservation_module.RunStage.DELIVERING,
             pdfs=pdfs,
         )
@@ -4209,7 +4205,6 @@ class TestPreservationNamesWhatItDidKeep:
             records: Sequence[PageRecord],
             output_dir: Path,
             filename: str,
-            dpi: int,
             *,
             title: str,
         ) -> Path:
@@ -4217,7 +4212,7 @@ class TestPreservationNamesWhatItDidKeep:
             nonlocal calls
             calls += 1
             if calls == 1:
-                return assemble_pdf(records, output_dir, filename, dpi, title=title)
+                return assemble_pdf(records, output_dir, filename, title=title)
             msg = "qpdf refused the backs"
             raise PdfError(msg)
 
@@ -5189,7 +5184,8 @@ class TestTheDpiTheDeviceActuallyChose:
                 request=PipelineRequest(profile_name="default", title="Clamped"),
             )
 
-        assert mock_assemble.call_args.kwargs["dpi"] == 300
+        records = mock_assemble.call_args.args[0]
+        assert [record.dpi for record in records] == [300]
 
     def test_preserved_partial_uses_the_read_back_dpi(
         self,
@@ -5276,8 +5272,11 @@ class TestTheDpiTheDeviceActuallyChose:
                 ),
             )
 
-        dpis = [call.kwargs["dpi"] for call in mock_assemble.call_args_list]
-        assert dpis == [150, 150]
+        dpis = [
+            [record.dpi for record in call.args[0]]
+            for call in mock_assemble.call_args_list
+        ]
+        assert dpis == [[150, 150, 150], [150, 150]]
 
     def test_two_passes_disagreeing_on_resolution_say_so(
         self,
@@ -5290,8 +5289,10 @@ class TestTheDpiTheDeviceActuallyChose:
         Manual duplex must not silently pick one of two different resolutions.
 
         The two passes use identical settings on one device, so a disagreement
-        means the device changed its mind mid-job. Pass A's value is used and
-        the difference is logged rather than swallowed.
+        means the device changed its mind mid-job. The difference is logged
+        rather than swallowed, and nothing has to be picked for the PDF: every
+        page is laid out at the dpi its own pass read back, so the fronts are
+        300 and the backs 150, interleaved.
         """
         default_settings.profiles["default"].source = "ADF"
         default_settings.profiles["default"].duplex = "manual"
@@ -5326,7 +5327,8 @@ class TestTheDpiTheDeviceActuallyChose:
             if record.levelno == logging.WARNING
         ]
         assert [m for m in messages if "300" in m and "150" in m]
-        assert mock_assemble.call_args.kwargs["dpi"] == 300
+        records = mock_assemble.call_args.args[0]
+        assert [record.dpi for record in records] == [300, 150, 300, 150]
 
 
 class TestRejectedPagesAreNotBlankPages:

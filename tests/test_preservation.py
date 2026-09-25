@@ -93,7 +93,6 @@ def _artefacts(tmp_path: Path, stage: RunStage) -> RunArtefacts:
         spool_dir=spool_dir,
         failed_dir=tmp_path / "state" / "failed",
         reserve_mb=0,
-        dpi=100,
         stage=stage,
     )
 
@@ -385,7 +384,6 @@ class TestTheSentenceSaysWhatSurvived:
             records: tuple[PageRecord, ...],
             output_dir: Path,
             filename: str,
-            dpi: int,
             *,
             title: str,
         ) -> Path:
@@ -393,7 +391,7 @@ class TestTheSentenceSaysWhatSurvived:
             nonlocal calls
             calls += 1
             if calls == 1:
-                return real_assemble(records, output_dir, filename, dpi, title=title)
+                return real_assemble(records, output_dir, filename, title=title)
             msg = "qpdf refused the backs"
             raise PdfError(msg)
 

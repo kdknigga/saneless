@@ -588,18 +588,17 @@ class _SpoolLedger:
     Each pass registers itself **before** it starts, so a fault part-way
     through it still finds the sink that has been collecting its pages.
 
+    There is no resolution here: each spooled page's record carries the dpi
+    the device read back for it, so a pass interrupted before it returned a
+    batch is still preserved at the device's resolution, not the profile's.
+
     Attributes:
-        dpi: The resolution a preserved partial is assembled at. It starts as
-            the resolution the profile asked for, because an interrupted pass
-            never returned a batch to read the device's own answer from, and
-            is replaced by that answer as soon as a pass does return one.
         passes: One ``(title suffix, sink)`` pair per acquisition pass, in
             pass order. The suffix is what the preserved PDF's name says the
             half is: ``(partial)``, ``(fronts)`` or ``(backs)``.
 
     """
 
-    dpi: int
     passes: list[tuple[str, SpooledPageSink]] = field(default_factory=list)
 
     def register(self, suffix: str, sink: SpooledPageSink) -> None:
@@ -612,16 +611,6 @@ class _SpoolLedger:
 
         """
         self.passes.append((suffix, sink))
-
-    def note_resolution(self, dpi: int) -> None:
-        """
-        Adopt the resolution a completed pass reported the device actually used.
-
-        Args:
-            dpi: The batch's ``actual_resolution``.
-
-        """
-        self.dpi = dpi
 
     def spooled(self) -> list[tuple[str, tuple[PageRecord, ...]]]:
         """
@@ -743,14 +732,13 @@ class _DuplexMismatch:
     backs.
 
     A named record rather than the bare ``(fronts, backs)`` tuple this used to
-    be. The recovery path now also needs the resolution the device actually
-    used and the sheets it could not read, and a four-element tuple would make
-    every call site remember an order.
+    be. The recovery path also needs the sheets the device could not read, and
+    a tuple would make every call site remember an order. The resolution is
+    not here: each record carries the dpi its page was read back at.
 
     Attributes:
         fronts: Page records produced by pass A, in pass order.
         backs: Page records produced by pass B, in pass order.
-        dpi: The resolution the device reported actually using.
         unreadable_sheets: Sheets skipped across both passes for failing their
             integrity checks. Nonzero is the reason the run was split. Zero
             means the split is a count difference alone.
@@ -759,7 +747,6 @@ class _DuplexMismatch:
 
     fronts: Sequence[PageRecord]
     backs: Sequence[PageRecord]
-    dpi: int
     unreadable_sheets: int
 
 
@@ -772,26 +759,28 @@ def _duplex_resolution(front: ScanBatch, back: ScanBatch) -> int:
     its mind mid-job, and that is a fact worth saying out loud rather than
     resolving silently.
 
-    Pass A's value wins. The choice is arbitrary between two equally plausible
-    numbers, which is exactly why it is logged; failing the run instead would
-    throw away a scan that completed, over a disagreement the crop fallback
-    already tolerates.
+    Nothing has to be chosen for the PDF any more: each page's record carries
+    the dpi its own pass read back, and assembly lays every page out at its
+    own, so a disagreement costs no page its real size. Failing the run
+    instead would throw away a scan that completed, over a disagreement the
+    crop fallback already tolerates. The one place a single value is still
+    needed is the interleaved batch's ``actual_resolution``, and pass A's is
+    used there.
 
     Args:
         front: The batch pass A produced.
         back: The batch pass B produced.
 
     Returns:
-        The resolution to assemble the document at.
+        The resolution the interleaved batch reports: pass A's.
 
     """
     if front.actual_resolution != back.actual_resolution:
         logger.warning(
             "Manual duplex passes disagree on resolution: pass A reports %s dpi, "
-            "pass B reports %s dpi; assembling at %s dpi",
+            "pass B reports %s dpi; each page is laid out at its own pass's",
             front.actual_resolution,
             back.actual_resolution,
-            front.actual_resolution,
         )
     return front.actual_resolution
 
@@ -1062,9 +1051,7 @@ class _PipelineRun:
 
     def __post_init__(self) -> None:
         """Start the ledger and the artefacts before anything has been scanned."""
-        # Seeded with the resolution the profile asked for: an interrupted pass
-        # never returned a batch to read the device's own answer from.
-        self.ledger = _SpoolLedger(dpi=self.profile.resolution)
+        self.ledger = _SpoolLedger()
         self.artefacts = preservation.RunArtefacts(
             job_id=self.request.job_id,
             title=self.request.title,
@@ -1072,7 +1059,6 @@ class _PipelineRun:
             spool_dir=self.spool_dir,
             failed_dir=self.settings.output.failed_dir,
             reserve_mb=self.settings.output.min_free_space_mb,
-            dpi=self.profile.resolution,
         )
 
     @property
@@ -1133,10 +1119,10 @@ class _PipelineRun:
             # and it is caught here because an interruption is not anyone's
             # decision to stop: the pages are kept.
             #
-            # The ledger knows what each pass spooled and the resolution the
-            # device reported; the artefacts are what the preservation reads.
+            # The ledger knows what each pass spooled, and each record the
+            # dpi it was read back at; the artefacts are what the
+            # preservation reads.
             self.artefacts.passes = self.ledger.spooled()
-            self.artefacts.dpi = self.ledger.dpi
             report = preservation.preserve_most_finished(self.artefacts)
             sentence = report.sentence()
             if sentence is not None:
@@ -1274,7 +1260,6 @@ class _PipelineRun:
         self.ledger.register(preservation.PARTIAL_SUFFIX, sink)
         batch = self.scanner.scan_pages(self.device_id, self.scan_settings, sink)
         _require_pages(batch)
-        self.ledger.note_resolution(batch.actual_resolution)
         logger.info("Scanned %d page(s)", len(batch.pages))
         return batch
 
@@ -1339,10 +1324,6 @@ class _PipelineRun:
         )
         # Before the flip prompt, so nobody is asked to flip nothing.
         _require_pages(front_batch)
-        # Pass A's answer is the better resolution to preserve at than the one the
-        # profile asked for, and it is the same value _duplex_resolution goes on to
-        # prefer when both passes complete.
-        self.ledger.note_resolution(front_batch.actual_resolution)
         front_pages = front_batch.pages
         logger.info("Pass A: scanned %d front page(s)", len(front_pages))
         # Before AWAITING_FLIP, and so before SCANNING_REVERSE: an observer that
@@ -1417,7 +1398,7 @@ class _PipelineRun:
         # count would change the number under the operator's eyes.
         _note_pass_count(self.request, SCAN_LABEL_BACK, len(back_pages))
 
-        dpi = _duplex_resolution(front_batch, back_batch)
+        resolution = _duplex_resolution(front_batch, back_batch)
         # Summed, not picked: a sheet lost on either pass is a sheet lost.
         rejected = front_batch.pages_rejected + back_batch.pages_rejected
 
@@ -1436,14 +1417,15 @@ class _PipelineRun:
             return _DuplexMismatch(
                 fronts=front_pages,
                 backs=back_pages,
-                dpi=dpi,
                 unreadable_sheets=rejected,
             )
 
         interleaved = _interleave_duplex(front_pages, back_pages)
         logger.info("Interleaved %d total pages", len(interleaved))
         return ScanBatch(
-            pages=tuple(interleaved), actual_resolution=dpi, pages_rejected=rejected
+            pages=tuple(interleaved),
+            actual_resolution=resolution,
+            pages_rejected=rejected,
         )
 
     def _finish_document(self, batch: ScanBatch) -> ScanResult:
@@ -1478,12 +1460,13 @@ class _PipelineRun:
         # or a browser would act on therefore cannot reach either file.
         filtered = _drop_empty_pages(records, self.profile)
 
-        # The resolution the device read back is the authoritative DPI, not the
-        # one the profile asked for. SANE substitutes silently -- measured, a
-        # request for 5000 comes back as 1200 -- and the read-back value is the
-        # same one the backend's crop arithmetic used, so the cropped shape and
-        # the declared page size cannot disagree.
-        pdf_path = self._assemble(filtered, batch.actual_resolution)
+        # Each page is laid out at the dpi on its own record: the resolution
+        # the device read back, not the one the profile asked for. SANE
+        # substitutes silently -- measured, a request for 5000 comes back as
+        # 1200 -- and the read-back value is the same one the backend's crop
+        # arithmetic used, so the cropped shape and the declared page size
+        # cannot disagree.
+        pdf_path = self._assemble(filtered)
         outcome, warning = self._deliver_document(pdf_path)
 
         result = ScanResult(
@@ -1500,7 +1483,7 @@ class _PipelineRun:
         logger.info("Pipeline complete for %r", self.request.title)
         return result
 
-    def _assemble(self, records: Sequence[PageRecord], dpi: int) -> Path:
+    def _assemble(self, records: Sequence[PageRecord]) -> Path:
         """
         Assemble the document's PDF inside the workspace.
 
@@ -1510,8 +1493,8 @@ class _PipelineRun:
         building another PDF would fail the same way.
 
         Args:
-            records: The pages to assemble, in document order.
-            dpi: The resolution the device reported using.
+            records: The pages to assemble, in document order, each laid out
+                at its own read-back dpi.
 
         Returns:
             The assembled PDF, still inside the workspace.
@@ -1526,7 +1509,6 @@ class _PipelineRun:
             records,
             self.workspace,
             filename=build_pdf_filename(self.request.job_id, self.request.title),
-            dpi=dpi,
             title=self.request.title,
         )
         logger.info("PDF assembled: %s", pdf_path)
@@ -1616,8 +1598,9 @@ class _PipelineRun:
         why the two passes disagreed.
 
         Args:
-            mismatch: Both passes, the resolution the device used, and the
-                sheets it could not read.
+            mismatch: Both passes, whose records carry the resolution each
+                page was read back at, and the sheets the device could not
+                read.
 
         Returns:
             SUCCESS when both halves reached the paperless-ngx API, otherwise
@@ -1645,14 +1628,12 @@ class _PipelineRun:
             fronts,
             self.workspace / "fronts",
             filename=build_pdf_filename(self.request.job_id, fronts_title),
-            dpi=mismatch.dpi,
             title=fronts_title,
         )
         backs_pdf = assemble_pdf(
             backs,
             self.workspace / "backs",
             filename=build_pdf_filename(self.request.job_id, backs_title),
-            dpi=mismatch.dpi,
             title=backs_title,
         )
         logger.info(

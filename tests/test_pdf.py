@@ -280,7 +280,7 @@ class TestAssemblePdf:
     ) -> None:
         """A single spooled page produces a valid PDF file."""
         pdf_path = assemble_pdf(
-            one_page, output_dir, filename="single.pdf", dpi=300, title=_TITLE
+            one_page, output_dir, filename="single.pdf", title=_TITLE
         )
 
         assert pdf_path.exists()
@@ -303,11 +303,9 @@ class TestAssemblePdf:
         )
 
         single_pdf = assemble_pdf(
-            records[:1], output_dir, filename="one.pdf", dpi=300, title=_TITLE
+            records[:1], output_dir, filename="one.pdf", title=_TITLE
         )
-        multi_pdf = assemble_pdf(
-            records, output_dir, filename="many.pdf", dpi=300, title=_TITLE
-        )
+        multi_pdf = assemble_pdf(records, output_dir, filename="many.pdf", title=_TITLE)
 
         assert multi_pdf.stat().st_size > single_pdf.stat().st_size
 
@@ -331,9 +329,7 @@ class TestAssemblePdf:
         records = spool_pages(images)
         before = {record.path.name: record.path.read_bytes() for record in records}
 
-        assemble_pdf(
-            records, output_dir, filename="embedded.pdf", dpi=300, title=_TITLE
-        )
+        assemble_pdf(records, output_dir, filename="embedded.pdf", title=_TITLE)
 
         assert list(output_dir.rglob("*.png")) == []
         assert sorted(path.name for path in output_dir.rglob("*")) == ["embedded.pdf"]
@@ -354,9 +350,7 @@ class TestAssemblePdf:
         before = sorted(path.name for path in spool_dir.iterdir())
 
         with pytest.raises(PdfError, match="fake img2pdf error"):
-            assemble_pdf(
-                one_page, output_dir, filename="boom.pdf", dpi=300, title=_TITLE
-            )
+            assemble_pdf(one_page, output_dir, filename="boom.pdf", title=_TITLE)
 
         assert list(output_dir.rglob("*.png")) == []
         assert sorted(path.name for path in spool_dir.iterdir()) == before
@@ -364,7 +358,7 @@ class TestAssemblePdf:
     def test_output_path(self, one_page: list[PageRecord], output_dir: Path) -> None:
         """Output PDF is written to the specified directory with .pdf extension."""
         pdf_path = assemble_pdf(
-            one_page, output_dir, filename="named.pdf", dpi=300, title=_TITLE
+            one_page, output_dir, filename="named.pdf", title=_TITLE
         )
 
         assert isinstance(pdf_path, Path)
@@ -391,14 +385,11 @@ class TestAssemblePdf:
             ]
         )
 
-        forward = assemble_pdf(
-            records, output_dir, filename="fwd.pdf", dpi=300, title=_TITLE
-        )
+        forward = assemble_pdf(records, output_dir, filename="fwd.pdf", title=_TITLE)
         backward = assemble_pdf(
             list(reversed(records)),
             output_dir,
             filename="rev.pdf",
-            dpi=300,
             title=_TITLE,
         )
 
@@ -433,7 +424,7 @@ class TestBoundedAssembly:
         )
 
         pdf_path = assemble_pdf(
-            records, output_dir, filename="merged.pdf", dpi=300, title=_TITLE
+            records, output_dir, filename="merged.pdf", title=_TITLE
         )
 
         with pikepdf.open(pdf_path) as pdf:
@@ -458,7 +449,7 @@ class TestBoundedAssembly:
         calls: list[dict[str, object]] = []
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _recording_convert(calls))
 
-        assemble_pdf(records, output_dir, filename="perpage.pdf", dpi=300, title=_TITLE)
+        assemble_pdf(records, output_dir, filename="perpage.pdf", title=_TITLE)
 
         assert len(calls) == len(records)
         assert [call["images"] for call in calls] == [
@@ -482,9 +473,7 @@ class TestBoundedAssembly:
         argvs: list[list[str]] = []
         monkeypatch.setattr(pdf_mod.pikepdf, "Job", _recording_job(argvs))
 
-        pdf_path = assemble_pdf(
-            records, output_dir, filename="job.pdf", dpi=300, title=_TITLE
-        )
+        pdf_path = assemble_pdf(records, output_dir, filename="job.pdf", title=_TITLE)
 
         assert len(argvs) == 1
         (argv,) = argvs
@@ -522,9 +511,7 @@ class TestBoundedAssembly:
             ]
         )
 
-        merged = assemble_pdf(
-            records, output_dir, filename="merged.pdf", dpi=300, title=_TITLE
-        )
+        merged = assemble_pdf(records, output_dir, filename="merged.pdf", title=_TITLE)
 
         # No outputstream here, so convert returns the bytes -- the very
         # contract whose other half (None when streaming) retired the old
@@ -549,7 +536,7 @@ class TestBoundedAssembly:
             [Image.new("RGB", (120, 160), colour) for colour in ("white", "red")]
         )
 
-        assemble_pdf(records, output_dir, filename="only.pdf", dpi=300, title=_TITLE)
+        assemble_pdf(records, output_dir, filename="only.pdf", title=_TITLE)
 
         assert sorted(path.name for path in output_dir.rglob("*")) == ["only.pdf"]
 
@@ -577,7 +564,7 @@ class TestBoundedAssembly:
         assert [record.sequence for record in records] == [1, 1, 2, 2]
 
         pdf_path = assemble_pdf(
-            records, output_dir, filename="duplex.pdf", dpi=300, title=_TITLE
+            records, output_dir, filename="duplex.pdf", title=_TITLE
         )
 
         assert embedded_streams(pdf_path) == [
@@ -603,7 +590,7 @@ class TestBoundedAssembly:
         monkeypatch.setattr(pdf_mod.pikepdf, "Job", _FailingJob)
 
         with pytest.raises(PdfError) as excinfo:
-            assemble_pdf(records, output_dir, "boom.pdf", dpi=300, title=_TITLE)
+            assemble_pdf(records, output_dir, "boom.pdf", title=_TITLE)
 
         message = str(excinfo.value)
         assert message.startswith(
@@ -664,9 +651,7 @@ class TestDocumentInfo:
         records = spool_pages([Image.new("RGB", (100, 100), "white")])
         title = "Tax — 2026 Übersicht"
 
-        pdf_path = assemble_pdf(
-            records, output_dir, filename="x.pdf", dpi=300, title=title
-        )
+        pdf_path = assemble_pdf(records, output_dir, filename="x.pdf", title=title)
 
         with pikepdf.open(pdf_path) as pdf:
             docinfo = pdf.docinfo
@@ -694,7 +679,7 @@ class TestDocumentInfo:
         )
 
         pdf_path = assemble_pdf(
-            records, output_dir, filename="three.pdf", dpi=300, title="Three pages"
+            records, output_dir, filename="three.pdf", title="Three pages"
         )
 
         with pikepdf.open(pdf_path) as pdf:
@@ -722,7 +707,7 @@ class TestDocumentInfo:
         caplog.set_level(logging.WARNING, logger=pdf_mod.logger.name)
 
         pdf_path = assemble_pdf(
-            records, output_dir, filename="warned.pdf", dpi=300, title=_TITLE
+            records, output_dir, filename="warned.pdf", title=_TITLE
         )
 
         assert pdf_path == output_dir / "warned.pdf"
@@ -747,7 +732,7 @@ class TestDocumentInfo:
         records = spool_pages([Image.new("RGB", (120, 160), "white")])
         caplog.set_level(logging.WARNING, logger=pdf_mod.logger.name)
 
-        assemble_pdf(records, output_dir, filename="clean.pdf", dpi=300, title=_TITLE)
+        assemble_pdf(records, output_dir, filename="clean.pdf", title=_TITLE)
 
         assert [
             record
@@ -804,7 +789,7 @@ for _ in range(page_count):
     records.append(sink.add(image, dpi=300))
     del image
 
-pdf_path = assemble_pdf(records, workspace / "out", "memory.pdf", 300, title="memory")
+pdf_path = assemble_pdf(records, workspace / "out", "memory.pdf", title="memory")
 with pikepdf.open(pdf_path) as pdf:
     assembled_pages = len(pdf.pages)
 
@@ -929,7 +914,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
 
         with pytest.raises(PdfError, match="boom from img2pdf") as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300, title=_TITLE)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         assert excinfo.value.__cause__ is original
         assert not isinstance(excinfo.value, error_cls)
@@ -950,7 +935,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(original))
 
         with pytest.raises(PdfError, match=str(original)) as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300, title=_TITLE)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         assert excinfo.value.__cause__ is original
 
@@ -967,7 +952,7 @@ class TestPdfBoundary:
         one_page[0].path.write_bytes(b"not a PNG at all")
 
         with pytest.raises(PdfError, match="cannot read input image") as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300, title=_TITLE)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         assert isinstance(excinfo.value.__cause__, img2pdf.ImageOpenError)
 
@@ -979,7 +964,7 @@ class TestPdfBoundary:
         blocker.write_text("a regular file where the directory should be")
 
         with pytest.raises(PdfError) as excinfo:
-            assemble_pdf(one_page, blocker / "out", "x.pdf", dpi=300, title=_TITLE)
+            assemble_pdf(one_page, blocker / "out", "x.pdf", title=_TITLE)
 
         assert isinstance(excinfo.value.__cause__, OSError)
         assert str(blocker / "out" / "x.pdf") in str(excinfo.value)
@@ -994,7 +979,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(ValueError("valued")))
 
         with pytest.raises(PdfError) as excinfo:
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300, title=_TITLE)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
         message = str(excinfo.value)
         assert message.startswith(
@@ -1015,7 +1000,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", fake_convert)
 
         with pytest.raises(PdfError, match="no pages"):
-            assemble_pdf([], output_dir, "x.pdf", dpi=300, title=_TITLE)
+            assemble_pdf([], output_dir, "x.pdf", title=_TITLE)
 
         assert calls == []
 
@@ -1029,7 +1014,7 @@ class TestPdfBoundary:
         monkeypatch.setattr(pdf_mod.img2pdf, "convert", _raising(KeyboardInterrupt()))
 
         with pytest.raises(KeyboardInterrupt):
-            assemble_pdf(one_page, output_dir, "x.pdf", dpi=300, title=_TITLE)
+            assemble_pdf(one_page, output_dir, "x.pdf", title=_TITLE)
 
 
 class TestSanitiseTitleForFilename:
@@ -1185,9 +1170,7 @@ class TestMediaBox:
         """An exact A4 raster at 300 DPI yields a 595 x 842 pt MediaBox."""
         # Rounded, never compared exactly: the true value is 595.2 x 841.92.
         records = spool_pages([Image.new("RGB", (2480, 3508), "white")])
-        pdf_path = assemble_pdf(
-            records, output_dir, filename="a4.pdf", dpi=300, title=_TITLE
-        )
+        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", title=_TITLE)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
@@ -1203,9 +1186,7 @@ class TestMediaBox:
         # img2pdf.default_dpi is 96, so an unlayouted 2480 x 3508 raster
         # becomes 1860 x 2631 pt.  Seeing that means no layout_fun was passed.
         records = spool_pages([Image.new("RGB", (2480, 3508), "white")])
-        pdf_path = assemble_pdf(
-            records, output_dir, filename="a4.pdf", dpi=300, title=_TITLE
-        )
+        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", title=_TITLE)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
@@ -1223,9 +1204,7 @@ class TestMediaBox:
         assert cropped.size == (2480, 3507)
 
         records = spool_pages([cropped])
-        pdf_path = assemble_pdf(
-            records, output_dir, filename="a4.pdf", dpi=300, title=_TITLE
-        )
+        pdf_path = assemble_pdf(records, output_dir, filename="a4.pdf", title=_TITLE)
 
         with pikepdf.open(pdf_path) as pdf:
             box = _rounded_media_box(pdf.pages[0])
@@ -1237,7 +1216,7 @@ class TestMediaBox:
         spool_pages: Callable[[Sequence[Image.Image]], list[PageRecord]],
         output_dir: Path,
     ) -> None:
-        """A fixed-DPI layout applies unconditionally, page by page."""
+        """Pages sharing a dpi share its scale: points follow the pixel count."""
         records = spool_pages(
             [
                 Image.new("RGB", (2480, 3508), "white"),
@@ -1245,9 +1224,7 @@ class TestMediaBox:
                 Image.new("RGB", (1240, 1754), "white"),
             ]
         )
-        pdf_path = assemble_pdf(
-            records, output_dir, filename="mixed.pdf", dpi=300, title=_TITLE
-        )
+        pdf_path = assemble_pdf(records, output_dir, filename="mixed.pdf", title=_TITLE)
 
         with pikepdf.open(pdf_path) as pdf:
             boxes = [_rounded_media_box(page) for page in pdf.pages]

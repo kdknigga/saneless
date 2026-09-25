@@ -406,7 +406,8 @@ class RunArtefacts:
         spool_dir: The directory holding the spooled page files.
         failed_dir: The durable directory everything kept goes in.
         reserve_mb: The ``min_free_space_mb`` reserve the disk rule keeps.
-        dpi: The resolution preserved PDFs are laid out at.
+            There is no resolution here: every preserved PDF lays each page
+            out at the dpi on the page's own record.
         stage: How far the run got.
         passes: One ``(title suffix, records)`` pair per acquisition pass, in
             pass order, with pass B's records in the order it scanned them.
@@ -422,7 +423,6 @@ class RunArtefacts:
     spool_dir: Path
     failed_dir: Path
     reserve_mb: int
-    dpi: int
     stage: RunStage = RunStage.ACQUIRING
     passes: list[tuple[str, tuple[PageRecord, ...]]] = field(default_factory=list)
     document: tuple[PageRecord, ...] | None = None
@@ -570,8 +570,9 @@ def _build_pdf(
     Assemble ``records`` into one PDF in the workspace, if there is room.
 
     Args:
-        artefacts: The run, for its workspace, job id, reserve and dpi.
-        records: The pages, in the order the PDF holds them.
+        artefacts: The run, for its workspace, job id and reserve.
+        records: The pages, in the order the PDF holds them, each laid out
+            at its own read-back dpi.
         title: The PDF's title, which its file name is composed from too.
 
     Returns:
@@ -586,7 +587,6 @@ def _build_pdf(
         records,
         artefacts.workspace / PRESERVED_DIR_NAME,
         filename=build_pdf_filename(artefacts.job_id, title),
-        dpi=artefacts.dpi,
         title=title,
     )
 
@@ -605,7 +605,7 @@ def build_pass_pdf(
     at.
 
     Args:
-        artefacts: The run, for its workspace, title, job id, reserve and dpi.
+        artefacts: The run, for its workspace, title, job id and reserve.
         suffix: The pass's title suffix, ``PARTIAL_SUFFIX``, ``FRONTS_SUFFIX``
             or ``BACKS_SUFFIX``.
         records: The pass's pages, in the order it scanned them.

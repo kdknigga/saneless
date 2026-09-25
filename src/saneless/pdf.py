@@ -144,7 +144,6 @@ def assemble_pdf(
     records: Sequence[PageRecord],
     output_dir: Path,
     filename: str,
-    dpi: int,
     *,
     title: str,
 ) -> Path:
@@ -171,22 +170,28 @@ def assemble_pdf(
     So the type level forces each caller to name its own file.
     Build the name with :func:`build_pdf_filename` rather than composing one.
 
-    ``dpi`` is likewise supplied by the caller -- as the resolution the scanner
-    reported actually using, read back from the device rather than the one the
-    profile requested -- and is deliberately **not** read from the images. On
-    this path PIL carries no DPI at all: images arrive from ``dev.snap()`` and
-    go through ``crop_to_paper_size``, whose ``Image.crop()`` returns a fresh
-    image whose ``.info`` is measured as ``{}``. A "prefer the image's own DPI"
-    branch would therefore be unreachable dead code -- and a PNG round-trip
-    degrades 300 to 299.9994 anyway, because PNG stores pixels per metre as an
-    integer. That same read-back value is what ``crop_to_paper_size`` uses for
-    its crop arithmetic, so the crop shape and the MediaBox cannot disagree.
+    **Each page is laid out at its own record's ``dpi``**: the resolution the
+    device read back for that page, which the backend handed the spool with
+    the page. It is not a parameter here. It used to be, and every caller had
+    to know the resolution: a preserved partial, whose pass never returned a
+    batch to read it from, fell back to the one the profile asked for, so a
+    600-requested scan the device delivered at 300 was preserved half size.
+    The record is the one place the fact is always present. The same
+    read-back value is what ``crop_to_paper_size`` uses for its crop
+    arithmetic, so the crop shape and the MediaBox cannot disagree.
 
-    A fixed-DPI layout function applies that DPI to **every** page
-    unconditionally, so a page's size in points is determined entirely by its
-    pixel count. That is correct here because one pipeline run scans every page
-    at one resolution: a half-size raster becomes a half-size page rather than
-    being rescaled to match its neighbours.
+    The spooled PNG carries that dpi in its pHYs chunk as well, for a sweep
+    that has no records, but it is deliberately **not** read here. The record
+    is authoritative, and a PNG round-trip degrades 300 to 299.9994 anyway,
+    because PNG stores pixels per metre as an integer. The fixed-DPI layout
+    function ignores pHYs, so the chunk does not change the PDF.
+
+    A fixed-DPI layout function is built per page, so a page's size in points
+    is determined entirely by its pixel count and its own dpi. Pages of one
+    run normally share a dpi; when the device changed its mind between the
+    two passes of a manual duplex, each page still comes out at its real
+    size. A half-size raster at the same dpi becomes a half-size page rather
+    than being rescaled to match its neighbours.
 
     **Memory is bounded by converting one page at a time.** Each page gets its
     own ``img2pdf.convert(..., outputstream=...)`` call into its own single-page
@@ -254,13 +259,11 @@ def assemble_pdf(
     Args:
         records: The spooled pages to include, in document order. Must not be
             empty. Each record's PNG is embedded exactly as the spool wrote
-            it, losslessly and with no re-encode.
+            it, losslessly and with no re-encode, at the record's ``dpi``.
         output_dir: Directory where the output PDF will be written.
         filename: File name for the PDF, including its ``.pdf`` extension.
             Must be a single path segment; :func:`build_pdf_filename`
             guarantees that.
-        dpi: Resolution the pages were actually scanned at, as read back from
-            the device. Determines the page size the PDF declares.
         title: The document's title, written to ``/Info`` as ``/Title``.
             Required, like ``filename``: each caller names what it built.
 
@@ -284,12 +287,6 @@ def assemble_pdf(
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
-        # default_layout_fun unpacks it, and an int silently yields wrong
-        # geometry.  Without it img2pdf lays pages out at its default_dpi
-        # of 96, turning an A4 page at 300 DPI into a 1860 x 2631 pt monster.
-        layout_fun = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
-
         with tempfile.TemporaryDirectory(dir=str(output_dir)) as tmp_dir:
             work_dir = Path(tmp_dir)
             # Only the first page carries the document metadata: that file is
@@ -306,6 +303,12 @@ def assemble_pdf(
                 # convert returns None once outputstream= is supplied -- that
                 # is its documented contract, not a failure, so there is
                 # nothing here to guard against.
+                # The argument is an (x_dpi, y_dpi) 2-tuple, not a scalar:
+                # default_layout_fun unpacks it, and an int silently yields
+                # wrong geometry.  Without it img2pdf lays pages out at its
+                # default_dpi of 96, turning an A4 page at 300 DPI into a
+                # 1860 x 2631 pt monster.
+                layout_fun = img2pdf.get_fixed_dpi_layout_fun((record.dpi, record.dpi))
                 with single.open("wb") as stream:
                     img2pdf.convert(
                         [str(record.path)],
