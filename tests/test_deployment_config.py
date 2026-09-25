@@ -1207,6 +1207,14 @@ def test_the_deploy_guide_explains_the_stop_grace_period() -> None:
             f"{DEPLOY_HOWTO.name}: the {_STOPPING_HEADING!r} section does not "
             f"mention {needle!r}"
         )
+    # The stop is bounded: only a scan at the flip wait is interrupted, and
+    # the rest is recovered by the next start of the same container only.
+    prose = " ".join(section.split())
+    for needle in ("is not interrupted", "docker compose restart"):
+        assert needle in prose, (
+            f"{DEPLOY_HOWTO.name}: the {_STOPPING_HEADING!r} section does not "
+            f"say {needle!r}"
+        )
 
 
 def test_no_shipped_example_token_is_a_detected_placeholder() -> None:

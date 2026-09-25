@@ -216,11 +216,21 @@ A Caddy site block named after a hostname and a Traefik router with a `Host()` r
 `docker compose up -d` after an upgrade all stop saneless the same way: Docker
 sends SIGTERM, waits for the container's grace period, and then kills it.
 
-A scan that the stop interrupts keeps the pages it already scanned. A manual
-duplex job waiting at the flip prompt, for example, keeps its front sides as a
+What a stop keeps depends on where the scan is. A manual duplex job waiting
+at the flip prompt is interrupted at once and keeps its front sides as a
 `(fronts)` PDF in `failed/`, and the job records that the server restarted and
-names the file. saneless waits up to 5 seconds for the scan worker to finish,
-and up to 60 seconds more while it is still writing those pages into `failed/`.
+names the file. One still in pass A does the same when pass A finishes, if
+that is within 5 seconds of the stop. saneless waits up to 5 seconds for the
+scan worker to finish, and up to 60 seconds more only while it is writing
+pages into `failed/`.
+
+A scan busy with anything else when those 5 seconds run out -- pass A still
+feeding, pass B, a single-pass scan, assembly or the upload -- is not
+interrupted. saneless exits under it, and its pages stay in the container's
+`/tmp`. The next start of the same container, after `docker compose restart`
+or `docker compose stop` and `start`, recovers them into `failed/`, but
+`docker compose up -d` recreates the container and they are lost. Let a scan
+finish before you stop or upgrade saneless.
 
 That copy can be slow. saneless spools pages under `/tmp` inside the
 container, and `failed/` is on the data volume: they are different

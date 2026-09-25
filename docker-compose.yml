@@ -73,11 +73,12 @@ services:
       # - SANELESS_SCANNER__HOST=192.168.1.50
       # Multiple hosts use colons: SANELESS_SCANNER__HOST=192.168.1.50:192.168.1.51
     restart: unless-stopped
-    # How long Docker waits after SIGTERM before it kills saneless. A scan
-    # stopped part way -- for example one waiting at the manual duplex flip
-    # prompt -- keeps the pages already scanned by copying them into failed/
-    # on the data volume. saneless waits up to 5 s for the scan worker, and up
-    # to 60 s more while that copy runs. /tmp and the data volume are different
+    # How long Docker waits after SIGTERM before it kills saneless. A manual
+    # duplex scan waiting at the flip prompt is stopped at once and keeps its
+    # fronts by copying them into failed/ on the data volume. saneless waits up
+    # to 5 s for the scan worker, and up to 60 s more while that copy runs; a
+    # scan busy with anything else is not interrupted, and its pages stay in
+    # /tmp for the next start of this same container. /tmp and the data volume are different
     # filesystems, so it really is a copy, and Docker's default 10 s grace
     # would kill it half way. `docker compose up -d` recreates the container
     # and discards /tmp, so the next start cannot recover a half-copied scan.
