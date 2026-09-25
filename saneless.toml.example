@@ -20,6 +20,8 @@ consume_dir = "/path/to/paperless/consume"
 # without a dot and names under .local, .home.arpa, .internal and .lan always
 # work; add a reverse proxy's public name here. ".example.com" covers that
 # domain and every name under it. No "*", port, scheme or path.
+# Use a leading dot only for a domain you control; for dynamic DNS write
+# your own full name (me.duckdns.org), never ".duckdns.org".
 # allowed_hosts = ["scan.example.com"]
 
 [profiles.default]
