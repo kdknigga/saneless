@@ -11,7 +11,9 @@ bytes to the hashes. Every browser test here runs behind an egress gate (the
 overridden ``context`` fixture) that aborts and records any request not
 addressed to the test server and fails the test if anything was recorded, so
 the UI is proven to work with no internet, and the CI ``browser`` job runs this
-whole module offline.
+whole module offline. The same fixture records every Content-Security-Policy
+violation a page raises and fails the test if there was one, so the module is
+also the proof that no page needs anything the policy refuses.
 
 A stylesheet whose bytes no longer match its ``integrity`` is refused by the
 browser without announcing itself: the contrast checks then report unstyled
@@ -478,9 +480,63 @@ def _make_gate(
     return _gate
 
 
+# Reports every Content-Security-Policy violation a page raises to the test.
+# It runs as an init script, which the page's policy does not govern, so it is
+# in place before the first byte of the page is parsed.
+_CSP_LISTENER = """
+document.addEventListener("securitypolicyviolation", (event) => {
+    window.__reportCsp(`${event.violatedDirective} ${event.blockedURI}`);
+});
+"""
+
+
+# The same two-part rule as ``_make_gate``, for the same reason: a context made
+# by hand from the ``browser`` fixture carries none of the overridden
+# fixture's set-up, so without this factory its pages could break the policy
+# and nothing would say so.  Every context this module creates installs a
+# listener built here, and every one of them is covered by an assertion at
+# teardown that its ``violations`` list is empty.  A browser that refuses
+# something under the policy does not fail the page loudly -- an inline style
+# is simply not applied, a script simply does not run -- so the listener is
+# how the whole browser suite becomes the proof that no page needs anything
+# the policy refuses.
+#
+# The page's report reaches the test only while the test is inside a
+# Playwright call, as the egress gate's route handler does.
+def _make_csp_gate(context: BrowserContext, violations: list[str]) -> None:
+    """
+    Record every Content-Security-Policy violation a page in ``context`` raises.
+
+    Args:
+        context: The browser context to install the listener in, before any
+            of its pages loads.
+        violations: The list each violation is appended to, as the violated
+            directive and the blocked URI.  The caller asserts it empty at
+            teardown; one list may be shared by several contexts.
+
+    """
+
+    def _report(_source: object, text: str) -> None:
+        violations.append(text)
+
+    context.expose_binding("__reportCsp", _report)
+    context.add_init_script(_CSP_LISTENER)
+
+
+@pytest.fixture
+def csp_violations() -> list[str]:
+    """
+    Return the list the ``context`` fixture's policy listener records into.
+
+    A fixture of its own so that the one test which provokes a violation on
+    purpose can read the list, and clear it, before teardown asserts it empty.
+    """
+    return []
+
+
 @pytest.fixture
 def context(
-    context: BrowserContext, egress_allowlist: list[str]
+    context: BrowserContext, egress_allowlist: list[str], csp_violations: list[str]
 ) -> Iterator[BrowserContext]:
     """
     Route every request the page makes through a no-egress gate.
@@ -499,10 +555,16 @@ def context(
     Teardown asserts the gate saw traffic before it asserts nothing was blocked,
     because the second assertion alone would pass over a context that was never
     routed at all -- an empty list is what a gate that does not exist produces.
+
+    The context also records every Content-Security-Policy violation its pages
+    raise (``_make_csp_gate``), and the test fails if there was any, so every
+    browser test is also a check that the page runs under the policy.
+    ``TestTheCspGate`` shows the listener does record one.
     """
     blocked: list[str] = []
     seen: list[str] = []
     context.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+    _make_csp_gate(context, csp_violations)
     yield context
     # Order matters: an ungated context must be reported as ungated, not handed
     # the clean bill of health an empty ``blocked`` list would otherwise give it.
@@ -511,6 +573,9 @@ def context(
         "would have passed for a context whose routing was never installed"
     )
     assert blocked == [], f"the page tried to reach the network: {blocked}"
+    assert csp_violations == [], (
+        f"the page violated its Content-Security-Policy: {csp_violations}"
+    )
 
 
 @pytest.fixture
@@ -648,9 +713,11 @@ class TestTheEgressGateRefuses:
         # ``_make_gate`` is a factory rather than a closure in that fixture.
         blocked: list[str] = []
         seen: list[str] = []
+        violations: list[str] = []
         ctx = browser.new_context()
         try:
             ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(ctx, violations)
             page = ctx.new_page()
             page.goto(browser_server.url)
             page.evaluate(
@@ -671,8 +738,73 @@ class TestTheEgressGateRefuses:
             assert blocked == [_OFF_ALLOWLIST_URL], (
                 f"the probe, and only the probe, should have been refused: {blocked}"
             )
+            assert violations == [], (
+                f"the page violated its Content-Security-Policy: {violations}"
+            )
         finally:
             ctx.close()
+
+
+_CSP_PROBE_BUDGET = 5.0
+
+
+@pytest.mark.browser
+class TestTheCspGate:
+    """
+    The positive half of the Content-Security-Policy proof.
+
+    Every other browser test asserts that its pages raised no violation, which
+    is a claim about the pages.  The first test here asserts that a violation
+    *was* recorded, which is a claim about the listener: without it an empty
+    list could not tell a page that keeps to the policy from a listener that
+    was never installed, or a policy that was never sent.
+    """
+
+    def test_an_inline_style_is_recorded_as_a_csp_violation(
+        self,
+        page: Page,
+        browser_server_url: str,
+        csp_violations: list[str],
+        poll_until: Callable[..., bool],
+    ) -> None:
+        """
+        An inline style set from script is refused and recorded, exactly once.
+
+        The page's policy has no ``style-src``, so ``default-src 'self'``
+        governs style attributes and refuses them.  The list is cleared once
+        the violation has been seen, so the fixture's teardown still checks
+        that nothing else was recorded.
+        """
+        page.goto(browser_server_url)
+        assert csp_violations == [], csp_violations
+        page.evaluate("document.body.setAttribute('style', 'color: red')")
+
+        def violation_recorded() -> bool:
+            # The round trip lets Playwright deliver the page's report, as the
+            # egress probe's poll does for its route handler.
+            page.evaluate("0")
+            return bool(csp_violations)
+
+        assert poll_until(violation_recorded, budget=_CSP_PROBE_BUDGET), (
+            "the listener recorded no violation for an inline style"
+        )
+        assert len(csp_violations) == 1, csp_violations
+        assert csp_violations[0].startswith("style-src"), csp_violations
+        csp_violations.clear()
+
+    def test_htmx_config_turns_off_eval_and_injects_no_style(
+        self, page: Page, browser_server_url: str
+    ) -> None:
+        """
+        The page runs htmx with eval and script tags off, and without its style.
+
+        The meta configuration is read before htmx would inject its indicator
+        style, so the switch takes effect on the first load.
+        """
+        page.goto(browser_server_url)
+        assert page.evaluate("htmx.config.allowEval") is False
+        assert page.evaluate("htmx.config.allowScriptTags") is False
+        assert page.locator("head style").count() == 0
 
 
 @pytest.mark.browser
@@ -4475,11 +4607,15 @@ class TestTwoBrowsersOneStack:
         # One ``seen`` list for the same reason as one ``blocked`` list: both
         # pages are navigated below, so a single record speaks for both gates.
         seen: list[str] = []
+        # And one policy-violation list, under the same one-assertion rule.
+        violations: list[str] = []
         owner_ctx = browser.new_context()
         viewer_ctx = browser.new_context()
         try:
             owner_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
             viewer_ctx.route("**/*", _make_gate(blocked, egress_allowlist, seen))
+            _make_csp_gate(owner_ctx, violations)
+            _make_csp_gate(viewer_ctx, violations)
             owner_page = owner_ctx.new_page()
             viewer_page = viewer_ctx.new_page()
 
@@ -4566,6 +4702,9 @@ class TestTwoBrowsersOneStack:
                 "below would have passed for two contexts that were never gated"
             )
             assert blocked == [], f"a page tried to reach the network: {blocked}"
+            assert violations == [], (
+                f"a page violated its Content-Security-Policy: {violations}"
+            )
 
     def test_abort_asks_first_and_does_nothing_when_the_answer_is_no(
         self,
