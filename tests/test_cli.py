@@ -5808,3 +5808,148 @@ class TestServeLogging:
         assert attached_to == [str(log_file)]
         assert obj["log_file"] == log_file
         assert log_file.parent.is_dir()
+
+
+_HOSTILE_DEVICE_NAME = "dev\x1b"
+_HOSTILE_BROKEN_NAME = "broken\x1b[2J"
+
+
+class _HostileScanner(StubScannerBackend):
+    """
+    A LAN device whose every reported string carries terminal controls.
+
+    The second device's probe fails, so the stderr line naming it is exercised
+    too.
+    """
+
+    def __init__(self, host: str = "") -> None:
+        """Accept host parameter for API compatibility."""
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """Return a device whose strings hold ESC and CSI, and one that fails."""
+        return [
+            DeviceInfo(_HOSTILE_DEVICE_NAME, "Vend\x1b", "\x1b[2J", "scanner\x9b"),
+            DeviceInfo(_HOSTILE_BROKEN_NAME, "V", "M", "scanner"),
+        ]
+
+    def get_capabilities(self, device_id: str) -> DeviceCapabilities:
+        """Report control characters in every label, or fail for the second."""
+        if device_id == _HOSTILE_BROKEN_NAME:
+            msg = "Could not open the device"
+            raise ScanError(msg)
+        return DeviceCapabilities(
+            sources=["Flat\x1b[2Jbed"],
+            resolutions=[300],
+            modes=["co\x9blor"],
+            raw_options=[
+                (0, "src\x1bopt", "Source", "desc", 3, 0, 1, 0, ["Flatbed"]),
+            ],
+        )
+
+
+def _control_free(text: str) -> bool:
+    """Return whether ``text`` holds no ESC, CSI or other terminal control."""
+    return not any(ch in text for ch in ("\x1b", "\x9b", "\x85", "\x7f"))
+
+
+class TestControlCharactersAtCliSinks:
+    """Human-readable CLI output never carries a raw control character."""
+
+    def test_devices_table_neutralises_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A device name, vendor and model with ESC print as visible escapes."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HostileScanner)
+
+        result = runner.invoke(cli, ["devices"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        assert _control_free(result.stderr), repr(result.stderr)
+        assert "dev\\x1b" in result.stdout
+        assert "\\x1b[2J" in result.stdout
+
+    def test_devices_capabilities_neutralise_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Capability labels, both "Capabilities for" lines and the log hold none."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HostileScanner)
+
+        with caplog.at_level(logging.WARNING, logger="saneless.cli"):
+            result = runner.invoke(cli, ["devices", "--capabilities"])
+
+        assert result.exit_code == 1, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        assert _control_free(result.stderr), repr(result.stderr)
+        assert "Capabilities for dev\\x1b:" in result.stdout
+        assert "Flat\\x1b[2Jbed" in result.stdout
+        assert "co\\x9blor" in result.stdout
+        assert "src\\x1bopt" in result.stdout
+        assert "Capabilities for broken\\x1b[2J:" in result.stderr
+        messages = [record.getMessage() for record in caplog.records]
+        assert messages
+        assert all(_control_free(message) for message in messages), messages
+
+    def test_devices_json_keeps_the_raw_name_for_the_machine_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``--json`` round-trips the raw name; ``json.dumps`` escapes it."""
+        runner, _ = _patch_cli(monkeypatch, scanner_cls=_HostileScanner)
+
+        result = runner.invoke(cli, ["devices", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        data = json.loads(result.stdout)
+        assert data[0]["name"] == _HOSTILE_DEVICE_NAME
+
+    @staticmethod
+    def _stored_hostile_job(tmp_path: Path) -> Settings:
+        """
+        Store one job whose title and profile carry terminal controls.
+
+        Returns:
+            Settings whose database holds that job.
+
+        """
+        settings = _make_settings(
+            tmp_path,
+            output=OutputConfig(
+                tmp_dir=str(tmp_path),
+                data_dir=str(tmp_path),
+                log_file=str(tmp_path / "saneless.log"),
+            ),
+        )
+        store = JobStore(db_path=settings.output.db_path)
+        store.create_job(profile="p\x1b", title="t\x1b[31m")
+        store.close()
+        return settings
+
+    def test_jobs_table_neutralises_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A stored title or profile holding ESC prints as a visible escape."""
+        settings = self._stored_hostile_job(tmp_path)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        assert "t\\x1b[31m" in result.stdout
+        assert "p\\x1b" in result.stdout
+
+    def test_jobs_json_keeps_the_raw_title_despite_control_characters(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``jobs --json`` round-trips the stored title unchanged."""
+        settings = self._stored_hostile_job(tmp_path)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        assert _control_free(result.stdout), repr(result.stdout)
+        data = json.loads(result.stdout)
+        assert data[0]["title"] == "t\x1b[31m"
+        assert data[0]["profile"] == "p\x1b"

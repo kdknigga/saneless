@@ -141,6 +141,28 @@ class TestDeviceInfo:
         assert info.model == "Scanner"
         assert info.device_type == "scanner"
 
+    def test_device_info_neutralises_control_characters_in_display_fields(
+        self,
+    ) -> None:
+        """
+        A device's vendor, model and type are stored with controls escaped.
+
+        A rogue saned or eSCL device chooses these strings, and they are only
+        ever shown. The name is kept byte for byte, because it goes back to
+        ``sane.open`` and into the configuration; it is escaped where shown.
+        """
+        info = DeviceInfo(
+            name="net:\x1bx",
+            vendor="V\x1b",
+            model="\x1b[2J",
+            device_type="t\x85",
+        )
+
+        assert info.name == "net:\x1bx"
+        assert info.vendor == "V\\x1b"
+        assert info.model == "\\x1b[2J"
+        assert info.device_type == "t\\x85"
+
 
 class TestScanSettings:
     """ScanSettings dataclass tests."""
