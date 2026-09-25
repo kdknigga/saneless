@@ -6411,3 +6411,32 @@ def test_first_web_ui_scan_no_longer_says_every_viewer_sees_the_same() -> None:
         f"{name} still says the title and thumbnail are the same for every viewer"
     )
     assert HIDDEN_JOB_TITLE in text, f"{name} does not name the generic title"
+
+
+def test_allowed_hosts_docs_warn_against_a_shared_suffix() -> None:
+    """
+    Both pages that explain ``allowed_hosts`` warn against a shared suffix.
+
+    saneless accepts any suffix with two labels, and it cannot tell a domain
+    the operator owns from one where anybody can register a name, such as a
+    dynamic DNS service's.  A leading-dot entry for the latter trusts every
+    name registered under it, which is DNS rebinding again, so the pages have
+    to say so and point at the operator's own full name instead.
+    """
+    config_text, config_name = _read(CONFIG_REFERENCE)
+    deploy_text, deploy_name = _read(DEPLOY_HOWTO)
+    sections = {
+        f"{config_name} ### Allowed host names": _subsection(
+            config_text, "### Allowed host names", config_name
+        ),
+        f"{deploy_name} ## Running behind a reverse proxy": _section(
+            deploy_text, "## Running behind a reverse proxy", deploy_name
+        ),
+    }
+    offenders = [
+        f"{where} does not mention {needle!r}"
+        for where, body in sections.items()
+        for needle in (".duckdns.org", "me.duckdns.org", "register")
+        if needle not in body
+    ]
+    assert not offenders, "\n".join(offenders)

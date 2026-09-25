@@ -176,6 +176,8 @@ saneless refuses every request whose `Host` header does not name it, with `421 M
 
 Entries are compared without case, and the port a request uses does not matter, so write the name alone. A suffix must contain a dot after its leading one: `.com` is refused, because it would trust a whole top-level domain.
 
+**A leading-dot entry trusts every name anyone can register under it.** saneless refuses only a suffix without a second dot, such as `.com`. It cannot tell a domain you own from one where anybody can register a name: a dynamic DNS service's domain such as `.duckdns.org`, or a registry suffix such as `.co.uk`. It accepts both. An entry like that lets a hostile site register a name under it, point that name at saneless's address and reach saneless through DNS rebinding. List your own full name instead, such as `me.duckdns.org`. Use a leading-dot entry only for a domain you control, where nobody else can create names.
+
 There is no `*`. A single wildcard would turn the check off for every name at once, which is exactly what DNS rebinding needs. An empty entry, a `*` anywhere, a port (`scan.example.com:8080`), a scheme (`https://scan.example.com`), a path, a user name, whitespace or a non-ASCII character is a configuration error, and saneless does not start. Write an international name in its `xn--` form. An IP address needs no entry: every IP address is already answered.
 
 A reverse proxy that keeps the original `Host` header -- as it should -- sends its public name to saneless, so put that name here. See [Running behind a reverse proxy](../how-to/deploy-docker-compose.md#running-behind-a-reverse-proxy).

@@ -895,8 +895,12 @@ class WebConfig(BaseModel):
         port, scheme or path means a URL was pasted where a name belongs, and
         an IP literal needs no entry, since every IP literal is already
         trusted.  One trailing dot is dropped, as it is from a Host.  A suffix
-        must hold a dot after its leading one, so ``.com`` cannot trust a whole
-        top-level domain.
+        must hold a dot after its leading one, so a single-label suffix such
+        as ``.com`` is refused.  That is the whole check: a suffix with two or
+        more labels is accepted even when it is a public one where anybody can
+        register a name, such as ``.co.uk`` or a dynamic DNS domain, and such
+        an entry trusts every name registered under it.  The configuration
+        reference warns against that.
 
         The message names the rule, never the value, like ``paperless.url``'s.
 

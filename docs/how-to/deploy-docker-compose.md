@@ -164,7 +164,7 @@ saneless answers only requests whose `Host` names it (see [Host check](../refere
 allowed_hosts = ["scan.example.com"]
 ```
 
-or `SANELESS_WEB__ALLOWED_HOSTS='["scan.example.com"]'` in the environment. A leading-dot entry such as `.example.com` covers that domain and every name under it. See [Allowed host names](../reference/configuration.md#allowed-host-names).
+or `SANELESS_WEB__ALLOWED_HOSTS='["scan.example.com"]'` in the environment. A leading-dot entry such as `.example.com` covers that domain and every name under it, so use one only for a domain you control. For a dynamic DNS name, write your own full name, such as `me.duckdns.org`. Never write the shared suffix `.duckdns.org` or a registry suffix such as `.co.uk`: anybody can register a name under those and use it to reach saneless through DNS rebinding. See [Allowed host names](../reference/configuration.md#allowed-host-names).
 
 **Have the proxy pass the original `Host` header, or set `X-Forwarded-Host`, whatever the scheme.** When the browser sends no `Sec-Fetch-Site`, saneless compares the browser's `Origin` with `Host` and `X-Forwarded-Host`. Browsers never send `Sec-Fetch-Site` over plain HTTP, and browsers without Fetch Metadata support (Safari before 16.4, for example) do not send it over HTTPS either. Behind an HTTPS proxy, current browsers do send it and saneless decides from that header alone, so HTTPS usually works without this step, but an older browser is then rejected. nginx replaces `Host` with the upstream address by default, so tell it to pass the original:
 
