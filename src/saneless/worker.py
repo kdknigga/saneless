@@ -31,6 +31,7 @@ from .exceptions import ConfigError, ScanCancelledError
 from .job import JobResult
 from .pipeline import (
     SCAN_LABEL_FRONT,
+    DeviceMemory,
     FlipAnswerSlot,
     FlipCoordinator,
     PipelineEvent,
@@ -448,6 +449,10 @@ class ScanWorker:
         # Whether the first successful probe must also fail the rows a crashed
         # process left active, because startup recovery could not.
         self._restart_recovery_pending = False
+        # The device this worker's last auto-detecting job chose, handed to
+        # every job's pipeline so a change between jobs is logged.  Touched
+        # only by the worker thread, one job at a time.
+        self._device_memory = DeviceMemory()
 
     def start(self) -> None:
         """Start the worker thread."""
@@ -1542,6 +1547,7 @@ class ScanWorker:
             thumbnail_callback=_thumbnail_cb,
             pass_count_callback=_pass_count_cb,
             flip_coordinator=coordinator,
+            device_memory=self._device_memory,
         )
         try:
             # The gate covers the whole pipeline call, which is the whole of

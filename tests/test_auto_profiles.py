@@ -2383,3 +2383,186 @@ class TestDurableConfigWrite:
             and str(real.resolve()) in record.getMessage()
         ]
         assert len(messages) == 1
+
+
+class TestDevicePin:
+    """
+    ``device=`` writes the scanner a run used into an unset ``[scanner] device``.
+
+    With ``scanner.device`` empty every scan goes to whichever device SANE
+    lists first, so a scanner that appears on the LAN later can take them.
+    Writing the id discovery chose closes that gap.  The key carries no
+    ``auto_generated`` marker, so it is never the tool's to change once set:
+    a non-empty value is left alone under ``force`` too.
+    """
+
+    _DEVICE = "net:h:1"
+
+    @staticmethod
+    def _generated() -> dict[str, ProfileConfig]:
+        """One generated profile, the smallest set a run writes."""
+        return {
+            "default": ProfileConfig(
+                source="Flatbed", resolution=300, mode="Color", auto_generated=True
+            ),
+        }
+
+    def test_pin_adds_a_scanner_table_when_there_is_none(self, tmp_path: Path) -> None:
+        """A file with no ``[scanner]`` table gains one holding the device."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text('[paperless]\nurl = "http://nas:8000"\n')
+
+        result = write_profiles_to_config(
+            config_file, self._generated(), device=self._DEVICE
+        )
+
+        data = tomllib.loads(config_file.read_text())
+        assert data["scanner"]["device"] == self._DEVICE
+        assert data["paperless"]["url"] == "http://nas:8000"
+        assert result.pinned_device == self._DEVICE
+
+    def test_pin_fills_an_empty_device(self, tmp_path: Path) -> None:
+        """``device = ""`` is unset, so it is filled; its neighbours survive."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            '[scanner]\nhost = "scanbox"  # the saned host\ndevice = ""\n'
+        )
+
+        result = write_profiles_to_config(
+            config_file, self._generated(), device=self._DEVICE
+        )
+
+        text = config_file.read_text()
+        data = tomllib.loads(text)
+        assert data["scanner"] == {"host": "scanbox", "device": self._DEVICE}
+        assert "# the saned host" in text
+        assert result.pinned_device == self._DEVICE
+
+    @pytest.mark.parametrize("force", [False, True])
+    def test_pin_never_overwrites_a_set_device(
+        self, tmp_path: Path, *, force: bool
+    ) -> None:
+        """A device the operator chose is left byte for byte, ``force`` or not."""
+        config_file = tmp_path / "saneless.toml"
+        # A hand-written default, so nothing else in the run changes the file
+        # and a byte comparison isolates the pin.
+        original = (
+            b'[scanner]\ndevice = "other"\n\n'
+            b'[profiles.default]\nsource = "ADF"\nauto_generated = false\n'
+        )
+        config_file.write_bytes(original)
+
+        result = write_profiles_to_config(
+            config_file, self._generated(), force=force, device=self._DEVICE
+        )
+
+        assert config_file.read_bytes() == original
+        assert result.pinned_device is None
+        assert not any(line.startswith("Pinned") for line in result.describe())
+
+    def test_pin_counts_as_a_change_when_the_profiles_do_not(
+        self, tmp_path: Path
+    ) -> None:
+        """Profiles already present do not stop the pin from being written."""
+        config_file = tmp_path / "saneless.toml"
+        config_file.write_text(
+            '[profiles.default]\nsource = "Flatbed"\nresolution = 300\n'
+            'mode = "Color"\nauto_generated = true\n'
+        )
+
+        result = write_profiles_to_config(
+            config_file, self._generated(), device=self._DEVICE
+        )
+
+        assert result.added == ()
+        assert result.skipped_existing == ("default",)
+        assert result.pinned_device == self._DEVICE
+        scanner = tomllib.loads(config_file.read_text())["scanner"]
+        assert scanner["device"] == self._DEVICE
+
+    def test_pin_absent_without_a_device(self, tmp_path: Path) -> None:
+        """No ``device`` argument, no ``[scanner]`` table: the worker's call."""
+        config_file = tmp_path / "saneless.toml"
+
+        result = write_profiles_to_config(config_file, self._generated())
+
+        assert "scanner" not in tomllib.loads(config_file.read_text())
+        assert result.pinned_device is None
+
+    def test_pin_refuses_a_scanner_key_that_is_not_a_table(
+        self, tmp_path: Path
+    ) -> None:
+        """A scalar ``scanner`` is not overwritten; the file is left intact."""
+        config_file = tmp_path / "saneless.toml"
+        original = b'scanner = "oops"\n'
+        config_file.write_bytes(original)
+
+        with pytest.raises(ConfigError, match=r"\[scanner\]"):
+            write_profiles_to_config(
+                config_file, self._generated(), device=self._DEVICE
+            )
+
+        assert config_file.read_bytes() == original
+
+    def test_pin_is_logged_with_repr(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The id is untrusted, so the log line quotes it with ``%r``."""
+        config_file = tmp_path / "saneless.toml"
+
+        with caplog.at_level(logging.INFO, logger="saneless.auto_profiles"):
+            write_profiles_to_config(
+                config_file, self._generated(), device=self._DEVICE
+            )
+
+        messages = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.auto_profiles"
+            and "Pinned [scanner] device" in record.getMessage()
+        ]
+        assert messages == ["Pinned [scanner] device to 'net:h:1'"]
+
+    def test_pin_skips_an_id_holding_control_characters(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        r"""
+        An id with control characters is not pinned; the profiles still are.
+
+        tomlkit writes ESC as ``\e``, which Python's TOML 1.0 reader rejects,
+        so the round-trip guard would refuse the whole run.  Skipping the pin
+        keeps the profiles and says why, with the id quoted by ``%r``.
+        """
+        config_file = tmp_path / "saneless.toml"
+        device = "net:h:1\x1b[2J"
+
+        with caplog.at_level(logging.INFO, logger="saneless.auto_profiles"):
+            result = write_profiles_to_config(
+                config_file, self._generated(), device=device
+            )
+
+        data = tomllib.loads(config_file.read_text())
+        assert "scanner" not in data
+        assert "default" in data["profiles"]
+        assert result.pinned_device is None
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "saneless.auto_profiles"
+            and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert repr(device) in warnings[0]
+        assert "\x1b" not in warnings[0]
+
+    def test_pin_describe_names_the_device(self, tmp_path: Path) -> None:
+        """The pin is its own line, after the profile groups, quoted with repr."""
+        result = ProfileWriteResult(
+            path=tmp_path / "saneless.toml",
+            added=("a",),
+            pinned_device=self._DEVICE,
+        )
+        assert result.describe() == [
+            "Added: 'a'",
+            "Pinned [scanner] device: 'net:h:1'",
+        ]

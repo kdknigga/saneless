@@ -193,7 +193,7 @@ saneless [--config PATH] [-v] doctor
 | Check | What it looks at |
 |-------|------------------|
 | Configuration | Whether a `saneless.toml` was loaded, and whether an old `config.toml` is sitting in a searched directory being ignored |
-| Scanner | Whether scanner support is installed and a device answers. A configured sane-net host has its saned port probed first, so an unplugged network scanner is reported in about two seconds rather than two minutes |
+| Scanner | Whether scanner support is installed and a device answers. A configured sane-net host has its saned port probed first, so an unplugged network scanner is reported in about two seconds rather than two minutes. When `[scanner] device` is empty and more than one device is visible, the row is a warning that gives only the count (device ids hold network addresses and the web page shows this row to everyone on your network): with no device set, every scan goes to whichever device SANE lists first |
 | Paperless | Whether the API token and the paperless-ngx address have been set, and whether paperless-ngx accepts the token. A placeholder token or an empty `paperless.url` is reported without sending a request |
 | Profiles | Whether any scan profiles are configured, whether they were saved to a config file, and whether the generated ones have names yet |
 | Fallback | Whether a fallback folder is configured for when paperless-ngx is down, and whether saneless can write to it |
@@ -312,7 +312,10 @@ Refreshed: ...
 Skipped (not auto-generated): ...
 Skipped (already exists; use --force to refresh): ...
 Removed (scanner no longer offers it): ...
+Pinned [scanner] device: ...
 ```
+
+**`auto-profiles` pins the scanner it used.** When no device is configured (`[scanner] device` is empty in the file and `SANELESS_SCANNER__DEVICE` is not set), the command generates profiles for the first device SANE lists and writes that device's id into `[scanner] device`, so later scans keep going to it rather than to whichever scanner appears first on the network. A device that is already set is never overwritten, with `--force` or without: that key has no `auto_generated` marker, so it is yours. Run [`saneless devices`](#saneless-devices) first if more than one scanner is visible, and set `[scanner] device` yourself when the first one listed is not the one you use. `saneless serve`'s startup generation does not pin a device.
 
 See [Auto-generated profiles](../how-to/configure-scan-profiles.md#auto-generated-profiles) for which keys are generated and how a hand edit is treated.
 

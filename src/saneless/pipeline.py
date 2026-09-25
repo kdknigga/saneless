@@ -344,6 +344,30 @@ class _FlipContext:
 
 
 @dataclass
+class DeviceMemory:
+    """
+    The device the last auto-detecting run of one worker chose.
+
+    With ``scanner.device`` empty each run scans on whichever device SANE lists
+    first, so a scanner that appears on the LAN between two jobs takes the
+    second one silently.  Comparing against this record is what lets that
+    change be logged.
+
+    One instance lives per worker and rides on every ``PipelineRequest`` it
+    builds; the CLI runs one scan per process and passes none.  It is not
+    module state, which would carry one test's device into the next and one
+    worker's into another's.
+
+    Attributes:
+        last_id: The device id the previous auto-detection chose, or None
+            before the first one.
+
+    """
+
+    last_id: str | None = None
+
+
+@dataclass
 class PipelineRequest:
     """
     Parameters for a scan pipeline run.
@@ -385,6 +409,10 @@ class PipelineRequest:
     # the second to learn why -- the two-step that once left an Abort pressed
     # during pass B doing nothing at all.
     flip_coordinator: FlipCoordinator | None = None
+    # The worker's record of the device its last auto-detection chose, so a
+    # change between jobs is logged.  Defaulted, like every field here, so the
+    # CLI -- one scan per process, nothing to compare with -- passes none.
+    device_memory: DeviceMemory | None = None
 
 
 @dataclass
@@ -2032,13 +2060,24 @@ def _deliver(
         )
 
 
-def _resolve_device(scanner: ScannerBackend, settings: Settings) -> str:
+def _resolve_device(
+    scanner: ScannerBackend,
+    settings: Settings,
+    memory: DeviceMemory | None = None,
+) -> str:
     """
     Resolve the scanner device ID from settings or auto-detection.
+
+    An auto-detected device that differs from the one ``memory`` recorded is
+    logged at WARNING, naming both: the scan still runs, on the new device,
+    because refusing would stop a household scanning over a warning.  The
+    ids are logged with ``%r`` since discovery supplies them.
 
     Args:
         scanner: Scanner backend instance.
         settings: Application settings.
+        memory: The worker's record of its last auto-detected device, updated
+            here; None when there is nothing to compare with.
 
     Returns:
         SANE device identifier string.
@@ -2054,8 +2093,20 @@ def _resolve_device(scanner: ScannerBackend, settings: Settings) -> str:
     if not devices:
         msg = "No scanner found: settings.scanner.device is empty and auto-detection found no devices"
         raise ConfigError(msg)
-    logger.info("Auto-detected scanner: %s", devices[0].name)
-    return devices[0].name
+    chosen = devices[0].name
+    previous = memory.last_id if memory is not None else None
+    if previous is not None and previous != chosen:
+        logger.warning(
+            "The auto-detected scanner changed from %r to %r; "
+            "set [scanner] device to pin one",
+            previous,
+            chosen,
+        )
+    else:
+        logger.info("Auto-detected scanner: %r", chosen)
+    if memory is not None:
+        memory.last_id = chosen
+    return chosen
 
 
 def run_pipeline(
@@ -2130,7 +2181,7 @@ def run_pipeline(
     manual_duplex = profile.duplex == "manual"
     flip = _flip_context(request, settings) if manual_duplex else None
 
-    device_id = _resolve_device(scanner, settings)
+    device_id = _resolve_device(scanner, settings, request.device_memory)
 
     scan_settings = ScanSettings(
         source=profile.source,

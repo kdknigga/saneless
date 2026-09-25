@@ -95,7 +95,7 @@ Scanner connection settings.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `host` | string | `""` | SANE net host IP/hostname. Empty = local USB, on a bare-metal install only -- in a container, leave this set, because the container reaches every scanner through `saned` over the network. Colon-separated for multiple hosts (e.g., `192.168.1.50:192.168.1.51`). |
-| `device` | string | `""` | Pin a specific SANE device name. Empty = auto-detect first available. |
+| `device` | string | `""` | Pin a specific SANE device name. Empty = auto-detect first available, which lets a scanner that appears on your network later take your scans; setting it is recommended. `saneless devices` lists the names, and `saneless auto-profiles` writes the one it used when this is empty. |
 
 ## `[paperless]`
 

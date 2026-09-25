@@ -39,6 +39,7 @@ from saneless.config import (
     OutputConfig,
     PaperlessConfig,
     ProfileConfig,
+    ScannerConfig,
     Settings,
     discover_config,
 )
@@ -3684,6 +3685,46 @@ class TestAutoProfiles:
         for name in ("default", "flatbed", "adf"):
             assert repr(name) in line
         assert "Added: " not in result.output
+
+    @staticmethod
+    def _two_devices() -> list[DeviceInfo]:
+        """Two visible scanners, listed in the order discovery reports them."""
+        return [
+            DeviceInfo(name="dev:a", vendor="A", model="One", device_type="scanner"),
+            DeviceInfo(name="dev:b", vendor="B", model="Two", device_type="scanner"),
+        ]
+
+    def test_auto_profiles_pins_the_discovered_device_when_none_is_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """With ``scanner.device`` empty, the id discovery chose is written."""
+        config_file = tmp_path / "saneless.toml"
+        settings = _make_settings(tmp_path, scanner=ScannerConfig(device=""))
+        scanner_cls = self._make_auto_scanner(devices=self._two_devices())
+        runner, _ = _patch_cli(monkeypatch, settings=settings, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        data = tomllib.loads(config_file.read_text())
+        assert data["scanner"]["device"] == "dev:a"
+        pinned = self._group_line(result.output, "Pinned ")
+        assert pinned == "Pinned [scanner] device: 'dev:a'"
+
+    def test_auto_profiles_does_not_pin_over_a_configured_device(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A configured device, from a file or the environment, is not re-pinned."""
+        config_file = tmp_path / "saneless.toml"
+        settings = _make_settings(tmp_path, scanner=ScannerConfig(device="dev:b"))
+        scanner_cls = self._make_auto_scanner(devices=self._two_devices())
+        runner, _ = _patch_cli(monkeypatch, settings=settings, scanner_cls=scanner_cls)
+
+        result = runner.invoke(cli, ["--config", str(config_file), "auto-profiles"])
+
+        assert result.exit_code == 0, result.output
+        assert "scanner" not in tomllib.loads(config_file.read_text())
+        assert "Pinned " not in result.output
 
 
 # What the superseded-name file holds in these tests.  Byte-for-byte

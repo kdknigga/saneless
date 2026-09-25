@@ -118,6 +118,23 @@ class _ReadyScanner(StubScannerBackend):
         return [DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner")]
 
 
+class _TwoScanners(_ReadyScanner):
+    """A backend reporting two devices, so the choice between them is open."""
+
+    def get_devices(self) -> list[DeviceInfo]:
+        """
+        Report a flatbed and a multi-function device.
+
+        Returns:
+            Two devices, in the order discovery would list them.
+
+        """
+        return [
+            DeviceInfo("epson:001", "Epson", "ET-4850", "flatbed scanner"),
+            DeviceInfo("hp:002", "HP", "Envy 6055", "multi-function peripheral"),
+        ]
+
+
 class _ConnectedPaperless:
     """A Paperless client whose connection test always succeeds."""
 
@@ -1027,6 +1044,28 @@ class TestDoctorUsesTheRealRegistry:
         rows = [line for line in _lines(result.output) if line.startswith("[")]
         assert len(rows) == len(CheckKey)
         assert "Connected to paperless-ngx." in result.output
+
+    def test_multiple_devices_without_a_pin_warn_and_exit_zero(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An ambiguous scanner choice is a WARN row, and a WARN passes the gate."""
+        settings = _make_settings(tmp_path, consume_dir=str(tmp_path / "data"))
+        settings.scanner.device = ""
+        runner = _patch_doctor(monkeypatch, settings, scanner_cls=_TwoScanners)
+
+        result = runner.invoke(cli, ["doctor"])
+
+        assert result.exit_code == 0, result.output
+        scanner_rows = [
+            line
+            for line in _lines(result.output)
+            if line.startswith(_state_marker(CheckState.WARN))
+            and check_name(CheckKey.SCANNER) in line
+        ]
+        assert len(scanner_rows) == 1
+        assert "2 scanners are visible and none is chosen." in scanner_rows[0]
+        assert "epson:001" not in result.output
+        assert "hp:002" not in result.output
 
 
 class TestDoctorWithoutPythonSane:

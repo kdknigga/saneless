@@ -1566,7 +1566,8 @@ def _scanner_enumeration(context: CheckContext) -> CheckResult:
         context: The injected dependencies and configuration.
 
     Returns:
-        Exactly one result for ``CheckKey.SCANNER``.
+        Exactly one result for ``CheckKey.SCANNER``: WARN when several devices
+        are visible and ``scanner.device`` chooses none of them.
 
     """
     scanner = context.scanner
@@ -1588,6 +1589,20 @@ def _scanner_enumeration(context: CheckContext) -> CheckResult:
         return _scanner_unreachable()
     if not devices:
         return _scanner_unreachable()
+    if not context.settings.scanner.device and len(devices) > 1:
+        # With no device configured, every scan goes to whichever device SANE
+        # lists first, and a scanner that appears on the LAN can take that
+        # place.  A warning, not a failure: scanning still works.  Count-only,
+        # because device ids are LAN addresses and this row is LAN-visible.
+        return CheckResult(
+            key=CheckKey.SCANNER,
+            state=CheckState.WARN,
+            message=f"{len(devices)} scanners are visible and none is chosen.",
+            next_step=(
+                "Set [scanner] device to the one you use; saneless devices "
+                "lists them, and saneless auto-profiles writes it for you."
+            ),
+        )
     label = _device_label(devices[0])
     return CheckResult(
         key=CheckKey.SCANNER,

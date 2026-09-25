@@ -25,6 +25,7 @@ from saneless.atomic_write import replace_file_atomically
 from saneless.config import DEFAULT_RESOLUTION, ProfileConfig, Settings
 from saneless.exceptions import ConfigError, describe
 from saneless.scanner.base import SourceKind, classify_source
+from saneless.text_safety import has_control_characters
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -719,6 +720,8 @@ class ProfileWriteResult:
         skipped_existing: Flagged profiles left alone because ``force`` was
             not passed.
         removed: Flagged profiles the scanner no longer produces, pruned.
+        pinned_device: The device id written into an unset ``[scanner]
+            device``, or None when the call wrote none.
 
     """
 
@@ -728,6 +731,7 @@ class ProfileWriteResult:
     skipped_not_generated: tuple[str, ...] = ()
     skipped_existing: tuple[str, ...] = ()
     removed: tuple[str, ...] = ()
+    pinned_device: str | None = None
 
     @property
     def persisted(self) -> frozenset[str]:
@@ -743,7 +747,8 @@ class ProfileWriteResult:
 
         Returns:
             ``(line, written_names)`` in the fixed order Added, Refreshed,
-            Skipped (not auto-generated), Skipped (already exists), Removed.
+            Skipped (not auto-generated), Skipped (already exists), Removed,
+            then the pinned device, if any, whose line names no profiles.
 
         """
         labelled = (
@@ -769,6 +774,10 @@ class ProfileWriteResult:
                 continue
             shown = ", ".join(repr(name) for name in names)
             lines.append((f"{label}: {shown}{suffix}", names if written else ()))
+        if self.pinned_device is not None:
+            # repr, as for the names above: the id came from device discovery
+            # and may carry control characters.
+            lines.append((f"Pinned [scanner] device: {self.pinned_device!r}", ()))
         return lines
 
     def describe(self) -> list[str]:
@@ -776,8 +785,8 @@ class ProfileWriteResult:
         Render the result as one line per non-empty group.
 
         Returns:
-            The group lines, empty when nothing was added, refreshed, skipped
-            or removed.
+            The group lines, empty when nothing was added, refreshed, skipped,
+            removed or pinned.
 
         """
         return [line for line, _ in self.groups()]
@@ -1021,11 +1030,58 @@ def _merge_profile(
     return "refreshed"
 
 
+def _pin_device(doc: TOMLDocument, config_path: Path, device: str) -> str | None:
+    """
+    Write ``device`` into the document's ``[scanner] device`` when it is unset.
+
+    Unset means absent or ``""``.  Any other value was put there by the
+    operator: ``[scanner] device`` carries no ``auto_generated`` marker, so it
+    is never the tool's to change, and ``force`` has no say over it.
+
+    Args:
+        doc: The parsed config document, changed in place.
+        config_path: The config file, for the error message.
+        device: The device id to write.
+
+    Returns:
+        ``device`` when it was written, None when a set value was kept or the
+        id could not be stored.
+
+    Raises:
+        ConfigError: ``scanner`` in the file is not a table.
+
+    """
+    if has_control_characters(device):
+        # tomlkit writes ESC as ``\e``, a TOML 1.1 escape the 1.0 reader
+        # rejects, so the round-trip guard would refuse the whole run.  No
+        # real SANE id holds one; skipping the pin keeps the profiles.
+        logger.warning(
+            "Not pinning [scanner] device to %r: it contains control characters",
+            device,
+        )
+        return None
+    if "scanner" not in doc:
+        doc.add("scanner", tomlkit.table())
+    section = doc["scanner"]
+    if not isinstance(section, MutableMapping):
+        # The same refusal as a scalar ``profiles``: a value this function
+        # cannot read as a table is not one it may replace with a table.
+        msg = f"[scanner] in {config_path} is not a table; refusing to overwrite it"
+        raise ConfigError(msg)
+    scanner = cast("MutableMapping[str, object]", section)
+    existing = scanner.get("device")
+    if existing is not None and existing != "":
+        return None
+    scanner["device"] = device
+    return device
+
+
 def write_profiles_to_config(
     config_path: Path,
     profiles: dict[str, ProfileConfig],
     *,
     force: bool = False,
+    device: str | None = None,
 ) -> ProfileWriteResult:
     """
     Merge generated profiles into a TOML config file, preserving what is there.
@@ -1052,10 +1108,11 @@ def write_profiles_to_config(
     an ordinary profile but a schema requirement (``_UNPRUNABLE``), and a
     config missing it is one saneless refuses to load.
 
-    Args:
-        config_path: Path to the TOML config file.
-        profiles: Dictionary of profile name to ProfileConfig.
-        force: If True, refresh the owned keys of flagged profiles.
+    ``device``, when given, is written into ``[scanner] device`` if the file
+    leaves that key absent or empty, so later scans go to the scanner this run
+    used rather than to whichever one SANE happens to list first.  A set value
+    is never overwritten, ``force`` included: the key has no
+    ``auto_generated`` marker, so it is not tool-owned.
 
     The rewrite is durable: the file is read as UTF-8 bytes, CRLF line endings
     are kept, the new text is re-parsed and must mean exactly the merged
@@ -1067,21 +1124,31 @@ def write_profiles_to_config(
         config_path: Path to the TOML config file.
         profiles: Dictionary of profile name to ProfileConfig.
         force: If True, refresh the owned keys of flagged profiles.
+        device: The device id discovery chose, to pin when the file has none;
+            None to leave ``[scanner]`` untouched.  Only ``auto-profiles``
+            passes one, and only when no device was configured.  The worker's
+            startup generation passes none on purpose: a service start must
+            not silently pin whichever scanner answered first, so pinning is
+            left to the operator, by that command or by hand.
 
     Returns:
-        What was added, refreshed, skipped and removed, with ``path`` the real
-        file (the symlink's target when ``config_path`` is a link).
+        What was added, refreshed, skipped, removed and pinned, with ``path``
+        the real file (the symlink's target when ``config_path`` is a link).
 
     Raises:
-        ConfigError: ``[profiles]`` in the file is not a table, the file is not
-            valid UTF-8, the merged text does not round-trip through TOML, or
-            the file is bind-mounted as a single file (EBUSY) and cannot be
-            replaced.
+        ConfigError: ``[profiles]`` or ``[scanner]`` in the file is not a
+            table, the file is not valid UTF-8, the merged text does not
+            round-trip through TOML, or the file is bind-mounted as a single
+            file (EBUSY) and cannot be replaced.
         OSError: Any other failure to read or replace the file, including
             ``PermissionError`` for a file this process may not write.
 
     """
     doc, original_text = _read_config(config_path)
+
+    # Before the profiles, so a file created from nothing reads [scanner]
+    # first, as the example config does.
+    pinned = _pin_device(doc, config_path, device) if device is not None else None
 
     if "profiles" not in doc:
         doc.add("profiles", tomlkit.table(is_super_table=True))
@@ -1123,7 +1190,9 @@ def write_profiles_to_config(
         outcome = _merge_profile(profiles_section, name, profile, force=force)
         outcomes[outcome].append(name)
 
-    if not (outcomes["added"] or outcomes["refreshed"] or orphans):
+    if not (
+        outcomes["added"] or outcomes["refreshed"] or orphans or pinned is not None
+    ):
         # Nothing changed, so nothing is replaced -- and a legacy single-file
         # mount gets no EBUSY error for a run that had nothing to write.
         target = config_path.resolve()
@@ -1134,6 +1203,9 @@ def write_profiles_to_config(
             # The operator edits the link, the write lands on the target;
             # naming both explains which file changed.
             logger.info("Wrote profiles to %s (symlink to %s)", config_path, target)
+        if pinned is not None:
+            # Logged once the file holds it; %r because the id is untrusted.
+            logger.info("Pinned [scanner] device to %r", pinned)
 
     return ProfileWriteResult(
         path=target,
@@ -1142,4 +1214,5 @@ def write_profiles_to_config(
         skipped_not_generated=tuple(outcomes["skipped_not_generated"]),
         skipped_existing=tuple(outcomes["skipped_existing"]),
         removed=tuple(orphans),
+        pinned_device=pinned,
     )

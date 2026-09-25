@@ -48,7 +48,7 @@ from saneless.job import (
     JobStore,
 )
 from saneless.paperless import UploadResult
-from saneless.pipeline import PipelineEvent, ScanResult
+from saneless.pipeline import DeviceMemory, PipelineEvent, ScanResult
 from saneless.scanner.base import DeviceCapabilities, DeviceInfo, ScanBatch
 from saneless.vocabulary import (
     RESTART_REASON,
@@ -303,6 +303,52 @@ class TestScanWorker:
             assert "Scanner on fire" in fetched.error
         finally:
             store.close()
+
+    def test_device_change_memory_is_shared_by_one_workers_jobs(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        Every job of one worker carries the same device memory.
+
+        The pipeline compares each job's auto-detected device with the last
+        one through that object, so a fresh one per job would never see a
+        change and a module-level one would leak between workers.
+        """
+        captured: list[object] = []
+
+        def capturing_pipeline(
+            _scanner: object,
+            _paperless: object,
+            _settings: object,
+            request: PipelineRequest,
+        ) -> ScanResult:
+            """Record the request's device memory."""
+            captured.append(request.device_memory)
+            return _success_result()
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", capturing_pipeline)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            first = store.create_job("default", "First")
+            worker.submit(first)
+            wait_for_state(store, first.id, TERMINAL_STATES)
+            second = store.create_job("default", "Second")
+            worker.submit(second)
+            wait_for_state(store, second.id, TERMINAL_STATES)
+            worker.stop()
+        finally:
+            store.close()
+
+        assert len(captured) == 2
+        assert isinstance(captured[0], DeviceMemory)
+        assert captured[0] is captured[1]
 
 
 def _success_result() -> ScanResult:
