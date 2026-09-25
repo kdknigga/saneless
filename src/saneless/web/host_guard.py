@@ -69,10 +69,11 @@ ECHOED_HOST_MAX_LENGTH: Final = 255
 
 # A host name (letters, digits, dots, hyphens and the underscore Docker
 # Compose service names may carry), or an IPv6 literal in brackets, then an
-# optional numeric port.  Matched against the lower-cased value, so a Host
+# optional port.  The port may be empty, as RFC 3986 allows ("localhost:"),
+# and it is ignored either way.  Matched against the lower-cased value, so a Host
 # that fails it cannot carry markup, whitespace or a control character.
 _HOST_PATTERN: Final = re.compile(
-    r"(?P<name>[a-z0-9._-]+|\[[a-f0-9]*:[a-f0-9.:]+\])(?::[0-9]+)?"
+    r"(?P<name>[a-z0-9._-]+|\[[a-f0-9]*:[a-f0-9.:]+\])(?::[0-9]*)?"
 )
 _HOST_HEADER: Final = b"host"
 _FORWARDED_HOST_HEADER: Final = b"x-forwarded-host"
@@ -97,7 +98,7 @@ def _split_host(value: str) -> str | None:
     Returns:
         The lower-cased name with its port and one trailing dot removed, or
         the bracketed IPv6 literal; None when the value is not a well-formed
-        ``name[:port]`` or ``[v6][:port]``.
+        ``name[:port]`` or ``[v6][:port]``, where the port may be empty.
 
     """
     # ASCII first: str.lower maps some non-ASCII letters, such as the Kelvin
