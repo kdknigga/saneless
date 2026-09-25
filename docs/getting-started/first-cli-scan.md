@@ -118,6 +118,13 @@ Uploading to paperless-ngx...
 Done: My First Scan
 ```
 
+`Done:` means the document was uploaded cleanly, and the command exits 0. A scan that did not go
+cleanly says so instead: `Uploaded with a warning: My First Scan` (exit 7) when, for example, a
+sheet was skipped, with the warning printed to stderr; or `Saved to folder: My First Scan` (exit 6)
+when the upload kept failing and a consume folder is configured, so the PDF went there without its
+title, tags or correspondent. See the [exit codes](../reference/cli-commands.md#exit-codes) for
+every outcome.
+
 !!! tip "Auto source scanners"
     If your scanner only exposes an "Auto" source, you can control whether it behaves as flatbed or ADF by setting `auto_source_mode` in your profile. See [Configure Scan Profiles](../how-to/configure-scan-profiles.md).
 
@@ -132,7 +139,10 @@ If the document does not appear after a minute, check:
 
 - The paperless-ngx URL and token in your `saneless.toml` are correct.
 - paperless-ngx is running and accessible from the machine where saneless ran.
-- The saneless output showed "Done" and not an error message.
+- The saneless output showed `Done:` and the command exited 0. `Uploaded with a warning:` (exit 7)
+  also means the document was uploaded; `Saved to folder:` (exit 6) means it was put in the consume
+  folder instead, and an error line means it was not delivered. See the
+  [exit codes](../reference/cli-commands.md#exit-codes).
 
 ## Next steps
 

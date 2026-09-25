@@ -75,7 +75,7 @@ The job history table at the bottom of the page lists recent scan jobs with four
 - **Time** -- When the scan was started, in the server's local timezone with the zone named. In a container that means setting `TZ`; without it the times read as UTC
 - **Profile** -- Which scan profile was used
 - **Title** -- The document title, with the page counts on a second line beneath it for jobs that recorded them
-- **Status** -- Current state of the job (Complete, Failed, Cancelled, Saved to folder, Scanning, and so on). The table says **Complete** where the status area above it says **Done**; they are the same state
+- **Status** -- Current state of the job (Complete, Uploaded with a warning, Failed, Cancelled, Saved to folder, Scanning, and so on). The table says **Complete** where the status area above it says **Done**; they are the same state. A scan that was uploaded but did not go cleanly -- a sheet the scanner skipped, say -- reads **Uploaded with a warning** in both places, and the status area gives the warning beneath it
 
 The history table updates automatically when a job finishes.
 
