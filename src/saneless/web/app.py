@@ -38,6 +38,7 @@ from saneless.vocabulary import (
     removed_pages,
 )
 from saneless.worker import PRESERVATION_JOIN_SECONDS, STOP_JOIN_SECONDS, ScanWorker
+from saneless.workspace import sweep_orphans
 
 from .cache import MetadataCache
 from .checks_cache import CheckCache
@@ -272,6 +273,80 @@ def _open_job_store(settings: Settings) -> JobStore:
     return job_store
 
 
+def _recover_orphaned_workspaces(settings: Settings) -> dict[str, str]:
+    """
+    Keep the pages a killed process left in ``tmp_dir``, and word their rows.
+
+    Runs the workspace sweep and composes, for each recovered workspace that
+    kept something, the error its job row should carry: ``RESTART_REASON``
+    followed by the sentence naming the preserved file.  That sentence keeps
+    "preserved at " before every path, which is what lets the job view show
+    the path to the job's owner, relative to ``data_dir``, and hide it from
+    anyone else.
+
+    A sweep failure never stops the app starting: it is logged with its
+    traceback and there are then no texts, so every row left active gets the
+    plain restart text.
+
+    Args:
+        settings: Application settings; ``tmp_dir``, ``failed_dir`` and
+            ``min_free_space_mb`` are read.
+
+    Returns:
+        The error text for each recovered job, by job id.
+
+    """
+    output = settings.output
+    try:
+        recovered = sweep_orphans(
+            output.tmp_dir, output.failed_dir, output.min_free_space_mb
+        )
+    except Exception:
+        logger.warning("Startup workspace recovery failed", exc_info=True)
+        return {}
+    return {
+        entry.job_id: f"{RESTART_REASON}. {entry.sentence}"
+        for entry in recovered
+        if entry.job_id and entry.sentence
+    }
+
+
+def _recover_interrupted_jobs(
+    settings: Settings, job_store: JobStore, worker: ScanWorker
+) -> None:
+    """
+    Recover what a previous process left behind: its workspaces, then its rows.
+
+    The orphaned workspaces are recovered first, so each job whose pages were
+    kept is failed with a text naming the kept file; every other row still
+    active is then failed with ``RESTART_REASON``.  When the job store refuses
+    either write, the worker is marked recovery-pending with the same texts,
+    so it starts degraded and writes them once the store accepts writes.
+
+    Args:
+        settings: Application settings, for the workspace sweep.
+        job_store: The job store the previous process's rows are in.
+        worker: The scan worker, not started yet.
+
+    """
+    recovered_texts = _recover_orphaned_workspaces(settings)
+    try:
+        failed = 0
+        if recovered_texts:
+            failed = job_store.fail_recovered_jobs(recovered_texts)
+        failed += job_store.fail_active_jobs(RESTART_REASON)
+    except Exception:
+        # logger.exception is an ERROR record with the traceback attached.
+        logger.exception(
+            "Crash recovery could not update the job store; "
+            "starting degraded until it accepts writes"
+        )
+        worker.mark_recovery_pending(recovered_texts)
+    else:
+        if failed:
+            logger.warning("Marked %d interrupted job(s) as failed at startup", failed)
+
+
 def _install_middleware(app: FastAPI, settings: Settings) -> None:
     """
     Add the application's own middleware, in the order that decides who runs first.
@@ -337,19 +412,24 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         """
         Recover, prune and start the worker at startup; stop it at shutdown.
 
-        Startup runs in a fixed order: validate the directories, fail
-        every job a previous process left active, prune history, and only
-        then start the worker.  Recovery comes before the worker so the
-        worker never sees an orphan as live work, and so a queued job that
-        was lost from memory in a restart can never be picked up and scan
-        whatever paper happens to be in the feeder now.
+        Startup runs in a fixed order: validate the directories, recover
+        the workspaces a killed process left in ``tmp_dir``, fail every job
+        a previous process left active, prune history, and only then start
+        the worker.  Recovery comes before the worker so the worker never
+        sees an orphan as live work, and so a queued job that was lost from
+        memory in a restart can never be picked up and scan whatever paper
+        happens to be in the feeder now.  The workspaces are recovered first
+        so that a job whose pages were kept is failed with a text naming the
+        kept file, before the plain restart text reaches every other row.
 
-        A recovery that cannot write does not refuse to start the app.  The
-        worker starts degraded with recovery pending instead, so ``/health``
-        answers a truthful 503 and the worker's first successful store probe
-        runs the recovery.  A prune failure is only logged: history that
-        outlives its retention is harmless, and a service that will not come
-        up over it is not.
+        A workspace recovery that fails is only logged, and the rows then get
+        the plain restart text.  A recovery that cannot write does not refuse
+        to start the app.  The worker starts degraded with recovery pending
+        instead, holding the recovered rows' texts, so ``/health`` answers a
+        truthful 503 and the worker's first successful store probe runs the
+        recovery.  A prune failure is only logged: history that outlives its
+        retention is harmless, and a service that will not come up over it is
+        not.
 
         The check refresher starts last, after the worker, and never probes on
         the way up: the cache is cold, the first render says ``Checking…`` and
@@ -364,20 +444,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         they stopped.
         """
         validate_settings_dirs(settings)
-        try:
-            failed = job_store.fail_active_jobs(RESTART_REASON)
-        except Exception:
-            # logger.exception is an ERROR record with the traceback attached.
-            logger.exception(
-                "Crash recovery could not update the job store; "
-                "starting degraded until it accepts writes"
-            )
-            worker.mark_recovery_pending()
-        else:
-            if failed:
-                logger.warning(
-                    "Marked %d interrupted job(s) as failed at startup", failed
-                )
+        _recover_interrupted_jobs(settings, job_store, worker)
         try:
             job_store.prune(
                 settings.output.history_retention_days,

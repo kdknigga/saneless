@@ -345,6 +345,35 @@ Ctrl-C is different. It is a deliberate cancel, exits 130 and keeps nothing (see
 connection interrupting it, start it under `tmux` or `screen`. `saneless serve` keeps the web
 server's own signal handling, where SIGTERM is a graceful stop.
 
+## A scan stopped by a crash or a power cut
+
+Some stops leave saneless no chance to react: `kill -9` (SIGKILL), the out-of-memory killer, a
+container killed after its grace period, or a power cut. The command prints nothing and exits with
+no code of its own, and the pages scanned so far are left in the scan's working directory under
+`tmp_dir`.
+
+They are recovered the next time saneless starts: when `saneless serve` starts, or before the next
+`saneless scan` opens the scanner, whichever comes first.
+
+- The pages become a PDF under `failed/` in the data directory, the same PDF a failed scan keeps:
+  `(partial)` for a one-sided scan, or `(fronts)` and `(backs)` for manual duplex. A page that was
+  only half written when the process died is left out. If no PDF can be built, for example
+  because the disk is short of space, the page files themselves are moved into a folder under
+  `failed/` instead.
+- A warning in the log names the job, its title and the path of what was kept.
+- In the web UI, the job shows as failed with "The server restarted before this scan finished",
+  followed by where its pages were kept. Only the browser that started the scan sees the path. A
+  scan started with `saneless scan` has no job in the web UI, so the log warning is where to look.
+
+Nothing recovered is uploaded. Check the kept file, then upload it yourself or scan the stack
+again, and delete it once the document is in paperless-ngx.
+
+A scan still running is never touched, even by a `saneless scan` started beside it or by a server
+sharing the same `tmp_dir`. Scratch directories left by versions of saneless from before this
+recovery existed are named `tmp` followed by random characters. They are not recovered, because
+nothing can prove their scan is over. Look through them, and delete them yourself when you are
+done.
+
 ## Cancelled scans (exit 130)
 
 Exit 130 means the scan was stopped on purpose, not that something broke:

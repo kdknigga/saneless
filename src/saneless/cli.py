@@ -102,6 +102,7 @@ from .vocabulary import (
     state_label,
 )
 from .web.app import create_app
+from .workspace import sweep_orphans
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -871,6 +872,36 @@ def _make_log_home_private(settings: Settings) -> None:
         make_private_dir(output.data_dir)
 
 
+def _recover_orphaned_workspaces(settings: Settings) -> None:
+    """
+    Keep the pages a killed scan left in ``tmp_dir``, before this scan starts.
+
+    A CLI-only install has no server whose startup would recover a scan that
+    was SIGKILLed, OOM-killed or cut off by a power failure, so each
+    ``saneless scan`` sweeps first. Only workspaces whose lock is free are
+    taken, so a scan still running -- another ``saneless scan``, or a server
+    sharing this ``tmp_dir`` -- is never touched. A CLI scan has no job row:
+    the sweep's WARNING, naming where the pages went, is its whole report.
+
+    The sweep is housekeeping and never decides whether the scan runs: any
+    failure is logged with its traceback and the scan goes ahead.
+
+    Args:
+        settings: The loaded settings; ``tmp_dir``, ``failed_dir`` and
+            ``min_free_space_mb`` are read.
+
+    """
+    output = settings.output
+    try:
+        sweep_orphans(output.tmp_dir, output.failed_dir, output.min_free_space_mb)
+    except Exception:
+        logger.warning(
+            "Could not recover the orphaned scan workspaces in %s; scanning anyway",
+            output.tmp_dir,
+            exc_info=True,
+        )
+
+
 @cli.command()
 @click.option(
     "--profile",
@@ -890,6 +921,10 @@ def scan(ctx: click.Context, profile: str, title: str) -> None:
     # reaches this body, so it needs no python-sane.
     require_sane()
     settings = _load_cli_settings(ctx)
+    # Before the scanner is opened, and before anything that can refuse the
+    # scan: the pages a killed scan left behind are recovered whether or not
+    # this one goes ahead.
+    _recover_orphaned_workspaces(settings)
 
     if profile not in settings.profiles:
         click.echo(f"Unknown profile: {profile}", err=True)
