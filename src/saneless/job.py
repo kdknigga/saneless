@@ -274,15 +274,20 @@ name, both halves are ordinary constants and the rule has nothing to flag.
 """
 
 _NEWEST_REJECTED_IDS = (
-    f"{_SELECT_JOBS} id FROM jobs WHERE error_category = ? "
-    "ORDER BY created_at DESC LIMIT ?"
+    f"{_SELECT_JOBS} id FROM jobs WHERE error_category = ? ORDER BY rowid DESC LIMIT ?"
 )
-"""The ids of the newest refused submits, up to a limit.
+"""The ids of the most recently written refused submits, up to a limit.
 
 The subquery ``_PRUNE`` and ``_TRIM_REJECTED`` share.  Two bound parameters, in
 this order: ``ErrorCategory.REJECTED.value`` and ``REJECTED_HISTORY_ROWS``.
 Plain ``=`` is right here, because it is meant to leave out every NULL
 category.  Named apart for the ``S608`` reason ``_NEWEST_RUN_IDS`` gives.
+
+Ordered by ``rowid``, which is insertion order, and not by ``created_at``.
+``_TRIM_REJECTED`` runs in the transaction that wrote a refused row, and the
+response names that row.  On an appliance whose clock is still behind at
+boot, before NTP, the new row's ``created_at`` sorts below the rows already
+kept, and an order by time would delete the row just written.
 """
 
 _TRIM_REJECTED = (
@@ -327,11 +332,13 @@ A single non-UTC timestamp reaching this column -- a ``-05:00`` offset, say --
 would make both the cutoff and the ordering silently wrong, and nothing here
 would raise.  Anyone adding a writer to this column meets this note first.
 
-The predicates are a *union*, not a sequence, and within each partition that is
-equivalent to deleting by age and then trimming to a row cap: both order by
-``created_at``, so a partition's age-expired rows are always a prefix of its
+The predicates are a *union*, not a sequence, and within the run partition that
+is equivalent to deleting by age and then trimming to a row cap: both order by
+``created_at``, so the partition's age-expired rows are always a prefix of its
 oldest and the union of the two sets is exactly what the sequential form
-produced.  The equivalence rests in turn on SQLite evaluating each
+produced.  The refused partition keeps its newest rows by insertion order, for
+the reason ``_NEWEST_REJECTED_IDS`` gives, which matches ``created_at`` order
+unless the clock stepped back between two refusals.  The equivalence rests in turn on SQLite evaluating each
 ``IN (SELECT ... ORDER BY ... LIMIT ?)`` right-hand side into a ``LIST
 SUBQUERY`` before the outer scan begins, so it never observes its own partial
 deletions.  SQLite does not document that as a guarantee, so it is pinned by the

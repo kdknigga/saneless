@@ -2393,6 +2393,37 @@ class TestRejectedRowCap:
         finally:
             store.close()
 
+    def test_a_refused_row_survives_a_clock_that_stepped_back(self) -> None:
+        """
+        The row just written is never the one its own trim removes.
+
+        An appliance whose clock is behind at boot, before NTP, stamps a new
+        row earlier than the rows already kept.  The trim keeps the newest by
+        insertion, so the new row -- which the response names -- survives and
+        the oldest written goes.
+        """
+        store = JobStore()
+        try:
+            for index in range(REJECTED_HISTORY_ROWS):
+                store.create_rejected_job(
+                    "default", f"Refused {index:02d}", error=QUEUE_FULL_JOB_ERROR
+                )
+            ahead = datetime.now(tz=UTC) + timedelta(days=1)
+            store._conn.execute("UPDATE jobs SET created_at = ?", (ahead.isoformat(),))
+            store._conn.commit()
+
+            latest = store.create_rejected_job(
+                "default", "After the step", error=QUEUE_FULL_JOB_ERROR
+            )
+
+            assert store.get_job(latest.id) is not None
+            titles = _rejected_titles(store)
+            assert "After the step" in titles
+            assert "Refused 00" not in titles
+            assert len(titles) == REJECTED_HISTORY_ROWS
+        finally:
+            store.close()
+
     def test_rejected_cap_is_smaller_than_the_visible_history(self) -> None:
         """A flood can never fill the web history table on its own (D-12)."""
         assert REJECTED_HISTORY_ROWS == 20
