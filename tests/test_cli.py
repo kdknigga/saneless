@@ -798,7 +798,7 @@ def _counting_scanner(calls: list[str]) -> type[ScannerBackend]:
 
             Args:
                 device_id: Recorded, one entry per call, in call order.
-                settings: Only ``resolution`` is used, and only to report back.
+                settings: Only ``resolution`` is used, as the page's dpi and the batch's.
                 sink: The pipeline's own sink, which receives the page.
 
             Returns:
@@ -806,7 +806,7 @@ def _counting_scanner(calls: list[str]) -> type[ScannerBackend]:
 
             """
             calls.append(device_id)
-            record = sink.add(_inked_page())
+            record = sink.add(_inked_page(), dpi=settings.resolution)
             return scan_batch([record], resolution=settings.resolution)
 
     return CountingScanner

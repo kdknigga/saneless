@@ -684,6 +684,50 @@ def _maybe_crop(
     return image
 
 
+@dataclass(frozen=True)
+class _PageFraming:
+    """
+    What every accepted page of one scan is cropped to and laid out at.
+
+    Both acquisition paths hand each page to the sink as
+    ``sink.add(framing.crop(page), dpi=framing.resolution)``. The crop and the
+    dpi are one fact seen twice -- the resolution the device read back -- so
+    they travel as one record: a crop closure alongside a separate ``dpi``
+    parameter would push ``_acquire_pages`` and ``_snap_flatbed`` past ruff's
+    ``PLR0913`` limit, and would let the two disagree.
+
+    Attributes:
+        paper_size: The requested paper size key, e.g. ``"a4"``, or ``"full"``.
+        resolution: The resolution the device actually reported, in dpi. The
+            crop arithmetic uses it, and every PDF lays the page out at it.
+        geometry_set: Whether the scan area was already set on the device, in
+            which case no crop is needed.
+
+    """
+
+    paper_size: PaperSize
+    resolution: int
+    geometry_set: bool
+
+    def crop(self, image: Image.Image) -> Image.Image:
+        """
+        Crop one page to the paper size if the device could not.
+
+        Args:
+            image: The page as the device produced it.
+
+        Returns:
+            The cropped page, or ``image`` itself if no crop is needed.
+
+        """
+        return _maybe_crop(
+            image,
+            self.paper_size,
+            self.resolution,
+            geometry_set=self.geometry_set,
+        )
+
+
 def _validate_page_image(page_image: Image.Image, page_num: int) -> bool:
     """
     Check that a scanned page is a readable image at all.
@@ -1351,7 +1395,7 @@ def _acquire_with_timeout(
 def _acquire_pages(
     dev: SaneDevice,
     sink: PageSink,
-    crop: Callable[[Image.Image], Image.Image],
+    framing: _PageFraming,
     timeout_per_page: float,
     grace: float = _CANCEL_GRACE_SECONDS,
 ) -> tuple[list[PageRecord], int]:
@@ -1394,17 +1438,22 @@ def _acquire_pages(
     correspond.  The promise that manual-duplex page parity survives forbids
     parity broken by *policy* -- the backend silently discarding a clean blank
     back page -- and not parity broken by a page that could not be read at all.
-    Parity broken that way is reported, never hidden.
+    Parity broken that way is reported, never hidden.  The pipeline goes
+    further than the count: it splits a manual-duplex run into its
+    ``(fronts)`` and ``(backs)`` PDFs whenever either pass skipped a sheet,
+    even when the counts still match, because two passes that each lost a
+    different sheet agree on the count and pair every later page wrongly.
 
     Args:
         dev: Open SANE device handle.
         sink: Where each accepted page goes.  ``add`` is called exactly once
             per accepted page, after it passed its integrity checks and was
             cropped, and nothing here retains the image afterwards.
-        crop: Applied to each accepted page before the sink sees it, so what
-            is spooled is what the PDF embeds.  It is the caller's closure
-            over the paper size, the resolution the device chose and whether
-            the scan area was set on the device.
+        framing: Its crop is applied to each accepted page before the sink
+            sees it, so what is spooled is what the PDF embeds, and its
+            resolution -- the one the device read back -- is the dpi the sink
+            records the page at.  The caller builds it from the paper size,
+            that resolution and whether the scan area was set on the device.
         timeout_per_page: Maximum seconds to wait for each page.
         grace: Maximum seconds to wait for a timed-out read to come back
             after it has been cancelled.  Injectable for the same reason
@@ -1481,7 +1530,7 @@ def _acquire_pages(
             # afterwards.  The sink is where this page stops being ours, so
             # everything that has to happen to it happens before the hand-off
             # -- and what is spooled is exactly what the PDF embeds.
-            records.append(sink.add(crop(page_image)))
+            records.append(sink.add(framing.crop(page_image), dpi=framing.resolution))
     finally:
         # ``del iterator`` is a cleanup everywhere except the wedge path, where
         # it is the hazard, and this branch is that reversal. Dropping the last
@@ -1821,7 +1870,7 @@ def _snap_flatbed(
     dev: SaneDevice,
     device_id: str,
     sink: PageSink,
-    crop: Callable[[Image.Image], Image.Image],
+    framing: _PageFraming,
     budget: _PageBudget = _DEFAULT_PAGE_BUDGET,
 ) -> PageRecord:
     """
@@ -1851,7 +1900,8 @@ def _snap_flatbed(
         device_id: The SANE device name, for the error message.
         sink: Where the page goes.  ``add`` is called exactly once, after the
             page passed its integrity checks and was cropped.
-        crop: Applied to the page before the sink sees it.
+        framing: The crop applied to the page before the sink sees it, and
+            the read-back dpi the sink records it at.
         budget: The per-page timeout and the cancel grace.  Both default to the
             constants the feeder path uses, and both are injectable for the
             reason ``_acquire_pages``' are: a test proving the
@@ -1906,7 +1956,7 @@ def _snap_flatbed(
         )
         raise ScanError(unreadable_msg)
 
-    return sink.add(crop(image))
+    return sink.add(framing.crop(image), dpi=framing.resolution)
 
 
 class SaneDevice(Protocol):
@@ -2133,7 +2183,7 @@ class SaneBackend(ScannerBackend):
         self,
         dev: SaneDevice,
         sink: PageSink,
-        crop: Callable[[Image.Image], Image.Image],
+        framing: _PageFraming,
         timeout_per_page: float = _DEFAULT_PAGE_TIMEOUT_SECONDS,
         grace: float = _CANCEL_GRACE_SECONDS,
     ) -> tuple[list[PageRecord], int]:
@@ -2154,7 +2204,8 @@ class SaneBackend(ScannerBackend):
         Args:
             dev: Open SANE device handle.
             sink: Where each accepted page goes.
-            crop: Applied to each accepted page before the sink sees it.
+            framing: The crop applied to each accepted page before the sink
+                sees it, and the read-back dpi the sink records it at.
             timeout_per_page: Maximum seconds to wait for each page.
             grace: Maximum seconds to wait for a cancelled read to return.
 
@@ -2163,7 +2214,7 @@ class SaneBackend(ScannerBackend):
             for failing their integrity checks.
 
         """
-        return _acquire_pages(dev, sink, crop, timeout_per_page, grace)
+        return _acquire_pages(dev, sink, framing, timeout_per_page, grace)
 
     def scan_pages(
         self, device_id: str, settings: ScanSettings, sink: PageSink
@@ -2270,12 +2321,11 @@ class SaneBackend(ScannerBackend):
                     use_adf,
                 )
 
-            # Bound once here and handed down, so both acquisition paths crop
-            # the same way and neither has to carry the three geometry facts
-            # as extra parameters past ruff's PLR0913 ceiling.  _maybe_crop
-            # itself is unchanged; only where it is called from moved.
-            crop: Callable[[Image.Image], Image.Image] = functools.partial(
-                _maybe_crop,
+            # Built once here and handed down, so both acquisition paths crop
+            # the same way and hand the sink the same read-back dpi, and
+            # neither has to carry the three geometry facts as extra
+            # parameters past ruff's PLR0913 ceiling.
+            framing = _PageFraming(
                 paper_size=settings.paper_size,
                 resolution=actual_resolution,
                 geometry_set=geometry_set,
@@ -2283,14 +2333,14 @@ class SaneBackend(ScannerBackend):
 
             if use_adf:
                 # ADF/duplex: use multi_scan() for multi-page acquisition
-                records, pages_rejected = self._scan_adf_pages(dev, sink, crop)
+                records, pages_rejected = self._scan_adf_pages(dev, sink, framing)
             else:
                 # Flatbed: start() initiates the SANE data channel, then
                 # snap() drains it via sane_read() loop.  Without start()
                 # the read loop has no data source.  Validation and the crop
                 # live in there too, so one sheet reaches the sink by the same
                 # route however it was acquired.
-                records = [_snap_flatbed(dev, device_id, sink, crop)]
+                records = [_snap_flatbed(dev, device_id, sink, framing)]
                 # Nothing was skipped: an unreadable sheet raised in there.
                 pages_rejected = 0
 

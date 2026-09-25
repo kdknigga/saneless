@@ -129,7 +129,7 @@ class TestSpooledPageSinkNaming:
     def test_first_page_is_sequence_one(self, tmp_path: Path) -> None:
         """The first add() assigns sequence 1 and writes a-0001.png."""
         sink = SpooledPageSink(tmp_path, "a", 10)
-        record = sink.add(_white_page())
+        record = sink.add(_white_page(), dpi=300)
         assert record.sequence == 1
         assert record.path == tmp_path / "a-0001.png"
         assert record.path.is_file()
@@ -137,8 +137,8 @@ class TestSpooledPageSinkNaming:
     def test_second_page_increments(self, tmp_path: Path) -> None:
         """The second add() assigns sequence 2 and writes a-0002.png."""
         sink = SpooledPageSink(tmp_path, "a", 10)
-        sink.add(_white_page())
-        second = sink.add(_inked_page())
+        sink.add(_white_page(), dpi=300)
+        second = sink.add(_inked_page(), dpi=300)
         assert second.sequence == 2
         assert second.path == tmp_path / "a-0002.png"
         assert second.path.is_file()
@@ -147,8 +147,8 @@ class TestSpooledPageSinkNaming:
         """The records property returns every record so far, in order."""
         sink = SpooledPageSink(tmp_path, "a", 10)
         assert sink.records == ()
-        first = sink.add(_white_page())
-        second = sink.add(_inked_page())
+        first = sink.add(_white_page(), dpi=300)
+        second = sink.add(_inked_page(), dpi=300)
         assert sink.records == (first, second)
         assert isinstance(sink.records, tuple)
 
@@ -158,8 +158,8 @@ class TestSpooledPageSinkNaming:
         """A pass-B sink writes b-0001.png beside pass A's a-0001.png."""
         pass_a = SpooledPageSink(tmp_path, "a", 10)
         pass_b = SpooledPageSink(tmp_path, "b", 10)
-        pass_a.add(_white_page())
-        record = pass_b.add(_inked_page())
+        pass_a.add(_white_page(), dpi=300)
+        record = pass_b.add(_inked_page(), dpi=300)
         assert record.path == tmp_path / "b-0001.png"
         assert sorted(path.name for path in tmp_path.iterdir()) == [
             "a-0001.png",
@@ -174,7 +174,7 @@ class TestSpooledPageSinkWrite:
         """The spooled file reopens as a PNG at the same size and mode."""
         sink = SpooledPageSink(tmp_path, "a", 10)
         image = _inked_page((150, 220))
-        record = sink.add(image)
+        record = sink.add(image, dpi=300)
         with Image.open(record.path) as reopened:
             assert reopened.format == "PNG"
             assert reopened.size == image.size
@@ -184,7 +184,7 @@ class TestSpooledPageSinkWrite:
         """The record's size and mode are the image's own, not the file's."""
         sink = SpooledPageSink(tmp_path, "a", 10)
         image = _inked_page((150, 220))
-        record = sink.add(image)
+        record = sink.add(image, dpi=300)
         assert record.size == (150, 220)
         assert record.mode == "RGB"
 
@@ -195,7 +195,7 @@ class TestSpooledPageSinkStatistics:
     def test_white_page_statistics(self, tmp_path: Path) -> None:
         """A pure-white page has mean 255.0 and stddev 0.0."""
         sink = SpooledPageSink(tmp_path, "a", 10)
-        record = sink.add(_white_page())
+        record = sink.add(_white_page(), dpi=300)
         assert record.mean == 255.0
         assert record.stddev == 0.0
 
@@ -204,7 +204,7 @@ class TestSpooledPageSinkStatistics:
         image = _inked_page()
         expected = Stat(image.convert("L"))
         sink = SpooledPageSink(tmp_path, "a", 10)
-        record = sink.add(image)
+        record = sink.add(image, dpi=300)
         assert record.mean == pytest.approx(expected.mean[0])
         assert record.stddev == pytest.approx(expected.stddev[0])
         assert record.stddev > 0.0
@@ -217,17 +217,17 @@ class TestSpooledPageSinkThumbnail:
         """Three pages produce exactly one thumbnail, from page 1."""
         thumbnails: list[str] = []
         sink = SpooledPageSink(tmp_path, "a", 10, thumbnails.append)
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
         assert len(thumbnails) == 1
-        sink.add(_inked_page())
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
+        sink.add(_inked_page(), dpi=300)
         assert len(thumbnails) == 1
 
     def test_thumbnail_is_non_empty_ascii_base64(self, tmp_path: Path) -> None:
         """The callback receives a decodable base64 ASCII JPEG string."""
         thumbnails: list[str] = []
         sink = SpooledPageSink(tmp_path, "a", 10, thumbnails.append)
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
         encoded = thumbnails[0]
         assert encoded
         assert encoded.isascii()
@@ -236,8 +236,8 @@ class TestSpooledPageSinkThumbnail:
     def test_no_callback_never_raises(self, tmp_path: Path) -> None:
         """A sink built without a callback spools pages normally."""
         sink = SpooledPageSink(tmp_path, "a", 10)
-        sink.add(_inked_page())
-        sink.add(_inked_page())
+        sink.add(_inked_page(), dpi=300)
+        sink.add(_inked_page(), dpi=300)
         assert len(sink.records) == 2
 
     def test_a_raising_thumbnail_callback_still_records_the_page(
@@ -268,8 +268,8 @@ class TestSpooledPageSinkThumbnail:
         sink = SpooledPageSink(tmp_path, "a", 10, explode)
 
         with caplog.at_level(logging.WARNING, logger="saneless.spool"):
-            record = sink.add(_inked_page())
-            sink.add(_inked_page())
+            record = sink.add(_inked_page(), dpi=300)
+            sink.add(_inked_page(), dpi=300)
 
         assert len(thumbnails) == 1
         assert len(sink.records) == 2
@@ -296,7 +296,7 @@ class TestSpooledPageSinkFailures:
         """A per-page shortfall names the page, the path and the config key."""
         sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
         with pytest.raises(ScanError) as excinfo:
-            sink.add(_white_page())
+            sink.add(_white_page(), dpi=300)
         message = str(excinfo.value)
         assert "page 1" in message
         assert str(tmp_path / "a-0001.png") in message
@@ -306,7 +306,7 @@ class TestSpooledPageSinkFailures:
         """Nothing is written when the page could not have fitted."""
         sink = SpooledPageSink(tmp_path, "a", _IMPOSSIBLE_RESERVE_MB)
         with pytest.raises(ScanError):
-            sink.add(_white_page())
+            sink.add(_white_page(), dpi=300)
         assert list(tmp_path.iterdir()) == []
         assert sink.records == ()
 
@@ -318,7 +318,7 @@ class TestSpooledPageSinkFailures:
         blocked.write_text("not a directory")
         sink = SpooledPageSink(blocked, "a", 0)
         with pytest.raises(ScanError) as excinfo:
-            sink.add(_white_page())
+            sink.add(_white_page(), dpi=300)
         message = str(excinfo.value)
         assert "page 1" in message
         assert str(blocked / "a-0001.png") in message
@@ -350,7 +350,7 @@ class TestSpooledPageSinkFailures:
         spool.rmdir()
 
         with pytest.raises(ScanError) as excinfo:
-            sink.add(_white_page())
+            sink.add(_white_page(), dpi=300)
 
         message = str(excinfo.value)
         assert "Could not measure free space for page 1" in message
@@ -537,7 +537,11 @@ class TestSpooledPageSinkAtomicWrite:
         def watching_save(image: Image.Image, fp: Path, **params: object) -> None:
             targets.append(str(fp))
             final_existed.append(final.exists())
-            original_save(image, fp, **params)
+            # Narrowed rather than forwarded blind: ``format`` is the one
+            # parameter ``save`` types, and the spool always names it.
+            image_format = params.pop("format")
+            assert isinstance(image_format, str)
+            original_save(image, fp, image_format, **params)
 
         monkeypatch.setattr(Image.Image, "save", watching_save)
         sink = SpooledPageSink(tmp_path, "a", 10)

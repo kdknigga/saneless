@@ -391,24 +391,15 @@ def _join_sane_reader_threads(timeout: float = _READER_JOIN_SECONDS) -> None:
             thread.join(timeout)
 
 
-def _uncropped(image: Image.Image) -> Image.Image:
-    """
-    Hand a page on unchanged, as the crop closure for a direct acquisition call.
-
-    ``_acquire_pages`` takes the per-page crop as a closure because
-    ``scan_pages`` binds the paper size, the resolution the device chose and
-    whether the scan area was set on the device into one callable.  A test
-    driving acquisition directly has none of those, and is not about geometry,
-    so it supplies the identity.
-
-    Args:
-        image: The page the device produced.
-
-    Returns:
-        That same page.
-
-    """
-    return image
+# The framing for a direct acquisition call: pages handed on uncropped, at
+# 300 dpi.  ``_acquire_pages`` takes the crop and the read-back dpi as one
+# record because ``scan_pages`` builds both from the paper size, the
+# resolution the device chose and whether the scan area was set on the
+# device.  A test driving acquisition directly has none of those, and is not
+# about geometry: a "full" paper size never crops.
+_UNCROPPED = sane_backend_mod._PageFraming(
+    paper_size="full", resolution=300, geometry_set=True
+)
 
 
 @pytest.fixture
@@ -2093,7 +2084,7 @@ class TestSaneBackendPerPageTimeout:
         try:
             with pytest.raises(ScanError, match="timed out after"):
                 backend._scan_adf_pages(
-                    mock_dev, page_sink, _uncropped, timeout_per_page=0.05
+                    mock_dev, page_sink, _UNCROPPED, timeout_per_page=0.05
                 )
         finally:
             mock_dev.release_read()
@@ -2117,7 +2108,7 @@ class TestSaneBackendPerPageTimeout:
 
         backend = SaneBackend()
         records, _ = backend._scan_adf_pages(
-            mock_dev, page_sink, _uncropped, timeout_per_page=5.0
+            mock_dev, page_sink, _UNCROPPED, timeout_per_page=5.0
         )
         assert len(records) == 3
         assert [record.sequence for record in records] == [1, 2, 3]
@@ -2197,7 +2188,7 @@ class TestSaneBackendCancelSequence:
             backend._open_device(_TEST_DEVICE) as dev,
         ):
             backend._scan_adf_pages(
-                dev, sink, _uncropped, timeout_per_page=0.05, grace=0.05
+                dev, sink, _UNCROPPED, timeout_per_page=0.05, grace=0.05
             )
 
     def test_close_not_called_while_blocked(
@@ -2220,7 +2211,7 @@ class TestSaneBackendCancelSequence:
         with sane_backend._open_device(_TEST_DEVICE) as dev:
             with pytest.raises(ScanError, match="timed out"):
                 sane_backend._scan_adf_pages(
-                    dev, page_sink, _uncropped, timeout_per_page=0.05
+                    dev, page_sink, _UNCROPPED, timeout_per_page=0.05
                 )
             assert fake_device.cancel_calls == 1
             assert fake_device.close_while_blocked is False
@@ -2250,7 +2241,7 @@ class TestSaneBackendCancelSequence:
             sane_backend._open_device(_TEST_DEVICE) as dev,
         ):
             sane_backend._scan_adf_pages(
-                dev, page_sink, _uncropped, timeout_per_page=0.05, grace=0.05
+                dev, page_sink, _UNCROPPED, timeout_per_page=0.05, grace=0.05
             )
 
         message = str(raised.value)
@@ -2287,7 +2278,7 @@ class TestSaneBackendCancelSequence:
             sane_backend._open_device(_TEST_DEVICE) as dev,
         ):
             sane_backend._scan_adf_pages(
-                dev, page_sink, _uncropped, timeout_per_page=0.05
+                dev, page_sink, _UNCROPPED, timeout_per_page=0.05
             )
 
         assert page_sink.records == ()
@@ -2423,7 +2414,7 @@ class TestSaneBackendCancelSequence:
                     dev,
                     _TEST_DEVICE,
                     page_sink,
-                    _uncropped,
+                    _UNCROPPED,
                     sane_backend_mod._PageBudget(timeout=0.05),
                 )
             # Inside the device context, so the count is the acquisition's own
@@ -2462,7 +2453,7 @@ class TestSaneBackendCancelSequence:
                 dev,
                 _TEST_DEVICE,
                 page_sink,
-                _uncropped,
+                _UNCROPPED,
                 sane_backend_mod._PageBudget(timeout=0.05, grace=0.05),
             )
 
@@ -2560,7 +2551,7 @@ class TestSaneBackendCancelSequence:
             interrupter.start()
             with pytest.raises(expected):
                 sane_backend._scan_adf_pages(
-                    dev, page_sink, _uncropped, timeout_per_page=5.0
+                    dev, page_sink, _UNCROPPED, timeout_per_page=5.0
                 )
             interrupter.join(_READER_JOIN_SECONDS)
 
@@ -4279,6 +4270,23 @@ class TestScanBatch:
 
         assert batch.actual_resolution == 1200
         assert isinstance(batch.actual_resolution, int)
+        # The page itself is recorded at the read-back value, not the 5000
+        # asked for: it is what every PDF lays the page out at.
+        assert [record.dpi for record in batch.pages] == [1200]
+
+    def test_every_fed_page_is_recorded_at_the_resolution_the_device_chose(
+        self, fake_sane_module: FakeSaneModule, page_sink: SpooledPageSink
+    ) -> None:
+        """The feeder path hands the sink the read-back dpi for every sheet."""
+        mock_dev = fake_sane_module.open(_TEST_DEVICE)
+        mock_dev.load_feeder([_make_content_image() for _ in range(3)])
+
+        backend = SaneBackend()
+        settings = ScanSettings(source="ADF", resolution=5000, mode="Color")
+        batch = backend.scan_pages("test:device:001", settings, page_sink)
+
+        assert batch.actual_resolution == 1200
+        assert [record.dpi for record in batch.pages] == [1200, 1200, 1200]
 
     def test_a_flatbed_scan_carries_both_facts_too(
         self, monkeypatch: pytest.MonkeyPatch, page_sink: SpooledPageSink
@@ -4344,19 +4352,20 @@ class _RecordingSink(PageSink):
         self.added: list[Image.Image] = []
         self.returned: list[PageRecord] = []
 
-    def add(self, image: Image.Image) -> PageRecord:
+    def add(self, image: Image.Image, *, dpi: int) -> PageRecord:
         """
         Record the page, pass it to the delegate, and record what came back.
 
         Args:
             image: The one page the backend handed over.
+            dpi: The resolution the backend read back, passed on unchanged.
 
         Returns:
             The delegate's record, unchanged.
 
         """
         self.added.append(image)
-        record = self._delegate.add(image)
+        record = self._delegate.add(image, dpi=dpi)
         self.returned.append(record)
         return record
 

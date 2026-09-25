@@ -293,7 +293,7 @@ def _spool_pass(
 
     """
     sink = SpooledPageSink(directory, label, _TEST_RESERVE_MB)
-    return [sink.add(page) for page in pages]
+    return [sink.add(page, dpi=300) for page in pages]
 
 
 def _duplex_spool(
@@ -3206,7 +3206,7 @@ def _spooling_then_failing(
     ) -> ScanBatch:
         """Spool every page the device managed, then raise as it would."""
         for page in pages:
-            sink.add(page)
+            sink.add(page, dpi=settings.resolution)
         raise failure
 
     return _spool_then_fail
@@ -3523,7 +3523,7 @@ def _failing_in_pass_b(
             pages = [distinct_page(number) for number in range(fronts)]
             return spooling(pages)(device_id, settings, sink)
         for number in range(backs):
-            sink.add(distinct_page(fronts + number))
+            sink.add(distinct_page(fronts + number), dpi=settings.resolution)
         raise failure
 
     return _spool_next

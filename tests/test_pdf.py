@@ -253,7 +253,7 @@ def spool_pages(spool_dir: Path) -> Callable[[Sequence[Image.Image]], list[PageR
 
     def _spool(images: Sequence[Image.Image]) -> list[PageRecord]:
         """Spool every image and return the records the sink produced."""
-        return [sink.add(image) for image in images]
+        return [sink.add(image, dpi=300) for image in images]
 
     return _spool
 
@@ -569,10 +569,10 @@ class TestBoundedAssembly:
         fronts = SpooledPageSink(spool_dir, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
         backs = SpooledPageSink(spool_dir, _SPOOL_LABEL_B, _TEST_RESERVE_MB)
         records = [
-            fronts.add(Image.new("RGB", (120, 160), "white")),
-            backs.add(Image.new("RGB", (120, 160), "red")),
-            fronts.add(Image.new("RGB", (120, 160), "blue")),
-            backs.add(Image.new("RGB", (120, 160), "green")),
+            fronts.add(Image.new("RGB", (120, 160), "white"), dpi=300),
+            backs.add(Image.new("RGB", (120, 160), "red"), dpi=300),
+            fronts.add(Image.new("RGB", (120, 160), "blue"), dpi=300),
+            backs.add(Image.new("RGB", (120, 160), "green"), dpi=300),
         ]
         assert [record.sequence for record in records] == [1, 1, 2, 2]
 
@@ -801,7 +801,7 @@ for _ in range(page_count):
     # One page decoded at a time: the parent is measuring assembly, so the
     # spooling phase must not be what sets the high-water mark.
     image = Image.frombytes("RGB", (width, height), os.urandom(width * height * 3))
-    records.append(sink.add(image))
+    records.append(sink.add(image, dpi=300))
     del image
 
 pdf_path = assemble_pdf(records, workspace / "out", "memory.pdf", 300, title="memory")

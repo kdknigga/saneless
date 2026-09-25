@@ -66,7 +66,7 @@ def _spool(
     directory.mkdir(parents=True, exist_ok=True)
     sink = SpooledPageSink(directory, label, 0)
     for index in range(count):
-        sink.add(distinct_page(first + index))
+        sink.add(distinct_page(first + index), dpi=300)
     return sink.records
 
 

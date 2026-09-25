@@ -136,7 +136,7 @@ def _spool(directory: Path, pages: Sequence[Image.Image]) -> list[PageRecord]:
 
     """
     sink = SpooledPageSink(directory, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
-    return [sink.add(page) for page in pages]
+    return [sink.add(page, dpi=300) for page in pages]
 
 
 def _is_blank(

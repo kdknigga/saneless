@@ -302,7 +302,13 @@ class PageRecord:
             the PDF's page content is built from -- nothing re-encodes it.
         size: The page's ``(width, height)`` in pixels, as the device produced
             it and as the PNG stores it.
-        mode: The page's Pillow mode, ``"L"`` or ``"RGB"`` for a SANE snap.
+        mode: The page's Pillow mode as spooled: ``"1"``, ``"L"`` or
+            ``"RGB"``. A SANE snap arrives as ``"L"`` or ``"RGB"``; any other
+            mode the sink accepts is converted to one of those first.
+        dpi: The resolution the device read back for this page, which every
+            PDF lays the page out at: the document, a mismatch half and a
+            preserved partial alike. A fact, like the rest: it is what the
+            device said, not what the profile asked for.
         mean: Greyscale mean luminance, measured once at spool time.
         stddev: Greyscale standard deviation, measured once at spool time.
 
@@ -312,6 +318,7 @@ class PageRecord:
     path: Path
     size: tuple[int, int]
     mode: str
+    dpi: int
     mean: float
     stddev: float
 
@@ -348,7 +355,7 @@ class PageSink(ABC):
     """
 
     @abstractmethod
-    def add(self, image: Image.Image) -> PageRecord:
+    def add(self, image: Image.Image, *, dpi: int) -> PageRecord:
         """
         Take ownership of one acquired page and materialise it.
 
@@ -358,9 +365,17 @@ class PageSink(ABC):
         this seam exists to prevent, and it would put peak memory back to
         growing with the page count.
 
+        ``dpi`` is **required**, with no default, because it is a fact about
+        the page that only the caller knows. A default would have kept every
+        caller compiling while laying out a page read back at 150 dpi as if it
+        were the profile's 300 -- half size, in a preserved partial nobody
+        re-scans.
+
         Args:
             image: The page the device produced, already cropped if the
                 requested paper size required it.
+            dpi: The resolution the device read back, which the page is
+                recorded and laid out at.
 
         Returns:
             A PageRecord describing where the page was written and what was

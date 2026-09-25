@@ -1282,7 +1282,7 @@ class _PassBGatedScanner(StubScannerBackend):
 
         Args:
             device_id: Ignored.
-            settings: Only ``resolution`` is used, and only to report it back.
+            settings: Only ``resolution`` is used, as the pages' dpi and the batch's.
             sink: The pipeline's own sink, which receives the page.
 
         Returns:
@@ -1292,7 +1292,7 @@ class _PassBGatedScanner(StubScannerBackend):
         self.scan_calls += 1
         if self.scan_calls >= 2:
             self.release_pass_b.wait(_PASS_B_GATE_CEILING)
-        record = sink.add(_inked_page())
+        record = sink.add(_inked_page(), dpi=settings.resolution)
         return scan_batch([record], resolution=settings.resolution)
 
 
@@ -1512,7 +1512,7 @@ class _GatedScanner(StubScannerBackend):
 
         Args:
             device_id: Ignored.
-            settings: Only ``resolution`` is used, and only to report it back.
+            settings: Only ``resolution`` is used, as the pages' dpi and the batch's.
             sink: The pipeline's own sink, which receives the page.
 
         Returns:
@@ -1524,7 +1524,7 @@ class _GatedScanner(StubScannerBackend):
         if call in self.gates:
             self.entered[call].set()
             self.gates[call].wait(_PASS_B_GATE_CEILING)
-        record = sink.add(_inked_page())
+        record = sink.add(_inked_page(), dpi=settings.resolution)
         return scan_batch([record], resolution=settings.resolution)
 
 
@@ -5464,7 +5464,7 @@ class _CountedPassScanner(StubScannerBackend):
 
         Args:
             device_id: Ignored.
-            settings: Only ``resolution`` is used, and only to report it back.
+            settings: Only ``resolution`` is used, as the pages' dpi and the batch's.
             sink: The pipeline's own sink, which receives the pages.
 
         Returns:
@@ -5475,7 +5475,9 @@ class _CountedPassScanner(StubScannerBackend):
         if self.scan_calls >= 2:
             self.release_pass_b.wait(_PASS_B_GATE_CEILING)
         wanted = self._per_pass[min(self.scan_calls, 2) - 1]
-        records = [sink.add(_inked_page()) for _ in range(wanted)]
+        records = [
+            sink.add(_inked_page(), dpi=settings.resolution) for _ in range(wanted)
+        ]
         return scan_batch(records, resolution=settings.resolution)
 
 

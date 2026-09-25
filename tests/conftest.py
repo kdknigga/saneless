@@ -503,7 +503,7 @@ def spooling(
         device_id: str, settings: ScanSettings, sink: PageSink
     ) -> ScanBatch:
         """Spool every page into the sink the caller supplied."""
-        records = [sink.add(page) for page in pages]
+        records = [sink.add(page, dpi=resolution) for page in pages]
         return scan_batch(records, resolution=resolution, rejected=rejected)
 
     return _spool_pages
@@ -552,7 +552,7 @@ def spooling_in_turn(
                 f"was given only {len(page_lists)} page list(s)"
             )
             raise AssertionError(msg)
-        records = [sink.add(page) for page in page_lists[index]]
+        records = [sink.add(page, dpi=resolution) for page in page_lists[index]]
         return scan_batch(records, resolution=resolution)
 
     return _spool_next
@@ -642,14 +642,14 @@ class StubScannerBackend(ScannerBackend):
 
         Args:
             device_id: Ignored; this stub scans nothing real.
-            settings: Only ``resolution`` is used, and only to report it back.
+            settings: Only ``resolution`` is used, as the pages' dpi and the batch's.
             sink: The caller's sink, which receives the one page.
 
         Returns:
             A batch of the single record the sink returned.
 
         """
-        record = sink.add(_inked_page())
+        record = sink.add(_inked_page(), dpi=settings.resolution)
         return scan_batch([record], resolution=settings.resolution)
 
 

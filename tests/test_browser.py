@@ -200,7 +200,7 @@ def _spool_pages(sink: PageSink, count: int, resolution: int) -> ScanBatch:
     for page in records:
         page.paste((0, 0, 0), (0, 0, 50, 100))
     return scan_batch(
-        [sink.add(page) for page in records],
+        [sink.add(page, dpi=resolution) for page in records],
         resolution=resolution,
     )
 
@@ -249,7 +249,7 @@ class _BrowserTestScanner(StubScannerBackend):
 
         Args:
             device_id: Ignored; this stub scans nothing real.
-            settings: Only ``resolution`` is used, and only to report it back.
+            settings: Only ``resolution`` is used, as the pages' dpi and the batch's.
             sink: The pipeline's own sink, which receives the page.
 
         Returns:
@@ -4232,7 +4232,7 @@ class _ManualDuplexScanner(_BrowserTestScanner):
 
         Args:
             device_id: Ignored; this stub scans nothing real.
-            settings: Only ``resolution`` is used, and only to report it back.
+            settings: Only ``resolution`` is used, as the pages' dpi and the batch's.
             sink: The pipeline's own sink, which receives each page.
 
         Returns:

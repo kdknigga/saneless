@@ -209,7 +209,7 @@ class DistinctPageScanner(StubScannerBackend):
 
         Args:
             device_id: Ignored; this scanner scans nothing real.
-            settings: Only ``resolution`` is used, and only to report it back.
+            settings: Only ``resolution`` is used, as the pages' dpi and the batch's.
             sink: The pipeline's sink, which receives every page of the pass.
 
         Returns:
@@ -232,7 +232,7 @@ class DistinctPageScanner(StubScannerBackend):
         for page_index in self.passes[index]:
             image = distinct_page(page_index)
             try:
-                record = sink.add(image)
+                record = sink.add(image, dpi=settings.resolution)
             finally:
                 image.close()
             self.spooled[page_index] = record.path.read_bytes()

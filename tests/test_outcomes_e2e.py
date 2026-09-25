@@ -580,7 +580,7 @@ def _jamming_scanner(pages: int, failure: Exception) -> MagicMock:
     ) -> ScanBatch:
         """Spool every sheet that made it through, then raise as SANE would."""
         for page in _pages(pages):
-            sink.add(page)
+            sink.add(page, dpi=settings.resolution)
         raise failure
 
     scanner.scan_pages.side_effect = spool_then_fail
