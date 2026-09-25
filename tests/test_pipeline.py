@@ -5594,6 +5594,54 @@ class TestTheDpiTheDeviceActuallyChose:
         ]
         assert dpis == [[150, 150, 150], [150, 150]]
 
+    def test_a_long_title_still_gives_the_two_halves_two_names(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        Past the file name's cap on the title, the halves are still told apart.
+
+        Both halves are named in the same second, and the consume folder
+        fallback lands each on its own name, so one name for both would let
+        the backs replace the fronts.
+        """
+        _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling_in_turn(
+            [_make_content_image() for _ in range(3)],
+            [_make_content_image() for _ in range(2)],
+        )
+        fronts_pdf = tmp_path / "fronts.pdf"
+        backs_pdf = tmp_path / "backs.pdf"
+        fronts_pdf.write_bytes(b"%PDF-fake")
+        backs_pdf.write_bytes(b"%PDF-fake")
+
+        with patch("saneless.pipeline.assemble_pdf") as mock_assemble:
+            mock_assemble.side_effect = [fronts_pdf, backs_pdf]
+
+            run_pipeline(
+                scanner=scanner,
+                paperless=_both_halves_delivered(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title=(
+                        "An Unusually Long Title For A Two Sided Stack Of Tax "
+                        "Paperwork 2026"
+                    ),
+                    job_id="job-long-1",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        names = [call.kwargs["filename"] for call in mock_assemble.call_args_list]
+        assert len(names) == 2
+        assert names[0].endswith("-fronts.pdf"), names[0]
+        assert names[1].endswith("-backs.pdf"), names[1]
+
     def test_two_passes_disagreeing_on_resolution_say_so(
         self,
         mock_paperless: MagicMock,
@@ -6031,20 +6079,20 @@ class TestPreservedFilesArePrivate:
         """
         A move between filesystems copies the file and still keeps it 0600.
 
-        ``tmp_dir`` and ``data_dir`` may be different volumes, where a rename
-        fails with EXDEV and ``shutil`` falls back to a copy.
+        ``tmp_dir`` and ``data_dir`` may be different volumes, where the hard
+        link the move starts with fails with EXDEV and a copy is made instead.
         """
         failed_dir = _isolate_dirs(default_settings, tmp_path)
-        real_rename = os.rename
+        real_link = os.link
         crossed: list[str] = []
 
         def cross_device(src: str | Path, dst: str | Path) -> None:
             if Path(dst).parent == failed_dir:
                 crossed.append(str(dst))
                 raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
-            real_rename(src, dst)
+            real_link(src, dst)
 
-        monkeypatch.setattr(os, "rename", cross_device)
+        monkeypatch.setattr(os, "link", cross_device)
 
         _fail_the_upload(default_settings, "job-mode-2")
 
@@ -6073,14 +6121,14 @@ class TestPreservedFilesArePrivate:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         failed_dir.mkdir(parents=True)
         failed_dir.chmod(0o755)
-        real_rename = os.rename
+        real_link = os.link
         real_copyfileobj = shutil.copyfileobj
         modes: list[int] = []
 
         def cross_device(src: str | Path, dst: str | Path) -> None:
             if Path(dst).parent == failed_dir:
                 raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
-            real_rename(src, dst)
+            real_link(src, dst)
 
         def no_fast_copy(*_args: object, **_kwargs: object) -> NoReturn:
             raise OSError(errno.ENOTSOCK, os.strerror(errno.ENOTSOCK))
@@ -6089,7 +6137,7 @@ class TestPreservedFilesArePrivate:
             modes.append(stat.S_IMODE(os.fstat(target.fileno()).st_mode))
             real_copyfileobj(source, target, *args)
 
-        monkeypatch.setattr(os, "rename", cross_device)
+        monkeypatch.setattr(os, "link", cross_device)
         monkeypatch.setattr(os, "copy_file_range", no_fast_copy, raising=False)
         monkeypatch.setattr(os, "sendfile", no_fast_copy)
         monkeypatch.setattr(shutil, "copyfileobj", recording)

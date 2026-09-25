@@ -38,12 +38,16 @@ if TYPE_CHECKING:
 # deny-list, and why auto_profiles._slugify is not reused.
 _NON_SLUG_CHARACTERS = re.compile(r"[^a-z0-9]+")
 
-# Cap on the title slug only; the timestamp and job-id segments are fixed
+# Cap on the title slug; the timestamp and job-id segments are fixed
 # width, keeping the composed name far below NAME_MAX.
 _MAX_SLUG_LENGTH = 60
 
 # A uuid4 prefix long enough that a collision needs ~2^16 jobs in one second.
 _JOB_ID_LENGTH = 8
+
+# Cap on the part segment ("fronts", "backs", "partial"), which is saneless's
+# own word and never truncated by the title's cap.
+_MAX_PART_LENGTH = 16
 
 __all__ = ["assemble_pdf", "build_pdf_filename", "sanitise_title_for_filename"]
 
@@ -68,9 +72,9 @@ def sanitise_title_for_filename(title: str) -> str:
     operator input, so it is correct for its own job and unsafe for this one.
 
     The 60-character cap keeps the whole composed name (see
-    :func:`build_pdf_filename`, whose other segments are fixed width) under
-    ``NAME_MAX`` -- 255 bytes on ext4 and overlayfs -- and under eCryptfs's
-    stricter 143-byte limit, so a long title cannot turn into
+    :func:`build_pdf_filename`, whose other segments are fixed width or
+    capped) under ``NAME_MAX`` -- 255 bytes on ext4 and overlayfs -- and
+    under eCryptfs's stricter 143-byte limit, so a long title cannot turn into
     ``OSError: [Errno 36] File name too long`` on a user-controlled path.
 
     A title with nothing allow-listed in it -- ``"..."``, or a wholly
@@ -91,13 +95,19 @@ def sanitise_title_for_filename(title: str) -> str:
     return slug[:_MAX_SLUG_LENGTH].strip("-")
 
 
-def build_pdf_filename(job_id: str, title: str) -> str:
+def build_pdf_filename(job_id: str, title: str, *, part: str = "") -> str:
     """
     Compose the unique file name for one job's assembled PDF.
 
-    The shape is ``{YYYYmmdd-HHMMSS}-{job id}-{title slug}.pdf``, with either
-    of the last two segments dropped entirely when it sanitises away, so the
-    name never carries a dangling ``-`` before its extension.
+    The shape is ``{YYYYmmdd-HHMMSS}-{job id}-{title slug}-{part}.pdf``, with
+    any of the last three segments dropped entirely when it sanitises away, so
+    the name never carries a dangling ``-`` before its extension.
+
+    ``part`` tells apart the PDFs one job can produce -- ``(fronts)`` and
+    ``(backs)``, or ``(partial)`` -- and it is a segment of its own, after the
+    title slug, rather than words appended to the title: the slug is cut at 60
+    characters, and a suffix inside it would be cut off a long title, giving
+    both halves of a duplex job one name.
 
     **Uniqueness comes from the job id, not from the timestamp.** The job id is
     a uuid4 -- ``job.id`` from the worker, and one minted per run by ``saneless
@@ -124,6 +134,9 @@ def build_pdf_filename(job_id: str, title: str) -> str:
             only in tests, which construct a request without one; the segment
             is then dropped, and with it the uniqueness this function promises.
         title: The title as typed by the operator. Wholly untrusted.
+        part: Which of the job's PDFs this is, for example ``(fronts)``;
+            sanitised like the title and never truncated by the title's cap.
+            Empty for the job's one document.
 
     Returns:
         A single ``.pdf`` file name -- never a path, and never a name that
@@ -132,10 +145,16 @@ def build_pdf_filename(job_id: str, title: str) -> str:
     """
     timestamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
     job_segment = sanitise_title_for_filename(job_id)[:_JOB_ID_LENGTH].strip("-")
+    part_segment = sanitise_title_for_filename(part)[:_MAX_PART_LENGTH].strip("-")
     segments = [
-        part
-        for part in (timestamp, job_segment, sanitise_title_for_filename(title))
-        if part
+        segment
+        for segment in (
+            timestamp,
+            job_segment,
+            sanitise_title_for_filename(title),
+            part_segment,
+        )
+        if segment
     ]
     return "-".join(segments) + ".pdf"
 

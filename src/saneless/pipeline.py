@@ -1698,8 +1698,10 @@ class _PipelineRun:
         # first.  Reversed here, as _interleave_duplex does, the (backs) PDF runs
         # in the same sheet order as the (fronts) PDF.
         backs = list(reversed(mismatch.backs))
-        # One composition per half, used for the file name, the PDF's own /Title
-        # and the upload, so the three cannot drift apart.
+        # One composition per half, used for the PDF's own /Title and the
+        # upload, so the two cannot drift apart.  The file name carries the
+        # half as a part segment of its own instead: inside the title slug it
+        # would be cut off a long title, and the halves would share one name.
         fronts_title = f"{self.request.title} {preservation.FRONTS_SUFFIX}"
         backs_title = f"{self.request.title} {preservation.BACKS_SUFFIX}"
 
@@ -1713,13 +1715,21 @@ class _PipelineRun:
         fronts_pdf = assemble_pdf(
             fronts,
             self.workspace / "fronts",
-            filename=build_pdf_filename(self.request.job_id, fronts_title),
+            filename=build_pdf_filename(
+                self.request.job_id,
+                self.request.title,
+                part=preservation.FRONTS_SUFFIX,
+            ),
             title=fronts_title,
         )
         backs_pdf = assemble_pdf(
             backs,
             self.workspace / "backs",
-            filename=build_pdf_filename(self.request.job_id, backs_title),
+            filename=build_pdf_filename(
+                self.request.job_id,
+                self.request.title,
+                part=preservation.BACKS_SUFFIX,
+            ),
             title=backs_title,
         )
         logger.info(

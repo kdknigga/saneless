@@ -94,6 +94,20 @@ _BYTES_PER_MB: Final[int] = 1024 * 1024
 # A preserved scan is a whole document, so only its owner may read it.
 _PRIVATE_FILE_MODE: Final = 0o600
 
+# Why a hard link can fail where a copy still works: the two paths are on
+# different filesystems, or the filesystem has no hard links at all (vfat, some
+# FUSE and network mounts refuse with EPERM or ENOTSUP), or the file already
+# has as many links as it may.
+_COPY_INSTEAD_OF_LINK: Final = frozenset(
+    {errno.EXDEV, errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EMLINK}
+)
+
+# How many numbered names a PDF may try in failed/ before giving up.  Every
+# name is keyed on the job id and the second, so even the second one is a
+# coincidence; the bound only stops a directory that refuses every name from
+# looping forever.
+_MAX_NAME_ATTEMPTS: Final = 100
+
 
 def make_failed_dir(failed_dir: Path) -> None:
     """
@@ -142,18 +156,24 @@ def best_effort_chmod(path: Path, mode: int) -> None:
 
 def move_private(source: Path, destination: Path) -> None:
     """
-    Move one file to ``destination`` so that nobody else can read it on the way.
+    Move one file to ``destination``, privately, and never over another file.
 
-    A rename keeps the mode the caller already gave the source.  Across
-    filesystems a rename fails with ``EXDEV``, and ``shutil.move`` would then
+    Everything this moves lands in ``failed/``, which is never pruned, so a
+    file already at ``destination`` is somebody's document too: it is never
+    replaced, and the move refuses instead.
+
+    On one filesystem the move is a hard link followed by removing the
+    source.  Unlike a rename, a link refuses an existing destination; like
+    one, it keeps the mode the caller already gave the source.  Across
+    filesystems a link fails with ``EXDEV``, and ``shutil.move`` would then
     copy through ``copy2``, which creates the destination with the umask's
     mode and applies the source's only once the whole document is written:
     inside a ``failed/`` an earlier release left at 0755, the scan would be
     readable by every local user for the length of the copy.  So the copy is
-    made here instead, into a file created 0600, and the source is removed
-    only once the copy is complete.  A copy that fails is removed, so no
-    truncated document is left behind.  Like ``rename``, an existing
-    destination is replaced; every name is keyed on the job id.
+    made here instead -- also where the filesystem has no hard links -- into a
+    file created 0600 with ``O_EXCL``, and the source is removed only once the
+    copy is complete.  A copy that fails is removed, so no truncated document
+    is left behind.
 
     Args:
         source: The file to move, inside the job workspace.
@@ -161,18 +181,22 @@ def move_private(source: Path, destination: Path) -> None:
             directory.
 
     Raises:
-        OSError: If the file could be neither renamed nor copied.  A
+        FileExistsError: If something is already at ``destination``; nothing
+            was moved.
+        OSError: If the file could be neither linked nor copied.  A
             ``shutil.Error`` from the copy is an ``OSError`` too.
 
     """
     try:
-        source.rename(destination)
+        os.link(source, destination)
+    except FileExistsError:
+        raise
     except OSError as exc:
-        if exc.errno != errno.EXDEV:
+        if exc.errno not in _COPY_INSTEAD_OF_LINK:
             raise
     else:
+        source.unlink()
         return
-    destination.unlink(missing_ok=True)
     descriptor = os.open(
         destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _PRIVATE_FILE_MODE
     )
@@ -564,16 +588,19 @@ class PreservationReport:
 
 
 def _build_pdf(
-    artefacts: RunArtefacts, records: Sequence[PageRecord], title: str
+    artefacts: RunArtefacts, records: Sequence[PageRecord], suffix: str = ""
 ) -> Path:
     """
     Assemble ``records`` into one PDF in the workspace, if there is room.
 
     Args:
-        artefacts: The run, for its workspace, job id and reserve.
+        artefacts: The run, for its workspace, title, job id and reserve.
         records: The pages, in the order the PDF holds them, each laid out
             at its own read-back dpi.
-        title: The PDF's title, which its file name is composed from too.
+        suffix: What part of the scan this is, such as ``FRONTS_SUFFIX``:
+            appended to the PDF's title, and a segment of its own in the
+            file name, where a long title cannot cut it off.  Empty for the
+            whole document.
 
     Returns:
         The assembled PDF, still inside the workspace.
@@ -583,10 +610,11 @@ def _build_pdf(
 
     """
     ensure_room_to_assemble(records, artefacts.workspace, artefacts.reserve_mb)
+    title = f"{artefacts.title} {suffix}" if suffix else artefacts.title
     return assemble_pdf(
         records,
         artefacts.workspace / PRESERVED_DIR_NAME,
-        filename=build_pdf_filename(artefacts.job_id, title),
+        filename=build_pdf_filename(artefacts.job_id, artefacts.title, part=suffix),
         title=title,
     )
 
@@ -618,12 +646,15 @@ def build_pass_pdf(
 
     """
     ordered = list(reversed(records)) if suffix == BACKS_SUFFIX else list(records)
-    return _build_pdf(artefacts, ordered, f"{artefacts.title} {suffix}")
+    return _build_pdf(artefacts, ordered, suffix)
 
 
 def _keep_file(pdf: Path, failed_dir: Path) -> Path:
     """
-    Move one PDF into ``failed_dir``, owner-only.
+    Move one PDF into ``failed_dir``, owner-only, beside whatever is there.
+
+    A file already holding the PDF's name is never replaced: the PDF takes
+    the next free numbered name instead (``<name>-2.pdf``, ``-3`` and so on).
 
     Args:
         pdf: The PDF, inside the workspace.
@@ -633,14 +664,22 @@ def _keep_file(pdf: Path, failed_dir: Path) -> Path:
         Where the PDF now is.
 
     Raises:
+        FileExistsError: If every numbered name is taken.
         OSError: If the chmod or the move fails.
 
     """
-    destination = failed_dir / pdf.name
     # Owner-only before the move, for the reason ``move_page_files`` gives.
     best_effort_chmod(pdf, _PRIVATE_FILE_MODE)
-    move_private(pdf, destination)
-    return destination
+    for attempt in range(1, _MAX_NAME_ATTEMPTS + 1):
+        name = pdf.name if attempt == 1 else f"{pdf.stem}-{attempt}{pdf.suffix}"
+        destination = failed_dir / name
+        try:
+            move_private(pdf, destination)
+        except FileExistsError:
+            continue
+        return destination
+    msg = f"No free name for {pdf.name} in {failed_dir}"
+    raise FileExistsError(errno.EEXIST, msg)
 
 
 def _record_problem(report: PreservationReport, what: str, exc: Exception) -> None:
@@ -702,7 +741,7 @@ def _keep_document(artefacts: RunArtefacts, report: PreservationReport) -> bool:
     """
     document = artefacts.document or ()
     try:
-        pdf = _build_pdf(artefacts, document, artefacts.title)
+        pdf = _build_pdf(artefacts, document)
         make_failed_dir(artefacts.failed_dir)
         kept = _keep_file(pdf, artefacts.failed_dir)
     except Exception as exc:

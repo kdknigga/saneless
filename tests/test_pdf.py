@@ -1158,6 +1158,17 @@ class TestBuildPdfFilename:
 
         assert len(name.encode()) <= 143
 
+    def test_a_long_title_keeps_the_part_that_tells_two_halves_apart(self) -> None:
+        """Past the title's cap, "(fronts)" and "(backs)" still name two files."""
+        title = "An Unusually Long Title For A Two Sided Stack Of Tax Paperwork 2026"
+
+        fronts = build_pdf_filename(JOB_A, title, part="(fronts)")
+        backs = build_pdf_filename(JOB_A, title, part="(backs)")
+
+        assert fronts.endswith("-fronts.pdf"), fronts
+        assert backs.endswith("-backs.pdf"), backs
+        assert len(build_pdf_filename(JOB_A, "x" * 500, part="(partial)")) <= 143
+
 
 class TestMediaBox:
     """Page geometry: a page scanned at N DPI must declare N DPI (OUTC-06)."""

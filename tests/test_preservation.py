@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import logging
 import math
+import os
 import stat
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
@@ -269,6 +271,57 @@ class TestTheMostFinishedArtefactIsKept:
             f"The 6 page(s) scanned before the error were preserved at "
             f"{fronts_pdf}, {backs_pdf}"
         ) in sentence
+
+    def test_a_long_title_still_keeps_both_halves_as_two_files(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        A title past the file name's cap cannot make the halves share a name.
+
+        Both halves are named in the same second, so if the half were only
+        words inside the title, the cap would cut it off and the backs would
+        land on the fronts' name.
+        """
+        artefacts = _artefacts(tmp_path, RunStage.ACQUIRING)
+        artefacts.title = (
+            "An Unusually Long Title For A Two Sided Stack Of Tax Paperwork 2026"
+        )
+        fronts = _spool(artefacts.spool_dir, "a", 2)
+        backs = _spool(artefacts.spool_dir, "b", 2, first=2)
+        artefacts.passes = [(FRONTS_SUFFIX, fronts), (BACKS_SUFFIX, backs)]
+
+        report = preserve_most_finished(artefacts)
+
+        fronts_pdf, backs_pdf = report.kept_paths
+        assert fronts_pdf.name.endswith("-fronts.pdf"), fronts_pdf.name
+        assert backs_pdf.name.endswith("-backs.pdf"), backs_pdf.name
+        assert sorted(artefacts.failed_dir.iterdir()) == sorted([fronts_pdf, backs_pdf])
+        assert embedded_streams(fronts_pdf) == _streams_of(fronts)
+        assert embedded_streams(backs_pdf) == _streams_of(list(reversed(backs)))
+
+    def test_a_file_already_in_failed_dir_is_never_replaced(
+        self, tmp_path: Path
+    ) -> None:
+        """A name already taken in failed/ is left alone; the PDF takes the next."""
+        artefacts = _artefacts(tmp_path, RunStage.DELIVERING)
+        records = _spool(artefacts.spool_dir, "a", 1)
+        pdf = preservation_module.assemble_pdf(
+            records,
+            artefacts.workspace / "out",
+            filename="20260925-120000-job-pres-kept-scan.pdf",
+            title=_TITLE,
+        )
+        artefacts.pdfs = [pdf]
+        artefacts.failed_dir.mkdir(parents=True)
+        earlier = artefacts.failed_dir / pdf.name
+        earlier.write_bytes(b"an earlier scan")
+
+        report = preserve_most_finished(artefacts)
+
+        (kept,) = report.kept_paths
+        assert kept.name == "20260925-120000-job-pres-kept-scan-2.pdf"
+        assert earlier.read_bytes() == b"an earlier scan"
+        assert embedded_streams(kept) == _streams_of(records)
 
     def test_mid_acquisition_an_empty_pass_is_left_out(self, tmp_path: Path) -> None:
         """A pass that spooled nothing yields no zero-page PDF."""
@@ -625,3 +678,51 @@ class TestTheFailedDirWarningMovedHere:
         ]
         assert len(growth) == 1
         assert str(FAILED_DIR_WARN_THRESHOLD + 1) in growth[0]
+
+
+class TestMovePrivateNeverReplaces:
+    """Whatever route the move takes, a file already there is left alone."""
+
+    @pytest.mark.parametrize("crossing", [False, True], ids=["link", "copy"])
+    def test_an_existing_destination_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, crossing: bool
+    ) -> None:
+        """The move refuses, and neither file is touched."""
+        if crossing:
+
+            def cross_device(_src: object, _dst: object) -> None:
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+            monkeypatch.setattr(os, "link", cross_device)
+        source = tmp_path / "work" / "scan.pdf"
+        source.parent.mkdir()
+        source.write_bytes(b"the new scan")
+        destination = tmp_path / "failed" / "scan.pdf"
+        destination.parent.mkdir()
+        destination.write_bytes(b"an earlier scan")
+
+        with pytest.raises(FileExistsError):
+            preservation_module.move_private(source, destination)
+
+        assert destination.read_bytes() == b"an earlier scan"
+        assert source.read_bytes() == b"the new scan"
+
+    @pytest.mark.parametrize("crossing", [False, True], ids=["link", "copy"])
+    def test_a_free_destination_is_moved_to(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, crossing: bool
+    ) -> None:
+        """Either route leaves the file at the destination and not at the source."""
+        if crossing:
+
+            def cross_device(_src: object, _dst: object) -> None:
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+            monkeypatch.setattr(os, "link", cross_device)
+        source = tmp_path / "scan.pdf"
+        source.write_bytes(b"the scan")
+        destination = tmp_path / "failed-scan.pdf"
+
+        preservation_module.move_private(source, destination)
+
+        assert destination.read_bytes() == b"the scan"
+        assert not source.exists()
