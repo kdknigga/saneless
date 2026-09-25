@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import gc
 import importlib
@@ -23,7 +24,12 @@ import saneless.cli as cli_module
 import saneless.scanner as scanner_pkg
 import saneless.scanner.sane_backend as sane_backend_mod
 import saneless.web.app as app_module
-from saneless.exceptions import ConfigError, FeederEmptyError, ScanError
+from saneless.exceptions import (
+    ConfigError,
+    FeederEmptyError,
+    ScanError,
+    ScanInterrupted,
+)
 from saneless.pipeline import _SPOOL_LABEL_A, _SPOOL_LABEL_B
 from saneless.scanner.base import (
     DeviceCapabilities,
@@ -51,10 +57,39 @@ from tests.fake_sane import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
-    from types import ModuleType
+    from types import FrameType, ModuleType
 
 # The backend module's own logger, for the tests that read what it reported.
 _BACKEND_LOGGER = "saneless.scanner.sane_backend"
+
+
+@contextlib.contextmanager
+def _signal_raises_scan_interrupted(signum: int) -> Iterator[None]:
+    """
+    Make ``signum`` raise ``ScanInterrupted`` for the block, then restore it.
+
+    The stand-in for the handler a one-shot command installs for SIGTERM and
+    SIGHUP.  The previous handler is put back in a ``finally``, because a
+    raising SIGTERM handler left behind would outlive this test.
+
+    Args:
+        signum: The signal to handle.
+
+    Yields:
+        Nothing; the handler is installed for the block.
+
+    """
+
+    def handler(received: int, _frame: FrameType | None) -> None:
+        msg = f"Interrupted by signal {received}"
+        raise ScanInterrupted(msg, signum=received)
+
+    previous = signal.signal(signum, handler)
+    try:
+        yield
+    finally:
+        signal.signal(signum, previous)
+
 
 # The EXIF orientation tag, set on a page so a test can tell whether any EXIF
 # survived into the file the spool wrote.
@@ -2469,14 +2504,29 @@ class TestSaneBackendCancelSequence:
         assert fake_device.calls == ["start", "snap"]
         assert page_sink.records == ()
 
+    @pytest.mark.parametrize(
+        ("signum", "expected"),
+        [
+            pytest.param(signal.SIGINT, KeyboardInterrupt, id="ctrl-c"),
+            pytest.param(signal.SIGTERM, ScanInterrupted, id="sigterm"),
+        ],
+    )
     def test_keyboard_interrupt_mid_read(
         self,
         sane_backend: SaneBackend,
         fake_device: FakeSaneDev,
         page_sink: SpooledPageSink,
+        signum: signal.Signals,
+        expected: type[BaseException],
     ) -> None:
         """
         D-15: Ctrl-C during a read takes the same device-safe path, then re-raises.
+
+        Parametrised over a SIGTERM that raises ``ScanInterrupted`` as well: a
+        signal that interrupts a one-shot command must leave the device
+        cancelled and settled exactly as Ctrl-C does, and the exception must
+        come back out unchanged so the command can keep the pages already
+        scanned.
 
         This closes the "safe device cancel on Ctrl-C mid-read" Phase 28
         deferred to this phase.  Nothing about the operator-facing behaviour
@@ -2495,15 +2545,20 @@ class TestSaneBackendCancelSequence:
 
         def interrupt_once_the_read_blocks() -> None:
             if fake_device.read_started.wait(_READER_JOIN_SECONDS):
-                signal.raise_signal(signal.SIGINT)
+                signal.raise_signal(signum)
 
         interrupter = threading.Thread(
-            target=interrupt_once_the_read_blocks, name="ctrl-c", daemon=True
+            target=interrupt_once_the_read_blocks, name="interrupter", daemon=True
+        )
+        handling = (
+            _signal_raises_scan_interrupted(signum)
+            if expected is ScanInterrupted
+            else contextlib.nullcontext()
         )
 
-        with sane_backend._open_device(_TEST_DEVICE) as dev:
+        with handling, sane_backend._open_device(_TEST_DEVICE) as dev:
             interrupter.start()
-            with pytest.raises(KeyboardInterrupt):
+            with pytest.raises(expected):
                 sane_backend._scan_adf_pages(
                     dev, page_sink, _uncropped, timeout_per_page=5.0
                 )
@@ -2517,14 +2572,30 @@ class TestSaneBackendCancelSequence:
         assert fake_device.close_while_blocked is False
         assert page_sink.records == ()
 
+    @pytest.mark.parametrize(
+        "interruption",
+        [
+            pytest.param(KeyboardInterrupt(), id="ctrl-c"),
+            pytest.param(
+                ScanInterrupted("Interrupted by SIGTERM", signum=signal.SIGTERM),
+                id="sigterm",
+            ),
+        ],
+    )
     def test_an_interrupt_before_the_reader_starts_wedges_nothing(
         self,
         sane_backend: SaneBackend,
         fake_device: FakeSaneDev,
         monkeypatch: pytest.MonkeyPatch,
+        interruption: BaseException,
     ) -> None:
         """
         WR-05: Ctrl-C landing before the thread exists must not cancel or wedge.
+
+        Parametrised over a signal's ``ScanInterrupted`` too, because the
+        handler that settles the device on Ctrl-C settles it for a signal
+        interruption as well, and must keep the same "no reader, nothing to
+        settle" guard for it.
 
         ``reader.start()`` sits inside the guarded block so that an interrupt
         arriving once the thread exists cannot abandon it uncancelled.  The
@@ -2549,7 +2620,7 @@ class TestSaneBackendCancelSequence:
             def start(self) -> None:
                 """Raise instead of starting, but only for the reader."""
                 if self.name.startswith(reader_prefix):
-                    raise KeyboardInterrupt
+                    raise interruption
                 super().start()
 
         monkeypatch.setattr(
@@ -2562,7 +2633,7 @@ class TestSaneBackendCancelSequence:
         # make cancel_calls 1 for a reason that has nothing to do with this.
         with sane_backend._open_device(_TEST_DEVICE) as dev:
             began = time.monotonic()
-            with pytest.raises(KeyboardInterrupt):
+            with pytest.raises(type(interruption)):
                 sane_backend_mod._acquire_with_timeout(
                     dev, fake_device.snap, sane_backend_mod._page_label(0), 5.0, grace
                 )

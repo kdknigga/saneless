@@ -11,6 +11,7 @@ import logging
 import logging.handlers
 import os
 import re
+import signal
 import socket
 import sqlite3
 import sys
@@ -44,6 +45,7 @@ from saneless.config import (
     discover_config,
 )
 from saneless.exceptions import (
+    AllPagesBlankError,
     ConfigError,
     FeederEmptyError,
     PaperlessError,
@@ -51,6 +53,7 @@ from saneless.exceptions import (
     SanelessError,
     ScanCancelledError,
     ScanError,
+    ScanInterrupted,
     StorageError,
 )
 from saneless.job import Job, JobResult, JobStore
@@ -4609,6 +4612,128 @@ class TestExitCodes:
             lines = lines[1:]
         assert lines == ["Cancelled (interrupted)"]
         assert "Aborted!" not in result.output
+
+    def test_all_pages_blank_exits_8_with_threshold_advice(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        Every page judged blank is its own failure: exit 8, never a scan error.
+
+        The advice line points at the detection threshold, because the scanner
+        did its job; a script can tell this apart from exit 1 (D-10, D-11).
+        """
+        exc = AllPagesBlankError("All pages were blank")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 8
+        lines = _failure_lines(result)
+        assert len(lines) == 1
+        assert lines[0].startswith("Empty-page detection: All pages were blank")
+        assert "empty_page_coverage_threshold" in result.stderr.splitlines()[-1]
+        assert "Scan error" not in result.stderr
+
+    def test_a_classified_failure_line_includes_the_exception_notes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        What ``add_note`` attached reaches stderr, on the one failure line.
+
+        ``str(exc)`` drops notes, and a preserved scan says where its pages
+        went in one; printing the bare message would hide the file.
+        """
+        exc = ScanError("jam")
+        exc.add_note("The 3 page(s) were preserved at /d/x.pdf")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 1
+        assert _failure_lines(result) == [
+            "Scan error: jam. The 3 page(s) were preserved at /d/x.pdf"
+        ]
+
+    def test_an_unexpected_error_line_includes_the_exception_notes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A foreign exception's notes reach its ``Unexpected error`` line too."""
+        exc = RuntimeError("boom")
+        exc.add_note("The 3 page(s) were preserved at /d/x.pdf")
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+        monkeypatch.setattr("saneless.cli.configure_logging", lambda *_a, **_kw: False)
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 5
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith(
+            "Unexpected error (RuntimeError): boom. "
+            "The 3 page(s) were preserved at /d/x.pdf"
+        )
+
+    @pytest.mark.parametrize(
+        ("signum", "code"),
+        [
+            pytest.param(signal.SIGHUP, 129, id="sighup"),
+            pytest.param(signal.SIGTERM, 143, id="sigterm"),
+        ],
+    )
+    def test_a_signal_interruption_exits_128_plus_the_signal(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        signum: signal.Signals,
+        code: int,
+    ) -> None:
+        """
+        SIGHUP or SIGTERM is an interruption, not a cancel: 129 or 143 (D-12, D-13).
+
+        One ``Interrupted:`` line, never the cancel's 130, because the pages
+        already scanned are kept rather than discarded.
+        """
+        exc = ScanInterrupted(f"Interrupted by {signum.name}", signum=signum)
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(exc),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == code
+        lines = result.stderr.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith("Interrupted: ")
+        assert "Traceback" not in result.output
+
+    def test_keyboard_interrupt_still_exits_130_beside_the_signal_codes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Ctrl-C stays a deliberate cancel that keeps nothing: exit 130 (D-12)."""
+        runner, _ = _patch_cli(
+            monkeypatch,
+            settings=_tmp_settings(tmp_path),
+            scanner_cls=_raising_scanner(KeyboardInterrupt()),
+        )
+
+        result = runner.invoke(cli, ["scan"])
+
+        assert result.exit_code == 130
+        assert result.stderr.splitlines() == ["Cancelled (interrupted)"]
 
     def test_unexpected_error_exits_5_naming_the_log_file(
         self,

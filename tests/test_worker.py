@@ -32,6 +32,7 @@ from saneless.config import (
     discover_config,
 )
 from saneless.exceptions import (
+    AllPagesBlankError,
     ConfigError,
     FeederEmptyError,
     PaperlessError,
@@ -1136,6 +1137,72 @@ class TestWorkerErrorCategories:
             worker.stop()
             fetched = _get(store, job.id)
             assert fetched.error_category == ErrorCategory.UNKNOWN
+        finally:
+            store.close()
+
+    def test_all_pages_blank_error_category(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """AllPagesBlankError sets ErrorCategory.ALL_BLANK, never SCANNER (D-10)."""
+
+        def failing(*_a: object, **_k: object) -> ScanResult:
+            msg = "All pages were blank"
+            raise AllPagesBlankError(msg)
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Blank Test")
+            worker.submit(job)
+            wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+            fetched = _get(store, job.id)
+            assert fetched.error_category is ErrorCategory.ALL_BLANK
+        finally:
+            store.close()
+
+    def test_job_error_includes_the_exception_notes(
+        self,
+        mock_scanner: MagicMock,
+        mock_paperless: MagicMock,
+        default_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_for_state: Callable[..., Job],
+    ) -> None:
+        """
+        What ``add_note`` attached reaches ``job.error``.
+
+        ``str(exc)`` drops notes, and a preserved scan says where its pages
+        went in one, so the job record would otherwise lose the path.
+        """
+
+        def failing(*_a: object, **_k: object) -> ScanResult:
+            exc = ScanError("Scanner jam")
+            exc.add_note("The 3 page(s) were preserved at /d/x.pdf")
+            raise exc
+
+        monkeypatch.setattr("saneless.worker.run_pipeline", failing)
+        store = JobStore()
+        try:
+            worker = ScanWorker(mock_scanner, mock_paperless, default_settings, store)
+            worker.start()
+            job = store.create_job("default", "Note Test")
+            worker.submit(job)
+            wait_for_state(store, job.id, TERMINAL_STATES)
+            worker.stop()
+            fetched = _get(store, job.id)
+            assert fetched.state is JobState.ERROR
+            assert fetched.error == (
+                "Scanner jam. The 3 page(s) were preserved at /d/x.pdf"
+            )
+            assert fetched.error_category is ErrorCategory.SCANNER
         finally:
             store.close()
 

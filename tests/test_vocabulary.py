@@ -7,6 +7,7 @@ Covers requirements: CTR-01, CTR-02, CTR-05, ROBU-01, ROBU-02, ROBU-08.
 from __future__ import annotations
 
 import json
+import signal
 import time
 from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta, timezone
@@ -16,6 +17,7 @@ import pytest
 
 import saneless.job
 from saneless.exceptions import (
+    AllPagesBlankError,
     ConfigError,
     FeederEmptyError,
     PaperlessError,
@@ -61,6 +63,7 @@ from saneless.vocabulary import (
     error_next_step,
     exit_code_for,
     exit_code_for_outcome,
+    exit_code_for_signal,
     flip_answer_label,
     job_label,
     job_state_for,
@@ -106,7 +109,9 @@ class TestErrorCategoryMembers:
         ErrorCategory names are the documented categories (CTR-05, D-06).
 
         The documented categories include REJECTED for a submit that never
-        ran (D-06) and ASSEMBLY for a PDF that could not be built (D-04).
+        ran (D-06), ASSEMBLY for a PDF that could not be built (D-04) and
+        ALL_BLANK for a scan whose every page empty-page detection judged
+        blank, which is not a scanner fault.
         Compared as a set: declaration order is not part of any contract, and
         pinning it would fail a harmless reordering.
         """
@@ -118,6 +123,7 @@ class TestErrorCategoryMembers:
             "UNKNOWN",
             "REJECTED",
             "ASSEMBLY",
+            "ALL_BLANK",
         }
 
     @pytest.mark.parametrize("category", list(ErrorCategory))
@@ -461,6 +467,21 @@ class TestErrorAdvice:
         assert error_message(ErrorCategory.ASSEMBLY) == (
             "The scanned pages could not be assembled into a PDF."
         )
+
+    def test_all_blank_advice_names_the_threshold_not_the_scanner(self) -> None:
+        """
+        An all-blank scan is advised to tune detection, not to check the scanner.
+
+        The scanner worked: it returned pages, and empty-page detection judged
+        every one of them blank.  The advice names the setting to lower and
+        the way to turn detection off, and never sends the reader to a
+        scanner that did nothing wrong.
+        """
+        advice = error_advice(ErrorCategory.ALL_BLANK)
+        assert "empty_page_coverage_threshold" in advice.next_step
+        assert "off" in advice.next_step
+        assert "scanner" not in advice.message.lower()
+        assert "scanner" not in advice.next_step.lower()
 
     def test_rejected_error_message(self) -> None:
         """REJECTED explains that the scan never started (D-05, D-06)."""
@@ -1352,6 +1373,10 @@ class TestClassifyError:
         """
         assert classify_error(ScanCancelledError("stopped")) is ErrorCategory.UNKNOWN
 
+    def test_all_pages_blank_error_is_all_blank(self) -> None:
+        """AllPagesBlankError classifies as ALL_BLANK, never SCANNER (D-10)."""
+        assert classify_error(AllPagesBlankError("x")) is ErrorCategory.ALL_BLANK
+
     def test_classify_error_storage_error_is_unknown(self) -> None:
         """
         StorageError stays UNKNOWN; its exit code 2 is assigned by type (D-07).
@@ -1372,6 +1397,7 @@ _EXIT_CODES_FOR_CATEGORIES: list[tuple[ErrorCategory, ExitCode]] = [
     (ErrorCategory.ASSEMBLY, ExitCode.PDF),
     (ErrorCategory.UNKNOWN, ExitCode.UNEXPECTED),
     (ErrorCategory.REJECTED, ExitCode.UNEXPECTED),
+    (ErrorCategory.ALL_BLANK, ExitCode.ALL_BLANK),
 ]
 
 
@@ -1379,7 +1405,13 @@ class TestExitCode:
     """ExitCode definition and exit_code_for mapping tests."""
 
     def test_exit_code_members_and_values(self) -> None:
-        """ExitCode is the one definition of the CLI exit codes (EXC-02, D-07)."""
+        """
+        ExitCode is the one definition of the CLI exit codes (EXC-02, D-07).
+
+        Rewritten when the all-blank failure (8) and the two signal
+        interruptions (129 for SIGHUP, 143 for SIGTERM) joined the enum, so
+        the pinned set lists all twelve members.
+        """
         assert {(member.name, int(member)) for member in ExitCode} == {
             ("SUCCESS", 0),
             ("SCAN", 1),
@@ -1389,18 +1421,47 @@ class TestExitCode:
             ("UNEXPECTED", 5),
             ("SAVED_TO_FOLDER", 6),
             ("UPLOADED_WITH_WARNING", 7),
+            ("ALL_BLANK", 8),
+            ("HANGUP", 129),
             ("CANCELLED", 130),
+            ("TERMINATED", 143),
         }
 
-    def test_exit_code_cancelled_stays_last(self) -> None:
+    def test_exit_code_members_are_declared_in_ascending_value_order(self) -> None:
         """
-        The delivered-but-degraded codes sit below 130, which stays last.
+        The enum lists its codes in value order, as every table pinned to it does.
 
-        130 is the shell's SIGINT convention rather than a saneless choice, so
-        every code saneless picks for itself is a small integer that comes
-        before it, in the enum and in every table pinned to the enum.
+        This replaces a test that pinned 130 as the last member.  That held
+        while 130 was the only shell-convention code; SIGTERM's 143 (128 + 15)
+        now follows it, so the lasting rule is value order: saneless's own
+        small codes first, then 129, 130 and 143.
         """
-        assert list(ExitCode)[-1] is ExitCode.CANCELLED
+        values = [int(member) for member in ExitCode]
+        assert values == sorted(values)
+
+
+class TestExitCodeForSignal:
+    """exit_code_for_signal maps an interrupting signal to 128 + its number."""
+
+    def test_sighup_is_hangup(self) -> None:
+        """A dropped SSH session's SIGHUP exits 129 (D-13)."""
+        assert exit_code_for_signal(signal.SIGHUP) is ExitCode.HANGUP
+        assert int(ExitCode.HANGUP) == 128 + signal.SIGHUP
+
+    def test_sigterm_is_terminated(self) -> None:
+        """A SIGTERM exits 143 (D-13)."""
+        assert exit_code_for_signal(signal.SIGTERM) is ExitCode.TERMINATED
+        assert int(ExitCode.TERMINATED) == 128 + signal.SIGTERM
+
+    @pytest.mark.parametrize("signum", [None, signal.SIGUSR1])
+    def test_anything_else_is_unexpected(self, signum: int | None) -> None:
+        """
+        A signal saneless installs no handler for cannot legitimately get here.
+
+        ``None`` is the server stopping, which the CLI never sees; any other
+        signal would be a bug, so it exits as one.
+        """
+        assert exit_code_for_signal(signum) is ExitCode.UNEXPECTED
 
     def test_exit_code_table_covers_every_category(self) -> None:
         """The pinned mapping table names every ErrorCategory member (D-07)."""
