@@ -323,6 +323,39 @@ class TestTheMostFinishedArtefactIsKept:
         assert earlier.read_bytes() == b"an earlier scan"
         assert embedded_streams(kept) == _streams_of(records)
 
+    def test_a_part_way_pass_b_says_which_sheets_its_backs_are(
+        self, tmp_path: Path
+    ) -> None:
+        """
+        Two backs of five fronts are sheets 4 and 5, not sheets 1 and 2.
+
+        Pass B feeds the flipped stack from its last sheet, so when it stops
+        part way its reversed PDF starts at the back of fronts page 4, and an
+        operator pairing the halves by page number needs telling.
+        """
+        artefacts = _artefacts(tmp_path, RunStage.ACQUIRING)
+        fronts = _spool(artefacts.spool_dir, "a", 5)
+        backs = _spool(artefacts.spool_dir, "b", 2, first=5)
+        artefacts.passes = [(FRONTS_SUFFIX, fronts), (BACKS_SUFFIX, backs)]
+
+        report = preserve_most_finished(artefacts)
+
+        sentence = report.sentence()
+        assert sentence is not None
+        assert "the backs of the last 2 of the 5 sheets" in sentence
+        assert f"{BACKS_SUFFIX} page 1 goes with {FRONTS_SUFFIX} page 4" in sentence
+
+    def test_a_whole_pass_b_needs_no_pairing_caution(self, tmp_path: Path) -> None:
+        """As many backs as fronts: nothing to explain."""
+        artefacts = _artefacts(tmp_path, RunStage.ACQUIRING)
+        fronts = _spool(artefacts.spool_dir, "a", 2)
+        backs = _spool(artefacts.spool_dir, "b", 2, first=2)
+        artefacts.passes = [(FRONTS_SUFFIX, fronts), (BACKS_SUFFIX, backs)]
+
+        report = preserve_most_finished(artefacts)
+
+        assert report.cautions == []
+
     def test_mid_acquisition_an_empty_pass_is_left_out(self, tmp_path: Path) -> None:
         """A pass that spooled nothing yields no zero-page PDF."""
         artefacts = _artefacts(tmp_path, RunStage.ACQUIRING)

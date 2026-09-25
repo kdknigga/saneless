@@ -1705,8 +1705,10 @@ class _PipelineRun:
         Instead of discarding scanned data, fronts and backs are assembled into
         separate PDFs and both are uploaded for manual review.  The ``(backs)``
         PDF is in sheet order, the reverse of the order pass B produced its
-        pages, so when nothing was skipped its page N is the back of the
-        ``(fronts)`` PDF's page N.
+        pages.  Its page N is the back of the ``(fronts)`` PDF's page N only
+        when both passes fed every sheet exactly once, which a mismatch says
+        they did not: from the sheet that was skipped, missed or fed twice on,
+        the two halves drift apart, which is why they are not interleaved.
 
         The two halves are one document between them, so a failure on either
         keeps both: an assembly failure keeps every page file of both passes,

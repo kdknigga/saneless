@@ -636,7 +636,11 @@ def build_pass_pdf(
 
     Pass B runs over the flipped stack, so it scans the last sheet's back
     first. A ``(backs)`` pass is therefore reversed here, so the PDF runs in
-    sheet order: its page N is the back of the ``(fronts)`` PDF's page N.
+    sheet order. When pass B fed the whole stack and no sheet was skipped,
+    its page N is the back of the ``(fronts)`` PDF's page N. A pass B that
+    stopped part way fed only the last sheets of the stack, so with ``k``
+    backs of ``n`` fronts its page 1 is the back of fronts page ``n - k + 1``;
+    ``_keep_passes`` says so in the report.
 
     Nothing is blank-filtered: an anomaly is kept whole for a person to look
     at.
@@ -795,6 +799,19 @@ def _keep_passes(artefacts: RunArtefacts, report: PreservationReport) -> bool:
     except Exception as exc:
         _record_problem(report, "keeping the scanned passes as PDFs", exc)
         complete = False
+    fronts = next(
+        (records for suffix, records in passes if suffix == FRONTS_SUFFIX), ()
+    )
+    backs = next((records for suffix, records in passes if suffix == BACKS_SUFFIX), ())
+    if complete and len(backs) < len(fronts) and backs:
+        # Only a pass B that stopped part way leaves fewer backs than fronts
+        # here, and it fed the stack from its last sheet.
+        report.cautions.append(
+            f"Pass B feeds the stack from its last sheet, so the {len(backs)} "
+            f"{BACKS_SUFFIX} page(s) are the backs of the last {len(backs)} of "
+            f"the {len(fronts)} sheets: {BACKS_SUFFIX} page 1 goes with "
+            f"{FRONTS_SUFFIX} page {len(fronts) - len(backs) + 1}"
+        )
     if kept:
         out_of = total if pages < total else None
         report.groups.append(KeptGroup(KeptKind.PASSES, tuple(kept), pages, out_of))
