@@ -18,12 +18,15 @@ from typing import TYPE_CHECKING, TypedDict, Unpack
 import pytest
 
 from saneless.config import OutputConfig, PaperlessConfig
-from saneless.exceptions import PaperlessError, PdfError
+from saneless.exceptions import PaperlessError, PdfError, describe, failure_text
 from saneless.job import Job, JobStore
-from saneless.pipeline import (
-    _preservation_failure_message,
-    _preserving,
-    _preserving_page_files,
+from saneless.preservation import (
+    KeptGroup,
+    KeptKind,
+    PreservationReport,
+    RunArtefacts,
+    RunStage,
+    preserve_most_finished,
 )
 from saneless.vocabulary import (
     HIDDEN_ERROR_DETAIL,
@@ -273,9 +276,54 @@ def test_preserved_error_relativised_for_owner_hidden_for_others(
     assert other.error_category is ErrorCategory.UPLOAD
 
 
-def _stored_error(raised: pytest.ExceptionInfo[Exception]) -> str:
-    """Return the text a job stores for the exception a pipeline guard raised."""
-    return str(raised.value)
+def _stored_error(exc: Exception, report: PreservationReport) -> str:
+    """
+    Return the text a job stores for a failure the run guard preserved around.
+
+    The run guard attaches the report's sentence to the failure as a note,
+    and the worker stores ``failure_text``, which is the message and every
+    note on one line.
+
+    Args:
+        exc: The run's failure.
+        report: What the preservation kept.
+
+    Returns:
+        The job's error text.
+
+    """
+    sentence = report.sentence()
+    if sentence is not None:
+        exc.add_note(sentence)
+    return failure_text(exc)
+
+
+def _artefacts(settings: Settings, tmp_path: Path, stage: RunStage) -> RunArtefacts:
+    """
+    Describe a run that failed at ``stage``, with a workspace under ``tmp_path``.
+
+    Args:
+        settings: The settings whose ``failed/`` the preservation fills.
+        tmp_path: pytest's per-test directory.
+        stage: How far the run got.
+
+    Returns:
+        The run's artefacts, with an empty spool.
+
+    """
+    workspace = tmp_path / "workspace"
+    spool = workspace / "spool"
+    spool.mkdir(parents=True)
+    return RunArtefacts(
+        job_id="job-1",
+        title="tax",
+        workspace=workspace,
+        spool_dir=spool,
+        failed_dir=settings.output.failed_dir,
+        reserve_mb=0,
+        dpi=300,
+        stage=stage,
+    )
 
 
 def test_nothing_preserved_is_never_reported_kept(
@@ -283,19 +331,22 @@ def test_nothing_preserved_is_never_reported_kept(
 ) -> None:
     """A preservation that kept nothing does not tell anyone the scan is safe."""
     failed_dir = settings.output.failed_dir
+    report = PreservationReport(
+        failed_dir=failed_dir,
+        problems=[
+            "moving the assembled PDF(s) failed: "
+            + describe(OSError(28, "No space left on device"))
+        ],
+    )
     job = _job(
         state=JobState.ERROR,
         error_category=ErrorCategory.UPLOAD,
-        error=_preservation_failure_message(
-            PaperlessError("Upload failed"),
-            OSError(28, "No space left on device"),
-            failed_dir,
-            [],
-        ),
+        error=_stored_error(PaperlessError("Upload failed"), report),
     )
 
     other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
 
+    assert "could NOT be preserved" in (job.error or "")
     assert other.error == HIDDEN_ERROR_DETAIL
 
 
@@ -306,16 +357,23 @@ def test_nothing_preserved_naming_a_file_under_failed_is_not_kept(
     failed_dir = settings.output.failed_dir
     target = failed_dir / "20260301-job-1-tax.pdf"
     page_dir = failed_dir / "20260301-job-1-tax"
-    for destination, failure in (
-        (failed_dir, OSError(28, "No space left on device", str(target))),
-        (page_dir, OSError(28, "No space left on device")),
+    for what, failure in (
+        (
+            "moving the assembled PDF(s)",
+            OSError(28, "No space left on device", str(target)),
+        ),
+        (
+            f"moving the page files into {page_dir}",
+            OSError(28, "No space left on device"),
+        ),
     ):
+        report = PreservationReport(
+            failed_dir=failed_dir, problems=[f"{what} failed: {describe(failure)}"]
+        )
         job = _job(
             state=JobState.ERROR,
             error_category=ErrorCategory.ASSEMBLY,
-            error=_preservation_failure_message(
-                PdfError("Assembly failed"), failure, destination, []
-            ),
+            error=_stored_error(PdfError("Assembly failed"), report),
         )
 
         other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
@@ -326,41 +384,43 @@ def test_nothing_preserved_naming_a_file_under_failed_is_not_kept(
 def test_partly_preserved_is_reported_kept(settings: Settings, tmp_path: Path) -> None:
     """A preservation that kept some of the scan says something was kept."""
     failed_dir = settings.output.failed_dir
+    report = PreservationReport(
+        failed_dir=failed_dir,
+        groups=[KeptGroup(KeptKind.ASSEMBLED, (failed_dir / "front.pdf",), 1, 2)],
+        problems=[
+            "moving the assembled PDF(s) failed: "
+            + describe(OSError(28, "No space left on device"))
+        ],
+    )
     job = _job(
         state=JobState.ERROR,
         error_category=ErrorCategory.UPLOAD,
-        error=_preservation_failure_message(
-            PaperlessError("Upload failed"),
-            OSError(28, "No space left on device"),
-            failed_dir,
-            [failed_dir / "front.pdf"],
-        ),
+        error=_stored_error(PaperlessError("Upload failed"), report),
     )
 
     other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
 
+    assert "could NOT" not in (job.error or "")
     assert other.error == HIDDEN_PRESERVED_ERROR
 
 
 def test_preserved_pdf_is_reported_kept(settings: Settings, tmp_path: Path) -> None:
     """The message a kept PDF produces tells everyone the scan was kept."""
-    pdf = tmp_path / "scratch-pdf" / "tax.pdf"
-    pdf.parent.mkdir()
+    artefacts = _artefacts(settings, tmp_path, RunStage.DELIVERING)
+    pdf = artefacts.workspace / "tax.pdf"
     pdf.write_bytes(b"%PDF-1.7\n")
-    upload_failed = "Upload failed"
-    with (
-        pytest.raises(PaperlessError) as raised,
-        _preserving([pdf], settings.output.failed_dir),
-    ):
-        raise PaperlessError(upload_failed)
+    artefacts.pdfs = [pdf]
+
+    report = preserve_most_finished(artefacts)
     job = _job(
         state=JobState.ERROR,
         error_category=ErrorCategory.UPLOAD,
-        error=_stored_error(raised),
+        error=_stored_error(PaperlessError("Upload failed"), report),
     )
 
     other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
 
+    assert report.kind is KeptKind.ASSEMBLED
     assert other.error == HIDDEN_PRESERVED_ERROR
 
 
@@ -368,24 +428,19 @@ def test_preserved_page_files_are_reported_kept(
     settings: Settings, tmp_path: Path
 ) -> None:
     """Kept page files also count as a kept scan, in wording true of both."""
-    spool = tmp_path / "spool"
-    spool.mkdir()
-    (spool / "page-0001.pnm").write_bytes(b"P5\n")
-    destination = settings.output.failed_dir / "20260301-job-1-tax"
-    assembly_failed = "Assembly failed"
-    with (
-        pytest.raises(PdfError) as raised,
-        _preserving_page_files(spool, destination),
-    ):
-        raise PdfError(assembly_failed)
+    artefacts = _artefacts(settings, tmp_path, RunStage.ASSEMBLING)
+    (artefacts.spool_dir / "a-0001.png").write_bytes(b"not really a page")
+
+    report = preserve_most_finished(artefacts)
     job = _job(
         state=JobState.ERROR,
         error_category=ErrorCategory.ASSEMBLY,
-        error=_stored_error(raised),
+        error=_stored_error(PdfError("Assembly failed"), report),
     )
 
     other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
 
+    assert report.kind is KeptKind.PAGE_FILES
     assert other.error == HIDDEN_PRESERVED_ERROR
     assert "PDF" not in HIDDEN_PRESERVED_ERROR
 

@@ -28,11 +28,12 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import pytest
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from saneless.cli import cli
 from saneless.config import (
@@ -42,6 +43,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
+from saneless.paperless import PaperlessClient
 from saneless.vocabulary import TERMINAL_STATES, JobState
 from saneless.web.app import create_app
 from tests.conftest import wait_for_state
@@ -680,3 +682,78 @@ def test_cli_fallback_with_a_skipped_sheet_exits_6(
     assert _CONSUME_FOLDER_SENTENCE in warned
     assert _SKIPPED_SHEET in warned
     assert len(run.consumed) == 1
+
+
+def _blank_page(_index: int) -> Image.Image:
+    """
+    Stand in for ``distinct_page``: a sheet with nothing on it.
+
+    Args:
+        _index: Ignored; every blank sheet is the same.
+
+    Returns:
+        A white page the size of a distinct one.
+
+    """
+    return Image.new("RGB", (120, 160), "white")
+
+
+def test_cli_all_blank_scan_keeps_a_pdf_and_exits_8(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Every page judged blank: nothing uploaded, the pages kept as one PDF, exit 8.
+
+    The scanner feeds three blank sheets.  Empty-page detection removes all
+    of them, which is its own failure rather than a scanner fault: the advice
+    is to tune the detection, and the unfiltered pages are in ``failed/``.
+    """
+    monkeypatch.setattr("tests.golden_support.distinct_page", _blank_page)
+
+    run = _run_cli(tmp_path, monkeypatch, _SIMPLEX_RUN)
+
+    assert run.result.exit_code == 8, run.result.output
+    kept = sorted((tmp_path / "data" / "failed").glob("*.pdf"))
+    assert len(kept) == 1
+    lines = run.result.stderr.splitlines()
+    assert lines[0].startswith("Empty-page detection: ")
+    assert f"preserved at {kept[0]}" in lines[0]
+    assert lines[1].startswith("Try: ")
+    assert "empty_page_coverage_threshold" in lines[1]
+    assert run.recorder.uploads() == []
+    assert run.scratch == []
+
+
+def test_cli_coding_error_in_the_upload_exits_5_with_the_pdf_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A bug in saneless's own upload code is an unexpected error, not paperless-ngx's.
+
+    The ``TypeError`` keeps its type all the way out, so the command exits 5
+    and says ``Unexpected error (TypeError)``, and the assembled PDF is kept
+    and named on that line.  It used to be re-raised as a ``PaperlessError``
+    and exit 3, blaming a server that was never reached.
+    """
+
+    def broken_upload(*_args: object, **_kwargs: object) -> NoReturn:
+        """Fail the way a call with the wrong arguments fails."""
+        msg = "upload_document() got an unexpected keyword argument 'tittle'"
+        raise TypeError(msg)
+
+    monkeypatch.setattr(PaperlessClient, "upload_document", broken_upload)
+
+    run = _run_cli(tmp_path, monkeypatch, _SIMPLEX_RUN)
+
+    assert run.result.exit_code == 5, run.result.output
+    kept = sorted((tmp_path / "data" / "failed").glob("*.pdf"))
+    assert len(kept) == 1
+    unexpected = [
+        line
+        for line in run.result.stderr.splitlines()
+        if line.startswith("Unexpected error (TypeError): ")
+    ]
+    assert len(unexpected) == 1
+    assert f"preserved at {kept[0]}" in unexpected[0]
+    assert run.recorder.uploads() == []
+    assert run.scratch == []

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -235,20 +236,20 @@ class TestSpooledPageSinkThumbnail:
         assert len(sink.records) == 2
 
     def test_a_raising_thumbnail_callback_still_records_the_page(
-        self, tmp_path: Path
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """
-        A failed thumbnail cannot unsee a page that is already on disk (WR-01).
+        A failed thumbnail is logged, and the page and the pass carry on (WR-01).
 
-        The callback is deliberately not wrapped -- a blank thumbnail strip is
-        a silence this project does not want -- but the record has to be
-        appended before it fires.  The web worker's callback writes to the job
-        store, which raises ``sqlite3.Error`` on a locked or closed database,
-        and the page it was describing is a sheet that really was fed.  With
-        the record appended afterwards, ``page_count()`` answered 0 and the
-        partial-scan guard took its "nothing reached the spool" branch, so the
-        workspace deleted the sheet on its way out.
+        The web worker's callback writes to the job store, which raises
+        ``sqlite3.Error`` on a locked or closed database; the page it was
+        describing is a sheet that really was fed.  The thumbnail is something
+        to look at, not part of the scan, so its failure is logged at WARNING
+        with the traceback and ``add`` returns the page's record as usual.
 
+        This test used to pin the opposite: the callback went unguarded, and
+        the only protection was that the record was appended before it fired.
+        The callback is now best-effort, and the record still comes first.
         The assertion on the file, not only on the record, is the part that
         matters: what is being pinned is that the two agree.
         """
@@ -261,14 +262,24 @@ class TestSpooledPageSinkThumbnail:
 
         sink = SpooledPageSink(tmp_path, "a", 10, explode)
 
-        with pytest.raises(OSError, match="the job store was closed"):
+        with caplog.at_level(logging.WARNING, logger="saneless.spool"):
+            record = sink.add(_inked_page())
             sink.add(_inked_page())
 
         assert len(thumbnails) == 1
-        assert len(sink.records) == 1
-        assert sink.records[0].sequence == 1
-        assert sink.records[0].path == tmp_path / "a-0001.png"
-        assert sink.records[0].path.stat().st_size > 0
+        assert len(sink.records) == 2
+        assert record == sink.records[0]
+        assert record.sequence == 1
+        assert record.path == tmp_path / "a-0001.png"
+        assert record.path.stat().st_size > 0
+        warnings = [
+            entry
+            for entry in caplog.records
+            if entry.name == "saneless.spool" and entry.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].exc_info is not None
+        assert "the job store was closed" in str(warnings[0].exc_info[1])
 
 
 class TestSpooledPageSinkFailures:

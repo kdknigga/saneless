@@ -69,11 +69,13 @@ class TestHierarchy:
     )
     def test_single_message_constructor(self, exc_type: type[Exception]) -> None:
         """
-        Each new type rebuilds from one message (Pitfall 9).
+        Each new type builds from one message (Pitfall 9).
 
-        ``pipeline._preserving`` re-raises ``type(exc)(message)``, so a type
-        that grew a required constructor argument would turn a clean re-raise
-        into a TypeError.
+        The pipeline no longer rebuilds an exception to re-raise it -- its run
+        guard adds a note to the original -- but every saneless type is still
+        raised from a single message across the codebase, so a type that grew
+        a required constructor argument would turn those raises into a
+        TypeError.
         """
         rebuilt = exc_type("rebuilt")
         assert str(rebuilt) == "rebuilt"
