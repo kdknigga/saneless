@@ -57,8 +57,9 @@ What the common cases mean:
 - **The flip prompt failed.** Reading your answer failed while `saneless scan` was asking you to
   flip the stack, for example with an I/O error or input that could not be decoded. The cause is
   logged with its traceback, and the fronts are kept the same way a flip timeout keeps them. End
-  of input is not a failure: Ctrl-D, or a terminal that closes, at the prompt cancels the scan
-  (exit 130).
+  of input is not a failure: Ctrl-D at the prompt cancels the scan (exit 130). A terminal or SSH
+  session that closes at the prompt is not a cancel either: it is an interruption that keeps the
+  fronts (exit 129).
 - **The scan stopped part-way through the stack.** The scanner failed after some sheets had
   already been fed -- a jam, a misfeed, a page that took too long, or the working directory
   running out of room. Those sheets are not lost. saneless assembles them into a PDF under
