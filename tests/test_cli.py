@@ -2583,6 +2583,80 @@ class TestJobsCommand:
         assert "error" in row
         assert row["error"] is None
 
+    def test_jobs_json_appends_the_counts_and_removed_positions(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """
+        The three counts and the removed positions follow every existing key.
+
+        Appended, so a script reading the old keys -- in their old order --
+        is unaffected.  The positions are 1-based scanned-page numbers, and
+        mean nothing without the scanned count beside them.
+        """
+        settings = self._settings_for(tmp_path)
+        store = JobStore(db_path=settings.output.db_path)
+        job = store.create_job(profile="default", title="Blank backs")
+        store.finish_job(
+            job.id,
+            JobState.DONE,
+            result=JobResult(
+                outcome=ScanOutcome.SUCCESS,
+                warning=None,
+                pages_scanned=4,
+                pages_removed=2,
+                pages_uploaded=2,
+                removed_positions=(2, 4),
+            ),
+        )
+        store.close()
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        assert list(row) == [
+            "id",
+            "profile",
+            "title",
+            "state",
+            "created_at",
+            "outcome",
+            "warning",
+            "error",
+            "pages_scanned",
+            "pages_removed",
+            "pages_uploaded",
+            "pages_removed_positions",
+        ]
+        assert row["pages_scanned"] == 4
+        assert row["pages_removed"] == 2
+        assert row["pages_uploaded"] == 2
+        assert row["pages_removed_positions"] == [2, 4]
+        # Information, never a warning: a DONE with blank backs stays plain.
+        assert row["warning"] is None
+
+    def test_jobs_json_counts_and_positions_are_null_when_never_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A job that counted nothing carries ``null`` for all four, not 0 or []."""
+        settings = self._settings_for(tmp_path)
+        self._populate_store(settings.output.db_path, count=1)
+        runner, _ = _patch_cli(monkeypatch, settings=settings)
+
+        result = runner.invoke(cli, ["jobs", "--json"])
+
+        assert result.exit_code == 0, result.output
+        (row,) = json.loads(result.output)
+        for key in (
+            "pages_scanned",
+            "pages_removed",
+            "pages_uploaded",
+            "pages_removed_positions",
+        ):
+            assert key in row
+            assert row[key] is None, key
+
     def test_jobs_data_dir_is_created_private(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

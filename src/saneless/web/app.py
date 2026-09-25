@@ -35,6 +35,7 @@ from saneless.vocabulary import (
     outcome_line,
     page_counts,
     progress_label,
+    removed_pages,
 )
 from saneless.worker import STOP_JOIN_SECONDS, ScanWorker
 
@@ -115,6 +116,10 @@ def _build_templates() -> Jinja2Templates:
     templates.env.filters["error_next_step"] = error_next_step
     templates.env.filters["local_time"] = local_time
     templates.env.filters["page_counts"] = page_counts
+    # Beside the counts it explains.  An informational note, so the templates
+    # render it in the muted page-counts style and never through job.warning,
+    # which would turn a plain DONE amber.
+    templates.env.filters["removed_pages"] = removed_pages
     # Jinja2 3.1.6 builds `Environment.globals` from the unannotated
     # `DEFAULT_NAMESPACE` dict, so a checker infers its value type as the union of
     # the six built-in helpers instead of the `MutableMapping[str, Any]` namespace

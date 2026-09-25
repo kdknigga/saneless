@@ -101,7 +101,11 @@ saneless jobs --json --limit 5
     "created_at": "2026-03-22T14:30:00+00:00",
     "outcome": "SUCCESS",
     "warning": null,
-    "error": null
+    "error": null,
+    "pages_scanned": 4,
+    "pages_removed": 2,
+    "pages_uploaded": 2,
+    "pages_removed_positions": [2, 4]
   }
 ]
 ```
@@ -131,6 +135,22 @@ server and the paperless-ngx URL. The web page shows the same failure only as a 
 no paths in it, which points here: `saneless jobs --json` is where to find
 where a failed scan's PDF was kept. `error` was added after the other keys, so
 a script that reads only those is unaffected.
+
+`pages_scanned`, `pages_removed` and `pages_uploaded` are the page counts the
+web page shows under a finished scan: how many pages the scanner produced, how
+many were removed as blank, and how many went to paperless-ngx.
+`pages_removed_positions` lists the pages that were removed as blank, by
+their scanned page number in document order, so `[2, 4]` with
+`pages_scanned` 4 means the second and fourth scanned pages. For a duplex scan
+that is the page number in the interleaved document. Removed pages are not
+kept, so these numbers are how you find the sheets to rescan if a real page
+was taken for a blank one. The list is information, not a warning: a `DONE`
+job that removed blank pages keeps `"warning": null`.
+
+All four are `null` when the job never recorded them: a failed, cancelled or
+refused job, or one that ran before saneless recorded them. A measured zero is
+`0` and an empty list is `[]`, never `null`. The four keys come after all
+the others, so a script that reads only the earlier keys is unaffected.
 
 ## Exit codes
 

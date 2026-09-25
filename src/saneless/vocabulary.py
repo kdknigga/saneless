@@ -24,9 +24,10 @@ from saneless.exceptions import (
 )
 
 if TYPE_CHECKING:
-    # Annotation-only, so the leaf rule is untouched either way -- ``datetime``
-    # is stdlib and importing it would not make this module depend on a
+    # Annotation-only, so the leaf rule is untouched either way -- both are
+    # stdlib and importing them would not make this module depend on a
     # consumer.
+    from collections.abc import Sequence
     from datetime import datetime
 
 __all__ = [
@@ -59,6 +60,7 @@ __all__ = [
     "PageCounted",
     "PaperSize",
     "ProfileStorage",
+    "RemovedPagesNoted",
     "RequestRejection",
     "ScanOutcome",
     "SubmitResult",
@@ -81,6 +83,8 @@ __all__ = [
     "progress_label",
     "rejection_message",
     "rejection_status_code",
+    "removed_pages",
+    "removed_pages_note",
     "state_label",
     "worker_health_detail",
 ]
@@ -182,6 +186,24 @@ class PageCounted(Protocol):
     @property
     def pages_uploaded(self) -> int | None:
         """Pages sent to paperless-ngx, or None if nothing counted them."""
+
+
+class RemovedPagesNoted(Protocol):
+    """
+    Anything carrying the positions of the pages removed as blank.
+
+    It exists for the same reason ``PageCounted`` does: this leaf module formats
+    the note without importing ``job.py``.  ``Job``, ``JobResult`` and the web
+    layer's ``JobView`` satisfy it structurally.
+    """
+
+    @property
+    def removed_positions(self) -> tuple[int, ...] | None:
+        """The 1-based scanned page numbers removed, or None if not recorded."""
+
+    @property
+    def pages_scanned(self) -> int | None:
+        """Pages the scanner produced, or None if nothing counted them."""
 
 
 class ProfileStorage(StrEnum):
@@ -866,6 +888,55 @@ def page_counts(job: PageCounted) -> str | None:
         return None
     noun = "page" if scanned == 1 else "pages"
     return f"{scanned} {noun} scanned, {removed} blank removed, {uploaded} uploaded"
+
+
+def removed_pages_note(
+    positions: Sequence[int] | None, scanned: int | None
+) -> str | None:
+    """
+    Return the sentence naming the pages removed as blank, or None.
+
+    Removed pages are not kept, so this sentence is how the operator learns
+    which sheets to rescan if a real page was taken for a blank one.  It is an
+    informational note shown beside the page counts, never a warning: a scan
+    that dropped the blank backs of a duplex stack is an ordinary success, and
+    it must stay a plain DONE rather than turn amber.
+
+    Pages are numbered by their scanned position in document order -- the
+    numbering the per-page log lines use -- so the note reads the same for
+    every source.  ``scanned`` is guarded with ``is None``, never truthiness,
+    for the same reason ``page_counts`` is.
+
+    Args:
+        positions: The 1-based scanned page numbers removed, or None when
+            nothing recorded them.
+        scanned: How many pages the scanner produced, or None when uncounted.
+
+    Returns:
+        ``"Removed as blank: pages 2, 4, 6 of 12 scanned."`` (``page 3`` for a
+        single page), or None when there are no positions to name or no
+        scanned count to name them against.
+
+    """
+    if positions is None or not positions or scanned is None:
+        return None
+    noun = "page" if len(positions) == 1 else "pages"
+    listed = ", ".join(str(position) for position in positions)
+    return f"Removed as blank: {noun} {listed} of {scanned} scanned."
+
+
+def removed_pages(job: RemovedPagesNoted) -> str | None:
+    """
+    Return the removed-pages note for a job, for the templates' filter.
+
+    Args:
+        job: Anything carrying the removed positions and the scanned count.
+
+    Returns:
+        What :func:`removed_pages_note` returns for the job's two fields.
+
+    """
+    return removed_pages_note(job.removed_positions, job.pages_scanned)
 
 
 def flip_answer_label(outcome: FlipOutcome) -> str:

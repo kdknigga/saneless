@@ -1146,6 +1146,20 @@ def jobs(ctx: click.Context, *, as_json: bool, limit: int) -> None:
                             # after the other keys, so existing scripts are
                             # unaffected.
                             "error": j.error,
+                            # Added after the other keys, so existing scripts
+                            # are unaffected. NULL when never recorded, never
+                            # a zero. The positions are 1-based scanned page
+                            # numbers in document order, and are information
+                            # rather than a warning: a DONE that removed blank
+                            # backs keeps "warning": null.
+                            "pages_scanned": j.pages_scanned,
+                            "pages_removed": j.pages_removed,
+                            "pages_uploaded": j.pages_uploaded,
+                            "pages_removed_positions": (
+                                None
+                                if j.removed_positions is None
+                                else list(j.removed_positions)
+                            ),
                         }
                         for j in recent
                     ],

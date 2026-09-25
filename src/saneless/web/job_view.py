@@ -92,7 +92,8 @@ class JobView:
 
     The fields are exactly the attributes the templates read off a job, under
     the same names, so a template renders a view as it rendered a job.  It
-    satisfies ``vocabulary.PageCounted``, so ``page_counts`` formats it too.
+    satisfies ``vocabulary.PageCounted`` and ``vocabulary.RemovedPagesNoted``,
+    so ``page_counts`` and ``removed_pages`` format it too.
 
     Attributes:
         id: Unique job identifier.
@@ -103,6 +104,8 @@ class JobView:
         pages_scanned: Pages the scanner produced, once counted.
         pages_removed: Pages discarded as blank, once counted.
         pages_uploaded: Pages sent to paperless-ngx, once counted.
+        removed_positions: The scanned page numbers removed as blank, once
+            recorded.  Page numbers only, so every viewer sees them.
         title: The document title, or the generic title for a non-owner.
         thumbnail: The base64 JPEG thumbnail, or None for a non-owner.
         error: The error text with host paths named by setting, or a fixed
@@ -120,6 +123,7 @@ class JobView:
     pages_scanned: int | None
     pages_removed: int | None
     pages_uploaded: int | None
+    removed_positions: tuple[int, ...] | None
     title: str
     thumbnail: str | None
     error: str | None
@@ -201,6 +205,9 @@ def build_job_view(job: Job, *, presented: str | None, settings: Settings) -> Jo
         pages_scanned=job.pages_scanned,
         pages_removed=job.pages_removed,
         pages_uploaded=job.pages_uploaded,
+        # Page numbers only -- no title, no path -- so the owner and everyone
+        # else see the same note.
+        removed_positions=job.removed_positions,
         title=title,
         thumbnail=thumbnail,
         error=error,

@@ -1203,6 +1203,75 @@ class TestPageCounts:
         assert "color: var(--pico-muted-color);" in css
 
 
+# Four pages scanned, the backs of two sheets removed as blank, two uploaded.
+_BLANK_BACKS = JobResult(
+    outcome=None,
+    warning=None,
+    pages_scanned=4,
+    pages_removed=2,
+    pages_uploaded=2,
+    removed_positions=(2, 4),
+)
+
+_BLANK_BACKS_NOTE = "Removed as blank: pages 2, 4 of 4 scanned."
+
+
+class TestRemovedPagesNote:
+    """
+    The pages removed as blank are named beside the counts, as information.
+
+    D-07: the note is not a warning, so a DONE that removed blank backs keeps
+    its green tick; D-08: pages are named by scanned position.
+    """
+
+    def test_the_status_poll_names_the_removed_pages(self, client: TestClient) -> None:
+        """The note is a muted `page-counts` line and the DONE headline stays green."""
+        _finished_job(client, JobState.DONE, _BLANK_BACKS)
+        text = client.get("/api/jobs/current/status").text
+        assert f'<p class="page-counts">{_BLANK_BACKS_NOTE}</p>' in text
+        assert '<p class="status-done">&#10003; Done: Render Test</p>' in text
+        assert "status-fallback" not in text
+
+    def test_the_index_page_names_the_removed_pages(self, client: TestClient) -> None:
+        """A reload of the page shows the same note as the poll."""
+        _finished_job(client, JobState.DONE, _BLANK_BACKS)
+        text = client.get("/").text
+        assert f'<p class="page-counts">{_BLANK_BACKS_NOTE}</p>' in text
+        assert 'class="status-done"' in text
+        assert "status-fallback" not in text
+
+    def test_the_note_follows_the_counts(self, client: TestClient) -> None:
+        """The note reads after the counts sentence it explains."""
+        _finished_job(client, JobState.DONE, _BLANK_BACKS)
+        text = client.get("/api/jobs/current/status").text
+        assert text.index("4 pages scanned, 2 blank removed, 2 uploaded") < (
+            text.index(_BLANK_BACKS_NOTE)
+        )
+
+    def test_the_history_row_names_the_removed_pages(self, client: TestClient) -> None:
+        """History carries the note as another `page-counts` line in the Title cell."""
+        _finished_job(client, JobState.DONE, _BLANK_BACKS)
+        text = client.get("/api/jobs/history").text
+        assert f'<span class="page-counts">{_BLANK_BACKS_NOTE}</span>' in text
+        assert '<td class="status-done">' in text
+        assert "status-fallback" not in text
+
+    def test_a_fallback_names_the_removed_pages_too(self, client: TestClient) -> None:
+        """FALLBACK shows the note beside its counts, as DONE does."""
+        _finished_job(client, JobState.FALLBACK, _BLANK_BACKS)
+        text = client.get("/api/jobs/current/status").text
+        assert f'<p class="page-counts">{_BLANK_BACKS_NOTE}</p>' in text
+
+    @pytest.mark.parametrize(
+        "path", ["/api/jobs/current/status", "/api/jobs/history", "/"]
+    )
+    def test_no_positions_render_no_note(self, client: TestClient, path: str) -> None:
+        """A job that recorded no positions renders no note element at all."""
+        _finished_job(client, JobState.DONE, _COUNTS)
+        text = client.get(path).text
+        assert "Removed as blank" not in text
+
+
 class TestHistoryTimeCell:
     """The history Time cell names its zone (APPL-12, D-34, D-35, UI-SPEC S7)."""
 

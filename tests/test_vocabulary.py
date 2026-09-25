@@ -73,6 +73,8 @@ from saneless.vocabulary import (
     progress_label,
     rejection_message,
     rejection_status_code,
+    removed_pages,
+    removed_pages_note,
     state_label,
     worker_health_detail,
 )
@@ -798,6 +800,74 @@ class TestPageCounts:
         """An ERROR or pre-Phase-23 row has no counts, so renders none (D-32)."""
         job = Job(id="j", profile="default", title="t", state=JobState.ERROR)
         assert page_counts(job) is None
+
+
+class TestRemovedPagesNote:
+    """The informational note naming the pages removed as blank (D-07, D-08)."""
+
+    def test_several_positions_are_listed_in_order(self) -> None:
+        """The D-08 sentence, with the plural noun."""
+        assert (
+            removed_pages_note((2, 4, 6), 12)
+            == "Removed as blank: pages 2, 4, 6 of 12 scanned."
+        )
+
+    def test_one_position_takes_the_singular_noun(self) -> None:
+        """A single removed page reads "page 3", not "pages 3"."""
+        assert removed_pages_note((3,), 12) == "Removed as blank: page 3 of 12 scanned."
+
+    @pytest.mark.parametrize(
+        ("positions", "scanned"),
+        [(None, 12), ((), 12), ((2,), None), (None, None)],
+    )
+    def test_nothing_to_say_is_none(
+        self, positions: tuple[int, ...] | None, scanned: int | None
+    ) -> None:
+        """No positions, an empty list or no scanned count renders nothing."""
+        assert removed_pages_note(positions, scanned) is None
+
+    def test_removed_pages_reads_a_job(self) -> None:
+        """removed_pages delegates to removed_pages_note with a job's two fields."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=4,
+            pages_removed=2,
+            pages_uploaded=2,
+            removed_positions=(2, 4),
+        )
+        assert removed_pages(job) == "Removed as blank: pages 2, 4 of 4 scanned."
+
+    def test_removed_pages_is_none_for_a_job_without_positions(self) -> None:
+        """A job that recorded no positions renders no note."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            pages_scanned=4,
+            pages_removed=0,
+            pages_uploaded=4,
+        )
+        assert removed_pages(job) is None
+
+    def test_the_note_never_becomes_a_warning(self) -> None:
+        """A DONE job with removed pages and no warning stays a plain DONE."""
+        job = Job(
+            id="j",
+            profile="default",
+            title="t",
+            state=JobState.DONE,
+            outcome=ScanOutcome.SUCCESS,
+            pages_scanned=4,
+            pages_removed=2,
+            pages_uploaded=2,
+            removed_positions=(2, 4),
+        )
+        assert job.warning is None
+        assert job_label(job.state, job.warning) == state_label(JobState.DONE)
 
 
 class TestBusyLine:

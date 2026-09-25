@@ -37,6 +37,7 @@ from saneless.vocabulary import (
     ScanOutcome,
     job_label,
     page_counts,
+    removed_pages,
 )
 from saneless.web.job_view import JobView, build_job_view, owns_detail
 
@@ -63,6 +64,7 @@ _TEMPLATE_FIELDS = (
     "pages_scanned",
     "pages_removed",
     "pages_uploaded",
+    "removed_positions",
     "title",
     "thumbnail",
     "error",
@@ -77,6 +79,7 @@ _PUBLIC_FIELDS = (
     "pages_scanned",
     "pages_removed",
     "pages_uploaded",
+    "removed_positions",
 )
 
 
@@ -106,6 +109,7 @@ class _JobOverrides(TypedDict, total=False):
     outcome: ScanOutcome | None
     warning: str | None
     owner_token: str | None
+    removed_positions: tuple[int, ...] | None
 
 
 def _job(**overrides: Unpack[_JobOverrides]) -> Job:
@@ -121,6 +125,7 @@ def _job(**overrides: Unpack[_JobOverrides]) -> Job:
         pages_scanned=4,
         pages_removed=1,
         pages_uploaded=3,
+        removed_positions=(2,),
         owner_token=_OWNER,
     )
     return dataclasses.replace(job, **overrides)
@@ -216,6 +221,33 @@ def test_non_owner_sees_generic_title_and_no_thumbnail(
     assert view.is_busy is job.is_busy
     assert page_counts(view) == page_counts(job)
     assert page_counts(view) is not None
+
+
+@pytest.mark.parametrize(
+    "presented",
+    [_OWNER, _OTHER, None],
+    ids=["owner", "other-token", "no-token"],
+)
+def test_removed_positions_are_shown_to_every_viewer(
+    settings: Settings, tmp_path: Path, presented: str | None
+) -> None:
+    """The positions are page numbers only, so owners and others both see them."""
+    job = _job(removed_positions=(2, 4))
+
+    view = _view(job, presented=presented, settings=settings, tmp_path=tmp_path)
+
+    assert view.removed_positions == (2, 4)
+    assert removed_pages(view) == "Removed as blank: pages 2, 4 of 4 scanned."
+
+
+def test_no_positions_stay_no_positions(settings: Settings, tmp_path: Path) -> None:
+    """A job that recorded no positions gives a view with none, and no note."""
+    job = _job(removed_positions=None)
+
+    view = _view(job, presented=_OWNER, settings=settings, tmp_path=tmp_path)
+
+    assert view.removed_positions is None
+    assert removed_pages(view) is None
 
 
 def test_preserved_error_relativised_for_owner_hidden_for_others(
