@@ -5191,6 +5191,53 @@ class TestTheDpiTheDeviceActuallyChose:
 
         assert mock_assemble.call_args.kwargs["dpi"] == 300
 
+    def test_preserved_partial_uses_the_read_back_dpi(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        A partial kept after a jam is laid out at the device's dpi (N-33).
+
+        The profile asks for 300 and the device reads back 150; two A4 rasters
+        at 150 dpi go through, then the third sheet jams.  The scan never
+        returned a batch, so the only place the 150 can come from is the pages
+        themselves.  Laid out at the requested 300, the kept PDF was half size.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].resolution = 300
+
+        def spool_two_then_jam(
+            device_id: str, settings: ScanSettings, sink: PageSink
+        ) -> ScanBatch:
+            """Spool two A4 pages read back at 150 dpi, then jam."""
+            for _ in range(2):
+                sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=150)
+            msg = "Scanner error on page 3: Document feeder jammed"
+            raise ScanError(msg)
+
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spool_two_then_jam
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="Read Back", job_id="job-dpi-rb"
+                ),
+            )
+
+        preserved = list(failed_dir.glob("*.pdf"))
+        assert len(preserved) == 1
+        with pikepdf.open(preserved[0]) as pdf:
+            box = pikepdf.Rectangle(pdf.pages[0].mediabox)
+            assert len(pdf.pages) == 2
+        assert (box.llx, box.lly, box.urx, box.ury) == pytest.approx(
+            (0.0, 0.0, 595.2, 841.92)
+        )
+
     def test_the_duplex_mismatch_recovery_also_uses_the_actual_dpi(
         self,
         default_settings: Settings,

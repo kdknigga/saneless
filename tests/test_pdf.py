@@ -1256,3 +1256,38 @@ class TestMediaBox:
         assert boxes[1] == [0, 0, 595, 842]
         # Half the pixels at the same DPI is half the page, not a rescaled A4.
         assert boxes[2] == [0, 0, 298, 421]
+
+    def test_a_page_is_laid_out_at_its_own_records_dpi(
+        self, spool_dir: Path, output_dir: Path
+    ) -> None:
+        """
+        An A4 raster read back at 150 dpi is an A4 page, 595.2 x 841.92 (N-33).
+
+        The dpi comes from the record and from nowhere else: nothing passes
+        one to ``assemble_pdf``.
+        """
+        sink = SpooledPageSink(spool_dir, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
+        record = sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=150)
+
+        pdf_path = assemble_pdf([record], output_dir, filename="x.pdf", title="t")
+
+        assert _media_boxes(pdf_path) == [
+            pytest.approx((0.0, 0.0, 595.2, 841.92)),
+        ]
+
+    def test_each_page_uses_its_own_dpi(
+        self, spool_dir: Path, output_dir: Path
+    ) -> None:
+        """Two rasters of one size at 150 and 300 dpi differ in width by 2x."""
+        sink = SpooledPageSink(spool_dir, _SPOOL_LABEL_A, _TEST_RESERVE_MB)
+        coarse = sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=150)
+        fine = sink.add(Image.new("RGB", (1240, 1754), "white"), dpi=300)
+
+        pdf_path = assemble_pdf(
+            [coarse, fine], output_dir, filename="mixed-dpi.pdf", title=_TITLE
+        )
+
+        boxes = _media_boxes(pdf_path)
+        assert boxes[0][2] == pytest.approx(2 * boxes[1][2])
+        assert boxes[0][3] == pytest.approx(2 * boxes[1][3])
+        assert boxes[1] == pytest.approx((0.0, 0.0, 297.6, 420.96))
