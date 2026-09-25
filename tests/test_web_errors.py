@@ -38,6 +38,7 @@ from saneless.config import (
     ProfileConfig,
     Settings,
 )
+from saneless.job import REJECTED_HISTORY_ROWS
 from saneless.vocabulary import (
     QUEUE_FULL_JOB_ERROR,
     TITLE_MAX_LENGTH,
@@ -926,6 +927,139 @@ def test_scan_title_at_the_cap_is_not_422(client: TestClient) -> None:
     assert 'id="status-area"' in response.text
 
 
+# One control character from each part of the refused set: a tab, which a
+# person can type into a text input; ESC, which starts a terminal escape
+# sequence; NEL, a C1 control; and DEL, the one control outside both blocks.
+_TITLE_CONTROL_CHARACTERS = ["\t", "\x1b", "\x85", "\x7f"]
+_TITLE_CONTROL_IDS = ["tab", "esc", "nel", "del"]
+
+
+@pytest.mark.parametrize("character", _TITLE_CONTROL_CHARACTERS, ids=_TITLE_CONTROL_IDS)
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_title_control_character_is_422_without_a_row(
+    client: TestClient,
+    caplog: pytest.LogCaptureFixture,
+    character: str,
+    *,
+    htmx: bool,
+) -> None:
+    """A title holding a control character is refused, not repaired, and not echoed."""
+    title = f"{INPUT_MARKER}a{character}b"
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/scan", data={"profile": "default", "title": title}, headers=headers
+        )
+    rejection = RequestRejection.TITLE_HAS_CONTROL
+    if htmx:
+        _assert_htmx_error(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert INPUT_MARKER not in response.text
+    assert all(INPUT_MARKER not in r.getMessage() for r in caplog.records)
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_scan_title_control_check_accepts_accents_and_no_break_space(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An accented letter and a no-break space are text, not control characters."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    title = "Caf\u00e9\u00a0receipt"
+    response = client.post(
+        "/api/scan",
+        data={"profile": "default", "title": title},
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert [job.title for job in offered] == [title]
+
+
+# The tag cap the scan form, the tag list and the tag refresh all enforce.
+# Spelled out rather than imported, so the test pins the documented number.
+_TAGS_CAP = 100
+
+
+def _tag_values(count: int) -> list[str]:
+    """Return ``count`` distinct tag ids as the form strings a browser sends."""
+    return [str(tag_id) for tag_id in range(1, count + 1)]
+
+
+def test_scan_tags_cap_accepts_the_cap(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submit ticking exactly the capped number of tags is accepted whole."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    response = client.post(
+        "/api/scan",
+        data={
+            "profile": "default",
+            "title": "Many Tags",
+            "tags": _tag_values(_TAGS_CAP),
+        },
+        headers=HTMX_HEADERS,
+    )
+    assert response.status_code == 200
+    assert len(offered) == 1
+    assert offered[0].tags == list(range(1, _TAGS_CAP + 1))
+
+
+@pytest.mark.parametrize("htmx", [True, False], ids=["htmx", "json"])
+def test_scan_tags_cap_refuses_one_over_without_a_row(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, *, htmx: bool
+) -> None:
+    """One tag over the cap is a 422 before any job row exists or is offered."""
+    offered = _refuse_submit(client, monkeypatch, SubmitResult.ACCEPTED)
+    before = _job_store(client).list_recent(limit=50)
+    headers = HTMX_HEADERS if htmx else {}
+    response = client.post(
+        "/api/scan",
+        data={
+            "profile": "default",
+            "title": "Too Many Tags",
+            "tags": _tag_values(_TAGS_CAP + 1),
+        },
+        headers=headers,
+    )
+    rejection = RequestRejection.INVALID_REQUEST
+    if htmx:
+        _assert_htmx_error(response, rejection, 422)
+    else:
+        _assert_json_error(response, rejection, 422)
+    assert offered == []
+    assert _job_store(client).list_recent(limit=50) == before
+
+
+def test_tag_list_tags_cap_accepts_the_cap(client: TestClient) -> None:
+    """The tag list re-renders with exactly the capped number ticked."""
+    response = client.get(
+        "/api/tags", params={"tags": _tag_values(_TAGS_CAP)}, headers=HTMX_HEADERS
+    )
+    assert response.status_code == 200
+
+
+def test_tag_list_tags_cap_refuses_one_over(client: TestClient) -> None:
+    """The tag list refuses one ticked tag over the cap before any work."""
+    response = client.get(
+        "/api/tags",
+        params={"tags": _tag_values(_TAGS_CAP + 1)},
+        headers=HTMX_HEADERS,
+    )
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
+def test_tag_refresh_tags_cap_refuses_one_over(client: TestClient) -> None:
+    """The tag refresh refuses one ticked tag over the cap before the cache."""
+    response = client.post(
+        "/api/cache/invalidate",
+        params={"resource": "tags"},
+        data={"tags": _tag_values(_TAGS_CAP + 1)},
+        headers=HTMX_HEADERS,
+    )
+    _assert_htmx_error(response, RequestRejection.INVALID_REQUEST, 422)
+
+
 def test_scan_queue_full_is_429_with_a_rejected_row_htmx(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1541,6 +1675,38 @@ class TestPlaceholderTokenRefusal:
             assert response.status_code == 200
             assert 'id="status-area"' in response.text
             assert OWNER_COOKIE in response.headers.get("set-cookie", "")
+
+
+# Ten times the refused-row cap, so a store that kept every refusal would hold
+# far more than the cap and one that let refusals push out runs would long since
+# have lost the finished scan.
+_FLOOD_SUBMITS = 200
+
+
+def test_a_refused_submit_flood_keeps_history_bounded_and_the_finished_scan(
+    web_settings: Settings, web_scanner: StubScannerBackend
+) -> None:
+    """Refused submits through the route are capped and never evict a real scan."""
+    with _appliance_with_credential(
+        web_settings, web_scanner, _SHIPPED_PLACEHOLDER
+    ) as client:
+        store = _job_store(client)
+        finished = store.create_job("default", "Finished Scan")
+        store.finish_job(finished.id, JobState.DONE)
+        for index in range(_FLOOD_SUBMITS):
+            response = client.post(
+                "/api/scan",
+                data={"profile": "default", "title": f"Flood {index:03d}"},
+                headers=HTMX_HEADERS,
+            )
+            assert response.status_code == 503
+        rows = store.list_recent(limit=_FLOOD_SUBMITS * 2)
+        refused = [job for job in rows if job.error_category is ErrorCategory.REJECTED]
+        assert len(refused) <= REJECTED_HISTORY_ROWS
+        assert refused[0].title == f"Flood {_FLOOD_SUBMITS - 1:03d}"
+        kept = store.get_job(finished.id)
+        assert kept is not None
+        assert kept.state is JobState.DONE
 
 
 class TestUnsetUrlRefusal:

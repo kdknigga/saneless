@@ -946,6 +946,11 @@ _REJECTION_MESSAGES: list[tuple[RequestRejection, str]] = [
         "The title is too long. Shorten it to 256 characters or fewer.",
     ),
     (
+        RequestRejection.TITLE_HAS_CONTROL,
+        "The title contains a tab or another control character. Remove it, then "
+        "try again.",
+    ),
+    (
         RequestRejection.INVALID_REQUEST,
         "The request was not valid. Reload the page, then try again.",
     ),
@@ -982,6 +987,7 @@ _REJECTION_STATUS_CODES: list[tuple[RequestRejection, int]] = [
     (RequestRejection.URL_UNSET, 503),
     (RequestRejection.UNKNOWN_PROFILE, 422),
     (RequestRejection.TITLE_TOO_LONG, 422),
+    (RequestRejection.TITLE_HAS_CONTROL, 422),
     (RequestRejection.INVALID_REQUEST, 422),
     (RequestRejection.CROSS_SITE, 403),
     (RequestRejection.NOT_FOUND, 404),
@@ -1013,6 +1019,7 @@ class TestRequestRejection:
             "URL_UNSET",
             "UNKNOWN_PROFILE",
             "TITLE_TOO_LONG",
+            "TITLE_HAS_CONTROL",
             "INVALID_REQUEST",
             "CROSS_SITE",
             "NOT_FOUND",
