@@ -1416,7 +1416,12 @@ class _AcquisitionContext:
 @dataclass(frozen=True)
 class _DuplexMismatch:
     """
-    The two passes of a manual duplex run whose page counts disagreed.
+    The two passes of a manual duplex run that cannot be paired by position.
+
+    Either the page counts disagreed, or a pass could not read a sheet. After a
+    lost sheet, equal counts prove nothing: when each pass loses a different
+    sheet, the counts match and the interleave pairs fronts with the wrong
+    backs.
 
     A named record rather than the bare ``(fronts, backs)`` tuple this used to
     be. The recovery path now also needs the resolution the device actually
@@ -1427,15 +1432,16 @@ class _DuplexMismatch:
         fronts: Page records produced by pass A, in pass order.
         backs: Page records produced by pass B, in pass order.
         dpi: The resolution the device reported actually using.
-        pages_rejected: Sheets skipped across both passes for failing their
-            integrity checks.
+        unreadable_sheets: Sheets skipped across both passes for failing their
+            integrity checks. Nonzero is the reason the run was split. Zero
+            means the split is a count difference alone.
 
     """
 
     fronts: Sequence[PageRecord]
     backs: Sequence[PageRecord]
     dpi: int
-    pages_rejected: int
+    unreadable_sheets: int
 
 
 def _duplex_resolution(front: ScanBatch, back: ScanBatch) -> int:
@@ -1524,17 +1530,21 @@ def _join_warnings(*parts: str | None) -> str | None:
 
 
 def _handle_duplex_mismatch(
-    passes: tuple[Sequence[PageRecord], Sequence[PageRecord]],
+    mismatch: _DuplexMismatch,
     tmp_path: Path,
     paperless: PaperlessClient,
     request: PipelineRequest,
     delivery: _DeliveryContext,
 ) -> tuple[str, bool]:
     """
-    Save and upload partial PDFs when duplex page counts mismatch.
+    Save and upload partial PDFs when the duplex passes cannot be paired.
 
     Instead of discarding scanned data, assembles fronts and backs into
     separate PDFs and uploads both to paperless-ngx for manual review.
+
+    The ``(backs)`` PDF is in sheet order, the reverse of the order pass B
+    produced its pages, so when nothing was skipped its page N is the back of
+    the ``(fronts)`` PDF's page N.
 
     The two halves get visibly distinct names, both carrying the job id. That
     matters beyond tidiness: the two partial PDFs are later covered by a single
@@ -1543,7 +1553,7 @@ def _handle_duplex_mismatch(
     path exists to save.
 
     Args:
-        passes: Tuple of (front-side records, back-side records).
+        mismatch: Both passes, and the sheets the scanner could not read.
         tmp_path: Temporary directory for PDF assembly.
         paperless: Paperless-ngx client for upload.
         request: Pipeline request with title, tags, correspondent, job id and
@@ -1553,8 +1563,8 @@ def _handle_duplex_mismatch(
             scope, and because three more parameters would break PLR0913.
 
     Returns:
-        A (warning, delivered_to_api) pair. The warning describes the mismatch
-        and recovery action; delivered_to_api is True only when BOTH partial
+        A (warning, delivered_to_api) pair. The warning gives the reason the
+        halves were not paired and the recovery action; delivered_to_api is True only when BOTH partial
         PDFs reached the paperless-ngx API. If either fell back to the consume
         directory the caller must report the run as a fallback, not a success.
 
@@ -1574,7 +1584,11 @@ def _handle_duplex_mismatch(
             names them.
 
     """
-    fronts, backs = passes
+    fronts = mismatch.fronts
+    # Pass B runs over the flipped stack, so it produces the backs last sheet
+    # first.  Reversed here, as _interleave_duplex does, the (backs) PDF runs
+    # in the same sheet order as the (fronts) PDF.
+    backs = list(reversed(mismatch.backs))
     # One composition per half, used for the file name, the PDF's own /Title
     # and the upload, so the three cannot drift apart.
     fronts_title = f"{request.title} {_FRONTS_SUFFIX}"
@@ -1653,12 +1667,41 @@ def _handle_duplex_mismatch(
 
     delivered = fronts_result.delivered_to_api and backs_result.delivered_to_api
 
-    warning = (
-        f"Page count mismatch: {len(fronts)} fronts, {len(backs)} backs. "
-        f"Partial PDFs saved."
-    )
+    warning = _duplex_mismatch_warning(mismatch)
     logger.warning(warning)
     return warning, delivered
+
+
+def _duplex_mismatch_warning(mismatch: _DuplexMismatch) -> str:
+    """
+    Say why the two manual-duplex passes were delivered as two PDFs.
+
+    A lost sheet takes precedence over the counts: when each pass lost a
+    different sheet the counts agree, and a "page count mismatch" sentence
+    quoting two equal numbers would be false. It is the only sentence that
+    mentions the lost sheets, so the generic unreadable-sheet warning is not
+    added on top of it.
+
+    Args:
+        mismatch: Both passes, and the sheets the scanner could not read.
+
+    Returns:
+        The warning, naming the unreadable sheets when there were any and
+        otherwise the two page counts.
+
+    """
+    count = mismatch.unreadable_sheets
+    if count > 0:
+        sheets = "1 sheet" if count == 1 else f"{count} sheets"
+        return (
+            f"The scanner could not read {sheets}, so the fronts and backs "
+            f"could not be paired reliably; they were uploaded as two PDFs, "
+            f"{_FRONTS_SUFFIX} and {_BACKS_SUFFIX}, for manual review."
+        )
+    return (
+        f"Page count mismatch: {len(mismatch.fronts)} fronts, "
+        f"{len(mismatch.backs)} backs. Partial PDFs saved."
+    )
 
 
 def _finish_duplex_mismatch(
@@ -1694,7 +1737,7 @@ def _finish_duplex_mismatch(
 
     """
     warning, delivered = _handle_duplex_mismatch(
-        (mismatch.fronts, mismatch.backs),
+        mismatch,
         tmp_path,
         paperless,
         request,
@@ -1728,10 +1771,10 @@ def _finish_duplex_mismatch(
         pages_scanned=mismatch_pages,
         pages_removed=0,
         pages_uploaded=mismatch_pages,
-        warning=_join_warnings(
-            warning,
-            _rejected_pages_warning(mismatch.pages_rejected),
-        ),
+        # Not joined with _rejected_pages_warning: a lost sheet is already the
+        # reason this warning gives, and saying the count twice in one message
+        # reads as two separate losses.
+        warning=warning,
     )
 
 
@@ -1811,7 +1854,8 @@ def _scan_manual_duplex(
     Returns:
         A ScanBatch of interleaved pages when the two passes agree on count,
         carrying the device's resolution and the rejections from both passes;
-        or a _DuplexMismatch holding both passes when the counts disagree.
+        or a _DuplexMismatch holding both passes when the counts disagree or
+        either pass could not read a sheet.
 
     Raises:
         ScanCancelledError: If the operator aborts at the flip prompt.  Raised
@@ -1936,14 +1980,23 @@ def _scan_manual_duplex(
     # Summed, not picked: a sheet lost on either pass is a sheet lost.
     rejected = front_batch.pages_rejected + back_batch.pages_rejected
 
+    # Interleaving pairs the pages by position, and position is proof of
+    # pairing only while every sheet was read on both passes.  A sheet lost on
+    # either pass shifts every later page of that pass by one, and when each
+    # pass loses a different sheet the counts still agree -- so a lost sheet
+    # sends the halves out separately even when the counts match.  Nothing
+    # tries to pair the pages by physical sheet instead: the scanner reports
+    # that a sheet was skipped, not which one.
+    #
     # Compare the raw counts BEFORE empty-page detection: filtering first
     # could drop a blank back and turn two matching passes into a mismatch.
-    if len(front_pages) != len(back_pages):
+    lost_a_sheet = bool(front_batch.pages_rejected or back_batch.pages_rejected)
+    if lost_a_sheet or len(front_pages) != len(back_pages):
         return _DuplexMismatch(
             fronts=front_pages,
             backs=back_pages,
             dpi=dpi,
-            pages_rejected=rejected,
+            unreadable_sheets=rejected,
         )
 
     interleaved = _interleave_duplex(front_pages, back_pages)
