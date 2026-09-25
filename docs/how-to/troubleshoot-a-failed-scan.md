@@ -119,6 +119,11 @@ Other causes of exit 2, each on one line:
   [`[output]`](../reference/configuration.md#output)) and the reason: the directory was removed or
   cannot be created, or the disk is full. Check that it exists, that saneless can write to it, and
   that there is free space.
+- **The working directory is not private.** The line names `output.tmp_dir`, its path and what is
+  wrong with it: it is a symbolic link, it is not a directory, it belongs to another user, or its
+  group or everyone can write to it. saneless keeps scanned pages there and will not use a
+  directory someone else could change. Run `chmod 700` on a directory you own (the line gives the
+  command), remove it so saneless creates it privately, or set `tmp_dir` to another directory.
 - **The job database cannot be used.** The line starts with `Job database error:` and names the
   database path and the reason: the file cannot be opened or is not a SQLite database, or its jobs
   table has a shape this version of saneless does not recognise. Check that the path is right,
