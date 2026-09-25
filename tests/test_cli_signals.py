@@ -29,6 +29,7 @@ that checks the command restores them itself asserts before that fixture runs.
 
 from __future__ import annotations
 
+import errno
 import os
 import signal
 from dataclasses import dataclass, field
@@ -718,3 +719,42 @@ def test_a_hangup_ignored_by_nohup_stays_ignored(
     # SIGTERM was not ignored, so it is still turned into an interruption.
     assert callable(scanner.dispositions[signal.SIGTERM])
     assert signal.getsignal(signal.SIGHUP) is signal.SIG_IGN
+
+
+def test_a_dead_terminal_cannot_turn_the_interruption_into_a_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The ``Interrupted:`` line fails with EIO, and the exit code still stands.
+
+    A hung-up terminal answers every write with an I/O error.  The exit code
+    is the report a script reads, so a line that cannot be written must not
+    replace it with a traceback and exit 1.
+    """
+    signaller = _Signaller()
+    recorder = _SignallingPaperless(signaller, signal.SIGTERM)
+    scanner = DistinctPageScanner(passes=((0, 1),))
+    real_echo = click.echo
+    refused: list[str] = []
+
+    def hung_up_stderr(
+        message: object = None, *, nl: bool = True, err: bool = False
+    ) -> None:
+        """Refuse every stderr write the way a hung-up terminal does."""
+        if err:
+            refused.append(str(message))
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        real_echo(message, nl=nl)
+
+    monkeypatch.setattr("saneless.cli.click.echo", hung_up_stderr)
+
+    run = _run_cli(
+        tmp_path, monkeypatch, profile=_SIMPLEX, scanner=scanner, recorder=recorder
+    )
+
+    assert signaller.sent == [signal.SIGTERM]
+    assert run.result.exit_code == ExitCode.TERMINATED, run.result.output
+    assert run.result.exception is None or isinstance(run.result.exception, SystemExit)
+    assert any(line.startswith("Interrupted:") for line in refused)
+    (kept,) = run.failed
+    assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1))

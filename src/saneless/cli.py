@@ -566,6 +566,27 @@ def _failure_line(exc: SanelessError, category: ErrorCategory) -> str:
     return neutralise_controls(line)
 
 
+def _echo_err(text: str, *, nl: bool = True) -> None:
+    """
+    Write one line of the guard's report to stderr, surviving a dead terminal.
+
+    The guard reports how a command ended, and the exit code is the report a
+    script reads.  A terminal that has gone away -- the dropped SSH session
+    behind a SIGHUP -- answers every write with EIO, and an ``OSError`` raised
+    here would escape the guard as a traceback and exit 1 instead of the code
+    it chose.  So a failed write is logged and the exit code still stands.
+
+    Args:
+        text: The line to write.
+        nl: Whether to end it with a newline.
+
+    """
+    try:
+        click.echo(text, err=True, nl=nl)
+    except OSError:
+        logger.info("Could not write to stderr: %r", text, exc_info=True)
+
+
 def _log_failure(ctx: click.Context, exc: Exception) -> None:
     """
     Log a failure with its traceback, but only once logging is configured.
@@ -625,10 +646,10 @@ def _report_unexpected(ctx: click.Context, exc: Exception) -> None:
         elif not verbose and not obj.get("log_stream"):
             line = f"{line}. {_VERBOSE_HINT}"
     elif verbose:
-        click.echo("".join(traceback.format_exception(exc)), err=True, nl=False)
+        _echo_err("".join(traceback.format_exception(exc)), nl=False)
     else:
         line = f"{line}. {_VERBOSE_HINT}"
-    click.echo(line, err=True)
+    _echo_err(line)
 
 
 class _GuardedGroup(click.Group):
@@ -689,21 +710,19 @@ class _GuardedGroup(click.Group):
             raise
         except ScanInterrupted as exc:
             logger.info("Command interrupted by a signal: %r", failure_text(exc))
-            click.echo(
-                neutralise_controls(f"Interrupted: {failure_text(exc)}"), err=True
-            )
+            _echo_err(neutralise_controls(f"Interrupted: {failure_text(exc)}"))
             ctx.exit(exit_code_for_signal(exc.signum))
         except KeyboardInterrupt:
             logger.info("Command interrupted")
-            click.echo("Cancelled (interrupted)", err=True)
+            _echo_err("Cancelled (interrupted)")
             ctx.exit(ExitCode.CANCELLED)
         except ScanCancelledError as exc:
             logger.info("Scan cancelled: %s", exc)
-            click.echo(failure_text(exc), err=True)
+            _echo_err(failure_text(exc))
             ctx.exit(ExitCode.CANCELLED)
         except StorageError as exc:
             _log_failure(ctx, exc)
-            click.echo(f"Job database error: {failure_text(exc)}", err=True)
+            _echo_err(f"Job database error: {failure_text(exc)}")
             ctx.exit(ExitCode.CONFIG)
         except SanelessError as exc:
             category = classify_error(exc)
@@ -721,8 +740,8 @@ class _GuardedGroup(click.Group):
                 # says "press Scan" or "run the command". The UNEXPECTED branch
                 # above gets no advice: its category is a guess about an
                 # exception saneless did not raise.
-                click.echo(_failure_line(exc, category), err=True)
-                click.echo(f"Try: {error_next_step(category)}", err=True)
+                _echo_err(_failure_line(exc, category))
+                _echo_err(f"Try: {error_next_step(category)}")
             ctx.exit(code)
         except Exception as exc:
             _report_unexpected(ctx, exc)
