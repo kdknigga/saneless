@@ -83,7 +83,7 @@ class SpooledPageSink(PageSink):
 
         Args:
             directory: Where the pages land.  The pipeline's per-job
-                ``TemporaryDirectory`` owns it, so the spool's lifetime is the
+                workspace owns it, so the spool's lifetime is the
                 job's and anything to be preserved must be moved out before
                 that workspace closes.
             pass_label: The short prefix every file of this pass carries, e.g.
@@ -164,21 +164,28 @@ class SpooledPageSink(PageSink):
         self._records.append(record)
 
         if sequence == 1 and self._thumbnail_callback is not None:
-            # Not wrapped in a suppression: a thumbnail is a visible part of
-            # what the operator sees, so a failure here should surface rather
-            # than leave the strip silently blank.
+            # Best-effort: the thumbnail is something to look at while the
+            # scan runs, not part of the scan.  It can fail for reasons that
+            # have nothing to do with the page -- the web worker's callback is
+            # a job-store write, which raises sqlite3.Error on a locked or
+            # closed database, and generate_thumbnail itself raises OSError
+            # for a mode JPEG cannot encode -- and a failure that ended the
+            # pass would stop the feeder over a missing picture.  So it is
+            # logged with its traceback and the page stands.
             #
-            # The record is appended *first*, and that ordering is load-bearing
-            # rather than tidy.  The callback can raise for reasons that have
-            # nothing to do with the page -- the web worker's is a job-store
-            # write, which raises sqlite3.Error on a locked or closed database,
-            # and generate_thumbnail itself raises OSError for a mode JPEG
-            # cannot encode.  Appending afterwards meant a raise here left
-            # a-0001.png on disk with no record of it: page_count() answered 0,
-            # so _preserving_partial_scan took its "nothing reached the spool"
-            # branch and let the workspace delete a sheet that had really been
-            # fed.
-            self._thumbnail_callback(generate_thumbnail(image))
+            # The record is still appended *first*, and that ordering stays
+            # load-bearing: if anything here escaped anyway (a
+            # KeyboardInterrupt, say), the page on disk is already recorded,
+            # so the run's guard keeps it rather than let the workspace delete
+            # a sheet that had really been fed.
+            try:
+                self._thumbnail_callback(generate_thumbnail(image))
+            except Exception:
+                logger.warning(
+                    "Could not make or hand on the thumbnail of %s; the scan continues",
+                    png_path,
+                    exc_info=True,
+                )
 
         logger.debug(
             "Spooled page %d to %s (%dx%d %s, mean %.1f, stddev %.1f)",

@@ -1387,8 +1387,8 @@ def _acquire_pages(
 
     **A skipped page may break manual-duplex parity, and that is accepted
     deliberately.** One skipped front makes ``len(front_pages) !=
-    len(back_pages)``, which ``pipeline.py`` routes to
-    ``_handle_duplex_mismatch`` -- two partial PDFs plus a warning instead of
+    len(back_pages)``, which ``pipeline.py`` routes to its duplex-mismatch
+    delivery -- two partial PDFs plus a warning instead of
     one interleaved document.  That is the honest response: a page the device
     could not read genuinely means the two manual-duplex passes no longer
     correspond.  The promise that manual-duplex page parity survives forbids
@@ -1795,8 +1795,7 @@ class _PageBudget:
     limit, and CLAUDE.md forbids both raising the limit and suppressing the
     rule. ``_acquire_pages`` takes the two separately and is at the same limit
     without needing this, so the asymmetry is the lint's, not a design
-    statement; ``pipeline._DeliveryContext`` is the same answer to the same
-    constraint.
+    statement.
 
     Both defaults are the module constants the ADF path uses, so "one sheet is
     one sheet, whichever way it was presented" is expressed in the
