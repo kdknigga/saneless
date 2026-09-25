@@ -6,7 +6,9 @@ import base64
 import errno
 import inspect
 import logging
+import os
 import shutil
+import stat
 import threading
 import time
 from pathlib import Path
@@ -45,6 +47,7 @@ from saneless.pipeline import (
     _check_disk_space,
     _interleave_duplex,
     _note_pass_count,
+    _open_workspace,
     _preserving,
     _warn_if_failed_dir_growing,
     run_pipeline,
@@ -2161,11 +2164,61 @@ class TestDiskSpaceCheck:
             )
 
         message = str(exc_info.value)
-        assert message.startswith(
-            f"Could not prepare the working directory {tmp_dir}: "
-        )
+        if failing_call == "mkdir":
+            # Creating tmp_dir is the private-directory helper's job, and its
+            # message names the setting.
+            assert message.startswith(
+                f"output.tmp_dir {tmp_dir} could not be created: "
+            )
+        else:
+            assert message.startswith(
+                f"Could not prepare the working directory {tmp_dir}: "
+            )
         assert isinstance(exc_info.value.__cause__, OSError)
         scanner.scan_pages.assert_not_called()
+
+    def test_open_workspace_creates_a_missing_tmp_dir_private(
+        self, tmp_path: Path
+    ) -> None:
+        """A missing ``tmp_dir`` is created 0700 even under umask 002."""
+        tmp_dir = tmp_path / "scratch"
+        old = os.umask(0o002)
+        try:
+            workspace = _open_workspace(tmp_dir, 0)
+        finally:
+            os.umask(old)
+        with workspace as path:
+            assert Path(path).parent == tmp_dir
+        assert stat.S_IMODE(tmp_dir.stat().st_mode) == 0o700
+
+    @pytest.mark.parametrize("shape", ["world-writable", "symlink"])
+    def test_open_workspace_refuses_an_unsafe_tmp_dir(
+        self, tmp_path: Path, shape: str
+    ) -> None:
+        """
+        ``tmp_dir`` is re-checked before every scan, not only at startup.
+
+        A temp-directory sweep can remove it while the server runs, and
+        another local user can then create the name. The refusal is the
+        private-directory check's own, not the "could not prepare" wrapper
+        for a raw ``OSError``.
+        """
+        tmp_dir = tmp_path / "scratch"
+        if shape == "symlink":
+            real = tmp_path / "elsewhere"
+            real.mkdir(mode=0o700)
+            tmp_dir.symlink_to(real)
+        else:
+            tmp_dir.mkdir()
+            tmp_dir.chmod(0o777)
+        with pytest.raises(ConfigError) as exc_info:
+            _open_workspace(tmp_dir, 0)
+        message = str(exc_info.value)
+        assert "output.tmp_dir" in message
+        assert "chmod 700" in message
+        assert not message.startswith("Could not prepare the working directory")
+        if shape == "symlink":
+            assert list((tmp_path / "elsewhere").iterdir()) == []
 
 
 class TestPipelineEventEnum:

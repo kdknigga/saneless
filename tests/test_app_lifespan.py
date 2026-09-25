@@ -15,8 +15,10 @@ exactly the rows a crashed process would leave behind.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sqlite3
+import stat
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -54,6 +56,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _APP_LOGGER = "saneless.web.app"
+
+# ``PRAGMA auto_vacuum`` reads 2 for INCREMENTAL.
+_INCREMENTAL = 2
 
 # The status area's opening tag, captured whole so a polling attribute
 # elsewhere on the page cannot satisfy or break the assertion.
@@ -1149,3 +1154,106 @@ def test_the_schema_builds_in_process_and_is_not_served(settings: Settings) -> N
         assert set(schema["paths"]) == served
         assert client.get("/openapi.json").status_code == 404
         assert (app.openapi_url, app.docs_url, app.redoc_url) == (None, None, None)
+
+
+# --- Private directories and the job database at startup ----------------------
+
+
+def _private_settings(tmp_path: Path) -> Settings:
+    """Build settings whose scratch and data directories do not exist yet."""
+    return Settings(
+        scanner=ScannerConfig(device="test:device:001"),
+        paperless=PaperlessConfig(url="http://localhost:8000", token="test-token"),
+        output=OutputConfig(
+            tmp_dir=str(tmp_path / "scratch"), data_dir=str(tmp_path / "state")
+        ),
+        profiles={"default": ProfileConfig()},
+    )
+
+
+def _build_app_under_umask(settings: Settings, umask: int) -> FastAPI:
+    """Build the app with ``umask`` in force, restoring the old one after."""
+    old = os.umask(umask)
+    try:
+        return _build_app(settings)
+    finally:
+        os.umask(old)
+
+
+def test_create_app_makes_tmp_dir_and_data_dir_private(tmp_path: Path) -> None:
+    """Both directories are created 0700 even under umask 002."""
+    settings = _private_settings(tmp_path)
+    app = _build_app_under_umask(settings, 0o002)
+    with TestClient(app):
+        pass
+    assert stat.S_IMODE(settings.output.tmp_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(settings.output.data_dir.stat().st_mode) == 0o700
+
+
+def test_create_app_keeps_an_existing_data_dir_mode(tmp_path: Path) -> None:
+    """A data_dir that already exists is used as it is, not re-moded."""
+    settings = _private_settings(tmp_path)
+    settings.output.data_dir.mkdir()
+    settings.output.data_dir.chmod(0o755)
+    app = _build_app(settings)
+    with TestClient(app):
+        pass
+    assert stat.S_IMODE(settings.output.data_dir.stat().st_mode) == 0o755
+
+
+def test_create_app_converts_an_old_database_to_incremental_vacuum(
+    tmp_path: Path,
+) -> None:
+    """A job database an earlier release created is converted once, at startup."""
+    settings = _private_settings(tmp_path)
+    settings.output.data_dir.mkdir(mode=0o700)
+    JobStore(db_path=settings.output.db_path).close()
+    raw = sqlite3.connect(settings.output.db_path)
+    try:
+        raw.execute("PRAGMA auto_vacuum = NONE")
+        raw.execute("VACUUM")
+        assert raw.execute("PRAGMA auto_vacuum").fetchone()[0] == 0
+    finally:
+        raw.close()
+
+    app = _build_app(settings)
+    with TestClient(app):
+        pass
+
+    raw = sqlite3.connect(settings.output.db_path)
+    try:
+        assert raw.execute("PRAGMA auto_vacuum").fetchone()[0] == _INCREMENTAL
+    finally:
+        raw.close()
+
+
+def test_create_app_vacuum_failure_is_a_warning_not_a_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A failed conversion is logged and the server still starts.
+
+    ``VACUUM`` needs free space about the size of the database, and a
+    database bloated by a flood may sit on a full disk.
+    """
+
+    def full_disk(_store: JobStore) -> bool:
+        msg = "database or disk is full"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(JobStore, "enable_incremental_auto_vacuum", full_disk)
+    settings = _private_settings(tmp_path)
+    with caplog.at_level(logging.WARNING, logger=_APP_LOGGER):
+        app = _build_app(settings)
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == _APP_LOGGER and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "auto-vacuum" in warnings[0].getMessage()
+    assert warnings[0].exc_info is not None
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200

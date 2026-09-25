@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import stat
 import tempfile
 import time
 import tomllib
@@ -561,7 +562,9 @@ class TestSettingsDefaults:
         settings = load_settings()
         assert settings.scanner.host == ""
         assert settings.paperless.url == ""
-        assert settings.output.tmp_dir == Path(tempfile.gettempdir()) / "saneless"
+        assert settings.output.tmp_dir == (
+            Path(tempfile.gettempdir()) / f"saneless-{os.getuid()}"
+        )
         assert settings.output.log_level == "INFO"
 
 
@@ -3165,6 +3168,72 @@ class TestValidateSettingsDirs:
         assert message.startswith(label)
         assert str(ancestor) in message
 
+    def test_validate_missing_tmp_dir_is_not_created(self, tmp_path: Path) -> None:
+        """The startup check only inspects: a missing ``tmp_dir`` stays missing."""
+        tmp_dir = tmp_path / "scratch"
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(tmp_dir), data_dir=str(tmp_path)),
+            profiles={"default": ProfileConfig()},
+        )
+        validate_settings_dirs(settings)
+        assert not os.path.lexists(tmp_dir)
+
+    def test_validate_owned_0755_tmp_dir_passes(self, tmp_path: Path) -> None:
+        """An existing ``tmp_dir`` the user owns may be group- and world-readable."""
+        tmp_dir = tmp_path / "scratch"
+        tmp_dir.mkdir()
+        tmp_dir.chmod(0o755)
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(tmp_dir), data_dir=str(tmp_path)),
+            profiles={"default": ProfileConfig()},
+        )
+        validate_settings_dirs(settings)
+        assert stat.S_IMODE(tmp_dir.stat().st_mode) == 0o755
+
+    @pytest.mark.parametrize("shape", ["symlink", "world-writable", "group-writable"])
+    def test_validate_unsafe_existing_tmp_dir_fails(
+        self, tmp_path: Path, shape: str
+    ) -> None:
+        """
+        A squatted or loosened ``tmp_dir`` stops startup with a fatal ConfigError.
+
+        Another local user can create the predictable default first; the
+        refusal names the setting and says what to do about it.
+        """
+        tmp_dir = tmp_path / "scratch"
+        if shape == "symlink":
+            real = tmp_path / "elsewhere"
+            real.mkdir(mode=0o700)
+            tmp_dir.symlink_to(real)
+        else:
+            tmp_dir.mkdir()
+            tmp_dir.chmod(0o777 if shape == "world-writable" else 0o770)
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(tmp_dir), data_dir=str(tmp_path)),
+            profiles={"default": ProfileConfig()},
+        )
+        with pytest.raises(ConfigError) as exc_info:
+            validate_settings_dirs(settings)
+        message = str(exc_info.value)
+        assert "output.tmp_dir" in message
+        assert str(tmp_dir) in message
+        assert "chmod 700" in message
+
+    def test_validate_tmp_dir_owned_by_another_user_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``tmp_dir`` owned by another UID is refused even at mode 0700."""
+        tmp_dir = tmp_path / "scratch"
+        tmp_dir.mkdir(mode=0o700)
+        owner = tmp_dir.stat().st_uid
+        settings = Settings(
+            output=OutputConfig(tmp_dir=str(tmp_dir), data_dir=str(tmp_path)),
+            profiles={"default": ProfileConfig()},
+        )
+        monkeypatch.setattr(os, "geteuid", lambda: owner + 1)
+        with pytest.raises(ConfigError, match=r"output\.tmp_dir"):
+            validate_settings_dirs(settings)
+
     def test_validate_deep_missing_dirs_under_writable_ancestor_pass(
         self, tmp_path: Path
     ) -> None:
@@ -3303,9 +3372,21 @@ class TestPathTypedSettings:
     def test_output_path_defaults_are_paths(self) -> None:
         """``tmp_dir``, ``data_dir`` and ``log_file`` default to Path values."""
         output = OutputConfig()
-        assert output.tmp_dir == Path(tempfile.gettempdir()) / "saneless"
+        assert output.tmp_dir == Path(tempfile.gettempdir()) / f"saneless-{os.getuid()}"
         assert isinstance(output.data_dir, Path)
         assert output.log_file == output.data_dir / "saneless.log"
+
+    def test_default_tmp_dir_is_computed_per_instance(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        The default ``tmp_dir`` follows the temp directory at construction.
+
+        It used to be computed once, at import, from whatever temp directory
+        the process saw then.
+        """
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        assert OutputConfig().tmp_dir == tmp_path / f"saneless-{os.getuid()}"
 
     def test_output_paths_given_as_strings_become_paths(self, tmp_path: Path) -> None:
         """A string from a config file or constructor is stored as a Path."""

@@ -10,9 +10,14 @@ autouse fixture that loosens it fails here rather than silently.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
+
+from saneless.config import OutputConfig
 
 # Captured at import, before any fixture runs, so it is the real home.
 _REAL_HOME = Path.home()
@@ -68,3 +73,44 @@ def test_no_test_module_names_a_fixed_temp_path() -> None:
         if fixed in path.read_text(encoding="utf-8")
     )
     assert offenders == []
+
+
+def test_hermetic_temp_dir_is_a_fresh_private_directory() -> None:
+    """``tempfile.tempdir`` is pinned to a new directory only this user can use."""
+    fake = Path(tempfile.gettempdir())
+    assert tempfile.tempdir == str(fake)
+    assert fake.is_dir()
+    assert list(fake.iterdir()) == []
+    assert fake.stat().st_mode & 0o077 == 0
+
+
+def test_hermetic_default_tmp_dir_is_under_the_fake_temp_dir() -> None:
+    """The default scratch directory lands in the test's temp dir, not in /tmp."""
+    fake = Path(tempfile.gettempdir())
+    assert OutputConfig().tmp_dir == fake / f"saneless-{os.getuid()}"
+
+
+def test_hermetic_import_of_config_touches_no_temp_dir() -> None:
+    """
+    Importing ``saneless.config`` does not resolve the temp directory.
+
+    ``tempfile.gettempdir()`` probes the file system on its first call and
+    caches the answer in ``tempfile.tempdir``, so a module that computes its
+    default at import leaves it set. A fresh interpreter shows it still unset.
+    """
+    result = subprocess.run(
+        ["/bin/sh", "-c", 'exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_CODE"'],
+        env={
+            **os.environ,
+            "SANELESS_TEST_PYTHON": sys.executable,
+            "SANELESS_TEST_CODE": (
+                "import tempfile, saneless.config; print(tempfile.tempdir)"
+            ),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "None"

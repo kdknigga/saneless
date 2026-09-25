@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -262,9 +263,16 @@ def hermetic_env(
 
     A test about the unset-XDG fallback deletes the variable itself.
 
+    The temp directory is faked too, by pinning ``tempfile.tempdir``: the
+    default ``output.tmp_dir`` is computed from ``tempfile.gettempdir()`` when
+    a ``Settings`` is built, so without this any test that builds default
+    settings and starts the app or a scan would create the real
+    ``/tmp/saneless-<uid>`` on the developer's machine. pytest's own temp
+    directories are already decided by then, so they are unaffected.
+
     Args:
         tmp_path: The test's own directory, which becomes the working directory.
-        tmp_path_factory: Source of a fresh fake home directory.
+        tmp_path_factory: Source of a fresh fake home and temp directory.
         monkeypatch: Undoes every change after the test.
 
     """
@@ -278,6 +286,7 @@ def hermetic_env(
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", _BROWSERS)
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path_factory.mktemp("tmp")))
 
 
 def build_settings(tmp_path: Path, **overrides: object) -> Settings:
