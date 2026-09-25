@@ -14,6 +14,7 @@ import re
 from typing import TYPE_CHECKING
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from saneless.config import ProfileConfig
@@ -22,8 +23,6 @@ from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-
-    from fastapi import FastAPI
 
     from saneless.config import Settings
 
@@ -111,8 +110,16 @@ def test_paperless_names_onerror_markup_is_escaped(
     assert response.text.count(_ESCAPED_NAME) >= renders
 
 
-def test_no_template_switches_escaping_off(app: FastAPI) -> None:
-    """No template marks a value safe, and autoescape is on for HTML."""
+def test_no_template_switches_escaping_off(client: TestClient) -> None:
+    """
+    No template marks a value safe, and autoescape is on for HTML.
+
+    The app is taken through ``client`` rather than built bare: only the
+    lifespan closes the job store ``create_app`` opens, and a connection left
+    to the garbage collector fails whichever later test it is finalized in.
+    """
+    app = client.app
+    assert isinstance(app, FastAPI)
     templates = sorted(TEMPLATE_DIR.rglob("*.html"))
     assert templates, f"no templates found under {TEMPLATE_DIR}"
 
