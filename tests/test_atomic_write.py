@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from saneless.atomic_write import replace_file_atomically
+from saneless.atomic_write import refused_mode_change, replace_file_atomically
 from saneless.exceptions import ConfigError
 
 _ORIGINAL = "[profiles.default]\nsource = 'Flatbed'\n"
@@ -819,3 +819,26 @@ class TestRealBindMount:
         assert "replaced" in completed.stdout
         assert host_file.read_text(encoding="utf-8") == "new = 1\n"
         assert sorted(entry.name for entry in host_dir.iterdir()) == ["saneless.toml"]
+
+
+class TestRefusedModeChange:
+    """
+    The public refusal predicate other modules share.
+
+    The consume-directory handoff sets its copy's mode and must not fail a
+    delivery on a filesystem that has no Unix modes, so it asks the same
+    question the config rewrite does.
+    """
+
+    @pytest.mark.parametrize(
+        "code",
+        [errno.EPERM, errno.EINVAL, errno.EOPNOTSUPP, errno.ENOTSUP],
+        ids=["EPERM", "EINVAL", "EOPNOTSUPP", "ENOTSUP"],
+    )
+    def test_refused_mode_change_is_true_for_a_refusal(self, code: int) -> None:
+        """A permission or filesystem refusal is a refusal, not a failure."""
+        assert refused_mode_change(OSError(code, os.strerror(code)))
+
+    def test_refused_mode_change_is_false_for_an_io_error(self) -> None:
+        """A real I/O failure is not mistaken for a refusal."""
+        assert not refused_mode_change(OSError(errno.EIO, os.strerror(errno.EIO)))
