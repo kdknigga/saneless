@@ -54,7 +54,7 @@ The failure keeps its own identity. The error a job records, and the line a comm
 
 Whether anything is kept turns on whether anyone chose to stop:
 
-- **An operator's cancel keeps nothing.** Aborting at the flip prompt, answering no, or Ctrl-C is a decision to stop, and saneless never prunes `failed/`, so a cancel that preserved pages would leave the operator files to clean up after choosing not to scan.
+- **An operator's cancel keeps nothing.** Aborting at the flip prompt, answering no, or Ctrl-C is a decision to stop, and saneless never prunes `failed/`, so a cancel that preserved pages would leave the operator files to clean up after choosing not to scan. That includes Ctrl-C pressed while a scan that has already failed is still keeping its pages: the keeping stops there, and anything not yet in `failed/` is lost.
 - **An interruption keeps the pages, like a failure.** A `saneless` command stopped by SIGTERM or SIGHUP -- `kill`, or a dropped SSH session -- or a server that stops mid-scan made no decision about the scan, so the pages already scanned are kept.
 
 Status updates cannot change how a scan ends. The progress the web UI shows, the first page's preview and the page count between manual-duplex passes are reported as the run goes, and a failure to record one of them -- a busy job database, say -- is logged as a warning while the scan carries on to its real outcome.
