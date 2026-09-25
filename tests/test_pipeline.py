@@ -18,7 +18,9 @@ from unittest.mock import MagicMock, patch
 
 import pikepdf
 import pytest
+import saneless.preservation as preservation_module
 from PIL import Image, ImageColor, ImageDraw
+from saneless.preservation import FAILED_DIR_WARN_THRESHOLD, warn_if_failed_dir_growing
 
 import saneless.pipeline as pipeline_module
 import saneless.scanner.sane_backend as sane_backend_mod
@@ -37,7 +39,6 @@ from saneless.pdf import assemble_pdf
 from saneless.pipeline import (
     _SPOOL_LABEL_A,
     _SPOOL_LABEL_B,
-    FAILED_DIR_WARN_THRESHOLD,
     SCAN_LABEL_BACK,
     SCAN_LABEL_FRONT,
     DeviceMemory,
@@ -52,7 +53,6 @@ from saneless.pipeline import (
     _open_workspace,
     _preserving,
     _resolve_device,
-    _warn_if_failed_dir_growing,
     run_pipeline,
 )
 from saneless.scanner.base import DeviceInfo, ScannerBackend
@@ -3810,7 +3810,7 @@ class TestFailedDirWarningFiresOncePerGuard:
         failure = PaperlessError("Upload failed")
 
         with (
-            caplog.at_level(logging.WARNING, logger="saneless.pipeline"),
+            caplog.at_level(logging.WARNING, logger="saneless.preservation"),
             pytest.raises(PaperlessError),
             _preserving(pdfs, failed_dir),
         ):
@@ -3859,7 +3859,7 @@ class TestFailedDirWarning:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-1")
 
         warnings = [
@@ -3880,7 +3880,7 @@ class TestFailedDirWarning:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-2")
 
         message = next(
@@ -3901,7 +3901,7 @@ class TestFailedDirWarning:
         """One preserved scan is not a problem and must not be announced."""
         failed_dir = _isolate_dirs(default_settings, tmp_path)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-3")
 
         assert len(list(failed_dir.glob("*.pdf"))) == 1
@@ -3926,7 +3926,7 @@ class TestFailedDirWarning:
         failed_dir = _isolate_dirs(default_settings, tmp_path)
         existing = _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
             _preserve_one_scan(default_settings, "job-growth-4")
 
         survivors = {path.name for path in failed_dir.glob("*.pdf")}
@@ -3973,7 +3973,9 @@ def _fail_assembly(message: str = "img2pdf refused the page") -> MagicMock:
         message: The failure text the error carries.
 
     Returns:
-        A MagicMock ready for ``patch("saneless.pipeline.assemble_pdf", ...)``.
+        A MagicMock ready for ``patch("saneless.pipeline.assemble_pdf", ...)``
+        (the main assembly) or ``patch("saneless.preservation.assemble_pdf",
+        ...)`` (the assembly of a preserved partial scan).
 
     """
     assembling = MagicMock()
@@ -4020,7 +4022,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
         scanner = _jamming_scanner(3, original)
 
         with (
-            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            patch("saneless.preservation.assemble_pdf", _fail_assembly()),
             pytest.raises(ScanError) as excinfo,
         ):
             run_pipeline(
@@ -4069,7 +4071,7 @@ class TestAPartialScanThatCannotAssembleKeepsThePageFiles:
         scanner.scan_pages.side_effect = _failing_in_pass_b(2, 1, original)
 
         with (
-            patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
+            patch("saneless.preservation.assemble_pdf", _fail_assembly()),
             pytest.raises(ScanError),
         ):
             run_pipeline(
@@ -4163,7 +4165,7 @@ class TestPreservationNamesWhatItDidKeep:
             raise PdfError(msg)
 
         with (
-            patch("saneless.pipeline.assemble_pdf", _fronts_then_refuse),
+            patch("saneless.preservation.assemble_pdf", _fronts_then_refuse),
             pytest.raises(ScanError) as excinfo,
         ):
             run_pipeline(
@@ -4201,7 +4203,7 @@ class TestPreservationNamesWhatItDidKeep:
         scanner.scan_pages.side_effect = spooling(
             [distinct_page(index) for index in range(3)]
         )
-        real_move = pipeline_module._move_private
+        real_move = preservation_module.move_private
         moved: list[Path] = []
 
         def _two_then_fail(src: Path, dst: Path) -> None:
@@ -4212,7 +4214,7 @@ class TestPreservationNamesWhatItDidKeep:
             moved.append(Path(dst))
             real_move(src, dst)
 
-        monkeypatch.setattr(pipeline_module, "_move_private", _two_then_fail)
+        monkeypatch.setattr(preservation_module, "move_private", _two_then_fail)
 
         with (
             patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
@@ -4427,6 +4429,124 @@ class TestAssemblyFailureKeepsThePageFiles:
         assert [item for item in scratch.iterdir() if item.is_dir()] == []
         assert len(_preserved_page_dirs(failed_dir)) == 1
 
+    def test_assembly_refuses_up_front_without_twice_the_spool_free(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        Too little room for the singles and the output: no PDF is attempted.
+
+        Assembly writes a single-page PDF per page and then the merged
+        document beside the spool, so it needs about twice the spooled bytes on
+        top of the reserve. Refusing before it starts keeps the disk from
+        filling half way through, and the pages go to failed/ as for any other
+        assembly failure.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        scanner = MagicMock(spec=ScannerBackend)
+        scanner.scan_pages.side_effect = spooling(
+            [distinct_page(index) for index in range(3)]
+        )
+        # Below the reserve alone, so below twice the spool plus the reserve.
+        monkeypatch.setattr(
+            preservation_module, "_free_bytes", lambda _directory: 1024 * 1024
+        )
+        assembling = MagicMock()
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", assembling),
+            pytest.raises(PdfError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=scanner,
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Room", job_id="job-room-1"
+                ),
+            )
+
+        assembling.assert_not_called()
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert sorted(entry.name for entry in kept[0].iterdir()) == [
+            "a-0001.png",
+            "a-0002.png",
+            "a-0003.png",
+        ]
+        message = str(excinfo.value)
+        assert "MB needed" in message
+        assert "1 MB free" in message
+        assert f"The 3 spooled page file(s) were preserved at {kept[0]}" in message
+        assert classify_error(excinfo.value) is ErrorCategory.ASSEMBLY
+
+    def test_mismatch_halves_are_refused_up_front_without_the_room(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Both halves together must fit the rule before either is assembled."""
+        failed_dir = _duplex_settings(default_settings, tmp_path)
+        monkeypatch.setattr(preservation_module, "_free_bytes", lambda _directory: 0)
+        assembling = MagicMock()
+        paperless = MagicMock()
+
+        with (
+            patch("saneless.pipeline.assemble_pdf", assembling),
+            pytest.raises(PdfError, match="MB needed"),
+        ):
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="No Room For Halves",
+                    job_id="job-room-2",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        assembling.assert_not_called()
+        paperless.upload_document.assert_not_called()
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        assert len(list(kept[0].iterdir())) == 5
+
+    def test_a_partial_refused_by_the_rule_keeps_the_page_files(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A jammed scan with no room for its partial PDF keeps the pages."""
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        monkeypatch.setattr(preservation_module, "_free_bytes", lambda _directory: 0)
+        assembling = MagicMock()
+
+        with (
+            patch("saneless.preservation.assemble_pdf", assembling),
+            pytest.raises(ScanError) as excinfo,
+        ):
+            run_pipeline(
+                scanner=_jamming_scanner(2, ScanError("Feeder jammed")),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default", title="No Room Jam", job_id="job-room-3"
+                ),
+            )
+
+        assembling.assert_not_called()
+        kept = _preserved_page_dirs(failed_dir)
+        assert len(kept) == 1
+        message = str(excinfo.value)
+        assert "MB needed" in message
+        assert f"The 2 spooled page file(s) were preserved at {kept[0]}" in message
+
 
 def _preserved_pages_dir(failed_dir: Path, name: str, page_bytes: int) -> Path:
     """
@@ -4470,8 +4590,8 @@ class TestFailedDirCountsPreservedPageDirectories:
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 1)
         _preserved_pages_dir(failed_dir, "20260101-000000-jobx-doc", 110 * 1024)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
-            _warn_if_failed_dir_growing(failed_dir)
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
+            warn_if_failed_dir_growing(failed_dir)
 
         message = next(
             record.getMessage()
@@ -4494,8 +4614,8 @@ class TestFailedDirCountsPreservedPageDirectories:
         _fill_failed_dir(failed_dir, FAILED_DIR_WARN_THRESHOLD - 2)
         _preserved_pages_dir(failed_dir, "20260101-000000-joby-doc", 1024)
 
-        with caplog.at_level(logging.WARNING, logger="saneless.pipeline"):
-            _warn_if_failed_dir_growing(failed_dir)
+        with caplog.at_level(logging.WARNING, logger="saneless.preservation"):
+            warn_if_failed_dir_growing(failed_dir)
 
         assert [
             record.getMessage()
@@ -4529,7 +4649,7 @@ class TestFailedDirCountsPreservedPageDirectories:
         monkeypatch.setattr(Path, "rglob", exploding_rglob)
 
         # The assertion is that this returns at all.
-        _warn_if_failed_dir_growing(failed_dir)
+        warn_if_failed_dir_growing(failed_dir)
 
     def test_failed_dir_counts_directories_never_raises_on_an_unreadable_dir(
         self,
@@ -4549,7 +4669,7 @@ class TestFailedDirCountsPreservedPageDirectories:
 
         monkeypatch.setattr(Path, "iterdir", exploding_iterdir)
 
-        _warn_if_failed_dir_growing(failed_dir)
+        warn_if_failed_dir_growing(failed_dir)
 
 
 def _mismatched_duplex_scanner(fronts: int = 3, backs: int = 2) -> MagicMock:
