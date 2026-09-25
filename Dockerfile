@@ -128,10 +128,16 @@ ENV PATH=/opt/venv/bin:$PATH
 # comes up owned by root and the app cannot write its job database. A local
 # build proving otherwise proves nothing: buildah was measured keeping the
 # change even with the order wrong.
+#
+# The chmod makes the directory owner-only. A fresh volume takes this mode
+# along with the owner, so the job database and preserved scans are private to
+# UID 1000 from the first start; saneless only creates the directory 0700 when
+# it is missing, and here it never is.
 RUN groupadd --gid 1000 saneless \
     && useradd --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin saneless \
     && mkdir -p /var/lib/saneless \
-    && chown 1000:1000 /var/lib/saneless
+    && chown 1000:1000 /var/lib/saneless \
+    && chmod 700 /var/lib/saneless
 # The app runs as UID 1000, whose home useradd was told not to create, so the
 # state defaults need a base that exists. saneless derives both its data
 # directory and its log file from XDG_STATE_HOME, so this one variable puts the

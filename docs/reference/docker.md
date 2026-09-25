@@ -203,7 +203,8 @@ See [Upgrading from a pre-`data_dir` release](../how-to/deploy-docker-compose.md
 ### Upgrading from an earlier release
 
 saneless now keeps what it writes under `/var/lib/saneless` to its own user.
-A new job database (`saneless.db`, with its `-wal` and `-shm` files) is created
+The image's `/var/lib/saneless` is `0700`, and a new volume starts with that
+mode. A new job database (`saneless.db`, with its `-wal` and `-shm` files) is created
 `0600`. `failed/` and each preserved page directory are created `0700`, and
 each preserved PDF and page file is `0600`.
 

@@ -2365,6 +2365,34 @@ def test_dockerfile_chowns_the_data_dir_before_declaring_the_volume() -> None:
     )
 
 
+def test_dockerfile_makes_the_data_dir_owner_only_before_declaring_the_volume() -> None:
+    """
+    The data directory is ``chmod 700`` in the image, **before** ``VOLUME``.
+
+    A fresh named or anonymous volume takes the mode of the image's directory
+    at that path, just as it takes the owner, so this line is what makes a new
+    deployment's job database and preserved scans unreadable to other local
+    users from the first start. saneless itself makes ``data_dir`` owner-only
+    only when it has to create it, and in the image the directory always
+    exists. An existing volume keeps its mode; the upgrade notes give the
+    command for that. The order matters for the same reason as the ``chown``.
+    """
+    name = DOCKERFILE.relative_to(REPO_ROOT)
+    lines = _significant_lines(DOCKERFILE)
+    chmods = [
+        number
+        for number, line in lines
+        if f"chmod 700 {DATA_DIR}" in line or f"chmod 0700 {DATA_DIR}" in line
+    ]
+    volumes = [number for number, line in lines if line.upper().startswith("VOLUME")]
+    assert chmods, f"{name} never makes {DATA_DIR} owner-only with chmod 700"
+    assert volumes, f"{name} has no VOLUME instruction"
+    assert max(chmods) < min(volumes), (
+        f"{name} sets the mode of {DATA_DIR} at line {max(chmods)}, after the "
+        f"VOLUME instruction at line {min(volumes)}, where a builder may discard it"
+    )
+
+
 def test_dockerfile_sets_a_workdir_in_the_runtime_stage() -> None:
     """
     The runtime stage anchors relative writes inside the durable volume (D-28).
