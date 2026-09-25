@@ -21,15 +21,15 @@ from typing import TYPE_CHECKING, NoReturn, get_args
 
 import pytest
 from fastapi.testclient import TestClient
+
+from saneless.web import checks_cache as checks_cache_module
+from saneless.web.app import create_app
+from saneless.web.routes import MetadataResource
 from saneless.web.throttle import (
     MIN_MANUAL_REFRESH_SECONDS,
     MinimumInterval,
     SingleFlightResult,
 )
-
-from saneless.web import checks_cache as checks_cache_module
-from saneless.web.app import create_app
-from saneless.web.routes import MetadataResource
 from tests.conftest import StubScannerBackend
 
 if TYPE_CHECKING:
@@ -384,6 +384,8 @@ def upstream(app: FastAPI, clock: _FakeClock) -> dict[str, _MetadataCounter]:
 class TestInvalidateFloor:
     """``POST /api/cache/invalidate`` refetches at most once per floor window."""
 
+    # The client runs the lifespan, whose shutdown closes the job store.
+    @pytest.mark.usefixtures("client")
     def test_create_app_installs_one_floor_per_resource(self, app: FastAPI) -> None:
         """Every invalidatable resource has its own floor, built by the app."""
         floors = app.state.invalidate_floors
@@ -480,6 +482,8 @@ def _shared_result(clock: _FakeClock) -> SingleFlightResult[object]:
 class TestPaperlessTestSingleFlight:
     """``GET /api/paperless/test`` shares one result for the floor window."""
 
+    # The client runs the lifespan, whose shutdown closes the job store.
+    @pytest.mark.usefixtures("client")
     def test_create_app_installs_a_shared_result(self, app: FastAPI) -> None:
         """The app builds the connection test's shared result itself."""
         assert isinstance(app.state.paperless_test_result, SingleFlightResult)

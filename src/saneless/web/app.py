@@ -42,6 +42,12 @@ from .cross_origin import CrossOriginGuard
 from .errors import install_error_handlers
 from .refresher import CheckRefresher
 from .routes import router
+from .throttle import (
+    MIN_MANUAL_REFRESH_SECONDS,
+    PAPERLESS_TEST_WAIT_SECONDS,
+    MinimumInterval,
+    SingleFlightResult,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -367,6 +373,16 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
     app.state.checks = checks_cache
     app.state.refresher = refresher
     app.state.templates = _build_templates()
+    # The two routes that send a token-bearing request to paperless-ngx on
+    # every call get a rate floor, decided in web/throttle.py: one refetch
+    # per resource per floor window, and one shared connection-test answer.
+    app.state.invalidate_floors = {
+        "tags": MinimumInterval(),
+        "correspondents": MinimumInterval(),
+    }
+    app.state.paperless_test_result = SingleFlightResult(
+        ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=PAPERLESS_TEST_WAIT_SECONDS
+    )
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)
