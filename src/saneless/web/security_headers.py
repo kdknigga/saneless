@@ -1,5 +1,5 @@
 """
-Send the same three security headers on every response.
+Send the same three security headers on every response, and forbid caching.
 
 ``Content-Security-Policy`` allows nothing that is not served by saneless
 itself: no inline script, no inline style, no foreign script, stylesheet,
@@ -14,6 +14,13 @@ and forms go.
 ``X-Frame-Options: DENY`` says what ``frame-ancestors`` says to browsers too
 old to read it.  ``X-Content-Type-Options: nosniff`` stops a browser guessing
 a content type the server did not send.
+
+``Cache-Control: no-store`` goes on every response except the static files.
+The page, the status poll and the history differ by browser: the one that
+started a job sees its real title and thumbnail, every other one a generic
+title.  A caching reverse proxy or shared cache that kept the owner's copy
+could hand it to anyone, so no dynamic response may be stored at all.  The
+files under ``/static/`` are the same for everyone and stay cacheable.
 
 The pages keep to the policy by construction: no template carries a ``style``
 attribute, a ``<style>`` element, an inline script, an event-handler attribute
@@ -31,7 +38,7 @@ from starlette.datastructures import MutableHeaders
 if TYPE_CHECKING:
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-__all__ = ["SECURITY_HEADERS", "SecurityHeaders"]
+__all__ = ["NO_STORE", "SECURITY_HEADERS", "STATIC_PATH", "SecurityHeaders"]
 
 SECURITY_HEADERS: Final[tuple[tuple[str, str], ...]] = (
     (
@@ -44,10 +51,19 @@ SECURITY_HEADERS: Final[tuple[tuple[str, str], ...]] = (
 )
 """The headers every response carries, as ``(name, value)`` pairs."""
 
+NO_STORE: Final[tuple[str, str]] = ("Cache-Control", "no-store")
+"""The header every response but a static file carries, as ``(name, value)``."""
+
+STATIC_PATH: Final = "/static"
+"""Where the static files are mounted; the only responses a cache may keep."""
+
 
 class SecurityHeaders:
     """
     Pure ASGI middleware that sets ``SECURITY_HEADERS`` on every HTTP response.
+
+    It also sets ``NO_STORE`` on every response whose path is not under
+    ``STATIC_PATH``.
 
     It is installed as the outermost of the application's own middleware, so
     every route, every static file, the router's 404 and 405 and the refusals
@@ -59,7 +75,8 @@ class SecurityHeaders:
     One response never reaches it: the 500 for an unhandled exception.
     Starlette's ``ServerErrorMiddleware`` sits outside all of the
     application's middleware and sends that response through its own outer
-    ``send``.  That is why ``render_error`` sets the same headers itself.
+    ``send``.  That is why ``render_error`` sets the same headers itself,
+    ``NO_STORE`` included.
 
     It is a plain ASGI class rather than ``BaseHTTPMiddleware``, which does
     not propagate ``contextvars`` changes and wraps streaming responses.
@@ -89,11 +106,17 @@ class SecurityHeaders:
             await self.app(scope, receive, send)
             return
 
+        path: str = scope["path"]
+        cacheable = path.startswith(f"{STATIC_PATH}/")
+
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
                 message.setdefault("headers", [])
                 headers = MutableHeaders(scope=message)
                 for name, value in SECURITY_HEADERS:
+                    headers[name] = value
+                if not cacheable:
+                    name, value = NO_STORE
                     headers[name] = value
             await send(message)
 

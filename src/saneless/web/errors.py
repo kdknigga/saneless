@@ -48,7 +48,7 @@ from saneless.vocabulary import (
     rejection_status_code,
 )
 
-from .security_headers import SECURITY_HEADERS
+from .security_headers import NO_STORE, SECURITY_HEADERS
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -251,8 +251,9 @@ def render_error(
     (ASVS V7), and a uniform affordance that sometimes lied about having
     detail would be worse than one that says what it has.
 
-    Every response built here carries ``SECURITY_HEADERS``.  Most would get
-    them from the ``SecurityHeaders`` middleware anyway, but the catch-all 500
+    Every response built here carries ``SECURITY_HEADERS`` and ``NO_STORE``:
+    an error is never worth caching.  Most would get them from the
+    ``SecurityHeaders`` middleware anyway, but the catch-all 500
     is sent by Starlette's ``ServerErrorMiddleware``, outside all of the
     application's middleware, so this is the only place that can give it them.
 
@@ -295,7 +296,7 @@ def render_error(
     # is sent past every middleware the application adds, the one that sets
     # them included.  That middleware sets rather than appends, so any other
     # error still carries each header once.
-    headers: dict[str, str] = dict(SECURITY_HEADERS)
+    headers: dict[str, str] = dict((*SECURITY_HEADERS, NO_STORE))
     headers.update(extra_headers or {})
     if status_code == _TOO_MANY_REQUESTS:
         headers["Retry-After"] = str(RETRY_AFTER_SECONDS)

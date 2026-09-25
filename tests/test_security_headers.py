@@ -167,6 +167,58 @@ def test_every_response_carries_the_security_headers_once(
         assert response.headers.get_list(name) == [value], name
 
 
+@pytest.mark.parametrize(
+    "probe",
+    [
+        pytest.param(_Probe("GET", "/", 200), id="index"),
+        pytest.param(
+            _Probe("GET", "/api/jobs/current/status", 200), id="current-status"
+        ),
+        pytest.param(_Probe("GET", "/api/jobs/current/status", 200, _HTMX), id="poll"),
+        pytest.param(_Probe("GET", "/api/jobs/history", 200, _HTMX), id="history"),
+        pytest.param(_Probe("GET", "/health", 200), id="health"),
+        pytest.param(
+            _Probe("GET", "/health", 421, {"Host": "evil.example"}),
+            id="foreign-host-421",
+        ),
+        pytest.param(_Probe("GET", "/nope", 404), id="not-found-404"),
+        pytest.param(_Probe("GET", _BOOM_PATH, 500), id="unhandled-500"),
+    ],
+)
+def test_every_dynamic_response_is_not_stored(
+    lenient_client: TestClient, probe: _Probe
+) -> None:
+    """
+    No dynamic response may be kept by a cache, the owner-only views included.
+
+    The page, the status poll and the history show the browser that started
+    a job its real title and thumbnail, and everyone else a generic title.
+    A caching proxy that stored the owner's copy could hand it to anyone.
+    """
+    response = lenient_client.request(
+        probe.method, probe.path, headers=probe.headers, data=probe.data
+    )
+    assert response.status_code == probe.status
+    assert response.headers.get_list("cache-control") == ["no-store"]
+
+
+def test_a_job_status_response_is_not_stored(
+    lenient_client: TestClient, app: FastAPI
+) -> None:
+    """The status of one job, the owner-gated view a poll fetches, is no-store."""
+    job = app.state.job_store.create_job("default", "Private Title")
+    response = lenient_client.get(f"/api/jobs/{job.id}/status", headers=_HTMX)
+    assert response.status_code == 200
+    assert response.headers.get_list("cache-control") == ["no-store"]
+
+
+def test_static_files_stay_cacheable(lenient_client: TestClient) -> None:
+    """The vendored scripts and stylesheets hold nothing private, so no no-store."""
+    response = lenient_client.get("/static/app.css")
+    assert response.status_code == 200
+    assert "no-store" not in response.headers.get("cache-control", "")
+
+
 def test_the_htmx_config_turns_off_eval_script_tags_and_indicator_styles(
     lenient_client: TestClient,
 ) -> None:

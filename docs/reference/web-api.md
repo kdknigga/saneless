@@ -417,6 +417,8 @@ Every response carries these three headers, whatever its status: pages, partials
 
 A reverse proxy may add a policy of its own. It cannot loosen this one, because a browser enforces every `Content-Security-Policy` it receives.
 
+**Nothing but a static file may be cached.** Every response except the files under `/static/` also carries `Cache-Control: no-store`, errors included. The page, the status poll and Job History differ by browser: the browser that started a job sees its real title and thumbnail, and every other browser sees a generic title (see [What an unauthenticated client can read](#what-an-unauthenticated-client-can-read)). A caching reverse proxy that kept the owner's copy could otherwise serve it to anyone. The static files are the same for everyone and stay cacheable.
+
 ### No API schema or interactive documentation
 
 **saneless serves no generated API schema and no interactive API documentation.** `GET /openapi.json`, `GET /docs` and `GET /redoc` answer `404` exactly like any unknown path, with the error body described under [Errors](#errors).

@@ -45,7 +45,7 @@ from .errors import install_error_handlers
 from .host_guard import HostGuard
 from .refresher import CheckRefresher
 from .routes import router
-from .security_headers import SecurityHeaders
+from .security_headers import STATIC_PATH, SecurityHeaders
 from .throttle import (
     MIN_MANUAL_REFRESH_SECONDS,
     PAPERLESS_TEST_WAIT_SECONDS,
@@ -449,7 +449,7 @@ def create_app(settings: Settings, scanner: ScannerBackend) -> FastAPI:
         ttl=MIN_MANUAL_REFRESH_SECONDS, wait_bound=PAPERLESS_TEST_WAIT_SECONDS
     )
 
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.mount(STATIC_PATH, StaticFiles(directory=str(STATIC_DIR)), name="static")
     app.include_router(router)
 
     return app
