@@ -30,7 +30,7 @@ The `run_pipeline()` function coordinates the full scan flow:
     1. **Pass A** -- scan the front sides through the feeder.
     2. **Flip wait** -- wait, for at most `flip_timeout_seconds`, for the operator to flip the stack and confirm. An abort cancels the job here (it ends `CANCELLED`) and a timeout fails it, both before pass B.
     3. **Pass B** -- scan the back sides, then reverse them and interleave them with the fronts. If the two passes disagree on page count, or either pass could not read a sheet, the fronts and backs are delivered as two separate PDFs instead, because position no longer proves which back belongs to which front. The `(backs)` PDF is reversed into sheet order. Its page N is the back of page N of `(fronts)` only when both passes fed every sheet exactly once; from a sheet that was skipped, missed or fed twice on, the two drift apart, which is exactly why they are not interleaved.
-4. **Filter empty pages** -- remove blank pages using the [dual-threshold algorithm](empty-page-detection.md).
+4. **Filter empty pages** -- remove blank pages using the ink-coverage rule (see [How Empty Page Detection Works](empty-page-detection.md)).
 5. **Assemble PDF** -- embed the spooled page files into a PDF document.
 6. **Upload to paperless-ngx** -- send the PDF with metadata via the REST API, or fall back to the [consume directory](consume-directory-fallback.md) if the API is unavailable.
 

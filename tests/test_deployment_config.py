@@ -3755,6 +3755,22 @@ def test_no_doc_page_names_a_removed_threshold_key() -> None:
     assert not offenders, "\n".join(offenders)
 
 
+def test_no_doc_page_describes_the_removed_blank_page_rule() -> None:
+    """
+    No page still calls blank-page detection the old two-threshold rule.
+
+    The mean and standard-deviation rule was replaced by ink coverage, so a
+    page describing detection by its old name sends the reader looking for
+    two thresholds that no longer exist.
+    """
+    offenders = [
+        str(page.relative_to(REPO_ROOT))
+        for page in _doc_pages()
+        if "dual-threshold" in page.read_text(encoding="utf-8").lower()
+    ]
+    assert not offenders, "\n".join(offenders)
+
+
 def test_first_web_ui_scan_names_real_history_labels() -> None:
     """
     Every word the walkthrough gives for the history Status column is a real label.
