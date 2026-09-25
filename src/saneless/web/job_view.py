@@ -78,11 +78,12 @@ _PATH_AFTER = r"(?![\w-]|\.\w)"
 _OTHER_PATH = re.compile(r"(?<![\w.<>-])/[^\s'\"<>]+")
 
 # What the pipeline writes directly before the path of something it kept in
-# the failed folder: "The scan was preserved at <path>", "The 3 page(s) ...
-# were preserved at <path>" and, after a partial failure, "Only <path> was
-# kept".  A preservation that kept nothing says "could NOT be preserved to"
-# instead, so none of these appears in its message.
-_KEPT_BEFORE = ("preserved at ", "Only ")
+# the failed folder.  Every sentence ``preservation.KeptGroup`` composes puts
+# it before its first path: "The scan was preserved at <path>", "The 3 scanned
+# page(s) were preserved at <path>", "2 of the 5 spooled page file(s) were
+# preserved at <path>, <path>".  A preservation that kept nothing says "could
+# NOT be preserved to" instead, so the phrase never appears in its message.
+_KEPT_BEFORE = ("preserved at ",)
 
 
 @dataclass(frozen=True, slots=True)

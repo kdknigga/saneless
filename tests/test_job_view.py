@@ -380,6 +380,28 @@ def test_nothing_preserved_naming_a_file_under_failed_is_not_kept(
         assert other.error == HIDDEN_ERROR_DETAIL, job.error
 
 
+def test_a_path_after_only_is_not_a_kept_file(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """
+    Only "preserved at " marks a kept file; "Only <path>" is somebody's words.
+
+    Preservation no longer writes "Only <path> was kept", so text that says
+    "Only" before a path under the failed folder -- a library's message, say
+    -- must not tell every viewer that part of the scan was kept.
+    """
+    failed_dir = settings.output.failed_dir
+    job = _job(
+        state=JobState.ERROR,
+        error_category=ErrorCategory.UPLOAD,
+        error=f"Upload failed: Only {failed_dir}/20260301-job-1-tax.pdf is readable",
+    )
+
+    other = _view(job, presented=_OTHER, settings=settings, tmp_path=tmp_path)
+
+    assert other.error == HIDDEN_ERROR_DETAIL
+
+
 def test_partly_preserved_is_reported_kept(settings: Settings, tmp_path: Path) -> None:
     """A preservation that kept some of the scan says something was kept."""
     failed_dir = settings.output.failed_dir
