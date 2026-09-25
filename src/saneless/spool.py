@@ -43,7 +43,7 @@ import shutil
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
-from .exceptions import ScanError, describe
+from .exceptions import ScanError, ScanInterrupted, describe
 from .pages import generate_thumbnail, measure_ink
 from .scanner.base import PageRecord, PageSink
 
@@ -221,7 +221,15 @@ class SpooledPageSink(PageSink):
         has the table), so a mode the spool refuses is refused before anything
         is measured or written, and the room check that follows estimates the
         page as it will be written rather than as it arrived.  Then the page
-        is written, and then measured.
+        is measured, in memory, and only then written, so that the record can
+        be appended the moment the page is on disk: a page file the records do
+        not name is a sheet the run's guard would not keep.
+
+        A signal that interrupts the write (``ScanInterrupted``) does not lose
+        the page either.  The sheet has already left the feeder and this image
+        is its only copy, so the write is finished and recorded before the
+        interruption goes on.  The signal handler has ignored both signals by
+        then, so nothing interrupts the second attempt.
 
         The page is measured exactly once, here, while it is already decoded,
         by ``pages.measure_ink``: its ink coverage and paper white go on the
@@ -257,7 +265,6 @@ class SpooledPageSink(PageSink):
 
         image = _normalise_mode(image, sequence)
         self._check_room_for(image, sequence, png_path)
-        self._write(image, sequence, png_path, dpi)
 
         measurement = measure_ink(image)
         record = PageRecord(
@@ -270,6 +277,12 @@ class SpooledPageSink(PageSink):
             paper_white=measurement.paper_white,
         )
 
+        try:
+            self._write(image, sequence, png_path, dpi)
+        except ScanInterrupted:
+            self._write(image, sequence, png_path, dpi)
+            self._records.append(record)
+            raise
         self._records.append(record)
 
         if sequence == 1 and self._thumbnail_callback is not None:

@@ -13,7 +13,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 import saneless.spool as spool_module
-from saneless.exceptions import ScanError
+from saneless.exceptions import ScanError, ScanInterrupted
 from saneless.pages import InkMeasurement, measure_ink
 from saneless.scanner.base import PageRecord, PageSink
 from saneless.spool import SpooledPageSink
@@ -613,3 +613,60 @@ class TestSpooledPageSinkAtomicWrite:
         assert isinstance(excinfo.value.__cause__, OSError)
         assert list(tmp_path.iterdir()) == []
         assert sink.records == ()
+
+
+class TestSpooledPageSinkInterruption:
+    """A page on disk is always a recorded page, whatever lands mid-way."""
+
+    def test_an_interrupted_write_is_finished_and_recorded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        A signal in the middle of the write still leaves the page recorded.
+
+        The sheet has left the feeder, so its image is the only copy: the
+        write is finished before the interruption goes on.
+        """
+        real_write = SpooledPageSink._write
+        calls: list[int] = []
+
+        def interrupted_once(
+            sink: SpooledPageSink,
+            image: Image.Image,
+            sequence: int,
+            png_path: Path,
+            dpi: int,
+        ) -> None:
+            calls.append(sequence)
+            if len(calls) == 1:
+                msg = "Interrupted by SIGTERM"
+                raise ScanInterrupted(msg, signum=15)
+            real_write(sink, image, sequence, png_path, dpi)
+
+        monkeypatch.setattr(SpooledPageSink, "_write", interrupted_once)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+
+        with pytest.raises(ScanInterrupted):
+            sink.add(_inked_page(), dpi=300)
+
+        (record,) = sink.records
+        assert record.path == tmp_path / "a-0001.png"
+        assert record.path.is_file()
+
+    def test_an_interruption_while_measuring_leaves_no_unrecorded_page(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Measured before it is written, so no page file is left unrecorded."""
+
+        def interrupted(_image: Image.Image) -> InkMeasurement:
+            msg = "Interrupted by SIGHUP"
+            raise ScanInterrupted(msg, signum=1)
+
+        monkeypatch.setattr(spool_module, "measure_ink", interrupted)
+        sink = SpooledPageSink(tmp_path, "a", 0)
+
+        with pytest.raises(ScanInterrupted):
+            sink.add(_inked_page(), dpi=300)
+
+        assert sink.records == ()
+        assert list(tmp_path.iterdir()) == []
