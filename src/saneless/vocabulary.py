@@ -303,8 +303,11 @@ class ExitCode(IntEnum):
     ``HANGUP`` (129) and ``TERMINATED`` (143) follow the shell's convention of
     128 plus the signal number, for a SIGHUP or a SIGTERM to a one-shot
     command.  They are an interruption rather than a cancel: nobody chose to
-    stop, so the pages already scanned are kept in ``failed/``, unlike 130,
-    which keeps nothing.  ``exit_code_for_signal`` chooses them.
+    stop, so the pages a scan already had are kept in ``failed/``, unlike 130,
+    which keeps nothing.  Not every interrupted command had pages -- any
+    command but ``serve`` exits this way -- so the ``Interrupted:`` line is
+    what says whether anything was kept, by naming its path.
+    ``exit_code_for_signal`` chooses them.
 
     Members are declared in value order, the order every table pinned to
     this enum lists them in.

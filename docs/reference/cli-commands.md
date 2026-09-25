@@ -28,11 +28,11 @@ Every command uses the same exit codes. Each failure prints one line to stderr, 
 | 6 | Saved to the consume folder without its title, tags or correspondent. The document was delivered, so do not scan it again |
 | 7 | Uploaded, with a warning on stderr: a sheet the scanner skipped, or manual-duplex front and back counts that differed. The document was delivered, so do not rescan the whole stack |
 | 8 | Every page looked blank to empty-page detection, so nothing was uploaded. The pages were kept in `failed/`, normally as one PDF; the error line names what was kept |
-| 129 | Interrupted by SIGHUP, for example a dropped SSH session. Pages already scanned were kept in `failed/` |
+| 129 | Interrupted by SIGHUP, for example a dropped SSH session. Pages a scan already had were kept in `failed/`, and the `Interrupted:` line names where |
 | 130 | Cancelled by the operator |
-| 143 | Interrupted by SIGTERM. Pages already scanned were kept in `failed/` |
+| 143 | Interrupted by SIGTERM. Pages a scan already had were kept in `failed/`, and the `Interrupted:` line names where |
 
-Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. `serve` keeps the web server's own handling, where SIGTERM is a graceful stop. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
+Every command exits 5 on an unexpected error, and 130 on Ctrl-C, except `serve` once the web server is running, where Ctrl-C is a graceful stop that exits 0. Every command but `serve` exits 129 on SIGHUP and 143 on SIGTERM (128 plus the signal number); unlike 130, these mean nobody chose to stop, so a scan keeps the pages it already had, and the `Interrupted:` line names where. No path on that line means nothing was kept: the command was not a scan, or it was stopped before its first page. A signal the command was started with ignored, such as SIGHUP under `nohup`, stays ignored. `serve` keeps the web server's own handling, where SIGTERM is a graceful stop. Each command's table below lists the codes it can return. See [Troubleshoot a Failed Scan](../how-to/troubleshoot-a-failed-scan.md) for what to check for each code.
 
 ---
 
@@ -62,9 +62,9 @@ saneless [--config PATH] [-v] scan [--title TEXT] [--profile NAME]
 | 6 | Saved to the consume folder, not uploaded: the document is there but its title, tags and correspondent were not applied; stdout reads `Saved to folder: <title>` |
 | 7 | Uploaded with a warning (a sheet the scanner skipped, or manual-duplex front and back counts that differed, uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr |
 | 8 | Every page looked blank to empty-page detection; nothing was uploaded, and the pages were kept in `failed/`, normally as one PDF (the error line names what was kept) |
-| 129 | Interrupted by SIGHUP (for example a dropped SSH session); pages already scanned were kept in `failed/` |
+| 129 | Interrupted by SIGHUP (for example a dropped SSH session); pages already scanned, if any, were kept in `failed/`, and the `Interrupted:` line names where |
 | 130 | Cancelled (no, Ctrl-D or Ctrl-C at the flip prompt, or Ctrl-C during the scan) |
-| 143 | Interrupted by SIGTERM; pages already scanned were kept in `failed/` |
+| 143 | Interrupted by SIGTERM; pages already scanned, if any, were kept in `failed/`, and the `Interrupted:` line names where |
 
 With neither `--title` nor a profile `title`, the document title is the scan's start time rendered in the server's local timezone with the zone named, for example `Scan 2026-03-22 09:30 CDT`. Set `TZ` on the server (or in `docker-compose.yml`) if that zone is wrong; a container reports UTC unless you do.
 

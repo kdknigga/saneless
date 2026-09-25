@@ -1217,6 +1217,22 @@ def test_the_deploy_guide_explains_the_stop_grace_period() -> None:
         )
 
 
+def test_the_signal_exit_codes_do_not_promise_a_kept_file() -> None:
+    """
+    After 129 or 143 a script is told to look where the line points, not blindly.
+
+    Every command but ``serve`` exits 129 or 143 on a signal, and most of them
+    -- or a scan stopped before its first page -- keep nothing, so the pages
+    say that a line naming no path kept nothing.
+    """
+    for path in (CLI_SCRIPTING, CLI_REFERENCE, TROUBLESHOOTING):
+        text, name = _read(path)
+        prose = " ".join(text.split())
+        assert "names no path" in prose or "No path on that line" in prose, (
+            f"{name} does not say what an Interrupted: line with no path means"
+        )
+
+
 def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
     """
     No live ``SANELESS_PAPERLESS__TOKEN=`` example is a detected placeholder.

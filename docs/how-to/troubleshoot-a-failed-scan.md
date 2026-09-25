@@ -342,8 +342,10 @@ The line starts with `Interrupted:`. Something outside saneless stopped the comm
 - **143** is SIGTERM: `kill`, a service manager or a container runtime stopped the command.
 
 Each code is 128 plus the signal number, the shell's convention. Nobody chose to stop the scan, so
-it is not treated as a cancel: the pages already scanned are kept as a PDF under `failed/` in the
-data directory, and the line names the path. Scan the rest of the stack, or the whole stack again,
+it is not treated as a cancel: the pages already scanned are kept, normally as a PDF, under
+`failed/` in the data directory, and the line names the path. A line that names no path kept
+nothing, because there was nothing to keep: the command was not a scan, or the scan was stopped
+before its first page. Scan the rest of the stack, or the whole stack again,
 and delete or upload the kept file yourself. The one exception is a signal that arrives while
 saneless waits for paperless-ngx to consume a document it has already accepted: the line then says
 the kept file had already been accepted, and names the task, so check paperless-ngx before
