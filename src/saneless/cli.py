@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import shutil
 import signal
 import socket
@@ -107,6 +108,7 @@ from .workspace import sweep_orphans
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import FrameType
+    from typing import TextIO
 
     from fastapi import FastAPI
 
@@ -575,7 +577,8 @@ def _echo_err(text: str, *, nl: bool = True) -> None:
     the dropped SSH session behind a SIGHUP -- answers every write with EIO,
     and an ``OSError`` raised here would escape as a traceback, or reach the
     guard as an unexpected error, instead of the code the command chose.  So a
-    failed write is logged and the exit code still stands.
+    failed write is logged here, and ``drain_dead_streams`` discards what it
+    left behind before the interpreter exits, so the exit code still stands.
 
     Args:
         text: The line to write.
@@ -605,6 +608,59 @@ def _echo_out(text: str) -> None:
         click.echo(text)
     except OSError:
         logger.info("Could not write to stdout: %r", text, exc_info=True)
+
+
+def _drain_dead_stream(stream: TextIO | None) -> None:
+    """
+    Discard what a standard stream can no longer write, if it cannot.
+
+    Args:
+        stream: ``sys.stdout`` or ``sys.stderr``; ``None`` when there is none.
+
+    """
+    if stream is None:
+        return
+    try:
+        stream.flush()
+    except ValueError:
+        return  # Closed already: shutdown will not flush it either.
+    except OSError:
+        pass
+    else:
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, stream.fileno())
+        finally:
+            os.close(devnull)
+    except OSError, ValueError:
+        logger.info("Could not detach a dead output stream", exc_info=True)
+        return
+    with contextlib.suppress(OSError):
+        stream.flush()  # The bytes the dead terminal refused now go nowhere.
+
+
+def drain_dead_streams() -> None:
+    """
+    Point a dead stdout or stderr at ``/dev/null`` before the interpreter exits.
+
+    A write that fails on a terminal that has gone away -- a hangup, or a
+    closed pipe -- leaves its bytes in the stream's buffer, and catching the
+    ``OSError`` does not remove them.  The interpreter flushes both streams
+    once more as it shuts down, that flush fails the same way, and CPython
+    then replaces the exit code the command chose with 120: a delivered scan
+    would stop exiting 0 and a hangup would stop exiting 129.  So each stream
+    that still cannot be flushed has its descriptor pointed at ``/dev/null``,
+    where the unwritten bytes, and anything written after them, go without
+    error.  A stream that flushes normally is left untouched.
+
+    It is called once, as the console entry point returns, so it covers every
+    write the command made: the ``_echo_out`` and ``_echo_err`` lines, and the
+    progress lines whose failure the pipeline only logs.
+    """
+    _drain_dead_stream(sys.stdout)
+    _drain_dead_stream(sys.stderr)
 
 
 def _log_failure(ctx: click.Context, exc: Exception) -> None:

@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import errno
 import os
+import pty
 import signal
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, override
 
@@ -903,3 +906,137 @@ def test_a_dead_terminal_cannot_turn_the_interruption_into_a_crash(
     assert any(line.startswith("Interrupted:") for line in refused)
     (kept,) = run.failed
     assert _kept_pages(kept) == _spooled_idat(scanner, (0, 1))
+
+
+# A real interpreter shutdown for each test below: the CliRunner tests above
+# never shut the interpreter down, and the defect they guard against only
+# shows there.
+_DEAD_OUTPUT_CHILD_SECONDS = 60
+
+# The console script's own shim, with the arguments travelling in the
+# environment, as a scan to a config file that does not exist: a config error.
+_CONFIG_ERROR_CHILD = """
+import os
+import sys
+
+from saneless import main
+
+sys.argv = ["saneless", "--config", os.environ["SANELESS_TEST_CONFIG"], "scan"]
+sys.exit(main())
+"""
+
+# The console script's shim around a command that writes a progress line (the
+# failure the pipeline only logs), then a delivered scan's closing line, and
+# exits 0 -- the command a hangup after delivery leaves writing to nothing.
+_DELIVERED_CHILD = """
+import contextlib
+import sys
+
+import click
+
+from saneless import cli as cli_module
+from saneless import main
+
+
+def delivered():
+    with contextlib.suppress(OSError):
+        click.echo("Uploading...")
+    cli_module._echo_out("Uploaded: Quarterly Report")
+    sys.exit(0)
+
+
+cli_module.cli = delivered
+sys.exit(main())
+"""
+
+
+@pytest.fixture(params=["pty", "pipe"])
+def dead_output(request: pytest.FixtureRequest) -> Generator[int]:
+    """
+    Open a descriptor every write to which fails, as a gone terminal's does.
+
+    ``pty``: a pseudo-terminal whose master is already closed, so writes to
+    it fail with EIO, as after a dropped SSH session.  ``pipe``: a pipe whose
+    read end is already closed, so writes fail with EPIPE, as under
+    ``saneless scan | head -c0``.
+
+    Yields:
+        The dead descriptor, open for writing.
+
+    """
+    if request.param == "pty":
+        try:
+            master, writer = pty.openpty()
+        except OSError as exc:
+            pytest.skip(f"no pseudo-terminal available: {exc}")
+        os.close(master)
+    else:
+        reader, writer = os.pipe()
+        os.close(reader)
+    yield writer
+    os.close(writer)
+
+
+def _exit_code_on_dead_output(dead: int, source: str, tmp_path: Path) -> int:
+    """
+    Run ``source`` in a child with stdout and stderr on ``dead``; its exit code.
+
+    The hangup is ignored, as ``nohup`` or a shell's ``trap '' HUP`` would,
+    so the dead terminal is the only thing that goes wrong.  Every argv
+    element is a literal and the per-run values travel in the environment, as
+    ``tests.conftest.leave_killed_workspace`` does, which keeps the call on
+    ruff's S603 allow-list without a suppression.
+
+    Args:
+        dead: The descriptor from the ``dead_output`` fixture.
+        source: The child's Python source.
+        tmp_path: The test's scratch directory.
+
+    Returns:
+        The exit code the child process really ended with.
+
+    """
+    env = {
+        **os.environ,
+        "SANELESS_TEST_PYTHON": sys.executable,
+        "SANELESS_TEST_SOURCE": source,
+        "SANELESS_TEST_CONFIG": str(tmp_path / "missing.toml"),
+    }
+    completed = subprocess.run(
+        [
+            "/bin/sh",
+            "-c",
+            'trap "" HUP; exec "$SANELESS_TEST_PYTHON" -c "$SANELESS_TEST_SOURCE"',
+        ],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=dead,
+        stderr=dead,
+        check=False,
+        timeout=_DEAD_OUTPUT_CHILD_SECONDS,
+    )
+    return completed.returncode
+
+
+def test_a_dead_terminal_leaves_the_real_exit_code_alone(
+    dead_output: int, tmp_path: Path
+) -> None:
+    """
+    The real CLI, its error line refused: the process still exits 2.
+
+    The refused line stays in stderr's buffer, and the interpreter flushes it
+    once more as it shuts down.  That flush must not replace the command's
+    exit code with CPython's 120.
+    """
+    code = _exit_code_on_dead_output(dead_output, _CONFIG_ERROR_CHILD, tmp_path)
+
+    assert code == ExitCode.CONFIG
+
+
+def test_a_delivered_scan_on_a_dead_terminal_still_exits_0(
+    dead_output: int, tmp_path: Path
+) -> None:
+    """A refused progress line and closing line: the process still exits 0."""
+    code = _exit_code_on_dead_output(dead_output, _DELIVERED_CHILD, tmp_path)
+
+    assert code == ExitCode.SUCCESS

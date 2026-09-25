@@ -357,7 +357,9 @@ A signal that arrives once the scan's outcome is settled -- the document already
 failure's pages already being kept -- does not interrupt it. The command finishes what it was doing
 and exits with that outcome's own code, so a delivered scan still exits 0 and a scanner fault still
 exits 1, with its line naming what was kept. After a hangup the terminal is gone, so those closing
-lines cannot be printed; they are logged at INFO instead, and the exit code still stands.
+lines cannot be printed; they are logged at INFO instead, and whatever could not be printed is
+discarded as the command exits, so the exit code still stands. The same holds when the output goes
+to a pipe that was closed early.
 
 Ctrl-C is different. It is a deliberate cancel, exits 130 and keeps nothing (see
 [Cancelled scans](#cancelled-scans-exit-130)). To run a long scan over SSH without a dropped
