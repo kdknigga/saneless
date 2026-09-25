@@ -1648,7 +1648,7 @@ class TestPlaceholderTokenRefusal:
         A refused submit owns no job, so it is handed no owner token (D-23).
 
         The guard sits ahead of the mint, which is what keeps a browser that
-        never started anything from collecting a session cookie.
+        never started anything from collecting an owner cookie.
         """
         with _appliance_with_credential(
             web_settings, web_scanner, _SHIPPED_PLACEHOLDER

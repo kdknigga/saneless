@@ -29,6 +29,7 @@ import json
 import re
 import socket
 import threading
+import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
@@ -2540,10 +2541,27 @@ class TestBlockedScanButtonInABrowser:
 
 _OWNER_COOKIE_NAME = "saneless_owner"
 
-# Playwright reports a session cookie -- one with neither Max-Age nor Expires --
-# with this expiry. It is the only way to tell a session cookie from a
-# persistent one through the cookie jar, and D-23 turns on the difference.
-_SESSION_COOKIE_EXPIRY = -1
+# The owner cookie lives a year (D-06), so a browser keeps its ownership across
+# restarts. Playwright reports a cookie's expiry in Unix seconds, and a session
+# cookie -- one with neither Max-Age nor Expires -- as -1, so an expiry more
+# than 364 days out proves the year-long lifetime arrived. The one day short of
+# a year is slack for the clock moving between the response and the check.
+_OWNER_COOKIE_MIN_LIFETIME_SECONDS = 364 * 24 * 60 * 60
+
+
+def _outlives_364_days(expires: float) -> bool:
+    """
+    Report whether a cookie jar's expiry is more than 364 days from now.
+
+    Args:
+        expires: The ``expires`` field Playwright reports, in Unix seconds.
+
+    Returns:
+        True for the owner cookie's year-long lifetime; False for a session
+        cookie (-1) or anything shorter.
+
+    """
+    return expires > time.time() + _OWNER_COOKIE_MIN_LIFETIME_SECONDS
 
 
 @pytest.mark.browser
@@ -2557,10 +2575,10 @@ class TestOwnerCookieInABrowser:
     so it is asserted here instead of reasoned about (APPL-09, D-23).
     """
 
-    def test_scan_submit_sets_a_session_owner_cookie(
+    def test_scan_submit_sets_a_persistent_owner_cookie(
         self, page: Page, scan_harness: _ScanHarness
     ) -> None:
-        """A real htmx submit leaves an HttpOnly, Lax, session cookie behind."""
+        """A real htmx submit leaves an HttpOnly, Lax, year-long cookie behind."""
         server = scan_harness.server
         server.scanner.gate.clear()
         page.goto(server.url)
@@ -2578,7 +2596,7 @@ class TestOwnerCookieInABrowser:
         assert cookie["httpOnly"] is True
         assert cookie["sameSite"] == "Lax"
         assert cookie["path"] == "/"
-        assert cookie["expires"] == _SESSION_COOKIE_EXPIRY
+        assert _outlives_364_days(cookie["expires"]), cookie["expires"]
         assert cookie["secure"] is False
         # HttpOnly proved from inside the page, not from the header: this is
         # the claim that the token cannot reach a script (T-30-59), and there
@@ -4506,11 +4524,9 @@ class TestTwoBrowsersOneStack:
                 cookie = owner_cookies[0]
                 assert cookie["httpOnly"] is True
                 assert cookie["sameSite"] == "Lax"
-                # -1 is how this Playwright reports a cookie carrying neither
-                # Max-Age nor Expires, and that is the only way a session
-                # cookie is distinguishable through a cookie jar -- which is
-                # what D-23 turns on: ownership ends when the browser does.
-                assert cookie["expires"] == _SESSION_COOKIE_EXPIRY
+                # The year-long lifetime, read through the jar: ownership
+                # outlives a browser restart rather than ending with it.
+                assert _outlives_364_days(cookie["expires"]), cookie["expires"]
                 assert [
                     c for c in viewer_ctx.cookies() if c["name"] == _OWNER_COOKIE_NAME
                 ] == []
