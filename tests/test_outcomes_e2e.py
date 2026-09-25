@@ -967,7 +967,9 @@ class TestClientSideMisconfigurationEndToEnd:
         wait_for_state: Callable[..., Job],
     ) -> None:
         """A token with a trailing space ends ERROR/CONFIG, token nowhere."""
-        token = "abc "
+        # Letters outside [0-9a-f], so no random job id in the DEBUG log can
+        # contain the stripped token by chance.
+        token = "tok-QzXwPadded "
         settings = _build_settings(tmp_path, _MISCONFIGURED)
         # caplog before the production configuration, so the root level it
         # restores at teardown is the one from before that lowered it.
