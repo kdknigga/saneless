@@ -16,8 +16,9 @@
      already gives #history-body td white-space: normal and word-break, so a
      two-line cell wraps with no new breakpoint; and a fifth column would
      compete with the Time column, which the zone name already widens.
-     The guard is the filter returning None, never truthiness. #}
-  <td>{{ job.title }}{% set counts = job | page_counts %}{% if counts %}<span class="page-counts">{{ counts }}</span>{% endif %}</td>
+     The guard is the filter returning None, never truthiness.  The pages
+     removed as blank are a further line of the same kind, not a warning. #}
+  <td>{{ job.title }}{% set counts = job | page_counts %}{% if counts %}<span class="page-counts">{{ counts }}</span>{% endif %}{% set removed = job | removed_pages %}{% if removed %}<span class="page-counts">{{ removed }}</span>{% endif %}</td>
   {# A warned upload is checked first and wears the fallback amber: it was
      uploaded, but it is not the clean success the green would claim. #}
   <td class="{% if job.state == JobState.DONE and job.warning %}status-fallback{% elif job.state == JobState.DONE %}status-done{% elif job.state == JobState.FALLBACK %}status-fallback{% elif job.state == JobState.ERROR %}status-error{% elif job.state == JobState.CANCELLED %}status-cancelled{% endif %}">

@@ -72,7 +72,12 @@
          with the warning beneath, so nobody throws away a stack that is missing
          a page.  It is a degraded success, not a failure, so like the fallback
          branch it is not announced as an alert.  The words come from the
-         outcome_line filter in both arms, never from this template. #}
+         outcome_line filter in both arms, never from this template.
+
+         The pages removed as blank follow the counts in the same muted style.
+         They are information, not a warning -- removed pages are not kept, so
+         the operator is told which to rescan -- and a DONE that removed blank
+         backs keeps its green tick. #}
       {% if job.warning %}
       <p class="status-fallback">&#9888; {{ job.state | outcome_line(job.warning, job.title) }}</p>
       <p class="status-fallback">{{ job.warning }}</p>
@@ -81,6 +86,8 @@
       {% endif %}
       {% set counts = job | page_counts %}
       {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
+      {% set removed = job | removed_pages %}
+      {% if removed %}<p class="page-counts">{{ removed }}</p>{% endif %}
       {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% elif job.state == JobState.FALLBACK %}
       <p class="status-fallback">&#8594; {{ job.state | outcome_line(job.warning, job.title) }}</p>
@@ -91,6 +98,8 @@
          scan's fate, the counts are only about its size. #}
       {% set counts = job | page_counts %}
       {% if counts %}<p class="page-counts">{{ counts }}</p>{% endif %}
+      {% set removed = job | removed_pages %}
+      {% if removed %}<p class="page-counts">{{ removed }}</p>{% endif %}
       {% if terminal_reload %}{% include "partials/terminal_reload.html" %}{% endif %}
     {% elif job.state == JobState.CANCELLED %}
       {# A cancel is a deliberate stop, not a failure, so it is not announced as an alert. #}

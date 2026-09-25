@@ -94,6 +94,7 @@ _COLUMNS: tuple[str, ...] = (
     "pages_uploaded",
     "warning",
     "owner_token",
+    "pages_removed_at",
 )
 """Every column the jobs table carries at the head schema version.
 
@@ -385,6 +386,16 @@ every job that fails before the scanner opens; ``NOT NULL DEFAULT 0`` would
 backfill history with a measured zero that never happened.
 """
 
+_V3_COLUMNS: tuple[tuple[str, str], ...] = (("pages_removed_at", "TEXT"),)
+"""The one ``(name, SQL type)`` pair migration step 3 adds to the jobs table.
+
+``pages_removed_at`` holds the positions of the pages blank-page detection
+removed, as a JSON array of 1-based scanned page numbers in document order.
+It is nullable and carries no ``DEFAULT``: ``NULL`` means "never recorded",
+which is true of every row written before this migration and of every job
+that recorded no result.  An empty array means "recorded, and none removed".
+"""
+
 
 def _migrate_v1(conn: sqlite3.Connection, db_path: str) -> None:
     """
@@ -442,14 +453,37 @@ def _migrate_v2(conn: sqlite3.Connection, db_path: str) -> None:
     logger.debug("Added the version 2 result columns to %s", db_path)
 
 
+def _migrate_v3(conn: sqlite3.Connection, db_path: str) -> None:
+    """
+    Add the removed-page positions column to a jobs table at version 2.
+
+    Every existing row reads ``NULL`` afterwards, which is the truth: none of
+    them recorded which pages were removed.
+
+    Args:
+        conn: Open connection to the job database.
+        db_path: Path the connection was opened on, for logging.
+
+    """
+    for name, sqltype in _V3_COLUMNS:
+        # Both interpolated values come from _V3_COLUMNS, a module-level
+        # literal no caller can reach, and SQL cannot parameterise a column
+        # name or a type name.
+        conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {sqltype}")
+    logger.debug("Added the version 3 removed-pages column to %s", db_path)
+
+
 _MIGRATIONS: tuple[Callable[[sqlite3.Connection, str], None], ...] = (
     _migrate_v1,
     _migrate_v2,
+    _migrate_v3,
 )
 """The ordered migration ladder, where ``index + 1`` is the version it produces.
 
-Both steps take the database path as well as the connection so the tuple stays
-homogeneous, even though only step 2 has anything to name in a failure.
+Every step takes the database path as well as the connection so the tuple
+stays homogeneous, even though only step 2 has anything to name in a failure.
+The downgrade guard in ``_open_connection`` reads its length, so a database a
+newer step has touched is refused by any release that lacks that step.
 """
 
 
@@ -628,6 +662,60 @@ def _open_connection(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _positions_json(positions: tuple[int, ...] | None) -> str | None:
+    """
+    Encode removed-page positions for the ``pages_removed_at`` column.
+
+    Args:
+        positions: The 1-based scanned page numbers, or None when not recorded.
+
+    Returns:
+        A JSON array such as ``"[2, 4]"``, or None so the column stays NULL.
+
+    """
+    if positions is None:
+        return None
+    return json.dumps(list(positions))
+
+
+def _parse_positions(raw: str | None, job_id: str) -> tuple[int, ...] | None:
+    """
+    Decode the ``pages_removed_at`` column, refusing anything but page numbers.
+
+    The column is only ever written by :meth:`JobStore.finish_job`, but the
+    database is a file on disk, so it is read defensively: a value that is not
+    a JSON array of integers, each at least 1, is logged and treated as never
+    recorded rather than rendered or allowed to break every history read.  A
+    JSON ``true`` is refused too, although Python counts ``bool`` as ``int``.
+
+    Args:
+        raw: The stored text, or None for NULL.
+        job_id: The row's id, named in the warning.
+
+    Returns:
+        The positions as a tuple of ints, or None when NULL or unreadable.
+
+    """
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        decoded = None
+    if isinstance(decoded, list) and all(
+        type(item) is int and item >= 1 for item in decoded
+    ):
+        return tuple(decoded)
+    # %r: the stored text came off disk, and a newline in it would otherwise
+    # start what reads as a second log line.
+    logger.warning(
+        "Job %s has an unreadable removed-pages value %r; ignoring it",
+        job_id,
+        raw,
+    )
+    return None
+
+
 @dataclass
 class Job:
     """
@@ -648,6 +736,9 @@ class Job:
         pages_scanned: Pages the scanner produced, once a scan has counted them.
         pages_removed: Pages discarded as blank, once a scan has counted them.
         pages_uploaded: Pages sent to paperless-ngx, once a scan has counted them.
+        removed_positions: The 1-based scanned page numbers blank-page detection
+            removed, in document order, once a scan has recorded them.  An
+            informational note, never a warning.
         warning: A note about something odd that did not fail the scan.
         owner_token: The browser token recorded with the submission, if one was.
 
@@ -667,6 +758,7 @@ class Job:
     pages_scanned: int | None = None
     pages_removed: int | None = None
     pages_uploaded: int | None = None
+    removed_positions: tuple[int, ...] | None = None
     warning: str | None = None
     owner_token: str | None = None
 
@@ -689,9 +781,9 @@ class JobResult:
     It exists to keep :meth:`JobStore.finish_job` within ruff's ``PLR0913``
     limit of five non-``self`` parameters.  :meth:`JobStore.create_job` sits
     exactly at that limit and passes, which is the evidence both that five is
-    the ceiling and that ``self`` is not counted; spelling these five facts out
+    the ceiling and that ``self`` is not counted; spelling these six facts out
     as individual parameters alongside ``job_id``, ``state``, ``error`` and
-    ``error_category`` would make nine.
+    ``error_category`` would make ten.
 
     The fields deliberately mirror :class:`saneless.pipeline.ScanResult`
     *without* importing it.  ``job.py`` importing ``pipeline.py`` would invert
@@ -710,6 +802,9 @@ class JobResult:
         pages_scanned: Pages the scanner produced.
         pages_removed: Pages discarded as blank.
         pages_uploaded: Pages sent to paperless-ngx.
+        removed_positions: The 1-based scanned page numbers removed as blank,
+            in document order, or None when the run did not record them.
+            Defaulted, so a caller with nothing to say about them need not.
 
     """
 
@@ -718,6 +813,7 @@ class JobResult:
     pages_scanned: int | None
     pages_removed: int | None
     pages_uploaded: int | None
+    removed_positions: tuple[int, ...] | None = None
 
 
 def _locked[**P, R](
@@ -833,6 +929,7 @@ class JobStore:
             pages_scanned=row["pages_scanned"],
             pages_removed=row["pages_removed"],
             pages_uploaded=row["pages_uploaded"],
+            removed_positions=_parse_positions(row["pages_removed_at"], row["id"]),
             warning=row["warning"],
             owner_token=row["owner_token"],
         )
@@ -895,7 +992,8 @@ class JobStore:
                     # A new job has recorded nothing yet, so every result
                     # column starts NULL -- deliberately, because NULL means
                     # "never recorded" rather than a measured zero.  finish_job
-                    # is the writer of these five, once the run ends.
+                    # is the writer of these, and of pages_removed_at, once the
+                    # run ends.
                     None,  # outcome
                     None,  # pages_scanned
                     None,  # pages_removed
@@ -914,6 +1012,7 @@ class JobStore:
                     # column already existed unused, and guessing a token
                     # grants nothing a LAN neighbour cannot already do.
                     owner_token,
+                    None,  # pages_removed_at -- finish_job's to write
                 ),
             )
             # Read the row back inside the same transaction, before the commit:
@@ -993,6 +1092,7 @@ class JobStore:
                     None,  # pages_uploaded
                     None,  # warning
                     None,  # owner_token
+                    None,  # pages_removed_at
                 ),
             )
             # Read back inside the same transaction, as create_job does, so the
@@ -1063,21 +1163,21 @@ class JobStore:
         """
         Record a job's terminal state together with everything the run produced.
 
-        The only writer of the five result columns, and the reason
+        The only writer of the six result columns, and the reason
         :meth:`update_state` is not.  ``update_state``'s SQL is an
         unconditional ``SET state, error, error_category``; naming the result
         columns there would blank them on every in-flight SCANNING /
         ASSEMBLING / UPLOADING transition, so the terminal write is a separate
         method rather than an extra argument.
 
-        State, outcome, warning, the three counts and the error all land in one
-        ``UPDATE``.  Recording ``ErrorCategory.REJECTED`` also trims the refused
+        State, outcome, warning, the three counts, the removed-page positions
+        and the error all land in one ``UPDATE``.  Recording ``ErrorCategory.REJECTED`` also trims the refused
         rows to their cap, in the same transaction.  The web request thread reads this row while the worker
         thread writes it, and a two-statement version would let it observe a
         job that had finished but had not yet recorded how.
 
-        Omitting ``result`` leaves ``outcome``, ``warning`` and all three page
-        counts NULL rather than zero.  NULL means "never recorded"; ``0`` means
+        Omitting ``result`` leaves ``outcome``, ``warning``, all three page
+        counts and the positions NULL rather than zero.  NULL means "never recorded"; ``0`` means
         "counted, and there were none".  A job that failed before the scanner
         opened has not measured zero pages, and writing ``0`` would make those
         two states indistinguishable for the life of the row.
@@ -1094,7 +1194,7 @@ class JobStore:
             self._conn.execute(
                 "UPDATE jobs SET state = ?, outcome = ?, warning = ?, "
                 "pages_scanned = ?, pages_removed = ?, pages_uploaded = ?, "
-                "error = ?, error_category = ? WHERE id = ?",
+                "pages_removed_at = ?, error = ?, error_category = ? WHERE id = ?",
                 (
                     state.value,
                     result.outcome.value if result and result.outcome else None,
@@ -1102,6 +1202,7 @@ class JobStore:
                     result.pages_scanned if result else None,
                     result.pages_removed if result else None,
                     result.pages_uploaded if result else None,
+                    _positions_json(result.removed_positions if result else None),
                     error,
                     error_category.value if error_category else None,
                     job_id,
