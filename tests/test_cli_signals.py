@@ -35,6 +35,7 @@ import pty
 import signal
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, override
 
@@ -46,7 +47,7 @@ from fastapi import FastAPI
 from saneless import pipeline as pipeline_module
 from saneless import preservation
 from saneless import workspace as workspace_module
-from saneless.cli import _INTERRUPTION, cli
+from saneless.cli import _INTERRUPTION, _interrupt_handler, _Interruption, cli
 from saneless.config import (
     OutputConfig,
     PaperlessConfig,
@@ -54,7 +55,7 @@ from saneless.config import (
     ScannerConfig,
     Settings,
 )
-from saneless.exceptions import ScanError
+from saneless.exceptions import ScanError, ScanInterrupted
 from saneless.vocabulary import ExitCode
 from tests.golden_support import (
     DOCUMENTS_PATH,
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     from types import FrameType
 
     import httpx2
+    from _typeshed import TraceFunction
     from click.testing import Result
 
     from saneless.scanner.base import PageSink, ScanBatch, ScanSettings
@@ -1040,3 +1042,104 @@ def test_a_delivered_scan_on_a_dead_terminal_still_exits_0(
     code = _exit_code_on_dead_output(dead_output, _DELIVERED_CHILD, tmp_path)
 
     assert code == ExitCode.SUCCESS
+
+
+# The longest a lock-free settle may take before the test calls it wedged.  It
+# is only a bound on a hang: a settle that works returns in microseconds, and
+# the join returns the moment it does.
+_SETTLE_BOUND_SECONDS = 10
+
+
+def _signal_at_opcode(action: Callable[[], None], at: int) -> tuple[bool, bool]:
+    """
+    Run ``action`` with the real signal handler landing at its ``at``-th opcode.
+
+    The handler is called from a trace function, at one exact bytecode inside
+    ``action`` or anything it calls, as a signal delivered at that instant
+    would run it.  Every instant is reachable this way, with no timing luck.
+
+    Args:
+        action: The call to interrupt.
+        at: The 1-based opcode, counted across every frame below ``action``,
+            at which the handler runs.
+
+    Returns:
+        Whether ``action`` ran that many opcodes, and whether the handler
+        raised ``ScanInterrupted`` out of it.
+
+    """
+    seen = 0
+
+    def tracer(frame: FrameType, event: str, _arg: object) -> TraceFunction:
+        """Count opcodes, and run the handler at the chosen one."""
+        nonlocal seen
+        frame.f_trace_opcodes = True
+        if event == "opcode":
+            seen += 1
+            if seen == at:
+                _interrupt_handler(signal.SIGTERM, None)
+        return tracer
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        action()
+    except ScanInterrupted:
+        return True, True
+    finally:
+        sys.settrace(previous)
+    return seen >= at, False
+
+
+def _returns(action: Callable[[], None]) -> bool:
+    """
+    Say whether ``action`` returns rather than blocking.
+
+    It runs on a daemon thread, so a call blocked on a lock the interrupted
+    attempt left held fails the test instead of hanging it.
+
+    Args:
+        action: The call to make.
+
+    Returns:
+        Whether it returned within the bound.
+
+    """
+    worker = threading.Thread(target=action, daemon=True)
+    worker.start()
+    worker.join(timeout=_SETTLE_BOUND_SECONDS)
+    return not worker.is_alive()
+
+
+def test_a_signal_anywhere_inside_settling_leaves_the_retry_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    However a signal splits the settling call, settling again still returns.
+
+    A signal that lands as the run settles raises, and the run settles again
+    to absorb it.  If the first attempt was holding a lock when the handler
+    raised, the lock stays held and the retry blocks forever, with both
+    signals already ignored.  So the handler is run at every opcode of the
+    settling call in turn, and after each the retry, and the context's
+    clear, must return.
+    """
+    interruption = _Interruption()
+    monkeypatch.setattr("saneless.cli._INTERRUPTION", interruption)
+    settled = interruption.settled
+    raised_at: list[int] = []
+    at = 1
+    while True:
+        reached, raised = _signal_at_opcode(settled.set, at)
+        if not reached:
+            break
+        if raised:
+            raised_at.append(at)
+        assert _returns(settled.set), f"handler at opcode {at}: the retry blocked"
+        assert settled.is_set()
+        assert _returns(interruption.clear), f"handler at opcode {at}: clear blocked"
+        assert not settled.is_set()
+        at += 1
+
+    # Before the flag is stored the handler raises; the test is not vacuous.
+    assert raised_at

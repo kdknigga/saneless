@@ -51,6 +51,7 @@ __all__ = [
     "PipelineEvent",
     "PipelineRequest",
     "ScanResult",
+    "Settled",
     "run_pipeline",
 ]
 
@@ -340,6 +341,45 @@ class DeviceMemory:
     last_id: str | None = None
 
 
+class Settled:
+    """
+    Whether a run's outcome is fixed: a flag with no lock in it.
+
+    It is set by the run and read by the CLI's signal handler, and both run on
+    the main thread; nothing ever waits on it.  So it takes no lock, and that
+    is the point.  A ``threading.Event`` takes one in ``set`` and
+    ``clear``, and a signal whose handler raises in the instant after the
+    lock is taken leaves that lock held for good: the next ``set`` -- the
+    very retry that lets a run settle despite the signal -- then blocks
+    forever, with both signals already ignored.  Here ``set`` is a single
+    attribute store, so a signal lands either before it, when the flag is
+    still clear and the retry simply sets it, or after it, when the flag is
+    set and the handler defers.
+    """
+
+    def __init__(self) -> None:
+        """Start clear: nothing is settled yet."""
+        self._flag = False
+
+    def set(self) -> None:
+        """Mark the outcome as fixed."""
+        self._flag = True
+
+    def clear(self) -> None:
+        """Forget it, once the command whose outcome it was is over."""
+        self._flag = False
+
+    def is_set(self) -> bool:
+        """
+        Say whether the outcome is fixed.
+
+        Returns:
+            Whether ``set`` was called since the last ``clear``.
+
+        """
+        return self._flag
+
+
 @dataclass
 class PipelineRequest:
     """
@@ -397,8 +437,10 @@ class PipelineRequest:
     # only undo what the run did, by abandoning the pages half way into
     # failed/ or by turning a delivered document into a failure, so the CLI's
     # signal handler defers a SIGTERM or SIGHUP while it is set.  The worker,
-    # whose stop never raises into the run, passes none.
-    settled: threading.Event | None = None
+    # whose stop never raises into the run, passes none.  A ``Settled``, not a
+    # ``threading.Event``, because a signal can land inside the call that
+    # sets it.
+    settled: Settled | None = None
 
 
 @dataclass
@@ -1253,6 +1295,8 @@ class _PipelineRun:
 
         The signal handler ignores both signals before it raises, so no
         second one can follow this, and the run is settled here after all.
+        Setting it again is safe because ``Settled`` holds no lock that the
+        interrupted attempt could have left taken.
 
         Args:
             late: The interruption raised as the run settled.

@@ -75,6 +75,7 @@ from .pipeline import (
     FlipCoordinator,
     PipelineEvent,
     PipelineRequest,
+    Settled,
     run_pipeline,
 )
 from .private_dirs import make_private_dir
@@ -206,7 +207,10 @@ class _Interruption:
     Whether a SIGTERM or SIGHUP has reached the running command, and which.
 
     Set by the signal handler on the main thread and read by the flip prompt's
-    thread, which is why it is an ``Event`` and not a bare flag.
+    thread, which is why the signal itself is an ``Event`` and not a bare
+    flag.  On the main thread that Event's lock is taken only inside the
+    handler, and in ``clear``, which runs only while the handler is not
+    installed.
 
     ``settled`` is the scan's ``PipelineRequest.settled``: the run sets it once
     its outcome is fixed, and the guard sets it as it starts reporting a
@@ -214,7 +218,9 @@ class _Interruption:
     raised, because raising it could only undo what is already done -- abandon
     a failure's pages half way into ``failed/``, or turn a delivered document
     into an interruption.  The command finishes and exits with its own
-    outcome's code.
+    outcome's code.  It is a lock-free ``Settled``, not an ``Event``: it is
+    set on the main thread, where the handler that reads it can interrupt the
+    very call that sets it.
     """
 
     def __init__(self) -> None:
@@ -222,7 +228,7 @@ class _Interruption:
         self._received = threading.Event()
         self.signum: int | None = None
         self.deferred: int | None = None
-        self.settled = threading.Event()
+        self.settled = Settled()
 
     def record(self, signum: int) -> None:
         """
