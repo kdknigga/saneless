@@ -2540,6 +2540,41 @@ class TestResponseTextIsRedacted:
         ]
         assert bodies == ["Paperless error body (403): Invalid token header: Token ***"]
 
+    @pytest.mark.usefixtures("debug_capture")
+    def test_full_body_logged_at_debug_carries_no_control_characters(
+        self, sample_pdf: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """
+        The DEBUG copy of an error body shows escape sequences as text.
+
+        ``serve`` streams its log to the terminal, so a body carrying ESC from a
+        hostile server or proxy must not reach it live.  The body is still logged
+        in full, with each control character written out.
+        """
+
+        def hostile_body(_request: httpx2.Request) -> httpx2.Response:
+            return httpx2.Response(403, text="bad\x1b[2Jgateway\x07\nline two")
+
+        client = PaperlessClient(
+            url="http://paperless:8000",
+            token="abc123",
+            transport=_make_transport(hostile_body),
+        )
+        try:
+            with pytest.raises(PaperlessError):
+                client.upload_document(sample_pdf, title="Echo")
+        finally:
+            client.close()
+        bodies = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.DEBUG
+            and record.getMessage().startswith("Paperless error body")
+        ]
+        assert bodies == [
+            "Paperless error body (403): bad\\x1b[2Jgateway\\x07\\nline two"
+        ]
+
 
 def _inner_token_failure(token: str) -> httpx2.ConnectError:
     """

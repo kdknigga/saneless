@@ -482,10 +482,12 @@ def _render_error_body(response: httpx2.Response, token: str) -> str:
         carried nothing.
 
     """
+    # Each control character is written out rather than dropped, so the body
+    # stays whole for diagnosis without reaching a terminal as live escapes.
     logger.debug(
         "Paperless error body (%s): %s",
         response.status_code,
-        _strike(response.text, token),
+        neutralise_controls(_strike(response.text, token)),
     )
     try:
         text = _json_error_text(response.json())
