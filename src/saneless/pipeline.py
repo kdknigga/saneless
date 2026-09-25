@@ -8,7 +8,9 @@ is automatically cleaned up on success or failure.
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
+import os
 import shutil
 import tempfile
 import threading
@@ -632,6 +634,50 @@ def _best_effort_chmod(path: Path, mode: int) -> None:
         logger.debug("Not setting the mode of %s: %s", path, exc.strerror)
 
 
+def _move_private(source: Path, destination: Path) -> None:
+    """
+    Move one file to ``destination`` so that nobody else can read it on the way.
+
+    A rename keeps the mode the caller already gave the source.  Across
+    filesystems a rename fails with ``EXDEV``, and ``shutil.move`` would then
+    copy through ``copy2``, which creates the destination with the umask's
+    mode and applies the source's only once the whole document is written:
+    inside a ``failed/`` an earlier release left at 0755, the scan would be
+    readable by every local user for the length of the copy.  So the copy is
+    made here instead, into a file created 0600, and the source is removed
+    only once the copy is complete.  A copy that fails is removed, so no
+    truncated document is left behind.  Like ``rename``, an existing
+    destination is replaced; every name is keyed on the job id.
+
+    Args:
+        source: The file to move, inside the job workspace.
+        destination: Its full path in the durable directory, never the bare
+            directory.
+
+    Raises:
+        OSError: If the file could be neither renamed nor copied.
+
+    """
+    try:
+        source.rename(destination)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    else:
+        return
+    destination.unlink(missing_ok=True)
+    descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as copy, source.open("rb") as original:
+            shutil.copyfileobj(original, copy)
+            copy.flush()
+            os.fsync(copy.fileno())
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    source.unlink()
+
+
 def _warn_if_failed_dir_growing(failed_dir: Path) -> None:
     """
     Log one WARNING when preserved scans have piled up in ``failed_dir``.
@@ -756,17 +802,14 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
     weighed and rejected for exactly that reason; narrowing it later would be a
     change of behaviour, not a tidy-up, so please do not relitigate it here.
 
-    The relocation goes through ``shutil`` rather than a bare rename:
+    The relocation goes through ``_move_private`` rather than a bare rename:
     ``data_dir`` and ``tmp_dir`` are independent settings and may sit on
     different filesystems, where ``Path.rename`` raises ``EXDEV``, while
-    ``shutil`` falls back to a copy plus a drop of the source. The destination is always a full
-    explicit path, never the bare directory -- handed a directory, ``shutil``
-    raises ``shutil.Error`` on a basename collision, and ``shutil.Error`` does
-    **not** inherit from ``OSError``, so it would escape the handler below and
-    mask the delivery failure with a confusing traceback. The explicit-path
-    form renames straight through; its silent-overwrite behaviour is a
-    non-event because :func:`saneless.pdf.build_pdf_filename` keys every name
-    on the job id.
+    ``_move_private`` falls back to an owner-only copy plus a drop of the
+    source. The destination is always a full explicit path, never the bare
+    directory, and every failure is an ``OSError`` the handler below catches.
+    Replacing an existing file of the same name is a non-event because
+    :func:`saneless.pdf.build_pdf_filename` keys every name on the job id.
 
     Args:
         pdf_paths: The assembled PDFs to rescue, in the order they should be
@@ -804,10 +847,11 @@ def _preserving(pdf_paths: Sequence[Path], failed_dir: Path) -> Generator[None]:
                 # Owner-only before the move, not after. The source sits in the
                 # 0700 workspace, so nobody else can open it in the meantime; a
                 # same-filesystem move is a rename, which keeps the mode, and a
-                # cross-filesystem one copies it through ``shutil.copy2``. The
-                # other preservation sites rely on the same reasoning.
+                # cross-filesystem one copies into a file created 0600 (see
+                # ``_move_private``). The other preservation sites rely on the
+                # same reasoning.
                 _best_effort_chmod(pdf_path, 0o600)
-                shutil.move(pdf_path, destination)
+                _move_private(pdf_path, destination)
                 destinations.append(destination)
             # Once, after the loop, so the count reflects the finished state.
             # The duplex-mismatch recovery passes two PDFs under a single
@@ -922,13 +966,11 @@ def _preserve_partial_passes(
     and ``_drop_empty_pages`` would additionally raise "All pages were blank"
     on an all-faint batch and destroy the very evidence being preserved.
 
-    Every move names an explicit destination path rather than the bare
-    directory, for the reason ``_preserving``'s docstring sets out at length:
-    handed a directory, ``shutil`` raises ``shutil.Error`` on a basename
-    collision, and ``shutil.Error`` does not inherit from ``OSError``, so it
-    would escape the caller's handler and mask the scan failure.
-    ``shutil`` rather than ``Path.rename`` because ``tmp_dir`` and ``data_dir``
-    are independent settings that may sit on different filesystems.
+    Every move goes through ``_move_private`` to an explicit destination
+    path, for the reasons ``_preserving``'s docstring sets out: ``tmp_dir``
+    and ``data_dir`` are independent settings that may sit on different
+    filesystems, and the copy made across them must never be readable by
+    anyone else.
 
     Args:
         ledger: The passes to preserve, and the resolution to assemble at.
@@ -959,7 +1001,7 @@ def _preserve_partial_passes(
         destination = failed_dir / partial_pdf.name
         # Owner-only before the move, for the reason ``_preserving`` gives.
         _best_effort_chmod(partial_pdf, 0o600)
-        shutil.move(partial_pdf, destination)
+        _move_private(partial_pdf, destination)
         destinations.append(destination)
 
 
@@ -1084,11 +1126,10 @@ def _move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> N
     it: the assembly ``_preserving_page_files`` wraps, and the *partial*
     assembly ``_preserving_partial_scan`` falls back to it from.
 
-    Each page moves to its own **explicit** destination path rather than into
-    the bare directory, for the reason ``_preserving``'s docstring sets out:
-    ``shutil.Error`` does not inherit from ``OSError`` and would escape both
-    callers' handlers. ``shutil`` rather than ``Path.rename`` because
-    ``tmp_dir`` and ``data_dir`` may be on different filesystems.
+    Each page moves to its own **explicit** destination path through
+    ``_move_private``, for the reasons ``_preserving``'s docstring sets out:
+    ``tmp_dir`` and ``data_dir`` may be on different filesystems, and the copy
+    made across them must never be readable by anyone else.
 
     Args:
         spool_dir: The job's spool, inside the workspace that is about to be
@@ -1115,7 +1156,7 @@ def _move_page_files(spool_dir: Path, destination: Path, moved: list[Path]) -> N
         target = destination / page_file.name
         # Owner-only before the move, for the reason ``_preserving`` gives.
         _best_effort_chmod(page_file, 0o600)
-        shutil.move(page_file, target)
+        _move_private(page_file, target)
         moved.append(target)
     # Once, after the loop, so the count reflects the finished state -- the
     # same reason _preserving calls it there.

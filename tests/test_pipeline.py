@@ -12,7 +12,7 @@ import stat
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 from unittest.mock import MagicMock, patch
 
 import pikepdf
@@ -74,6 +74,7 @@ from tests.golden_support import distinct_page, embedded_streams, png_idat
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
+    from typing import BinaryIO
 
     from saneless.config import Settings
     from saneless.scanner.base import PageRecord, PageSink, ScanBatch, ScanSettings
@@ -3988,18 +3989,18 @@ class TestPreservationNamesWhatItDidKeep:
         scanner.scan_pages.side_effect = spooling(
             [distinct_page(index) for index in range(3)]
         )
-        real_move = shutil.move
+        real_move = pipeline_module._move_private
         moved: list[Path] = []
 
-        def _two_then_fail(src: Path, dst: Path) -> object:
+        def _two_then_fail(src: Path, dst: Path) -> None:
             """Move the first two pages for real, then fail on the third."""
             if len(moved) == 2:
                 msg = "the volume went away"
                 raise OSError(msg)
             moved.append(Path(dst))
-            return real_move(src, dst)
+            real_move(src, dst)
 
-        monkeypatch.setattr(pipeline_module.shutil, "move", _two_then_fail)
+        monkeypatch.setattr(pipeline_module, "_move_private", _two_then_fail)
 
         with (
             patch("saneless.pipeline.assemble_pdf", _fail_assembly()),
@@ -5286,6 +5287,54 @@ class TestPreservedFilesArePrivate:
         assert len(preserved) == 1
         assert crossed == [str(preserved[0])]
         assert _mode(preserved[0]) == _PRIVATE_FILE_MODE
+
+    def test_preserved_pdf_is_private_while_it_crosses_filesystems(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        The copy a cross-filesystem move makes is 0600 before any byte lands.
+
+        A ``failed/`` an earlier release made 0755 lets every local user reach
+        the files inside, so a copy created with the umask's mode would be
+        readable by all of them for as long as the document takes to copy.
+        The kernel's fast copies, ``copy_file_range`` and ``sendfile``, are
+        refused here so that every copy, the standard library's included,
+        goes through ``copyfileobj``, where the mode of the file being
+        written can be read.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.mkdir(parents=True)
+        failed_dir.chmod(0o755)
+        real_rename = os.rename
+        real_copyfileobj = shutil.copyfileobj
+        modes: list[int] = []
+
+        def cross_device(src: str | Path, dst: str | Path) -> None:
+            if Path(dst).parent == failed_dir:
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+            real_rename(src, dst)
+
+        def no_fast_copy(*_args: object, **_kwargs: object) -> NoReturn:
+            raise OSError(errno.ENOTSOCK, os.strerror(errno.ENOTSOCK))
+
+        def recording(source: BinaryIO, target: BinaryIO, *args: int) -> None:
+            modes.append(stat.S_IMODE(os.fstat(target.fileno()).st_mode))
+            real_copyfileobj(source, target, *args)
+
+        monkeypatch.setattr(os, "rename", cross_device)
+        monkeypatch.setattr(os, "copy_file_range", no_fast_copy, raising=False)
+        monkeypatch.setattr(os, "sendfile", no_fast_copy)
+        monkeypatch.setattr(shutil, "copyfileobj", recording)
+
+        _fail_the_upload(default_settings, "job-mode-6")
+
+        [preserved] = list(failed_dir.glob("*.pdf"))
+        assert modes == [_PRIVATE_FILE_MODE]
+        assert _mode(preserved) == _PRIVATE_FILE_MODE
+        assert preserved.read_bytes().startswith(b"%PDF")
 
     def test_partial_pdf_mode_is_private(
         self, default_settings: Settings, tmp_path: Path
