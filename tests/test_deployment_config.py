@@ -1233,6 +1233,35 @@ def test_the_signal_exit_codes_do_not_promise_a_kept_file() -> None:
         )
 
 
+def test_the_signal_exit_codes_admit_a_settled_outcome_and_failed_keeping() -> None:
+    """
+    129 and 143 are not promised for every signal, nor a kept file for each.
+
+    A signal that arrives once a scan's outcome is settled leaves the command
+    its own exit code, and a scan interrupted while ``failed/`` cannot be
+    written keeps nothing there: every page that documents the codes says so,
+    and no 129 or 143 table row claims the pages were kept unconditionally.
+    """
+    for path in (CLI_SCRIPTING, CLI_REFERENCE, TROUBLESHOOTING):
+        text, name = _read(path)
+        prose = " ".join(text.split())
+        assert "outcome's own code" in prose, (
+            f"{name} does not say a settled outcome keeps its own exit code"
+        )
+    overclaims = [
+        f"{path.name}:{number}: {line.strip()}"
+        for path in (CLI_SCRIPTING, CLI_REFERENCE, TROUBLESHOOTING)
+        for number, line in _numbered(path)
+        if line.startswith(("| 129 |", "| 143 |"))
+        and "kept in `failed/`" in line
+        and "when they could be" not in line
+    ]
+    assert not overclaims, (
+        "a 129/143 row says the pages were kept whether or not they could be:\n"
+        + "\n".join(overclaims)
+    )
+
+
 def test_no_shipped_example_token_is_a_detected_placeholder() -> None:
     """
     No live ``SANELESS_PAPERLESS__TOKEN=`` example is a detected placeholder.

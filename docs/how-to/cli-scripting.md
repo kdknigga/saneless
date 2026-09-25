@@ -167,13 +167,14 @@ saneless uses distinct exit codes so scripts can handle different failure modes:
 | 6 | Saved to the consume folder | paperless-ngx could not be reached, so the PDF went to the consume folder without its title, tags or correspondent; stdout reads `Saved to folder: <title>`. The document was delivered: do not rescan |
 | 7 | Uploaded with a warning | A sheet the scanner skipped, or manual-duplex front and back counts that differed (uploaded as two documents); stdout reads `Uploaded with a warning: <title>` and the warning is on stderr. The document was delivered: do not rescan the whole stack |
 | 8 | Every page looked blank | Empty-page detection judged every page blank, so nothing was uploaded; the pages were kept in `failed/`, normally as one PDF, and stderr names what was kept. The scanner worked: lower `empty_page_coverage_threshold` or turn detection off if the pages are not blank |
-| 129 | Interrupted by SIGHUP | The terminal or SSH session running the command went away. Pages a scan already had were kept in `failed/`, and the `Interrupted:` line names where |
+| 129 | Interrupted by SIGHUP | The terminal or SSH session running the command went away. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 | 130 | Cancelled by the operator | Answered no, Ctrl-D or Ctrl-C at the flip prompt; Ctrl-C during a one-shot command |
-| 143 | Interrupted by SIGTERM | `kill`, a service manager or a container runtime stopped the command. Pages a scan already had were kept in `failed/`, and the `Interrupted:` line names where |
+| 143 | Interrupted by SIGTERM | `kill`, a service manager or a container runtime stopped the command. Pages a scan already had were kept in `failed/` when they could be; the `Interrupted:` line says what was kept, or where the pages were left |
 
 130 means someone chose to stop, so nothing was kept. 129 and 143 (128 plus the signal number)
 mean the command was stopped from outside without anyone choosing to discard the scan, so a scan
-that had pages keeps them in `failed/`, and its `Interrupted:` line on stderr names the path. No
+that had pages keeps them in `failed/` when it can, and its `Interrupted:` line on stderr names
+the path, or says where the pages were left when they could not be kept. No
 path on that line means nothing was kept: the command was not a scan, or the scan was stopped
 before its first page. So after 129 or 143, look for a kept file only where that line names one.
 A signal that arrives once a scan's outcome is settled -- the document delivered, or a failure's
