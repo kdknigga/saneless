@@ -695,6 +695,31 @@ def _keep_file(pdf: Path, failed_dir: Path) -> Path:
     raise FileExistsError(errno.EEXIST, msg)
 
 
+def _discard_unkept(pdf: Path | None) -> None:
+    """
+    Delete a PDF built for ``failed/`` that could not be moved there.
+
+    It was built from the spooled pages, which are still in the spool: the
+    page-file fallback keeps them, or the workspace is left in place for the
+    next sweep.  So the PDF is only a copy, and left in the workspace it would
+    be joined by another whole copy of the document on every sweep that
+    failed the same way.  Never an assembled PDF from a delivery, which can be
+    the only copy.  A failure to delete it is logged and otherwise ignored.
+
+    Args:
+        pdf: The PDF, inside the workspace, or None when none was built.
+
+    """
+    if pdf is None:
+        return
+    try:
+        pdf.unlink(missing_ok=True)
+    except OSError:
+        logger.warning(
+            "Could not delete %s, a PDF that could not be kept", pdf, exc_info=True
+        )
+
+
 def _record_problem(report: PreservationReport, what: str, exc: Exception) -> None:
     """
     Note a failure in the report and log it with its traceback.
@@ -759,12 +784,14 @@ def _keep_document(artefacts: RunArtefacts, report: PreservationReport) -> bool:
 
     """
     document = artefacts.document or ()
+    pdf: Path | None = None
     try:
         pdf = _build_pdf(artefacts, document)
         make_failed_dir(artefacts.failed_dir)
         kept = _keep_file(pdf, artefacts.failed_dir)
     except Exception as exc:
         _record_problem(report, "keeping the unfiltered document as a PDF", exc)
+        _discard_unkept(pdf)
         return False
     report.groups.append(KeptGroup(KeptKind.DOCUMENT, (kept,), len(document)))
     return True
@@ -790,14 +817,18 @@ def _keep_passes(artefacts: RunArtefacts, report: PreservationReport) -> bool:
     kept: list[Path] = []
     pages = 0
     complete = True
+    # The PDF built and not yet kept, if any.
+    pdf: Path | None = None
     try:
         make_failed_dir(artefacts.failed_dir)
         for suffix, records in passes:
             pdf = build_pass_pdf(artefacts, suffix, records)
             kept.append(_keep_file(pdf, artefacts.failed_dir))
+            pdf = None
             pages += len(records)
     except Exception as exc:
         _record_problem(report, "keeping the scanned passes as PDFs", exc)
+        _discard_unkept(pdf)
         complete = False
     fronts = next(
         (records for suffix, records in passes if suffix == FRONTS_SUFFIX), ()

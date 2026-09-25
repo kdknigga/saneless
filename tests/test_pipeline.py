@@ -4696,6 +4696,50 @@ class TestPreservationNamesWhatItDidKeep:
         assert list(tmp_dir.glob("job-*")) == []
         assert len(list(failed_dir.glob("*.pdf"))) == 1
 
+    def test_a_pdf_that_could_not_be_kept_is_not_left_to_pile_up(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """
+        A PDF built for failed/ but refused there does not stay in the workspace.
+
+        Its pages are still in the spool, which is what is kept for the next
+        sweep.  Left behind, the PDF would be joined by another whole copy of
+        the document on every sweep that failed the same way.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        failed_dir.mkdir(parents=True)
+
+        def refused(source: Path, destination: Path) -> None:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+
+        monkeypatch.setattr("saneless.preservation.move_private", refused)
+
+        with pytest.raises(ScanError):
+            run_pipeline(
+                scanner=_jamming_scanner(2, ScanError("Paper jam")),
+                paperless=MagicMock(),
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="No Pile Up",
+                    job_id="job-pile-1",
+                ),
+            )
+
+        tmp_dir = default_settings.output.tmp_dir
+        (workspace,) = tmp_dir.glob("job-*")
+        assert len(list((workspace / SPOOL_DIR_NAME).glob("*.png"))) == 2
+        assert list(workspace.rglob("*.pdf")) == []
+
+        sweep_orphans(tmp_dir, failed_dir, 0)
+
+        assert list(tmp_dir.glob("job-*")) == [workspace]
+        assert len(list((workspace / SPOOL_DIR_NAME).glob("*.png"))) == 2
+        assert list(workspace.rglob("*.pdf")) == []
+
     def test_pages_left_in_an_unlocked_workspace_say_no_sweep_will_come(
         self,
         default_settings: Settings,
