@@ -106,9 +106,9 @@ from saneless.vocabulary import (
     ExitCode,
     JobState,
     RequestRejection,
+    job_label,
     rejection_message,
     rejection_status_code,
-    state_label,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -3419,8 +3419,8 @@ def test_first_web_ui_scan_names_real_history_labels() -> None:
     """
     Every word the walkthrough gives for the history Status column is a real label.
 
-    The history table renders ``state_label(job.state)``; the status area above
-    it spells the same terminal state differently -- ``DONE`` is "Complete" in
+    The history table renders ``job_label(job.state, job.warning)``; the status
+    area above it spells the same terminal state differently -- ``DONE`` is "Complete" in
     the table and "Done" in the status line.  Naming the status area's word in
     the description of the table sends a reader looking for a string the table
     never renders.  Derived from ``JobState`` so a relabelling cannot leave
@@ -3438,10 +3438,14 @@ def test_first_web_ui_scan_names_real_history_labels() -> None:
         if (stripped := word.strip()) and stripped != HISTORY_STATUS_HEDGE
     ]
     assert listed, f"{name} lists no example status words at all"
-    real = {state_label(state) for state in JobState}
+    real = {
+        job_label(state, warning)
+        for state in JobState
+        for warning in (None, "a warning")
+    }
     unreal = [word for word in listed if word not in real]
     assert not unreal, (
-        f"{name} says the history table shows {unreal}, but state_label never "
+        f"{name} says the history table shows {unreal}, but job_label never "
         f"returns those. The labels it can return are {sorted(real)}"
     )
 
