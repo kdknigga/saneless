@@ -242,7 +242,11 @@ The line starts with `Paperless error:`.
   when paperless-ngx rejects duplicates, the failure says so. Check paperless-ngx before scanning
   again.
 
-When the upload fails, the assembled PDF is kept and its path is added to the error.
+When the upload fails, the assembled PDF is kept and its path is added to the error. A kept PDF
+paperless-ngx had already taken is named as such: the failure came while saneless waited for the
+document to be consumed, or it was the other half of a manual-duplex pair that failed. The line
+then says the file had already been accepted as a task, or saved to the consume folder, so check
+paperless-ngx before uploading it, or it will be there twice.
 [How Consume Directory Fallback Works](../explanation/consume-directory-fallback.md) explains
 which failures retry, when the consume directory is used, and where a kept PDF goes.
 
@@ -337,8 +341,11 @@ The line starts with `Interrupted:`. Something outside saneless stopped the comm
 
 Each code is 128 plus the signal number, the shell's convention. Nobody chose to stop the scan, so
 it is not treated as a cancel: the pages already scanned are kept as a PDF under `failed/` in the
-data directory, and the line names the path. Nothing is uploaded. Scan the rest of the stack, or
-the whole stack again, and delete or upload the kept file yourself.
+data directory, and the line names the path. Scan the rest of the stack, or the whole stack again,
+and delete or upload the kept file yourself. The one exception is a signal that arrives while
+saneless waits for paperless-ngx to consume a document it has already accepted: the line then says
+the kept file had already been accepted, and names the task, so check paperless-ngx before
+uploading it, or it will be there twice.
 
 A signal that arrives once the scan's outcome is settled -- the document already delivered, or a
 failure's pages already being kept -- does not interrupt it. The command finishes what it was doing

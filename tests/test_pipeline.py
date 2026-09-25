@@ -5279,6 +5279,50 @@ class TestDuplexMismatchDelivery:
         assert paperless.poll_task.call_count == 2
         assert len(list(failed_dir.glob("*.pdf"))) == 2
 
+    def test_a_half_paperless_already_took_is_kept_with_a_caution(
+        self,
+        default_settings: Settings,
+        tmp_path: Path,
+    ) -> None:
+        """
+        The fronts reached paperless-ngx, the backs did not: only one is new.
+
+        Both are kept, because the pair is one document, but the kept fronts
+        say they were already accepted, so they are not uploaded a second
+        time by someone following the usual advice.
+        """
+        failed_dir = _isolate_dirs(default_settings, tmp_path)
+        default_settings.profiles["default"].source = "ADF"
+        default_settings.profiles["default"].duplex = "manual"
+        paperless = MagicMock()
+        paperless.upload_document.side_effect = [
+            UploadResult(delivered_to_api=True, task_uuid="fronts-task"),
+            PaperlessError("Upload rejected"),
+        ]
+
+        with pytest.raises(PaperlessError) as excinfo:
+            run_pipeline(
+                scanner=_mismatched_duplex_scanner(),
+                paperless=paperless,
+                settings=default_settings,
+                request=PipelineRequest(
+                    profile_name="default",
+                    title="Half Taken",
+                    job_id="job-dx-9",
+                    flip_coordinator=AlwaysContinueFlipCoordinator(),
+                ),
+            )
+
+        (fronts,) = failed_dir.glob("*-fronts.pdf")
+        (backs,) = failed_dir.glob("*-backs.pdf")
+        message = failure_text(excinfo.value)
+        assert (
+            f"{fronts.name} had already been accepted by paperless-ngx as task "
+            f"fronts-task, which had not confirmed it was consumed, so check "
+            f"paperless-ngx before uploading it again"
+        ) in message
+        assert f"{backs.name} had already" not in message
+
     def test_duplex_mismatch_assembly_failure_keeps_every_spooled_page(
         self,
         default_settings: Settings,
@@ -6686,8 +6730,13 @@ class TestRunGuard:
         assert excinfo.value is original
         kept = list(failed_dir.glob("*.pdf"))
         assert len(kept) == 1
+        # paperless-ngx had accepted the upload before the poll timed out, so
+        # the kept copy says so: uploading it unchecked would duplicate it.
         assert failure_text(excinfo.value) == (
-            f"Timed out after 300s waiting for task. The scan was preserved at {kept[0]}"
+            f"Timed out after 300s waiting for task. The scan was preserved at "
+            f"{kept[0]}. {kept[0].name} had already been accepted by paperless-ngx "
+            f"as task task-uuid-1, which had not confirmed it was consumed, so "
+            f"check paperless-ngx before uploading it again"
         )
 
     def test_run_guard_keeps_the_pages_of_an_interrupted_run(

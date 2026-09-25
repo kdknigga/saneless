@@ -1635,9 +1635,22 @@ class _PipelineRun:
             What the upload did.
 
         """
-        return self.paperless.upload_document(
+        upload = self.paperless.upload_document(
             pdf_path, title, self.request.tags, self.request.correspondent
         )
+        # From here paperless-ngx has the document, or will from its consume
+        # folder: if the run fails later -- the poll, the other half of a
+        # mismatch, a signal -- the kept copy must say so, or following the
+        # usual advice to upload it would make a duplicate.
+        if upload.task_uuid is not None:
+            how = (
+                f"had already been accepted by paperless-ngx as task "
+                f"{upload.task_uuid}, which had not confirmed it was consumed"
+            )
+        else:
+            how = "had already been saved to the paperless-ngx consume folder"
+        self.artefacts.accepted[pdf_path] = how
+        return upload
 
     def _poll(self, upload: UploadResult) -> None:
         """

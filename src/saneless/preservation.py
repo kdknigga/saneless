@@ -438,6 +438,11 @@ class RunArtefacts:
         document: Every page in document order, unfiltered, once acquisition
             has finished; None before that.
         pdfs: Assembled PDFs not yet delivered, still in the workspace.
+        accepted: Of those PDFs, each one paperless-ngx had already taken --
+            accepted by its API, or saved to its consume folder -- before the
+            run failed, with the words that say how.  Such a PDF is still
+            kept, because paperless-ngx may yet fail to consume it, but the
+            sentence says it got there, so nobody uploads it again unchecked.
 
     """
 
@@ -451,6 +456,7 @@ class RunArtefacts:
     passes: list[tuple[str, tuple[PageRecord, ...]]] = field(default_factory=list)
     document: tuple[PageRecord, ...] | None = None
     pdfs: list[Path] = field(default_factory=list)
+    accepted: dict[Path, str] = field(default_factory=dict)
 
 
 class KeptKind(StrEnum):
@@ -533,12 +539,15 @@ class PreservationReport:
         failed_dir: The durable directory everything kept went in.
         groups: The artefacts kept, most finished first.
         problems: What failed, one short description each, in order.
+        cautions: What the operator must check before using a kept file, one
+            sentence each: a kept PDF paperless-ngx had already taken.
 
     """
 
     failed_dir: Path
     groups: list[KeptGroup] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    cautions: list[str] = field(default_factory=list)
 
     @property
     def kind(self) -> KeptKind:
@@ -583,8 +592,8 @@ class PreservationReport:
             return f"The scan could NOT be preserved to {self.failed_dir}: {problems}"
         kept = ". ".join(group.sentence() for group in self.groups)
         if problems:
-            return f"{kept} ({problems})"
-        return kept
+            kept = f"{kept} ({problems})"
+        return ". ".join([kept, *self.cautions])
 
 
 def _build_pdf(
@@ -717,6 +726,12 @@ def _keep_assembled(artefacts: RunArtefacts, report: PreservationReport) -> bool
             # second still leaves the first named in the report.
             destination = _keep_file(pdf, artefacts.failed_dir)
             kept.append(destination)
+            how = artefacts.accepted.get(pdf)
+            if how is not None:
+                report.cautions.append(
+                    f"{destination.name} {how}, so check paperless-ngx before "
+                    f"uploading it again"
+                )
     except Exception as exc:
         _record_problem(report, "moving the assembled PDF(s)", exc)
     if kept:
