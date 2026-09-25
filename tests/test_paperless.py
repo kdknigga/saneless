@@ -26,6 +26,8 @@ from saneless.exceptions import (
 from saneless.paperless import (
     PaperlessClient,
     UploadResult,
+    _not_accepted_message,
+    _one_line_reason,
     _render_error_body,
     _retry_decision,
     _RetryDecision,
@@ -1428,6 +1430,49 @@ class TestRenderErrorBody:
         result = _render_error_body(response, _MOCK_AUTH)
         assert not has_control_characters(result)
         assert "\\x1b" in result
+
+    @pytest.mark.parametrize(
+        "render",
+        [
+            pytest.param(
+                lambda response: _one_line_reason(
+                    httpx2.HTTPStatusError(
+                        "refused",
+                        request=httpx2.Request("POST", "http://paperless.test/"),
+                        response=response,
+                    ),
+                    _MOCK_AUTH,
+                ),
+                id="status-error",
+            ),
+            pytest.param(
+                lambda response: _not_accepted_message(response, _MOCK_AUTH),
+                id="upload-not-accepted",
+            ),
+            pytest.param(
+                lambda response: _failed_poll_message(lambda _call: response),
+                id="task-poll",
+            ),
+        ],
+    )
+    def test_reason_phrase_controls_are_shown_as_escapes(
+        self, render: Callable[[httpx2.Response], str]
+    ) -> None:
+        """
+        The status line's reason phrase is upstream text like the body.
+
+        HTTP allows any control but NUL, CR and LF in a reason phrase, so a
+        misbehaving server or proxy can put a terminal escape there, and the
+        message it lands in is printed and logged.
+        """
+        response = httpx2.Response(
+            400,
+            json={"detail": "no"},
+            extensions={"reason_phrase": b"Bad\x1b]0;owned\x07\x1b[31mRed"},
+        )
+        result = render(response)
+        assert not has_control_characters(result)
+        assert "400 Bad\\x1b]0;owned\\x07\\x1b[31mRed" in result
 
     def test_empty_body_says_so(self) -> None:
         """An empty body renders as an explicit marker, never an empty string."""

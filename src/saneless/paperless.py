@@ -297,10 +297,7 @@ def _one_line_reason(exc: BaseException, token: str) -> str:
     """
     if isinstance(exc, httpx2.HTTPStatusError):
         response = exc.response
-        return (
-            f"{response.status_code} {response.reason_phrase}: "
-            f"{_render_error_body(response, token)}"
-        )
+        return f"{_status_text(response)}: {_render_error_body(response, token)}"
     return _strike(describe(exc), token)
 
 
@@ -549,6 +546,24 @@ def _bounded_line(text: str) -> str:
     return line
 
 
+def _status_text(response: httpx2.Response) -> str:
+    """
+    Render a response's status code and reason phrase for a message.
+
+    The reason phrase is upstream text like the body: HTTP allows any control
+    character in it but NUL, CR and LF, so it goes through ``_bounded_line``
+    before it reaches a message that is printed and logged.
+
+    Args:
+        response: The response whose status line is reported.
+
+    Returns:
+        ``"<code> <reason>"``, or only the code when the reason is empty.
+
+    """
+    return f"{response.status_code} {_bounded_line(response.reason_phrase)}".rstrip()
+
+
 def _loggable_task_id(task_id: str) -> str:
     """
     Tame a paperless task id for a log line or an error message.
@@ -586,7 +601,7 @@ def _not_accepted_message(response: httpx2.Response, token: str) -> str:
         A single line naming the status and what to check.
 
     """
-    status = f"{response.status_code} {response.reason_phrase}"
+    status = _status_text(response)
     location = _bounded_line(
         _strike(_without_userinfo(response.headers.get("location", "")), token)
     )
@@ -1316,8 +1331,7 @@ class PaperlessClient:
         """
         if response.status_code != 200:
             msg = (
-                f"Paperless task poll failed ({response.status_code} "
-                f"{response.reason_phrase}): "
+                f"Paperless task poll failed ({_status_text(response)}): "
                 f"{_render_error_body(response, self._token)}"
             )
             raise PaperlessError(msg)
