@@ -1453,13 +1453,52 @@ class ScanWorker:
             with self._front_pages_lock:
                 self._front_pages = None
 
+    def _store_progress_state(self, job_id: str, state: JobState) -> bool:
+        """
+        Write one active state a running job has reached, without raising.
+
+        The write only tells observers how far the scan has got, so a store
+        error is logged at WARNING with its traceback and the scan carries on.
+        ``AWAITING_FLIP`` is tried twice: the flip prompt renders from the row,
+        so while that write is missing nobody sees a prompt to answer.  If the
+        second attempt fails too, the flip wait still runs, and its timeout
+        ends the job with pass A's fronts kept.
+
+        Args:
+            job_id: The running job's row.
+            state: The active state it has reached.
+
+        Returns:
+            Whether the write landed.
+
+        """
+        attempts = 2 if state is JobState.AWAITING_FLIP else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                self._job_store.update_state(job_id, state)
+            except Exception:
+                logger.warning(
+                    "Could not store state %s for job %s (attempt %d of %d); "
+                    "the scan continues",
+                    state.value,
+                    job_id,
+                    attempt,
+                    attempts,
+                    exc_info=True,
+                )
+            else:
+                return True
+        return False
+
     def _scan_job(self, job: Job) -> None:
         """
         Run one job through the pipeline and record how it ended.
 
         A pipeline failure is a job failure: it is recorded as ERROR here and
-        this returns normally.  That includes a store write inside a pipeline
-        callback, which reaches here through ``run_pipeline``.  A cancel is
+        this returns normally.  A store write inside a pipeline callback -- the
+        thumbnail or an active state -- is not one: it is logged and the scan
+        carries on, so a locked job database cannot change how a scan ends
+        (see :meth:`_store_progress_state`).  A cancel is
         recorded as CANCELLED, and a flip answer claimed by shutdown as ERROR
         with ``RESTART_REASON``; neither is a failure.  The loop's own store
         writes -- SCANNING before the pipeline, and the terminal write of
@@ -1483,8 +1522,24 @@ class ScanWorker:
         coordinator = WorkerFlipCoordinator(job.id) if is_manual_duplex else None
         self._flip_coordinator = coordinator
 
+        # Neither progress callback lets a store error out.  One raised inside
+        # run_pipeline would end the run -- filed as a scanner fault, and with
+        # the spooled pages deleted if it fell outside the pipeline's guard --
+        # over a write that only tells observers how far the scan has got.
+        #
+        # Nor is such a failure counted by _record_loop_failure.  That count
+        # measures the loop's own store failures; a progress write that fails
+        # is not one, and if the store really is down, the terminal write that
+        # follows fails and is counted there.
         def _thumbnail_cb(thumb: str, _jid: str = job.id) -> None:
-            self._job_store.update_thumbnail(_jid, thumb)
+            try:
+                self._job_store.update_thumbnail(_jid, thumb)
+            except Exception:
+                logger.warning(
+                    "Could not store the thumbnail for job %s; the scan continues",
+                    _jid,
+                    exc_info=True,
+                )
 
         # The back count is ignored on purpose.  It arrives a moment before the
         # ScanResult that carries the run's real total, so storing it would
@@ -1532,8 +1587,11 @@ class ScanWorker:
                     # Abort now, or the wait would hold the thread for
                     # flip_timeout_seconds after shutdown began.
                     coordinator.abort_for_shutdown()
-            self._job_store.update_state(_jid, state)
-            persisted_state = state
+            # Only a write that landed advances persisted_state, so a state
+            # whose write failed is tried again at the next event instead of
+            # being taken as already on the row.
+            if self._store_progress_state(_jid, state):
+                persisted_state = state
 
         request = PipelineRequest(
             profile_name=job.profile,
